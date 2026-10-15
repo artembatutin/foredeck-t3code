@@ -11,6 +11,13 @@ not owner-authorized work in this fork.
 - Develop on task branches from our `main` and target fork pull requests there.
   `upstream/main` tracks the original project; merge reviewed upstream updates into
   our main without rewriting shared history. See the fork runbook for the procedure.
+- Treat upstream compatibility and the cost of future updates as design constraints
+  for all development. Follow the runbook's
+  [customization policy](docs/operations/foredeck-development.md#keeping-customizations-easy-to-update).
+- Put fork implementations in the owning workspace's `src/fd/<feature>/`, exposing
+  explicit feature entry points. Respect the runbook's [enforced fd boundary](docs/operations/foredeck-development.md#enforced-fd-boundary);
+  keep necessary core integration edits small and declared. Do not bypass or weaken
+  the boundary check to make a task pass.
 - GitHub Actions is disabled for this fork; no hosted CI status is required to merge.
   Verify affected behavior locally, record commands and limitations, and fix relevant
   failures before integration. Repository-wide checks still require an explicit request.

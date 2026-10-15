@@ -294,6 +294,108 @@ submit upstream independently. Core changes are appropriate when correctness req
 them; explain the constraint instead of building a wrapper or duplicate subsystem.
 There is no empty foredeck-t3 package or new plugin framework.
 
+### Keeping customizations easy to update
+
+Upstream compatibility and the cost of future merges or rebases are acceptance
+criteria for all Foredeck development: features, fixes, architecture, dependencies,
+and visual changes. Build our product by expanding the existing system while keeping
+upstream improvements practical to integrate. This permits new capabilities, UI,
+and modules; the implementation should have a clear purpose and ownership boundary.
+
+- **Define the intended change.** Identify the requested outcome, the existing
+  integration points, and affected contracts, persisted state, and clients before
+  implementation. Reference products and designs inform the work; they do not
+  automatically expand its scope. Keep task-specific restrictions in the task.
+- **Extend the existing system.** Prefer established services, adapters, contracts,
+  shared components, and composition points. Keep new behavior in cohesive modules
+  with small, explicit connections to upstream code. Avoid parallel implementations
+  of subsystems upstream already owns. Core edits are appropriate when they are the
+  smallest correct solution; explain their purpose rather than forcing wrappers
+  around everything or introducing a framework without a concrete need.
+- **Keep patches cohesive.** Separate visual identity from behavior changes and
+  unrelated refactoring. Avoid unnecessary upstream file moves, symbol renames,
+  formatting churn, duplicated subsystems, and competing sources for theme values.
+  Keep changes independently reviewable, reversible, and suitable for upstreaming
+  where useful; small line counts alone do not establish maintainability.
+- **Review the integration cost.** Before finishing, inspect the diff for accidental
+  scope growth, identify the upstream components it touches, and explain any necessary
+  structural deviation. Verify existing behavior and saved preferences still work;
+  test the ordinary unconfigured path when adding optional behavior. Record focused
+  local checks and relevant untested surfaces in the task or PR, not an audit diary.
+
+The published-main merge workflow above preserves shared history. Private rebases
+and their range comparisons remain useful for evaluating changes without rewriting
+the published fork automatically.
+
+### Enforced fd boundary
+
+Use **`fd`** as the code namespace. The product remains Foredeck / foredeck-t3.
+Put new fork implementation in the owning workspace's `src/fd/<feature>/`:
+server behavior in `apps/server`, shared client behavior in `packages/client-runtime`,
+presentation in `apps/web` or `apps/mobile`, shell behavior in `apps/desktop`, and
+relay behavior in `infra/relay`. Keep provider-specific work in its existing adapter
+package. Expose each feature through its own `index.ts` or `index.tsx`; imports within
+that feature can use private files. Do not create a global fd barrel or move existing
+upstream code into fd. Tests live with the feature.
+
+Use `packages/fd-<capability>` only for actual shared functionality, with a public
+package entry and no imports from applications. App-local fd code can reuse its
+own upstream services and components; shared code is reached through package exports.
+Features must not import another application's internals or another fd feature's
+private files. Keep assets under `assets/fd/<feature>/` or `public/fd/<feature>/`
+where those directories already belong to the workspace. Native additions can live
+under `native/fd/`; fork contributor tooling belongs under `scripts/fd/`.
+Create these directories only with real implementation, not empty scaffolding.
+
+Necessary upstream edits remain legitimate: compose services, register routes,
+extend contracts, add migrations, fix shared correctness, or configure a build.
+Keep the implementation in fd when practical. Declare each necessary integration
+file as an **exact repository path with a reason** in
+[`scripts/fd/integration-files.json`](../../scripts/fd/integration-files.json).
+Explain the behavior it connects and why that edit must stay in core. No wildcards
+or directory exemptions. Remove entries when their integration is removed. An entry
+permits edits to that file; it does not justify unrelated changes or waive feature
+privacy. Review changes to this small exception list and to the guard itself.
+
+The local [boundary check](../../scripts/fd/check-boundaries.ts) runs before commit
+formatting and before automatic merge commits. It checks an immutable snapshot of
+the Git index, including partially staged files, and works when `.git` is a worktree
+file. It rejects additions, edits, renames, or deletions in `apps/`, `packages/`,
+`infra/`, and `native/` outside the allowed fd locations unless declared above.
+Files copied unchanged from the verified `upstream/main` tree, and deletions already
+made upstream since the merge base, pass without creating customization exceptions.
+Conflicts resolved differently from upstream still require a reason.
+
+For changed JavaScript and TypeScript, it also checks relative imports, the existing
+web `~/` alias, and `@t3tools/*` package paths. It covers static imports, reexports,
+type imports, literal dynamic imports and `require`; fd modules cannot use computed
+module specifiers. Inbound fd imports require a declared integration file and must
+use a feature entry point. Relative imports across workspaces and fd imports into
+other apps are rejected. Keep shared package exports aligned with these entry points;
+adding aliases, custom package-export mappings or loaders requires extending the check
+and its tests. CSS/native imports and runtime registration are not module-graph checked.
+
+The normal frozen install runs `prepare`, which configures `.vite-hooks/_` as
+Git's hook directory. Verify with `git config --get core.hooksPath`, then run:
+
+```sh
+# Inspect what will be committed; this reads the staged policy too.
+node scripts/fd/check-boundaries.ts --staged
+# Before integrating a task branch, check all its committed changes from our main.
+node scripts/fd/check-boundaries.ts --base main
+vp test run scripts/fd/check-boundaries.test.ts
+```
+
+The branch check reads committed HEAD, not uncommitted work. Use both checks when
+both exist. Before an upstream merge, verify remotes and fetch as described above;
+the check trusts the local upstream tracking ref and never fetches itself. Git
+fast-forwards and rebases do not consistently invoke commit hooks: run the branch
+check against the saved pre-update main after a rehearsal and before integration.
+These checks need no hosted CI. They constrain file placement and dependency paths;
+they cannot prove correctness, minimal scope, or prevent someone with repository
+write access from disabling them. Do not disable hooks or broaden exceptions just
+to pass a check. Keep focused behavior tests and the integration-cost review above.
+
 | Concern                                        | Integration boundary                                                                                                                                                 |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Execution, authorization, files, durable state | Server services; thin HTTP/RPC/MCP handlers. The pure orchestrator decides events, EventSink commits, EffectWorker performs I/O.                                     |
@@ -398,8 +500,9 @@ restoring required status checks. Keep publishing workflows disabled separately.
 
 The PR template follows the owner attribution policy. The mobile version-bump workflow
 also omits its former automatic AI co-author trailer. Installation runs the existing
-`prepare` step, which configures `.vite-hooks`; its tracked pre-commit action formats
-staged files and does not add message trailers. Reinspect generated hooks and any
+`prepare` step, which configures `.vite-hooks`; its tracked commit hooks check the
+[fd boundary](#enforced-fd-boundary), and pre-commit also formats staged files.
+They do not add message trailers. Reinspect generated hooks and any
 machine-local hook initialization before committing.
 
 Publishing/deployment entry jobs, the upstream hygiene webhook, and upstream vouch
