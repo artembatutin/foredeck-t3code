@@ -9,24 +9,33 @@ architecture, performance, compatibility, and verification guidance for fork wor
 
 ## Branch roles
 
-- `main`: GitHub default branch and upstream mirror, advanced only by fast-forward;
-  no fork commits.
-- `chore/foredeck-t3`: fork integration branch. Start focused task branches here and
-  integrate reviewed work here. Once published, treat this as shared history.
+- `main`: our product and GitHub default branch, including all foredeck-t3 changes.
+  Start task branches here and target fork pull requests here.
+- `upstream/main`: remote-tracking reference for `pingdotgg/t3code`. Fetching updates
+  this reference without changing our files or branches. No local mirror is needed.
+- `origin/main`: the published main branch of our fork, `artembatutin/foredeck-t3code`.
 - `feature/*`, `bugfix/*`, `chore/*`, `docs/*`: short-lived task branches. Rebase
-  private work; do not rewrite a published branch without explicit authorization.
+  private work; preserve published history. Keep each change independently reviewable.
 
-The initial checkout and `origin/main` were both
-`c814e51af2ba962c9291c9459ee64b4f57e0b5ce`, with **zero customization commits**.
-The upstream tip fetched for this foundation was
-`e536bfd33bc3c351997141d93790df75eeded7b9` (two commits ahead). The foundation starts
-at the checkout commit; it does not silently integrate those two changes. An empty
-series rebase rehearsal reached the fetched tip with an identical tree. This proves
-the branch procedure, not the correctness of those upstream changes.
+From a clean checkout, start an ordinary task with:
 
-The integration branch contains the foundation on that checkout base. `main` remains
-the GitHub default; explicitly choose `chore/foredeck-t3` for development and as the
-base of fork pull requests. No ticket was assigned to the foundation work.
+```sh
+git fetch --no-tags origin
+git switch main
+git merge --ff-only origin/main
+git switch -c feature/my-change
+```
+
+Use focused checks locally and the required CI `Check` before integration. Fork pull
+requests target `main` in our repository. Upstream submissions are a separate choice.
+Use a merge commit for upstream update pull requests so upstream ancestry survives;
+squashing or rebasing those updates loses the ancestry needed by later merges.
+
+The foundation was based on `c814e51af2ba962c9291c9459ee64b4f57e0b5ce`.
+The upstream commit audited during setup was
+`e536bfd33bc3c351997141d93790df75eeded7b9`, two commits beyond that base.
+These record the initial audit, not the current upstream tip or an application-wide
+verification result. No ticket was assigned to the foundation work.
 
 ## Reproducible setup
 
@@ -44,7 +53,7 @@ function named `vp` is insufficient for setup's subprocesses or another checkout
 From a fresh clone:
 
 ```sh
-git clone --branch chore/foredeck-t3 https://github.com/artembatutin/foredeck-t3code.git foredeck-t3
+git clone --branch main https://github.com/artembatutin/foredeck-t3code.git foredeck-t3
 cd foredeck-t3
 git remote add upstream https://github.com/pingdotgg/t3code.git
 git config remote.pushDefault origin
@@ -59,7 +68,7 @@ For a linked worktree, run from the primary checkout and choose an unused task n
 
 ```sh
 foredeck_primary=$(git rev-parse --show-toplevel)
-git worktree add -b feature/my-change ../foredeck-my-change chore/foredeck-t3
+git worktree add -b feature/my-change ../foredeck-my-change main
 cd ../foredeck-my-change
 T3CODE_PROJECT_ROOT="$foredeck_primary" node scripts/setup-worktree.ts
 T3CODE_TELEMETRY_ENABLED=false vp run dev --home-dir "$PWD/.t3" --host 127.0.0.1
@@ -96,8 +105,13 @@ run with Ctrl-C, or retain and stop only the process/session you started.
 
 ## Updating upstream
 
+Published `main` contains our customizations. Merge upstream on a separate update
+branch, test the result, and integrate it without rewriting history. Fetching alone
+never replaces our changes. Do not reset `main` to upstream or use GitHub's discard
+changes operation to synchronize this fork.
+
 Run these steps in one shell, stopping on any failure. Substitute unique backup
-and rehearsal names when resuming an existing attempt. Do not automatically stash,
+and worktree names when resuming an existing attempt. Do not automatically stash,
 reset, overwrite tags, or use a mirror push. Stop if a merge/rebase is already in
 progress or any worktree involved has uncommitted work; preserve that work first.
 
@@ -107,7 +121,6 @@ progress or any worktree involved has uncommitted work; preserve that work first
 git status --short --branch
 git worktree list
 git branch -vv
-git remote -v
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
 git remote get-url --all origin
 git remote get-url --push --all origin
@@ -118,21 +131,22 @@ git remote get-url --push --all upstream
 Verify that origin's fetch/push URLs identify `artembatutin/foredeck-t3code` and
 upstream identifies `pingdotgg/t3code` (HTTPS and SSH forms are equivalent).
 Inspect every URL; stop on an unexpected identity. Never push to upstream here.
-Then record the old base **before fetching**, so a moving remote-tracking ref
-cannot change the meaning of the old customization range:
+Synchronize our local main with the fork, then record the old upstream base before
+fetching upstream so a moving remote-tracking ref cannot change the old range:
 
 ```sh
-foredeck_old_tip=$(git rev-parse chore/foredeck-t3)
-foredeck_old_base=$(git merge-base chore/foredeck-t3 upstream/main)
-foredeck_stamp=$(date -u +%Y%m%dT%H%M%SZ)
-git log --oneline "$foredeck_old_base..$foredeck_old_tip"
-git branch --no-track "backup/foredeck-$foredeck_stamp" "$foredeck_old_tip"
-git branch --no-track "backup/upstream-base-$foredeck_stamp" "$foredeck_old_base"
-git branch --no-track "backup/main-$foredeck_stamp" main
-git fetch --no-tags upstream refs/heads/main:refs/remotes/upstream/main
 git fetch --no-tags origin
+git switch main
+git merge --ff-only origin/main
+git log --left-right --oneline main...origin/main
+test "$(git rev-parse main)" = "$(git rev-parse origin/main)"
+foredeck_old_tip=$(git rev-parse main)
+foredeck_old_base=$(git merge-base main upstream/main)
+foredeck_stamp=$(date -u +%Y%m%dT%H%M%SZ)
+git branch --no-track "backup/main-$foredeck_stamp" "$foredeck_old_tip"
+git branch --no-track "backup/upstream-base-$foredeck_stamp" "$foredeck_old_base"
+git fetch --no-tags upstream refs/heads/main:refs/remotes/upstream/main
 foredeck_new_base=$(git rev-parse upstream/main)
-git branch -vv
 git merge-base --is-ancestor "$foredeck_old_base" "$foredeck_new_base"
 git log --oneline "$foredeck_old_base..$foredeck_new_base"
 git diff --stat "$foredeck_old_base" "$foredeck_new_base"
@@ -143,117 +157,131 @@ git diff "$foredeck_old_base" "$foredeck_new_base" -- AGENTS.md CLAUDE.md CONTRI
   scripts t3.json native
 ```
 
-Follow changed contracts to their server and client consumers. Review replay and
-migration changes, provider SDKs, native archives, build tools, hooks, and newly added
-publishers. Re-read applicable nested instructions. If upstream rewrote history or
-the chosen base does not bound the intended series, stop and select a verified base;
-do not force the fetch or mechanically transplant a mixed merge history. If
-`origin/chore/foredeck-t3` exists, inspect
-`git log --left-right --oneline chore/foredeck-t3...origin/chore/foredeck-t3`; reconcile
-unincorporated collaborator work before updating the integration branch.
+Stop and reconcile if local main has unpublished or divergent work. Follow changed
+contracts to their server and client consumers. Review replay and migration changes,
+provider SDKs, native archives, build tools, hooks, and new publishing workflows.
+Re-read applicable nested instructions. If upstream rewrote history or the chosen
+base does not bound the intended changes, investigate; do not force the fetch.
+If `upstream/main` is already an ancestor of `main`, there is nothing to integrate.
 
-### Rehearse independently
+### Rehearse the merge in an isolated worktree
 
 ```sh
-foredeck_rehearsal="chore/upstream-rehearsal-$foredeck_stamp"
-foredeck_worktree="../foredeck-rehearsal-$foredeck_stamp"
-git worktree add -b "$foredeck_rehearsal" "$foredeck_worktree" "$foredeck_old_tip"
+foredeck_update="chore/upstream-update-$foredeck_stamp"
+foredeck_worktree="../foredeck-update-$foredeck_stamp"
+git worktree add -b "$foredeck_update" "$foredeck_worktree" "$foredeck_old_tip"
+git -C "$foredeck_worktree" merge --no-commit --no-ff "$foredeck_new_base"
+```
+
+Read both sides of conflicts and preserve intended behavior, owner policy, and
+compatibility. Stage only resolved files; never use blanket `--ours`/`--theirs`.
+Inspect the result before committing:
+
+```sh
+git -C "$foredeck_worktree" diff --name-only --diff-filter=U
+git -C "$foredeck_worktree" diff --cached --check
+git -C "$foredeck_worktree" diff --cached "$foredeck_new_base"
+git -C "$foredeck_worktree" diff --cached "$foredeck_old_tip"
+```
+
+The first command must list no unresolved conflicts. Review the remaining fork diff
+against upstream for lost customizations and duplicated patches, and the change from
+our old main for unintended behavior. Install using the linked-worktree setup above.
+Run focused tests, lint, and package typechecks for the affected areas. Use copied
+data for migrations/replay; never test a downgrade on the only database copy.
+
+`git -C "$foredeck_worktree" merge --abort` abandons a failed rehearsal; main and the
+backup refs remain untouched. To resume, inspect status and continue resolving the
+existing merge, or abort and start a new attempt from the backups. Do not recreate
+backup refs over existing names.
+
+### Publish and integrate the tested update
+
+When checks pass and committing/publishing are authorized:
+
+```sh
+git -C "$foredeck_worktree" commit -m "chore(upstream): merge upstream changes"
+git -C "$foredeck_worktree" log -1 --format=fuller
+git branch --no-track "backup/update-verified-$foredeck_stamp" "$foredeck_update"
+git -C "$foredeck_worktree" push --set-upstream origin "$foredeck_update"
+```
+
+Before pushing, verify repository-level workflow safeguards and guard any new
+publisher as described below. Record the tested SHA, upstream base, commands, and
+limits in the owning task/PR. Open an update PR targeting our `main` only when
+requested, wait for the required `Check`, and use **Create a merge commit**. Do not
+squash or rebase an upstream update. If main advances, merge it into the update
+branch and recheck the changed result. Never bypass protection to land failed CI.
+After integration, update the local checkout:
+
+```sh
+git fetch --no-tags origin
+git switch main
+git merge --ff-only origin/main
+git merge-base --is-ancestor "$foredeck_new_base" main
+```
+
+The final command verifies that the upstream commit remains in our history. Remove
+only clean disposable worktrees and fully merged task branches; retain backup refs
+until the update is accepted. Recover old work on a new branch from its backup.
+Undo a published change with a reviewed revert, not a reset or force push.
+
+### Rebase private task branches
+
+Rebase a private task onto the updated fork main, including its customizations.
+Do not rebase a task directly onto upstream if it depends on fork behavior. Save its
+tip and rehearse on a disposable branch before changing the original:
+
+```sh
+git fetch --no-tags origin
+foredeck_task=feature/my-change
+foredeck_task_tip=$(git rev-parse "$foredeck_task")
+foredeck_task_base=$(git merge-base "$foredeck_task" origin/main)
+foredeck_task_target=$(git rev-parse origin/main)
+foredeck_stamp=$(date -u +%Y%m%dT%H%M%SZ)
+git branch --no-track "backup/task-$foredeck_stamp" "$foredeck_task_tip"
+foredeck_rehearsal="chore/rebase-rehearsal-$foredeck_stamp"
+foredeck_worktree="../foredeck-rebase-$foredeck_stamp"
+git worktree add -b "$foredeck_rehearsal" "$foredeck_worktree" "$foredeck_task_tip"
 git -C "$foredeck_worktree" -c rebase.autoStash=false rebase \
-  --onto "$foredeck_new_base" "$foredeck_old_base"
-foredeck_old_count=$(git rev-list --count "$foredeck_old_base..$foredeck_old_tip")
-foredeck_new_count=$(git rev-list --count "$foredeck_new_base..$foredeck_rehearsal")
+  --onto "$foredeck_task_target" "$foredeck_task_base"
+foredeck_old_count=$(git rev-list --count "$foredeck_task_base..$foredeck_task_tip")
+foredeck_new_count=$(git rev-list --count "$foredeck_task_target..$foredeck_rehearsal")
 if test "$foredeck_old_count" -gt 0 && test "$foredeck_new_count" -gt 0; then
-  git range-diff "$foredeck_old_base..$foredeck_old_tip" \
-    "$foredeck_new_base..$foredeck_rehearsal"
+  git range-diff "$foredeck_task_base..$foredeck_task_tip" \
+    "$foredeck_task_target..$foredeck_rehearsal"
 elif test "$foredeck_old_count" -eq 0 && test "$foredeck_new_count" -eq 0; then
-  git diff --exit-code "$foredeck_new_base" "$foredeck_rehearsal"
+  git diff --exit-code "$foredeck_task_target" "$foredeck_rehearsal"
 else
-  echo "One customization series is empty; investigate before proceeding."
+  echo "One patch series is empty; investigate before proceeding."
   false
 fi
-git log --oneline "$foredeck_new_base..$foredeck_rehearsal"
-git diff --check "$foredeck_new_base" "$foredeck_rehearsal"
-git diff "$foredeck_new_base" "$foredeck_rehearsal"
 ```
 
-`range-diff` requires nonempty ranges. If both series are empty, skip it and require
-`git diff --exit-code "$foredeck_new_base" "$foredeck_rehearsal"`. If only one is
-empty, investigate every dropped or newly introduced patch. For nonempty series,
-review every `!`, `<`, and `>` entry: upstream may already contain a customization,
-but a dropped patch is not automatically correct. Look for duplicates and changed
-intent. A merge-heavy integration history generally calls for a merge, not a plain
-linear rebase; preserve meaningful merges if explicitly choosing a rebase later.
+Review changed, dropped, and duplicated patches; a dropped patch may already exist
+on main but is not automatically correct. Resolve conflicts by behavior, stage the
+resolved files, and use `git rebase --continue`. `git rebase --abort` in the rehearsal
+restores it. Re-test the result and either retain the tested branch or repeat the
+verified rebase on the clean private task. Merge-heavy history usually calls for a
+merge instead; a successful rebase rehearsal does not verify a different merge result.
 
-Resolve conflicts in the rehearsal by reading both behaviors, retaining owner policy
-and compatibility, then stage only resolved files and `git rebase --continue` there.
-Never choose an entire side with blanket `--ours`/`--theirs`. Inspect generated commit
-messages and trailers. `git -C "$foredeck_worktree" rebase --abort` restores the
-rehearsal; the integration branch and backup refs remain untouched. To resume, inspect
-`git status` there and continue the existing operation, or abort and start a new
-rehearsal from the saved refs. Do not recreate backups over existing names.
-
-Install and check the rehearsal using the setup above. Run focused tests, lint, and
-package typechecks for upstream changes and fork integration points. Use copied data
-for migrations/replay; never test a downgrade on the only database copy. Record the
-tested SHA, base, commands, and limits in the owning task/PR. Only after those checks
-pass, run `git branch --no-track "backup/foredeck-verified-$foredeck_stamp" "$foredeck_rehearsal"`
-to save that exact SHA; the
-initial audit refs are not claims of a fully tested application.
-
-### Integrate without rewriting shared history
-
-For a **private** task branch, the same rehearsal/rebase procedure is suitable.
-For a private integration branch, explicitly choose a local fast-forward where
-possible or an authorized branch replacement after review; do not use a destructive
-reset to promote a rehearsal. Keeping the tested branch under its own name is safe.
-
-For **published** `chore/foredeck-t3`, prefer merging upstream: it retains collaborator
-bases and review history. Rehearse that merge separately:
+Never rewrite shared history automatically. If a published task rebase is explicitly
+authorized later, fetch and save its exact remote tip before rebasing, coordinate
+with collaborators, and use an explicit lease expectation:
 
 ```sh
-foredeck_merge_branch="chore/upstream-merge-$foredeck_stamp"
-foredeck_merge_tree="../foredeck-merge-$foredeck_stamp"
-git worktree add -b "$foredeck_merge_branch" "$foredeck_merge_tree" "$foredeck_old_tip"
-git -C "$foredeck_merge_tree" merge --no-commit --no-ff "$foredeck_new_base"
-```
-
-Resolve and test the actual merge result; `git -C "$foredeck_merge_tree" merge --abort`
-abandons it. Commit there only when authorized, with a compliant Conventional Commit
-message. Once the tested merge is committed, use a clean integration checkout:
-
-```sh
-git switch chore/foredeck-t3
-git merge --ff-only "$foredeck_merge_branch"
-# Only when publishing is authorized:
-git push origin chore/foredeck-t3:chore/foredeck-t3
-```
-
-A successful rebase rehearsal does not verify a different merge result. Re-check
-the remote tip before publishing; a rejected normal push is a reason to reconcile.
-
-Advance the mirror only if `git merge-base --is-ancestor main upstream/main` succeeds:
-switch to a clean `main` checkout and run `git merge --ff-only "$foredeck_new_base"`.
-Push `main:main` normally only with authorization **and the remote workflow safeguards
-below in place**. Leave mirror divergence for investigation; never reset it blindly.
-
-If a published integration rebase is explicitly authorized later, first re-fetch
-origin, verify collaborators have coordinated, and save its exact tip:
-
-```sh
-git fetch --no-tags origin refs/heads/chore/foredeck-t3:refs/remotes/origin/chore/foredeck-t3
-foredeck_expected=$(git rev-parse refs/remotes/origin/chore/foredeck-t3)
+git fetch --no-tags origin
+foredeck_expected=$(git rev-parse "refs/remotes/origin/$foredeck_task")
 git branch --no-track "backup/published-$foredeck_stamp" "$foredeck_expected"
-# After review/testing, with foredeck_rehearsal naming the approved result:
-git push --force-with-lease="refs/heads/chore/foredeck-t3:$foredeck_expected" \
-  origin "$foredeck_rehearsal:refs/heads/chore/foredeck-t3"
+# Only after the rebase is reviewed/tested and the rewrite is authorized:
+git push --force-with-lease="refs/heads/$foredeck_task:$foredeck_expected" \
+  origin "$foredeck_rehearsal:refs/heads/$foredeck_task"
 ```
 
-A lease rejection means someone advanced the branch: stop and reconcile; do not
-refresh the expectation merely to overwrite them. Backups remain recovery anchors:
-create `chore/recovery-<stamp>` from the saved tip to inspect/recover work. Undoing a
-published merge uses a reviewed revert; restoring a published pre-rebase tip is
-another shared rewrite requiring separate authorization. Remove only clean disposable
-worktrees after review; keep backup refs until the update is accepted.
+A lease rejection means someone advanced the branch: stop and reconcile rather
+than refreshing the expectation to overwrite them. A future shared-main rewrite
+would also need explicit authorization and coordination; current protection forbids
+it. Merging upstream is the routine update procedure.
 
 ## Where customizations belong
 
@@ -346,7 +374,7 @@ Create another dependency fork only when our changes require owning its source.
 
 ## CI and distribution boundaries
 
-CI validates pull requests and pushes to `main`/`chore/foredeck-t3`. Fork validation uses
+CI validates pull requests and pushes to `main`. Fork validation uses
 GitHub-hosted Ubuntu, macOS, and manual Windows runners; upstream retains Blacksmith.
 The selected labels are listed in [GitHub's runner images](https://github.com/actions/runner-images#available-images).
 The full existing CI jobs and final `Check` gate remain. Fork jobs get more time on
@@ -369,15 +397,13 @@ Re-audit new upstream workflows during every update.
 
 **Repository settings:** inherited distribution/hygiene/vouch workflows are disabled
 at repository level. Keep them disabled until their identities and destinations are
-configured for this fork. `main` remains the default branch. Require the final
-`Check` status before integration into `chore/foredeck-t3`, with force pushes and
-branch deletion blocked. Protect the mirror against force pushes and deletion too;
-do not require the fork CI gate on the untouched upstream mirror.
-Keep validation enabled. A pure upstream `main` mirror cannot carry fork guards:
-default-branch selection alone does not disable push/tag workflows on the mirror.
-Before every mirror update, verify workflow states in GitHub and disable any newly
-inherited publisher. Repository settings are external to Git and must be reapplied
-when creating another fork; the YAML guards are a second layer.
+configured for this fork. `main` is the default development branch and requires the
+final GitHub Actions `Check` status, including for administrators. Force pushes and
+branch deletion are blocked. Merge commits remain allowed for upstream updates.
+Keep validation enabled. During every upstream update, inspect new/changed workflows,
+retain the fork guards, and disable newly inherited publishers before pushing any
+update branch. Repository settings are external to Git and must be reapplied when
+creating another fork; the YAML guards are a second layer.
 
 Source development is ready to isolate; distributable foredeck-t3 app identity is not
 defined. Before installing or shipping a fork artifact, resolve these boundaries:
