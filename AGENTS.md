@@ -11,6 +11,9 @@ not owner-authorized work in this fork.
 - Develop on task branches from our `main` and target fork pull requests there.
   `upstream/main` tracks the original project; merge reviewed upstream updates into
   our main without rewriting shared history. See the fork runbook for the procedure.
+- GitHub Actions is disabled for this fork; no hosted CI status is required to merge.
+  Verify affected behavior locally, record commands and limitations, and fix relevant
+  failures before integration. Repository-wide checks still require an explicit request.
 - Use neutral branch prefixes (`feature/`, `bugfix/`, `chore/`, `docs/`) and Conventional Commits.
   Include verified ticket identifiers when applicable; never invent one.
 - Newly authored branch names, commit messages (including merge, squash, and revert messages),

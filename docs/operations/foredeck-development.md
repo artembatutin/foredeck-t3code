@@ -26,8 +26,9 @@ git merge --ff-only origin/main
 git switch -c feature/my-change
 ```
 
-Use focused checks locally and the required CI `Check` before integration. Fork pull
-requests target `main` in our repository. Upstream submissions are a separate choice.
+Use focused local checks and review their results before integration. Fork pull
+requests target `main` in our repository. Hosted CI is disabled; upstream submissions
+are a separate choice.
 Use a merge commit for upstream update pull requests so upstream ancestry survives;
 squashing or rebasing those updates loses the ancestry needed by later merges.
 
@@ -209,9 +210,10 @@ git -C "$foredeck_worktree" push --set-upstream origin "$foredeck_update"
 Before pushing, verify repository-level workflow safeguards and guard any new
 publisher as described below. Record the tested SHA, upstream base, commands, and
 limits in the owning task/PR. Open an update PR targeting our `main` only when
-requested, wait for the required `Check`, and use **Create a merge commit**. Do not
-squash or rebase an upstream update. If main advances, merge it into the update
-branch and recheck the changed result. Never bypass protection to land failed CI.
+requested, include local verification results, and use **Create a merge commit**. Do
+not squash or rebase an upstream update. If main advances, merge it into the update
+branch and recheck the changed result. Fix relevant local failures before integration;
+record platform checks that were not run.
 After integration, update the local checkout:
 
 ```sh
@@ -314,7 +316,8 @@ database migration order, and replay semantics; an additive wire field alone doe
 not establish downgrade safety. Rebase migration numbering deliberately after upstream
 adds migrations. Add focused behavior tests, including the ordinary unconfigured path,
 permissions, and reconnect/replay when affected. Drain asynchronous workers in tests.
-UI automation requires explicit authorization. CI owns repository-wide checks.
+UI automation and repository-wide checks require explicit authorization. Focused
+local verification is the default for this fork.
 
 ## Dependencies beyond package installation
 
@@ -374,13 +377,24 @@ Create another dependency fork only when our changes require owning its source.
 
 ## CI and distribution boundaries
 
-CI validates pull requests and pushes to `main`. Fork validation uses
-GitHub-hosted Ubuntu, macOS, and manual Windows runners; upstream retains Blacksmith.
-The selected labels are listed in [GitHub's runner images](https://github.com/actions/runner-images#available-images).
-The full existing CI jobs and final `Check` gate remain. Fork jobs get more time on
-smaller runners; actual hosted performance and runner availability need a first run.
-Mobile fingerprint comparison remains available without an Expo token. Review
-service installation and branch protection are repository settings, not proven by YAML.
+GitHub Actions is disabled at repository level by owner choice, so development does
+not depend on hosted runner billing. No hosted status is required to merge into
+`main`. This also prevents labeling and other inherited workflows from starting.
+
+Before integration, review the diff and run the smallest meaningful local proof:
+focused tests for changed behavior, lint for changed source files, and package
+typechecks when types or contracts change. For example, use `vp test run <files>`,
+`vp lint <files>`, and the affected package's existing typecheck script. For docs or
+workflow-only changes, check formatting, links/shell examples, or workflow syntax as
+appropriate. Record the exact commands, results, and untested platforms in the task
+or PR. A local pass is not evidence of untested native, provider, migration, or
+release paths. Repository-wide checks still require an explicit request.
+
+The workflow definitions are retained for future use and upstream compatibility.
+They cover pull requests and main pushes, with GitHub-hosted fallback runners for
+this fork. The full CI jobs and final `Check` job remain in YAML, but do not run.
+Re-enabling hosted validation requires an owner decision and a successful run before
+restoring required status checks. Keep publishing workflows disabled separately.
 
 The PR template follows the owner attribution policy. The mobile version-bump workflow
 also omits its former automatic AI co-author trailer. Installation runs the existing
@@ -392,17 +406,16 @@ Publishing/deployment entry jobs, the upstream hygiene webhook, and upstream vou
 automation require `github.repository == 'pingdotgg/t3code'`. This covers release/npm,
 desktop previews/signing, Vercel previews, relay deployment, AUR, EAS build/submit/OTA,
 Play APK mirroring, and store screenshot jobs. Guarded entry jobs block their dependent
-jobs. Useful CI, fingerprint checks, diff-size labels, and transfer reports are retained.
+jobs. CI, fingerprint checks, diff-size labels, and transfer report definitions are retained.
 Re-audit new upstream workflows during every update.
 
-**Repository settings:** inherited distribution/hygiene/vouch workflows are disabled
-at repository level. Keep them disabled until their identities and destinations are
-configured for this fork. `main` is the default development branch and requires the
-final GitHub Actions `Check` status, including for administrators. Force pushes and
-branch deletion are blocked. Merge commits remain allowed for upstream updates.
-Keep validation enabled. During every upstream update, inspect new/changed workflows,
-retain the fork guards, and disable newly inherited publishers before pushing any
-update branch. Repository settings are external to Git and must be reapplied when
+**Repository settings:** Actions is disabled for the fork. Inherited distribution,
+hygiene, and vouch workflows also remain individually disabled, so re-enabling
+validation later does not enable publishing. `main` is the default development
+branch with no required hosted status checks. Force pushes and branch deletion are
+blocked, including for administrators. Merge commits remain allowed for upstream
+updates. During every upstream update, inspect new/changed workflows and retain
+fork guards. Repository settings are external to Git and must be reapplied when
 creating another fork; the YAML guards are a second layer.
 
 Source development is ready to isolate; distributable foredeck-t3 app identity is not
