@@ -64,7 +64,7 @@ export function ProviderAuthenticationSection({
     provider.auth.status === "authenticated" ||
     (provider.auth.status === "unknown" && auth?.phase === "succeeded");
   const isDiscovering =
-    provider.driver === "acpRegistry" &&
+    (provider.driver === "acpRegistry" || provider.driver === "devin") &&
     !active &&
     !signedIn &&
     !query.error &&
@@ -73,7 +73,8 @@ export function ProviderAuthenticationSection({
     !active &&
     !signedIn &&
     (provider.setup?.canAuthenticate === false ||
-      (provider.driver === "acpRegistry" && auth?.methods?.length === 0));
+      ((provider.driver === "acpRegistry" || provider.driver === "devin") &&
+        auth?.methods?.length === 0));
   const accountDescription = active
     ? auth?.phase === "starting"
       ? "Starting sign-in…"

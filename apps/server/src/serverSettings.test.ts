@@ -851,6 +851,26 @@ it.layer(NodeServices.layer)("server settings", (it) => {
     }).pipe(Effect.provide(layerServerSettings())),
   );
 
+  it.effect.each(["devin", "devinCloud"])(
+    "replaces session-only %s text generation selections with a usable provider",
+    (driver) =>
+      Effect.gen(function* () {
+        const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+        const instanceId = ProviderInstanceId.make("session_only");
+        const next = yield* serverSettings.updateSettings({
+          providerInstances: {
+            [instanceId]: { driver: ProviderDriverKind.make(driver), enabled: true, config: {} },
+          },
+          textGenerationModelSelection: { instanceId, model: "default" },
+        });
+        assert.notEqual(next.textGenerationModelSelection.instanceId, instanceId);
+        assert.deepEqual(
+          (yield* serverSettings.getSettings).textGenerationModelSelection,
+          next.textGenerationModelSelection,
+        );
+      }).pipe(Effect.provide(layerServerSettings())),
+  );
+
   it.effect("preserves enabled text generation selections for non-built-in drivers", () =>
     Effect.gen(function* () {
       const serverSettings = yield* ServerSettingsModule.ServerSettingsService;

@@ -3727,6 +3727,38 @@ it.effect("records a finished run as failed when its ownership check cannot be r
   }),
 );
 
+it.effect.each(["completed", "interrupted", "cancelled", "failed"] as const)(
+  "finalizes %s runs according to their filesystem checkpoint capability",
+  (status) =>
+    Effect.gen(function* () {
+      for (const canCheckpointFilesystem of [false, true]) {
+        const { baselineCaptures, finalEvents, committedEffects } =
+          yield* captureRootRunTermination({
+            key: `checkpoint-capability:${canCheckpointFilesystem}:${status}`,
+            shouldFinalizeRun: () => Effect.succeed(true),
+            canCheckpointFilesystem,
+            events: (ids) => Stream.make(rootTerminalEvent(ids, status)),
+          });
+        assert.equal(baselineCaptures, canCheckpointFilesystem ? 1 : 0);
+        assert.deepEqual(
+          committedEffects.map((effect) => effect.request.type),
+          canCheckpointFilesystem && status !== "failed" ? ["checkpoint.capture"] : [],
+        );
+        const runEvent = finalEvents.find((event) => event.type === "run.updated");
+        const nodeEvent = finalEvents.find((event) => event.type === "node.updated");
+        assert.isDefined(runEvent);
+        assert.isDefined(nodeEvent);
+        if (runEvent?.type !== "run.updated" || nodeEvent?.type !== "node.updated") return;
+        const waitsForCheckpoint = canCheckpointFilesystem && status === "completed";
+        assert.equal(runEvent.payload.status, waitsForCheckpoint ? "waiting" : status);
+        assert.equal(nodeEvent.payload.status, waitsForCheckpoint ? "waiting" : status);
+        assert.equal(runEvent.payload.completedAt === null, waitsForCheckpoint);
+        assert.equal(nodeEvent.payload.completedAt === null, waitsForCheckpoint);
+        assert.equal(nodeEvent.payload.checkpointScopeId === null, !canCheckpointFilesystem);
+      }
+    }),
+);
+
 it.effect("does not refresh pull requests for auxiliary or stale provider terminals", () =>
   Effect.gen(function* () {
     const { observed } = yield* captureRootRunTermination({
@@ -3828,6 +3860,7 @@ function captureRootRunTermination(input: {
   >;
   readonly startTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"];
   readonly refreshAfterTurn?: Effect.Effect<void>;
+  readonly canCheckpointFilesystem?: boolean;
 }) {
   return Effect.gen(function* () {
     const ids = backgroundScenarioIds(input.key);
@@ -3843,11 +3876,14 @@ function captureRootRunTermination(input: {
     const observed = yield* Ref.make<ReadonlyArray<string>>([]);
     const submittedEffects = yield* Ref.make<ReadonlyArray<PendingOrchestrationEffectV2>>([]);
     const committedEffects = yield* Ref.make<ReadonlyArray<PendingOrchestrationEffectV2>>([]);
+    const baselineCaptures = yield* Ref.make(0);
+    const finalEvents = yield* Ref.make<ReadonlyArray<OrchestrationV2DomainEvent>>([]);
     const ingestionDone = yield* Deferred.make<void>();
     const captureTurnItem = (payload: OrchestrationV2TurnItem) =>
       Ref.update(writtenItems, (current) => [...current, payload]);
     const captureFinalEvents = (events: ReadonlyArray<OrchestrationV2DomainEvent>) =>
       Effect.gen(function* () {
+        yield* Ref.update(finalEvents, (current) => [...current, ...events]);
         for (const event of events) {
           if (event.type === "turn-item.updated") {
             yield* captureTurnItem(event.payload);
@@ -3861,7 +3897,9 @@ function captureRootRunTermination(input: {
       Layer.provide(
         Layer.mergeAll(
           McpAppModelContext.layerEmpty,
-          Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
+          Layer.mock(CheckpointService.CheckpointServiceV2)({
+            captureBaseline: () => Ref.update(baselineCaptures, (count) => count + 1),
+          }),
           Layer.mock(EventSink.EventSinkV2)({
             write: (payload) =>
               Effect.gen(function* () {
@@ -3914,6 +3952,13 @@ function captureRootRunTermination(input: {
         appThread: { id: ids.threadId } as OrchestrationV2AppThread,
         providerSessionId: ProviderSessionId.make(`session:${input.key}`),
         session: {
+          providerSession: {
+            capabilities: {
+              checkpointing: {
+                appCanCheckpointFilesystem: input.canCheckpointFilesystem ?? true,
+              },
+            },
+          },
           events: Stream.empty,
           subscribeEvents: Effect.succeed({
             events:
@@ -4003,6 +4048,8 @@ function captureRootRunTermination(input: {
       observed: yield* Ref.get(observed),
       submittedEffects: yield* Ref.get(submittedEffects),
       committedEffects: yield* Ref.get(committedEffects),
+      baselineCaptures: yield* Ref.get(baselineCaptures),
+      finalEvents: yield* Ref.get(finalEvents),
     };
   });
 }

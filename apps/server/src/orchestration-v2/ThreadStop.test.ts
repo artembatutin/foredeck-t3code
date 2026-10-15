@@ -49,23 +49,43 @@ const adapter = {
 } as ProviderAdapter.ProviderAdapterV2["Service"];
 const layerDatabase = SqlitePersistence.layerMemory;
 // No effect worker: runs stay unstarted, so Stop ends them without a provider.
-const layerTest = ThreadManagementService.layer.pipe(
-  Layer.provideMerge(
-    Layer.mergeAll(
-      layerDatabase,
-      ProjectionStore.layer.pipe(Layer.provide(layerDatabase)),
-      EventStore.layer.pipe(Layer.provide(layerDatabase)),
-      EffectOutbox.layer.pipe(Layer.provide(layerDatabase)),
-      ProviderReplayHarness.layerWithRegistry(
-        { name: "thread-stop" },
-        ProviderAdapterRegistry.layerFromAdapters([adapter]),
-        { databaseLayer: layerDatabase, runEffectWorker: false },
+const makeTestLayer = (canCheckpointFilesystem = true, supportsDetachedStop = false) =>
+  ThreadManagementService.layer.pipe(
+    Layer.provideMerge(
+      Layer.mergeAll(
+        layerDatabase,
+        ProjectionStore.layer.pipe(Layer.provide(layerDatabase)),
+        EventStore.layer.pipe(Layer.provide(layerDatabase)),
+        EffectOutbox.layer.pipe(Layer.provide(layerDatabase)),
+        ProviderReplayHarness.layerWithRegistry(
+          { name: "thread-stop" },
+          ProviderAdapterRegistry.layerFromAdapters([
+            {
+              ...adapter,
+              ...(supportsDetachedStop
+                ? {
+                    interruptDetachedTurn: () =>
+                      Effect.die("Stop must enqueue detached work before executing it"),
+                  }
+                : {}),
+              getCapabilities: () =>
+                Effect.succeed({
+                  ...CodexProviderCapabilitiesV2,
+                  checkpointing: {
+                    ...CodexProviderCapabilitiesV2.checkpointing,
+                    appCanCheckpointFilesystem: canCheckpointFilesystem,
+                  },
+                }),
+            },
+          ]),
+          { databaseLayer: layerDatabase, runEffectWorker: false },
+        ),
       ),
     ),
-  ),
-  Layer.provideMerge(ServerSettings.layerTest()),
-  Layer.provideMerge(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
-);
+    Layer.provideMerge(ServerSettings.layerTest()),
+    Layer.provideMerge(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+  );
+const layerTest = makeTestLayer();
 
 const encodeEffectRequest = Schema.encodeSync(Schema.fromJsonString(OrchestrationEffectRequestV2));
 
@@ -722,6 +742,139 @@ it.effect("thread.stop marks a turn it cannot interrupt so a late agent watch is
     assert.isTrue(Exit.isFailure(yield* Effect.exit(watch(threadId, 12))));
     assert.deepEqual(yield* threadState(threadId), { runs: ["running"], watched: [] });
   }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect.each([
+  { canCheckpointFilesystem: true, supportsDetachedStop: false },
+  { canCheckpointFilesystem: false, supportsDetachedStop: false },
+  { canCheckpointFilesystem: false, supportsDetachedStop: true },
+])(
+  "Stop without a live session respects checkpoint=$canCheckpointFilesystem, detached=$supportsDetachedStop",
+  ({ canCheckpointFilesystem, supportsDetachedStop }) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make(
+        `thread:stop-checkpoint:${canCheckpointFilesystem}:${supportsDetachedStop}`,
+      );
+      yield* createWatchingThread(threadId, 13);
+      yield* send(threadId, "work", "start_immediately");
+      const before = yield* orchestrator.getThreadProjection(threadId);
+      const run = before.runs[0]!;
+      const attempt = before.attempts.find((candidate) => candidate.id === run.activeAttemptId)!;
+      const node = before.nodes.find((candidate) => candidate.id === run.rootNodeId)!;
+      const turnId = ProviderTurnId.make(`turn:stop-checkpoint:${canCheckpointFilesystem}`);
+      const now = yield* DateTime.now;
+      assert.isNotNull(node.checkpointScopeId);
+      for (const event of [
+        {
+          id: EventId.make(`event:${threadId}:run`),
+          type: "run.updated" as const,
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: { ...run, status: "running" as const, startedAt: now },
+        },
+        {
+          id: EventId.make(`event:${threadId}:attempt`),
+          type: "run-attempt.updated" as const,
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            ...attempt,
+            status: "running" as const,
+            providerTurnId: turnId,
+            startedAt: now,
+          },
+        },
+        {
+          id: EventId.make(`event:${threadId}:node`),
+          type: "node.updated" as const,
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: { ...node, status: "running" as const, providerTurnId: turnId, startedAt: now },
+        },
+        {
+          id: EventId.make(`event:${threadId}:turn`),
+          type: "provider-turn.updated" as const,
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: turnId,
+            providerThreadId: run.providerThreadId!,
+            nodeId: node.id,
+            runAttemptId: attempt.id,
+            nativeTurnRef: null,
+            ordinal: 1,
+            status: "running" as const,
+            startedAt: now,
+            completedAt: null,
+          },
+        },
+      ])
+        yield* projections.apply(event);
+
+      yield* orchestrator.dispatch({
+        type: "run.interrupt",
+        commandId: CommandId.make(`stop:${threadId}`),
+        threadId,
+        runId: run.id,
+      });
+
+      const stopped = yield* orchestrator.getThreadProjection(threadId);
+      const expectedStatus = supportsDetachedStop ? "running" : "interrupted";
+      assert.equal(
+        stopped.runs.find((candidate) => candidate.id === run.id)?.status,
+        expectedStatus,
+      );
+      assert.equal(
+        stopped.attempts.find((candidate) => candidate.id === attempt.id)?.status,
+        expectedStatus,
+      );
+      assert.equal(
+        stopped.providerTurns.find((candidate) => candidate.id === turnId)?.status,
+        expectedStatus,
+      );
+      const effects = yield* sql<{ readonly effect_type: string }>`
+        SELECT effect_type FROM orchestration_v2_effect_outbox
+        WHERE thread_id = ${threadId} AND effect_type = 'checkpoint.capture'
+      `;
+      assert.equal(effects.length, canCheckpointFilesystem ? 1 : 0);
+      const interrupts = yield* sql<{ readonly payload_json: string }>`
+        SELECT payload_json FROM orchestration_v2_effect_outbox
+        WHERE thread_id = ${threadId} AND effect_type = 'provider-turn.interrupt'
+      `;
+      assert.equal(interrupts.length, supportsDetachedStop ? 1 : 0);
+      if (supportsDetachedStop) {
+        assert.deepEqual(JSON.parse(interrupts[0]!.payload_json), {
+          type: "provider-turn.interrupt",
+          providerSessionId: before.providerThreads.find(
+            (thread) => thread.id === run.providerThreadId,
+          )!.providerSessionId,
+          providerThreadId: run.providerThreadId,
+          providerTurnId: turnId,
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.background-work.settle",
+          commandId: CommandId.make(`confirmed-stop:${threadId}`),
+          threadId,
+          providerThreadId: run.providerThreadId!,
+          providerTurnId: turnId,
+        });
+        const confirmed = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(
+          confirmed.runs.find((candidate) => candidate.id === run.id)?.status,
+          "interrupted",
+        );
+        assert.equal(
+          confirmed.attempts.find((candidate) => candidate.id === attempt.id)?.status,
+          "interrupted",
+        );
+      }
+    }).pipe(Effect.provide(makeTestLayer(canCheckpointFilesystem, supportsDetachedStop))),
 );
 
 it.effect.each(["missing session", "completed", "failed", "cancelled"] as const)(

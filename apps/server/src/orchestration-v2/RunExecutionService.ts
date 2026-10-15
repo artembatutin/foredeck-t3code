@@ -586,6 +586,7 @@ export const layer: Layer.Layer<
       readonly checkpointScope: OrchestrationV2CheckpointScope;
       readonly providerThread: OrchestrationV2ProviderThread;
       readonly attempt: OrchestrationV2RunAttempt;
+      readonly canCheckpointFilesystem: boolean;
       readonly shouldFinalizeRun?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
       readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
       readonly openRunOwnedSubagents?: OpenRunOwnedSubagentProjection;
@@ -659,8 +660,9 @@ export const layer: Layer.Layer<
                 allocateEventId,
               })
             : [];
-        const persistedStatus =
-          input.terminal.status === "completed" ? "waiting" : input.terminal.status;
+        const waitsForCheckpoint =
+          input.canCheckpointFilesystem && input.terminal.status === "completed";
+        const persistedStatus = waitsForCheckpoint ? "waiting" : input.terminal.status;
         // Completion cohorts are advanced by Orchestrator while a provider
         // turn is in flight. Do not replay the run snapshot captured at start
         // over a newer acknowledgement, successor, or Stop barrier.
@@ -669,13 +671,13 @@ export const layer: Layer.Layer<
         const finalizedRun: OrchestrationV2Run = {
           ...runWithoutDelegatedCompletion,
           status: persistedStatus,
-          completedAt: input.terminal.status === "completed" ? null : completedAt,
+          completedAt: waitsForCheckpoint ? null : completedAt,
         };
         const finalizedRootNode: OrchestrationV2ExecutionNode = {
           ...input.rootNode,
           status: persistedStatus,
-          completedAt: input.terminal.status === "completed" ? null : completedAt,
-          checkpointScopeId: input.checkpointScope.id,
+          completedAt: waitsForCheckpoint ? null : completedAt,
+          checkpointScopeId: input.canCheckpointFilesystem ? input.checkpointScope.id : null,
         };
         const finalizedProviderThread: OrchestrationV2ProviderThread = {
           ...input.providerThread,
@@ -693,9 +695,10 @@ export const layer: Layer.Layer<
         // ahead of any later run's start on this thread's effect lane.
         const finalization = {
           effects:
-            input.terminal.status === "completed" ||
-            input.terminal.status === "interrupted" ||
-            input.terminal.status === "cancelled"
+            input.canCheckpointFilesystem &&
+            (input.terminal.status === "completed" ||
+              input.terminal.status === "interrupted" ||
+              input.terminal.status === "cancelled")
               ? [
                   {
                     id: `effect:checkpoint.capture:${input.run.id}`,
@@ -822,6 +825,9 @@ export const layer: Layer.Layer<
     return RunExecutionServiceV2.of({
       startRootRun: (input) =>
         Effect.gen(function* () {
+          const canCheckpointFilesystem =
+            input.session.providerSession?.capabilities.checkpointing.appCanCheckpointFilesystem !==
+            false;
           // Startup failure and stream shutdown can report the same attempt.
           const refreshAfterTurn = yield* Effect.cached(
             finalizationObserver.refreshAfterTurn(input.appThread.projectId).pipe(
@@ -861,21 +867,23 @@ export const layer: Layer.Layer<
                     .responseStreamingMode,
               ),
             );
-            yield* checkpointService
-              .captureBaseline({
-                scope: input.checkpointScope,
-                ordinalWithinScope: Math.max(0, input.run.ordinal - 1),
-              })
-              .pipe(
-                Effect.catchCause((cause) =>
-                  Cause.hasInterruptsOnly(cause)
-                    ? Effect.failCause(cause)
-                    : Effect.logWarning(
-                        "orchestration V2 checkpoint baseline capture failed; starting provider without a baseline",
-                        { runId: input.run.id },
-                      ),
-                ),
-              );
+            if (canCheckpointFilesystem) {
+              yield* checkpointService
+                .captureBaseline({
+                  scope: input.checkpointScope,
+                  ordinalWithinScope: Math.max(0, input.run.ordinal - 1),
+                })
+                .pipe(
+                  Effect.catchCause((cause) =>
+                    Cause.hasInterruptsOnly(cause)
+                      ? Effect.failCause(cause)
+                      : Effect.logWarning(
+                          "orchestration V2 checkpoint baseline capture failed; starting provider without a baseline",
+                          { runId: input.run.id },
+                        ),
+                  ),
+                );
+            }
             if (
               input.shouldStartProviderTurn !== undefined &&
               !(yield* input.shouldStartProviderTurn())
@@ -899,6 +907,7 @@ export const layer: Layer.Layer<
                   checkpointScope: input.checkpointScope,
                   providerThread: input.providerThread,
                   attempt: input.attempt,
+                  canCheckpointFilesystem,
                   terminal: makeFailedTerminalEvent(
                     makeProviderFailure({
                       cause: Cause.squash(cause),
@@ -974,6 +983,7 @@ export const layer: Layer.Layer<
             }),
           );
           const rootTerminalSeen = yield* Ref.make(false);
+          const pendingAdmissionStopScheduled = yield* Ref.make(false);
           const rootRunFinalized = yield* Ref.make(false);
           const providerThreadOwnerLost = yield* Ref.make(false);
           const activeChildProviderTurns = yield* Ref.make<ReadonlySet<ProviderTurnId>>(new Set());
@@ -995,6 +1005,7 @@ export const layer: Layer.Layer<
                 checkpointScope: input.checkpointScope,
                 providerThread,
                 attempt: input.attempt,
+                canCheckpointFilesystem,
                 ...(input.shouldFinalizeRun === undefined
                   ? {}
                   : {
@@ -1293,6 +1304,40 @@ export const layer: Layer.Layer<
                   }
                 }
                 if (
+                  !canCheckpointFilesystem &&
+                  storedEventCount > 0 &&
+                  event.type === "provider_turn.updated" &&
+                  event.providerTurn.status === "running" &&
+                  event.providerTurn.runAttemptId === input.attempt.id &&
+                  event.providerTurn.providerThreadId === input.providerThread.id &&
+                  input.hasUnpairedRunInterruptRequest !== undefined &&
+                  !(yield* Ref.get(pendingAdmissionStopScheduled)) &&
+                  (yield* input.hasUnpairedRunInterruptRequest()) &&
+                  (yield* input.shouldFinalizeRun?.() ?? Effect.succeed(true))
+                ) {
+                  yield* Ref.set(pendingAdmissionStopScheduled, true);
+                  // The pending Stop now has a durable native target. Use the
+                  // normal interrupt lane so ownership checks and retries apply.
+                  yield* eventSink.writeWithEffects({
+                    events: [],
+                    effects: [
+                      {
+                        id: `effect:admission-stop:${input.run.id}:${input.attempt.id}`,
+                        commandId: CommandId.make(
+                          `command:admission-stop:${input.run.id}:${input.attempt.id}`,
+                        ),
+                        threadId: input.run.threadId,
+                        request: {
+                          type: "provider-turn.interrupt",
+                          providerSessionId: input.providerSessionId,
+                          providerThreadId: input.providerThread.id,
+                          providerTurnId: event.providerTurn.id,
+                        },
+                      },
+                    ],
+                  });
+                }
+                if (
                   event.type === "turn_item.updated" &&
                   event.turnItem.providerTurnId ===
                     (yield* Ref.get(eventRouting)).rootProviderTurnId
@@ -1343,6 +1388,7 @@ export const layer: Layer.Layer<
                                         checkpointScope: input.checkpointScope,
                                         providerThread,
                                         attempt: input.attempt,
+                                        canCheckpointFilesystem,
                                         // The failure may be the ownership
                                         // read itself, so check in the write.
                                         writeIfRunCurrent: {
@@ -1470,6 +1516,7 @@ export const layer: Layer.Layer<
                             checkpointScope: input.checkpointScope,
                             providerThread,
                             attempt: input.attempt,
+                            canCheckpointFilesystem,
                             // Checked in the write transaction, not by another
                             // read that can fail like the one before the start.
                             writeIfRunCurrent: {

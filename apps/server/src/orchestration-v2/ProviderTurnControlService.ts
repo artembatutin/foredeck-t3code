@@ -2,6 +2,7 @@ import { projectComposerContextForProvider } from "@t3tools/shared/composerConte
 import {
   MessageId,
   type NodeId,
+  type OrchestrationV2ProviderTurn,
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
@@ -16,8 +17,9 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
-import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 
 const yieldToRuntime = Effect.yieldNow.pipe(
@@ -84,12 +86,63 @@ export class ProviderTurnControlServiceV2 extends Context.Service<
 export const layer: Layer.Layer<
   ProviderTurnControlServiceV2,
   never,
-  ProjectionStore.ProjectionStoreV2 | ProviderSessionManager.ProviderSessionManagerV2
+  | ProjectionStore.ProjectionStoreV2
+  | ProviderSessionManager.ProviderSessionManagerV2
+  | ProviderAdapterRegistry.ProviderAdapterRegistryV2
 > = Layer.effect(
   ProviderTurnControlServiceV2,
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    const adapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
+
+    const interruptDetachedTurn = Effect.fnUntraced(function* (
+      threadId: ThreadId,
+      providerThread: ProviderAdapter.ProviderAdapterV2InterruptInput["providerThread"],
+      providerTurn: OrchestrationV2ProviderTurn,
+      recordedSessionId: ProviderSessionId | null | undefined,
+    ) {
+      const adapter = yield* adapters.get(providerThread.providerInstanceId);
+      if (adapter.driver !== providerThread.driver) {
+        return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+          driver: providerThread.driver,
+          detail: "The recorded provider execution belongs to a different driver.",
+        });
+      }
+      if (adapter.interruptDetachedTurn !== undefined) {
+        const current = yield* projections.getProviderControlContext(threadId, {
+          providerThreadId: providerThread.id,
+          providerTurnId: providerTurn.id,
+          ...(providerTurn.runAttemptId === null ? {} : { attemptId: providerTurn.runAttemptId }),
+        });
+        const attempt = current.attempt;
+        const records =
+          attempt === undefined
+            ? undefined
+            : yield* projections.getThreadRecords(threadId, ["runs"], { runIds: [attempt.runId] });
+        const run = records?.runs.find((candidate) => candidate.id === attempt?.runId);
+        if (
+          current.providerThread === undefined ||
+          current.providerThread.providerSessionId !== recordedSessionId ||
+          current.providerThread.nativeThreadRef?.nativeId !==
+            providerThread.nativeThreadRef?.nativeId ||
+          attempt === undefined ||
+          run === undefined ||
+          run.providerThreadId !== providerThread.id ||
+          run.activeAttemptId !== attempt.id ||
+          (current.providerThread.lastRunOrdinal !== null &&
+            current.providerThread.lastRunOrdinal > run.ordinal) ||
+          (attempt.nativeThreadId !== undefined &&
+            attempt.nativeThreadId !== providerThread.nativeThreadRef?.nativeId)
+        ) {
+          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            driver: providerThread.driver,
+            detail: "A later provider execution replaced this detached Stop target.",
+          });
+        }
+        yield* adapter.interruptDetachedTurn({ providerThread, providerTurnId: providerTurn.id });
+      }
+    });
 
     const load = (input: {
       readonly threadId: ThreadId;
@@ -148,21 +201,9 @@ export const layer: Layer.Layer<
         }
         const session = yield* sessions.get(input.providerSessionId);
         if (Option.isNone(session)) {
-          // Interrupt/restart against a already-released session must not fail
-          // the durable effect (and retry 5x). The turn may still look running
-          // in projection until recovery/finalization; there is no live adapter
-          // to interrupt.
+          // Remote work can survive release. The caller uses the recorded
+          // execution target to stop it through the provider's detached hook.
           if (input.operation === "interrupt" || input.operation === "restart") {
-            yield* Effect.logWarning(
-              "Provider interrupt/restart found no live session; treating as already stopped",
-              {
-                threadId: input.threadId,
-                operation: input.operation,
-                providerSessionId: input.providerSessionId,
-                providerTurnId: input.providerTurnId,
-                providerTurnStatus: providerTurn.status,
-              },
-            );
             return {
               context,
               providerThread: interruptProviderThread,
@@ -196,6 +237,12 @@ export const layer: Layer.Layer<
                 cause: "No live provider session can confirm this subagent's outcome.",
               });
             }
+            yield* interruptDetachedTurn(
+              input.threadId,
+              loaded.providerThread,
+              loaded.providerTurn,
+              loaded.context.providerThread?.providerSessionId,
+            );
             return;
           }
           if (input.subagent !== undefined) {
@@ -260,12 +307,17 @@ export const layer: Layer.Layer<
         Effect.gen(function* () {
           const loaded = yield* load({ ...input, operation: "restart" });
           if (Option.isNone(loaded.session)) {
-            // No live adapter: nothing can emit a terminal provider-turn update
-            // from interrupt. Do not poll for projection terminalization or the
-            // restart effect stalls; let detach/start proceed.
+            yield* interruptDetachedTurn(
+              input.threadId,
+              loaded.providerThread,
+              loaded.providerTurn,
+              loaded.context.providerThread?.providerSessionId,
+            );
+            // No live runtime can emit a terminal update after the detached
+            // hook succeeds. Let detach/start proceed without polling it.
             if (loaded.providerTurn.status === "running") {
               yield* Effect.logWarning(
-                "Provider restart interrupt skipped; no live session for a still-projected running turn",
+                "Provider restart proceeding without a live terminal event stream",
                 {
                   threadId: input.threadId,
                   providerSessionId: input.providerSessionId,

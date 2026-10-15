@@ -459,14 +459,13 @@ function migrateLegacyProviderSettings(
   };
 }
 
-const ACP_REGISTRY_DRIVER = ProviderDriverKind.make("acpRegistry");
-
-/** ACP Registry instances reject every application text-generation operation. */
+/** These session-only drivers do not provide application text generation. */
 function selectionSupportsTextGeneration(
   settings: ServerSettings,
   selection: ModelSelection,
 ): boolean {
-  return settings.providerInstances[selection.instanceId]?.driver !== ACP_REGISTRY_DRIVER;
+  const driver = settings.providerInstances[selection.instanceId]?.driver;
+  return driver !== "acpRegistry" && driver !== "devin" && driver !== "devinCloud";
 }
 
 function resolveTextGenerationProvider(settings: ServerSettings): ServerSettings {

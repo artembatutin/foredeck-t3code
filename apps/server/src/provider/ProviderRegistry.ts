@@ -209,7 +209,7 @@ export function upsertProviderWorkspaceSnapshot(
 }
 
 const shouldRetainMissingProviderModels = (provider: ServerProvider): boolean => {
-  if (provider.driver === ProviderDriverKind.make("acpRegistry")) {
+  if (provider.driver === "acpRegistry" || provider.driver === "devin") {
     // ACP Registry discovery probes return the agent's complete inventory, so
     // a completed probe (ready and authenticated) replaces the model list —
     // otherwise agents that rename or collapse models leave stale entries

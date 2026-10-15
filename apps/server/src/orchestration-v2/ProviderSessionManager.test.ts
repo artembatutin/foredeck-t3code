@@ -5,11 +5,13 @@ import { AgentScope } from "@t3tools/shared/AgentScope";
 import {
   EnvironmentId,
   type ModelSelection,
+  type OrchestrationV2ConversationMessage,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2TurnItem,
   type Project,
   ProjectId,
   ProviderDriverKind,
@@ -76,6 +78,27 @@ const layerFailingReleaseEventSink = Layer.effect(
     });
   }),
 ).pipe(Layer.provide(layerTestEventSink));
+
+const layerFailingHistoryEventSink = (failing: Ref.Ref<boolean>) =>
+  Layer.effect(
+    EventSink.EventSinkV2,
+    Effect.gen(function* () {
+      const delegate = yield* EventSink.EventSinkV2;
+      return EventSink.EventSinkV2.of({
+        ...delegate,
+        write: (input) =>
+          Effect.gen(function* () {
+            if (
+              input.events.some((event) => event.type === "message.updated") &&
+              (yield* Ref.get(failing))
+            ) {
+              return yield* new EventSink.EventSinkWriteError({ eventCount: input.events.length });
+            }
+            return yield* delegate.write(input);
+          }),
+      });
+    }),
+  ).pipe(Layer.provide(layerTestEventSink));
 
 interface FlakyReleaseWrites {
   /** Which release writes fail right now. */
@@ -343,6 +366,12 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly spawnBeforeOpen?: boolean;
     /** Completed when a hanging scope close reaches its wedged finalizer. */
     readonly scopeCloseReached?: Deferred.Deferred<void>;
+    readonly runtimeOverrides?: Partial<
+      Pick<
+        ProviderAdapter.ProviderAdapterV2SessionRuntime,
+        "ensureThread" | "resumeThread" | "readThreadHistory"
+      >
+    >;
   } = {},
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
@@ -458,6 +487,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
           readThreadSnapshot: () => unimplemented("readThreadSnapshot unused in test"),
           rollbackThread: () => unimplemented("rollbackThread unused in test"),
           forkThread: () => unimplemented("forkThread unused in test"),
+          ...options.runtimeOverrides,
         } satisfies ProviderAdapter.ProviderAdapterV2SessionRuntime;
       }),
   });
@@ -496,17 +526,26 @@ function layerTest(input: {
   readonly scopeCloseReached?: Deferred.Deferred<void>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
+  readonly runtimeOverrides?: Partial<
+    Pick<
+      ProviderAdapter.ProviderAdapterV2SessionRuntime,
+      "ensureThread" | "resumeThread" | "readThreadHistory"
+    >
+  >;
+  readonly failHistoryWrites?: Ref.Ref<boolean>;
 }) {
   const layerConfiguredEventSink =
-    input.flakyReleaseWrites !== undefined
-      ? layerFlakyReleaseEventSink(input.flakyReleaseWrites)
-      : input.pauseAttachWrite !== undefined
-        ? layerPausingAttachEventSink(input.pauseAttachWrite)
-        : input.beforeUnchangedWrite !== undefined
-          ? layerBeforeUnchangedWriteEventSink(input.beforeUnchangedWrite)
-          : input.failReleaseEventWrites
-            ? layerFailingReleaseEventSink
-            : layerTestEventSink;
+    input.failHistoryWrites !== undefined
+      ? layerFailingHistoryEventSink(input.failHistoryWrites)
+      : input.flakyReleaseWrites !== undefined
+        ? layerFlakyReleaseEventSink(input.flakyReleaseWrites)
+        : input.pauseAttachWrite !== undefined
+          ? layerPausingAttachEventSink(input.pauseAttachWrite)
+          : input.beforeUnchangedWrite !== undefined
+            ? layerBeforeUnchangedWriteEventSink(input.beforeUnchangedWrite)
+            : input.failReleaseEventWrites
+              ? layerFailingReleaseEventSink
+              : layerTestEventSink;
   const layerRegistry = Layer.unwrap(
     makeProviderAdapter(input.state, {
       failEventStream: input.failEventStream ?? false,
@@ -531,6 +570,7 @@ function layerTest(input: {
       ...(input.scopeCloseReached === undefined
         ? {}
         : { scopeCloseReached: input.scopeCloseReached }),
+      ...(input.runtimeOverrides === undefined ? {} : { runtimeOverrides: input.runtimeOverrides }),
     }).pipe(Effect.map(ProviderAdapterRegistry.layerSingle)),
   );
   const layerConfiguredMcpRegistry =
@@ -824,6 +864,260 @@ function makePendingRuntimeRequestEvents(input: {
     return { events, providerEvents, requestId, nodeId };
   });
 }
+
+it.effect.each([
+  "ensure",
+  "resume",
+  "retry failed write",
+  "foreign message",
+  "foreign item",
+] as const)("ProviderSessionManagerV2 persists setup history before subscribers: %s", (scenario) =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const failing = yield* Ref.make(false);
+    const stagedThread = yield* Ref.make<OrchestrationV2ProviderThread | null>(null);
+    const history = yield* Ref.make<
+      ReadonlyArray<
+        Extract<
+          ProviderAdapter.ProviderAdapterV2Event,
+          { readonly type: "message.updated" | "turn_item.updated" }
+        >
+      >
+    >([]);
+    const reads = yield* Ref.make(0);
+    const attach = Ref.get(stagedThread).pipe(
+      Effect.flatMap((thread) =>
+        thread ? Effect.succeed(thread) : unimplemented("No staged history thread"),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const threadId = yield* idAllocator.allocate.thread({
+        fixtureName: `setup-history:${scenario}`,
+      });
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      const priorRunId = idAllocator.derive.run({ threadId, ordinal: 1 });
+      const providerThread = {
+        ...makeProviderThread({ idAllocator, threadId, providerSessionId, now }),
+        nativeConversationHeadRef: {
+          driver: CODEX_DRIVER,
+          nativeId: "prior",
+          strength: "strong" as const,
+        },
+      };
+      const message = (
+        nativeId: string,
+        runId: typeof priorRunId | null,
+      ): OrchestrationV2ConversationMessage => ({
+        id: idAllocator.derive.messageFromProviderItem({
+          driver: CODEX_DRIVER,
+          nativeItemId: nativeId,
+        }),
+        threadId,
+        runId,
+        nodeId: null,
+        role: "assistant",
+        text: nativeId,
+        attachments: [],
+        streaming: false,
+        createdBy: "agent",
+        creationSource: "provider",
+        createdAt: now,
+        updatedAt: now,
+      });
+      const item = (
+        entry: OrchestrationV2ConversationMessage,
+      ): Extract<OrchestrationV2TurnItem, { readonly type: "assistant_message" }> => ({
+        id: idAllocator.derive.turnItemFromProviderItem({
+          driver: CODEX_DRIVER,
+          nativeItemId: entry.text,
+        }),
+        threadId,
+        runId: entry.runId,
+        nodeId: null,
+        providerThreadId: providerThread.id,
+        providerTurnId: null,
+        nativeItemRef: { driver: CODEX_DRIVER, nativeId: entry.text, strength: "strong" },
+        parentItemId: null,
+        ordinal: 1,
+        status: "completed",
+        title: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "assistant_message",
+        messageId: entry.id,
+        text: entry.text,
+        streaming: false,
+      });
+      const priorMessage = message("prior", priorRunId);
+      const priorItem = item(priorMessage);
+      const offlineMessage = message("offline", null);
+      const offlineItem = item(offlineMessage);
+      yield* eventSink.write({
+        events: [
+          yield* makeThreadCreatedEvent({ idAllocator, threadId, now }),
+          {
+            id: yield* idAllocator.allocate.event({ threadId }),
+            type: "run.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: priorRunId,
+              threadId,
+              ordinal: 1,
+              providerInstanceId: modelSelection.instanceId,
+              modelSelection,
+              providerThreadId: providerThread.id,
+              userMessageId: priorMessage.id,
+              rootNodeId: null,
+              activeAttemptId: null,
+              status: "completed",
+              requestedAt: now,
+              startedAt: now,
+              completedAt: now,
+              checkpointId: null,
+              contextHandoffId: null,
+            },
+          },
+          {
+            id: yield* idAllocator.allocate.event({ threadId }),
+            type: "provider-thread.updated",
+            threadId,
+            occurredAt: now,
+            payload: providerThread,
+          },
+          {
+            id: yield* idAllocator.allocate.event({ threadId }),
+            type: "message.updated",
+            threadId,
+            occurredAt: now,
+            payload: priorMessage,
+          },
+          {
+            id: yield* idAllocator.allocate.event({ threadId }),
+            type: "turn-item.updated",
+            threadId,
+            occurredAt: now,
+            payload: priorItem,
+          },
+        ],
+      });
+      yield* Ref.set(stagedThread, {
+        ...providerThread,
+        nativeConversationHeadRef: {
+          driver: CODEX_DRIVER,
+          nativeId: "offline",
+          strength: "strong",
+        },
+      });
+      yield* Ref.set(history, [
+        {
+          type: "message.updated",
+          driver: CODEX_DRIVER,
+          message:
+            scenario === "foreign message"
+              ? { ...offlineMessage, threadId: ThreadId.make("foreign") }
+              : offlineMessage,
+        },
+        {
+          type: "turn_item.updated",
+          driver: CODEX_DRIVER,
+          turnItem:
+            scenario === "foreign item"
+              ? {
+                  ...offlineItem,
+                  providerThreadId: idAllocator.derive.providerThread({
+                    driver: CODEX_DRIVER,
+                    nativeThreadId: "foreign",
+                  }),
+                }
+              : offlineItem,
+        },
+      ]);
+      const runtime = yield* manager.open({
+        threadId,
+        providerSessionId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const load =
+        scenario === "ensure"
+          ? runtime.ensureThread({
+              threadId,
+              modelSelection,
+              runtimePolicy,
+              existingProviderThread: providerThread,
+            })
+          : runtime.resumeThread({ providerThread, modelSelection, runtimePolicy });
+      if (scenario === "retry failed write") yield* Ref.set(failing, true);
+      const result = yield* load.pipe(Effect.result);
+      if (
+        scenario === "retry failed write" ||
+        scenario === "foreign message" ||
+        scenario === "foreign item"
+      ) {
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure")
+          assert.instanceOf(result.failure, ProviderAdapter.ProviderAdapterEventStreamError);
+        const unchanged = yield* projections.getThreadProjection(threadId);
+        assert.lengthOf(unchanged.messages, 1);
+        assert.lengthOf(unchanged.turnItems, 1);
+        assert.equal(
+          unchanged.providerThreads.find((thread) => thread.id === providerThread.id)
+            ?.nativeConversationHeadRef?.nativeId,
+          "prior",
+        );
+        if (scenario !== "retry failed write") return;
+        yield* Ref.set(failing, false);
+        yield* load;
+      } else assert.equal(result._tag, "Success");
+      const stored = yield* projections.getThreadProjection(threadId);
+      assert.lengthOf(stored.messages, 2);
+      assert.lengthOf(stored.turnItems, 2);
+      assert.equal(
+        stored.messages.find((entry) => entry.id === priorMessage.id)?.runId,
+        priorRunId,
+      );
+      assert.equal(stored.turnItems.find((entry) => entry.id === priorItem.id)?.runId, priorRunId);
+      assert.equal(
+        stored.messages.find((entry) => entry.id === offlineMessage.id)?.text,
+        "offline",
+      );
+      const loadedThread = stored.providerThreads.find(
+        (thread) => thread.id === providerThread.id,
+      )!;
+      assert.equal(loadedThread.nativeConversationHeadRef?.nativeId, "offline");
+      const readCount = yield* Ref.get(reads);
+      yield* runtime.resumeThread({ providerThread: loadedThread, modelSelection, runtimePolicy });
+      assert.equal(yield* Ref.get(reads), readCount);
+      const repeated = yield* projections.getThreadProjection(threadId);
+      assert.lengthOf(repeated.messages, 2);
+      assert.lengthOf(repeated.turnItems, 2);
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 60_000,
+          failHistoryWrites: failing,
+          runtimeOverrides: {
+            ensureThread: () => attach,
+            resumeThread: () => attach,
+            readThreadHistory: () =>
+              Ref.update(reads, (count) => count + 1).pipe(Effect.andThen(Ref.get(history))),
+          },
+        }),
+      ),
+    );
+  }),
+);
 
 it.effect("ProviderSessionManagerV2 opens independent sessions concurrently", () =>
   Effect.gen(function* () {

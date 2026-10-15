@@ -1805,6 +1805,66 @@ export const layerWithOptions = (
       ): ProviderAdapter.ProviderAdapterV2SessionRuntime => {
         const providerSessionId = runtime.providerSessionId;
         const subscribeEvents = makeEventSubscription(eventSubscribers);
+        const persistThreadHistory = (
+          providerThread: OrchestrationV2ProviderThread,
+          threadId: ThreadId | null | undefined,
+        ) =>
+          Effect.gen(function* () {
+            if (runtime.readThreadHistory === undefined) return;
+            const targetThreadId = threadId ?? providerThread.appThreadId;
+            if (
+              targetThreadId == null ||
+              providerThread.appThreadId !== targetThreadId ||
+              providerThread.providerSessionId !== providerSessionId ||
+              providerThread.providerInstanceId !== runtime.instanceId ||
+              providerThread.driver !== runtime.driver
+            )
+              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                driver: runtime.driver,
+                detail: "Setup history does not belong to the attached provider thread.",
+              });
+            const history = yield* runtime.readThreadHistory({ providerThread });
+            const events: Array<OrchestrationV2DomainEvent> = [];
+            for (const event of history) {
+              if (
+                event.driver !== runtime.driver ||
+                (event.type === "message.updated"
+                  ? event.message.threadId !== targetThreadId
+                  : event.turnItem.threadId !== targetThreadId ||
+                    event.turnItem.providerThreadId !== providerThread.id)
+              )
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: runtime.driver,
+                  detail: "Setup history contains an event for another provider thread.",
+                });
+              events.push(
+                ...(yield* providerEventIngestor.normalize({
+                  providerSessionId,
+                  providerInstanceId: runtime.instanceId,
+                  threadId: targetThreadId,
+                  event,
+                })),
+              );
+            }
+            events.push(
+              ...(yield* providerEventIngestor.normalize({
+                providerSessionId,
+                providerInstanceId: runtime.instanceId,
+                threadId: targetThreadId,
+                event: { type: "provider_thread.updated", driver: runtime.driver, providerThread },
+              })),
+            );
+            yield* eventSink.write({ events });
+          }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterEventStreamError({
+                  driver: runtime.driver,
+                  providerSessionId,
+                  cause,
+                }),
+            ),
+          );
         // Every provider's turn operations pass through here, so this is where they are
         // counted. Only turn starts are timed: until the provider accepts the turn.
         const turnMetrics = (operation: string, model?: string) =>
@@ -1833,6 +1893,7 @@ export const layerWithOptions = (
               }),
             ).pipe(
               Effect.andThen(runtime.ensureThread(input)),
+              Effect.tap((providerThread) => persistThreadHistory(providerThread, input.threadId)),
               Effect.tap((providerThread) =>
                 markProviderThreadLoaded({
                   providerSessionId,
@@ -1848,7 +1909,13 @@ export const layerWithOptions = (
           resumeThread: (input) => {
             const threadId = input.threadId ?? input.providerThread.appThreadId;
             if (threadId === null || threadId === undefined) {
-              return runtime.resumeThread(input);
+              return runtime
+                .resumeThread(input)
+                .pipe(
+                  Effect.tap((providerThread) =>
+                    persistThreadHistory(providerThread, providerThread.appThreadId),
+                  ),
+                );
             }
             const providerThreadKey = providerThreadLoadKey({
               providerThread: input.providerThread,
@@ -1876,7 +1943,15 @@ export const layerWithOptions = (
                 isProviderThreadLoaded({ providerSessionId, threadId, providerThreadKey }),
               ),
               Effect.flatMap((loaded) =>
-                loaded ? Effect.succeed(input.providerThread) : runtime.resumeThread(input),
+                loaded
+                  ? Effect.succeed(input.providerThread)
+                  : runtime
+                      .resumeThread(input)
+                      .pipe(
+                        Effect.tap((providerThread) =>
+                          persistThreadHistory(providerThread, threadId),
+                        ),
+                      ),
               ),
               Effect.tap((providerThread) =>
                 markProviderThreadLoaded({

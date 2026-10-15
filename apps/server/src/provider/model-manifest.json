@@ -1,7 +1,14 @@
 {
   "version": 1,
-  "updatedAt": "2026-10-09T23:31:10Z",
+  "updatedAt": "2026-10-15T05:49:14Z",
   "compatibility": [
+    {
+      "driver": "devin",
+      "t3CodeRange": ">=0.0.45",
+      "recommendedRange": "=3000.6.14",
+      "recommendedVersion": "3000.6.14",
+      "ranges": [{ "range": "=3000.6.14", "status": "supported" }]
+    },
     {
       "driver": "codex",
       "t3CodeRange": ">=0.0.44",

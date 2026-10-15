@@ -64,8 +64,10 @@ function makeThread(input: {
 // Grok's instance offers no Auto-accept edits; the Codex instance advertises no
 // restriction.
 const grokInstanceId = ProviderInstanceId.make("grok");
+const cloudInstanceId = ProviderInstanceId.make("cloud-runtime-policy");
 const supportedRuntimeModesByInstance = new Map<ProviderInstanceId, ReadonlyArray<RuntimeMode>>([
   [grokInstanceId, ["approval-required", "auto", "full-access"]],
+  [cloudInstanceId, ["full-access"]],
 ]);
 const providerInstanceFor = (instanceId: ProviderInstanceId) =>
   ({
@@ -152,5 +154,25 @@ it.layer(layerTest)("RuntimePolicyV2", (it) => {
       // A provider that advertises no restriction runs every mode as stored.
       assert.equal(yield* modeFor(providerInstanceId, "auto-accept-edits"), "auto-accept-edits");
     }),
+  );
+
+  it.effect(
+    "uses a provider's sole runtime mode for threads created with a different stored mode",
+    () =>
+      Effect.gen(function* () {
+        const policy = yield* RuntimePolicy.RuntimePolicyV2;
+        const now = yield* DateTime.now;
+        const selection = { instanceId: cloudInstanceId, model: "default" };
+        const resolved = yield* policy.resolve({
+          thread: {
+            ...makeThread({ now, worktreePath: null, runtimeMode: "approval-required" }),
+            providerInstanceId: cloudInstanceId,
+            modelSelection: selection,
+          },
+          modelSelection: selection,
+        });
+        assert.equal(resolved.runtimeMode, "full-access");
+        assert.equal(resolved.cwd, "/project-root");
+      }),
   );
 });

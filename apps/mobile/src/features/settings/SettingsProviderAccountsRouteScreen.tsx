@@ -44,7 +44,8 @@ export function SettingsProviderAccountsRouteScreen() {
                   .filter(
                     (provider) =>
                       provider.setup?.canAuthenticate ||
-                      (provider.driver === "acpRegistry" && provider.installed),
+                      ((provider.driver === "acpRegistry" || provider.driver === "devin") &&
+                        provider.installed),
                   )
                   .map((provider) => (
                     <ProviderAccount
@@ -56,7 +57,8 @@ export function SettingsProviderAccountsRouteScreen() {
                 {!environment.serverConfig.providers.some(
                   (provider) =>
                     provider.setup?.canAuthenticate ||
-                    (provider.driver === "acpRegistry" && provider.installed),
+                    ((provider.driver === "acpRegistry" || provider.driver === "devin") &&
+                      provider.installed),
                 ) ? (
                   <Text className="p-4 text-foreground-muted">
                     Configure a provider with in-app sign-in in web or desktop Settings.
@@ -103,7 +105,7 @@ function ProviderAccount({
     provider.auth.status === "authenticated" ||
     (provider.auth.status === "unknown" && state?.phase === "succeeded");
   const isDiscovering =
-    provider.driver === "acpRegistry" &&
+    (provider.driver === "acpRegistry" || provider.driver === "devin") &&
     !active &&
     !signedIn &&
     !auth.error &&
@@ -112,7 +114,8 @@ function ProviderAccount({
     !active &&
     !signedIn &&
     (provider.setup?.canAuthenticate === false ||
-      (provider.driver === "acpRegistry" && state?.methods?.length === 0));
+      ((provider.driver === "acpRegistry" || provider.driver === "devin") &&
+        state?.methods?.length === 0));
   const url =
     interaction?.type === "browser" || interaction?.type === "deviceCode"
       ? interaction.url

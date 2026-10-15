@@ -1026,7 +1026,8 @@ export function EnvironmentProviderSettings({
             !readOnly &&
             liveProvider &&
             (liveProvider.setup?.canAuthenticate ||
-              (liveProvider.driver === "acpRegistry" && liveProvider.installed)) ? (
+              ((liveProvider.driver === "acpRegistry" || liveProvider.driver === "devin") &&
+                liveProvider.installed)) ? (
             <ProviderAuthenticationSection
               key={`${environmentId}:${row.instanceId}`}
               environmentId={environmentId}

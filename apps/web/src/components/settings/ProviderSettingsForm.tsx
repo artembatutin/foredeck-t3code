@@ -254,6 +254,9 @@ function ProviderCommandArguments({
 function readProviderConfigString(config: unknown, key: string): string {
   if (config === null || typeof config !== "object") return "";
   const value = (config as Record<string, unknown>)[key];
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (Array.isArray(value) && value.every((item) => typeof item === "string"))
+    return value.join("\n");
   return typeof value === "string" ? value : "";
 }
 

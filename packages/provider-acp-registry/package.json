@@ -3,6 +3,18 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./fd/devin": {
+      "types": "./src/fd/devin/index.ts",
+      "import": "./src/fd/devin/index.ts"
+    },
+    "./fd/devin-cli-server": {
+      "types": "./src/fd/devin-cli-server/index.ts",
+      "import": "./src/fd/devin-cli-server/index.ts"
+    },
+    "./fd/devin-cloud": {
+      "types": "./src/fd/devin-cloud/index.ts",
+      "import": "./src/fd/devin-cloud/index.ts"
+    },
     "./client": {
       "types": "./src/client.ts",
       "import": "./src/client.ts"

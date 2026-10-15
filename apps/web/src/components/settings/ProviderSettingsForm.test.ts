@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import { ProviderDriverKind } from "@t3tools/contracts";
+import { DevinCloudSettings } from "@t3tools/provider-acp-registry/fd/devin-cloud";
+import * as Schema from "effect/Schema";
 
 import { providerClients } from "./providerDriverMeta";
 import {
@@ -7,7 +9,39 @@ import {
   nextProviderConfigWithFieldValue,
 } from "./ProviderSettingsForm";
 
+const decodeCloudSettings = Schema.decodeUnknownSync(DevinCloudSettings);
+
 describe("ProviderSettingsForm helpers", () => {
+  it("saves cloud form inputs as usable session settings", () => {
+    const definition = providerClients.get(ProviderDriverKind.make("devinCloud"))!;
+    const fields = deriveProviderSettingsFields(definition);
+    let config: Record<string, unknown> | undefined;
+    for (const [key, value] of [
+      ["organizationId", "org-example"],
+      ["repos", "owner/first\nowner/second"],
+      ["maxAcuLimit", "20"],
+      ["devinMode", "fast"],
+    ]) {
+      config = nextProviderConfigWithFieldValue(
+        config,
+        fields.find((field) => field.key === key)!,
+        value!,
+      );
+    }
+    expect(decodeCloudSettings(config)).toMatchObject({
+      organizationId: "org-example",
+      repos: ["owner/first", "owner/second"],
+      maxAcuLimit: 20,
+      devinMode: "fast",
+    });
+    config = nextProviderConfigWithFieldValue(
+      config,
+      fields.find((field) => field.key === "maxAcuLimit")!,
+      "",
+    );
+    expect(decodeCloudSettings(config).maxAcuLimit).toBe(10);
+  });
+
   it("derives visible provider config fields from the client definition schema", () => {
     const codex = providerClients.get(ProviderDriverKind.make("codex"));
 

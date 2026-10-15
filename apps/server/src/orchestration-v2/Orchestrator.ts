@@ -8764,7 +8764,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
       });
       const scopeId = rootNode.checkpointScopeId;
-      if (scopeId !== null) {
+      const canCheckpointFilesystem =
+        scopeId !== null &&
+        (yield* providerAdapters.get(run.providerInstanceId).pipe(
+          Effect.flatMap((adapter) => adapter.getCapabilities()),
+          Effect.map((capabilities) => capabilities.checkpointing.appCanCheckpointFilesystem),
+          Effect.orElseSucceed(() => false),
+        ));
+      if (scopeId !== null && canCheckpointFilesystem) {
         yield* Ref.update(input.effects, (effects) => [
           ...effects,
           {
@@ -9371,6 +9378,35 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         providerTurn === undefined &&
         (run.status === "preparing" || run.status === "starting" || run.status === "running")
       ) {
+        const adapter =
+          run.status === "running"
+            ? yield* providerAdapters.get(run.providerInstanceId).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestratorProviderAdapterError({
+                      commandId: command.commandId,
+                      providerInstanceId: run.providerInstanceId,
+                      cause,
+                    }),
+                ),
+              )
+            : undefined;
+        if (adapter?.interruptDetachedTurn !== undefined) {
+          // A remote request can already be accepted before its response gives
+          // us a native identity. Preserve admission so Stop can target it.
+          yield* emitEvent({
+            type: "turn-item.updated",
+            threadId: command.threadId,
+            runId: run.id,
+            nodeId: rootNode.id,
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+            payload: interruptRequestItem,
+          });
+          yield* stopRemainingWork();
+          yield* Ref.update(effects, (existing) => [...existing, ...otherProviderInterrupts]);
+          return undefined;
+        }
         const attempt = projection.attempts.find(
           (candidate) => candidate.id === run.activeAttemptId,
         );
@@ -9521,6 +9557,35 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           payload: interruptRequestItem,
         });
         yield* stopRemainingWork();
+        const detachedAdapter = yield* providerAdapters.get(run.providerInstanceId).pipe(
+          Effect.mapError(
+            (cause) =>
+              new OrchestratorProviderAdapterError({
+                commandId: command.commandId,
+                providerInstanceId: run.providerInstanceId,
+                cause,
+              }),
+          ),
+        );
+        const detachedSessionId = providerThread.providerSessionId;
+        if (detachedAdapter?.interruptDetachedTurn !== undefined && detachedSessionId !== null) {
+          yield* Ref.update(effects, (existing) => [
+            ...existing,
+            {
+              id: `effect:${command.commandId}:provider-turn.interrupt:${providerTurn.id}`,
+              commandId: command.commandId,
+              threadId: command.threadId,
+              request: {
+                type: "provider-turn.interrupt",
+                providerSessionId: detachedSessionId,
+                providerThreadId: providerThread.id,
+                providerTurnId: providerTurn.id,
+              },
+            } satisfies PendingOrchestrationEffectV2,
+            ...otherProviderInterrupts,
+          ]);
+          return undefined;
+        }
         yield* settleInterruptedRun({ command, projection, providerTurn, events, effects, now });
         yield* settleBackgroundWork({
           command,

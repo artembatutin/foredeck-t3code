@@ -19,6 +19,11 @@ import {
   type OpenCodeAdapterV2DriverEnv,
 } from "@t3tools/provider-opencode/server";
 import { PiAdapterV2Driver, type PiAdapterV2DriverEnv } from "@t3tools/provider-pi/server";
+import {
+  DevinAdapterV2Driver,
+  type DevinAdapterV2DriverEnv,
+} from "@t3tools/provider-acp-registry/fd/devin-cli-server";
+import { DevinCloudDriver } from "../fd/devin-cloud/index.ts";
 import type { AnyProviderAdapterDriver } from "@t3tools/provider-core/server/adapterDriver";
 
 export type BuiltInProviderAdapterDriversV2Env =
@@ -28,6 +33,7 @@ export type BuiltInProviderAdapterDriversV2Env =
   | CursorAdapterV2DriverEnv
   | GrokAdapterV2DriverEnv
   | OpenCodeAdapterV2DriverEnv
+  | DevinAdapterV2DriverEnv
   | PiAdapterV2DriverEnv;
 
 const BUILT_IN_PROVIDER_ADAPTER_DRIVERS_V2: ReadonlyArray<
@@ -40,8 +46,10 @@ const BUILT_IN_PROVIDER_ADAPTER_DRIVERS_V2: ReadonlyArray<
   GrokAdapterV2Driver,
   PiAdapterV2Driver,
   AcpRegistryAdapterV2Driver,
+  DevinAdapterV2Driver,
 ];
 
-export const BUILT_IN_PROVIDER_ADAPTER_DRIVER_KINDS_V2: ReadonlySet<ProviderDriverKind> = new Set(
-  BUILT_IN_PROVIDER_ADAPTER_DRIVERS_V2.map((driver) => driver.driverKind),
-);
+export const BUILT_IN_PROVIDER_ADAPTER_DRIVER_KINDS_V2: ReadonlySet<ProviderDriverKind> = new Set([
+  ...BUILT_IN_PROVIDER_ADAPTER_DRIVERS_V2.map((driver) => driver.driverKind),
+  DevinCloudDriver.driverKind,
+]);

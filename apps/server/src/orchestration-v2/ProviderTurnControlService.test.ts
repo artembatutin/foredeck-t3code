@@ -1,5 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import {
+  MessageId,
   type ModelSelection,
   NodeId,
   type OrchestrationV2ProviderThread,
@@ -24,7 +25,8 @@ import * as Stream from "effect/Stream";
 
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
-import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 
@@ -34,6 +36,160 @@ const modelSelection = {
   instanceId: providerInstanceId,
   model: "gpt-5.4",
 } satisfies ModelSelection;
+
+it.effect.each([
+  "confirmed",
+  "rejected",
+  "missing adapter",
+  "wrong session",
+  "replaced driver",
+  "subagent",
+  "legacy provider",
+  "later run",
+  "new attempt",
+  "restart confirmed",
+] as const)("detached Stop validates its durable target and preserves failures: %s", (scenario) =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make("thread:detached-stop");
+    const sessionId = ProviderSessionId.make("session:detached-stop");
+    const providerTurnId = ProviderTurnId.make("turn:detached-stop");
+    const providerThread: OrchestrationV2ProviderThread = {
+      id: ProviderThreadId.make("provider-thread:detached-stop"),
+      driver,
+      providerInstanceId,
+      providerSessionId: sessionId,
+      appThreadId: threadId,
+      ownerNodeId: null,
+      nativeThreadRef: { driver, nativeId: "remote-session", strength: "strong" },
+      nativeConversationHeadRef: null,
+      status: "active",
+      firstRunOrdinal: 1,
+      lastRunOrdinal: scenario === "later run" ? 2 : 1,
+      handoffIds: [],
+      forkedFrom: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const projection = makeProjection({
+      now,
+      threadId,
+      providerThread,
+      providerTurnId,
+      attemptId: RunAttemptId.make("attempt:detached-stop"),
+    });
+    const attempt = { ...projection.attempts[0]!, status: "running" as const, completedAt: null };
+    const run = {
+      id: attempt.runId,
+      threadId,
+      ordinal: 1,
+      providerInstanceId,
+      modelSelection,
+      providerThreadId: providerThread.id,
+      userMessageId: MessageId.make("message:detached-stop"),
+      rootNodeId: attempt.rootNodeId,
+      activeAttemptId:
+        scenario === "new attempt" ? RunAttemptId.make("attempt:replacement") : attempt.id,
+      status: "running" as const,
+      requestedAt: now,
+      startedAt: now,
+      completedAt: null,
+      checkpointId: null,
+      contextHandoffId: null,
+    };
+    const interrupted: Array<OrchestrationV2ProviderThread> = [];
+    const adapter: ProviderAdapter.ProviderAdapterV2["Service"] = {
+      instanceId: providerInstanceId,
+      driver: scenario === "replaced driver" ? ProviderDriverKind.make("changed") : driver,
+      getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+      planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
+      openSession: () => Effect.die("Detached Stop must not open a session"),
+      ...(scenario === "legacy provider"
+        ? {}
+        : {
+            interruptDetachedTurn: (input) =>
+              Effect.gen(function* () {
+                interrupted.push(input.providerThread);
+                assert.equal(input.providerTurnId, providerTurnId);
+                if (scenario === "rejected")
+                  return yield* new ProviderAdapter.ProviderAdapterInterruptError({
+                    driver,
+                    providerThreadId: providerThread.id,
+                    providerTurnId,
+                  });
+              }),
+          }),
+    };
+    const layerControl = ProviderTurnControlService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getProviderControlContext: () =>
+              Effect.succeed({
+                providerThread,
+                providerTurn: projection.providerTurns[0],
+                attempt,
+                message: undefined,
+                run: undefined,
+              }),
+            getThreadRecords: () => Effect.succeed({ ...projection, runs: [run] }),
+          }),
+          Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+            get: () => Effect.succeed(Option.none()),
+          }),
+          ProviderAdapterRegistry.layerFromAdapters(
+            scenario === "missing adapter" ? [] : [adapter],
+          ),
+        ),
+      ),
+    );
+    const result = yield* Effect.gen(function* () {
+      const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+      if (scenario === "restart confirmed") {
+        return yield* control
+          .interruptAndAwaitTerminal({
+            threadId,
+            providerSessionId: sessionId,
+            providerThreadId: providerThread.id,
+            providerTurnId,
+            interruptedAttemptId: attempt.id,
+          })
+          .pipe(Effect.result);
+      }
+      return yield* control
+        .interrupt({
+          threadId,
+          providerSessionId:
+            scenario === "wrong session" ? ProviderSessionId.make("session:stale") : sessionId,
+          providerThreadId: providerThread.id,
+          providerTurnId,
+          ...(scenario === "subagent"
+            ? { subagent: { id: NodeId.make("child"), nativeTaskId: "remote-child" } }
+            : {}),
+        })
+        .pipe(Effect.result);
+    }).pipe(Effect.provide(layerControl));
+    assert.equal(
+      result._tag,
+      scenario === "confirmed" || scenario === "legacy provider" || scenario === "restart confirmed"
+        ? "Success"
+        : "Failure",
+    );
+    if (result._tag === "Failure")
+      assert.instanceOf(result.failure, ProviderTurnControlService.ProviderTurnControlError);
+    assert.lengthOf(
+      interrupted,
+      scenario === "confirmed" || scenario === "rejected" || scenario === "restart confirmed"
+        ? 1
+        : 0,
+    );
+    assert.equal(
+      interrupted[0]?.nativeThreadRef?.nativeId,
+      interrupted.length ? "remote-session" : undefined,
+    );
+    assert.equal(projection.providerTurns[0]?.status, "running");
+  }),
+);
 
 function makeProjection(input: {
   readonly now: DateTime.Utc;
@@ -280,7 +436,13 @@ it.effect(
         }),
       );
       const layerControl = ProviderTurnControlService.layer.pipe(
-        Layer.provide(Layer.merge(layerProjection, layerSessionManager)),
+        Layer.provide(
+          Layer.mergeAll(
+            layerProjection,
+            layerSessionManager,
+            ProviderAdapterRegistry.layerFromAdapters([]),
+          ),
+        ),
       );
 
       const [ordinaryInterrupt, unrelatedRestart] = yield* Effect.gen(function* () {

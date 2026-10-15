@@ -595,6 +595,20 @@ export interface ProviderAdapterV2SessionRuntime {
     readonly modelSelection?: ModelSelection;
     readonly runtimePolicy?: ProviderAdapterV2RuntimePolicy;
   }) => Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapterV2Error>;
+  /**
+   * Setup history returned outside the live event stream, before run subscribers
+   * exist. Event IDs stay stable across retries. The thread snapshot returned by
+   * ensureThread/resumeThread carries the head following this history, so the
+   * manager can persist both in one transaction. Reading does not consume it.
+   */
+  readonly readThreadHistory?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+  }) => Effect.Effect<
+    ReadonlyArray<
+      Extract<ProviderAdapterV2Event, { readonly type: "message.updated" | "turn_item.updated" }>
+    >,
+    ProviderAdapterV2Error
+  >;
   /** False means the native protocol explicitly does not support history injection. */
   readonly injectHistory?: (
     input: ProviderAdapterV2HistoricalContext & {
@@ -672,6 +686,11 @@ export class ProviderAdapterV2 extends Context.Service<
     readonly planSelectionTransition: (
       input: ProviderSelectionTransitionInput,
     ) => Effect.Effect<ProviderSelectionTransitionPlan, ProviderAdapterV2Error>;
+    /** Stop remote work that outlives this server's observing runtime. */
+    readonly interruptDetachedTurn?: (input: {
+      readonly providerThread: OrchestrationV2ProviderThread;
+      readonly providerTurnId: ProviderTurnId;
+    }) => Effect.Effect<void, ProviderAdapterV2Error>;
     readonly openSession: (
       input: ProviderAdapterV2OpenSessionInput,
     ) => Effect.Effect<ProviderAdapterV2SessionRuntime, ProviderAdapterV2Error, Scope.Scope>;

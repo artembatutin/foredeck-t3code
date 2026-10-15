@@ -71,7 +71,8 @@ export const layer: Layer.Layer<RuntimePolicyV2> = Layer.succeed(RuntimePolicyV2
 /**
  * The mode a provider runs a thread in. A mode the provider does not offer
  * (a thread set before it stopped offering it, or a stale client) runs in
- * Supervised rather than having T3 imitate it.
+ * Supervised when available, otherwise its first advertised mode. Remote
+ * providers may offer only Full access in their hosted workspace.
  */
 function providerRuntimeMode(
   runtimeMode: RuntimeMode,
@@ -81,7 +82,9 @@ function providerRuntimeMode(
     supportedRuntimeModes.length === 0 ||
     supportedRuntimeModes.includes(runtimeMode)
     ? runtimeMode
-    : "approval-required";
+    : supportedRuntimeModes.includes("approval-required")
+      ? "approval-required"
+      : (supportedRuntimeModes[0] ?? "approval-required");
 }
 
 export const layerFromProjectStore: Layer.Layer<

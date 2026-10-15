@@ -1308,7 +1308,8 @@ export function ProviderInstanceCard({
           onChange={updateGenericEnvironment}
         />
       </SettingsSection>
-      {environmentId !== undefined && liveProvider?.driver === "acpRegistry" ? (
+      {environmentId !== undefined &&
+      (liveProvider?.nativeSessions?.canList || liveProvider?.configurableProviders) ? (
         <AcpSessionManagementSection
           environmentId={environmentId}
           instanceId={instanceId}
@@ -1326,7 +1327,9 @@ export function ProviderInstanceCard({
               across connected devices.
             </p>
             <ProviderModelsSection
-              canManageCustomModels={!readOnly}
+              canManageCustomModels={
+                !readOnly && "customModels" in driverOption.settingsSchema.fields
+              }
               canWritePreferences={canWriteSettings}
               instanceId={instanceId}
               driverKind={driverKind}

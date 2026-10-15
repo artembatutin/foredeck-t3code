@@ -38,4 +38,9 @@ by the permission mode. See [ACP Registry permissions](./providers-acp.md#permis
 Antigravity can still send native approval requests in **Full access**. It only offers remembered
 approvals for actions that support them.
 
+Devin CLI commands run through Foredeck's terminals and follow the selected permission mode.
+Devin Cloud offers only **Full access** because its hosted workspace does not use the local
+permission system. Selecting Cloud uses that mode even when the thread previously used a
+different mode. See [Devin CLI and Cloud](./providers-devin.md).
+
 See the [provider guides](./install.md#providers) for setup and provider-specific limits.
