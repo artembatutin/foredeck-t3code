@@ -1,4 +1,6 @@
 <!--
+For this fork, apply AGENTS.md's foredeck-t3 ownership policy. The upstream approval
+requirements below apply only to submissions to upstream; identify the fork task instead.
 Read CONTRIBUTING.md before opening a PR. Review capacity is limited, and meeting
 the requirements does not guarantee review or merging. Solve one underlying problem.
 The same requirements apply to drafts. Draft status does not defer triage or closure.
@@ -35,5 +37,3 @@ is insufficient; broad repo-wide checks are not required.
 For UI changes, include clear before/after screenshots. Include a short recording
 when motion, timing, transitions, or interaction details are needed to demonstrate
 the change. Upload evidence to GitHub and embed or link it here. Never commit PR-only assets. -->
-
-<!-- If you used an agent, end with the model and harness that did the work. -->

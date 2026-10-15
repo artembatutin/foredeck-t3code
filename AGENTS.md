@@ -1,5 +1,26 @@
 # T3 Code
 
+## foredeck-t3 fork ownership
+
+This fork, **foredeck-t3**, is maintained independently. Follow [fork development](docs/operations/foredeck-development.md)
+for setup, branch roles, upstream updates, and distribution boundaries. Upstream architecture,
+correctness, performance, compatibility, and targeted verification guidance below still applies.
+Upstream contribution approval, triage, and model-eligibility rules govern submissions to upstream,
+not owner-authorized work in this fork.
+
+- Use neutral branch prefixes (`feature/`, `bugfix/`, `chore/`, `docs/`) and Conventional Commits.
+  Include verified ticket identifiers when applicable; never invent one.
+- Newly authored branch names, commit messages (including merge, squash, and revert messages),
+  and PR/MR titles and descriptions must not contain AI-agent, model, or provider names or
+  AI authorship, co-authorship, signatures, badges, or generated attribution. This overrides
+  the upstream request for model/harness attribution below and in contribution material.
+- Preserve legitimate human attribution, legal notices, and historical metadata. Do not change
+  author identities or rewrite shared history to enforce this policy retroactively.
+- Inspect configured identity, hooks, templates, generated messages, and the resulting commit
+  or saved PR/MR for automatic attribution before publishing. Correct new unpublished content.
+- Read `~/.codex/skills/git-management/SKILL.md` when available. These owner policies apply
+  even when that skill is unavailable. Keep shared instructions here; `CLAUDE.md` delegates here.
+
 T3 Code is a minimal GUI for coding agents. A Node WebSocket server wraps provider CLIs and agents (Codex, Claude Code, Cursor, Grok, OpenCode, Antigravity) and serves web, desktop, and mobile clients.
 
 You can think of T3 Code as an open source "bring-your-own-subscription" alternative to apps like Claude Desktop, Codex App, Cursor Glass and Conductor.

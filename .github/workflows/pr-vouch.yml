@@ -19,6 +19,8 @@ permissions:
 
 jobs:
   collect-targets:
+    # Fork distribution and upstream automation require separate configuration.
+    if: github.repository == 'pingdotgg/t3code'
     name: Collect PR targets
     runs-on: ubuntu-24.04
     outputs:

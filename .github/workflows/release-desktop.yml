@@ -99,6 +99,8 @@ permissions:
 
 jobs:
   build:
+    # Fork distribution and upstream automation require separate configuration.
+    if: github.repository == 'pingdotgg/t3code'
     name: Build ${{ inputs.label }}
     runs-on: ${{ inputs.runner }}
     # Windows waits for the Linux CLI archive inside its own budget (see

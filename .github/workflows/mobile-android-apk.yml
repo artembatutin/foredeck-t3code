@@ -19,6 +19,8 @@ concurrency:
 
 jobs:
   mirror:
+    # Fork distribution and upstream automation require separate configuration.
+    if: github.repository == 'pingdotgg/t3code'
     name: Mirror Play APK
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10

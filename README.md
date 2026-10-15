@@ -1,4 +1,7 @@
-# T3 Code
+# foredeck-t3
+
+Maintaining foredeck-t3? Start with the [fork development runbook](docs/operations/foredeck-development.md).
+The installation and service links below refer to upstream T3 Code.
 
 T3 Code is an "agent harness control surface". It enables control of the agents on your machine with a best-in-class mobile app ([iOS](https://apps.apple.com/us/app/t3-code-remote-claude-more/id6787819824), [Android](https://play.google.com/store/apps/details?id=com.t3tools.t3code)), [web app](https://app.t3.codes) and [Electron-based desktop app](https://t3.codes).
 
