@@ -39,6 +39,20 @@ const makeEnvironment = (
 ) => DesktopEnvironment.DesktopEnvironment.pipe(Effect.provide(layerEnvironment(overrides, env)));
 
 describe("DesktopEnvironment", () => {
+  it("uses Foredeck for visible branding while retaining the release stage", () => {
+    assert.deepEqual(
+      DesktopEnvironment.resolveDesktopAppBranding({ isDevelopment: true, appVersion: "0.0.45" }),
+      { baseName: "Foredeck", stageLabel: "Dev", displayName: "Foredeck (Dev)" },
+    );
+    assert.deepEqual(
+      DesktopEnvironment.resolveDesktopAppBranding({
+        isDevelopment: false,
+        appVersion: "0.0.45-nightly.20261015.1",
+      }),
+      { baseName: "Foredeck", stageLabel: "Nightly", displayName: "Foredeck (Nightly)" },
+    );
+  });
+
   it.effect("derives state paths and development identity inside Effect", () =>
     Effect.gen(function* () {
       const environment = yield* makeEnvironment(

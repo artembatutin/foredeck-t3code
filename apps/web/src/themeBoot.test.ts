@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import indexHtml from "../index.html?raw";
+import { FOREDECK_THEME, FOREDECK_THEME_ID, themeFollowsSystemByDefault } from "./fd/appearance";
 import {
   CUSTOM_THEMES_STORAGE_KEY,
   getDefaultThemeColors,
@@ -113,7 +114,7 @@ function runtimeResolvedAppearance(
   invalidateCustomThemes();
   try {
     const raw = storage[THEME_STORAGE_KEY] ?? null;
-    const theme = raw !== null && isKnownThemePreference(raw) ? raw : "system";
+    const theme = raw !== null && isKnownThemePreference(raw) ? raw : FOREDECK_THEME_ID;
     const followRaw = storage[THEME_FOLLOW_SYSTEM_STORAGE_KEY] ?? null;
     const appearanceRaw = storage[THEME_APPEARANCE_MODE_STORAGE_KEY] ?? null;
     const appearanceMode =
@@ -123,7 +124,7 @@ function runtimeResolvedAppearance(
           ? "system"
           : followRaw === "false"
             ? null
-            : theme === "system"
+            : themeFollowsSystemByDefault(theme)
               ? "system"
               : null;
     const followSystem = appearanceMode === "system";
@@ -154,6 +155,7 @@ describe("index.html boot script", () => {
     storage: Record<string, string>;
     prefersDark: boolean;
   }> = [
+    { name: "no stored preference on a light OS", storage: {}, prefersDark: false },
     { name: "no stored preference on a dark OS", storage: {}, prefersDark: true },
     {
       name: "T3 Chat follows a dark OS",
@@ -226,7 +228,7 @@ describe("index.html boot script", () => {
       prefersDark: true,
     },
     {
-      name: "a removed custom theme falls back to system",
+      name: "a removed custom theme falls back to Foredeck",
       storage: { [THEME_STORAGE_KEY]: "gone-theme" },
       prefersDark: true,
     },
@@ -310,6 +312,20 @@ describe("index.html boot script", () => {
     expect(boot.metaContent).toBe(colors.chrome);
   });
 
+  it("preserves a saved custom theme whose id is foredeck", () => {
+    const custom = { ...AURORA_DUAL, id: "foredeck" };
+    const boot = runBootScript({
+      storage: {
+        [THEME_STORAGE_KEY]: custom.id,
+        [CUSTOM_THEMES_STORAGE_KEY]: JSON.stringify([custom]),
+      },
+      prefersDark: false,
+    });
+    expect(boot.themeId).toBe(custom.id);
+    expect(boot.bootVariables["--boot-background"]).toBe(custom.colors.canvas);
+    expect(boot.bootVariables["--boot-accent"]).toBe(custom.colors.accent);
+  });
+
   it("accepts legacy CSS color formats before the runtime mounts", () => {
     const colors = {
       canvas: "rgb(248 251 255)",
@@ -342,7 +358,14 @@ describe("index.html boot script", () => {
   // boot script's hand-maintained copy into a CI-enforced contract: any
   // palette change breaks this test until the copy in index.html is updated.
   it("keeps every built-in boot splash in sync with the real palettes", () => {
-    for (const theme of [T3_CHAT_THEME, GROVE_THEME, OCEAN_THEME, EMBER_THEME, IRIS_THEME]) {
+    for (const theme of [
+      FOREDECK_THEME,
+      T3_CHAT_THEME,
+      GROVE_THEME,
+      OCEAN_THEME,
+      EMBER_THEME,
+      IRIS_THEME,
+    ]) {
       // The boot script resolves every built-in from a light base appearance.
       expect(theme.appearance).toBe("light");
       for (const mode of ["light", "dark"] as const) {
@@ -491,28 +514,44 @@ describe("index.html boot script", () => {
       prefersDark: false,
     });
 
-    expect(boot.themeId).toBeUndefined();
-    expect(boot.themeSelected).toBeUndefined();
+    expect(boot.themeId).toBe(FOREDECK_THEME_ID);
+    expect(boot.themeSelected).toBe("true");
     expect(boot.backgroundColor).toBe("#ffffff");
     expect(boot.metaContent).toBe("#ffffff");
   });
 
-  it("leaves unknown preferences unthemed so the runtime default applies", () => {
+  it("uses Foredeck for unknown preferences so the runtime default applies", () => {
     const boot = runBootScript({
       storage: { [THEME_STORAGE_KEY]: "gone-theme" },
       prefersDark: true,
     });
-    expect(boot.themeId).toBeUndefined();
-    expect(boot.themeSelected).toBeUndefined();
+    expect(boot.themeId).toBe(FOREDECK_THEME_ID);
+    expect(boot.themeSelected).toBe("true");
     expect(boot.isDark).toBe(true);
   });
 
   it("follows the OS appearance when storage is unavailable", () => {
     const light = runBootScript({ storageThrows: true, prefersDark: false });
     expect(light.isDark).toBe(false);
-    expect(light.themeId).toBeUndefined();
+    expect(light.themeId).toBe(FOREDECK_THEME_ID);
 
     const dark = runBootScript({ storageThrows: true, prefersDark: true });
     expect(dark.isDark).toBe(true);
+    expect(dark.themeId).toBe(FOREDECK_THEME_ID);
+    expect(dark.backgroundColor).toBe(FOREDECK_THEME.variants!.dark!.chrome);
   });
+
+  it.each([false, true])(
+    "paints the Foredeck default before runtime mounts (dark: %s)",
+    (prefersDark) => {
+      const boot = runBootScript({ prefersDark });
+      const colors = getThemeColorsForMode(FOREDECK_THEME, prefersDark ? "dark" : "light")!;
+      expect(boot.themeId).toBe(FOREDECK_THEME_ID);
+      expect(boot.bootVariables["--boot-background"]).toBe(colors.canvas);
+      expect(boot.bootVariables["--boot-foreground"]).toBe(colors.text);
+      expect(boot.bootVariables["--boot-accent"]).toBe(colors.accent);
+      expect(boot.backgroundColor).toBe(colors.chrome);
+      expect(boot.metaContent).toBe(colors.chrome);
+    },
+  );
 });

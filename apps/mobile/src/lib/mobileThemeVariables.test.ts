@@ -6,10 +6,10 @@ import { getMobileThemeRuntimeVariables } from "./mobileThemeVariables";
 
 describe("mobile theme runtime variables", () => {
   it("matches the standard base palette to the generated stylesheet", () => {
-    expect(getMobileThemeRuntimeVariables("t3-code", "light", "web")).toEqual(
+    expect(getMobileThemeRuntimeVariables("__fd-foredeck", "light", "web")).toEqual(
       readDefaultMobileThemeVariables("light"),
     );
-    expect(getMobileThemeRuntimeVariables("t3-code", "dark", "web")).toEqual(
+    expect(getMobileThemeRuntimeVariables("__fd-foredeck", "dark", "web")).toEqual(
       readDefaultMobileThemeVariables("dark"),
     );
   });
@@ -32,6 +32,10 @@ describe("mobile theme runtime variables", () => {
           appearance,
         );
         const android = getMobileThemeRuntimeVariables(themeId, appearance, "android");
+        if (themeId === "__fd-foredeck") {
+          expect(android).toEqual(base);
+          continue;
+        }
         expect(android).toEqual({
           ...base,
           "--color-header": themeColorWithAlpha(

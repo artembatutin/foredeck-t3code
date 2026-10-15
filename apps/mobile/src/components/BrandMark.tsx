@@ -1,9 +1,9 @@
 import Constants from "expo-constants";
-import { Image } from "expo-image";
 import { View } from "react-native";
 
 import { AppText as Text } from "./AppText";
-import { T3_CODE_BRAND_MARK_SOURCE } from "./brandAssets";
+import { ForedeckAnchor } from "../fd/branding";
+import { FOREDECK_WORDMARK } from "@t3tools/shared/fd/branding";
 
 const appVariant = Constants.expoConfig?.extra?.appVariant;
 const DEFAULT_STAGE_LABEL =
@@ -16,20 +16,15 @@ export function BrandMark(props: { readonly compact?: boolean; readonly stageLab
 
   return (
     <View className="flex-row items-center gap-3">
-      <Image
-        source={T3_CODE_BRAND_MARK_SOURCE}
-        accessibilityIgnoresInvertColors
-        style={{
-          width: iconSize,
-          height: iconSize,
-          borderRadius: compact ? 10 : 14,
-        }}
-      />
+      <ForedeckAnchor height={iconSize} colorClassName="text-foreground" />
       <View className="gap-1">
         <View className="flex-row items-center gap-2">
-          <Text className="text-lg font-t3-bold tracking-[-0.4px] text-foreground">T3 Code</Text>
+          <Text className="font-bold text-foreground" style={{ fontSize: 22, letterSpacing: -0.3 }}>
+            {FOREDECK_WORDMARK.slice(0, -1)}
+            <Text className="text-primary">.</Text>
+          </Text>
           <View className="rounded-full bg-subtle px-2 py-1">
-            <Text className="text-3xs font-t3-bold tracking-[1.1px] uppercase text-foreground-muted">
+            <Text className="text-3xs font-semibold tracking-[0.3px] text-foreground-muted">
               {stageLabel}
             </Text>
           </View>

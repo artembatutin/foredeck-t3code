@@ -2,6 +2,7 @@ import * as Equal from "effect/Equal";
 import * as Schema from "effect/Schema";
 import "culori/css";
 import { converter, parse } from "culori/fn";
+import { applyForedeckThemeVariables, FOREDECK_THEME } from "./fd/appearance";
 import {
   BUILT_IN_THEMES,
   EMBER_THEME,
@@ -1087,7 +1088,10 @@ export function updateThemeColorFamily(
   }
 }
 
-const BUILT_IN_THEME_DEFINITIONS: ReadonlyArray<ThemeDefinition> = BUILT_IN_THEMES;
+const BUILT_IN_THEME_DEFINITIONS: ReadonlyArray<ThemeDefinition> = [
+  FOREDECK_THEME,
+  ...BUILT_IN_THEMES,
+];
 
 export function getThemeDefinition(theme: ThemePreference): ThemeDefinition | null {
   const themeId = themeIdFromPreference(theme);
@@ -1529,6 +1533,7 @@ export function applyThemeColorPreview(colors: ThemeColors, appearance: ThemeApp
   // Drafts become user-controlled themes when saved, so their preview keeps
   // the fixed stage artwork hidden even when it was seeded from a built-in.
   setThemePreviewSidebarArtwork(false);
+  applyForedeckThemeVariables(THEME_PREVIEW_ID, appearance);
   root.dataset.themeId = THEME_PREVIEW_ID;
   root.classList.toggle("dark", appearance === "dark");
   for (const [role, value] of Object.entries(colors) as Array<[ThemeColorRole, string]>) {
@@ -1550,6 +1555,7 @@ export function applyThemePalette(theme: ThemePreference, appearance?: ThemeAppe
     root.dataset.themeId = palette.id;
     const mode = appearance ?? legacyThemeMode(theme) ?? palette.appearance;
     const colors = getThemeColorsForMode(palette, mode) ?? palette.colors;
+    applyForedeckThemeVariables(palette.id, mode);
     for (const [role, value] of Object.entries(colors) as Array<[ThemeColorRole, string]>) {
       root.style.setProperty(APP_THEME_VARIABLES[role], value);
     }
@@ -1557,6 +1563,7 @@ export function applyThemePalette(theme: ThemePreference, appearance?: ThemeAppe
   }
 
   delete root.dataset.themeId;
+  applyForedeckThemeVariables(theme, appearance ?? "light");
   for (const variable of Object.values(APP_THEME_VARIABLES)) {
     root.style.removeProperty(variable);
   }

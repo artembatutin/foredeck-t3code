@@ -22,18 +22,20 @@ export function getMobileThemeRuntimeVariables(
   appearance: MobileThemeAppearance,
   platform: string,
 ): MobileThemeVariables {
-  const usesDefaultPalette = themeId === DEFAULT_MOBILE_THEME_ID || themeId === "material-you";
-  const variables = usesDefaultPalette
-    ? defaults[appearance]
-    : getMobileThemeVariables(themeId, appearance);
+  const variables =
+    themeId === DEFAULT_MOBILE_THEME_ID
+      ? defaults[appearance]
+      : getMobileThemeVariables(themeId === "material-you" ? "t3-code" : themeId, appearance);
+  if (themeId === DEFAULT_MOBILE_THEME_ID) return variables;
+  const usesLegacyPalette = themeId === "t3-code" || themeId === "material-you";
   // Android's frame surrounds the sidebar and chat panes. Light iPad sidebars
   // reuse that stronger tonal fill; dark sidebars retain the shared black pane
   // beneath the near-black chat canvas. System colors replace these roles later.
   const frame = themeColorWithAlpha(
-    variables[usesDefaultPalette ? "--color-row-hover" : "--color-drawer"],
+    variables[usesLegacyPalette ? "--color-row-hover" : "--color-drawer"],
     1,
   );
-  if (platform === "ios" && usesDefaultPalette && appearance === "light") {
+  if (platform === "ios" && usesLegacyPalette && appearance === "light") {
     return {
       ...variables,
       "--color-header": frame,

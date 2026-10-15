@@ -3,7 +3,13 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import tailwindColors from "tailwindcss/colors";
-import { BUILT_IN_THEME_IDS, type BuiltInThemeId } from "@t3tools/shared/themePalettes";
+import { type MobileThemeId } from "@t3tools/shared/themePalettes";
+import {
+  FOREDECK_MOBILE_TYPOGRAPHY,
+  FOREDECK_THEME_ID,
+  MOBILE_REGISTERED_THEME_IDS,
+  getForedeckAdaptiveVariables,
+} from "../src/fd/appearance/index.ts";
 
 import {
   createMobileThemeVariables,
@@ -154,7 +160,7 @@ const ADAPTIVE_COLORS: Readonly<Record<string, readonly [light: string, dark: st
   "--color-adaptive-zinc-600-300": [color("zinc", 600), color("zinc", 300)],
 };
 
-export const customThemeNames = BUILT_IN_THEME_IDS.flatMap((themeId) =>
+export const customThemeNames = MOBILE_REGISTERED_THEME_IDS.flatMap((themeId) =>
   APPEARANCES.map((appearance) => `${themeId}-${appearance}`),
 );
 
@@ -166,9 +172,10 @@ const adaptiveVariablesFor = (appearance: MobileThemeAppearance) =>
     ]),
   );
 
-const variablesFor = (themeId: BuiltInThemeId, appearance: MobileThemeAppearance) => ({
+const variablesFor = (themeId: MobileThemeId, appearance: MobileThemeAppearance) => ({
   ...getMobileThemeVariables(themeId, appearance),
   ...adaptiveVariablesFor(appearance),
+  ...(themeId === FOREDECK_THEME_ID ? getForedeckAdaptiveVariables(appearance) : {}),
   ...clerkVariablesFor(appearance),
 });
 
@@ -220,13 +227,9 @@ const renderVariant = (name: string, variables: Readonly<Record<string, string>>
 export const renderUniwindThemesCSS = () => {
   const variants = [
     ...APPEARANCES.map((appearance) =>
-      renderVariant(appearance, {
-        ...getMobileThemeVariables(DEFAULT_MOBILE_THEME_ID, appearance),
-        ...adaptiveVariablesFor(appearance),
-        ...clerkVariablesFor(appearance),
-      }),
+      renderVariant(appearance, variablesFor(DEFAULT_MOBILE_THEME_ID, appearance)),
     ),
-    ...BUILT_IN_THEME_IDS.flatMap((themeId) =>
+    ...MOBILE_REGISTERED_THEME_IDS.flatMap((themeId) =>
       APPEARANCES.map((appearance) =>
         renderVariant(`${themeId}-${appearance}`, variablesFor(themeId, appearance)),
       ),
@@ -238,6 +241,16 @@ export const renderUniwindThemesCSS = () => {
     "  :root {",
     variants.join("\n\n"),
     "  }",
+    "}",
+    "",
+    "@theme {",
+    ...Object.values(FOREDECK_MOBILE_TYPOGRAPHY).flatMap((role, index) => {
+      const scale = ["3xs", "2xs", "xs", "sm", "base", "lg", "xl", "2xl", "3xl"][index];
+      return [
+        `  --text-${scale}: ${role.fontSize}px;`,
+        `  --text-${scale}--line-height: ${role.lineHeight}px;`,
+      ];
+    }),
     "}",
     "",
   ].join("\n");

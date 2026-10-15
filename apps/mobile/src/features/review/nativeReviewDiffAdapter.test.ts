@@ -92,9 +92,9 @@ function filesPatch(paths: ReadonlyArray<string>) {
 }
 
 function appTheme(themeId: MobileThemeId, appearance: MobileThemeAppearance) {
-  return themeId === DEFAULT_MOBILE_THEME_ID || themeId === "material-you"
+  return themeId === DEFAULT_MOBILE_THEME_ID
     ? readDefaultMobileThemeVariables(appearance)
-    : getMobileThemeVariables(themeId, appearance);
+    : getMobileThemeVariables(themeId === "material-you" ? "t3-code" : themeId, appearance);
 }
 
 function contrastRatio(first: string, second: string): number {

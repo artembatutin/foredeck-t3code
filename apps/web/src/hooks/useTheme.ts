@@ -2,6 +2,7 @@ import type { DesktopBridge } from "@t3tools/contracts";
 import { safeErrorLogAttributes } from "@t3tools/client-runtime/errors";
 import * as Schema from "effect/Schema";
 import { useCallback, useEffect, useSyncExternalStore } from "react";
+import { FOREDECK_THEME_ID, themeFollowsSystemByDefault } from "../fd/appearance";
 import {
   applyThemePalette,
   CUSTOM_THEMES_STORAGE_KEY,
@@ -38,7 +39,7 @@ type DesktopThemeBridge = Pick<DesktopBridge, "setTheme">;
 const STORAGE_KEY = "t3code:theme";
 const MEDIA_QUERY = "(prefers-color-scheme: dark)";
 const DEFAULT_THEME_SNAPSHOT: ThemeSnapshot = {
-  theme: "system",
+  theme: FOREDECK_THEME_ID,
   resolvedTheme: "light",
   systemDark: false,
   followSystem: true,
@@ -153,7 +154,7 @@ function getSystemDark() {
 }
 
 function readStoredFollowSystem(theme: Theme): boolean {
-  if (typeof window === "undefined") return theme === "system";
+  if (typeof window === "undefined") return themeFollowsSystemByDefault(theme);
 
   try {
     const raw = window.localStorage.getItem(THEME_FOLLOW_SYSTEM_STORAGE_KEY);
@@ -163,7 +164,7 @@ function readStoredFollowSystem(theme: Theme): boolean {
     // Fall back to the legacy theme value when the separate preference is unavailable.
   }
 
-  return theme === "system";
+  return themeFollowsSystemByDefault(theme);
 }
 
 function isThemePreferenceMode(value: string | null): value is ThemePreferenceMode {

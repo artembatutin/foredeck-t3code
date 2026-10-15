@@ -52,6 +52,7 @@ function enrichedStyle(
       ...body,
       color: style.strongColor,
       fontFamily: style.headingFontFamily,
+      fontWeight: "bold" as const,
       fontSize,
       lineHeight: fontSize * 1.35,
       marginTop: 8,
@@ -65,7 +66,7 @@ function enrichedStyle(
     h4: heading(4),
     h5: heading(5),
     h6: heading(6),
-    strong: { color: style.strongColor, fontFamily: style.boldFontFamily, fontWeight: "normal" },
+    strong: { color: style.strongColor, fontFamily: style.boldFontFamily, fontWeight: "bold" },
     link: { color: style.linkColor, underline: false },
     code: {
       fontFamily: monospace,

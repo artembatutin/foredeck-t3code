@@ -3,18 +3,15 @@
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#161616",
-  "theme_color": "#161616",
+  "background_color": "#161618",
+  "theme_color": "#161618",
   "icons": [
     {
-      "src": "/favicon-32x32.png",
-      "sizes": "32x32",
-      "type": "image/png"
-    },
-    {
-      "src": "/apple-touch-icon.png",
-      "sizes": "180x180",
+      "src": "/fd/branding/appicon.png",
+      "sizes": "1024x1024",
       "type": "image/png"
     }
-  ]
+  ],
+  "name": "Foredeck",
+  "short_name": "Foredeck"
 }

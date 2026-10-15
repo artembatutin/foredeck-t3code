@@ -1,0 +1,30 @@
+/* Platform system families preserve native glyphs and Dynamic Type. */
+@theme {
+  --font-sans: "System";
+}
+
+@layer theme {
+  :root {
+    @variant ios {
+      --font-sans: "System";
+    }
+    @variant android {
+      --font-sans: "sans-serif";
+    }
+  }
+}
+
+@utility font-t3-medium {
+  font-family: var(--font-sans);
+  font-weight: 500;
+}
+
+@utility font-t3-bold {
+  font-family: var(--font-sans);
+  font-weight: 700;
+}
+
+@utility font-t3-extrabold {
+  font-family: var(--font-sans);
+  font-weight: 800;
+}

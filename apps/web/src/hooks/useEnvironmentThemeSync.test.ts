@@ -1,5 +1,6 @@
 import type { EnvironmentTheme } from "@t3tools/contracts";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { FOREDECK_THEME_ID } from "../fd/appearance";
 
 const NIGHTFALL_THEME = {
   id: "nightfall",
@@ -141,7 +142,7 @@ describe("published theme refresh", () => {
     expectPreview();
     publish([LIGHT_THEME, { ...NIGHTFALL_THEME, id: "unused-theme" }]);
     expectPreview();
-    expect(publish([]).theme).toBe("system");
+    expect(publish([]).theme).toBe(FOREDECK_THEME_ID);
     expectPreview();
 
     const current = publish([{ ...NIGHTFALL_THEME, canvas: "#112233" }]);

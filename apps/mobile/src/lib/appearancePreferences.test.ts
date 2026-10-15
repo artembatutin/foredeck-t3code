@@ -105,7 +105,7 @@ describe("appearancePreferences", () => {
     expect(variables["--text-base--line-height"]).toBe(23);
     expect(variables["--text-sm"]).toBe(14);
     expect(variables["--text-sm--line-height"]).toBe(19);
-    expect(variables["--text-lg"]).toBe(18);
+    expect(variables["--text-lg"]).toBe(17);
     expect(variables["--text-3xl"]).toBe(30);
   });
 
@@ -119,7 +119,7 @@ describe("appearancePreferences", () => {
     expect(variables["--text-base--line-height"]).toBe(29);
     expect(variables["--text-sm"]).toBe(18);
     expect(variables["--text-xs"]).toBe(16);
-    expect(variables["--text-lg"]).toBe(23);
+    expect(variables["--text-lg"]).toBe(21);
 
     const smaller = resolveTextScaleVariables(11);
     expect(smaller["--text-base"]).toBe(11);

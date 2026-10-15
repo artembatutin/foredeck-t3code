@@ -1,0 +1,45 @@
+/* Foredeck desktop geometry from docs/design/tokens.md §§3.2–3.3.
+   Colors come from the shared palette; these variables are web adaptations. */
+:root {
+  --fd-radius: 8px;
+  --fd-control-radius: 6px;
+  --fd-workspace-topbar-height: 48px;
+  --fd-reading-width: 55rem;
+  --fd-popup-shadow: 0 8px 24px var(--fd-shadow-color-md, rgb(0 0 0 / 14%));
+  --fd-dialog-shadow: 0 12px 32px var(--fd-shadow-color-lg, rgb(0 0 0 / 16%));
+  --fd-composer-radius: 28px;
+  --fd-composer-corner-control: calc(var(--fd-composer-radius) * 0.4477);
+  --fd-control-shadow: none;
+  --fd-control-highlight: 0 0 transparent;
+
+  @variant dark {
+    --fd-popup-shadow: 0 8px 24px var(--fd-shadow-color-md, rgb(0 0 0 / 45%));
+    --fd-dialog-shadow: 0 12px 32px var(--fd-shadow-color-lg, rgb(0 0 0 / 45%));
+  }
+
+  @media (min-width: 640px) {
+    --fd-composer-radius: 8px;
+  }
+}
+
+@theme {
+  --text-fd-wordmark: 22px;
+  --text-fd-wordmark--line-height: 1.35;
+  --tracking-fd-wordmark: -0.3px;
+  --text-sm: 0.8125rem;
+  --text-sm--line-height: 1.45;
+  --default-transition-duration: 120ms;
+}
+
+/* The reduced-motion preference applies to transient UI as well as indicators.
+   State labels and static icons continue to communicate activity. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0s !important;
+    scroll-behavior: auto !important;
+  }
+}

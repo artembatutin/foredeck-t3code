@@ -7,13 +7,14 @@
       content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
     />
     <meta name="theme-color" content="#0a0a0a" />
-    <link rel="icon" href="/favicon.ico" sizes="48x48" />
-    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" href="/fd/branding/appicon.png" type="image/png" />
+    <link rel="apple-touch-icon" href="/fd/branding/appicon.png" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <script>
       (() => {
         const LIGHT_BACKGROUND = "#ffffff";
         const DARK_BACKGROUND = "#0a0a0a";
+        const FOREDECK_THEME_ID = "__fd-foredeck";
         const CUSTOM_THEMES_STORAGE_KEY = "t3code:themes:v1";
         const THEME_FOLLOW_SYSTEM_STORAGE_KEY = "t3code:theme-follow-system";
         const THEME_APPEARANCE_MODE_STORAGE_KEY = "t3code:theme-appearance-mode";
@@ -51,6 +52,20 @@
         // Keep this small boot-time copy in sync with the built-in palettes so
         // the selected theme is visible before the app has mounted.
         const BUILT_IN_THEME_PALETTES = {
+          [FOREDECK_THEME_ID]: {
+            light: {
+              background: "#f7f7f8",
+              foreground: "#242428",
+              accent: "#202024",
+              chrome: "#ffffff",
+            },
+            dark: {
+              background: "#161618",
+              foreground: "#e4e4e8",
+              accent: "#f4f4f6",
+              chrome: "#1e1e21",
+            },
+          },
           "t3-chat": {
             light: {
               background: "oklch(0.982446 0.010114 325.653)",
@@ -131,6 +146,7 @@
           ]),
         );
         const RESERVED_THEME_IDS = [
+          FOREDECK_THEME_ID,
           "system",
           "light",
           "dark",
@@ -230,12 +246,12 @@
             "t3-iris": "iris",
           };
           const isLegacyT3ChatDark = storedTheme === "t3-chat-dark";
-          const themeId =
+          const requestedThemeId =
             storedTheme === null ? "" : (LEGACY_THEME_IDS[storedTheme] ?? storedTheme);
           const legacyMode = isLegacyT3ChatDark ? "dark" : null;
-          const builtInModes = BUILT_IN_THEME_MODES[themeId] ?? null;
-          const customTheme = builtInModes ? null : findCustomTheme(themeId);
-          const themeModes =
+          const builtInModes = BUILT_IN_THEME_MODES[requestedThemeId] ?? null;
+          const customTheme = builtInModes ? null : findCustomTheme(requestedThemeId);
+          let themeModes =
             builtInModes ??
             (customTheme
               ? ["light", "dark"].filter(
@@ -248,8 +264,10 @@
             storedTheme === "dark" ||
             storedTheme === "system" ||
             themeModes !== null;
-          const theme = isKnownTheme && storedTheme ? storedTheme : "system";
-          const isThemed = isKnownTheme && themeModes !== null;
+          const theme = isKnownTheme && storedTheme ? storedTheme : FOREDECK_THEME_ID;
+          const themeId = isKnownTheme ? requestedThemeId : FOREDECK_THEME_ID;
+          if (!isKnownTheme) themeModes = BUILT_IN_THEME_MODES[FOREDECK_THEME_ID];
+          const isThemed = themeModes !== null;
           const baseAppearance = customTheme ? customTheme.appearance : "light";
           const systemMode = prefersDark ? "dark" : "light";
           const storedAppearanceMode = window.localStorage.getItem(
@@ -266,7 +284,7 @@
               ? "system"
               : storedFollowSystem === "false"
                 ? preferenceMode
-                : theme === "system"
+                : theme === "system" || theme === FOREDECK_THEME_ID
                   ? "system"
                   : preferenceMode;
           // A valid mix half for the wanted appearance takes over: it decides
@@ -360,7 +378,7 @@
           }
           // A resolved half is a selection even when the base theme is gone
           // (deleting the base leaves the mix pointing at a real theme).
-          const hasSelection = halfThemeId !== null || (isKnownTheme && storedTheme !== null);
+          const hasSelection = effectiveIsThemed || (isKnownTheme && storedTheme !== null);
           if (hasSelection) {
             document.documentElement.dataset.themeSelected = "true";
           } else {
@@ -392,12 +410,16 @@
           } catch {
             // Keep the dark default when even matchMedia is unavailable.
           }
-          delete document.documentElement.dataset.themeId;
-          delete document.documentElement.dataset.themeSelected;
+          document.documentElement.dataset.themeId = FOREDECK_THEME_ID;
+          document.documentElement.dataset.themeSelected = "true";
           document.documentElement.classList.toggle("dark", prefersDark);
-          const fallbackColor = prefersDark ? DARK_BACKGROUND : LIGHT_BACKGROUND;
-          document.documentElement.style.backgroundColor = fallbackColor;
-          setThemeColor(fallbackColor);
+          const fallback =
+            BUILT_IN_THEME_PALETTES[FOREDECK_THEME_ID][prefersDark ? "dark" : "light"];
+          for (const [name, value] of Object.entries(fallback)) {
+            document.documentElement.style.setProperty(`--boot-${name}`, value);
+          }
+          document.documentElement.style.backgroundColor = fallback.chrome;
+          setThemeColor(fallback.chrome);
         }
       })();
     </script>
@@ -477,13 +499,13 @@
         cursor: pointer;
       }
     </style>
-    <title>T3 Code (Alpha)</title>
+    <title>Foredeck (Alpha)</title>
   </head>
   <body>
     <div id="root">
       <div id="boot-shell">
-        <div id="boot-shell-card" aria-label="T3 Code splash screen">
-          <img id="boot-shell-logo" src="/apple-touch-icon.png" alt="T3 Code" />
+        <div id="boot-shell-card" aria-label="Foredeck splash screen">
+          <img id="boot-shell-logo" src="/fd/branding/appicon.png" alt="Foredeck" />
         </div>
       </div>
     </div>

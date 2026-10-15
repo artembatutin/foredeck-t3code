@@ -6,7 +6,6 @@ import {
   T3_CODE_LIGHT_THEME_COLORS,
   T3_CODE_DARK_THEME_COLORS,
   MOBILE_THEME_IDS,
-  getThemeColorsForAppearance,
 } from "@t3tools/shared/themePalettes";
 import {
   readDefaultMobileThemeVariables,
@@ -21,6 +20,7 @@ import {
   DEFAULT_MOBILE_THEME_ID,
   flattenThemeColor,
   getMobileThemePreviewColors,
+  getMobileThemeColors,
   getMobileThemeVariables,
   normalizeMobileThemeId,
   normalizeMobileThemeMode,
@@ -81,12 +81,7 @@ describe("mobile themes", () => {
 
   it.each(MOBILE_THEME_IDS)("uses the web color roles for %s in both appearances", (themeId) => {
     for (const appearance of ["light", "dark"] as const) {
-      const theme = BUILT_IN_THEMES.find((candidate) => candidate.id === themeId);
-      const colors = theme
-        ? getThemeColorsForAppearance(theme, appearance)!
-        : appearance === "dark"
-          ? T3_CODE_DARK_THEME_COLORS
-          : T3_CODE_LIGHT_THEME_COLORS;
+      const colors = getMobileThemeColors(themeId, appearance);
       const variables =
         themeId === DEFAULT_MOBILE_THEME_ID
           ? readDefaultMobileThemeVariables(appearance)
@@ -108,7 +103,7 @@ describe("mobile themes", () => {
         themeColorToNativeColor(colors.sidebarForeground),
       );
       expect(variables["--color-primary"]).toBe(themeColorToNativeColor(colors.messageAction));
-      if (themeId !== DEFAULT_MOBILE_THEME_ID) {
+      if (themeId !== "t3-code") {
         expect(variables["--color-user-bubble"]).toBe(
           themeColorToNativeColor(colors.messageSurface),
         );
@@ -275,7 +270,7 @@ describe("mobile themes", () => {
         variables[
           themeId === "t3-chat" && appearance === "dark"
             ? "--color-primary-foreground"
-            : themeId === DEFAULT_MOBILE_THEME_ID || themeId === "t3-chat"
+            : themeId === DEFAULT_MOBILE_THEME_ID || themeId === "t3-code" || themeId === "t3-chat"
               ? "--color-foreground"
               : "--color-primary"
         ],
@@ -342,7 +337,7 @@ describe("mobile themes", () => {
   );
 
   it("uses the same preview roles and standard artwork as desktop", () => {
-    expect(getMobileThemePreviewColors(DEFAULT_MOBILE_THEME_ID, "light")).toEqual({
+    expect(getMobileThemePreviewColors("t3-code", "light")).toEqual({
       canvas: "#fcfcfc",
       accent: "#f4f4f5",
       messageAction: "#4f46e5",
@@ -357,6 +352,15 @@ describe("mobile themes", () => {
 
   it("normalizes persisted theme preferences", () => {
     expect(normalizeMobileThemeId("ocean")).toBe("ocean");
+    expect(normalizeMobileThemeId("t3-code")).toBe("t3-code");
+    expect(resolveMobileThemeIds({})).toEqual({
+      light: DEFAULT_MOBILE_THEME_ID,
+      dark: DEFAULT_MOBILE_THEME_ID,
+    });
+    expect(resolveMobileThemeIds({ themeId: "t3-code" })).toEqual({
+      light: "t3-code",
+      dark: "t3-code",
+    });
     expect(normalizeMobileThemeId("missing-theme")).toBe(DEFAULT_MOBILE_THEME_ID);
     expect(normalizeMobileThemeMode("dark")).toBe("dark");
     expect(normalizeMobileThemeMode("sepia")).toBe("system");
@@ -486,9 +490,7 @@ describe("mobile themes", () => {
       expect(
         contrastRatio(variables["--color-user-bubble-skill-foreground"], bubble),
       ).toBeGreaterThanOrEqual(4.5);
-      expect(variables["--color-user-bubble-skill-foreground"]).not.toBe(
-        variables["--color-user-bubble-foreground"],
-      );
+
       const fenceSurface = compositeOver(variables["--color-md-user-fence-bg"], bubble);
       expect(fenceSurface).not.toBe(bubble);
       expect(

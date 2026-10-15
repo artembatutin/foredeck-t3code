@@ -32,8 +32,8 @@ import {
 
 const STATUS_DOT_CLASS: Record<ScheduledTask["lastRunStatus"], string> = {
   never: "bg-muted-foreground/40",
-  running: "bg-sky-500",
-  succeeded: "bg-emerald-500",
+  running: "bg-foreground",
+  succeeded: "bg-success",
   failed: "bg-destructive",
 };
 
