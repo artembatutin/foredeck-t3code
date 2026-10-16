@@ -15,6 +15,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   UsageDay,
+  UsageSummary,
   type UsageSource,
   type UsageSummaryInput,
 } from "@t3tools/contracts";
@@ -46,6 +47,7 @@ import * as UsageService from "./UsageService.ts";
 const encodeUnknownJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeUnknownJsonString = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeUsageSummary = Schema.decodeEffect(UsageSummary);
 
 function claudeLine(id: number, outputTokens: number, model = "claude-fable-5"): string {
   return `${JSON.stringify({
@@ -270,6 +272,101 @@ function cursorSource(summary: { readonly sources: readonly UsageSource[] }) {
 }
 
 describe("UsageService", () => {
+  it.live("includes local CLI history in priced, decoded and merged usage summaries", () =>
+    Effect.gen(function* () {
+      const { home, settings } = yield* setup;
+      const dir = NodePath.join(home, "data", "devin", "cli");
+      yield* Effect.promise(() => NodeFSP.mkdir(dir, { recursive: true }));
+      yield* Effect.sync(() => {
+        const db = new NodeSqlite.DatabaseSync(NodePath.join(dir, "sessions.db"));
+        try {
+          db.exec(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT); INSERT INTO sessions VALUES ('session', 'priced-model')",
+          );
+          db.exec(
+            "CREATE TABLE message_nodes (row_id INTEGER PRIMARY KEY, session_id TEXT, created_at INTEGER, chat_message TEXT)",
+          );
+          const insert = db.prepare("INSERT INTO message_nodes VALUES (?, 'session', ?, ?)");
+          const message = (id: string, model: string) =>
+            JSON.stringify({
+              role: "assistant",
+              message_id: id,
+              metadata: {
+                generation_model: model,
+                created_at: "2026-08-01T10:00:00Z",
+                committed_credit_cost: 9999,
+                metrics: {
+                  input_tokens: 10,
+                  output_tokens: 5,
+                  cache_read_tokens: 20,
+                  cache_creation_tokens: 2,
+                },
+              },
+            });
+          insert.run(1, BEFORE_NARROW_WINDOW, message("one", "priced-model"));
+          insert.run(2, BEFORE_NARROW_WINDOW, message("one", "priced-model"));
+          insert.run(3, BEFORE_NARROW_WINDOW, message("two", "unpriced-model"));
+        } finally {
+          db.close();
+        }
+      });
+      yield* Effect.gen(function* () {
+        const service = yield* UsageService.make;
+        const summary = yield* service.readSummary(WINDOW);
+        const buckets = summary.buckets.filter((bucket) => bucket.provider === "devin");
+        assert.strictEqual(buckets.length, 2);
+        const priced = buckets.find((bucket) => bucket.model === "priced-model")!;
+        assert.strictEqual(priced.records, 1);
+        assert.deepStrictEqual(priced.totals, {
+          uncachedInputTokens: 10,
+          outputTokens: 5,
+          cachedInputTokens: 20,
+          cacheCreationTokens: 2,
+          reasoningTokens: 0,
+        });
+        assert.approximately(priced.costUsd, 0.044, 0.000001);
+        assert.strictEqual(priced.costSource, "modelPriced");
+        assert.strictEqual(
+          buckets.find((bucket) => bucket.model === "unpriced-model")?.unpricedRecords,
+          1,
+        );
+        const source = summary.sources.find((source) => source.fingerprint.provider === "devin");
+        assert.strictEqual(source?.status, "ok");
+        const decoded = yield* decodeUsageSummary(summary);
+        const merged = mergeUsage(
+          [
+            {
+              environmentId: EnvironmentId.make("local-cli"),
+              label: "Local CLI",
+              summary: decoded,
+            },
+          ],
+          decoded.contractVersion,
+        );
+        assert.strictEqual(
+          merged.providers.find((provider) => provider.provider === "devin")?.totalTokens,
+          74,
+        );
+      }).pipe(
+        Effect.provide(
+          layerService({
+            prefix: "local-cli-history",
+            home,
+            settings,
+            environment: { XDG_DATA_HOME: NodePath.join(home, "data") },
+            ratesDocument: {
+              "priced-model": {
+                input_cost_per_token: 0.001,
+                output_cost_per_token: 0.002,
+                cache_read_input_token_cost: 0.001,
+                cache_creation_input_token_cost: 0.002,
+              },
+            },
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped),
+  );
   it.live(
     "reads Pi per-model usage and auxiliary costs once across forks and repeated entries",
     () =>

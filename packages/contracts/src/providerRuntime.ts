@@ -281,6 +281,7 @@ export const ThreadTokenUsageSnapshot = Schema.Struct({
     Schema.Struct({
       amount: Schema.Number.check(Schema.isFinite()),
       currency: TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(32)),
+      scope: Schema.optional(Schema.Literals(["session", "turn"])),
     }),
   ),
 });

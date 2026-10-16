@@ -73,6 +73,9 @@ function normalizeModels(
   // other portable model inventory.
   const candidates = modelConfigOptions(configOptions).map((model) => ({
     id: model.value,
+    ...(typeof model._meta?.["cognition.ai/supportsImages"] === "boolean"
+      ? { supportsImages: model._meta["cognition.ai/supportsImages"] }
+      : {}),
     name: model.name,
     description: model.description ?? null,
   }));
@@ -84,6 +87,9 @@ function normalizeModels(
     seen.add(id);
     models.push({
       id,
+      ...(candidate.supportsImages === undefined
+        ? {}
+        : { supportsImages: candidate.supportsImages }),
       name: boundedText(candidate.name, MAX_NAME_LENGTH) || id,
       description:
         candidate.description === null
@@ -288,6 +294,7 @@ export function acpRegistryProbeFailure(
 }
 
 export interface AcpRegistryConfigurationProbeInput {
+  readonly normalizeCommands?: typeof normalizeAcpRegistryCommands;
   readonly instanceId: ProviderInstanceId;
   readonly settings: AcpRegistrySettings;
   readonly cwd: string;
@@ -401,10 +408,10 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
       yield* runtime.handleSessionUpdate((notification) => {
         const update = notification.update;
         return update.sessionUpdate === "available_commands_update"
-          ? Ref.set(commandsRef, normalizeAcpRegistryCommands(update.availableCommands)).pipe(
-              Effect.andThen(Deferred.succeed(commandsAdvertised, undefined)),
-              Effect.asVoid,
-            )
+          ? Ref.set(
+              commandsRef,
+              (input.normalizeCommands ?? normalizeAcpRegistryCommands)(update.availableCommands),
+            ).pipe(Effect.andThen(Deferred.succeed(commandsAdvertised, undefined)), Effect.asVoid)
           : Effect.void;
       });
       const startResult = yield* Effect.result(runtime.start());

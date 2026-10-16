@@ -15,6 +15,8 @@ import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
@@ -112,6 +114,7 @@ function modelsFromDiscovery(
       : discovered.map((model) => ({
           slug: model.id,
           name: model.name,
+          ...(model.supportsImages === undefined ? {} : { supportsImages: model.supportsImages }),
           isCustom: false,
           ...(model.id === discovery?.currentModelId ? { isDefault: true } : {}),
           capabilities,
@@ -471,10 +474,42 @@ export const makeAcpRegistryDriver = <Settings extends AcpRegistrySettings>(opti
   ) => NodeJS.ProcessEnv;
   /** Dedicated drivers can reserve session-creating discovery for the user's Refresh action. */
   readonly backgroundSessionProbe?: boolean;
+  readonly workspaceSnapshot?: (
+    settings: Settings,
+    environment: NodeJS.ProcessEnv,
+    cwd: string,
+    provider: ServerProvider,
+  ) => Effect.Effect<
+    ServerProvider & { readonly slashCommandsPending?: boolean },
+    never,
+    ChildProcessSpawner.ChildProcessSpawner | import("effect/FileSystem").FileSystem
+  >;
+  readonly normalizeCommands?: typeof import("./probe.ts").normalizeAcpRegistryCommands;
+  readonly readTextGenerationSupport?: (
+    settings: Settings,
+    environment: NodeJS.ProcessEnv,
+  ) => Effect.Effect<boolean, never, ChildProcessSpawner.ChildProcessSpawner>;
+  readonly makeTextGeneration?: (
+    settings: Settings,
+    environment: NodeJS.ProcessEnv,
+  ) => Effect.Effect<
+    ProviderTextGeneration,
+    never,
+    ChildProcessSpawner.ChildProcessSpawner | Crypto.Crypto | import("effect/FileSystem").FileSystem
+  >;
   readonly readVersion?: (
     settings: Settings,
     environment: NodeJS.ProcessEnv,
   ) => Effect.Effect<string | null, never, ChildProcessSpawner.ChildProcessSpawner>;
+  /** Read-only native discovery avoids creating disposable ACP sessions at startup. */
+  readonly readModels?: (
+    settings: Settings,
+    environment: NodeJS.ProcessEnv,
+  ) => Effect.Effect<
+    ReadonlyArray<ServerProviderModel> | null,
+    never,
+    ChildProcessSpawner.ChildProcessSpawner
+  >;
 }): ProviderDriver<Settings, AcpRegistryDriverEnv> => ({
   driverKind: options.driverKind,
   metadata: {
@@ -514,6 +549,7 @@ export const makeAcpRegistryDriver = <Settings extends AcpRegistrySettings>(opti
       }
       const crypto = yield* Crypto.Crypto;
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
       const hostEnvironment = yield* HostProcess.Environment;
       const host = yield* ProviderHost.ProviderHost;
       const continuationIdentity = defaultProviderContinuationIdentity({
@@ -534,6 +570,57 @@ export const makeAcpRegistryDriver = <Settings extends AcpRegistrySettings>(opti
       );
       const processEnvironment =
         options.prepareProcessEnvironment?.(mergedEnvironment, environment) ?? mergedEnvironment;
+      const [readModels, invalidateModels] = yield* Effect.cachedInvalidateWithTTL(
+        options.readModels
+          ? options
+              .readModels(config, processEnvironment)
+              .pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner))
+          : Effect.succeed(null),
+        (exit) => (Exit.isSuccess(exit) && exit.value !== null ? PROBE_SUCCESS_TTL_MS : 0),
+      );
+      const withNativeModels = (provider: ServerProvider) =>
+        Effect.gen(function* () {
+          if (!provider.enabled || !provider.installed || !options.readModels) return provider;
+          const catalog = yield* readModels;
+          if (catalog === null)
+            return provider.models.some((model) => model.slug !== "default" && !model.isCustom)
+              ? provider
+              : {
+                  ...provider,
+                  status: provider.status === "ready" ? ("warning" as const) : provider.status,
+                  message:
+                    provider.message ??
+                    "Native model discovery is unavailable. Refresh after signing in or updating the CLI; the native default and custom selections remain available.",
+                };
+          const current = new Map(provider.models.map((model) => [model.slug, model]));
+          const nativeIds = new Set(catalog.map((model) => model.slug));
+          return {
+            ...provider,
+            models: [
+              ...catalog.map((model) => ({
+                ...model,
+                ...(current.get(model.slug)?.isCustom
+                  ? { isCustom: true, name: current.get(model.slug)!.name }
+                  : {}),
+                ...(current.get(model.slug)?.supportsImages === undefined
+                  ? {}
+                  : { supportsImages: current.get(model.slug)!.supportsImages }),
+                capabilities:
+                  current.get(model.slug)?.capabilities ??
+                  provider.models[0]?.capabilities ??
+                  model.capabilities,
+                ...(current.get(model.slug)?.isDefault ? { isDefault: true } : {}),
+              })),
+              ...provider.models.filter(
+                (model) =>
+                  !nativeIds.has(model.slug) && (model.isCustom || model.slug === "default"),
+              ),
+            ],
+          };
+        });
+      const textGeneration = options.makeTextGeneration
+        ? yield* options.makeTextGeneration(config, processEnvironment)
+        : makeUnsupportedTextGeneration();
       const orchestrationAdapter = yield* options.adapterDriver
         .create({
           instanceId,
@@ -598,14 +685,30 @@ export const makeAcpRegistryDriver = <Settings extends AcpRegistrySettings>(opti
                   return applyAcpRegistryUrlAuthAction(withConfiguration, authAction);
                 }),
               );
-        }).pipe(Effect.map(options.presentSnapshot ?? ((snapshot) => snapshot)));
+        }).pipe(
+          Effect.flatMap(withNativeModels),
+          Effect.map(options.presentSnapshot ?? ((snapshot) => snapshot)),
+        );
       const withVersion = (snapshot: ServerProvider) =>
-        options.readVersion && snapshot.installed
-          ? options.readVersion(config, processEnvironment).pipe(
-              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-              Effect.map((version) => ({ ...snapshot, version })),
-            )
-          : Effect.succeed(snapshot);
+        Effect.gen(function* () {
+          const version =
+            options.readVersion && snapshot.installed
+              ? yield* options
+                  .readVersion(config, processEnvironment)
+                  .pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner))
+              : snapshot.version;
+          const supportsTextGeneration =
+            options.readTextGenerationSupport && snapshot.installed && snapshot.enabled
+              ? yield* options
+                  .readTextGenerationSupport(config, processEnvironment)
+                  .pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner))
+              : false;
+          return {
+            ...snapshot,
+            version,
+            ...(options.readTextGenerationSupport ? { supportsTextGeneration } : {}),
+          };
+        });
       const checkProvider = checkAcpRegistryProviderReadiness(readinessInput).pipe(
         Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
         Effect.flatMap(withVersion),
@@ -627,7 +730,11 @@ export const makeAcpRegistryDriver = <Settings extends AcpRegistrySettings>(opti
           ...readinessInput,
           cwd: host.paths.cwd,
         },
-        probeAcpRegistryConfiguration,
+        (input) =>
+          probeAcpRegistryConfiguration({
+            ...input,
+            ...(options.normalizeCommands ? { normalizeCommands: options.normalizeCommands } : {}),
+          }),
       ).pipe(
         Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
@@ -740,12 +847,15 @@ export const makeAcpRegistryDriver = <Settings extends AcpRegistrySettings>(opti
               liveSnapshotSemaphore.withPermit(
                 getSnapshot.pipe(
                   Effect.flatMap((current) =>
-                    publishSnapshot(
+                    withNativeModels(
                       applyAcpRegistryLiveConfiguration(
                         current,
                         configuration,
                         effectiveConfig.customModels,
                       ),
+                    ).pipe(
+                      Effect.map(options.presentSnapshot ?? ((provider) => provider)),
+                      Effect.flatMap(publishSnapshot),
                     ),
                   ),
                 ),
@@ -847,6 +957,7 @@ export const makeAcpRegistryDriver = <Settings extends AcpRegistrySettings>(opti
             .set(authenticated)
             .pipe(
               Effect.andThen(authenticated ? Effect.void : clearLiveState),
+              Effect.andThen(invalidateModels),
               Effect.andThen(liveSnapshotSemaphore.withPermit(invalidateEnrichmentCache)),
               Effect.andThen(refreshProvider),
               Effect.asVoid,
@@ -861,6 +972,7 @@ export const makeAcpRegistryDriver = <Settings extends AcpRegistrySettings>(opti
         invalidate: (controller.invalidate ?? Effect.void).pipe(
           Effect.andThen(confirmedAuthentication.set(false)),
           Effect.andThen(clearLiveState),
+          Effect.andThen(invalidateModels),
           Effect.andThen(liveSnapshotSemaphore.withPermit(invalidateEnrichmentCache)),
           Effect.andThen(refreshProvider),
           Effect.asVoid,
@@ -877,10 +989,29 @@ export const makeAcpRegistryDriver = <Settings extends AcpRegistrySettings>(opti
         auth,
         snapshot: {
           ...snapshot,
-          refresh: refreshProvider.pipe(Effect.tap(() => controller.refreshMethods ?? Effect.void)),
+          refresh: invalidateModels.pipe(
+            Effect.andThen(clearLiveState),
+            Effect.andThen(refreshProvider),
+            Effect.tap(() => controller.refreshMethods ?? Effect.void),
+          ),
         },
+        ...(options.workspaceSnapshot
+          ? {
+              snapshotForCwd: (cwd: string) =>
+                snapshot.getSnapshot.pipe(
+                  Effect.flatMap((provider) =>
+                    provider.installed && provider.enabled
+                      ? options.workspaceSnapshot!(config, processEnvironment, cwd, provider).pipe(
+                          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+                          Effect.provideService(FileSystem.FileSystem, fileSystem),
+                        )
+                      : Effect.succeed(provider),
+                  ),
+                ),
+            }
+          : {}),
         orchestrationAdapter,
-        textGeneration: makeUnsupportedTextGeneration(),
+        textGeneration,
         acpSessionManagement: {
           listSessions: ({ cwd, cursor }) =>
             provideAcpManagementServices(
@@ -945,6 +1076,7 @@ export const makeAcpRegistryDriver = <Settings extends AcpRegistrySettings>(opti
               Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
               Effect.provideService(Crypto.Crypto, crypto),
               Effect.tap(() => confirmedAuthentication.set(false)),
+              Effect.tap(() => invalidateModels),
               Effect.tap(() =>
                 liveSnapshotSemaphore.withPermit(
                   invalidateEnrichmentCache.pipe(

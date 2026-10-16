@@ -794,6 +794,8 @@ describe("AcpAdapterV2", () => {
         flavor: {
           driver: ACP_TEST_DRIVER,
           capabilities: AcpProviderCapabilitiesV2,
+          supportsCompaction: true,
+          commandPromptsAreVerbatim: true,
           makeRuntime: makeMockRuntime({ childProcessSpawner, mockAgentPath, protocolEvents }),
         },
         selfInvocation,
@@ -823,7 +825,7 @@ describe("AcpAdapterV2", () => {
         runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
         messageText: string,
       ) {
-        yield* runtime.startTurn(
+        yield* (ordinal === 0 ? runtime.compactThread! : runtime.startTurn)(
           makeTurnInput({
             threadId,
             providerThread,
@@ -852,7 +854,7 @@ describe("AcpAdapterV2", () => {
       });
 
       const command = yield* runTurn(0, defaultPolicy, "/compact");
-      assert.isTrue(command.prompt.startsWith("/compact"));
+      assert.equal(command.prompt, "/compact");
       assert.notInclude(command.prompt, "<t3_code_instructions>");
       const firstDefault = yield* runTurn(1, defaultPolicy, "First default request.");
       assert.include(firstDefault.prompt, "T3 Code interaction mode: Default");

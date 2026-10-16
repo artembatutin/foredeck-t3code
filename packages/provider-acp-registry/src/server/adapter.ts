@@ -72,6 +72,7 @@ export interface AcpRegistryAdapterV2Options {
   readonly flavor?: Partial<AcpAdapterV2Flavor>;
   readonly clientTerminals?: Parameters<typeof makeAcpAdapterV2>[0]["clientTerminals"];
   readonly authenticateOnAuthRequired?: boolean;
+  readonly normalizeCommands?: typeof normalizeAcpRegistryCommands;
   readonly nativeLogging?: Parameters<typeof makeAcpAdapterV2>[0]["nativeLogging"];
   readonly makeRuntime?: (
     input: AcpAdapterV2RuntimeInput,
@@ -244,7 +245,7 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
           onAvailableCommandsUpdate: (commands) =>
             runtimeCoordinator.publishAvailableCommands(
               options.instanceId,
-              normalizeAcpRegistryCommands(commands),
+              (options.normalizeCommands ?? normalizeAcpRegistryCommands)(commands),
             ),
           onSessionConfigurationUpdate: (configOptions, modeState) =>
             runtimeCoordinator.publishLiveConfiguration(
@@ -303,9 +304,12 @@ export const makeAcpRegistryAdapterDriver = <Settings extends AcpRegistrySetting
   readonly driverKind: ProviderDriverKind;
   readonly configSchema: Schema.Codec<Settings, unknown>;
   readonly defaultConfig: () => Settings;
-  readonly flavor?: Partial<AcpAdapterV2Flavor>;
+  readonly flavor?:
+    | Partial<AcpAdapterV2Flavor>
+    | ((settings: Settings, environment: NodeJS.ProcessEnv) => Partial<AcpAdapterV2Flavor>);
   readonly clientTerminals?: boolean;
   readonly authenticateOnAuthRequired?: boolean;
+  readonly normalizeCommands?: typeof normalizeAcpRegistryCommands;
   readonly prepareProcessEnvironment?: (
     environment: NodeJS.ProcessEnv,
     configured: ProviderInstanceEnvironment,
@@ -334,7 +338,17 @@ export const makeAcpRegistryAdapterDriver = <Settings extends AcpRegistrySetting
         ...(options.authenticateOnAuthRequired === undefined
           ? {}
           : { authenticateOnAuthRequired: options.authenticateOnAuthRequired }),
-        ...(options.flavor === undefined ? {} : { flavor: options.flavor }),
+        ...(options.flavor === undefined
+          ? {}
+          : {
+              flavor:
+                typeof options.flavor === "function"
+                  ? options.flavor(input.config, environment)
+                  : options.flavor,
+            }),
+        ...(options.normalizeCommands === undefined
+          ? {}
+          : { normalizeCommands: options.normalizeCommands }),
         ...(options.clientTerminals
           ? { clientTerminals: { environment, shellCommands: true } }
           : {}),

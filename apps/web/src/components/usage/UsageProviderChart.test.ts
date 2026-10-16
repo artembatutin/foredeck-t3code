@@ -115,6 +115,7 @@ describe("buildPeriodColumns", () => {
       { provider: "opencode", value: 0 },
       { provider: "antigravity", value: 0 },
       { provider: "pi", value: 5 },
+      { provider: "devin", value: 0 },
     ]);
   });
 

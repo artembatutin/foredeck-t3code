@@ -57,6 +57,10 @@ type ModelPickerItem = {
   slug: string;
   name: string;
   shortName?: string;
+  costSummary?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  supportsImages?: boolean;
   subProvider?: string;
   badge?: "new";
   instanceId: ProviderInstanceId;
@@ -391,6 +395,10 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
           slug: model.slug,
           name: model.name,
           ...(model.shortName ? { shortName: model.shortName } : {}),
+          ...(model.costSummary ? { costSummary: model.costSummary } : {}),
+          ...(model.contextWindow ? { contextWindow: model.contextWindow } : {}),
+          ...(model.maxOutputTokens ? { maxOutputTokens: model.maxOutputTokens } : {}),
+          ...(model.supportsImages === undefined ? {} : { supportsImages: model.supportsImages }),
           ...(model.subProvider ? { subProvider: model.subProvider } : {}),
           ...(model.badge ? { badge: model.badge } : {}),
           ...(model.isLegacy ? { isLegacy: true } : {}),
@@ -459,6 +467,12 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
             {
               name: model.name,
               ...(model.shortName ? { shortName: model.shortName } : {}),
+              ...(model.costSummary ? { costSummary: model.costSummary } : {}),
+              ...(model.contextWindow ? { contextWindow: model.contextWindow } : {}),
+              ...(model.maxOutputTokens ? { maxOutputTokens: model.maxOutputTokens } : {}),
+              ...(model.supportsImages === undefined
+                ? {}
+                : { supportsImages: model.supportsImages }),
               ...(model.subProvider ? { subProvider: model.subProvider } : {}),
               driverKind: model.driverKind,
               providerDisplayName: model.instanceDisplayName,
@@ -470,6 +484,10 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
           tieBreaker: buildModelPickerSearchText({
             name: model.name,
             ...(model.shortName ? { shortName: model.shortName } : {}),
+            ...(model.costSummary ? { costSummary: model.costSummary } : {}),
+            ...(model.contextWindow ? { contextWindow: model.contextWindow } : {}),
+            ...(model.maxOutputTokens ? { maxOutputTokens: model.maxOutputTokens } : {}),
+            ...(model.supportsImages === undefined ? {} : { supportsImages: model.supportsImages }),
             ...(model.subProvider ? { subProvider: model.subProvider } : {}),
             driverKind: model.driverKind,
             providerDisplayName: model.instanceDisplayName,

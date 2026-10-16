@@ -17,6 +17,7 @@ import * as AcpRegistrySupport from "../../server/AcpRegistrySupport.ts";
 import { AcpRegistryDriver } from "../../server/driver.ts";
 import { AcpRegistryAdapterV2Driver } from "../../server/adapter.ts";
 import { DevinDriver, prepareDevinEnvironment, readDevinVersion } from "./index.ts";
+import { readDevinModels } from "./models.ts";
 
 const layerTest = TestProviderHost.layer({ runBackgroundWork: false }).pipe(
   Layer.provideMerge(NodeServices.layer),
@@ -79,6 +80,95 @@ describe("Devin CLI configuration", () => {
 });
 
 it.layer(layerTest)("DevinDriver", (it) => {
+  it.effect("discovers priced reasoning variants before opening an ACP session", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "local-agent-models-" });
+      const commandPath = writeFakeCli({
+        directory,
+        name: "devin",
+        source: `
+          const args = process.argv.slice(2).join(' ');
+          if (args === 'version') { process.stdout.write('devin 3000.6.14'); }
+          else if (args === 'models list --format json') {
+            if (process.env.WINDSURF_API_KEY) process.exit(13);
+            process.stdout.write(JSON.stringify({families:[{variants:[
+              {model_uid:'native-low',label:'Native Low Thinking',cost_summary:'3 credits / message',max_context_tokens:200000,max_output_tokens:64000},
+              {model_uid:'native-high',label:'Native High Thinking',cost_summary:'8 credits / message',is_new:true},
+              {model_uid:'native-high',label:'Duplicate'},
+              {model_uid:' bad-id ',label:'Invalid'}
+            ]}]}));
+          } else { process.exit(12); }
+        `,
+      });
+      const instance = yield* DevinDriver.create({
+        instanceId: ProviderInstanceId.make("native-catalog-test"),
+        enabled: true,
+        displayName: undefined,
+        accentColor: undefined,
+        environment: [],
+        config: { ...DEFAULT_DEVIN_SETTINGS, commandPath },
+      }).pipe(
+        Effect.provideService(
+          AcpRegistrySupport.AcpRegistryCatalog,
+          AcpRegistrySupport.AcpRegistryCatalog.of({
+            ...(yield* AcpRegistrySupport.AcpRegistryCatalog),
+            inspect: () =>
+              Effect.succeed({
+                status: "ready",
+                agentId: "devin",
+                version: null,
+                distribution: "local",
+              } as const),
+          }),
+        ),
+      );
+      const snapshot = yield* instance.snapshot.getSnapshot;
+      expect(snapshot.models.map(({ slug, name }) => ({ slug, name }))).toEqual([
+        { slug: "native-low", name: "Native Low Thinking" },
+        { slug: "native-high", name: "Native High Thinking" },
+        { slug: "default", name: "Default" },
+      ]);
+      expect(snapshot.models[0]).toMatchObject({
+        costSummary: "3 credits / message",
+        contextWindow: 200000,
+        maxOutputTokens: 64000,
+      });
+      expect(snapshot.models[1]?.badge).toBe("new");
+      expect(snapshot.status).toBe("ready");
+      expect(snapshot.version).toBe("3000.6.14");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("tolerates old CLI commands and invalid or empty catalog output", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        prefix: "local-agent-model-fallback-",
+      });
+      for (const source of [
+        "process.stderr.write('unsupported command'); process.exit(2)",
+        "process.stdout.write('not json')",
+        "process.stdout.write(JSON.stringify({families:[{variants:[{model_uid:'partial',label:'Partial'}]}]})); process.exit(2)",
+
+        "process.stdout.write(JSON.stringify({families:[{variants:[{model_uid:42,label:'bad'}]}]}))",
+      ]) {
+        const commandPath = writeFakeCli({ directory, name: "devin", source });
+        expect(
+          yield* readDevinModels({ ...DEFAULT_DEVIN_SETTINGS, commandPath }, process.env),
+        ).toBeNull();
+      }
+      const empty = writeFakeCli({
+        directory,
+        name: "devin",
+        source: "process.stdout.write(JSON.stringify({families:[]}))",
+      });
+      expect(
+        yield* readDevinModels({ ...DEFAULT_DEVIN_SETTINGS, commandPath: empty }, process.env),
+      ).toEqual([]);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect(
     "reads the installed build with the read-only version command and tolerates unknown output",
     () =>

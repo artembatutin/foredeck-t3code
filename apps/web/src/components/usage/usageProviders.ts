@@ -46,6 +46,11 @@ export const PROVIDER_PRESENTATION = {
     color: "#4d9f8a",
     driverKind: ProviderDriverKind.make("pi"),
   },
+  devin: {
+    label: "Devin CLI",
+    color: "#b88631",
+    driverKind: ProviderDriverKind.make("devin"),
+  },
 } satisfies Record<UsageProviderKind, UsageProviderPresentation>;
 
 /** Stable provider reading order across charts, summaries, tables, and hover rows. */

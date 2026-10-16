@@ -1,3 +1,4 @@
+import { modelMetadataSubtitle } from "../fd/provider-models/index";
 import type { MenuAction } from "@react-native-menu/menu";
 import type {
   ModelCapabilities,
@@ -305,7 +306,7 @@ export function buildModelOptions(
       options.set(key, {
         key,
         label: model.name,
-        subtitle: model.subProvider ?? "",
+        subtitle: modelMetadataSubtitle(model),
         providerKey: provider.instanceId,
         providerLabel,
         providerDriver: provider.driver,
@@ -369,7 +370,7 @@ export function buildModelOptions(
       options.set(key, {
         key,
         label: model?.name ?? fallbackModelSelection.model,
-        subtitle: model?.subProvider ?? "",
+        subtitle: modelMetadataSubtitle(model),
         providerKey: fallbackModelSelection.instanceId,
         providerLabel,
         providerDriver,

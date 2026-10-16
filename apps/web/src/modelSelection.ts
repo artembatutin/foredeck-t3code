@@ -73,6 +73,10 @@ export interface AppModelOption {
   slug: string;
   name: string;
   shortName?: string;
+  costSummary?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  supportsImages?: boolean;
   subProvider?: string;
   aliases?: ReadonlyArray<string>;
   badge?: "new";
@@ -109,6 +113,10 @@ function toAppModelOption(model: ServerProvider["models"][number]): AppModelOpti
     name: model.name,
     isCustom: model.isCustom,
   };
+  if (model.costSummary) option.costSummary = model.costSummary;
+  if (model.contextWindow) option.contextWindow = model.contextWindow;
+  if (model.maxOutputTokens) option.maxOutputTokens = model.maxOutputTokens;
+  if (model.supportsImages !== undefined) option.supportsImages = model.supportsImages;
   if (model.shortName) option.shortName = model.shortName;
   if (model.subProvider) option.subProvider = model.subProvider;
   if (model.aliases) option.aliases = model.aliases;

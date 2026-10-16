@@ -87,7 +87,8 @@ export type BuiltInUsageReadersEnv =
   | ProviderUsageReaderEnv<typeof OpenCodeDriver>
   | ProviderUsageReaderEnv<typeof AntigravityDriver>
   | ProviderUsageReaderEnv<typeof CursorDriver>
-  | ProviderUsageReaderEnv<typeof PiDriver>;
+  | ProviderUsageReaderEnv<typeof PiDriver>
+  | ProviderUsageReaderEnv<typeof DevinDriver>;
 
 /**
  * The drivers that keep usage history, in the order the usage page reads
@@ -104,4 +105,5 @@ export const BUILT_IN_USAGE_DRIVERS: ReadonlyArray<
   OpenCodeDriver,
   AntigravityDriver,
   CursorDriver,
+  DevinDriver,
 ];

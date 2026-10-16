@@ -82,6 +82,11 @@ export const ServerProviderModel = Schema.Struct({
   slug: TrimmedNonEmptyString,
   name: TrimmedNonEmptyString,
   shortName: Schema.optional(TrimmedNonEmptyString),
+  /** Provider-advertised estimate, in its native billing unit; never a dollar price. */
+  costSummary: Schema.optional(TrimmedNonEmptyString),
+  contextWindow: Schema.optional(Schema.Int.check(Schema.isGreaterThan(0))),
+  maxOutputTokens: Schema.optional(Schema.Int.check(Schema.isGreaterThan(0))),
+  supportsImages: Schema.optional(Schema.Boolean),
   subProvider: Schema.optional(TrimmedNonEmptyString),
   aliases: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
   badge: Schema.optional(Schema.Literal("new")),

@@ -265,6 +265,7 @@ export const AcpRegistryLogoutResult = Schema.Struct({
 export type AcpRegistryLogoutResult = typeof AcpRegistryLogoutResult.Type;
 
 export const AcpRegistryProbeModel = Schema.Struct({
+  supportsImages: Schema.optional(Schema.Boolean),
   id: AcpRegistryProbeText,
   name: AcpRegistryProbeText,
   description: AcpRegistryProbeDescription,

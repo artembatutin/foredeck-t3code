@@ -1,3 +1,4 @@
+import { ModelMetadata } from "../../fd/provider-models/index";
 import { type ProviderDriverKind, type ProviderInstanceId } from "@t3tools/contracts";
 import { memo } from "react";
 import { CheckIcon, StarIcon } from "lucide-react";
@@ -82,6 +83,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
             </Badge>
           ) : null}
         </div>
+        <ModelMetadata model={props.model} />
         {props.showProvider && (
           <div className="mt-1 flex items-center gap-1.5">
             <ProviderInstanceIcon

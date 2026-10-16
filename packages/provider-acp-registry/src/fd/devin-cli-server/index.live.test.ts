@@ -13,11 +13,13 @@ import * as Layer from "effect/Layer";
 import * as HttpClient from "effect/http/HttpClient";
 
 import * as AcpRegistrySupport from "../../server/AcpRegistrySupport.ts";
+import * as AcpRegistryRuntimeCoordinator from "../../server/AcpRegistryRuntimeCoordinator.ts";
 import { DEFAULT_DEVIN_SETTINGS } from "../devin/index.ts";
 import { DevinDriver } from "./index.ts";
 
 const layerInfrastructure = Layer.mergeAll(
   NodeServices.layer,
+  AcpRegistryRuntimeCoordinator.layer,
   IdAllocator.layer,
   McpProviderSessions.layer,
   TestProviderHost.layer().pipe(Layer.provide(NodeServices.layer)),
@@ -56,8 +58,9 @@ it.live.skipIf(process.env.DEVIN_CLI_LIVE !== "1")(
         showInteractionModeToggle: false,
       });
       expect(initial.message).toBe(
-        "Refresh this provider to discover models, commands, and native sessions.",
+        "Refresh this provider to discover commands and native sessions.",
       );
+      expect(initial.models.some((model) => model.slug !== "default")).toBe(true);
 
       const snapshot = yield* instance.snapshot.refresh;
       yield* Effect.logInfo("Local CLI discovery", {
@@ -72,7 +75,9 @@ it.live.skipIf(process.env.DEVIN_CLI_LIVE !== "1")(
       const adapter = instance.orchestrationAdapter;
       if (!adapter) return yield* Effect.die("Dedicated CLI adapter missing");
       const threadId = ThreadId.make("devin-live-thread");
-      const modelSelection = { instanceId, model: "default" };
+      const model = initial.models.find((candidate) => candidate.slug !== "default");
+      if (!model) return yield* Effect.die("Native model catalog missing");
+      const modelSelection = { instanceId, model: model.slug };
       const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
         runtimeMode: "approval-required",
         interactionMode: "default",
@@ -92,6 +97,9 @@ it.live.skipIf(process.env.DEVIN_CLI_LIVE !== "1")(
       const nativeThread = yield* runtime.ensureThread({ threadId, modelSelection, runtimePolicy });
       expect(nativeThread.driver).toBe("devin");
       expect(nativeThread.nativeThreadRef).toBeTruthy();
+      const coordinator = yield* AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator;
+      const configuration = yield* coordinator.getLiveConfiguration(instanceId);
+      expect(configuration).toMatchObject({ _tag: "Some", value: { currentModelId: model.slug } });
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   { timeout: 60_000 },
 );

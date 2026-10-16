@@ -87,12 +87,7 @@ export function ModelRowContent(
             ) : null}
           </View>
           {props.option.subtitle ? (
-            <Text
-              className="text-xs text-foreground-muted"
-              numberOfLines={props.labelNumberOfLines}
-            >
-              {props.option.subtitle}
-            </Text>
+            <Text className="text-xs text-foreground-muted">{props.option.subtitle}</Text>
           ) : null}
         </View>
         {props.trailingSelection}

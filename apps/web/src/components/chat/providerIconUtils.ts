@@ -2,6 +2,10 @@ export type ModelEsque = {
   slug: string;
   name: string;
   shortName?: string | undefined;
+  costSummary?: string | undefined;
+  contextWindow?: number | undefined;
+  maxOutputTokens?: number | undefined;
+  supportsImages?: boolean | undefined;
   subProvider?: string | undefined;
   aliases?: ReadonlyArray<string> | undefined;
   isDefault?: boolean | undefined;

@@ -167,6 +167,16 @@ export interface AcpAdapterV2UserInputRequest {
 
 export interface AcpAdapterV2ExtensionContext {
   readonly runtime: AcpSessionRuntime.AcpSessionRuntime["Service"];
+  readonly reportUsage: (notice: {
+    readonly sessionId: string;
+    readonly usage: Partial<ThreadTokenUsageSnapshot>;
+  }) => Effect.Effect<void>;
+  readonly reportCompaction: (notice: {
+    readonly sessionId: string;
+    readonly compactionId: string;
+    readonly status: "in_progress" | "completed" | "failed";
+    readonly summary?: string;
+  }) => Effect.Effect<void>;
   readonly reportProviderRetry: (input: {
     readonly sessionId: string;
     readonly failure: OrchestrationV2ProviderFailure;
@@ -221,6 +231,10 @@ export interface AcpAdapterV2Flavor {
   readonly clientCapabilitiesMeta?: NonNullable<
     EffectAcpSchema.InitializeRequest["clientCapabilities"]
   >["_meta"];
+  readonly normalizeUsage?: (
+    notification: EffectAcpSchema.SessionNotification,
+    usage: ThreadTokenUsageSnapshot,
+  ) => ThreadTokenUsageSnapshot;
   readonly normalizeSessionUpdate?: (
     notification: EffectAcpSchema.SessionNotification,
   ) => EffectAcpSchema.SessionNotification;
@@ -314,6 +328,19 @@ export interface AcpAdapterV2Flavor {
   /** Batch launches without child completion signals become idle when the root turn ends. */
   readonly subagentsIdleOnTurnCompletion?: boolean;
   readonly supportsCompaction?: boolean;
+  /** Native commands must not acquire instruction blocks as command arguments. */
+  readonly preparePrompt?: (
+    text: string,
+    commands: ReadonlyArray<EffectAcpSchema.AvailableCommand>,
+    cwd: string,
+  ) => Effect.Effect<string, EffectAcpErrors.AcpError, ChildProcessSpawner.ChildProcessSpawner>;
+  readonly commandPromptsAreVerbatim?: boolean;
+  readonly requireAdvertisedCompaction?: boolean;
+  readonly runPrompt?: (
+    runtime: AcpSessionRuntime.AcpSessionRuntime["Service"],
+    sessionId: string,
+    prompt: ReadonlyArray<EffectAcpSchema.ContentBlock>,
+  ) => Effect.Effect<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
   readonly runtimeHarness?: string;
   readonly registerExtensions?: (
     context: AcpAdapterV2ExtensionContext,
@@ -432,6 +459,10 @@ export interface AcpAdapterV2Flavor {
    * false; without this override, screenshot turns fail before `session/prompt`.
    */
   readonly supportsImagePrompts?: boolean;
+  readonly modelSupportsImages?: (
+    options: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
+    model: string,
+  ) => boolean;
 }
 
 /** Whether image attachment blocks may be included in session/prompt. */
@@ -4127,11 +4158,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             );
             if (stateEvent === undefined) return;
             if (stateEvent._tag === "UsageUpdated") {
+              const usage =
+                flavor.normalizeUsage?.(notification, stateEvent.usage) ?? stateEvent.usage;
               yield* Ref.update(contextUsageBySessionId, (current) =>
-                new Map(current).set(notification.sessionId, stateEvent.usage),
+                new Map(current).set(notification.sessionId, usage),
               );
               if (context?.nativeThreadId === notification.sessionId) {
-                context.contextUsage = stateEvent.usage;
+                context.contextUsage = usage;
               }
             } else {
               const metadata = yield* Ref.modify(nativeMetadataBySessionId, (current) => {
@@ -5464,6 +5497,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           }
         });
 
+        const sessionCommands = new Map<string, ReadonlyArray<EffectAcpSchema.AvailableCommand>>();
         const projectAcpRuntimeSessionUpdateEffect = (
           rawNotification: EffectAcpSchema.SessionNotification,
         ) =>
@@ -5485,6 +5519,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     clientTerminals.readOutputSnapshot,
                   );
             if (notification.update.sessionUpdate === "available_commands_update") {
+              sessionCommands.set(notification.sessionId, notification.update.availableCommands);
               yield* (
                 flavor.onAvailableCommandsUpdate?.(notification.update.availableCommands) ??
                   Effect.void
@@ -5938,6 +5973,83 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           if (flavor.registerExtensions !== undefined) {
             yield* flavor.registerExtensions({
               runtime: targetRuntime,
+              reportUsage: (notice) =>
+                runRuntimeCallbackAtGeneration(
+                  handlerGeneration,
+                  Effect.gen(function* () {
+                    const previous = (yield* Ref.get(contextUsageBySessionId)).get(
+                      notice.sessionId,
+                    );
+                    const usedTokens = notice.usage.usedTokens ?? previous?.usedTokens;
+                    if (usedTokens === undefined) return;
+                    const usage = { ...previous, ...notice.usage, usedTokens };
+                    yield* Ref.update(contextUsageBySessionId, (current) =>
+                      new Map(current).set(notice.sessionId, usage),
+                    );
+                    const active = yield* Ref.get(activeTurn);
+                    if (active?.nativeThreadId === notice.sessionId) active.contextUsage = usage;
+                    const known = (yield* Ref.get(providerThreadByNativeSessionId)).get(
+                      notice.sessionId,
+                    );
+                    if (!known) return;
+                    const providerThread = {
+                      ...known,
+                      contextUsage: usage,
+                      updatedAt: yield* DateTime.now,
+                    };
+                    yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+                      new Map(current).set(notice.sessionId, providerThread),
+                    );
+                    yield* emitProviderEvent({
+                      type: "provider_thread.updated",
+                      driver,
+                      providerThread,
+                    });
+                  }),
+                ).pipe(Effect.asVoid),
+              reportCompaction: (notice) =>
+                runRuntimeCallbackAtGeneration(
+                  handlerGeneration,
+                  Effect.gen(function* () {
+                    yield* projectAcpRuntimeSessionUpdateEffect({
+                      sessionId: notice.sessionId,
+                      update: {
+                        sessionUpdate: "compaction_update",
+                        compactionId: notice.compactionId,
+                        status: notice.status,
+                        ...(notice.summary
+                          ? { summary: [{ type: "text", text: notice.summary }] }
+                          : {}),
+                      },
+                    }).pipe(Effect.orDie);
+                    if (notice.status !== "completed") return;
+                    // A successful compaction invalidates the old context measurement. Wait for native usage rather than estimating the new size.
+                    yield* Ref.update(contextUsageBySessionId, (current) => {
+                      const next = new Map(current);
+                      next.delete(notice.sessionId);
+                      return next;
+                    });
+                    const active = yield* Ref.get(activeTurn);
+                    if (active?.nativeThreadId === notice.sessionId) active.contextUsage = null;
+                    const known = (yield* Ref.get(providerThreadByNativeSessionId)).get(
+                      notice.sessionId,
+                    );
+                    if (!known) return;
+                    const providerThread = {
+                      ...known,
+                      contextUsage: null,
+                      updatedAt: yield* DateTime.now,
+                    };
+                    yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+                      new Map(current).set(notice.sessionId, providerThread),
+                    );
+                    yield* emitProviderEvent({
+                      type: "provider_thread.updated",
+                      driver,
+                      providerThread,
+                    });
+                  }),
+                ).pipe(Effect.asVoid),
               reportProviderRetry: (notice) =>
                 runRuntimeCallbackAtGeneration(handlerGeneration, reportProviderRetry(notice)).pipe(
                   Effect.asVoid,
@@ -6796,11 +6908,27 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             hasT3Mcp: (yield* readMcpContext(turnInput.threadId)).servers.length > 0,
           } satisfies T3AcpInstructionState;
           const previousInstructionState = (yield* Ref.get(promptInstructionStates)).get(sessionId);
-          const messageText = providerMessageTextWithAttachmentPaths({
+          const attachmentText = providerMessageTextWithAttachmentPaths({
             text: turnInput.message.text,
             attachments: turnInput.message.attachments,
             resolveAttachmentPath: host.resolveAttachmentPath,
           });
+          const messageText = flavor.preparePrompt
+            ? yield* flavor
+                .preparePrompt(
+                  attachmentText,
+                  sessionCommands.get(sessionId) ?? [],
+                  turnInput.runtimePolicy.cwd ?? process.cwd(),
+                )
+                .pipe(
+                  Effect.provideService(
+                    ChildProcessSpawner.ChildProcessSpawner,
+                    childProcessSpawner,
+                  ),
+                )
+            : attachmentText;
+          const nativeCommand =
+            flavor.commandPromptsAreVerbatim === true && messageText.startsWith("/");
           const text = t3AcpPromptWithInstructions({
             prompt: messageText,
             state: instructionState,
@@ -6814,7 +6942,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           const imageAttachments = turnInput.message.attachments.filter(
             isProviderNativeImageAttachment,
           );
-          if (imageAttachments.length > 0 && !supportsImagePrompts) {
+          if (
+            imageAttachments.length > 0 &&
+            (!supportsImagePrompts ||
+              flavor.modelSupportsImages?.(
+                yield* runtime.getConfigOptions,
+                turnInput.modelSelection.model,
+              ) === false)
+          ) {
             return yield* new ProviderAdapter.ProviderAdapterProtocolError({
               driver,
               detail: "ACP driver did not negotiate image prompt support",
@@ -6850,13 +6985,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               detail: "ACP turn requires non-empty text or attachments",
             });
           }
-          prompt.push({
-            type: "text",
-            text: buildRuntimeInstructions({
-              harness: flavor.runtimeHarness ?? driver,
-              model: turnInput.modelSelection.model,
-            }),
-          });
+          if (!nativeCommand)
+            prompt.push({
+              type: "text",
+              text: buildRuntimeInstructions({
+                harness: flavor.runtimeHarness ?? driver,
+                model: turnInput.modelSelection.model,
+              }),
+            });
           return { prompt, instructionState: text === messageText ? undefined : instructionState };
         });
 
@@ -6932,6 +7068,19 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 yield* Ref.set(activeSelection, turnInput.modelSelection);
                 yield* Ref.set(activeInteractionMode, turnInput.runtimePolicy.interactionMode);
               }
+            }
+            if (
+              flavor.requireAdvertisedCompaction &&
+              /^\/compact(?:\s|$)/.test(turnInput.message.text.trimStart()) &&
+              !sessionCommands
+                .get(requestedSessionId)
+                ?.some((command) => command.name === "compact")
+            ) {
+              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                driver,
+                detail:
+                  "This CLI session does not advertise native compaction. Refresh or update the CLI.",
+              });
             }
             yield* Ref.set(lastTurnRoute, {
               threadId: turnInput.threadId,
@@ -7165,7 +7314,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               return;
             }
             const promptGeneration = yield* Ref.get(runtimeCallbackGeneration);
-            yield* runtime.prompt({ prompt: promptParts!.prompt }).pipe(
+            yield* (
+              flavor.runPrompt?.(runtime, requestedSessionId, promptParts!.prompt) ??
+              runtime.prompt({ prompt: promptParts!.prompt })
+            ).pipe(
               Effect.tap(() =>
                 Ref.update(promptInstructionStates, (current) => {
                   if (promptParts?.instructionState === undefined) return current;
