@@ -1,4 +1,6 @@
 import { ThreadFind, ThreadFindCanvas, type ThreadFindControls } from "./chat/ThreadFindProvider";
+import { isAssistantThread } from "@t3tools/shared/fd/assistant";
+import { AssistantVoiceControls } from "~/fd/assistant";
 import { THREAD_FIND_BAR_RESERVED_HEIGHT } from "./chat/ThreadFindBar";
 import { usageLimitRecoveryBannerItem } from "./chat/UsageLimitRecoveryBanner";
 import {
@@ -11762,6 +11764,21 @@ export default function ChatView(props: ChatViewProps) {
                                 parentThreadLink
                                   ? () => onOpenRelatedThread(parentThreadLink.threadId)
                                   : null
+                              }
+                            />
+                          ) : null}
+                          {isServerThread && isAssistantThread(threadId) ? (
+                            <AssistantVoiceControls
+                              key={routeThreadKey}
+                              threadRef={routeThreadRef}
+                              messages={timelineMessages}
+                              runtimeMode={runtimeMode}
+                              interactionMode={interactionMode}
+                              disabled={
+                                !canOperateThread ||
+                                isConnecting ||
+                                threadDetailLoading ||
+                                isRevertingCheckpoint
                               }
                             />
                           ) : null}

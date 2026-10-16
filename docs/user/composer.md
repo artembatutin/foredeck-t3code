@@ -12,6 +12,29 @@ becomes an attachment when inserting it would exceed the message limit. On a
 hardware keyboard, use `Cmd+Shift+V` on Apple devices or `Ctrl+Shift+V` elsewhere
 to keep a large paste editable in the composer instead.
 
+## Project assistant
+
+On desktop and web, open **Assistant** in the sidebar to discuss goals and priorities
+across projects in the selected environment. Set up the Codex provider with your
+subscription in **Settings → Providers** first. The assistant uses that provider's
+configured default model and keeps a saved conversation you can return to.
+
+Ask it to clarify a project, then tell it to start the agreed work. It can launch
+separate project conversations while you discuss the next project, and keep project
+briefs, priorities and work references in its own workspace. Work uses the existing
+permission controls. You can inspect and stop each worker from its conversation.
+Foredeck is the default executor; choosing Looper requires a working local Looper
+installation and its configured author and reviewer providers.
+
+**Enable local voice** downloads an English speech model once. Record up to one
+minute, finish recording, review or edit the transcript, then send. Audio is
+processed on your device; only the text is sent as a normal message. Web recording
+requires HTTPS or localhost and microphone permission. **Spoken replies** uses an
+installed local system voice; it never falls back to a paid speech service.
+Ending voice or leaving the conversation releases the microphone and stops speech,
+while already dispatched project work continues. Reopen the assistant to review
+progress; it does not run an always-on background monitor after its turn ends.
+
 ## Formatting
 
 The composer writes Markdown and shows it styled as you type. Markers such as

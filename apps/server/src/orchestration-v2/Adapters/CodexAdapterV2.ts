@@ -1,4 +1,5 @@
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
+import { assistantInstructionsForThread } from "../../fd/assistant/index.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import {
@@ -719,6 +720,8 @@ function codexRuntimeModeTurnDefaults(runtimeMode: RuntimeMode): {
 
 export function buildCodexTurnStartParams(input: {
   readonly nativeThreadId: string;
+  readonly appThreadId?: string;
+  readonly assistantAccountType?: string;
   readonly codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>;
   readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
   readonly modelSelection: ModelSelection;
@@ -731,6 +734,14 @@ export function buildCodexTurnStartParams(input: {
   readonly appContext?: ProviderAdapter.ProviderAdapterV2TurnInput["appContext"];
 }) {
   return Effect.gen(function* () {
+    if (
+      assistantInstructionsForThread(input.appThreadId ?? "") &&
+      input.assistantAccountType !== "chatgpt"
+    ) {
+      return yield* toProtocolError(
+        "The project assistant requires a subscription login. Sign in with ChatGPT in Settings → Providers.",
+      );
+    }
     const runtimeModeDefaults = codexRuntimeModeTurnDefaults(input.runtimePolicy.runtimeMode);
     const approvalPolicy =
       input.runtimePolicy.approvalPolicy === undefined
@@ -773,10 +784,24 @@ export function buildCodexTurnStartParams(input: {
             },
           )
         : undefined;
+    const assistantInstructions = input.hasT3Mcp
+      ? assistantInstructionsForThread(input.appThreadId ?? "")
+      : undefined;
     const additionalContext =
-      t3Context === undefined && Object.keys(appContext).length === 0
+      t3Context === undefined && Object.keys(appContext).length === 0 && !assistantInstructions
         ? undefined
-        : { ...t3Context, ...appContext };
+        : {
+            ...t3Context,
+            ...appContext,
+            ...(assistantInstructions
+              ? {
+                  foredeck_assistant: {
+                    kind: "application" as const,
+                    value: assistantInstructions,
+                  },
+                }
+              : {}),
+          };
     const collaborationMode: CodexSchema.ClientRequest__CollaborationMode | undefined =
       input.runtimePolicy.interactionMode !== "plan" && developerInstructions === undefined
         ? undefined
@@ -6286,9 +6311,16 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         ) =>
           Effect.gen(function* () {
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
+            const assistantAccount = assistantInstructionsForThread(turnInput.threadId)
+              ? yield* client.request("account/read", { refreshToken: false })
+              : undefined;
             const mcpSession = yield* mcpSessions.read(turnInput.threadId);
             const turnStartParams = yield* buildCodexTurnStartParams({
               nativeThreadId: threadId,
+              appThreadId: turnInput.threadId,
+              ...(assistantAccount?.account
+                ? { assistantAccountType: assistantAccount.account.type }
+                : {}),
               codexInput,
               runtimePolicy: turnInput.runtimePolicy,
               modelSelection: turnInput.modelSelection,

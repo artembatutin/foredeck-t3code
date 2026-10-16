@@ -272,6 +272,7 @@ export function resolveMacBundleInfoPlistStrings(executableName) {
     NSScreenCaptureUsageDescription:
       "T3 Code captures the active window when you use the snapshot shortcut.",
     NSDocumentsFolderUsageDescription: "T3 Code reads project files you open in the desktop app.",
+    NSMicrophoneUsageDescription: "Foredeck uses the microphone when you record a voice message.",
   };
 }
 

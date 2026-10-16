@@ -1,4 +1,5 @@
 import { type EnvironmentId, type ScopedProjectRef } from "@t3tools/contracts";
+import { AssistantEntry } from "~/fd/assistant";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "./ThreadHoverCard";
 import { CollapsibleSectionHeader } from "./ui/collapsible-section-header";
 import {
@@ -5176,6 +5177,13 @@ export default function Sidebar() {
               searchResultCount={threadSearchResults.length}
               activeSearchResultIndex={activeSearchResultIndex}
               onClearSearch={clearThreadSearch}
+            />
+            <AssistantEntry
+              environmentId={
+                routeTarget?.kind === "server"
+                  ? routeTarget.threadRef.environmentId
+                  : primaryEnvironmentId
+              }
             />
           </SidebarGroup>
         }

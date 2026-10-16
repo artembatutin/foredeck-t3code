@@ -1,5 +1,11 @@
 {
   "integrationFiles": {
+    "apps/desktop/scripts/electron-launcher.mjs": "Declares microphone access for the development app's local assistant voice recording.",
+    "apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts": "Adds the fd assistant role only for marked assistant conversations through the existing application-context boundary; runtime permissions stay unchanged.",
+    "apps/web/package.json": "Packages the lazy local speech model runtime and its matching browser WASM assets.",
+    "apps/web/vite.config.ts": "Resolves the speech runtime's external-WASM export so only the explicitly packaged local voice assets ship.",
+    "apps/web/src/components/Sidebar.tsx": "Mounts the fd assistant entry in the selected environment's existing sidebar.",
+    "apps/web/src/components/ChatView.tsx": "Mounts local voice controls only in assistant conversations, using existing thread state and permission checks.",
     "apps/desktop/src/app/DesktopEnvironment.test.ts": "Verifies ordinary and staged display names from the existing desktop branding composition.",
     "apps/desktop/src/app/DesktopEnvironment.ts": "Supplies Foredeck display branding through the existing desktop environment composition; runtime and package identifiers remain unchanged.",
     "apps/desktop/src/window/DesktopApplicationMenu.ts": "Uses the shared visible product name in the existing update-status dialog.",
@@ -96,7 +102,7 @@
     "packages/provider-acp-registry/src/server/adapter.ts": "Allows a dedicated driver to reuse the existing ACP runtime, client terminals and live configuration pipeline with its own identity and flavor.",
     "packages/provider-acp-registry/src/server/driver.ts": "Allows a dedicated driver to reuse registry account and session management with its own schema, snapshot identity and explicit discovery policy.",
     "packages/provider-core/src/server/ProviderAdapter.ts": "Adds optional detached remote cancellation and stable setup-history hooks so work surviving runtime loss can be stopped and recovered before live subscribers exist; current local adapters remain unchanged.",
-    "packages/shared/package.json": "Exposes the shared fd appearance and branding feature entry points consumed by all three clients.",
+    "packages/shared/package.json": "Exposes shared fd appearance, branding and assistant conversation identity through explicit feature entry points.",
     "packages/shared/src/themePalettes.ts": "Registers an internal Foredeck mobile palette id and reserves it without replacing legacy palette values or valid custom ids."
   }
 }
