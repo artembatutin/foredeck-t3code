@@ -1200,7 +1200,7 @@ function renderFeedEntry(
             </Text>
           ) : presentation.attribution === "t3code" ? (
             <Text className="mb-1 pr-1 font-t3-medium text-2xs text-foreground-muted opacity-60">
-              Sent by Foredeck
+              Sent by foredeck-t3
             </Text>
           ) : presentation.attribution === "agent" ? (
             <AgentMessageAttribution

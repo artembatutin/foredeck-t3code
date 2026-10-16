@@ -1,6 +1,6 @@
 /** Visible product identity only; runtime and distribution identifiers stay upstream-owned. */
-export const FOREDECK_PRODUCT_NAME = "Foredeck";
-export const FOREDECK_WORDMARK = "foredeck.";
+export const FOREDECK_PRODUCT_NAME = "foredeck-t3";
+export const FOREDECK_WORDMARK = FOREDECK_PRODUCT_NAME;
 
 /**
  * Reused without geometry changes from Foredeck's archived

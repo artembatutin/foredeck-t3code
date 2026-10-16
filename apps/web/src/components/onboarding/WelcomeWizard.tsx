@@ -233,9 +233,9 @@ export function WelcomeWizard({
         initialFocus={() => document.getElementById("onboarding-pairing-url") ?? true}
       >
         <WizardHeader
-          title="Set up Foredeck"
+          title="Set up foredeck-t3"
           identity={
-            <div className="flex items-center gap-2 text-2xl" role="img" aria-label="Foredeck">
+            <div className="flex items-center gap-2 text-2xl" role="img" aria-label="foredeck-t3">
               <ForedeckAnchor className="size-7 shrink-0" aria-hidden />
               <ForedeckWordmark />
             </div>

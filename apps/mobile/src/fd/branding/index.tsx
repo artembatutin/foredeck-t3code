@@ -12,7 +12,7 @@ export function ForedeckAnchor(props: {
 }) {
   return (
     <ThemedAnchor
-      accessibilityLabel="Foredeck"
+      accessibilityLabel="foredeck-t3"
       xml={FOREDECK_ANCHOR_SVG}
       height={props.height}
       width={props.height}

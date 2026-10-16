@@ -35,7 +35,7 @@ export function CompactBrandTitle(
   return (
     <View
       aria-level={1}
-      accessibilityLabel={props.accessibilityLabel ?? "Foredeck, Threads"}
+      accessibilityLabel={props.accessibilityLabel ?? "foredeck-t3, Threads"}
       accessible
       role="heading"
       className="flex-row items-center gap-1.5"
@@ -47,8 +47,7 @@ export function CompactBrandTitle(
         className="font-bold text-foreground"
         style={{ fontSize: 22 * scale, letterSpacing: -0.3 * scale }}
       >
-        {FOREDECK_WORDMARK.slice(0, -1)}
-        <Text className="text-primary">.</Text>
+        {FOREDECK_WORDMARK}
       </Text>
       <View
         className="rounded-full bg-subtle px-1.5 py-0.5"

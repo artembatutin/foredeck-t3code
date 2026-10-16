@@ -18,11 +18,11 @@ afterEach(() => {
 });
 
 describe("branding", () => {
-  it("uses Foredeck without desktop-injected branding", async () => {
+  it("uses foredeck-t3 without desktop-injected branding", async () => {
     Reflect.deleteProperty(globalThis, "window");
     const branding = await import("./branding");
-    expect(branding.APP_BASE_NAME).toBe("Foredeck");
-    expect(branding.APP_DISPLAY_NAME).toMatch(/^Foredeck \(.*\)$/);
+    expect(branding.APP_BASE_NAME).toBe("foredeck-t3");
+    expect(branding.APP_DISPLAY_NAME).toMatch(/^foredeck-t3 \(.*\)$/);
   });
 
   it("uses injected desktop branding when available", async () => {
@@ -31,9 +31,9 @@ describe("branding", () => {
       value: {
         desktopBridge: {
           getAppBranding: () => ({
-            baseName: "Foredeck",
+            baseName: "foredeck-t3",
             stageLabel: "Nightly",
-            displayName: "Foredeck (Nightly)",
+            displayName: "foredeck-t3 (Nightly)",
           }),
         },
       },
@@ -41,9 +41,9 @@ describe("branding", () => {
 
     const branding = await import("./branding");
 
-    expect(branding.APP_BASE_NAME).toBe("Foredeck");
+    expect(branding.APP_BASE_NAME).toBe("foredeck-t3");
     expect(branding.APP_STAGE_LABEL).toBe("Nightly");
-    expect(branding.APP_DISPLAY_NAME).toBe("Foredeck (Nightly)");
+    expect(branding.APP_DISPLAY_NAME).toBe("foredeck-t3 (Nightly)");
   });
 
   it("normalizes hosted app channel metadata", async () => {
@@ -54,7 +54,7 @@ describe("branding", () => {
     expect(branding.HOSTED_APP_CHANNEL).toBe("nightly");
     expect(branding.HOSTED_APP_CHANNEL_LABEL).toBe("Nightly");
     expect(branding.APP_STAGE_LABEL).toBe("Nightly");
-    expect(branding.APP_DISPLAY_NAME).toBe("Foredeck (Nightly)");
+    expect(branding.APP_DISPLAY_NAME).toBe("foredeck-t3 (Nightly)");
   });
 
   it("does not label the latest hosted app channel", async () => {
@@ -65,7 +65,7 @@ describe("branding", () => {
     expect(branding.HOSTED_APP_CHANNEL).toBe("latest");
     expect(branding.HOSTED_APP_CHANNEL_LABEL).toBe("Latest");
     expect(branding.APP_STAGE_LABEL).toBe("Latest");
-    expect(branding.APP_DISPLAY_NAME).toBe("Foredeck");
+    expect(branding.APP_DISPLAY_NAME).toBe("foredeck-t3");
   });
 
   it("ignores unknown hosted app channels", async () => {
@@ -91,33 +91,33 @@ describe("branding logic", () => {
   it("updates the display name for nightly primary server versions", () => {
     expect(
       resolveServerBackedAppDisplayName({
-        baseName: "Foredeck",
-        fallbackDisplayName: "Foredeck (Alpha)",
+        baseName: "foredeck-t3",
+        fallbackDisplayName: "foredeck-t3 (Alpha)",
         fallbackStageLabel: "Alpha",
         primaryServerVersion: "0.0.28-nightly.20260616.12",
       }),
-    ).toBe("Foredeck (Nightly)");
+    ).toBe("foredeck-t3 (Nightly)");
   });
 
   it("keeps the fallback display name for stable primary server versions", () => {
     expect(
       resolveServerBackedAppDisplayName({
-        baseName: "Foredeck",
-        fallbackDisplayName: "Foredeck (Alpha)",
+        baseName: "foredeck-t3",
+        fallbackDisplayName: "foredeck-t3 (Alpha)",
         fallbackStageLabel: "Alpha",
         primaryServerVersion: "0.0.27",
       }),
-    ).toBe("Foredeck (Alpha)");
+    ).toBe("foredeck-t3 (Alpha)");
   });
 
   it("keeps the fallback display name for malformed nightly primary server versions", () => {
     expect(
       resolveServerBackedAppDisplayName({
-        baseName: "Foredeck",
-        fallbackDisplayName: "Foredeck (Alpha)",
+        baseName: "foredeck-t3",
+        fallbackDisplayName: "foredeck-t3 (Alpha)",
         fallbackStageLabel: "Alpha",
         primaryServerVersion: "0.0.28-nightly.20260616",
       }),
-    ).toBe("Foredeck (Alpha)");
+    ).toBe("foredeck-t3 (Alpha)");
   });
 });

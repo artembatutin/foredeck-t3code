@@ -15,9 +15,6 @@ export function ForedeckAnchor(props: SVGProps<SVGSVGElement>) {
 
 export function ForedeckWordmark() {
   return (
-    <span className="text-fd-wordmark font-bold tracking-fd-wordmark">
-      {FOREDECK_WORDMARK.slice(0, -1)}
-      <span className="text-(--fd-brand-period)">.</span>
-    </span>
+    <span className="text-fd-wordmark font-bold tracking-fd-wordmark">{FOREDECK_WORDMARK}</span>
   );
 }

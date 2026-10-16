@@ -14,9 +14,9 @@ const defaultInput = {
   platform: "darwin",
   processArch: "arm64",
   appVersion: "0.0.22",
-  appPath: "/Applications/T3 Code.app/Contents/Resources/app.asar",
+  appPath: "/Applications/foredeck-t3.app/Contents/Resources/app.asar",
   isPackaged: false,
-  resourcesPath: "/Applications/T3 Code.app/Contents/Resources",
+  resourcesPath: "/Applications/foredeck-t3.app/Contents/Resources",
   runningUnderArm64Translation: false,
 } satisfies DesktopEnvironment.MakeDesktopEnvironmentInput;
 
@@ -39,17 +39,17 @@ const makeEnvironment = (
 ) => DesktopEnvironment.DesktopEnvironment.pipe(Effect.provide(layerEnvironment(overrides, env)));
 
 describe("DesktopEnvironment", () => {
-  it("uses Foredeck for visible branding while retaining the release stage", () => {
+  it("uses foredeck-t3 for visible branding while retaining the release stage", () => {
     assert.deepEqual(
       DesktopEnvironment.resolveDesktopAppBranding({ isDevelopment: true, appVersion: "0.0.45" }),
-      { baseName: "Foredeck", stageLabel: "Dev", displayName: "Foredeck (Dev)" },
+      { baseName: "foredeck-t3", stageLabel: "Dev", displayName: "foredeck-t3 (Dev)" },
     );
     assert.deepEqual(
       DesktopEnvironment.resolveDesktopAppBranding({
         isDevelopment: false,
         appVersion: "0.0.45-nightly.20261015.1",
       }),
-      { baseName: "Foredeck", stageLabel: "Nightly", displayName: "Foredeck (Nightly)" },
+      { baseName: "foredeck-t3", stageLabel: "Nightly", displayName: "foredeck-t3 (Nightly)" },
     );
   });
 

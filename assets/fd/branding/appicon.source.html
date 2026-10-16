@@ -1,0 +1,128 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      /* Foredeck app icon source — render to appicon.png with headless Chrome:
+     "Google Chrome" --headless=new --screenshot=appicon.png \
+       --window-size=1024,1024 --default-background-color=00000000 \
+       --hide-scrollbars file://$PWD/appicon.source.html
+     Mark: a SOLID classic anchor silhouette (user-approved reference: filled,
+     not stroked) — thick ring, ball-ended stock, tapered shank ending in a
+     pointed crown, sweeping arms ending in broad barbed arrowhead flukes.
+     Generated parametrically (scratchpad solid.html), mirrored across x=50.
+     The glyph is drawn on its own 100-grid and scaled 0.78 about the centre
+     to sit on the tile.
+     On-brand palette (see tokens.md):
+       · tile = the app's neutral near-blacks (bg-raised #131315 → bg #09090a →
+         sunken #000), a subtle raised→sunken gradient for depth;
+       · anchor = --brand-gradient, white → silver (#ffffff → #b6b6be), the
+         app's one identity gradient (same as the wordmark period).
+     Mirrored (monochrome) by brandmark.svg next to this file — keep the
+     outline in sync. */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+      }
+      #canvas {
+        width: 1024px;
+        height: 1024px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: transparent;
+      }
+      /* centred 824² tile leaves the transparent padding macOS icons expect */
+      #tile {
+        width: 824px;
+        height: 824px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="canvas">
+      <svg id="tile" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <!-- neutral near-black tile depth: raised top → sunken bottom -->
+          <linearGradient
+            id="tile-grad"
+            gradientUnits="userSpaceOnUse"
+            x1="50"
+            y1="0"
+            x2="50"
+            y2="100"
+          >
+            <stop offset="0" stop-color="#141417" />
+            <stop offset="0.55" stop-color="#0a0a0b" />
+            <stop offset="1" stop-color="#050506" />
+          </linearGradient>
+          <!-- soft top edge light -->
+          <linearGradient
+            id="tile-rim"
+            gradientUnits="userSpaceOnUse"
+            x1="50"
+            y1="0"
+            x2="50"
+            y2="100"
+          >
+            <stop offset="0" stop-color="#ffffff" stop-opacity="0.12" />
+            <stop offset="0.16" stop-color="#ffffff" stop-opacity="0" />
+          </linearGradient>
+          <!-- the brand gradient: white → silver (identity moments only) -->
+          <linearGradient
+            id="brand-stroke"
+            gradientUnits="userSpaceOnUse"
+            x1="30"
+            y1="16"
+            x2="72"
+            y2="84"
+          >
+            <stop offset="0" stop-color="#ffffff" />
+            <stop offset="1" stop-color="#b6b6be" />
+          </linearGradient>
+        </defs>
+
+        <rect width="100" height="100" rx="22" fill="url(#tile-grad)" />
+        <rect
+          x="0.75"
+          y="0.75"
+          width="98.5"
+          height="98.5"
+          rx="21.4"
+          fill="none"
+          stroke="url(#tile-rim)"
+          stroke-width="1.2"
+        />
+
+        <g transform="translate(50 50) scale(0.78) translate(-50 -50)">
+          <circle
+            cx="50"
+            cy="15"
+            r="7"
+            fill="none"
+            stroke="url(#brand-stroke)"
+            stroke-width="4.4"
+          />
+          <line
+            x1="32.5"
+            y1="30.5"
+            x2="67.5"
+            y2="30.5"
+            stroke="url(#brand-stroke)"
+            stroke-width="5"
+            stroke-linecap="round"
+          />
+          <circle cx="32.5" cy="30.5" r="2.9" fill="url(#brand-stroke)" />
+          <circle cx="67.5" cy="30.5" r="2.9" fill="url(#brand-stroke)" />
+          <path d="M 47.2 20 L 52.8 20 L 55.5 76 L 50 87.5 L 44.5 76 Z" fill="url(#brand-stroke)" />
+          <path
+            d="M 50 85.5 C 38 83.5 26.5 76.5 21.5 67 L 14.5 49 L 28 58 L 26 65 C 34 73.5 43 75 47.5 75 L 52.5 75 C 57 75 66 73.5 74 65 L 72 58 L 85.5 49 L 78.5 67 C 73.5 76.5 62 83.5 50 85.5 Z"
+            fill="url(#brand-stroke)"
+          />
+        </g>
+      </svg>
+    </div>
+  </body>
+</html>
