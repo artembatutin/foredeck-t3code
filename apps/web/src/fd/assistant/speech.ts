@@ -1,30 +1,43 @@
-/** Prefer installed enhanced voices; a saved selection always wins if it is still local. */
+const noveltyVoice =
+  /^(albert|bad news|bahh|bells|boing|bubbles|cellos|eddy|flo|fred|good news|grandma|grandpa|jester|junior|kathy|organ|ralph|reed|rocko|sandy|shelley|superstar|trinoids|whisper|wobble|zarvox)\b/i;
+const normalizedLanguage = (language: string) => language.toLowerCase().replaceAll("_", "-");
+
+/** A small local shortlist: matching language, no character voices, best quality per voice. */
 export function rankedLocalVoices(voices: ReadonlyArray<SpeechSynthesisVoice>, language: string) {
-  const lang = language.toLowerCase();
+  const lang = normalizedLanguage(language);
   const score = (voice: SpeechSynthesisVoice) =>
-    (voice.lang.toLowerCase() === lang
-      ? 100
-      : voice.lang.split("-")[0] === lang.split("-")[0]
-        ? 80
-        : 0) +
-    (/premium/i.test(voice.name) ? 30 : /enhanced|natural/i.test(voice.name) ? 20 : 0) +
-    (/samantha|ava|alex|daniel/i.test(voice.name) ? 10 : 0) -
-    (/bells|bad news|boing|bubbles|cellos|good news|whisper|zarvox|trinoids/i.test(voice.name)
-      ? 100
-      : 0);
+    (/premium/i.test(voice.name) ? 300 : /enhanced|natural/i.test(voice.name) ? 200 : 0) +
+    (normalizedLanguage(voice.lang) === lang ? 30 : 0) +
+    (/samantha|ava|alex/i.test(voice.name)
+      ? 20
+      : /daniel|karen|moira|tessa/i.test(voice.name)
+        ? 10
+        : 0);
+  const seen = new Set<string>();
   return voices
-    .filter((voice) => voice.localService)
-    .toSorted((a, b) => score(b) - score(a) || a.name.localeCompare(b.name));
+    .filter(
+      (voice) =>
+        voice.localService &&
+        normalizedLanguage(voice.lang).split("-")[0] === lang.split("-")[0] &&
+        !noveltyVoice.test(voice.name),
+    )
+    .toSorted((a, b) => score(b) - score(a) || a.name.localeCompare(b.name))
+    .filter((voice) => {
+      const name = voice.name.replace(/\s*\((premium|enhanced|natural|compact)\)/gi, "").trim();
+      const key = `${name.toLowerCase()}:${normalizedLanguage(voice.lang)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 6);
 }
 export function selectLocalVoice(
   voices: ReadonlyArray<SpeechSynthesisVoice>,
   language: string,
   selected?: string,
 ) {
-  return (
-    voices.find((voice) => voice.localService && voice.voiceURI === selected) ??
-    rankedLocalVoices(voices, language)[0]
-  );
+  const shortlist = rankedLocalVoices(voices, language);
+  return shortlist.find((voice) => voice.voiceURI === selected) ?? shortlist[0];
 }
 /** Speech is intentional content from the completed run, never extracted from a transcript. */
 export function shouldSpeakReply(

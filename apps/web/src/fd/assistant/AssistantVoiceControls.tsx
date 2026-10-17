@@ -102,7 +102,9 @@ export function AssistantVoiceControls(props: {
   const speak = (text: string) => {
     const voice = selectLocalVoice(voices, navigator.language, voiceURI);
     if (!voice) {
-      setError("No installed local voice is available. You can keep typing or dictating.");
+      setError(
+        "No suitable local voice is available for your language. You can keep typing or dictating.",
+      );
       return;
     }
     stopAudio();
@@ -344,7 +346,7 @@ export function AssistantVoiceControls(props: {
                   { value: "", label: "Recommended" },
                   ...voices.map((v) => ({ value: v.voiceURI, label: `${v.name} (${v.lang})` })),
                 ]}
-                value={voiceURI}
+                value={voices.some((voice) => voice.voiceURI === voiceURI) ? voiceURI : ""}
                 onValueChange={(value) => {
                   if (value === null) return;
                   stopAudio();
