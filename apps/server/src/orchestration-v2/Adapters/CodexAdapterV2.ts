@@ -805,6 +805,15 @@ export function buildCodexTurnStartParams(input: {
         : {
             ...t3Context,
             ...appContext,
+            ...(input.hasT3Mcp
+              ? {
+                  foredeck_voice: {
+                    kind: "application" as const,
+                    value:
+                      "Before your final answer, use voice_reply to compose a separate spoken response: one or two natural owner-facing sentences, leading with the result or question. Keep detailed evidence in your written answer. Never send tool narration, progress or logs to voice_reply. This does not start audio; the client chooses when to speak.",
+                  },
+                }
+              : {}),
             ...(assistantInstructions
               ? {
                   foredeck_assistant: {

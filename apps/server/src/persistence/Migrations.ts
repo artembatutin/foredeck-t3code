@@ -80,6 +80,7 @@ import Migration0062 from "./Migrations/062_ThreadFailureLookupIndex.ts";
 import {
   assistantPortfolioMigration,
   assistantDispatchMigration,
+  assistantIdeasMigration,
   reconcileAssistantMigration,
 } from "../fd/assistant/index.ts";
 
@@ -161,6 +162,7 @@ export const migrationEntries = [
   [63, "ProjectRepositories", multirepoMigration],
   [64, "AssistantPortfolio", assistantPortfolioMigration],
   [65, "AssistantDispatches", assistantDispatchMigration],
+  [66, "AssistantIdeas", assistantIdeasMigration],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

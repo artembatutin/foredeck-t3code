@@ -1,161 +1,158 @@
 import { useEffect, useEffectEvent, useRef, useState } from "react";
-import {
-  CommandId,
-  type ProviderInteractionMode,
-  type RuntimeMode,
-  type ScopedThreadRef,
-} from "@t3tools/contracts";
-import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import { MicIcon, SquareIcon, Volume2Icon, VolumeXIcon } from "lucide-react";
+import type { ScopedThreadRef } from "@t3tools/contracts";
+import { MicIcon, SquareIcon, ChevronDownIcon } from "lucide-react";
 import { Button } from "~/components/ui/button";
-import { Textarea } from "~/components/ui/textarea";
-import { newMessageId } from "~/lib/utils";
-import { threadEnvironment } from "~/state/threads";
-import { useOrchestrationCommand } from "~/state/use-orchestration-command";
+import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
+import { useAtomCommand } from "~/state/use-atom-command";
 import type { ChatMessage } from "~/types";
 import { startRecording } from "./recording";
-import { selectLocalVoice, spokenText } from "./speech";
+import { rankedLocalVoices, selectLocalVoice, shouldSpeakReply } from "./speech";
+import { readSpeech } from "./commands";
 
-type Phase = "off" | "loading" | "ready" | "requesting" | "recording" | "transcribing" | "sending";
+type Phase = "off" | "loading" | "ready" | "requesting" | "recording" | "transcribing";
 type Reply =
   | { type: "ready" }
   | { type: "progress"; progress: number }
   | { type: "transcript"; text: string }
   | { type: "error"; message: string };
+const preference = (key: string, fallback: string) => {
+  try {
+    return localStorage.getItem(key) ?? fallback;
+  } catch {
+    return fallback;
+  }
+};
 
 export function AssistantVoiceControls(props: {
   threadRef: ScopedThreadRef;
   messages: ReadonlyArray<ChatMessage>;
-  runtimeMode: RuntimeMode;
-  interactionMode: ProviderInteractionMode;
   disabled: boolean;
+  thinking: boolean;
+  canConverse: boolean;
+  onTranscript: (text: string, submit: boolean) => void;
 }) {
   const [phase, setPhase] = useState<Phase>("off");
   const [progress, setProgress] = useState(0);
-  const [message, setMessage] = useState<string | null>(null);
-  const [transcript, setTranscript] = useState("");
-  const [speak, setSpeak] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [mode, setMode] = useState(() => preference("fd.voice.mode", "dictation"));
+  const [voiceURI, setVoiceURI] = useState(() => preference("fd.voice.voice", ""));
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [speaking, setSpeaking] = useState(false);
-  const [automatic, setAutomatic] = useState(true);
-  const autoSendReady = useRef(false);
+  const [options, setOptions] = useState(false);
   const worker = useRef<Worker | null>(null);
   const recording = useRef<Awaited<ReturnType<typeof startRecording>> | null>(null);
   const abort = useRef<AbortController | null>(null);
   const generation = useRef(0);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const spokenIds = useRef(new Set(props.messages.map((entry) => entry.id)));
-  const startTurn = useOrchestrationCommand(threadEnvironment.startTurn, { reportFailure: false });
-  const sendAttempt = useRef<Parameters<typeof startTurn>[0] | null>(null);
-  const sending = useRef(false);
-
+  const seen = useRef(new Set<string>(props.messages.flatMap((m) => (m.runId ? [m.runId] : []))));
+  const requested = useRef(false);
+  const read = useAtomCommand(readSpeech, { reportFailure: false });
+  const onTranscript = useEffectEvent((text: string) =>
+    props.onTranscript(text, mode === "conversation" && props.canConverse),
+  );
   const clearTimer = () => {
-    if (timer.current !== null) clearTimeout(timer.current);
+    if (timer.current) clearTimeout(timer.current);
     timer.current = null;
   };
   const stopAudio = () => {
-    if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
+    generation.current++;
+    window.speechSynthesis?.cancel();
     setSpeaking(false);
   };
-  const cancel = () => {
-    generation.current++;
-    autoSendReady.current = false;
+  const end = () => {
+    requested.current = false;
     clearTimer();
     abort.current?.abort();
     recording.current = null;
     worker.current?.terminate();
     worker.current = null;
     stopAudio();
-    setSpeak(false);
     setPhase("off");
   };
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    const update = () =>
+      setVoices(rankedLocalVoices(window.speechSynthesis?.getVoices() ?? [], navigator.language));
+    update();
+    window.speechSynthesis?.addEventListener("voiceschanged", update);
+    return () => {
+      window.speechSynthesis?.removeEventListener("voiceschanged", update);
       generation.current++;
-      if (timer.current !== null) clearTimeout(timer.current);
+      if (timer.current) clearTimeout(timer.current);
       abort.current?.abort();
       worker.current?.terminate();
-      if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
-    },
-    [],
-  );
-
+      window.speechSynthesis?.cancel();
+    };
+  }, []);
   useEffect(() => {
-    // Mark old and muted replies as seen so enabling voice never replays chat history.
-    const replies = props.messages.filter(
-      (entry) => entry.role === "assistant" && !entry.streaming && !spokenIds.current.has(entry.id),
-    );
-    for (const reply of replies) spokenIds.current.add(reply.id);
-    const latest = replies.at(-1);
-    if (
-      !speak ||
-      !latest ||
-      typeof speechSynthesis === "undefined" ||
-      phase === "recording" ||
-      phase === "requesting"
-    )
-      return;
-    const voice = selectLocalVoice(speechSynthesis.getVoices(), navigator.language);
-    if (!voice) return;
-    const text = spokenText(latest.text);
-    if (!text) return;
-    speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.voice = voice;
-    utterance.addEventListener("start", () => setSpeaking(true));
-    utterance.addEventListener("end", () => setSpeaking(false));
-    utterance.addEventListener("error", (event) => {
-      setSpeaking(false);
-      if (event.error === "canceled" || event.error === "interrupted") return;
-      setMessage("Spoken reply stopped. Read the reply here or try speaking again.");
-    });
-    speechSynthesis.speak(utterance);
-  }, [props.messages, speak, phase]);
-
-  const enable = () => {
-    if (worker.current) return;
-    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-      setMessage(
-        "This browser cannot record audio here. Use HTTPS or the desktop app, or type a message.",
-      );
+    try {
+      localStorage.setItem("fd.voice.mode", mode);
+      localStorage.setItem("fd.voice.voice", voiceURI);
+    } catch {
+      /* Storage is optional. */
+    }
+  }, [mode, voiceURI]);
+  const speak = (text: string) => {
+    const voice = selectLocalVoice(voices, navigator.language, voiceURI);
+    if (!voice) {
+      setError("No installed local voice is available. You can keep typing or dictating.");
       return;
     }
-    setMessage(null);
-    setProgress(0);
-    setPhase("loading");
-    if (
-      typeof speechSynthesis !== "undefined" &&
-      selectLocalVoice(speechSynthesis.getVoices(), navigator.language)
-    )
-      setSpeak(true);
-    const current = new Worker(new URL("./voice.worker.ts", import.meta.url), { type: "module" });
-    worker.current = current;
-    current.addEventListener("error", () => {
-      if (worker.current !== current) return;
-      current.terminate();
-      worker.current = null;
-      setPhase("off");
-      setMessage("Local voice could not load. Check your connection and try again.");
+    stopAudio();
+    const id = generation.current;
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.voice = voice;
+    utterance.addEventListener("start", () => {
+      if (generation.current === id) setSpeaking(true);
     });
-    current.addEventListener("message", (event: MessageEvent<Reply>) => {
-      if (worker.current !== current) return;
-      const reply = event.data;
-      if (reply.type === "ready") setPhase("ready");
-      else if (reply.type === "progress") setProgress(Math.round(reply.progress));
-      else if (reply.type === "transcript") {
-        autoSendReady.current = true;
-        setTranscript(reply.text.trim());
-        setPhase("ready");
-        if (!reply.text.trim()) setMessage("No speech was detected. Try again.");
-      } else {
-        setMessage(reply.message);
-        current.terminate();
-        worker.current = null;
-        setPhase("off");
-      }
+    utterance.addEventListener("end", () => {
+      if (generation.current === id) setSpeaking(false);
     });
-    current.postMessage({ type: "load" }, []);
+    utterance.addEventListener("error", (event) => {
+      if (generation.current !== id) return;
+      setSpeaking(false);
+      if (!["canceled", "interrupted"].includes(event.error))
+        setError("Speech stopped. The written response is available.");
+    });
+    speechSynthesis.speak(utterance);
   };
-
+  useEffect(() => {
+    if (phase === "off" || mode !== "conversation") {
+      for (const message of props.messages) if (message.runId) seen.current.add(message.runId);
+    }
+  }, [props.messages, mode, phase]);
+  const acceptReply = useEffectEvent((reply: { runId: string; text: string } | null) => {
+    const enabled = mode === "conversation" && phase !== "off";
+    if (
+      shouldSpeakReply(
+        reply,
+        seen.current,
+        enabled,
+        ["recording", "requesting", "transcribing"].includes(phase),
+      )
+    )
+      speak(reply!.text);
+    if (reply) seen.current.add(reply.runId);
+  });
+  const voiceEnabled = phase !== "off" && mode === "conversation";
+  useEffect(() => {
+    if (!voiceEnabled) return;
+    let alive = true;
+    let next: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      const result = await read({
+        environmentId: props.threadRef.environmentId,
+        input: { threadId: props.threadRef.threadId },
+      });
+      if (!alive) return;
+      if (result._tag === "Success") acceptReply(result.value);
+      next = setTimeout(() => void refresh(), 1500);
+    };
+    void refresh();
+    return () => {
+      alive = false;
+      clearTimeout(next);
+    };
+  }, [voiceEnabled, read, props.threadRef.environmentId, props.threadRef.threadId]);
   const finish = async () => {
     const current = recording.current;
     if (!current) return;
@@ -165,226 +162,200 @@ export function AssistantVoiceControls(props: {
     setPhase("transcribing");
     try {
       const audio = await current.finish();
-      if (id !== generation.current) return;
-      worker.current?.postMessage({ type: "transcribe", audio }, [audio.buffer]);
-    } catch (error) {
-      if (id !== generation.current) return;
-      setPhase(worker.current ? "ready" : "off");
-      setMessage(error instanceof Error ? error.message : "Recording failed.");
+      if (id === generation.current)
+        worker.current?.postMessage({ type: "transcribe", audio }, [audio.buffer]);
+    } catch (cause) {
+      if (id === generation.current) {
+        setPhase("ready");
+        setError(cause instanceof Error ? cause.message : "Recording failed; try again or type.");
+      }
     }
   };
-
-  const record = async () => {
-    if (phase !== "ready" || props.disabled || transcript) return;
+  const record = useEffectEvent(async () => {
+    if (props.disabled) return;
     stopAudio();
-    setMessage(null);
-    const id = ++generation.current;
+    setError(null);
+    const id = generation.current;
     abort.current = new AbortController();
     setPhase("requesting");
     try {
-      const current = await startRecording(
-        abort.current.signal,
-        automatic ? () => void finish() : undefined,
-      );
-      if (id !== generation.current) return;
+      const current = await startRecording(abort.current.signal, () => void finish());
+      if (id !== generation.current) {
+        abort.current.abort();
+        return;
+      }
       recording.current = current;
       setPhase("recording");
       timer.current = setTimeout(() => void finish(), 60_000);
-    } catch (error) {
-      if (id !== generation.current) return;
-      setPhase("ready");
-      setMessage(error instanceof Error ? error.message : "Microphone access failed.");
+    } catch (cause) {
+      if (id === generation.current) {
+        setPhase("ready");
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "Microphone access failed. You can type instead.",
+        );
+      }
     }
+  });
+  const enable = () => {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setError("Recording needs HTTPS or the desktop app. You can type instead.");
+      setOptions(true);
+      return;
+    }
+    requested.current = true;
+    setError(null);
+    setProgress(0);
+    setPhase("loading");
+    const current = new Worker(new URL("./voice.worker.ts", import.meta.url), { type: "module" });
+    worker.current = current;
+    const fail = (message: string) => {
+      if (worker.current !== current) return;
+      current.terminate();
+      worker.current = null;
+      requested.current = false;
+      setPhase("off");
+      setError(message);
+      setOptions(true);
+    };
+    current.addEventListener("error", () =>
+      fail("Local recognition could not load. Retry or type a message."),
+    );
+    current.addEventListener("message", (event: MessageEvent<Reply>) => {
+      if (worker.current !== current) return;
+      const reply = event.data;
+      if (reply.type === "ready") setPhase("ready");
+      else if (reply.type === "progress") setProgress(Math.round(reply.progress));
+      else if (reply.type === "transcript") {
+        setPhase("ready");
+        if (reply.text.trim()) onTranscript(reply.text.trim());
+        else {
+          setError("No speech detected. Try again.");
+          setOptions(true);
+        }
+      } else fail(reply.message);
+    });
+    current.postMessage({ type: "load" }, []);
   };
-
-  const send = async () => {
-    if (!transcript.trim() || props.disabled || phase !== "ready" || sending.current) return;
-    sending.current = true;
-    const id = generation.current;
-    const text = transcript.trim();
-    setPhase("sending");
-    if (sendAttempt.current?.input.message.text !== text) {
-      const messageId = newMessageId();
-      sendAttempt.current = {
-        environmentId: props.threadRef.environmentId,
-        input: {
-          commandId: CommandId.make("voice:" + messageId),
-          createdAt: new Date().toISOString(),
-          threadId: props.threadRef.threadId,
-          runtimeMode: props.runtimeMode,
-          interactionMode: props.interactionMode,
-          message: { messageId, role: "user", text, attachments: [] },
-          dispatchMode: "auto",
-        },
-      };
-    }
-    try {
-      const result = await startTurn(sendAttempt.current);
-      if (result._tag === "Failure") throw squashAtomCommandFailure(result);
-      if (id !== generation.current) return;
-      setTranscript("");
-      sendAttempt.current = null;
-    } catch (error) {
-      if (id !== generation.current) return;
-      setMessage(
-        error instanceof Error
-          ? error.message
-          : "The message could not be sent. Check the conversation before editing or retrying.",
-      );
-    } finally {
-      sending.current = false;
-      if (id === generation.current) setPhase("ready");
-    }
-  };
-
-  const sendAutomatically = useEffectEvent(send);
   useEffect(() => {
-    if (
-      automatic &&
-      autoSendReady.current &&
-      phase === "ready" &&
-      transcript.trim() &&
-      !props.disabled
-    ) {
-      autoSendReady.current = false;
-      void sendAutomatically();
+    if (phase === "ready" && requested.current && !props.disabled) {
+      requested.current = false;
+      void record();
     }
-  }, [automatic, phase, transcript, props.disabled]);
-
+  }, [phase, props.disabled]);
+  const status = speaking
+    ? "Speaking"
+    : phase === "recording"
+      ? "Listening"
+      : phase === "transcribing"
+        ? "Transcribing"
+        : props.thinking && mode === "conversation" && phase !== "off"
+          ? "Thinking"
+          : phase === "loading"
+            ? `Loading ${progress}%`
+            : phase === "requesting"
+              ? "Microphone…"
+              : "";
+  const label = speaking
+    ? "Interrupt speech"
+    : phase === "recording"
+      ? "Finish speaking"
+      : "Microphone";
   return (
-    <section aria-label="Assistant voice" className="space-y-2 border-b border-border px-3 py-2">
-      <div className="flex flex-wrap items-center gap-2">
-        {phase === "off" ? (
-          <Button variant="outline" size="sm" onClick={enable}>
-            Enable local voice
-          </Button>
-        ) : null}
-        {phase === "ready" ? (
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={props.disabled || !!transcript}
-            onClick={() => void record()}
-          >
-            <MicIcon />
-            Talk
-          </Button>
-        ) : null}
-        {phase === "recording" ? (
-          <Button variant="default" size="sm" onClick={() => void finish()}>
-            <SquareIcon />
-            Finish recording
-          </Button>
-        ) : null}
-        {phase !== "off" && phase !== "ready" ? (
-          <span role="status" className="text-sm text-muted-foreground">
-            {phase === "loading"
-              ? `Downloading voice model… ${progress}%`
-              : phase === "requesting"
-                ? "Waiting for microphone…"
-                : phase === "recording"
-                  ? "Listening · up to one minute"
-                  : phase === "transcribing"
-                    ? "Transcribing on this device…"
-                    : "Sending…"}
-          </span>
-        ) : null}
-        <Button
-          variant="ghost"
-          size="sm"
-          aria-pressed={speak}
-          onClick={() => {
+    <div className="flex items-center gap-1">
+      {status ? (
+        <span role="status" className="text-xs text-muted-foreground">
+          {status}
+        </span>
+      ) : null}
+      <Button
+        type="button"
+        variant={phase === "recording" ? "default" : "ghost"}
+        size="icon-sm"
+        aria-label={label}
+        disabled={props.disabled && !speaking && phase !== "recording"}
+        onClick={() => {
+          if (speaking) {
             stopAudio();
-            if (
-              !speak &&
-              (typeof speechSynthesis === "undefined" ||
-                !selectLocalVoice(speechSynthesis.getVoices(), navigator.language))
-            ) {
-              setMessage(
-                "No local voice is available yet. Install a system voice or try again after it loads.",
-              );
-              return;
-            }
-            setMessage(null);
-            setSpeak(!speak);
-          }}
+            return;
+          }
+          if (phase === "off") enable();
+          else if (phase === "ready") void record();
+          else if (phase === "recording") void finish();
+          else end();
+        }}
+      >
+        {speaking || phase === "recording" ? <SquareIcon /> : <MicIcon />}
+      </Button>
+      <Popover open={options} onOpenChange={setOptions}>
+        <PopoverTrigger
+          openOnHover
+          render={
+            <Button type="button" variant="ghost" size="icon-xs" aria-label="Voice options" />
+          }
         >
-          {speak ? <Volume2Icon /> : <VolumeXIcon />}
-          {speak ? "Spoken replies on" : "Spoken replies off"}
-        </Button>
-        {phase !== "off" ? (
-          <Button
-            variant="ghost"
-            size="sm"
-            aria-pressed={automatic}
-            disabled={phase !== "ready"}
-            onClick={() => {
-              autoSendReady.current = false;
-              setAutomatic(!automatic);
-            }}
-          >
-            {automatic ? "Send after a pause" : "Review before sending"}
-          </Button>
-        ) : null}
-        {speaking ? (
-          <span role="status" className="text-sm text-muted-foreground">
-            Speaking
-          </span>
-        ) : null}
-        {speaking ? (
-          <Button variant="ghost" size="sm" onClick={stopAudio}>
-            Stop speaking
-          </Button>
-        ) : null}
-        {phase !== "off" ? (
-          <Button variant="ghost" size="sm" disabled={phase === "sending"} onClick={cancel}>
-            End voice
-          </Button>
-        ) : null}
-      </div>
-      {phase === "off" ? (
-        <p className="text-xs text-muted-foreground">
-          English voice runs on this device after a one-time model download. Speech sends after a
-          pause; you can choose to review it first. Tap Talk or Stop speaking to interrupt a reply.
-          No speech API charges.
-        </p>
-      ) : null}
-      {transcript ? (
-        <div className="flex items-start gap-2">
-          <div className="min-w-0 flex-1">
-            <Textarea
-              aria-label="Voice message"
-              size="sm"
-              value={transcript}
-              disabled={phase === "sending"}
-              onChange={(event) => setTranscript(event.target.value)}
-            />
+          <ChevronDownIcon />
+        </PopoverTrigger>
+        <PopoverPopup width="md" side="top">
+          <div className="space-y-3 text-sm">
+            <label className="block">
+              Voice mode{" "}
+              <select
+                aria-label="Voice mode"
+                value={mode}
+                onChange={(e) => {
+                  stopAudio();
+                  setMode(e.target.value);
+                }}
+              >
+                <option value="dictation">Dictation — edit, then send</option>
+                <option value="conversation">Conversation — send after a pause</option>
+              </select>
+            </label>
+            <label className="block">
+              Local voice{" "}
+              <select
+                aria-label="Local voice"
+                value={voiceURI}
+                onChange={(e) => {
+                  stopAudio();
+                  setVoiceURI(e.target.value);
+                }}
+              >
+                <option value="">Recommended installed voice</option>
+                {voices.map((v) => (
+                  <option key={v.voiceURI} value={v.voiceURI}>
+                    {v.name} ({v.lang})
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => speak("The changes are ready. What would you like to explore next?")}
+              >
+                Preview voice
+              </Button>
+              {phase !== "off" ? (
+                <Button type="button" variant="ghost" size="sm" onClick={end}>
+                  End voice
+                </Button>
+              ) : null}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              English recognition runs on this device after a model download. Speech uses installed
+              local voices. Tap the microphone for each turn; tap the square to interrupt.
+              Hands-free interruption is not enabled. Dictation and worker answers stay editable in
+              the composer.
+            </p>
+            {error ? <p role="status">{error}</p> : null}
           </div>
-          <Button
-            size="sm"
-            disabled={phase !== "ready" || props.disabled || !transcript.trim()}
-            onClick={() => void send()}
-          >
-            Send
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={phase === "sending"}
-            onClick={() => {
-              setTranscript("");
-              sendAttempt.current = null;
-            }}
-          >
-            Discard
-          </Button>
-        </div>
-      ) : null}
-      {message ? (
-        <p role="status" className="text-sm text-muted-foreground">
-          {message}
-        </p>
-      ) : null}
-    </section>
+        </PopoverPopup>
+      </Popover>
+    </div>
   );
 }

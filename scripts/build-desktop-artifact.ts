@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+import {
+  isAssistantPreviewVersion,
+  ASSISTANT_PREVIEW_APP_ID,
+  ASSISTANT_PREVIEW_PRODUCT_NAME,
+} from "./fd/assistantPreview.ts";
 // @effect-diagnostics nodeBuiltinImport:off - Node's typed junction API avoids Windows symlink privileges while keeping the probe isolated.
 
 import * as NodeFSP from "node:fs/promises";
@@ -2746,6 +2751,7 @@ export function resolvePackageManagerUserAgent(packageManager: string): string {
 }
 
 export function resolveDesktopProductName(version: string): string {
+  if (isAssistantPreviewVersion(version)) return ASSISTANT_PREVIEW_PRODUCT_NAME;
   return resolveDesktopUpdateChannel(version) === "nightly"
     ? "T3 Code (Nightly)"
     : (desktopPackageJson.productName ?? "T3 Code");
@@ -2771,7 +2777,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   arch?: typeof BuildArch.Type,
 ) {
   const buildConfig: Record<string, unknown> = {
-    appId: DESKTOP_APP_ID,
+    appId: isAssistantPreviewVersion(version) ? ASSISTANT_PREVIEW_APP_ID : DESKTOP_APP_ID,
     productName: resolveDesktopProductName(version),
     artifactName: "T3-Code-${version}-${arch}.${ext}",
     electronLanguages: [...DESKTOP_ELECTRON_LANGUAGES],
@@ -2845,19 +2851,21 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
           },
         ],
       },
-      protocols: [
-        {
-          name: "T3 Code",
-          schemes: ["t3code", "t3code-dev"],
-        },
-        // Lets people choose T3 Code as their default web browser, which opens
-        // each link in a new thread's browser panel.
-        {
-          name: "Web site URL",
-          schemes: ["http", "https"],
-          role: "Viewer",
-        },
-      ],
+      protocols: isAssistantPreviewVersion(version)
+        ? []
+        : [
+            {
+              name: "T3 Code",
+              schemes: ["t3code", "t3code-dev"],
+            },
+            // Lets people choose T3 Code as their default web browser, which opens
+            // each link in a new thread's browser panel.
+            {
+              name: "Web site URL",
+              schemes: ["http", "https"],
+              role: "Viewer",
+            },
+          ],
       ...(signed ? { sign: path.join(repoRoot, "scripts/sign-macos.ts") } : {}),
       ...(macPasskeySigning
         ? {
@@ -2912,12 +2920,14 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       // electron-builder turns these into MimeType=x-scheme-handler/<scheme>;
       // in the .desktop entry (Exec already gets %U), so browsers can hand
       // t3code:// OAuth callbacks to the app.
-      protocols: [
-        {
-          name: "T3 Code",
-          schemes: ["t3code", "t3code-dev"],
-        },
-      ],
+      protocols: isAssistantPreviewVersion(version)
+        ? []
+        : [
+            {
+              name: "T3 Code",
+              schemes: ["t3code", "t3code-dev"],
+            },
+          ],
       desktop: {
         entry: {
           StartupWMClass: "t3code",

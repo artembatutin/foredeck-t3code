@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
-import { selectLocalVoice, spokenText } from "./speech";
+import { selectLocalVoice, shouldSpeakReply } from "./speech";
 
 const voice = (lang: string, localService: boolean): SpeechSynthesisVoice => ({
   lang,
@@ -22,12 +22,18 @@ describe("local spoken replies", () => {
     expect(selectLocalVoice([other, nearby, exact], "en-US")).toBe(exact);
     expect(selectLocalVoice([other, nearby], "en-US")).toBe(nearby);
   });
-  it("reads prose and link labels instead of code and URLs", () => {
-    expect(
-      spokenText(
-        "# Update\n**Done.** [Review](https://example.com)\n```ts\nsecret()\n```\n![chart](https://example.com/chart)",
-      ),
-    ).toBe("Update Done. Review Code is available in the conversation.");
-    expect(spokenText("x".repeat(4000))).toHaveLength(3000);
+  it("selects enhanced quality and respects a saved local voice", () => {
+    const compact = { ...voice("en-US", true), name: "Samantha", voiceURI: "compact" };
+    const enhanced = { ...compact, name: "Ava (Enhanced)", voiceURI: "enhanced" };
+    expect(selectLocalVoice([compact, enhanced], "en-US")).toBe(enhanced);
+    expect(selectLocalVoice([compact, enhanced], "en-US", "compact")).toBe(compact);
+  });
+  it("plays only an intentional unseen reply and never while listening or muted", () => {
+    const reply = { runId: "run-a", text: "The changes are ready. One decision remains." };
+    expect(shouldSpeakReply(null, new Set(), true, false)).toBe(false);
+    expect(shouldSpeakReply(reply, new Set(), true, false)).toBe(true);
+    expect(shouldSpeakReply(reply, new Set(["run-a"]), true, false)).toBe(false);
+    expect(shouldSpeakReply(reply, new Set(), true, true)).toBe(false);
+    expect(shouldSpeakReply(reply, new Set(), false, false)).toBe(false);
   });
 });

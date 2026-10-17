@@ -13,7 +13,6 @@ import { MessageCircleIcon } from "lucide-react";
 import { Button } from "~/components/ui/button";
 import { toastManager } from "~/components/ui/toast";
 import { useScratchProject } from "~/hooks/useScratchProject";
-import { newMessageId, randomUUID } from "~/lib/utils";
 import { useThreadShells, useAllEnvironmentShellsBootstrapped } from "~/state/entities";
 import { useEnvironments } from "~/state/environments";
 import { useEnvironmentScope } from "~/state/session";
@@ -26,10 +25,10 @@ export function AssistantEntry({ environmentId }: { environmentId: EnvironmentId
   const ready = useAllEnvironmentShellsBootstrapped();
   const { environments } = useEnvironments();
   const { openScratchProject } = useScratchProject();
-  const startTurn = useOrchestrationCommand(threadEnvironment.startTurn, { reportFailure: false });
+  const create = useOrchestrationCommand(threadEnvironment.create, { reportFailure: false });
+  const unarchive = useOrchestrationCommand(threadEnvironment.unarchive, { reportFailure: false });
   const canOperate = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
   const inFlight = useRef(false);
-  const attempt = useRef<Parameters<typeof startTurn>[0] | null>(null);
   const [opening, setOpening] = useState(false);
 
   const open = async () => {
@@ -38,15 +37,13 @@ export function AssistantEntry({ environmentId }: { environmentId: EnvironmentId
     setOpening(true);
     try {
       const existing = threads
-        .filter(
-          (thread) =>
-            thread.environmentId === environmentId &&
-            isAssistantThread(thread.id) &&
-            !thread.archivedAt,
-        )
-        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+        .filter((thread) => thread.environmentId === environmentId && isAssistantThread(thread.id))
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
       if (existing) {
-        attempt.current = null;
+        if (existing.archivedAt) {
+          const restored = await unarchive({ environmentId, input: { threadId: existing.id } });
+          if (restored._tag === "Failure") throw squashAtomCommandFailure(restored);
+        }
         await navigate({
           to: "/$environmentId/$threadId",
           params: { environmentId, threadId: existing.id },
@@ -70,45 +67,24 @@ export function AssistantEntry({ environmentId }: { environmentId: EnvironmentId
         );
       const project = await openScratchProject(environmentId, "Could not open the assistant");
       if (!project) return;
-      // Keep the entire request after an uncertain launch, including its receipt and message IDs.
-      if (attempt.current?.environmentId !== environmentId) {
-        const threadId = ThreadId.make(ASSISTANT_THREAD_PREFIX + randomUUID());
-        const runtimeMode = environment.serverConfig.settings.defaultRuntimeMode;
-        const createdAt = new Date().toISOString();
-        attempt.current = {
-          environmentId,
-          input: {
-            commandId: CommandId.make("start:" + threadId),
-            threadId,
-            createdAt,
-            runtimeMode,
-            interactionMode: "default",
-            modelSelection: selected.selection,
-            message: {
-              messageId: newMessageId(),
-              role: "user",
-              text: "Help me review my projects, clarify what matters most, and coordinate the work we agree to start.",
-              attachments: [],
-            },
-            bootstrap: {
-              createThread: {
-                projectId: project.id,
-                title: "Project assistant",
-                modelSelection: selected.selection,
-                runtimeMode,
-                interactionMode: "default",
-                branch: null,
-                worktreePath: null,
-                createdAt,
-              },
-            },
-          },
-        };
-      }
-      const { threadId } = attempt.current.input;
-      const result = await startTurn(attempt.current);
+      // One stable identity per destination environment, including concurrent clients.
+      // Creating a shell does not enqueue a message or start a provider turn.
+      const threadId = ThreadId.make(ASSISTANT_THREAD_PREFIX + "owner");
+      const result = await create({
+        environmentId,
+        input: {
+          commandId: CommandId.make("create:" + threadId),
+          threadId,
+          projectId: project.id,
+          title: "Project assistant",
+          modelSelection: selected.selection,
+          runtimeMode: environment.serverConfig.settings.defaultRuntimeMode,
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        },
+      });
       if (result._tag === "Failure") throw squashAtomCommandFailure(result);
-      attempt.current = null;
       await navigate({ to: "/$environmentId/$threadId", params: { environmentId, threadId } });
     } catch (error) {
       toastManager.add({

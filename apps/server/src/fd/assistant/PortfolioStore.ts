@@ -31,6 +31,8 @@ const StringList = Schema.fromJsonString(Schema.Array(Schema.String));
 
 const BriefDbRow = Schema.Struct({
   projectId: ProjectId,
+  ideaId: Schema.String,
+  decisions: StringList,
   goal: Schema.String,
   acceptanceCriteria: StringList,
   constraints: StringList,
@@ -62,12 +64,14 @@ const toBrief = ({ priorityRank, priorityReason, ...row }: BriefDbRow): Portfoli
 
 const toBriefRow = ({ priority, ...brief }: Portfolio.ProjectBrief): BriefDbRow => ({
   ...brief,
+  ideaId: brief.ideaId ?? "legacy",
+  decisions: brief.decisions ?? [],
   priorityRank: priority?.rank ?? null,
   priorityReason: priority?.reason ?? null,
 });
 
 /**
- * The assistant's durable, environment-local portfolio: one agreed brief per project, its
+ * The assistant's durable, environment-local portfolio: independent idea briefs in each project, their
  * revision history, and assignments with their lifecycle. Lifecycle rules live in
  * `portfolio.ts`; this service applies them atomically against stored state.
  */
@@ -76,6 +80,7 @@ export class PortfolioStore extends Context.Service<
   {
     readonly getBrief: (
       projectId: ProjectId,
+      ideaId?: string,
     ) => Effect.Effect<Option.Option<Portfolio.ProjectBrief>, PortfolioStoreError>;
     /** Briefs in priority order; unranked projects last. */
     readonly listBriefs: () => Effect.Effect<
@@ -88,12 +93,14 @@ export class PortfolioStore extends Context.Service<
      */
     readonly reviseBrief: (input: {
       readonly projectId: ProjectId;
+      readonly ideaId?: string;
       readonly patch: Portfolio.BriefPatch;
       readonly reason?: string | null;
     }) => Effect.Effect<Portfolio.ProjectBrief, PortfolioStoreError>;
     /** Revisions oldest first, each with the previous and next value of every changed field. */
     readonly listRevisions: (
       projectId: ProjectId,
+      ideaId?: string,
     ) => Effect.Effect<ReadonlyArray<Portfolio.BriefRevision>, PortfolioStoreError>;
     /**
      * Create a draft assignment. The caller's id is the idempotency key: reusing it returns
@@ -102,6 +109,7 @@ export class PortfolioStore extends Context.Service<
     readonly createAssignment: (input: {
       readonly assignmentId: string;
       readonly projectId: ProjectId;
+      readonly ideaId?: string;
       readonly executor: Portfolio.ExecutorKind;
     }) => Effect.Effect<Portfolio.Assignment, PortfolioStoreError>;
     readonly getAssignment: (
@@ -134,11 +142,16 @@ const make = Effect.gen(function* () {
   const now = Effect.map(DateTime.now, DateTime.formatIso);
 
   const selectBriefs = SqlSchema.findAll({
-    Request: Schema.Struct({ projectId: Schema.optional(ProjectId) }),
+    Request: Schema.Struct({
+      projectId: Schema.optional(ProjectId),
+      ideaId: Schema.optional(Schema.String),
+    }),
     Result: BriefDbRow,
-    execute: ({ projectId }) => sql`
+    execute: ({ projectId, ideaId }) => sql`
       SELECT
         project_id AS "projectId",
+        idea_id AS "ideaId",
+        decisions_json AS decisions,
         goal,
         acceptance_criteria_json AS "acceptanceCriteria",
         constraints_json AS "constraints",
@@ -149,7 +162,7 @@ const make = Effect.gen(function* () {
         revision,
         updated_at AS "updatedAt"
       FROM fd_assistant_project_briefs
-      WHERE ${sql.and(projectId === undefined ? [] : [sql`project_id = ${projectId}`])}
+      WHERE ${sql.and([...(projectId === undefined ? [] : [sql`project_id = ${projectId}`]), ...(ideaId === undefined ? [] : [sql`idea_id = ${ideaId}`])])}
       ORDER BY priority_rank IS NULL, priority_rank, project_id
     `,
   });
@@ -159,6 +172,8 @@ const make = Effect.gen(function* () {
     execute: (row) => sql`
       INSERT INTO fd_assistant_project_briefs (
         project_id,
+        idea_id,
+        decisions_json,
         goal,
         acceptance_criteria_json,
         constraints_json,
@@ -171,6 +186,8 @@ const make = Effect.gen(function* () {
       )
       VALUES (
         ${row.projectId},
+        ${row.ideaId},
+        ${row.decisions},
         ${row.goal},
         ${row.acceptanceCriteria},
         ${row.constraints},
@@ -181,7 +198,8 @@ const make = Effect.gen(function* () {
         ${row.revision},
         ${row.updatedAt}
       )
-      ON CONFLICT (project_id) DO UPDATE SET
+      ON CONFLICT (project_id, idea_id) DO UPDATE SET
+        decisions_json = excluded.decisions_json,
         goal = excluded.goal,
         acceptance_criteria_json = excluded.acceptance_criteria_json,
         constraints_json = excluded.constraints_json,
@@ -195,17 +213,18 @@ const make = Effect.gen(function* () {
   });
 
   const selectRevisions = SqlSchema.findAll({
-    Request: Schema.Struct({ projectId: ProjectId }),
+    Request: Schema.Struct({ projectId: ProjectId, ideaId: Schema.String }),
     Result: RevisionDbRow,
-    execute: ({ projectId }) => sql`
+    execute: ({ projectId, ideaId }) => sql`
       SELECT
         project_id AS "projectId",
+        idea_id AS "ideaId",
         revision,
         changes_json AS "changes",
         reason,
         recorded_at AS "recordedAt"
       FROM fd_assistant_brief_revisions
-      WHERE project_id = ${projectId}
+      WHERE project_id = ${projectId} AND idea_id = ${ideaId}
       ORDER BY revision ASC
     `,
   });
@@ -215,12 +234,13 @@ const make = Effect.gen(function* () {
     execute: (row) => sql`
       INSERT INTO fd_assistant_brief_revisions (
         project_id,
+        idea_id,
         revision,
         changes_json,
         reason,
         recorded_at
       )
-      VALUES (${row.projectId}, ${row.revision}, ${row.changes}, ${row.reason}, ${row.recordedAt})
+      VALUES (${row.projectId}, ${row.ideaId ?? "legacy"}, ${row.revision}, ${row.changes}, ${row.reason}, ${row.recordedAt})
     `,
   });
 
@@ -235,6 +255,7 @@ const make = Effect.gen(function* () {
       SELECT
         assignment_id AS "assignmentId",
         project_id AS "projectId",
+        idea_id AS "ideaId",
         executor,
         attempt,
         state,
@@ -261,6 +282,7 @@ const make = Effect.gen(function* () {
       INSERT INTO fd_assistant_assignments (
         assignment_id,
         project_id,
+        idea_id,
         executor,
         attempt,
         state,
@@ -273,6 +295,7 @@ const make = Effect.gen(function* () {
       VALUES (
         ${row.assignmentId},
         ${row.projectId},
+        ${row.ideaId ?? "legacy"},
         ${row.executor},
         ${row.attempt},
         ${row.state},
@@ -299,8 +322,8 @@ const make = Effect.gen(function* () {
     `,
   });
 
-  const readBrief = (projectId: ProjectId) =>
-    selectBriefs({ projectId }).pipe(
+  const readBrief = (projectId: ProjectId, ideaId = "legacy") =>
+    selectBriefs({ projectId, ideaId }).pipe(
       Effect.map((rows) => Option.map(Option.fromUndefinedOr(rows[0]), toBrief)),
     );
 
@@ -312,9 +335,10 @@ const make = Effect.gen(function* () {
   const reviseBrief: PortfolioStore["Service"]["reviseBrief"] = (input) =>
     Effect.gen(function* () {
       const at = yield* now;
-      const current = yield* readBrief(input.projectId);
+      const current = yield* readBrief(input.projectId, input.ideaId);
       const { brief, revision } = Portfolio.reviseBrief(Option.getOrUndefined(current), {
         projectId: input.projectId,
+        ideaId: input.ideaId ?? "legacy",
         patch: input.patch,
         reason: input.reason ?? null,
         at,
@@ -341,7 +365,7 @@ const make = Effect.gen(function* () {
       if (Option.isNone(current)) {
         return yield* new AssignmentNotFound({ assignmentId: input.assignmentId });
       }
-      const brief = yield* readBrief(current.value.projectId);
+      const brief = yield* readBrief(current.value.projectId, current.value.ideaId);
       const at = yield* now;
       const next = yield* Effect.fromResult(
         Portfolio.transitionAssignment(current.value, input.event, {
@@ -362,14 +386,15 @@ const make = Effect.gen(function* () {
     );
 
   return PortfolioStore.of({
-    getBrief: (projectId) => readBrief(projectId).pipe(mapError("getBrief")),
+    getBrief: (projectId, ideaId) => readBrief(projectId, ideaId).pipe(mapError("getBrief")),
     listBriefs: () =>
       selectBriefs({}).pipe(
         Effect.map((rows) => rows.map(toBrief)),
         mapError("listBriefs"),
       ),
     reviseBrief,
-    listRevisions: (projectId) => selectRevisions({ projectId }).pipe(mapError("listRevisions")),
+    listRevisions: (projectId, ideaId = "legacy") =>
+      selectRevisions({ projectId, ideaId }).pipe(mapError("listRevisions")),
     createAssignment,
     getAssignment: (assignmentId) => readAssignment(assignmentId).pipe(mapError("getAssignment")),
     listAssignments: (filter) =>

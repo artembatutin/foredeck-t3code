@@ -13,9 +13,11 @@ export type Priority = typeof Priority.Type;
 /** The agreed, environment-local brief for one project. */
 export const ProjectBrief = Schema.Struct({
   projectId: ProjectId,
+  ideaId: Schema.optionalKey(Schema.String),
   goal: Schema.String,
   acceptanceCriteria: Schema.Array(Schema.String),
   constraints: Schema.Array(Schema.String),
+  decisions: Schema.optionalKey(Schema.Array(Schema.String)),
   priority: Schema.NullOr(Priority),
   openQuestions: Schema.Array(Schema.String),
   executionAuthorized: Schema.Boolean,
@@ -29,6 +31,7 @@ export const BriefPatch = Schema.Struct({
   goal: Schema.optionalKey(Schema.String),
   acceptanceCriteria: Schema.optionalKey(Schema.Array(Schema.String)),
   constraints: Schema.optionalKey(Schema.Array(Schema.String)),
+  decisions: Schema.optionalKey(Schema.Array(Schema.String)),
   priority: Schema.optionalKey(Schema.NullOr(Priority)),
   openQuestions: Schema.optionalKey(Schema.Array(Schema.String)),
   executionAuthorized: Schema.optionalKey(Schema.Boolean),
@@ -46,6 +49,7 @@ export const BriefChange = Schema.Union([
   Schema.Struct({ field: Schema.Literal("goal"), previous: Schema.String, next: Schema.String }),
   listChange("acceptanceCriteria"),
   listChange("constraints"),
+  listChange("decisions"),
   listChange("openQuestions"),
   Schema.Struct({
     field: Schema.Literal("priority"),
@@ -63,6 +67,7 @@ export type BriefChange = typeof BriefChange.Type;
 /** One recorded correction. A priority change keeps the previous rank and both reasons. */
 export const BriefRevision = Schema.Struct({
   projectId: ProjectId,
+  ideaId: Schema.optionalKey(Schema.String),
   revision: Schema.Int,
   changes: Schema.Array(BriefChange),
   reason: Schema.NullOr(Schema.String),
@@ -90,6 +95,7 @@ export function reviseBrief(
   current: ProjectBrief | undefined,
   input: {
     readonly projectId: ProjectId;
+    readonly ideaId?: string;
     readonly patch: BriefPatch;
     readonly reason: string | null;
     readonly at: string;
@@ -97,9 +103,11 @@ export function reviseBrief(
 ): { readonly brief: ProjectBrief; readonly revision?: BriefRevision } {
   const base: ProjectBrief = current ?? {
     projectId: input.projectId,
+    ideaId: input.ideaId ?? "legacy",
     goal: "",
     acceptanceCriteria: [],
     constraints: [],
+    decisions: [],
     priority: null,
     openQuestions: [],
     executionAuthorized: false,
@@ -115,13 +123,18 @@ export function reviseBrief(
     next.goal = goal;
     changes.push({ field: "goal", previous: base.goal, next: goal });
   }
-  for (const field of ["acceptanceCriteria", "constraints", "openQuestions"] as const) {
+  for (const field of [
+    "acceptanceCriteria",
+    "constraints",
+    "openQuestions",
+    "decisions",
+  ] as const) {
     const value = patch[field];
     if (value === undefined) continue;
     const normalized = normalizeList(value);
-    if (sameList(normalized, base[field])) continue;
+    if (sameList(normalized, base[field] ?? [])) continue;
     next[field] = normalized;
-    changes.push({ field, previous: base[field], next: normalized });
+    changes.push({ field, previous: base[field] ?? [], next: normalized });
   }
   if (patch.priority !== undefined) {
     const priority =
@@ -134,7 +147,7 @@ export function reviseBrief(
     }
   }
   const scopeChanged = changes.some((change) =>
-    ["goal", "acceptanceCriteria", "constraints"].includes(change.field),
+    ["goal", "acceptanceCriteria", "constraints", "decisions"].includes(change.field),
   );
   const authorized = patch.executionAuthorized ?? (scopeChanged ? false : undefined);
   if (authorized !== undefined && authorized !== base.executionAuthorized) {
@@ -152,6 +165,7 @@ export function reviseBrief(
     brief: { ...next, revision, updatedAt: input.at },
     revision: {
       projectId: input.projectId,
+      ideaId: input.ideaId ?? "legacy",
       revision,
       changes,
       reason: input.reason?.trim() || null,
@@ -192,6 +206,7 @@ export type ProgressNote = typeof ProgressNote.Type;
 export const Assignment = Schema.Struct({
   assignmentId: TrimmedNonEmptyString,
   projectId: ProjectId,
+  ideaId: Schema.optionalKey(Schema.String),
   executor: ExecutorKind,
   attempt: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
   state: AssignmentState,
@@ -210,11 +225,13 @@ export function newAssignment(input: {
   readonly assignmentId: string;
   readonly projectId: ProjectId;
   readonly executor: ExecutorKind;
+  readonly ideaId?: string;
   readonly at: string;
 }): Assignment {
   return {
     assignmentId: input.assignmentId,
     projectId: input.projectId,
+    ideaId: input.ideaId ?? "legacy",
     executor: input.executor,
     attempt: 1,
     state: "draft",
@@ -228,6 +245,7 @@ export function newAssignment(input: {
 
 /** Every event may carry a progress note recorded with the move. */
 export type AssignmentEvent = { readonly note?: string } & (
+  | { readonly type: "record-notice" }
   | { readonly type: "queue" }
   | { readonly type: "claim" }
   | { readonly type: "uncertain" }
@@ -288,6 +306,7 @@ const MOVES: {
     readonly requiresAuthorization?: true;
   };
 } = {
+  "record-notice": { from: AssignmentState.literals },
   queue: { from: ["draft"], to: "queued", requiresAuthorization: true },
   claim: { from: ["queued"], to: "launching", requiresAuthorization: true },
   uncertain: { from: ["launching"], to: "launch-uncertain" },
@@ -423,10 +442,11 @@ const renderList = (
  */
 export function renderAssignmentBrief(brief: ProjectBrief): string {
   return [
-    `Project brief for ${brief.projectId}. This is the complete agreed scope for this assignment.`,
+    `Project brief for ${brief.projectId}, idea ${brief.ideaId ?? "legacy"}. This is the complete agreed scope for this assignment.`,
     `Goal:\n${brief.goal || "(none recorded)"}`,
     renderList("Acceptance criteria", brief.acceptanceCriteria, (index) => `${index + 1}.`),
     renderList("Constraints", brief.constraints, () => "-"),
+    renderList("Decisions", brief.decisions ?? [], () => "-"),
     ...(brief.openQuestions.length === 0
       ? []
       : [renderList("Open questions (ask instead of assuming)", brief.openQuestions, () => "-")]),
@@ -472,7 +492,7 @@ function summarizeProject(brief: ProjectBrief, assignments: ReadonlyArray<Assign
           .map(String)
           .join(" — ");
   return [
-    `## ${brief.projectId}`,
+    `## ${brief.projectId} / ${brief.ideaId ?? "legacy"}`,
     `Priority: ${priority}`,
     `Execution: ${brief.executionAuthorized ? "authorized" : "not authorized"}`,
     `Goal: ${oneLine(brief.goal) || "(not agreed yet)"}`,
@@ -517,7 +537,12 @@ export function renderManagerSummary(
   const shown = ordered.slice(0, Math.max(0, limits.projects));
   const sections = shown.map((brief) =>
     truncate(
-      summarizeProject(brief, byProject.get(brief.projectId) ?? []),
+      summarizeProject(
+        brief,
+        (byProject.get(brief.projectId) ?? []).filter(
+          (a) => (a.ideaId ?? "legacy") === (brief.ideaId ?? "legacy"),
+        ),
+      ),
       limits.charactersPerProject,
     ),
   );

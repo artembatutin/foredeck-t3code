@@ -1,3 +1,4 @@
+import { AssistantVoiceControls } from "~/fd/assistant";
 import {
   repositoryExecutionBlockReason,
   type RepositoryFileScope,
@@ -6351,6 +6352,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     [expandMobileComposer, insertComposerText, isComposerCollapsedMobile],
   );
 
+  const [voiceSubmitPending, setVoiceSubmitPending] = useState(false);
+  useEffect(() => {
+    if (!voiceSubmitPending) return;
+    setVoiceSubmitPending(false);
+    submitComposer();
+  }, [voiceSubmitPending, submitComposer]);
+
   // Context produced by other panels (diff comments, preview picks) asks the store to place
   // its chip; while this composer is mounted for the draft, that means the caret.
   const insertContextReferencesAtCaret = useCallback(
@@ -7861,6 +7869,41 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       </Tooltip>
                     </>
                   ) : null}
+                  <AssistantVoiceControls
+                    key={`${environmentId}:${activeThreadId ?? draftId}:${activePendingUserInput?.requestId ?? "turn"}:${activePendingProgress?.activeQuestion?.id ?? ""}`}
+                    threadRef={routeThreadRef}
+                    messages={promptHistoryMessages}
+                    thinking={phase === "running"}
+                    disabled={
+                      !canOperateThread ||
+                      isConnecting ||
+                      isSendBusy ||
+                      isComposerApprovalState ||
+                      projectSelectionRequired ||
+                      isChoiceOnlyPendingQuestion
+                    }
+                    canConverse={
+                      !activePendingProgress &&
+                      !prompt.trim() &&
+                      composerImages.length === 0 &&
+                      composerFiles.length === 0
+                    }
+                    onTranscript={(text, submit) => {
+                      if (activePendingProgress?.activeQuestion) {
+                        const answer = `${activePendingProgress.customAnswer} ${text}`.trim();
+                        onChangeActivePendingUserInputCustomAnswer(
+                          activePendingProgress.activeQuestion.id,
+                          answer,
+                          answer.length,
+                          answer.length,
+                          isLiteralPendingAnswer,
+                        );
+                        return;
+                      }
+                      if (insertComposerTextAtEnd(text, { ensureLeadingBoundary: true }) && submit)
+                        setVoiceSubmitPending(true);
+                    }}
+                  />
                   <ComposerFooterPrimaryActions
                     compact={isComposerResting || isComposerPrimaryActionsCompact}
                     canOperateThread={canOperateThread}

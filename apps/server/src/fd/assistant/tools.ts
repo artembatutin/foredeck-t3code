@@ -27,11 +27,20 @@ const common = {
   ],
 };
 export const AssistantToolkit = Toolkit.make(
+  Tool.make("voice_reply", {
+    ...common,
+    description:
+      "Save a separately composed owner-facing spoken answer for this turn. Use one or two natural sentences unless the owner asks for more. Lead with the outcome or focused question. No tool narration, progress, markup or technical logs. Call once when ready to give your final answer; the client plays it only after this run completes and only when voice is enabled.",
+    parameters: Schema.Struct({ text: TrimmedNonEmptyString.check(Schema.isMaxLength(1600)) }),
+  }),
   Tool.make("assistant_portfolio", {
     ...common,
     description:
       "Read the authoritative, bounded project portfolio. Pass projectId for its full brief, assignments and exact worker IDs. Only the project assistant can read the portfolio.",
-    parameters: Schema.Struct({ projectId: Schema.optionalKey(ProjectId) }),
+    parameters: Schema.Struct({
+      projectId: Schema.optionalKey(ProjectId),
+      ideaId: Schema.optionalKey(TrimmedNonEmptyString),
+    }),
   }).annotate(Tool.Readonly, true),
   Tool.make("assistant_revise_brief", {
     ...common,
@@ -39,6 +48,7 @@ export const AssistantToolkit = Toolkit.make(
       "Persist an agreed project brief or correction. Save goals, criteria, constraints, questions, priority rank/reason and explicit execution authorization. Ask about ambiguous priority. A change does not interrupt workers; queued work with changed scope needs a new assignment. Markdown notes are not authoritative.",
     parameters: Schema.Struct({
       projectId: ProjectId,
+      ideaId: TrimmedNonEmptyString,
       patch: BriefPatch,
       reason: Schema.optionalKey(Schema.String),
     }),
@@ -50,6 +60,7 @@ export const AssistantToolkit = Toolkit.make(
     parameters: Schema.Struct({
       assignmentId: TrimmedNonEmptyString,
       projectId: ProjectId,
+      ideaId: TrimmedNonEmptyString,
       looperConfig: Schema.optionalKey(TrimmedNonEmptyString),
     }),
   }),
@@ -98,10 +109,24 @@ const result = <A, R>(effect: Effect.Effect<A, Assistant.AssistantError, R>) =>
     ),
   );
 export const toolLayer = McpToolAccess.toLayer(AssistantToolkit, {
+  voice_reply: McpToolAccess.actsAsCaller((input) =>
+    Effect.gen(function* () {
+      const { caller } = yield* readCaller();
+      if (!caller)
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message: "A conversation is required.",
+        });
+      yield* result((yield* Assistant.ProjectAssistant).saveSpeech(caller.id, input.text));
+      return { saved: true };
+    }),
+  ),
   assistant_portfolio: McpToolAccess.reads((input) =>
     Effect.gen(function* () {
       yield* manager;
-      return yield* result((yield* Assistant.ProjectAssistant).inspect(input.projectId));
+      return yield* result(
+        (yield* Assistant.ProjectAssistant).inspect(input.projectId, input.ideaId),
+      );
     }),
   ),
   assistant_revise_brief: McpToolAccess.actsAsCaller((input) =>

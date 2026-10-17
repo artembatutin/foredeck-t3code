@@ -689,3 +689,114 @@ it.effect("tracks exact Looper runs, progress, graceful stop and resumed identit
     assert.equal(h.launches.length, 0);
   }).pipe(Effect.provide(h.layer()), inMemory);
 });
+
+it.effect(
+  "keeps three ideas across two projects isolated through priority changes and restart",
+  () => {
+    const h = harness();
+    const agree = Effect.fn(function* (projectId: ProjectId, ideaId: string, rank: number) {
+      const service = yield* Assistant.ProjectAssistant;
+      yield* service.revise({
+        projectId,
+        ideaId,
+        patch: {
+          goal: `Deliver ${ideaId}`,
+          acceptanceCriteria: [`Check ${ideaId}`],
+          decisions: [`Decision for ${ideaId}`],
+          executionAuthorized: true,
+          priority: { rank, reason: `Owner ranked ${ideaId}` },
+        },
+      });
+      yield* service.enqueue({
+        assignmentId: ideaId,
+        projectId,
+        ideaId,
+        managerThreadId: managerId,
+        modelSelection,
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        looperConfig: null,
+      });
+    });
+    return Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        const service = yield* Assistant.ProjectAssistant;
+        yield* agree(alpha, "onboarding", 1);
+        yield* agree(beta, "reporting", 2);
+        yield* agree(alpha, "notifications", 3);
+        yield* service.tick;
+        assert.equal(h.launches.length, 2);
+        assert.equal(
+          (yield* service.inspect(alpha, "notifications")).assignments[0]!.state,
+          "queued",
+        );
+        yield* service.revise({
+          projectId: alpha,
+          ideaId: "notifications",
+          patch: { priority: { rank: 1, reason: "Important next" } },
+        });
+        yield* service.revise({
+          projectId: alpha,
+          ideaId: "onboarding",
+          patch: { openQuestions: ["Explore another audience later"] },
+        });
+        yield* service.tick;
+        assert.equal(h.launches.length, 2);
+        assert.equal(h.interrupts.length, 0);
+        const onboarding = (yield* service.inspect(alpha, "onboarding")).dispatches[0]!;
+        assert.deepEqual(onboarding.brief.openQuestions, []);
+        assert.notInclude(h.launches[0]!.initialMessage!.text, "notifications");
+        assert.notInclude(h.launches[0]!.initialMessage!.text, "reporting");
+        assert.equal(h.notices.length, 0, "worker progress must not start manager turns");
+      }).pipe(Effect.provide(h.layer()));
+      yield* Effect.gen(function* () {
+        const service = yield* Assistant.ProjectAssistant;
+        yield* service.tick;
+        assert.equal(h.launches.length, 2);
+        const before = yield* service.inspect(alpha, "onboarding");
+        assert.equal(before.dispatches[0]!.threadId, h.launches[0]!.threadId);
+        h.change(h.launches[0]!.threadId!, "completed");
+        yield* service.tick;
+        assert.equal(h.launches.length, 3);
+        assert.include(h.launches[2]!.initialMessage!.text, "Deliver notifications");
+        assert.notInclude(h.launches[2]!.initialMessage!.text, "Deliver onboarding");
+        const ideas = yield* service.inspect(alpha);
+        assert.equal(ideas.briefs.length, 2);
+        assert.equal(
+          ideas.assignments.find((a) => a.ideaId === "onboarding")!.state,
+          "awaiting-verification",
+        );
+        assert.equal((yield* service.inspect(beta)).assignments[0]!.state, "running");
+        yield* service.verify({
+          assignmentId: "onboarding",
+          managerThreadId: managerId,
+          evidence: ["Check onboarding passed; no integration or deployment requested."],
+        });
+        assert.equal(
+          (yield* service.overview).assignments.find((a) => a.assignmentId === "onboarding")!.state,
+          "completed",
+        );
+        assert.equal(h.notices.length, 0);
+      }).pipe(Effect.provide(h.layer()));
+    }).pipe(inMemory);
+  },
+);
+
+it.effect("withholds separately generated speech until the exact run completes", () => {
+  const h = harness();
+  return Effect.gen(function* () {
+    const service = yield* Assistant.ProjectAssistant;
+    yield* queue(alpha);
+    yield* service.tick;
+    const id = h.launches[0]!.threadId!;
+    yield* service.saveSpeech(id, "The changes are ready. One decision remains.");
+    assert.isNull(yield* service.speech(id));
+    h.change(id, "completed");
+    assert.deepEqual(yield* service.speech(id), {
+      runId: h.projections.get(id)!.runs[0]!.id,
+      text: "The changes are ready. One decision remains.",
+    });
+    h.change(id, "failed");
+    assert.isNull(yield* service.speech(id));
+  }).pipe(Effect.provide(h.layer()), inMemory);
+});

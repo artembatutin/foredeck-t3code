@@ -336,3 +336,20 @@ it.effect("rejects protected unary and streamed RPCs outside a guarded command",
     expect(writes).toBe(0);
   }),
 );
+
+it.effect("assistant controls recheck the destination grant after it is revoked", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const registry = yield* setup;
+      const assistant = createCommandPermissions(runtime, WS_METHODS.assistantControl);
+      registry.set(sessions(env), AsyncResult.success(grant(true)));
+      expect(registry.get(assistant.permissionAtom(env))).toBe(true);
+      yield* assistant.authorize(registry, env);
+      registry.set(sessions(env), AsyncResult.success(grant(false)));
+      expect(registry.get(assistant.permissionAtom(env))).toBe(false);
+      expect((yield* assistant.authorize(registry, env).pipe(Effect.flip))._tag).toBe(
+        "EnvironmentAuthorizationError",
+      );
+    }),
+  ),
+);

@@ -1,3 +1,4 @@
+import { AssistantOverview, AssistantOperationError, SpokenReply } from "./fd/assistant/index.ts";
 import { RepositoryTargetError } from "./project.ts";
 import {
   OrchestrationV2SearchThreadError,
@@ -26,7 +27,7 @@ import * as Schema from "effect/Schema";
 import * as Rpc from "effect/rpc/Rpc";
 import * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcMiddleware from "effect/rpc/RpcMiddleware";
-import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, TrimmedNonEmptyString, ThreadId } from "./baseSchemas.ts";
 import {
   CodexAuthCallbackInput,
   CodexAuthCallbackState,
@@ -479,6 +480,9 @@ export const WS_METHODS = {
   deviceAction: "device.action",
 
   // Server meta
+  assistantOverview: "assistant.overview",
+  assistantControl: "assistant.control",
+  assistantSpeech: "assistant.speech",
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
   serverRefreshProviders: "server.refreshProviders",
@@ -609,6 +613,26 @@ const WsServerProbeRpc = Rpc.make(WS_METHODS.serverProbe, {
   payload: Schema.Struct({}),
   success: Schema.Struct({}),
   error: EnvironmentAuthorizationError,
+});
+
+const WsAssistantOverviewRpc = Rpc.make(WS_METHODS.assistantOverview, {
+  payload: Schema.Struct({}),
+  success: AssistantOverview,
+  error: Schema.Union([AssistantOperationError, EnvironmentAuthorizationError]),
+});
+const WsAssistantControlRpc = Rpc.make(WS_METHODS.assistantControl, {
+  payload: Schema.Struct({
+    assignmentId: TrimmedNonEmptyString,
+    managerThreadId: ThreadId,
+    action: Schema.Literals(["stop", "resume", "retry", "cancel"]),
+  }),
+  success: Schema.Void,
+  error: Schema.Union([AssistantOperationError, EnvironmentAuthorizationError]),
+});
+const WsAssistantSpeechRpc = Rpc.make(WS_METHODS.assistantSpeech, {
+  payload: Schema.Struct({ threadId: ThreadId }),
+  success: SpokenReply,
+  error: Schema.Union([AssistantOperationError, EnvironmentAuthorizationError]),
 });
 
 const WsServerGetConfigRpc = Rpc.make(WS_METHODS.serverGetConfig, {
@@ -1939,6 +1963,9 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
 export const WsRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
+  WsAssistantOverviewRpc,
+  WsAssistantControlRpc,
+  WsAssistantSpeechRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsProviderConsumeResetCreditRpc,

@@ -20,6 +20,7 @@ const PORTFOLIO_TABLES = [
   "fd_assistant_brief_revisions",
   "fd_assistant_dispatches",
   "fd_assistant_project_briefs",
+  "fd_assistant_spoken_replies",
 ];
 
 const schemaObjects = Effect.gen(function* () {
@@ -66,18 +67,15 @@ describe("migration 064", () => {
       const sql = yield* SqlClient.SqlClient;
       yield* sql`INSERT INTO effect_sql_migrations (migration_id, name) VALUES (63, 'AssistantPortfolio')`;
       const store = yield* PortfolioStore.PortfolioStore;
-      const brief = yield* store.reviseBrief({
-        projectId: alpha,
-        patch: { goal: "Keep this brief" },
-      });
-      const assignment = yield* store.createAssignment({
-        assignmentId: "keep",
-        projectId: alpha,
-        executor: "foredeck",
-      });
+      yield* sql`INSERT INTO fd_assistant_project_briefs VALUES (${alpha}, 'Keep this brief', '[]', '[]', NULL, NULL, '[]', 0, 1, '2026-10-16T12:00:00.000Z')`;
+      yield* sql`INSERT INTO fd_assistant_brief_revisions VALUES (${alpha}, 1, '[]', 'Original decision', '2026-10-16T12:00:00.000Z')`;
+      yield* sql`INSERT INTO fd_assistant_assignments VALUES ('keep', ${alpha}, 'foredeck', 1, 'draft', '[]', '[]', '[]', '2026-10-16T12:00:00.000Z', '2026-10-16T12:00:00.000Z')`;
       yield* runMigrations();
-      assert.deepStrictEqual(Option.getOrThrow(yield* store.getBrief(alpha)), brief);
-      assert.deepStrictEqual(Option.getOrThrow(yield* store.getAssignment("keep")), assignment);
+      const brief = Option.getOrThrow(yield* store.getBrief(alpha));
+      assert.equal(brief.ideaId, "legacy");
+      assert.equal(brief.goal, "Keep this brief");
+      assert.equal((yield* store.listRevisions(alpha))[0]!.reason, "Original decision");
+      assert.equal(Option.getOrThrow(yield* store.getAssignment("keep")).ideaId, "legacy");
       const columns = yield* sql<{ name: string }>`PRAGMA table_info(projection_projects)`;
       assert.isTrue(columns.some((c) => c.name === "repositories_json"));
       assert.deepStrictEqual(yield* runMigrations(), []);
@@ -106,6 +104,7 @@ describe("migration 064", () => {
       assert.deepStrictEqual(yield* runMigrations(), [
         [64, "AssistantPortfolio"],
         [65, "AssistantDispatches"],
+        [66, "AssistantIdeas"],
       ]);
       const after = yield* schemaObjects;
       assert.deepStrictEqual(

@@ -1,4 +1,5 @@
 import { type EnvironmentId, type ScopedProjectRef } from "@t3tools/contracts";
+import { isAssistantThread } from "@t3tools/shared/fd/assistant";
 import { AssistantEntry } from "~/fd/assistant";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "./ThreadHoverCard";
 import { CollapsibleSectionHeader } from "./ui/collapsible-section-header";
@@ -2420,7 +2421,11 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
 
 export default function Sidebar() {
   const projects = useProjects();
-  const threads = useThreadShells();
+  const allThreads = useThreadShells();
+  const threads = useMemo(
+    () => allThreads.filter((thread) => !isAssistantThread(thread.id)),
+    [allThreads],
+  );
   const router = useRouter();
   const { isMobile, setOpenMobile } = useSidebar();
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);

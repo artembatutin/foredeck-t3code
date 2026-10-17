@@ -1,3 +1,4 @@
+import { isAssistantPreviewVersion, ASSISTANT_PREVIEW_HOME } from "@t3tools/shared/fd/assistant";
 import { FOREDECK_PRODUCT_NAME } from "@t3tools/shared/fd/branding";
 import type {
   DesktopAppBranding,
@@ -168,7 +169,11 @@ const make = Effect.fn("desktop.environment.make")(function* (
   const baseDir = resolveDesktopBaseDir({
     homeDirectory,
     joinPath: path.join,
-    t3Home: config.t3Home,
+    t3Home: Option.orElse(config.t3Home, () =>
+      input.isPackaged && isAssistantPreviewVersion(input.appVersion)
+        ? Option.some(path.join(homeDirectory, ASSISTANT_PREVIEW_HOME))
+        : Option.none(),
+    ),
   });
   const rootDir = path.resolve(input.dirname, "../../..");
   const appRoot = input.isPackaged ? input.appPath : rootDir;
