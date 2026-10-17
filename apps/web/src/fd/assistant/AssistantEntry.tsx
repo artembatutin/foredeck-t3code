@@ -10,7 +10,7 @@ import { ASSISTANT_THREAD_PREFIX, isAssistantThread } from "@t3tools/shared/fd/a
 import { resolvePromptLinkModelSelection } from "@t3tools/client-runtime/prompt-links";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { MessageCircleIcon } from "lucide-react";
-import { Button } from "~/components/ui/button";
+import { SidebarMenuButton } from "~/components/ui/sidebar";
 import { toastManager } from "~/components/ui/toast";
 import { useScratchProject } from "~/hooks/useScratchProject";
 import { useThreadShells, useAllEnvironmentShellsBootstrapped } from "~/state/entities";
@@ -19,7 +19,13 @@ import { useEnvironmentScope } from "~/state/session";
 import { threadEnvironment } from "~/state/threads";
 import { useOrchestrationCommand } from "~/state/use-orchestration-command";
 
-export function AssistantEntry({ environmentId }: { environmentId: EnvironmentId | null }) {
+export function AssistantEntry({
+  environmentId,
+  active = false,
+}: {
+  environmentId: EnvironmentId | null;
+  active?: boolean;
+}) {
   const navigate = useNavigate();
   const threads = useThreadShells();
   const ready = useAllEnvironmentShellsBootstrapped();
@@ -99,16 +105,17 @@ export function AssistantEntry({ environmentId }: { environmentId: EnvironmentId
   };
 
   return (
-    <div className="px-2 pb-2">
-      <Button
-        variant="ghost"
-        size="sm"
+    <div className="pt-1">
+      <SidebarMenuButton
+        type="button"
+        isActive={active}
+        aria-current={active ? "page" : undefined}
         disabled={!environmentId || !ready || !canOperate || opening}
         onClick={() => void open()}
       >
         <MessageCircleIcon />
-        {opening ? "Opening assistant…" : "Assistant"}
-      </Button>
+        <span>{opening ? "Opening assistant…" : "Assistant"}</span>
+      </SidebarMenuButton>
     </div>
   );
 }

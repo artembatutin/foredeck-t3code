@@ -7,6 +7,13 @@ vi.mock("~/components/ui/popover", () => ({
   PopoverPopup: (props: object) => <div {...props} />,
   PopoverTrigger: (props: object) => <div {...props} />,
 }));
+vi.mock("~/components/ui/select", () => ({
+  Select: (props: object) => <div {...props} />,
+  SelectTrigger: (props: object) => <button {...props} />,
+  SelectValue: () => null,
+  SelectPopup: (props: object) => <div {...props} />,
+  SelectItem: (props: object) => <div {...props} />,
+}));
 vi.mock("./commands", () => ({ readSpeech: {} }));
 vi.mock("~/state/use-atom-command", () => ({
   useAtomCommand: () => async () => ({ _tag: "Success", value: null }),

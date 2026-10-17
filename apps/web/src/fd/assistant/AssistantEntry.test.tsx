@@ -8,7 +8,9 @@ vi.mock("@t3tools/client-runtime/prompt-links", () => ({
     selection: { instanceId: "subscription", model: "configured" },
   }),
 }));
-vi.mock("~/components/ui/button", () => ({ Button: (props: object) => <button {...props} /> }));
+vi.mock("~/components/ui/sidebar", () => ({
+  SidebarMenuButton: (props: object) => <button {...props} />,
+}));
 vi.mock("~/components/ui/toast", () => ({ toastManager: { add: vi.fn() } }));
 vi.mock("~/hooks/useScratchProject", () => ({
   useScratchProject: () => ({ openScratchProject: async () => ({ id: "scratch" }) }),

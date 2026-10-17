@@ -5184,6 +5184,9 @@ export default function Sidebar() {
               onClearSearch={clearThreadSearch}
             />
             <AssistantEntry
+              active={
+                routeTarget?.kind === "server" && isAssistantThread(routeTarget.threadRef.threadId)
+              }
               environmentId={
                 routeTarget?.kind === "server"
                   ? routeTarget.threadRef.environmentId

@@ -1,8 +1,15 @@
-import { useEffect, useEffectEvent, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useId, useRef, useState } from "react";
 import type { ScopedThreadRef } from "@t3tools/contracts";
 import { MicIcon, SquareIcon, ChevronDownIcon } from "lucide-react";
 import { Button } from "~/components/ui/button";
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
+import {
+  Select,
+  SelectItem,
+  SelectPopup,
+  SelectTrigger,
+  SelectValue,
+} from "~/components/ui/select";
 import { useAtomCommand } from "~/state/use-atom-command";
 import type { ChatMessage } from "~/types";
 import { startRecording } from "./recording";
@@ -31,6 +38,7 @@ export function AssistantVoiceControls(props: {
   canConverse: boolean;
   onTranscript: (text: string, submit: boolean) => void;
 }) {
+  const optionsId = useId();
   const [phase, setPhase] = useState<Phase>("off");
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -297,40 +305,65 @@ export function AssistantVoiceControls(props: {
         >
           <ChevronDownIcon />
         </PopoverTrigger>
-        <PopoverPopup width="md" side="top">
+        <PopoverPopup width="sm" side="top" align="end">
           <div className="space-y-3 text-sm">
-            <label className="block">
-              Voice mode{" "}
-              <select
-                aria-label="Voice mode"
+            <div className="space-y-1.5">
+              <label htmlFor={`${optionsId}-mode`} className="text-xs text-muted-foreground">
+                Mode
+              </label>
+              <Select
+                items={[
+                  { value: "dictation", label: "Dictation" },
+                  { value: "conversation", label: "Conversation" },
+                ]}
                 value={mode}
-                onChange={(e) => {
+                onValueChange={(value) => {
+                  if (value === null) return;
                   stopAudio();
-                  setMode(e.target.value);
+                  setMode(value);
                 }}
               >
-                <option value="dictation">Dictation — edit, then send</option>
-                <option value="conversation">Conversation — send after a pause</option>
-              </select>
-            </label>
-            <label className="block">
-              Local voice{" "}
-              <select
-                aria-label="Local voice"
+                <SelectTrigger id={`${optionsId}-mode`} size="sm" aria-label="Voice mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectPopup>
+                  <SelectItem value="dictation">Dictation</SelectItem>
+                  <SelectItem value="conversation">Conversation</SelectItem>
+                </SelectPopup>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {mode === "dictation" ? "Edit before sending." : "Send after a pause."}
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor={`${optionsId}-voice`} className="text-xs text-muted-foreground">
+                Voice
+              </label>
+              <Select
+                items={[
+                  { value: "", label: "Recommended" },
+                  ...voices.map((v) => ({ value: v.voiceURI, label: `${v.name} (${v.lang})` })),
+                ]}
                 value={voiceURI}
-                onChange={(e) => {
+                onValueChange={(value) => {
+                  if (value === null) return;
                   stopAudio();
-                  setVoiceURI(e.target.value);
+                  setVoiceURI(value);
                 }}
               >
-                <option value="">Recommended installed voice</option>
-                {voices.map((v) => (
-                  <option key={v.voiceURI} value={v.voiceURI}>
-                    {v.name} ({v.lang})
-                  </option>
-                ))}
-              </select>
-            </label>
+                <SelectTrigger id={`${optionsId}-voice`} size="sm" aria-label="Local voice">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectPopup>
+                  <SelectItem value="">Recommended</SelectItem>
+                  {voices.map((v) => (
+                    <SelectItem key={v.voiceURI} value={v.voiceURI}>
+                      {v.name} ({v.lang})
+                    </SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
+            </div>
             <div className="flex gap-2">
               <Button
                 type="button"
@@ -346,12 +379,6 @@ export function AssistantVoiceControls(props: {
                 </Button>
               ) : null}
             </div>
-            <p className="text-xs text-muted-foreground">
-              English recognition runs on this device after a model download. Speech uses installed
-              local voices. Tap the microphone for each turn; tap the square to interrupt.
-              Hands-free interruption is not enabled. Dictation and worker answers stay editable in
-              the composer.
-            </p>
             {error ? <p role="status">{error}</p> : null}
           </div>
         </PopoverPopup>
