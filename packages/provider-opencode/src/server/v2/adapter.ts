@@ -1,3 +1,4 @@
+import { repositoryContext } from "@t3tools/provider-core/fd/multirepo";
 /**
  * The OpenCode 2 runtime behind the `opencode` driver. It talks to the
  * instance's `opencode serve` process through the HTTP client and reads that
@@ -102,6 +103,9 @@ import { OPENCODE_PROVIDER, openCodePermissionRequestKind } from "../adapter.ts"
 import { openCodeToolTurnItem } from "../toolItems.ts";
 
 const OpenCode2ProviderCapabilities = {
+  multiRepository: {
+    runtimeModes: ["approval-required", "auto-accept-edits", "auto", "full-access"],
+  },
   sessions: {
     // One server serves every location, so one session runtime owns them all.
     supportsMultipleProviderThreadsPerSession: true,
@@ -428,7 +432,7 @@ type TurnTerminal =
 type Rule = Permission.Rule;
 type RulesPolicy = Pick<
   ProviderAdapter.ProviderAdapterV2RuntimePolicy,
-  "runtimeMode" | "interactionMode"
+  "runtimeMode" | "interactionMode" | "repositories"
 >;
 type NativeForm = EventOf<"form.created">["data"]["form"];
 
@@ -509,6 +513,15 @@ const sessionRules = (
         rule("edit", policy.runtimeMode === "auto-accept-edits" ? "allow" : "ask"),
         rule("external_directory", "ask"),
       ]),
+  ...(policy.repositories ?? []).flatMap((repository) =>
+    /[?*]/.test(repository.rootPath)
+      ? []
+      : [repository.rootPath, `${repository.rootPath.replace(/\/$/, "")}/*`].map((resource) => ({
+          action: "external_directory",
+          resource,
+          effect: "allow" as const,
+        })),
+  ),
   ...grants,
   // Plan mode writes only its plan, which `paths` allows again. Shell and read
   // are never denied: the free tier refuses sessions whose rules deny them.
@@ -845,7 +858,10 @@ const turnTokenUsage = (turn: ActiveTurn, status: OrchestrationV2ProviderTurn["s
  * The adapter for one provider instance. It talks to the instance's
  * {@link OpenCode2Server.OpenCode2Server}, which the driver builds from the instance's settings.
  */
-export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: ProviderInstanceId) {
+export const make = Effect.fn("OpenCode2Adapter.make")(function* (
+  instanceId: ProviderInstanceId,
+  localRepositories = true,
+) {
   const server = yield* OpenCode2Server.OpenCode2Server;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const host = yield* ProviderHost.ProviderHost;
@@ -3415,6 +3431,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const instructions = [
         buildRuntimeInstructions({ harness: "OpenCode", model: turnInput.modelSelection.model }),
         t3OrchestrationSystemPrompt(state.mcp !== undefined),
+        repositoryContext(turnInput.runtimePolicy.repositories),
       ]
         .filter((part) => part !== undefined && part.length > 0)
         .join("\n\n");
@@ -4472,7 +4489,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId,
     driver,
-    getCapabilities: () => Effect.succeed(OpenCode2ProviderCapabilities),
+    getCapabilities: () =>
+      Effect.succeed({
+        ...OpenCode2ProviderCapabilities,
+        ...(localRepositories ? {} : { multiRepository: undefined }),
+      }),
     planSelectionTransition: () => Effect.succeed(turnScopedSelectionTransition()),
     // The session borrows the instance's server for as long as it is open, so a
     // spawned server is not idle-stopped under a long tool call.
@@ -4481,6 +4502,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         const scope = yield* Scope.make();
         yield* Effect.addFinalizer((exit) => Scope.close(scope, exit));
         const connection = yield* borrow.pipe(Effect.provideService(Scope.Scope, scope));
+        if (connection.external && (input.runtimePolicy.repositories?.length ?? 0) > 1)
+          return yield* new ProviderAdapter.ProviderAdapterOpenSessionError({
+            driver,
+            providerSessionId: input.providerSessionId,
+            cause:
+              "Multi-repository execution requires a local provider process on the owning environment.",
+          });
         return yield* openSession(input, { connection, scope });
       }).pipe(
         Effect.mapError(

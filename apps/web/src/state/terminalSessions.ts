@@ -1,3 +1,4 @@
+import { repositoryTerminalInput } from "../fd/multirepo";
 import {
   combineTerminalSessionState,
   EMPTY_TERMINAL_BUFFER_STATE,
@@ -135,7 +136,7 @@ export function useAttachedTerminalSession(input: {
       ? canOperate
         ? terminalEnvironment.attach({
             environmentId: input.environmentId,
-            input: input.terminal,
+            input: repositoryTerminalInput(input.environmentId, input.terminal),
           })
         : canRead
           ? terminalEnvironment.observe({

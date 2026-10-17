@@ -1,3 +1,5 @@
+import { RepositoryFileAccessProvider, useRepositoryFileAccess } from "../../fd/multirepo";
+import type { RepositoryTarget } from "@t3tools/contracts";
 import { Spinner } from "~/components/ui/spinner";
 import {
   AuthPreviewOperateScope,
@@ -117,6 +119,7 @@ import {
 } from "./projectFilesQueryState";
 
 interface FilePreviewPanelProps {
+  repositoryTarget?: RepositoryTarget | undefined;
   environmentId: EnvironmentId;
   cwd: string;
   projectName: string;
@@ -155,16 +158,18 @@ function WorkspaceImagePreview(props: {
   readonly alt: string;
   readonly workspaceMutationId: string | null;
 }) {
+  const repositoryTarget = useRepositoryFileAccess();
   const resource = useMemo(
     () =>
       workspaceAssetResource({
+        repositoryTarget,
         kind: "workspace-file",
         threadRef: props.threadRef,
         draft: props.draft,
         workspaceRoot: props.workspaceRoot,
         absolutePath: props.absolutePath,
       }),
-    [props.threadRef, props.draft, props.workspaceRoot, props.absolutePath],
+    [props.threadRef, props.draft, props.workspaceRoot, props.absolutePath, repositoryTarget],
   );
   const assetUrl = useAssetUrlState(props.environmentId, resource);
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
@@ -228,16 +233,25 @@ function WorkspaceBrowserPreview(props: {
 }) {
   const insideWorkspace =
     mediaFileReference(props.absolutePath, props.workspaceRoot).relativePath !== undefined;
+  const repositoryTarget = useRepositoryFileAccess();
   const resource = useMemo(
     () =>
       workspaceAssetResource({
+        repositoryTarget,
         kind: insideWorkspace ? "workspace-file" : "media-file",
         threadRef: props.threadRef,
         draft: props.draft,
         workspaceRoot: props.workspaceRoot,
         absolutePath: props.absolutePath,
       }),
-    [insideWorkspace, props.threadRef, props.draft, props.workspaceRoot, props.absolutePath],
+    [
+      insideWorkspace,
+      props.threadRef,
+      props.draft,
+      props.workspaceRoot,
+      props.absolutePath,
+      repositoryTarget,
+    ],
   );
   const assetUrl = useAssetUrlState(props.environmentId, resource);
   const revisionSuffix =
@@ -278,16 +292,18 @@ function WorkspaceVideoPreview(props: {
   readonly name: string;
   readonly workspaceMutationId: string | null;
 }) {
+  const repositoryTarget = useRepositoryFileAccess();
   const resource = useMemo(
     () =>
       workspaceAssetResource({
+        repositoryTarget,
         kind: "media-file",
         threadRef: props.threadRef,
         draft: props.draft,
         workspaceRoot: props.workspaceRoot,
         absolutePath: props.absolutePath,
       }),
-    [props.threadRef, props.draft, props.workspaceRoot, props.absolutePath],
+    [props.threadRef, props.draft, props.workspaceRoot, props.absolutePath, repositoryTarget],
   );
   const assetUrl = useAssetUrlState(props.environmentId, resource);
   const refreshAssetUrl = useAssetUrlRefresh(props.environmentId, resource);
@@ -337,16 +353,18 @@ function WorkspaceAudioPreview(props: {
   readonly name: string;
   readonly workspaceMutationId: string | null;
 }) {
+  const repositoryTarget = useRepositoryFileAccess();
   const resource = useMemo(
     () =>
       workspaceAssetResource({
+        repositoryTarget,
         kind: "media-file",
         threadRef: props.threadRef,
         draft: props.draft,
         workspaceRoot: props.workspaceRoot,
         absolutePath: props.absolutePath,
       }),
-    [props.threadRef, props.draft, props.workspaceRoot, props.absolutePath],
+    [props.threadRef, props.draft, props.workspaceRoot, props.absolutePath, repositoryTarget],
   );
   const assetUrl = useAssetUrlState(props.environmentId, resource);
   const refreshAssetUrl = useAssetUrlRefresh(props.environmentId, resource);
@@ -700,6 +718,7 @@ function EditableFileSurface({
   );
   const surfaceRef = useRef<HTMLDivElement>(null);
   const selectionFrameRef = useRef<number | null>(null);
+  const repositoryTarget = useRepositoryFileAccess();
   const saveCoordinator = useFileSaveCoordinator({
     environmentId,
     cwd,
@@ -739,7 +758,10 @@ function EditableFileSurface({
       lineAnnotations: nextLineAnnotations,
     }: EditorChangeEvent<"file", FileCommentAnnotationGroup, undefined>) => {
       // Adopting an external change reports it as an edit; it is already on disk.
-      if (file.contents === getProjectFileContents(environmentId, cwd, relativePath)) return;
+      if (
+        file.contents === getProjectFileContents(environmentId, cwd, relativePath, repositoryTarget)
+      )
+        return;
       setEditedContents(file.contents);
       setProjectFileQueryData(environmentId, cwd, relativePath, file.contents);
       saveCoordinator.change(file.contents);
@@ -764,7 +786,15 @@ function EditableFileSurface({
         }
       }
     },
-    [addReviewComment, composerDraftTarget, cwd, environmentId, relativePath, saveCoordinator],
+    [
+      addReviewComment,
+      composerDraftTarget,
+      cwd,
+      environmentId,
+      relativePath,
+      saveCoordinator,
+      repositoryTarget,
+    ],
   );
 
   const removeAnnotationEntry = useCallback(
@@ -1025,7 +1055,15 @@ function initialExplorerOpen(): boolean {
   }
 }
 
-export default function FilePreviewPanel({
+export default function FilePreviewPanel(props: FilePreviewPanelProps) {
+  return (
+    <RepositoryFileAccessProvider target={props.repositoryTarget}>
+      <RepositoryFilePreviewPanel {...props} />
+    </RepositoryFileAccessProvider>
+  );
+}
+
+function RepositoryFilePreviewPanel({
   environmentId,
   cwd,
   projectName,

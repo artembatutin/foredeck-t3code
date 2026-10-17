@@ -1,6 +1,8 @@
 import {
   ORCHESTRATION_PROTOCOL_QUERY_PARAM,
   ORCHESTRATION_PROTOCOL_VERSION,
+  MULTIREPO_PROTOCOL_QUERY_PARAM,
+  MULTIREPO_PROTOCOL_VERSION,
   type ExecutionEnvironmentDescriptor,
 } from "@t3tools/contracts";
 
@@ -38,5 +40,6 @@ function canSelfUpdate(descriptor: ExecutionEnvironmentDescriptor): boolean {
 export function appendOrchestrationProtocol(socketUrl: string): string {
   const url = new URL(socketUrl);
   url.searchParams.set(ORCHESTRATION_PROTOCOL_QUERY_PARAM, String(ORCHESTRATION_PROTOCOL_VERSION));
+  url.searchParams.set(MULTIREPO_PROTOCOL_QUERY_PARAM, String(MULTIREPO_PROTOCOL_VERSION));
   return url.toString();
 }

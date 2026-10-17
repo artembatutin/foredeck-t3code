@@ -29,6 +29,28 @@ describe("mobile Markdown draft media", () => {
     ).toMatchObject({ resource: { _tag: "media-file", threadId, path: "/project/image.png" } });
   });
 
+  it("keeps an explicit repository on nested file media and draft previews", () => {
+    const target = {
+      type: "thread" as const,
+      threadId: ThreadId.make("thread"),
+      repositoryId: "client",
+    };
+    expect(
+      resolveMobileMarkdownMediaSource("diagram.svg", {
+        workspaceRoot: "/separate/client/docs",
+        repositoryTarget: target,
+        threadId: undefined,
+      }),
+    ).toMatchObject({
+      access: "environment",
+      resource: {
+        _tag: "repository-file",
+        repositoryTarget: target,
+        path: "/separate/client/docs/diagram.svg",
+      },
+    });
+  });
+
   it("keeps direct URLs direct and rejects unresolvable or blocked references", () => {
     const input = { threadId: undefined, workspaceRoot: "/project" };
     expect(resolveMobileMarkdownMediaSource("https://example.com/image.png", input)).toMatchObject({

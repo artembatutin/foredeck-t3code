@@ -1,3 +1,4 @@
+import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as CodexInstallation from "./CodexInstallation.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -1238,7 +1239,10 @@ it.layer(
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
             },
-            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+            orchestrationAdapter: {
+              getCapabilities: () =>
+                Effect.succeed({ ...CodexProviderCapabilitiesV2, multiRepository: undefined }),
+            } as unknown as ProviderInstance["orchestrationAdapter"],
             textGeneration: {} as ProviderInstance["textGeneration"],
           } satisfies ProviderInstance;
           const layerInstanceRegistry = Layer.succeed(
@@ -1615,7 +1619,10 @@ it.layer(
             streamChanges: Stream.empty,
             applyUsageLimits: () => Effect.void,
           },
-          orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+          orchestrationAdapter: {
+            getCapabilities: () =>
+              Effect.succeed({ ...CodexProviderCapabilitiesV2, multiRepository: undefined }),
+          } as unknown as ProviderInstance["orchestrationAdapter"],
           textGeneration: {} as ProviderInstance["textGeneration"],
         } satisfies ProviderInstance;
         const layerInstanceRegistry = Layer.succeed(
@@ -1721,7 +1728,10 @@ it.layer(
           },
           snapshotForCwd,
           invalidateCaches: Ref.update(cacheInvalidations, (count) => count + 1),
-          orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+          orchestrationAdapter: {
+            getCapabilities: () =>
+              Effect.succeed({ ...CodexProviderCapabilitiesV2, multiRepository: undefined }),
+          } as unknown as ProviderInstance["orchestrationAdapter"],
           textGeneration: {} as ProviderInstance["textGeneration"],
         });
         const firstInstance = makeInstance(machineProvider, () =>
@@ -1989,7 +1999,10 @@ it.layer(
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
             },
-            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+            orchestrationAdapter: {
+              getCapabilities: () =>
+                Effect.succeed({ ...CodexProviderCapabilitiesV2, multiRepository: undefined }),
+            } as unknown as ProviderInstance["orchestrationAdapter"],
             textGeneration: {} as ProviderInstance["textGeneration"],
           },
           {
@@ -2016,7 +2029,10 @@ it.layer(
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
             },
-            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+            orchestrationAdapter: {
+              getCapabilities: () =>
+                Effect.succeed({ ...CodexProviderCapabilitiesV2, multiRepository: undefined }),
+            } as unknown as ProviderInstance["orchestrationAdapter"],
             textGeneration: {} as ProviderInstance["textGeneration"],
           },
         ] satisfies ReadonlyArray<ProviderInstance>;
@@ -2192,7 +2208,10 @@ it.layer(
               streamChanges: Stream.empty,
               applyUsageLimits: () => Effect.void,
             },
-            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+            orchestrationAdapter: {
+              getCapabilities: () =>
+                Effect.succeed({ ...CodexProviderCapabilitiesV2, multiRepository: undefined }),
+            } as unknown as ProviderInstance["orchestrationAdapter"],
             textGeneration: {} as ProviderInstance["textGeneration"],
           },
         ] satisfies ReadonlyArray<ProviderInstance>;
@@ -2297,7 +2316,10 @@ it.layer(
             streamChanges: Stream.fromPubSub(changes),
             applyUsageLimits: () => Effect.void,
           },
-          orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+          orchestrationAdapter: {
+            getCapabilities: () =>
+              Effect.succeed({ ...CodexProviderCapabilitiesV2, multiRepository: undefined }),
+          } as unknown as ProviderInstance["orchestrationAdapter"],
           textGeneration: {} as ProviderInstance["textGeneration"],
         } satisfies ProviderInstance;
         const layerInstanceRegistry = Layer.succeed(
@@ -2425,7 +2447,10 @@ it.layer(
               streamChanges: Stream.fromPubSub(changes),
               applyUsageLimits: () => Effect.void,
             },
-            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+            orchestrationAdapter: {
+              getCapabilities: () =>
+                Effect.succeed({ ...CodexProviderCapabilitiesV2, multiRepository: undefined }),
+            } as unknown as ProviderInstance["orchestrationAdapter"],
             textGeneration: {} as ProviderInstance["textGeneration"],
           } satisfies ProviderInstance;
           const layerInstanceRegistry = Layer.succeed(
@@ -2528,7 +2553,10 @@ it.layer(
             streamChanges: Stream.empty,
             applyUsageLimits: () => Effect.void,
           },
-          orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+          orchestrationAdapter: {
+            getCapabilities: () =>
+              Effect.succeed({ ...CodexProviderCapabilitiesV2, multiRepository: undefined }),
+          } as unknown as ProviderInstance["orchestrationAdapter"],
           textGeneration: {} as ProviderInstance["textGeneration"],
         } satisfies ProviderInstance;
         const layerInstanceRegistry = Layer.succeed(
@@ -2629,7 +2657,10 @@ it.layer(
             streamChanges: Stream.empty,
             applyUsageLimits: () => Effect.void,
           },
-          orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+          orchestrationAdapter: {
+            getCapabilities: () =>
+              Effect.succeed({ ...CodexProviderCapabilitiesV2, multiRepository: undefined }),
+          } as unknown as ProviderInstance["orchestrationAdapter"],
           textGeneration: {} as ProviderInstance["textGeneration"],
         });
         const codexInstance = makeInstance(codexProvider);

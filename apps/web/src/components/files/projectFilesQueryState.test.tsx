@@ -1,3 +1,4 @@
+vi.mock("../../fd/multirepo", () => ({ useRepositoryFileAccess: () => undefined }));
 import {
   AuthFilesystemReadScope,
   EnvironmentId,

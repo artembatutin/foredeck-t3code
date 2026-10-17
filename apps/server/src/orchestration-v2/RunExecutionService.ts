@@ -1,3 +1,4 @@
+import { RepositoryCheckpoints, RepositorySet } from "../fd/multirepo/index.ts";
 import { makeAssistantStreamingFilter } from "./assistantStreaming.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
@@ -573,6 +574,7 @@ export const layer: Layer.Layer<
   RunExecutionServiceV2,
   Effect.gen(function* () {
     const checkpointService = yield* CheckpointService.CheckpointServiceV2;
+    const repositoryCheckpoints = yield* RepositoryCheckpoints.make;
     const eventSink = yield* EventSink.EventSinkV2;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const providerEventIngestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
@@ -698,7 +700,9 @@ export const layer: Layer.Layer<
             input.canCheckpointFilesystem &&
             (input.terminal.status === "completed" ||
               input.terminal.status === "interrupted" ||
-              input.terminal.status === "cancelled")
+              input.terminal.status === "cancelled" ||
+              (input.terminal.status === "failed" &&
+                RepositorySet.isMultiRepo(input.checkpointScope.repositories)))
               ? [
                   {
                     id: `effect:checkpoint.capture:${input.run.id}`,
@@ -868,21 +872,26 @@ export const layer: Layer.Layer<
               ),
             );
             if (canCheckpointFilesystem) {
-              yield* checkpointService
-                .captureBaseline({
-                  scope: input.checkpointScope,
-                  ordinalWithinScope: Math.max(0, input.run.ordinal - 1),
-                })
-                .pipe(
-                  Effect.catchCause((cause) =>
-                    Cause.hasInterruptsOnly(cause)
-                      ? Effect.failCause(cause)
-                      : Effect.logWarning(
-                          "orchestration V2 checkpoint baseline capture failed; starting provider without a baseline",
-                          { runId: input.run.id },
-                        ),
-                  ),
-                );
+              yield* (
+                RepositorySet.isMultiRepo(input.checkpointScope.repositories)
+                  ? repositoryCheckpoints.captureBaselines(
+                      input.checkpointScope,
+                      Math.max(0, input.run.ordinal - 1),
+                    )
+                  : checkpointService.captureBaseline({
+                      scope: input.checkpointScope,
+                      ordinalWithinScope: Math.max(0, input.run.ordinal - 1),
+                    })
+              ).pipe(
+                Effect.catchCause((cause) =>
+                  Cause.hasInterruptsOnly(cause)
+                    ? Effect.failCause(cause)
+                    : Effect.logWarning(
+                        "orchestration V2 checkpoint baseline capture failed; starting provider without a baseline",
+                        { runId: input.run.id },
+                      ),
+                ),
+              );
             }
             if (
               input.shouldStartProviderTurn !== undefined &&

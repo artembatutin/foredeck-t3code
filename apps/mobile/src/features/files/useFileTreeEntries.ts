@@ -1,5 +1,5 @@
 import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
-import type { EnvironmentId, ProjectEntry } from "@t3tools/contracts";
+import type { EnvironmentId, ProjectEntry, RepositoryTarget } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 
@@ -12,21 +12,25 @@ export function useFileTreeEntries(input: {
   readonly cwd: string | null;
   readonly environmentId: EnvironmentId | null;
   readonly searchQuery: string;
+  readonly repositoryTarget?: RepositoryTarget | undefined;
 }) {
-  const { cwd, environmentId } = input;
+  const { cwd, environmentId, repositoryTarget } = input;
   const searching = input.searchQuery.trim().length > 0;
   const query = input.searchQuery.trim().slice(0, 256);
   const debouncedQuery = useDebouncedValue(query, 200);
   const root = useEnvironmentQuery(
     cwd !== null && environmentId !== null
-      ? projectEnvironment.listEntries({ environmentId, input: { cwd, directoryPath: "" } })
+      ? projectEnvironment.listEntries({
+          environmentId,
+          input: { cwd, repositoryTarget, directoryPath: "" },
+        })
       : null,
   );
   const search = useEnvironmentQuery(
     searching && debouncedQuery.length > 0 && cwd !== null && environmentId !== null
       ? projectEnvironment.searchEntries({
           environmentId,
-          input: { cwd, query: debouncedQuery, limit: 200 },
+          input: { cwd, repositoryTarget, query: debouncedQuery, limit: 200 },
         })
       : null,
   );
@@ -37,12 +41,13 @@ export function useFileTreeEntries(input: {
     () => ({
       cwd,
       environmentId,
+      repositoryTarget,
       entries: new Map<string, ReadonlyArray<ProjectEntry>>(),
       requested: new Set<string>(),
       pending: new Map<string, AbortController>(),
       errors: new Map<string, string>(),
     }),
-    [cwd, environmentId],
+    [cwd, environmentId, repositoryTarget],
   );
   const [refreshingDirectories, setRefreshingDirectories] = useState<typeof directories | null>(
     null,
@@ -70,7 +75,10 @@ export function useFileTreeEntries(input: {
       directories.pending.set(directoryPath, controller);
       directories.errors.delete(directoryPath);
       render();
-      const atom = projectEnvironment.listEntries({ environmentId, input: { cwd, directoryPath } });
+      const atom = projectEnvironment.listEntries({
+        environmentId,
+        input: { cwd, repositoryTarget, directoryPath },
+      });
       appAtomRegistry.refresh(atom);
       return executeAtomQuery(appAtomRegistry, atom, {
         signal: controller.signal,
@@ -98,7 +106,7 @@ export function useFileTreeEntries(input: {
         render();
       });
     },
-    [cwd, directories, environmentId],
+    [cwd, directories, environmentId, repositoryTarget],
   );
   const { refresh: refreshRoot, data: rootData } = root;
   const { refresh: refreshSearch, data: searchData } = search;
@@ -143,12 +151,15 @@ export function useFileTreeEntries(input: {
     const queries =
       cwd !== null && environmentId !== null
         ? [
-            projectEnvironment.listEntries({ environmentId, input: { cwd, directoryPath: "" } }),
+            projectEnvironment.listEntries({
+              environmentId,
+              input: { cwd, repositoryTarget, directoryPath: "" },
+            }),
             ...(searching
               ? [
                   projectEnvironment.searchEntries({
                     environmentId,
-                    input: { cwd, query: debouncedQuery, limit: 200 },
+                    input: { cwd, repositoryTarget, query: debouncedQuery, limit: 200 },
                   }),
                 ]
               : []),
@@ -167,6 +178,7 @@ export function useFileTreeEntries(input: {
   }, [
     cwd,
     debouncedQuery,
+    repositoryTarget,
     environmentId,
     directories,
     loadDirectory,

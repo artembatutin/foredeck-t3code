@@ -1,3 +1,7 @@
+import {
+  usesSharedCheckouts,
+  MULTIREPO_CHECKOUT_NOTICE,
+} from "@t3tools/client-runtime/fd/multirepo";
 import { useAtomValue } from "@effect/atom-react";
 import {
   AuthOrchestrationOperateScope,
@@ -585,6 +589,9 @@ function TaskForm({
   );
   const projects = useProjects().filter((project) => project.environmentId === environmentId);
   const config = useEnvironmentServerConfig(environmentId);
+  const multiRepository = usesSharedCheckouts(
+    projects.find((project) => project.id === draft.projectId),
+  );
   const modelOptions = useMemo(
     () => buildModelOptions(config, null, undefined, draft.projectId),
     [config, draft.projectId],
@@ -622,6 +629,10 @@ function TaskForm({
       environmentUnavailable
     )
       return;
+    if (multiRepository && draft.workspace !== "root") {
+      Alert.alert("Workspace unavailable", MULTIREPO_CHECKOUT_NOTICE);
+      return;
+    }
     // Signatures are edited on desktop and web; send the task's current one,
     // not the copy taken when this form opened, so a newer edit survives.
     const liveTask = tasks.data?.tasks.find((task) => task.id === draft.task?.id);
@@ -776,6 +787,9 @@ function TaskForm({
             setDraft({
               ...draft,
               projectId: project.id,
+              ...(!draft.task && usesSharedCheckouts(project)
+                ? { workspace: "root" as const }
+                : {}),
               modelSelection: keepsExplicitModel
                 ? draft.modelSelection
                 : scheduledTaskDefaultModel(config, project),
@@ -814,6 +828,7 @@ function TaskForm({
             {
               id: "worktree",
               title: "New worktree",
+              attributes: multiRepository ? { disabled: true } : undefined,
               state: draft.workspace === "worktree" ? "on" : undefined,
             },
             {
@@ -824,15 +839,20 @@ function TaskForm({
             {
               id: "existing_worktree",
               title: "Specific checkout",
+              attributes: multiRepository ? { disabled: true } : undefined,
               state: draft.workspace === "existing_worktree" ? "on" : undefined,
             },
           ]}
           onSelect={(id) => {
+            if (multiRepository && id !== "root") return;
             if (id === "worktree" || id === "root" || id === "existing_worktree")
               setDraft({ ...draft, workspace: id });
           }}
         />
-        {draft.workspace === "worktree" ? (
+        {multiRepository ? (
+          <Text className="text-sm text-foreground-secondary">{MULTIREPO_CHECKOUT_NOTICE}</Text>
+        ) : null}
+        {draft.workspace === "worktree" && !multiRepository ? (
           <PickerRow
             label="Base branch"
             value={resolveNewTaskBranchLabel({

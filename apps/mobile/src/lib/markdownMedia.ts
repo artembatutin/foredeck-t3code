@@ -8,7 +8,7 @@ import {
   mediaUrlReference,
   mediaReferenceFileName,
 } from "@t3tools/client-runtime/media-reference";
-import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import type { EnvironmentId, RepositoryTarget, ThreadId } from "@t3tools/contracts";
 import { normalizeNativeMarkdownUrl } from "./markdownLinks";
 import { resolveMobileMarkdownMediaSource } from "./markdownMediaSource";
 
@@ -21,6 +21,7 @@ export function resolveMarkdownMediaPreview(
   href: string,
   input: {
     readonly environmentId: EnvironmentId;
+    readonly repositoryTarget?: RepositoryTarget | undefined;
     readonly threadId: ThreadId | undefined;
     readonly workspaceRoot: string | null | undefined;
     /** Captured markdown may only open media with a direct URL. */
@@ -61,11 +62,13 @@ export function resolveMarkdownMediaPreview(
         };
       }
       if (input.captured) return null;
-      const resource = input.threadId
-        ? { _tag: "media-file" as const, threadId: input.threadId, path }
-        : input.workspaceRoot
-          ? { _tag: "draft-workspace-file" as const, cwd: input.workspaceRoot, path }
-          : null;
+      const resource = input.repositoryTarget
+        ? { _tag: "repository-file" as const, repositoryTarget: input.repositoryTarget, path }
+        : input.threadId
+          ? { _tag: "media-file" as const, threadId: input.threadId, path }
+          : input.workspaceRoot
+            ? { _tag: "draft-workspace-file" as const, cwd: input.workspaceRoot, path }
+            : null;
       if (!resource) return null;
       return {
         kind: "pdf",

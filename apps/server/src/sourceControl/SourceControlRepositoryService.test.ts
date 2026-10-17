@@ -13,6 +13,7 @@ import { ChildProcessSpawner } from "effect/process";
 import { GitCommandError, SourceControlProviderError } from "@t3tools/contracts";
 
 import * as ServerConfig from "../config.ts";
+import * as GitManager from "../git/GitManager.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as BitbucketApi from "@t3tools/source-control-bitbucket/server/BitbucketApi";
 import * as BitbucketSourceControlProvider from "@t3tools/source-control-bitbucket/server/BitbucketSourceControlProvider";
@@ -66,6 +67,9 @@ function layer(input: {
   readonly fileSystem?: FileSystem.FileSystem;
 }) {
   const layerService = SourceControlRepositoryService.layer.pipe(
+    Layer.provide(
+      Layer.mock(GitManager.GitManager)({ withCheckoutMutation: (_input, effect) => effect }),
+    ),
     Layer.provide(
       Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
         resolveLink: () => undefined,

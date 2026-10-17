@@ -1,3 +1,4 @@
+vi.mock("../../fd/multirepo", () => ({ useRepositoryFileAccess: () => undefined }));
 import { EnvironmentId } from "@t3tools/contracts";
 import { AsyncResult } from "effect/reactivity";
 import { act, StrictMode } from "react";
@@ -89,6 +90,7 @@ describe("file-save React lifecycle", () => {
       "/workspace",
       "file.txt",
       "AUDIT7907NATIVE\n",
+      undefined,
     );
     expect(onPendingChange).toHaveBeenLastCalledWith("file.txt", false);
   });

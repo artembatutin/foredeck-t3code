@@ -1,9 +1,13 @@
+import {
+  RepositoryFileAccessProvider,
+  RepositorySelector,
+  openRepositoryFile,
+} from "../../fd/multirepo";
 import { useAtomValue } from "@effect/atom-react";
 import { useMemo, useState, type ReactNode } from "react";
 
 import { useActiveProjectTarget, type ActiveProjectTarget } from "~/hooks/useActiveProjectTarget";
 import { useTheme } from "~/hooks/useTheme";
-import { useRightPanelStore } from "~/rightPanelStore";
 import { primaryServerKeybindingsAtom } from "~/state/server";
 
 import { PierreEntryIcon } from "../chat/PierreEntryIcon";
@@ -107,10 +111,10 @@ function OpenProjectFilePicker(props: ProjectFilePickerProps & { target: ActiveP
         ),
         icon: <PierreEntryIcon pathValue={match.path} kind="file" theme={resolvedTheme} />,
         run: async () => {
-          useRightPanelStore.getState().openFile(target.threadRef, match.path);
+          openRepositoryFile(target.threadRef, match.path, undefined, target.repositoryScope);
         },
       })),
-    [hasMatchedQuery, matches, resolvedTheme, target.threadRef],
+    [hasMatchedQuery, matches, resolvedTheme, target.threadRef, target.repositoryScope],
   );
 
   const emptyStateMessage = getEmptyStateMessage(query, result.error, result.isPending);
@@ -134,6 +138,9 @@ function OpenProjectFilePicker(props: ProjectFilePickerProps & { target: ActiveP
       testId="project-file-picker"
       value={query}
     >
+      <div className="px-3 py-1">
+        <RepositorySelector workspace={target.repositoryWorkspace} />
+      </div>
       <CommandPaletteResults
         groups={
           items.length > 0 ? [{ value: "project-files", label: target.projectName, items }] : []
@@ -159,5 +166,13 @@ export function ProjectFilePicker(props: ProjectFilePickerProps) {
     return <EmptyProjectFilePicker />;
   }
 
-  return <OpenProjectFilePicker setOpen={props.setOpen} target={target} />;
+  return (
+    <RepositoryFileAccessProvider target={target.repositoryScope?.target}>
+      <OpenProjectFilePicker
+        key={JSON.stringify(target.repositoryScope?.target)}
+        setOpen={props.setOpen}
+        target={target}
+      />
+    </RepositoryFileAccessProvider>
+  );
 }

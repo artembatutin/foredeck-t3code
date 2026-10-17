@@ -1,3 +1,4 @@
+import { migration as multirepoMigration } from "../fd/multirepo/index.ts";
 /**
  * Migration runner with an inline loader.
  *
@@ -152,6 +153,7 @@ export const migrationEntries = [
   [60, "ThreadSnapshotWindowIndexes", Migration0060],
   [61, "PullRequestReviewGuides", Migration0061],
   [62, "ThreadFailureLookupIndex", Migration0062],
+  [63, "ProjectRepositories", multirepoMigration],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

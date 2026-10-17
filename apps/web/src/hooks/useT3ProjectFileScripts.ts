@@ -1,4 +1,8 @@
 import {
+  repositoryFileRequest,
+  type RepositoryFileScope,
+} from "@t3tools/client-runtime/fd/multirepo";
+import {
   T3_PROJECT_FILE_NAME,
   type EnvironmentId,
   type T3ProjectFile,
@@ -32,8 +36,16 @@ export interface T3ProjectFileState {
 export function useT3ProjectFileState(
   environmentId: EnvironmentId,
   cwd: string | null,
+  repositoryScope?: RepositoryFileScope,
 ): T3ProjectFileState {
-  const query = useProjectFileQuery(environmentId, cwd ?? "", T3_PROJECT_FILE_NAME, cwd !== null);
+  const request = repositoryFileRequest(cwd ?? "", T3_PROJECT_FILE_NAME, repositoryScope);
+  const query = useProjectFileQuery(
+    environmentId,
+    request.cwd,
+    request.path,
+    cwd !== null,
+    request.repositoryTarget,
+  );
   const contents = query.data && !query.data.truncated ? query.data.contents : null;
   const isPending = query.isPending;
   return useMemo(() => {
@@ -60,6 +72,7 @@ export function useT3ProjectFileState(
 export function useT3ProjectFileScripts(
   environmentId: EnvironmentId,
   cwd: string | null,
+  repositoryScope?: RepositoryFileScope,
 ): ReadonlyArray<T3ProjectFileScript> {
-  return useT3ProjectFileState(environmentId, cwd).scripts;
+  return useT3ProjectFileState(environmentId, cwd, repositoryScope).scripts;
 }

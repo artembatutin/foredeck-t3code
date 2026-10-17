@@ -1,3 +1,4 @@
+import { RepositorySet, WorkspaceTransitionGate } from "../fd/multirepo/index.ts";
 import {
   CommandId,
   type OrchestrationV2Run,
@@ -37,6 +38,8 @@ import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 /**
  * ERRORS
  */
+const isRepositorySetError = Schema.is(RepositorySet.RepositorySetError);
+
 export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
   "EventSinkWriteError",
   {
@@ -46,6 +49,7 @@ export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>
   },
 ) {
   override get message(): string {
+    if (isRepositorySetError(this.cause)) return this.cause.message;
     return `Failed to write ${this.eventCount} orchestration V2 event(s).`;
   }
 }
@@ -222,6 +226,7 @@ const layerBase: Layer.Layer<
   EventSinkV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const workspaceTransitions = yield* WorkspaceTransitionGate.make;
     const commandReceipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
     const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
     const eventStore = yield* EventStore.EventStoreV2;
@@ -598,6 +603,7 @@ const layerBase: Layer.Layer<
             return { ...existing, committed: false as const, cancelledEffectIds: [] };
           }
 
+          yield* workspaceTransitions.assertEvents(input.events);
           const normalized = yield* normalizeEvents(input.events);
           const storedEvents = yield* eventStore.append({
             commandId: input.commandId,
@@ -698,6 +704,12 @@ const layerBase: Layer.Layer<
             };
             if (!(yield* commandReceipts.insertIfAbsent(reserved))) {
               return { receipt: yield* existingProjectReceipt(input.commandId), event: undefined };
+            }
+            if (input.event.type !== "project.deleted") {
+              yield* workspaceTransitions.assertProjectMembership(
+                input.projectId,
+                input.event.payload.repositories,
+              );
             }
             const event = yield* eventStore.appendProjectEvent(input.event);
             yield* projectStore.apply(event);

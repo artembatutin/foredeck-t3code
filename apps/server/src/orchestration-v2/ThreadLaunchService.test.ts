@@ -25,6 +25,7 @@ import {
   OrchestrationV2ThreadProjectionJson,
   ScheduledTaskId,
   type ServerProvider,
+  type ProjectRepository,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -100,6 +101,7 @@ const adapter = {
 } as ProviderAdapter.ProviderAdapterV2["Service"];
 
 interface HarnessOptions {
+  readonly repositories?: ReadonlyArray<ProjectRepository>;
   readonly closeTerminal?: TerminalManager.TerminalManager["Service"]["close"];
   readonly adapters?: ReadonlyArray<ProviderAdapter.ProviderAdapterV2["Service"]>;
   readonly managedFolders?: Layer.Layer<ManagedProjectFolders.ManagedProjectFolders>;
@@ -167,7 +169,10 @@ function makeHarness(options: HarnessOptions = {}) {
       getById: (id) =>
         Effect.succeed(
           id === projectId
-            ? Option.some(project)
+            ? Option.some({
+                ...project,
+                ...(options.repositories ? { repositories: options.repositories } : {}),
+              })
             : id === otherProjectId
               ? Option.some(otherProject)
               : Option.none(),
@@ -2269,6 +2274,7 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
               }),
             ),
           ),
+        checkWorkspaceStrategy: launches.checkWorkspaceStrategy,
         checkWorktreeBase: launches.checkWorktreeBase,
         retryPreparation: launches.retryPreparation,
         prepareRun: launches.prepareRun,
@@ -2930,4 +2936,66 @@ it.effect.each(
         }
       }).pipe(Effect.provide(Layer.merge(harness.layer, layerService)));
     }),
+);
+
+it.effect.each([
+  { type: "worktree" as const, baseRef: "main" },
+  { type: "existing_worktree" as const, worktreePath: "/worktrees/existing" },
+])(
+  "rejects $type for multi-repository launches and schedules before saving changes",
+  (workspaceStrategy) => {
+    const harness = makeHarness({
+      repositories: [
+        { id: "primary", name: "Primary", rootPath: project.workspaceRoot },
+        { id: "missing", name: "Missing checkout", rootPath: "/unavailable/secondary" },
+      ],
+    });
+    const schedules = ScheduledTasks.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          harness.layer,
+          NodeCrypto.layer,
+          Scheduler.layer,
+          Layer.mock(SecretRequests.SecretRequests)({}),
+        ),
+      ),
+    );
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const tasks = yield* ScheduledTasks.ScheduledTaskService;
+      const failedLaunch = yield* launches
+        .launch(
+          launchInput({ command: "reject-multi", thread: "multi", workspace: workspaceStrategy }),
+        )
+        .pipe(Effect.flip);
+      assert.include(failedLaunch.message, "existing checkouts");
+      const input = {
+        id: ScheduledTaskId.make("multi-schedule"),
+        title: "Review",
+        prompt: "Review changes",
+        enabled: false,
+        schedule: { type: "interval" as const, everyMs: 60000 },
+        projectId,
+        workspaceStrategy: { type: "root" as const },
+        modelSelection,
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
+        createdBy: "user" as const,
+        creationSource: "web" as const,
+      };
+      const saved = yield* tasks.upsert(input);
+      const failedSave = yield* tasks
+        .upsert({ ...input, title: "Invalid replacement", workspaceStrategy })
+        .pipe(Effect.flip);
+      assert.include(failedSave.message, "existing checkouts");
+      const listed = yield* tasks.list();
+      assert.deepEqual(listed.tasks, [saved.task]);
+      assert.equal(harness.createWorktree.mock.calls.length, 0);
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      assert.deepEqual(
+        yield* threads.listProjectThreads({ projectId, includeSubagents: true }),
+        [],
+      );
+    }).pipe(Effect.provide(Layer.mergeAll(harness.layer, schedules)));
+  },
 );

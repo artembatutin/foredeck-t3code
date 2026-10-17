@@ -1,3 +1,4 @@
+import { RepositorySelector, openRepositoryFile } from "../../fd/multirepo";
 import { Spinner } from "~/components/ui/spinner";
 import { AuthFilesystemReadScope, type ProjectContentMatch } from "@t3tools/contracts";
 
@@ -6,7 +7,6 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import { useActiveProjectTarget, type ActiveProjectTarget } from "~/hooks/useActiveProjectTarget";
 import { useTheme } from "~/hooks/useTheme";
 import { cn } from "~/lib/utils";
-import { useRightPanelStore } from "~/rightPanelStore";
 import { useProjectContentSearch } from "~/state/queries";
 import { readEnvironmentScope } from "~/state/session";
 
@@ -119,6 +119,7 @@ function OpenContentSearchDialog(props: {
   const search = useProjectContentSearch({
     environmentId: target.environmentId,
     cwd: target.cwd,
+    repositoryTarget: target.repositoryScope?.target,
     query,
     caseSensitive,
     wholeWord,
@@ -160,7 +161,7 @@ function OpenContentSearchDialog(props: {
       return;
     }
     props.onOpenChange(false);
-    useRightPanelStore.getState().openFile(target.threadRef, match.path, match.lineNumber);
+    openRepositoryFile(target.threadRef, match.path, match.lineNumber, target.repositoryScope);
   };
   const fileCount = useMemo(() => new Set(matches.map((match) => match.path)).size, [matches]);
   const showSearchStatus =
@@ -233,6 +234,9 @@ function OpenContentSearchDialog(props: {
       testId="project-content-search"
       value={query}
     >
+      <div className="px-3 py-1">
+        <RepositorySelector workspace={target.repositoryWorkspace} />
+      </div>
       {showSearchStatus ? (
         <div className="flex h-9 shrink-0 items-center border-b px-3 text-xs text-muted-foreground">
           {search.isPending ? (

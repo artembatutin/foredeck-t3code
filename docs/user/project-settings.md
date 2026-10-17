@@ -46,6 +46,37 @@ Settings that are environment-wide stay read-only while a project is selected. W
 targets disagree, a control shows **Mixed** until you choose one value. Appearance, keyboard,
 and other phone-only settings ignore the filter.
 
+## Multiple repositories in one project
+
+Open the project's settings and use **Repositories** to add existing Git checkout paths
+and display names. On mobile, this is in **Settings → Projects & threads → Overview**.
+Paths belong to the selected environment: use server paths when connected remotely.
+Repositories can live in unrelated folders, but all must be on that environment.
+The first repository retains the project's default working directory. Additional entries
+can be reordered or removed; removing an association never deletes files.
+
+Each repository must be independent. Duplicate paths, aliases, overlapping folders,
+submodules, and two checkouts of the same repository are rejected. A monorepo containing
+several apps remains one repository and keeps its original working folder, permissions, and normal worktree behavior. Saving only one repository does not enable multi-repository mode. A checkout already used as another project’s workspace cannot be added here.
+
+Start a new conversation to use a changed repository list. Existing conversations retain
+their original repositories and names, including after restart. Removing an association
+does not remove an old conversation's access. A missing checkout stays part of that
+conversation; restore it at its original path before continuing execution.
+
+Multi-repository conversations use shared existing checkouts. Worktrees, worktree handoffs,
+worktree-isolated delegation, and whole-turn undo are unavailable. Existing worktree threads
+must be removed from the project's thread records before it can enter multi-repository mode;
+archiving them does not suffice. Keep any history you need in its current project and create
+a separate project for multi-repository work. No worktree is deleted by changing membership.
+Scheduled tasks must use **Project checkout**; an existing task's incompatible workspace
+choice must be changed explicitly.
+
+The provider and runtime must support additional repository roots. The composer explains
+unsupported choices before sending. Supported local integrations are Codex, Claude, OpenCode,
+and Muse; OpenCode connected to an external server is unsupported. Update both server and
+clients before using multi-repository projects.
+
 ## Worktree branch names
 
 In **Settings → Source Control → Worktree branch naming**, choose a static prefix,

@@ -1,3 +1,8 @@
+import {
+  usesSharedCheckouts,
+  MULTIREPO_CHECKOUT_NOTICE,
+  repositoryExecutionBlockReason,
+} from "@t3tools/client-runtime/fd/multirepo";
 import { useAtomValue } from "@effect/atom-react";
 import {
   threadRuntimeIsActive,
@@ -819,6 +824,17 @@ export function useThreadOutboxDrain(): void {
       );
       if (!serverConfig) return false;
       const settings = resolveQueuedThreadSettings(queuedMessage, thread, serverConfig.providers);
+      const repositoryBlock = repositoryExecutionBlockReason({
+        isMultiRepository:
+          queuedMessage.requiresRepositoryProtocol === true ||
+          (thread.workspaceBinding?.repositories.length ?? 0) > 1,
+        serverProtocolVersion: serverConfig.environment.capabilities.multiRepository,
+        provider: serverConfig.providers.find(
+          (provider) => provider.instanceId === settings.modelSelection.instanceId,
+        ),
+        runtimeMode: settings.runtimeMode,
+      });
+      if (repositoryBlock) return restoreQueuedMessage(queuedMessage, repositoryBlock);
       if (isModelSelectionUnavailable(serverConfig, settings.modelSelection, thread.projectId)) {
         const { title, detail } = describeUnavailableModelSelection(
           serverConfig,
@@ -921,6 +937,7 @@ export function useThreadOutboxDrain(): void {
         environmentId: queuedMessage.environmentId,
         input: {
           commandId: queuedMessage.commandId,
+          requiresRepositoryProtocol: queuedMessage.requiresRepositoryProtocol,
           creationSource: "mobile",
           threadId: queuedMessage.threadId,
           message: {
@@ -1002,6 +1019,23 @@ export function useThreadOutboxDrain(): void {
         },
         serverConfig.providers,
       );
+      const multiRepository =
+        queuedMessage.requiresRepositoryProtocol === true ||
+        usesSharedCheckouts(findCreationProject(projects, queuedMessage));
+      if (
+        multiRepository &&
+        (creation.workspaceMode === "worktree" || creation.worktreePath !== null)
+      )
+        return restoreQueuedMessage(queuedMessage, MULTIREPO_CHECKOUT_NOTICE);
+      const repositoryBlock = repositoryExecutionBlockReason({
+        isMultiRepository: multiRepository,
+        serverProtocolVersion: serverConfig.environment.capabilities.multiRepository,
+        provider: serverConfig.providers.find(
+          (provider) => provider.instanceId === settings.modelSelection.instanceId,
+        ),
+        runtimeMode: settings.runtimeMode,
+      });
+      if (repositoryBlock) return restoreQueuedMessage(queuedMessage, repositoryBlock);
       if (isModelSelectionUnavailable(serverConfig, settings.modelSelection, creation.projectId)) {
         const { title, detail } = describeUnavailableModelSelection(
           serverConfig,
@@ -1094,32 +1128,35 @@ export function useThreadOutboxDrain(): void {
       }
       const deliveryResult = await startTurn({
         environmentId: queuedMessage.environmentId,
-        input: buildProjectThreadStartTurnInput({
-          projectId: creation.projectId,
-          projectCwd,
-          threadId: queuedMessage.threadId,
-          commandId: queuedMessage.commandId,
-          messageId: queuedMessage.messageId,
-          createdAt: queuedMessage.createdAt,
-          ...serializeComposerMessageForServer(
-            queuedMessage.text.trim(),
-            uploadedComposerContext(
-              queuedMessage.context,
-              queuedMessage.attachments,
-              prepared.attachments,
+        input: {
+          requiresRepositoryProtocol: multiRepository,
+          ...buildProjectThreadStartTurnInput({
+            projectId: creation.projectId,
+            projectCwd,
+            threadId: queuedMessage.threadId,
+            commandId: queuedMessage.commandId,
+            messageId: queuedMessage.messageId,
+            createdAt: queuedMessage.createdAt,
+            ...serializeComposerMessageForServer(
+              queuedMessage.text.trim(),
+              uploadedComposerContext(
+                queuedMessage.context,
+                queuedMessage.attachments,
+                prepared.attachments,
+              ),
+              currentConfig.environment.capabilities.inlineMessageContext === true,
             ),
-            currentConfig.environment.capabilities.inlineMessageContext === true,
-          ),
-          uploadedAttachments: prepared.attachments,
-          modelSelection: sendSettings.modelSelection,
-          runtimeMode: sendSettings.runtimeMode,
-          interactionMode: sendSettings.interactionMode,
-          workspaceMode: workspace.workspaceMode,
-          branch: workspace.branch,
-          worktreePath: workspace.worktreePath,
-          startFromOrigin: workspace.startFromOrigin ?? false,
-          worktreeBranchName: buildTemporaryWorktreeBranchName(randomHex),
-        }),
+            uploadedAttachments: prepared.attachments,
+            modelSelection: sendSettings.modelSelection,
+            runtimeMode: sendSettings.runtimeMode,
+            interactionMode: sendSettings.interactionMode,
+            workspaceMode: workspace.workspaceMode,
+            branch: workspace.branch,
+            worktreePath: workspace.worktreePath,
+            startFromOrigin: workspace.startFromOrigin ?? false,
+            worktreeBranchName: buildTemporaryWorktreeBranchName(randomHex),
+          }),
+        },
       });
       if (AsyncResult.isFailure(deliveryResult) && !hasAccess()) return true;
       const failure = reportFailure(deliveryResult, "start-turn");
@@ -1146,7 +1183,7 @@ export function useThreadOutboxDrain(): void {
       }
       return outcome === "removed";
     },
-    [makeDeliveryHelpers, preparePullRequest, restoreQueuedMessage, startTurn],
+    [makeDeliveryHelpers, preparePullRequest, restoreQueuedMessage, startTurn, projects],
   );
 
   // A creation outcome bridges setup until the server's shell has a turn.

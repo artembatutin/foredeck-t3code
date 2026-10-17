@@ -15,6 +15,7 @@ import {
 
 import type {
   EnvironmentId,
+  RepositoryTarget,
   ReviewDiffFileStat,
   ReviewDiffPreviewSource,
 } from "@t3tools/contracts";
@@ -125,6 +126,7 @@ export function useReviewDiffData(input: {
   readonly threadKey: string | null;
   readonly environmentId: EnvironmentId | undefined;
   readonly cwd: string | null;
+  readonly repositoryTarget?: RepositoryTarget | undefined;
   readonly selectedSection: ReviewSectionItem | null;
   readonly revision: string | undefined;
   readonly draftMessage: string;
@@ -147,10 +149,11 @@ export function useReviewDiffData(input: {
     [lazySource, selectedSection?.diff, selectedSection?.id, threadKey],
   );
   const registry = useContext(RegistryContext);
-  const { environmentId, cwd } = input;
+  const { environmentId, cwd, repositoryTarget } = input;
   const scope = JSON.stringify([
     environmentId,
     cwd,
+    repositoryTarget,
     source?.kind,
     source?.baseRef,
     source?.diffHash,
@@ -172,6 +175,7 @@ export function useReviewDiffData(input: {
                     cacheKey: scope,
                     request: {
                       cwd,
+                      repositoryTarget,
                       ...(lazySource.baseRef ? { baseRef: lazySource.baseRef } : {}),
                       file: {
                         path: file.path,
@@ -183,7 +187,7 @@ export function useReviewDiffData(input: {
                 })
               : null,
           ),
-    [environmentId, cwd, lazySource, indices, scope],
+    [environmentId, cwd, repositoryTarget, lazySource, indices, scope],
   );
   const parsedQuery = useMemo(
     () =>

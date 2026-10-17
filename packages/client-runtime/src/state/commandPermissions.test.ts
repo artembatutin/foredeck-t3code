@@ -59,6 +59,33 @@ const setup = Effect.gen(function* () {
 });
 
 describe("command permissions", () => {
+  it.effect("requires settings and conversation permissions on the repository destination", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        const membership = createCommandPermissions(runtime, WS_METHODS.projectsSetRepositories);
+        for (const scopes of [[AuthSettingsWriteScope], [AuthOrchestrationOperateScope]]) {
+          registry.set(
+            sessions(env),
+            AsyncResult.success({ ...grant(true), scopes, permissions: scopes }),
+          );
+          expect(registry.get(membership.permissionAtom(env))).toBe(false);
+          expect((yield* membership.authorize(registry, env).pipe(Effect.flip))._tag).toBe(
+            "EnvironmentAuthorizationError",
+          );
+        }
+        const scopes = [AuthSettingsWriteScope, AuthOrchestrationOperateScope];
+        registry.set(
+          sessions(env),
+          AsyncResult.success({ ...grant(true), scopes, permissions: scopes }),
+        );
+        expect(registry.get(membership.permissionAtom(env))).toBe(true);
+        yield* membership.authorize(registry, env);
+        registry.set(sessions(other), AsyncResult.success(grant(false)));
+        expect(registry.get(membership.permissionAtom(other))).toBe(false);
+      }),
+    ),
+  );
   it.effect("requires the destination settings grant to run storage cleanup", () =>
     Effect.scoped(
       Effect.gen(function* () {

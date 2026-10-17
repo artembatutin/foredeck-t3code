@@ -1,3 +1,4 @@
+import { usesSharedCheckouts } from "@t3tools/client-runtime/fd/multirepo";
 import { useAtomValue } from "@effect/atom-react";
 import type { EnvironmentId } from "@t3tools/contracts";
 import {
@@ -61,10 +62,11 @@ export function ScheduledTaskEditorProvider({ children }: { readonly children: R
               member.project.environmentId === environmentId && member.project.id === project.id,
           ),
         ) ?? environmentProjects[0];
-      return createDraft(
+      const draft = createDraft(
         project?.id ?? null,
         scheduledTaskDefaultModel(configs.get(environmentId) ?? null, project ?? null),
       );
+      return usesSharedCheckouts(project) ? { ...draft, workspace: "root" as const } : draft;
     },
     [configs, projects, selectedGroup],
   );

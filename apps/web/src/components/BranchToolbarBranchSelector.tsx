@@ -1,3 +1,5 @@
+import { useRepositoryWorkspace } from "../fd/multirepo";
+import { threadRuntimeIsActive } from "@t3tools/client-runtime/state/shell";
 import { ThreadDetailsControl } from "./chat/ThreadDetailsControl";
 import { ComposerContextLabel } from "./ComposerContextLabel";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
@@ -152,20 +154,30 @@ export function BranchToolbarBranchSelector({
       ? scopeProjectRef(draftThread.environmentId, draftThread.projectId)
       : null;
   const activeProject = useProject(activeProjectRef);
+  const repositoryWorkspace = useRepositoryWorkspace(
+    activeProject,
+    serverThread,
+    draftThread?.worktreePath,
+  );
+  const { isMultiRepository, repositoryTarget } = repositoryWorkspace;
 
   const activeThreadId = serverThread?.id ?? (draftThread ? threadId : undefined);
-  const activeThreadBranch =
-    activeThreadBranchOverride !== undefined
+  const activeThreadBranch = isMultiRepository
+    ? null
+    : activeThreadBranchOverride !== undefined
       ? activeThreadBranchOverride
       : (serverThread?.branch ?? draftThread?.branch ?? null);
   const activeWorktreePath = forceNewWorktree
     ? null
     : (serverThread?.worktreePath ?? draftThread?.worktreePath ?? null);
-  const activeProjectCwd = activeProject?.workspaceRoot ?? null;
+  const activeProjectCwd = repositoryWorkspace.cwd;
   const branchCwd = activeWorktreePath ?? activeProjectCwd;
   const hasServerThread = serverThread !== null;
   const canUpdateThreadBranch = !hasServerThread || canOperateThread;
-  const canChangeThreadBranch = canWriteSourceControl && canUpdateThreadBranch;
+  const canChangeThreadBranch =
+    canWriteSourceControl &&
+    canUpdateThreadBranch &&
+    !(isMultiRepository && threadRuntimeIsActive(serverSession));
   const effectiveEnvMode =
     effectiveEnvModeOverride ??
     resolveEffectiveEnvMode({
@@ -179,6 +191,7 @@ export function BranchToolbarBranchSelector({
   // ---------------------------------------------------------------------------
   const setThreadBranch = useCallback(
     (branch: string | null, worktreePath: string | null, automatic = false) => {
+      if (isMultiRepository) return;
       if (
         !activeThreadId ||
         !activeProject ||
@@ -222,6 +235,7 @@ export function BranchToolbarBranchSelector({
     },
     [
       activeThreadId,
+      isMultiRepository,
       activeProject,
       serverSession,
       activeWorktreePath,
@@ -251,7 +265,7 @@ export function BranchToolbarBranchSelector({
       ? null
       : vcsEnvironment.status({
           environmentId,
-          input: { cwd: branchCwd },
+          input: { cwd: branchCwd, repositoryTarget },
         }),
   );
   const trimmedBranchQuery = branchQuery.trim();
@@ -264,6 +278,7 @@ export function BranchToolbarBranchSelector({
   const branchRefState = usePaginatedBranches({
     environmentId,
     cwd: branchCwd,
+    repositoryTarget,
     query: branchRefQuery,
   });
   const refs = branchRefState.refs;
@@ -278,12 +293,14 @@ export function BranchToolbarBranchSelector({
     [branchStatusQuery.data?.sourceControlProvider],
   );
   const SourceControlIcon = sourceControlPresentation.Icon;
-  const canonicalActiveBranch = resolveBranchToolbarValue({
-    envMode: effectiveEnvMode,
-    activeWorktreePath,
-    activeThreadBranch,
-    currentGitBranch,
-  });
+  const canonicalActiveBranch = isMultiRepository
+    ? currentGitBranch
+    : resolveBranchToolbarValue({
+        envMode: effectiveEnvMode,
+        activeWorktreePath,
+        activeThreadBranch,
+        currentGitBranch,
+      });
   const branchNames = useMemo(() => refs.map((refName) => refName.name), [refs]);
   const branchByName = useMemo(
     () => new Map(refs.map((refName) => [refName.name, refName] as const)),
@@ -348,6 +365,7 @@ export function BranchToolbarBranchSelector({
           environmentId,
           input: {
             cwd: branchCwd,
+            repositoryTarget,
             query: resolvedActiveBranch,
             limit: 10,
           },
@@ -417,6 +435,7 @@ export function BranchToolbarBranchSelector({
 
   const runBranchAction = (action: () => Promise<void>) => {
     if (
+      (isMultiRepository && !canChangeThreadBranch) ||
       !readEnvironmentScope(environmentId, AuthSourceControlWriteScope) ||
       (hasServerThread && !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope))
     ) {
@@ -438,7 +457,14 @@ export function BranchToolbarBranchSelector({
   };
 
   const selectBranch = (refName: VcsRef) => {
-    if (!canUpdateThreadBranch || !branchCwd || !activeProjectCwd || isBranchActionPending) return;
+    if (
+      !canUpdateThreadBranch ||
+      !branchCwd ||
+      !activeProjectCwd ||
+      isBranchActionPending ||
+      (isMultiRepository && !canChangeThreadBranch)
+    )
+      return;
 
     if (isSelectingWorktreeBase) {
       setThreadBranch(refName.name, null);
@@ -447,11 +473,13 @@ export function BranchToolbarBranchSelector({
       return;
     }
 
-    const selectionTarget = resolveBranchSelectionTarget({
-      activeProjectCwd,
-      activeWorktreePath,
-      refName,
-    });
+    const selectionTarget = isMultiRepository
+      ? { checkoutCwd: branchCwd, nextWorktreePath: null, reuseExistingWorktree: false }
+      : resolveBranchSelectionTarget({
+          activeProjectCwd,
+          activeWorktreePath,
+          refName,
+        });
 
     if (selectionTarget.reuseExistingWorktree) {
       setThreadBranch(refName.name, selectionTarget.nextWorktreePath);
@@ -474,6 +502,7 @@ export function BranchToolbarBranchSelector({
         environmentId,
         input: {
           cwd: selectionTarget.checkoutCwd,
+          repositoryTarget,
           refName: refName.name,
         },
       });
@@ -513,6 +542,7 @@ export function BranchToolbarBranchSelector({
         environmentId,
         input: {
           cwd: branchCwd,
+          repositoryTarget,
           refName: name,
           switchRef: true,
         },
@@ -610,17 +640,19 @@ export function BranchToolbarBranchSelector({
   const supportsMultiplePullRequests = useSupportsMultiplePullRequests(environmentId);
   const linkedStatus = useLinkedThreadPullRequest(
     environmentId,
-    serverThread?.linkedPullRequest,
-    true,
+    isMultiRepository ? null : serverThread?.linkedPullRequest,
+    !isMultiRepository,
     serverThread?.pullRequests,
     serverThread?.branchPullRequest,
   );
-  const currentLinkedPr = supportsMultiplePullRequests
-    ? resolveThreadCurrentPullRequestLink(serverThread?.pullRequests ?? [])
-    : null;
-  const prBadge = supportsMultiplePullRequests
-    ? resolveThreadPullRequestBadge(serverThread?.pullRequests)
-    : null;
+  const currentLinkedPr =
+    supportsMultiplePullRequests && !isMultiRepository
+      ? resolveThreadCurrentPullRequestLink(serverThread?.pullRequests ?? [])
+      : null;
+  const prBadge =
+    supportsMultiplePullRequests && !isMultiRepository
+      ? resolveThreadPullRequestBadge(serverThread?.pullRequests)
+      : null;
   const displayedPr = linkedStatus?.pr ?? (currentLinkedPr === null ? branchPr : null);
   const displayedPrStatus = prStatusIndicator(
     displayedPr,
@@ -693,6 +725,7 @@ export function BranchToolbarBranchSelector({
         index={index}
         value={itemValue}
         disabled={
+          (isMultiRepository && !canChangeThreadBranch) ||
           !canUpdateThreadBranch ||
           (!canWriteSourceControl &&
             !isSelectingWorktreeBase &&

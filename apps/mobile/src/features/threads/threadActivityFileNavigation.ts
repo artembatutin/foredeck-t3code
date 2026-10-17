@@ -14,7 +14,7 @@ export function buildThreadActivityFileParams(input: ThreadActivityFileContext) 
   return {
     environmentId: String(input.environmentId),
     threadId: String(input.currentThreadId),
-    path: input.relativePath.split("/").filter((segment) => segment.length > 0),
+    path: input.relativePath.split("/"),
     ...(Number.isFinite(input.line) && Number(input.line) > 0
       ? { line: String(Math.floor(Number(input.line))) }
       : {}),

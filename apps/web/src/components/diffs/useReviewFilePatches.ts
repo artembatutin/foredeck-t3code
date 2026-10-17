@@ -1,6 +1,6 @@
 import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import type { FileDiffMetadata } from "@pierre/diffs";
-import type { EnvironmentId, ReviewDiffPreviewSource } from "@t3tools/contracts";
+import type { EnvironmentId, RepositoryTarget, ReviewDiffPreviewSource } from "@t3tools/contracts";
 import * as AsyncResult from "effect/reactivity/AsyncResult";
 import * as Atom from "effect/reactivity/Atom";
 import {
@@ -23,6 +23,7 @@ const filePathCollator = new Intl.Collator(undefined, {
 export function useReviewFilePatches({
   environmentId,
   cwd,
+  repositoryTarget,
   source,
   baseRef,
   ignoreWhitespace,
@@ -32,6 +33,7 @@ export function useReviewFilePatches({
 }: {
   environmentId: EnvironmentId | undefined;
   cwd: string | undefined;
+  repositoryTarget?: RepositoryTarget | undefined;
   source: ReviewDiffPreviewSource | null;
   baseRef: string | null;
   ignoreWhitespace: boolean;
@@ -43,6 +45,7 @@ export function useReviewFilePatches({
   const scope = JSON.stringify([
     environmentId,
     cwd,
+    repositoryTarget,
     source?.kind,
     source?.diffHash,
     baseRef,
@@ -73,6 +76,7 @@ export function useReviewFilePatches({
                     cacheKey: scope,
                     request: {
                       cwd,
+                      repositoryTarget,
                       ...(baseRef ? { baseRef } : {}),
                       ignoreWhitespace,
                       file: {
@@ -85,7 +89,17 @@ export function useReviewFilePatches({
                 }),
               };
             }),
-    [environmentId, cwd, source, files, indices, scope, baseRef, ignoreWhitespace],
+    [
+      environmentId,
+      cwd,
+      repositoryTarget,
+      source,
+      files,
+      indices,
+      scope,
+      baseRef,
+      ignoreWhitespace,
+    ],
   );
   const previousPreview = useRef({ scope, revision, queries: [] as typeof queries });
   useEffect(() => {

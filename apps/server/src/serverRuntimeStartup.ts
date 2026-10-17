@@ -1,3 +1,4 @@
+import * as GitManager from "./git/GitManager.ts";
 import {
   CommandId,
   DEFAULT_MODEL,
@@ -185,15 +186,20 @@ interface AutoBootstrapWelcomeTargets {
 }
 
 export const autoPullProjects = Effect.fn("autoPullProjects")(function* (
-  projects: ReadonlyArray<Pick<Project, "id" | "workspaceRoot" | "autoPull">>,
+  projects: ReadonlyArray<Pick<Project, "id" | "workspaceRoot" | "autoPull" | "repositories">>,
   settings = DEFAULT_SERVER_SETTINGS,
 ) {
   const git = yield* GitVcsDriver.GitVcsDriver;
+  const gitManager = yield* GitManager.GitManager;
   const workspaceRoots = [
     ...new Set(
       projects
         .filter((project) => resolveProjectSettings(settings, project.id).settings.defaultAutoPull)
-        .map((project) => project.workspaceRoot),
+        .flatMap((project) =>
+          (project.repositories?.length ?? 0) > 1
+            ? project.repositories!.map((repository) => repository.rootPath)
+            : [project.workspaceRoot],
+        ),
     ),
   ];
 
@@ -226,7 +232,10 @@ export const autoPullProjects = Effect.fn("autoPullProjects")(function* (
 
         if (status.behindCount <= 0) return;
 
-        const result = yield* git.pullCurrentBranch(cwd);
+        const result = yield* gitManager.withCheckoutMutation(
+          { cwd, operation: "automaticPull", changesBranch: true },
+          git.pullCurrentBranch(cwd),
+        );
         yield* Effect.logDebug("Automatic project pull completed", {
           cwd,
           status: result.status,

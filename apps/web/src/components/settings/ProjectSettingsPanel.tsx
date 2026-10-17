@@ -46,6 +46,7 @@ import { ProjectActionsSettings } from "./ProjectActionsSettings";
 import { ProjectDefaultsSettings } from "./ProjectDefaultsSettings";
 import { projectGroupTitleNeedsUpdate } from "./ProjectSettingsPanel.logic";
 import { useSettingsProjectGroups } from "./useSettingsProjectGroups";
+import { RepositorySettings } from "../../fd/multirepo";
 
 const ProjectIconPickerDialog = lazy(() =>
   import("./ProjectIconPickerDialog").then((module) => ({
@@ -537,6 +538,17 @@ function ProjectDetail({
             }
           />
         </SettingsSection>
+        {group.memberProjects.map((member) => {
+          const environment = environmentById.get(member.environmentId);
+          return (
+            <RepositorySettings
+              key={`${member.environmentId}:${member.id}`}
+              project={member}
+              serverConfig={environment?.serverConfig ?? null}
+              environmentLabel={environment?.label ?? "Environment"}
+            />
+          );
+        })}
         <ProjectDefaultsSettings category="project" />
         <ProjectActionsSettings />
         {hasMultipleCheckouts ? checkoutChoices : null}

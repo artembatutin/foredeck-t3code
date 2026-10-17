@@ -1,3 +1,5 @@
+import { useRepositoryFileAccess } from "../../fd/multirepo";
+import type { RepositoryTarget } from "@t3tools/contracts";
 import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import {
   type EnvironmentId,
@@ -59,10 +61,15 @@ function getProjectEntriesQueryAtom(
   environmentId: EnvironmentId,
   cwd: string,
   directoryPath?: string,
+  repositoryTarget?: RepositoryTarget,
 ) {
   return projectEnvironment.listEntries({
     environmentId,
-    input: { cwd, ...(directoryPath !== undefined ? { directoryPath } : {}) },
+    input: {
+      cwd,
+      ...(repositoryTarget ? { repositoryTarget } : {}),
+      ...(directoryPath !== undefined ? { directoryPath } : {}),
+    },
   });
 }
 
@@ -70,10 +77,15 @@ export function getProjectFileQueryAtom(
   environmentId: EnvironmentId,
   cwd: string,
   relativePath: string | null,
+  repositoryTarget?: RepositoryTarget,
 ) {
   return projectEnvironment.readFile({
     environmentId,
-    input: { cwd, relativePath: relativePath ?? EMPTY_PROJECT_FILE_PATH },
+    input: {
+      cwd,
+      relativePath: relativePath ?? EMPTY_PROJECT_FILE_PATH,
+      ...(repositoryTarget ? { repositoryTarget } : {}),
+    },
   });
 }
 
@@ -111,10 +123,13 @@ export function getProjectFileContents(
   environmentId: EnvironmentId,
   cwd: string,
   relativePath: string,
+  repositoryTarget?: RepositoryTarget,
 ): string | undefined {
   const optimistic = getOptimisticProjectFileQueryData(environmentId, cwd, relativePath);
   if (optimistic) return optimistic.contents;
-  const result = appAtomRegistry.get(getProjectFileQueryAtom(environmentId, cwd, relativePath));
+  const result = appAtomRegistry.get(
+    getProjectFileQueryAtom(environmentId, cwd, relativePath, repositoryTarget),
+  );
   return Option.getOrUndefined(AsyncResult.value(result))?.contents;
 }
 
@@ -132,12 +147,13 @@ export function confirmProjectFileQueryData(
   cwd: string,
   relativePath: string,
   contents: string,
+  repositoryTarget?: RepositoryTarget,
 ): boolean {
   const atom = optimisticFileAtom(environmentId, cwd, relativePath);
   const optimisticFile = appAtomRegistry.get(atom);
   if (optimisticFile?.data.contents !== contents) return false;
 
-  const queryAtom = getProjectFileQueryAtom(environmentId, cwd, relativePath);
+  const queryAtom = getProjectFileQueryAtom(environmentId, cwd, relativePath, repositoryTarget);
   const confirmed = {
     ...optimisticFile,
     confirmedAgainst: appAtomRegistry.get(queryAtom),
@@ -192,10 +208,11 @@ export function useProjectEntriesQuery(
   cwd: string,
   directoryPath?: string,
 ): ProjectQueryState<ProjectListEntriesResult> {
+  const repositoryTarget = useRepositoryFileAccess();
   const fileAccess = useFilesystemReadAccess(environmentId);
   const { canReadFiles } = fileAccess;
   const atom = canReadFiles
-    ? getProjectEntriesQueryAtom(environmentId, cwd, directoryPath)
+    ? getProjectEntriesQueryAtom(environmentId, cwd, directoryPath, repositoryTarget)
     : EMPTY_PROJECT_ENTRIES_QUERY_ATOM;
   const result = useAtomValue(atom);
   const refreshAtom = useAtomRefresh(atom);
@@ -227,10 +244,12 @@ export function useProjectFilePickerQuery(
   limit: number,
   options?: { readonly imageOnly?: boolean },
 ) {
+  const repositoryTarget = useRepositoryFileAccess();
   const search = useProjectPathSearch(
     {
       environmentId,
       cwd,
+      repositoryTarget,
       query,
       kind: "file",
       ...(options?.imageOnly ? { imageOnly: true } : {}),
@@ -252,15 +271,18 @@ export function useProjectFileQuery(
   cwd: string,
   relativePath: string | null,
   enabled = true,
+  explicitRepositoryTarget?: RepositoryTarget,
 ): ProjectFileQueryState {
   // The caller decides what to read. A media path is not skipped here: a folder
   // named `assets.png` is only knowable as a folder from the read failure.
+  const contextTarget = useRepositoryFileAccess();
+  const repositoryTarget = explicitRepositoryTarget ?? contextTarget;
   const fileAccess = useFilesystemReadAccess(environmentId);
   const { canReadFiles } = fileAccess;
   const isQueryEnabled = enabled;
   const atom =
     enabled && canReadFiles
-      ? getProjectFileQueryAtom(environmentId, cwd, relativePath)
+      ? getProjectFileQueryAtom(environmentId, cwd, relativePath, repositoryTarget)
       : EMPTY_PROJECT_FILE_QUERY_ATOM;
   const result = useAtomValue(atom);
   const refreshAtom = useAtomRefresh(atom);

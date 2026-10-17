@@ -1,6 +1,7 @@
 import type { ReviewSectionItem } from "./reviewModel";
 
 export interface ReviewSectionMenu {
+  readonly conversation: ReviewSectionItem | null;
   readonly workingTree: ReviewSectionItem | null;
   readonly branchChanges: ReviewSectionItem | null;
   readonly latestTurn: ReviewSectionItem | null;
@@ -13,6 +14,7 @@ export function buildReviewSectionMenu(
   const turns = sections.filter((section) => section.kind === "turn");
 
   return {
+    conversation: sections.find((section) => section.kind === "thread") ?? null,
     workingTree: sections.find((section) => section.kind === "working-tree") ?? null,
     branchChanges: sections.find((section) => section.kind === "branch-range") ?? null,
     latestTurn: turns[0] ?? null,

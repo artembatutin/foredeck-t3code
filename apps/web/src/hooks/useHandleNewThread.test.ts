@@ -5,6 +5,7 @@ const testState = vi.hoisted(() => {
   let completeProjectFileRead: (value: null) => void = () => undefined;
   let projectFileRead = Promise.resolve<null>(null);
   let projectRemoved = false;
+  let multiRepository = false;
   let targetSettings = {
     defaultThreadEnvMode: "local" as "local" | "worktree",
     newWorktreesStartFromOrigin: false,
@@ -46,6 +47,12 @@ const testState = vi.hoisted(() => {
     get projectRemoved() {
       return projectRemoved;
     },
+    get multiRepository() {
+      return multiRepository;
+    },
+    enableRepositories() {
+      multiRepository = true;
+    },
     removeProject() {
       projectRemoved = true;
     },
@@ -61,6 +68,7 @@ const testState = vi.hoisted(() => {
     ) {
       storedDraft = nextStoredDraft;
       projectRemoved = false;
+      multiRepository = false;
       targetSettings = {
         defaultThreadEnvMode: workspaceDefaults.envMode,
         newWorktreesStartFromOrigin: workspaceDefaults.startFromOrigin,
@@ -101,7 +109,8 @@ vi.mock("@t3tools/client-runtime/environment", () => ({
   scopeProjectRef: (environmentId: string, projectId: string) => ({ environmentId, projectId }),
   scopeThreadRef: (environmentId: string, threadId: string) => ({ environmentId, threadId }),
 }));
-vi.mock("@t3tools/contracts", () => ({
+vi.mock("@t3tools/contracts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@t3tools/contracts")>()),
   DEFAULT_RUNTIME_MODE: "default",
   DEFAULT_SERVER_SETTINGS: {},
 }));
@@ -174,6 +183,14 @@ vi.mock("../state/entities", () => {
     workspaceRoot: "/remote/project",
     defaultThreadEnvMode: null,
     defaultModelSelection: null,
+    get repositories() {
+      return testState.multiRepository
+        ? [
+            { id: "one", name: "One", rootPath: "/remote/project" },
+            { id: "two", name: "Two", rootPath: "/remote/other" },
+          ]
+        : [];
+    },
   };
   return {
     readProject: () => (testState.projectRemoved ? null : project),
@@ -261,6 +278,20 @@ describe.each([
     await expect(pendingOpen).resolves.toBeNull();
     expect(testState.router.navigate).not.toHaveBeenCalled();
     expect(testState.draftStore.setLogicalProjectDraftThreadId).not.toHaveBeenCalled();
+  });
+
+  it("defaults a multi-repository project to its existing checkouts despite the environment worktree default", async () => {
+    testState.reset(draft, { envMode: "worktree", startFromOrigin: false });
+    testState.enableRepositories();
+    const projectRef = { environmentId: "environment-ssh", projectId: "project-remote" } as never;
+    const opened = await useNewThreadHandler()(projectRef);
+    expect(opened).not.toBeNull();
+    expect(testState.draftStore.setLogicalProjectDraftThreadId).toHaveBeenCalledWith(
+      "remote-project",
+      projectRef,
+      opened!.draftId,
+      expect.objectContaining({ envMode: "local" }),
+    );
   });
 
   it.each([true, false])(

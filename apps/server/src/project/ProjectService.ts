@@ -1,3 +1,4 @@
+import { RepositorySet } from "../fd/multirepo/index.ts";
 import {
   CommandId,
   type OrchestrationProjectShell,
@@ -6,6 +7,7 @@ import {
   type ProjectCreatePayload,
   type ProjectUpdatePayload,
   type ProjectSnapshot,
+  type ProjectRepositoryInput,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
@@ -108,7 +110,8 @@ export type ProjectServiceError =
   | ProjectNotFoundError
   | ProjectConflictError
   | ProjectNotEmptyError
-  | ProjectOperationError;
+  | ProjectOperationError
+  | RepositorySet.RepositorySetError;
 
 export class ProjectService extends Context.Service<
   ProjectService,
@@ -145,8 +148,11 @@ export class ProjectService extends Context.Service<
   }
 >()("t3/project/ProjectService") {}
 
+const isRepositorySetError = Schema.is(RepositorySet.RepositorySetError);
+
 export const make = Effect.gen(function* () {
   const projects = yield* ProjectStore.ProjectStoreV2;
+  const repositorySet = yield* RepositorySet.RepositorySet;
   const projectEnrichment = yield* ProjectEnrichmentService.ProjectEnrichmentService;
   const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
   const threadProjections = yield* ProjectionStore.ProjectionStoreV2;
@@ -167,6 +173,7 @@ export const make = Effect.gen(function* () {
     id: row.projectId,
     title: row.title,
     workspaceRoot: row.workspaceRoot,
+    repositories: row.repositories ?? [],
     repositoryIdentity: enrichment?.repositoryIdentity ?? null,
     faviconPath: row.faviconPath ?? enrichment?.faviconPath ?? null,
     defaultModelSelection: row.defaultModelSelection,
@@ -221,7 +228,10 @@ export const make = Effect.gen(function* () {
    * Plan one command against rows read under its locks, then commit its event or
    * its rejection. A reused command id resolves to the receipt it already has.
    */
-  const commit = Effect.fn("ProjectService.commit")(function* (command: ProjectCommand) {
+  const commit = Effect.fn("ProjectService.commit")(function* (
+    command: ProjectCommand,
+    requestedRepositories?: ReadonlyArray<ProjectRepositoryInput>,
+  ) {
     const { projectId } = command;
     const dispatchError = (cause: unknown) =>
       new ProjectOperationError({ operation: "dispatch-project-command", projectId, cause });
@@ -236,12 +246,57 @@ export const make = Effect.gen(function* () {
                 .findActiveByWorkspaceRoot(workspaceRoot)
                 .pipe(Effect.mapError(dispatchError)),
             );
+      const normalizedRepositories =
+        requestedRepositories === undefined
+          ? workspaceRoot !== undefined &&
+            project !== undefined &&
+            workspaceRoot !== project.workspaceRoot &&
+            !RepositorySet.isMultiRepo(project.repositories)
+            ? []
+            : undefined
+          : yield* repositorySet.normalize({
+              defaultCwd: workspaceRoot ?? project?.workspaceRoot ?? "",
+              repositories: requestedRepositories,
+              ...(project?.repositories === undefined ? {} : { previous: project.repositories }),
+            });
+      if (
+        project !== undefined &&
+        workspaceRoot !== undefined &&
+        workspaceRoot !== project.workspaceRoot &&
+        (RepositorySet.isMultiRepo(project.repositories) ||
+          RepositorySet.isMultiRepo(normalizedRepositories))
+      ) {
+        return yield* new RepositorySet.RepositorySetError({
+          reason: "identity",
+          path: workspaceRoot,
+        });
+      }
+      if (RepositorySet.isMultiRepo(normalizedRepositories)) {
+        yield* repositorySet.assertNoProjectOverlap(
+          (normalizedRepositories ?? []).filter(
+            (repository) => !project?.repositories?.some((entry) => entry.id === repository.id),
+          ),
+          (yield* projects.list().pipe(Effect.mapError(dispatchError))).filter(
+            (other) => other.projectId !== projectId,
+          ),
+        );
+        const snapshot = yield* threadProjections
+          .getShellSnapshot({ projectId })
+          .pipe(Effect.mapError(dispatchError));
+        const threads = [...snapshot.threads, ...snapshot.archivedThreads];
+        if (threads.some((thread) => thread.worktreePath !== null)) {
+          return yield* new RepositorySet.RepositorySetError({ reason: "existing-worktrees" });
+        }
+      }
       const now = yield* DateTime.now;
       const eventId = yield* idAllocator.allocate
         .event({ commandId: command.commandId })
         .pipe(Effect.mapError(dispatchError));
       const planned = planProjectCommand({
-        command,
+        command:
+          normalizedRepositories === undefined || command.type === "project.delete"
+            ? command
+            : { ...command, repositories: normalizedRepositories },
         state: { project, workspaceOwner },
         eventId,
         now,
@@ -271,7 +326,9 @@ export const make = Effect.gen(function* () {
           ? planAndCommit
           : workspaceLocks.withLock(workspaceRoot, planAndCommit),
       )
-      .pipe(Effect.mapError(dispatchError));
+      .pipe(
+        Effect.mapError((cause) => (isRepositorySetError(cause) ? cause : dispatchError(cause))),
+      );
     if (receipt.projectId !== projectId || receipt.commandType !== command.type) {
       return yield* dispatchError(
         `Command ${command.commandId} was already used by ${receipt.commandType} for ${receipt.projectId}.`,
@@ -343,14 +400,17 @@ export const make = Effect.gen(function* () {
         workspaceRoot: input.workspaceRoot,
         createIfMissing: input.createWorkspaceRootIfMissing ?? false,
       });
-      yield* commit({
-        type: "project.create",
-        commandId: input.commandId,
-        projectId: input.projectId,
-        title: input.title,
-        workspaceRoot,
-        ...(input.scripts === undefined ? {} : { scripts: input.scripts }),
-      });
+      yield* commit(
+        {
+          type: "project.create",
+          commandId: input.commandId,
+          projectId: input.projectId,
+          title: input.title,
+          workspaceRoot,
+          ...(input.scripts === undefined ? {} : { scripts: input.scripts }),
+        },
+        input.repositories,
+      );
       yield* projectEnrichment.invalidate([workspaceRoot]);
       return yield* readCommitted(input.projectId);
     },
@@ -370,23 +430,26 @@ export const make = Effect.gen(function* () {
               projectId: input.projectId,
               workspaceRoot: input.workspaceRoot,
             });
-      yield* commit({
-        type: "project.meta.update",
-        commandId: input.commandId,
-        projectId: input.projectId,
-        ...(input.title === undefined ? {} : { title: input.title }),
-        ...(workspaceRoot === previousRoot ? {} : { workspaceRoot }),
-        ...(input.defaultModelSelection === undefined
-          ? {}
-          : { defaultModelSelection: input.defaultModelSelection }),
-        ...(input.autoPull === undefined ? {} : { autoPull: input.autoPull }),
-        ...(input.projectIcon === undefined ? {} : { projectIcon: input.projectIcon }),
-        ...(input.faviconPath === undefined ? {} : { faviconPath: input.faviconPath }),
-        ...(input.defaultThreadEnvMode === undefined
-          ? {}
-          : { defaultThreadEnvMode: input.defaultThreadEnvMode }),
-        ...(input.scripts === undefined ? {} : { scripts: input.scripts }),
-      });
+      yield* commit(
+        {
+          type: "project.meta.update",
+          commandId: input.commandId,
+          projectId: input.projectId,
+          ...(input.title === undefined ? {} : { title: input.title }),
+          ...(workspaceRoot === previousRoot ? {} : { workspaceRoot }),
+          ...(input.defaultModelSelection === undefined
+            ? {}
+            : { defaultModelSelection: input.defaultModelSelection }),
+          ...(input.autoPull === undefined ? {} : { autoPull: input.autoPull }),
+          ...(input.projectIcon === undefined ? {} : { projectIcon: input.projectIcon }),
+          ...(input.faviconPath === undefined ? {} : { faviconPath: input.faviconPath }),
+          ...(input.defaultThreadEnvMode === undefined
+            ? {}
+            : { defaultThreadEnvMode: input.defaultThreadEnvMode }),
+          ...(input.scripts === undefined ? {} : { scripts: input.scripts }),
+        },
+        input.repositories,
+      );
       if (workspaceRoot !== previousRoot) {
         yield* projectEnrichment.invalidate([previousRoot, workspaceRoot]);
       }
@@ -591,4 +654,5 @@ export const make = Effect.gen(function* () {
 
 export const layer = Layer.effect(ProjectService, make).pipe(
   Layer.provide(ThreadCommandExecutor.layer),
+  Layer.provide(RepositorySet.layerDefault),
 );

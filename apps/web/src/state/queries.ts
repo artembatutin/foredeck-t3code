@@ -11,6 +11,7 @@ import {
 import { type VcsRefTarget } from "@t3tools/client-runtime/state/vcs";
 import type {
   EnvironmentId,
+  RepositoryTarget,
   ProjectContentMatch,
   ProjectEntry,
   ProjectEntryKind,
@@ -104,7 +105,7 @@ export function usePaginatedBranches(target: VcsRefTarget) {
   const query = target.query?.trim() ?? "";
   const targetKey =
     target.environmentId !== null && target.cwd !== null
-      ? JSON.stringify([target.environmentId, target.cwd, query])
+      ? JSON.stringify([target.environmentId, target.cwd, target.repositoryTarget, query])
       : null;
   const [pagination, setPagination] = useState<{
     readonly targetKey: string | null;
@@ -122,6 +123,7 @@ export function usePaginatedBranches(target: VcsRefTarget) {
               environmentId: target.environmentId!,
               input: {
                 cwd: target.cwd!,
+                repositoryTarget: target.repositoryTarget,
                 ...(query.length > 0 ? { query } : {}),
                 ...(cursor === undefined ? {} : { cursor }),
                 limit: VCS_REF_LIST_LIMIT,
@@ -129,7 +131,7 @@ export function usePaginatedBranches(target: VcsRefTarget) {
             }),
           )
         : [],
-    [cursors, query, target.cwd, target.environmentId],
+    [cursors, query, target.cwd, target.environmentId, target.repositoryTarget],
   );
   const pagesAtom = useMemo(
     () =>
@@ -215,6 +217,7 @@ export function areProjectPathSearchTargetsEqual(
   return (
     left.environmentId === right.environmentId &&
     left.cwd === right.cwd &&
+    JSON.stringify(left.repositoryTarget) === JSON.stringify(right.repositoryTarget) &&
     left.query === right.query &&
     left.kind === right.kind &&
     left.imageOnly === right.imageOnly
@@ -231,11 +234,19 @@ export function useProjectPathSearch(
     () => ({
       environmentId: target.environmentId,
       cwd: target.cwd,
+      repositoryTarget: target.repositoryTarget,
       query: target.query == null ? null : target.query.trim(),
       kind: target.kind,
       imageOnly: target.imageOnly,
     }),
-    [target.cwd, target.environmentId, target.imageOnly, target.kind, target.query],
+    [
+      target.cwd,
+      target.environmentId,
+      target.imageOnly,
+      target.kind,
+      target.query,
+      target.repositoryTarget,
+    ],
   );
   const debouncedTarget = useDebouncedValue(normalizedTarget, PROJECT_PATH_SEARCH_DEBOUNCE_MS);
   const fileAccess = useFilesystemReadAccess(debouncedTarget.environmentId);
@@ -249,6 +260,7 @@ export function useProjectPathSearch(
           environmentId: debouncedTarget.environmentId,
           input: {
             cwd: debouncedTarget.cwd,
+            repositoryTarget: debouncedTarget.repositoryTarget,
             query: debouncedTarget.query,
             limit,
             ...(debouncedTarget.kind ? { kind: debouncedTarget.kind } : {}),
@@ -285,6 +297,7 @@ export function useComposerPathSearch(target: ComposerPathSearchTarget) {
 interface ProjectContentSearchTarget {
   readonly environmentId: EnvironmentId | null;
   readonly cwd: string | null;
+  readonly repositoryTarget?: RepositoryTarget | undefined;
   readonly query: string;
   readonly caseSensitive: boolean;
   readonly wholeWord: boolean;
@@ -311,6 +324,7 @@ export function useProjectContentSearch(target: ProjectContentSearchTarget) {
           environmentId: target.environmentId,
           input: {
             cwd: target.cwd,
+            repositoryTarget: target.repositoryTarget,
             query: debouncedQuery,
             limit: PROJECT_CONTENT_SEARCH_LIMIT,
             caseSensitive: target.caseSensitive,
@@ -356,6 +370,7 @@ export function useCheckpointDiff(
           environmentId: target.environmentId!,
           input: {
             threadId: target.threadId!,
+            ...(target.repositoryId === undefined ? {} : { repositoryId: target.repositoryId }),
             toTurnCount: target.toTurnCount!,
             ignoreWhitespace: target.ignoreWhitespace,
           },
@@ -367,6 +382,7 @@ export function useCheckpointDiff(
           environmentId: target.environmentId!,
           input: {
             threadId: target.threadId!,
+            ...(target.repositoryId === undefined ? {} : { repositoryId: target.repositoryId }),
             fromTurnCount: target.fromTurnCount!,
             toTurnCount: target.toTurnCount!,
             ignoreWhitespace: target.ignoreWhitespace,

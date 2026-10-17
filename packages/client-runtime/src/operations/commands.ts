@@ -167,6 +167,8 @@ interface StartThreadBootstrap {
 }
 
 export interface StartThreadTurnInput extends ThreadCommandInput {
+  /** Retained by offline queues so reconnecting cannot downgrade multi-repository execution. */
+  readonly requiresRepositoryProtocol?: boolean;
   readonly manualContinuationOfRunId?: RunId;
   readonly message: {
     readonly messageId: MessageId;

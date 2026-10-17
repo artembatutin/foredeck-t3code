@@ -1,4 +1,9 @@
 import {
+  withRepositoryTerminalTarget,
+  repositoryTerminalLabel,
+} from "@t3tools/client-runtime/fd/multirepo";
+import { useRepositoryWorkspace } from "../../fd/multirepo";
+import {
   AuthTerminalReadScope,
   AuthTerminalOperateScope,
   DEFAULT_TERMINAL_ID,
@@ -390,8 +395,9 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
     requestedTerminalId === null &&
     runningSession !== null &&
     runningSession.target.terminalId !== terminalId;
+  const repositoryWorkspace = useRepositoryWorkspace(selectedThreadProject, selectedThread);
   const launchLocationCandidate = useMemo(() => {
-    if (!selectedThread || !selectedThreadProject?.workspaceRoot) {
+    if (!selectedThread || !selectedThreadProject?.workspaceRoot || !repositoryWorkspace.cwd) {
       return null;
     }
     if (pendingLaunch) {
@@ -403,7 +409,7 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
     return resolveTerminalOpenLocation({
       terminalLocation: activeKnownSession?.state.summary ?? null,
       activeSessionLocation: activeKnownSession?.state.summary ?? null,
-      workspaceRoot: selectedThreadProject.workspaceRoot,
+      workspaceRoot: repositoryWorkspace.cwd,
       threadShellWorktreePath: selectedThread.worktreePath ?? null,
       threadDetailWorktreePath: selectedThreadDetailWorktreePath,
     });
@@ -413,6 +419,7 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
     selectedThread,
     selectedThreadDetailWorktreePath,
     selectedThreadProject?.workspaceRoot,
+    repositoryWorkspace.cwd,
   ]);
   const [initialLaunchLocationEntry, setInitialLaunchLocationEntry] = useState(() => ({
     key: launchTargetKey,
@@ -430,16 +437,20 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
       hasMeasuredSurface &&
       isEnvironmentReady &&
       !shouldRedirectToRunningTerminal
-        ? {
-            threadId: selectedThread.id,
-            terminalId,
-            cwd: launchLocation.cwd,
-            worktreePath: launchLocation.worktreePath,
-            cols: initialAttachGridSize.cols,
-            rows: initialAttachGridSize.rows,
-            ...(pendingLaunch?.env ? { env: pendingLaunch.env } : {}),
-            ...(pendingLaunch ? { restartIfNotRunning: true } : {}),
-          }
+        ? withRepositoryTerminalTarget(
+            {
+              threadId: selectedThread.id,
+              terminalId,
+              cwd: launchLocation.cwd,
+              worktreePath: launchLocation.worktreePath,
+              cols: initialAttachGridSize.cols,
+              rows: initialAttachGridSize.rows,
+              ...(pendingLaunch?.env ? { env: pendingLaunch.env } : {}),
+              ...(pendingLaunch ? { restartIfNotRunning: true } : {}),
+            },
+            selectedThreadProject,
+            selectedThread,
+          )
         : null,
     [
       hasMeasuredSurface,
@@ -450,6 +461,7 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
       launchLocation,
       pendingLaunch,
       selectedThread,
+      selectedThreadProject,
       shouldRedirectToRunningTerminal,
       terminalId,
     ],
@@ -541,7 +553,7 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
       preview: terminal.buffer.slice(0, 160),
     });
   }, [terminal.buffer, terminal.buffer.length, terminalKey]);
-  const cwd = terminal.summary?.cwd ?? selectedThreadProject?.workspaceRoot ?? null;
+  const cwd = terminal.summary?.cwd ?? launchLocation?.cwd ?? null;
   const serverConfigs = useServerConfigs();
   const hostOs =
     routeEnvironmentId === null
@@ -558,7 +570,12 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
   const terminalTheme = getMobileTerminalTheme(themeId, appearanceScheme);
   const pendingModifier =
     pendingModifierState.terminalId === terminalId ? pendingModifierState.value : null;
-  const headerSubtitle = selectedThreadProject?.title ?? "";
+  const headerSubtitle = repositoryTerminalLabel(
+    selectedThreadProject?.title ?? "",
+    cwd ?? undefined,
+    selectedThreadProject,
+    selectedThread,
+  );
   const terminalToolbarActions = useMemo<ReadonlyArray<TerminalToolbarAction>>(() => {
     const modifierActions: ReadonlyArray<TerminalToolbarAction> =
       hostPlatform === "mac"
@@ -629,11 +646,20 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
           displayLabel: resolveTerminalSessionLabel(terminalId, terminal.summary),
           updatedAt: terminal.updatedAt,
         },
-      }),
+      }).map((session) => ({
+        ...session,
+        displayLabel: repositoryTerminalLabel(
+          session.displayLabel,
+          session.cwd ?? undefined,
+          selectedThreadProject,
+          selectedThread,
+        ),
+      })),
     [
       cwd,
       knownSessions,
-      selectedThreadProject?.workspaceRoot,
+      selectedThreadProject,
+      selectedThread,
       terminal.hasRunningSubprocess,
       terminal.summary,
       terminal.status,
@@ -994,6 +1020,7 @@ export function ThreadTerminalRouteScreen(props: ThreadTerminalRouteScreenProps)
           threadId: selectedThread.id,
           terminalId,
           cwd: terminalAttachInput.cwd,
+          repositoryTarget: terminalAttachInput.repositoryTarget,
           worktreePath: terminalAttachInput.worktreePath,
           cols: terminalAttachInput.cols,
           rows: terminalAttachInput.rows,

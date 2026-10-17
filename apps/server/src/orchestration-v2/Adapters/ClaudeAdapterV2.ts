@@ -1,3 +1,4 @@
+import { repositoryContext } from "../../fd/multirepo/index.ts";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import {
   dynamicToolTitle,
@@ -266,6 +267,9 @@ function spawnClaudeProcessGroup(options: ClaudeSpawnOptions): ClaudeSpawnedProc
 }
 
 export const ClaudeProviderCapabilitiesV2 = {
+  multiRepository: {
+    runtimeModes: ["approval-required", "auto-accept-edits", "auto", "full-access"],
+  },
   sessions: {
     supportsMultipleProviderThreadsPerSession: false,
     supportsModelSwitchInSession: true,
@@ -1056,6 +1060,7 @@ function claudeLiveSelectionFlagSettings(
 }
 
 export function makeClaudeQueryOptions(input: {
+  readonly repositories?: ProviderAdapter.ProviderAdapterV2RuntimePolicy["repositories"];
   readonly modelSelection: ModelSelection;
   readonly nativeThreadId: string;
   readonly resume: boolean;
@@ -1157,20 +1162,36 @@ export function makeClaudeQueryOptions(input: {
     ...(input.settings?.binaryPath
       ? { pathToClaudeCodeExecutable: input.settings.binaryPath }
       : {}),
-    ...(input.environment === undefined ? {} : { env: input.environment }),
+    ...((input.repositories?.length ?? 0) > 1
+      ? {
+          env: {
+            ...process.env,
+            ...input.environment,
+            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: "1",
+          },
+        }
+      : input.environment === undefined
+        ? {}
+        : { env: input.environment }),
     ...(input.mcpServers === undefined ? {} : { mcpServers: input.mcpServers }),
     systemPrompt: {
       type: "preset" as const,
       preset: "claude_code" as const,
       append:
         buildRuntimeInstructions({ harness: "Claude Code" }) +
-        (input.mcpServers === undefined ? "" : T3_CODE_ORCHESTRATION_INSTRUCTIONS),
+        (input.mcpServers === undefined ? "" : T3_CODE_ORCHESTRATION_INSTRUCTIONS) +
+        (repositoryContext(input.repositories) === undefined
+          ? ""
+          : `\n${repositoryContext(input.repositories)}`),
     },
     ...(Object.keys(extraArgs).length === 0 ? {} : { extraArgs }),
   };
   const additionalDirectories = [
-    ...(input.cwd === null ? [] : [input.cwd]),
-    ...(input.attachmentsDir === undefined ? [] : [input.attachmentsDir]),
+    ...new Set([
+      ...(input.repositories?.map((repository) => repository.rootPath) ?? []),
+      ...(input.cwd === null ? [] : [input.cwd]),
+      ...(input.attachmentsDir === undefined ? [] : [input.attachmentsDir]),
+    ]),
   ];
   const withDirectories =
     additionalDirectories.length === 0 ? options : { ...options, additionalDirectories };
@@ -8546,6 +8567,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             resume: shouldResume,
             ...(resumeSessionAt === undefined ? {} : { resumeSessionAt }),
             cwd: turnInput.runtimePolicy.cwd,
+            repositories: turnInput.runtimePolicy.repositories,
             attachmentsDir,
             settings: adapterOptions.settings,
             environment: adapterOptions.environment,

@@ -998,8 +998,24 @@ export const layer = Layer.effect(
         }),
       );
 
+    const checkWorkspaceStrategy = (input: {
+      readonly projectId: ScheduledTask["projectId"];
+      readonly threadId?: ScheduledTask["threadId"] | undefined;
+      readonly workspaceStrategy: ScheduledTask["workspaceStrategy"];
+    }) =>
+      input.workspaceStrategy.type === "root"
+        ? Effect.void
+        : threadLaunch
+            .checkWorkspaceStrategy({
+              projectId: input.projectId,
+              workspaceStrategy: input.workspaceStrategy,
+              ...(input.threadId ? { threadId: input.threadId } : {}),
+            })
+            .pipe(Effect.mapError((cause) => taskError(cause.message, { cause })));
+
     const upsert: ScheduledTaskService["Service"]["upsert"] = (input) =>
       Effect.gen(function* () {
+        yield* checkWorkspaceStrategy(input);
         const now = yield* localNow;
         const uuid =
           input.commandId === undefined
@@ -1112,6 +1128,7 @@ export const layer = Layer.effect(
     const setEnabled: ScheduledTaskService["Service"]["setEnabled"] = (input) =>
       Effect.gen(function* () {
         const existing = yield* loadTask(input.id);
+        if (input.enabled) yield* checkWorkspaceStrategy(existing);
         if (existing.enabled === input.enabled) return { task: existing };
         const now = yield* localNow;
         const next = nextRunAt({ enabled: input.enabled, schedule: existing.schedule }, now);

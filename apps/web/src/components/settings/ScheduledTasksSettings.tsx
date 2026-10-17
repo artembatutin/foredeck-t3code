@@ -1,3 +1,7 @@
+import {
+  usesSharedCheckouts,
+  MULTIREPO_CHECKOUT_NOTICE,
+} from "@t3tools/client-runtime/fd/multirepo";
 import { useAtomValue } from "@effect/atom-react";
 import {
   Clock3Icon,
@@ -805,7 +809,13 @@ function ScheduledTaskEditorDialog({
     label: "scheduled task upsert",
   });
   const [draft, setDraft] = useState<DraftState>(() =>
-    task ? taskToDraft(task) : { ...EMPTY_DRAFT, projectId: projects[0]?.id ?? "" },
+    task
+      ? taskToDraft(task)
+      : {
+          ...EMPTY_DRAFT,
+          projectId: projects[0]?.id ?? "",
+          workspaceMode: usesSharedCheckouts(projects[0]) ? "root" : EMPTY_DRAFT.workspaceMode,
+        },
   );
   const [saving, setSaving] = useState(false);
   const submissionPending = useRef(false);
@@ -820,6 +830,7 @@ function ScheduledTaskEditorDialog({
     : task;
   const selectedProjectId = draft.projectId || projects[0]?.id || "";
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
+  const multiRepository = usesSharedCheckouts(selectedProject);
   // The task runs in selectedProject, so its model picker should reflect that
   // project's effective enablement, not just the machine's.
   const instanceEntries = useMemo(
@@ -871,6 +882,10 @@ function ScheduledTaskEditorDialog({
       tasksQuery.data === null
     )
       return;
+    if (multiRepository && draft.workspaceMode !== "root") {
+      reportFailure("Workspace unavailable", MULTIREPO_CHECKOUT_NOTICE);
+      return;
+    }
     const selection = activeSelection;
     if (
       !draft.title.trim() ||
@@ -1047,7 +1062,14 @@ function ScheduledTaskEditorDialog({
                 <Select
                   value={selectedProjectId}
                   onValueChange={(projectId) =>
-                    setDraft((current) => ({ ...current, projectId: projectId ?? "" }))
+                    setDraft((current) => ({
+                      ...current,
+                      projectId: projectId ?? "",
+                      ...(!current.editingId &&
+                      usesSharedCheckouts(projects.find((project) => project.id === projectId))
+                        ? { workspaceMode: "root" }
+                        : {}),
+                    }))
                   }
                 >
                   <SelectTrigger size="sm" id="scheduled-task-project">
@@ -1076,15 +1098,22 @@ function ScheduledTaskEditorDialog({
                     <SelectValue>{WORKSPACE_MODE_LABELS[draft.workspaceMode]}</SelectValue>
                   </SelectTrigger>
                   <SelectPopup>
-                    <SelectItem value="worktree">Create a new worktree</SelectItem>
+                    <SelectItem value="worktree" disabled={multiRepository}>
+                      Create a new worktree
+                    </SelectItem>
                     <SelectItem value="root">Use the project checkout</SelectItem>
-                    <SelectItem value="existing_worktree">Use a specific checkout</SelectItem>
+                    <SelectItem value="existing_worktree" disabled={multiRepository}>
+                      Use a specific checkout
+                    </SelectItem>
                   </SelectPopup>
                 </Select>
               </Field>
             </div>
 
-            {draft.workspaceMode === "worktree" ? (
+            {multiRepository ? (
+              <p className="text-xs text-muted-foreground">{MULTIREPO_CHECKOUT_NOTICE}</p>
+            ) : null}
+            {draft.workspaceMode === "worktree" && !multiRepository ? (
               <Field label="Base branch" htmlFor="scheduled-task-base-ref">
                 <WorktreeBaseBranchPicker
                   key={`${environmentId}:${selectedProjectId}`}

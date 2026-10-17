@@ -45,6 +45,7 @@ vi.mock("../../../state/use-thread-selection", () => ({
 vi.mock("../../../state/use-selected-thread-worktree", () => ({
   useSelectedThreadWorktree: () => ({
     selectedThreadCwd: "/repo",
+    repositoryWorkspace: { isMultiRepository: false, selected: null },
     selectedThreadWorktreePath: null,
   }),
 }));

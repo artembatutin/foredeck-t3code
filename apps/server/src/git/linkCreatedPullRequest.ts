@@ -39,6 +39,8 @@ export function createdPullRequestKey(
   }
   const parsed = parseChangeRequestUrl(url);
   if (parsed !== null) return { ...parsed, url };
+  // An unrecognizable URL cannot be attributed to the primary of several repositories.
+  if ((project?.repositories?.length ?? 0) > 1) return null;
   const identity = project?.repositoryIdentity;
   const kind = identity?.provider as SourceControlProviderKind | undefined;
   const repository = sourceControlRepositorySelector(identity);
@@ -70,7 +72,13 @@ export const linkCreatedPullRequest = <E>(input: {
       .pipe(Effect.map(Option.fromNullishOr));
     if (Option.isNone(thread)) return;
     const project = Option.getOrUndefined(yield* projects.getShell(thread.value.projectId));
-    const key = createdPullRequestKey(input.result, project);
+    const key = createdPullRequestKey(
+      input.result,
+      project && {
+        ...project,
+        repositories: thread.value.workspaceBinding?.repositories ?? [],
+      },
+    );
     if (key === null) return;
     const commandId = yield* input.commandId;
     yield* engine

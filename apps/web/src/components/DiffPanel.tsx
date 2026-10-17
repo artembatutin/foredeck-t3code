@@ -1,3 +1,10 @@
+import { repositoryHistoryGroups } from "@t3tools/client-runtime/fd/multirepo";
+import {
+  RepositoryHistory,
+  RepositoryStatus,
+  RepositorySelector,
+  useRepositoryWorkspace,
+} from "../fd/multirepo";
 import { RefreshIcon } from "~/components/ui/refresh-icon";
 import { useAtomValue } from "@effect/atom-react";
 import type { FileDiffContentsLoader, FileDiffMetadata } from "@pierre/diffs";
@@ -235,10 +242,15 @@ export default function DiffPanel({
         }
       : null,
   );
-  const activeCwd = activeThread?.worktreePath ?? activeProject?.workspaceRoot;
-  const activeRepositoryRoot = activeThread?.worktreePath
-    ? undefined
-    : activeProject?.repositoryIdentity?.rootPath;
+  const repositoryWorkspace = useRepositoryWorkspace(activeProject, activeThread);
+  const repositoryTarget = repositoryWorkspace.repositoryTarget;
+  const repositoryId = repositoryWorkspace.isMultiRepository
+    ? repositoryWorkspace.selected?.id
+    : undefined;
+  const activeCwd = repositoryWorkspace.cwd;
+  const activeRepositoryRoot =
+    repositoryWorkspace.selected?.rootPath ??
+    (activeThread?.worktreePath ? undefined : activeProject?.repositoryIdentity?.rootPath);
   const serverConfig = useAtomValue(
     serverEnvironment.configValueAtom(activeThread?.environmentId ?? null),
   );
@@ -252,16 +264,18 @@ export default function DiffPanel({
     activeThread !== null && activeThread !== undefined && activeCwd != null
       ? vcsEnvironment.status({
           environmentId: activeThread.environmentId,
-          input: { cwd: activeCwd },
+          input: { cwd: activeCwd, repositoryTarget },
         })
       : null,
   );
   const diffSelection = useDiffPanelStore((state) =>
-    selectThreadDiffPanelSelection(state.byThreadKey, routeThreadRef),
+    selectThreadDiffPanelSelection(state.byThreadKey, routeThreadRef, repositoryId),
   );
   const isGitRepo = gitStatusQuery.data?.isRepo ?? true;
-  const { turnDiffSummaries, inferredCheckpointTurnCountByRunId } =
-    useTurnDiffSummaries(activeThreadProjection);
+  const { turnDiffSummaries, inferredCheckpointTurnCountByRunId } = useTurnDiffSummaries(
+    activeThreadProjection,
+    repositoryId,
+  );
   const orderedTurnDiffSummaries = useMemo(
     () =>
       [...turnDiffSummaries].toSorted((left, right) => {
@@ -278,14 +292,27 @@ export default function DiffPanel({
   );
 
   useEffect(() => {
-    if (!routeThreadRef || diffSelection.kind !== "turn") return;
+    if (!routeThreadRef || diffSelection.kind !== "turn" || repositoryWorkspace.isMultiRepository)
+      return;
     useDiffPanelStore.getState().reconcileTurnSelection(
       routeThreadRef,
       orderedTurnDiffSummaries.map((summary) => summary.runId),
+      repositoryId,
     );
-  }, [diffSelection, orderedTurnDiffSummaries, routeThreadRef]);
+  }, [
+    diffSelection,
+    orderedTurnDiffSummaries,
+    routeThreadRef,
+    repositoryId,
+    repositoryWorkspace.isMultiRepository,
+  ]);
 
   const selectedRunId = diffSelection.kind === "turn" ? diffSelection.turnId : null;
+  const isFullThread = diffSelection.kind === "thread";
+  const isCheckpointSelection = isFullThread || selectedRunId !== null;
+  const historyGroups = activeThreadProjection
+    ? repositoryHistoryGroups(activeThreadProjection, selectedRunId)
+    : null;
   const selectedGitScope = diffSelection.kind === "unstaged" ? "unstaged" : "branch";
   const selectedBaseRef = diffSelection.kind === "branch" ? diffSelection.baseRef : null;
   const selectedFilePath = diffSelection.kind === "turn" ? diffSelection.filePath : null;
@@ -295,56 +322,68 @@ export default function DiffPanel({
     selectedRunId === null
       ? undefined
       : (orderedTurnDiffSummaries.find((summary) => summary.runId === selectedRunId) ??
-        orderedTurnDiffSummaries[0]);
+        (repositoryWorkspace.isMultiRepository ? undefined : orderedTurnDiffSummaries[0]));
   const selectedCheckpointTurnCount =
-    selectedTurn &&
-    (selectedTurn.checkpointTurnCount ?? inferredCheckpointTurnCountByRunId[selectedTurn.runId]);
+    isFullThread || (repositoryWorkspace.isMultiRepository && selectedRunId !== null)
+      ? historyGroups?.toTurnCount
+      : selectedTurn &&
+        (selectedTurn.checkpointTurnCount ??
+          inferredCheckpointTurnCountByRunId[selectedTurn.runId]);
   const latestTurn = orderedTurnDiffSummaries[0];
-  const selectedScopeLabel =
-    selectedRunId === null
+  const selectedScopeLabel = isFullThread
+    ? "Conversation"
+    : selectedRunId === null
       ? selectedGitScope === "unstaged"
         ? "Uncommitted"
         : "Changes"
-      : selectedTurn?.runId === latestTurn?.runId
+      : selectedTurn !== undefined && selectedTurn.runId === latestTurn?.runId
         ? "Latest turn"
         : `Turn ${selectedCheckpointTurnCount ?? "?"}`;
-  const reviewSectionId = selectedTurn ? `turn:${selectedTurn.runId}` : selectedGitScope;
+  const reviewSectionId = isFullThread
+    ? "thread"
+    : selectedRunId
+      ? `turn:${selectedRunId}`
+      : selectedGitScope;
   const collapseScopeKey = routeThreadRef
-    ? `${routeThreadRef.environmentId}:${routeThreadRef.threadId}:${reviewSectionId}`
+    ? `${routeThreadRef.environmentId}:${routeThreadRef.threadId}:${repositoryId ?? ""}:${reviewSectionId}`
     : null;
   const codeViewMountKey = `${collapseScopeKey ?? reviewSectionId}:${codeViewRevision}`;
-  const reviewSectionTitle = selectedTurn
-    ? `Turn ${selectedCheckpointTurnCount ?? "?"}`
-    : selectedGitScope === "unstaged"
-      ? "Uncommitted"
-      : "Changes";
+  const reviewSectionTitle = isFullThread
+    ? "Conversation"
+    : isCheckpointSelection
+      ? `Turn ${selectedCheckpointTurnCount ?? "?"}`
+      : selectedGitScope === "unstaged"
+        ? "Uncommitted"
+        : "Changes";
   const selectedCheckpointRange = useMemo(
     () =>
       typeof selectedCheckpointTurnCount === "number"
         ? {
-            fromTurnCount: Math.max(0, selectedCheckpointTurnCount - 1),
+            fromTurnCount: isFullThread ? 0 : Math.max(0, selectedCheckpointTurnCount - 1),
             toTurnCount: selectedCheckpointTurnCount,
           }
         : null,
-    [selectedCheckpointTurnCount],
+    [selectedCheckpointTurnCount, isFullThread],
   );
   const activeCheckpointDiff = useCheckpointDiff(
     {
       environmentId: activeThread?.environmentId ?? null,
       threadId: activeThreadId,
+      repositoryId,
       fromTurnCount: selectedCheckpointRange?.fromTurnCount ?? null,
       toTurnCount: selectedCheckpointRange?.toTurnCount ?? null,
       ignoreWhitespace: diffIgnoreWhitespace,
-      cacheScope: selectedTurn ? `turn:${selectedTurn.runId}` : null,
+      cacheScope: isFullThread ? "thread" : selectedTurn ? `turn:${selectedTurn.runId}` : null,
     },
-    { enabled: isGitRepo && selectedTurn !== undefined },
+    { enabled: isCheckpointSelection && (selectedCheckpointTurnCount ?? 0) > 0 },
   );
   const branchDiffPreview = useEnvironmentQuery(
-    canReadFiles && selectedRunId === null && activeThread && activeCwd
+    canReadFiles && !isCheckpointSelection && activeThread && activeCwd
       ? reviewEnvironment.diffPreview({
           environmentId: activeThread.environmentId,
           input: {
             cwd: activeCwd,
+            repositoryTarget,
             ...(selectedBaseRef ? { baseRef: selectedBaseRef } : {}),
             ignoreWhitespace: diffIgnoreWhitespace,
           },
@@ -352,7 +391,7 @@ export default function DiffPanel({
       : null,
   );
   const canRefreshGitDiff =
-    isGitRepo && selectedRunId === null && activeThread != null && activeCwd != null;
+    isGitRepo && !isCheckpointSelection && activeThread != null && activeCwd != null;
   const activeThreadRefreshKey = routeThreadRef
     ? `${routeThreadRef.environmentId}:${routeThreadRef.threadId}`
     : null;
@@ -361,11 +400,13 @@ export default function DiffPanel({
     (source) => source.kind === (selectedGitScope === "unstaged" ? "working-tree" : "branch-range"),
   );
   const refreshPreviewQuery = branchDiffPreview.refresh;
-  const refreshDiffFromUserAction = refreshPreviewQuery;
+  const refreshDiffFromUserAction = isCheckpointSelection
+    ? activeCheckpointDiff.refresh
+    : refreshPreviewQuery;
 
   const currentLoadDiffFiles = useMemo<FileDiffContentsLoader | undefined>(() => {
     const preview = branchDiffPreview.data;
-    if (selectedRunId !== null || !activeThread || !preview || !selectedGitSource) {
+    if (isCheckpointSelection || !activeThread || !preview || !selectedGitSource) {
       return undefined;
     }
 
@@ -373,18 +414,21 @@ export default function DiffPanel({
     return createGitDiffFileContentsLoader(getDiffFileContents, {
       environmentId: activeThread.environmentId,
       cwd: preview.cwd,
+      repositoryTarget,
       sourceKind: selectedGitSource.kind,
       baseRef: selectedGitSource.baseRef,
       headRef: selectedGitSource.headRef,
-      cacheKey: selectedGitSource.diffHash,
+      cacheKey: `${repositoryId ?? ""}:${selectedGitSource.diffHash}`,
     });
   }, [
     activeThread,
     branchDiffPreview.data,
     getDiffFileContents,
+    repositoryTarget,
+    repositoryId,
     canReadFiles,
     selectedGitSource,
-    selectedRunId,
+    isCheckpointSelection,
   ]);
   const loadDiffFilesRef = useRef(currentLoadDiffFiles);
   loadDiffFilesRef.current = currentLoadDiffFiles;
@@ -394,7 +438,7 @@ export default function DiffPanel({
     return loader(fileDiff);
   }, []);
   const localBranchRefs = useEnvironmentQuery(
-    selectedRunId === null &&
+    !isCheckpointSelection &&
       selectedGitScope === "branch" &&
       activeThread &&
       branchDiffPreview.data?.cwd
@@ -402,6 +446,7 @@ export default function DiffPanel({
           environmentId: activeThread.environmentId,
           input: {
             cwd: branchDiffPreview.data.cwd,
+            repositoryTarget,
             includeMatchingRemoteRefs: true,
             refKind: "local",
             ...(baseRefQuery.trim().length > 0 ? { query: baseRefQuery.trim() } : {}),
@@ -411,7 +456,7 @@ export default function DiffPanel({
       : null,
   );
   const remoteBranchRefs = useEnvironmentQuery(
-    selectedRunId === null &&
+    !isCheckpointSelection &&
       selectedGitScope === "branch" &&
       activeThread &&
       branchDiffPreview.data?.cwd
@@ -419,6 +464,7 @@ export default function DiffPanel({
           environmentId: activeThread.environmentId,
           input: {
             cwd: branchDiffPreview.data.cwd,
+            repositoryTarget,
             includeMatchingRemoteRefs: true,
             refKind: "remote",
             ...(baseRefQuery.trim().length > 0 ? { query: baseRefQuery.trim() } : {}),
@@ -443,26 +489,28 @@ export default function DiffPanel({
   ];
   const gitDiff = selectedGitSource?.diff;
 
-  const selectedPatch = selectedTurn ? activeCheckpointDiff.data?.diff : gitDiff;
-  const isSelectedPatchTruncated = !selectedTurn && selectedGitSource?.truncated === true;
-  const isLoadingSelectedPatch = selectedTurn
+  const selectedPatch = isCheckpointSelection ? activeCheckpointDiff.data?.diff : gitDiff;
+  const isSelectedPatchTruncated = !isCheckpointSelection && selectedGitSource?.truncated === true;
+  const isLoadingSelectedPatch = isCheckpointSelection
     ? activeCheckpointDiff.isPending
     : branchDiffPreview.isPending;
-  const selectedPatchError = selectedTurn ? activeCheckpointDiff.error : branchDiffPreview.error;
+  const selectedPatchError = isCheckpointSelection
+    ? activeCheckpointDiff.error
+    : branchDiffPreview.error;
   const hasResolvedPatch = typeof selectedPatch === "string";
   const hasNoNetChanges = hasResolvedPatch && selectedPatch.trim().length === 0;
   const lazySource =
-    !selectedTurn && selectedGitSource?.truncated && selectedGitSource.files
+    !isCheckpointSelection && selectedGitSource?.truncated && selectedGitSource.files
       ? selectedGitSource
       : null;
   const renderablePatch = useMemo(
     () =>
       lazySource
         ? null
-        : getRenderablePatch(selectedPatch, `diff-panel:${resolvedTheme}`, {
-            compactPartialHunkOffsets: selectedRunId === null,
+        : getRenderablePatch(selectedPatch, `diff-panel:${repositoryId ?? ""}:${resolvedTheme}`, {
+            compactPartialHunkOffsets: !isCheckpointSelection,
           }),
-    [lazySource, resolvedTheme, selectedPatch, selectedRunId],
+    [lazySource, resolvedTheme, selectedPatch, isCheckpointSelection, repositoryId],
   );
   const fileStats = useMemo(
     () => new Map(lazySource?.files?.map((file) => [file.path, file])),
@@ -481,6 +529,7 @@ export default function DiffPanel({
   } = useReviewFilePatches({
     environmentId: activeThread?.environmentId,
     cwd: branchDiffPreview.data?.cwd,
+    repositoryTarget,
     source: lazySource,
     baseRef: lazySource?.baseRef ?? selectedBaseRef,
     ignoreWhitespace: diffIgnoreWhitespace,
@@ -556,7 +605,7 @@ export default function DiffPanel({
   );
   const allDiffFilesCollapsed = areAllDiffFilesCollapsed(diffFileKeys, collapsedDiffFileKeys);
   const diffLineStat = useMemo(() => {
-    if (!selectedTurn && selectedGitSource?.files) {
+    if (!isCheckpointSelection && selectedGitSource?.files) {
       return selectedGitSource.files.reduce(
         (total, file) => ({
           additions: total.additions + file.additions,
@@ -566,7 +615,7 @@ export default function DiffPanel({
       );
     }
     return getDiffLineStat(renderableFiles);
-  }, [renderableFiles, selectedGitSource, selectedTurn]);
+  }, [renderableFiles, selectedGitSource, isCheckpointSelection]);
   const fileTreeEntries = useMemo(() => diffFileTreeEntries(renderableFiles), [renderableFiles]);
   const selectedDiffFileKey = selectedFilePath
     ? (codeViewFiles.find((candidate) => candidate.filePath === selectedFilePath)?.fileKey ?? null)
@@ -634,8 +683,12 @@ export default function DiffPanel({
       openDiffFilePrimaryAction({
         threadRef: routeThreadRef,
         filePath,
-        activeCwd,
+        activeCwd: activeCwd ?? undefined,
         repositoryRoot: activeRepositoryRoot,
+        repositoryScope:
+          repositoryWorkspace.selected && repositoryTarget
+            ? { repository: repositoryWorkspace.selected, target: repositoryTarget }
+            : undefined,
         openInEditor: (targetPath) => {
           void (async () => {
             const result = await openInPreferredEditor(targetPath);
@@ -655,7 +708,14 @@ export default function DiffPanel({
         },
       });
     },
-    [activeCwd, activeRepositoryRoot, openInPreferredEditor, routeThreadRef],
+    [
+      activeCwd,
+      activeRepositoryRoot,
+      openInPreferredEditor,
+      routeThreadRef,
+      repositoryWorkspace.selected,
+      repositoryTarget,
+    ],
   );
   const collapseDefaultsRef = useRef({ collapseScopeKey, defaultCollapsedDiffFileKeys });
   useLayoutEffect(() => {
@@ -703,28 +763,32 @@ export default function DiffPanel({
 
   const selectTurn = (runId: RunId) => {
     if (!routeThreadRef) return;
-    useDiffPanelStore.getState().selectTurn(routeThreadRef, runId);
+    useDiffPanelStore.getState().selectTurn(routeThreadRef, runId, undefined, repositoryId);
   };
   const selectGitScope = (scope: "branch" | "unstaged") => {
     if (!routeThreadRef) return;
-    useDiffPanelStore.getState().selectGitScope(routeThreadRef, scope);
+    useDiffPanelStore.getState().selectGitScope(routeThreadRef, scope, repositoryId);
   };
   const selectBranchBaseRef = (baseRef: string | null) => {
     if (!routeThreadRef) return;
-    useDiffPanelStore.getState().selectBranchBaseRef(routeThreadRef, baseRef);
+    useDiffPanelStore.getState().selectBranchBaseRef(routeThreadRef, baseRef, repositoryId);
   };
   // The scope menu has two radio groups: the top-level one treats the latest
   // turn as "latest", while the turn sub-menu keys every turn by id so the
   // latest turn is also marked there.
   const selectedTurnValue = selectedTurn ? `turn:${selectedTurn.runId}` : "";
-  const selectedScopeValue =
-    selectedRunId === null
+  const selectedScopeValue = isFullThread
+    ? "thread"
+    : !isCheckpointSelection
       ? selectedGitScope
-      : selectedTurn?.runId === latestTurn?.runId
+      : selectedTurn !== undefined && selectedTurn.runId === latestTurn?.runId
         ? "latest"
         : selectedTurnValue;
   const selectScopeValue = (value: string) => {
-    if (value === "unstaged" || value === "branch") {
+    if (value === "thread") {
+      if (routeThreadRef)
+        useDiffPanelStore.getState().selectThreadHistory(routeThreadRef, repositoryId);
+    } else if (value === "unstaged" || value === "branch") {
       selectGitScope(value);
     } else if (value === "latest") {
       if (latestTurn) selectTurn(latestTurn.runId);
@@ -737,6 +801,12 @@ export default function DiffPanel({
   const headerRow = (
     <>
       <div className="flex min-w-0 flex-1 items-center gap-3 [-webkit-app-region:no-drag]">
+        <RepositorySelector workspace={repositoryWorkspace} />
+        <RepositoryStatus
+          environmentId={activeThread?.environmentId ?? null}
+          workspace={repositoryWorkspace}
+          enabled={canReadFiles}
+        />
         <DropdownMenu>
           <DropdownMenuTrigger
             render={<Button size="xs" variant="secondary" />}
@@ -754,6 +824,11 @@ export default function DiffPanel({
               <DropdownMenuRadioItem value="unstaged" closeOnClick>
                 <span>Uncommitted</span>
               </DropdownMenuRadioItem>
+              {repositoryWorkspace.isMultiRepository && (
+                <DropdownMenuRadioItem value="thread" closeOnClick>
+                  <span>Conversation</span>
+                </DropdownMenuRadioItem>
+              )}
               <DropdownMenuRadioItem value="latest" closeOnClick>
                 <span>Latest turn</span>
               </DropdownMenuRadioItem>
@@ -787,7 +862,7 @@ export default function DiffPanel({
             </DropdownMenuSub>
           </DropdownMenuContent>
         </DropdownMenu>
-        {selectedRunId === null && selectedGitScope === "branch" && selectedGitSource?.baseRef && (
+        {!isCheckpointSelection && selectedGitScope === "branch" && selectedGitSource?.baseRef && (
           <div
             className="flex min-w-0 max-w-full items-center gap-2 overflow-hidden text-xs text-muted-foreground"
             aria-label={`Comparing ${selectedGitSource.headRef ?? "HEAD"} against ${selectedGitSource.baseRef}`}
@@ -904,7 +979,8 @@ export default function DiffPanel({
         )}
       </div>
       <div className="flex shrink-0 items-center gap-1 [-webkit-app-region:no-drag]">
-        {codeViewFiles.length > 0 || (!selectedTurn && selectedGitSource?.files?.length) ? (
+        {codeViewFiles.length > 0 ||
+        (!isCheckpointSelection && selectedGitSource?.files?.length) ? (
           <DiffStatLabel
             additions={diffLineStat.additions}
             deletions={diffLineStat.deletions}
@@ -1042,19 +1118,33 @@ export default function DiffPanel({
 
   return (
     <DiffPanelShell mode={mode} header={headerRow}>
+      {isCheckpointSelection && activeThreadProjection ? (
+        <RepositoryHistory
+          projection={activeThreadProjection}
+          runId={selectedRunId}
+          selectedId={repositoryId}
+          onSelect={(id) => {
+            if (!routeThreadRef) return;
+            repositoryWorkspace.selectRepository(id);
+            if (isFullThread) useDiffPanelStore.getState().selectThreadHistory(routeThreadRef, id);
+            else if (selectedRunId)
+              useDiffPanelStore.getState().selectTurn(routeThreadRef, selectedRunId, undefined, id);
+          }}
+        />
+      ) : null}
       {!activeThread ? (
         <div className="flex flex-1 items-center justify-center px-5 text-center text-xs text-muted-foreground/70">
           Select a thread to inspect turn diffs.
         </div>
-      ) : !isGitRepo ? (
+      ) : !isGitRepo && !isCheckpointSelection ? (
         <div className="flex flex-1 items-center justify-center px-5 text-center text-xs text-muted-foreground/70">
           Turn diffs are unavailable because this project is not a git repository.
         </div>
-      ) : selectedRunId !== null && orderedTurnDiffSummaries.length === 0 ? (
+      ) : isCheckpointSelection && (selectedCheckpointTurnCount ?? 0) === 0 ? (
         <div className="flex flex-1 items-center justify-center px-5 text-center text-xs text-muted-foreground/70">
-          No completed turns yet.
+          No recorded turn snapshots yet.
         </div>
-      ) : selectedRunId === null && !canReadFiles ? (
+      ) : !isCheckpointSelection && !canReadFiles ? (
         fileAccess.isPending ? (
           <DiffPanelLoadingState label="Checking file access..." />
         ) : (
@@ -1080,7 +1170,7 @@ export default function DiffPanel({
               isLoadingSelectedPatch ? (
                 <DiffPanelLoadingState
                   label={
-                    selectedTurn
+                    isCheckpointSelection
                       ? "Loading checkpoint diff..."
                       : selectedGitScope === "unstaged"
                         ? "Loading uncommitted changes..."
@@ -1144,7 +1234,7 @@ export default function DiffPanel({
                       {
                         environmentId: activeThread?.environmentId ?? null,
                         filePath,
-                        workspaceRoot: activeCwd,
+                        workspaceRoot: activeCwd ?? undefined,
                         repositoryRoot: activeRepositoryRoot,
                       },
                       event,

@@ -1,3 +1,4 @@
+import { CheckoutCoordination, CheckoutPolicy } from "../fd/multirepo/index.ts";
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import * as Arr from "effect/Array";
 import * as Cache from "effect/Cache";
@@ -118,6 +119,7 @@ interface SourceControlTextGenerationSettings {
 export class GitManager extends Context.Service<
   GitManager,
   {
+    readonly withCheckoutMutation: CheckoutCoordination.Coordination["withMutation"];
     readonly createWorktree: (
       input: VcsCreateWorktreeInput,
       options?: GitVcsDriver.CreateWorktreeOptions,
@@ -721,6 +723,8 @@ function toPullRequestHeadRemoteInfo(pr: {
 }
 
 export const make = Effect.gen(function* () {
+  const checkoutPolicy = yield* CheckoutPolicy.make;
+  const checkoutCoordination = yield* CheckoutCoordination.make;
   const gitCore = yield* GitVcsDriver.GitVcsDriver;
   const sourceControlProviders = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
   const textGeneration = yield* TextGeneration.TextGeneration;
@@ -761,6 +765,18 @@ export const make = Effect.gen(function* () {
   const createWorktree: GitManager["Service"]["createWorktree"] = Effect.fn(
     "GitManager.createWorktree",
   )(function* (input, options) {
+    yield* checkoutPolicy.assertWorktree(input.cwd, input.repositoryTarget).pipe(
+      Effect.mapError(
+        (cause) =>
+          new GitCommandError({
+            operation: "createWorktree",
+            command: "git",
+            cwd: input.cwd,
+            detail: cause.message,
+            cause,
+          }),
+      ),
+    );
     const submodules =
       options?.submodules !== undefined
         ? options.submodules
@@ -2676,6 +2692,18 @@ export const make = Effect.gen(function* () {
   const preparePullRequestThread: GitManager["Service"]["preparePullRequestThread"] = Effect.fn(
     "preparePullRequestThread",
   )(function* (input) {
+    if (input.mode !== "local")
+      yield* checkoutPolicy.assertWorktree(input.cwd, input.repositoryTarget, input.threadId).pipe(
+        Effect.mapError(
+          (cause) =>
+            new GitManagerError({
+              operation: "preparePullRequestThread",
+              cwd: input.cwd,
+              detail: cause.message,
+              cause,
+            }),
+        ),
+      );
     const maybeRunSetupScript = (worktreePath: string) => {
       if (!input.threadId) {
         return Effect.void;
@@ -3188,7 +3216,12 @@ export const make = Effect.gen(function* () {
   );
 
   return GitManager.of({
-    createWorktree,
+    withCheckoutMutation: checkoutCoordination.withMutation,
+    createWorktree: (input, options) =>
+      checkoutCoordination.withMutation(
+        { cwd: input.cwd, operation: "createWorktree" },
+        createWorktree(input, options),
+      ),
     localStatus,
     remoteStatus,
     status,
@@ -3197,8 +3230,24 @@ export const make = Effect.gen(function* () {
     invalidateRemoteStatus,
     invalidateStatus,
     resolvePullRequest,
-    preparePullRequestThread,
-    runStackedAction,
+    preparePullRequestThread: (input) =>
+      checkoutCoordination.withMutation(
+        {
+          cwd: input.cwd,
+          operation: "preparePullRequestThread",
+          changesBranch: input.mode === "local",
+        },
+        preparePullRequestThread(input),
+      ),
+    runStackedAction: (input, options) =>
+      checkoutCoordination.withMutation(
+        {
+          cwd: input.cwd,
+          operation: "runStackedAction",
+          changesBranch: true,
+        },
+        runStackedAction(input, options),
+      ),
     subscribePullRequestStateChanges: PubSub.subscribe(pullRequestStateChanges).pipe(
       Effect.map((subscription) => Stream.fromSubscription(subscription)),
     ),

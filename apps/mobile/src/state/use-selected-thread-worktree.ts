@@ -1,3 +1,4 @@
+import { useRepositoryWorkspace } from "../fd/multirepo";
 import { useMemo } from "react";
 
 import { useSelectedThreadWorktreePath } from "./use-thread-detail";
@@ -17,8 +18,11 @@ export function useSelectedThreadWorktree() {
     [detailWorktreePath, selectedThread?.worktreePath],
   );
 
+  const repositoryWorkspace = useRepositoryWorkspace(selectedThreadProject, selectedThread);
   return {
+    repositoryWorkspace,
+    repositoryTarget: repositoryWorkspace.repositoryTarget,
     selectedThreadWorktreePath,
-    selectedThreadCwd: selectedThreadWorktreePath ?? selectedThreadProject?.workspaceRoot ?? null,
+    selectedThreadCwd: selectedThreadWorktreePath ?? repositoryWorkspace.cwd,
   };
 }

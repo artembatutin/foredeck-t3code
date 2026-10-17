@@ -6,7 +6,7 @@ import * as Arr from "effect/Array";
 import { pipe } from "effect/Function";
 import * as Order from "effect/Order";
 
-export type ReviewSectionKind = "turn" | "working-tree" | "branch-range";
+export type ReviewSectionKind = "thread" | "turn" | "working-tree" | "branch-range";
 
 const CHANGES_SECTION_ID = "git:branch-range";
 const CHANGES_TITLE = "Changes";
@@ -405,7 +405,9 @@ export function getReadyReviewCheckpoints(
 ): ReadonlyArray<ThreadCheckpointSummary> {
   return pipe(
     checkpoints,
-    Arr.filter((checkpoint) => checkpoint.status === "ready"),
+    Arr.filter(
+      (checkpoint) => checkpoint.status === "ready" || checkpoint.repositoryId !== undefined,
+    ),
     Arr.sort(readyCheckpointOrder),
   );
 }

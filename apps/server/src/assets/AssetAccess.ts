@@ -442,7 +442,11 @@ const finalizeWorkspaceFileAsset = Effect.fn("AssetAccess.finalizeWorkspaceFileA
             }),
         ),
       );
-    if (!isWorkspacePreviewEntryPath(resolved.relativePath)) {
+    const repositoryMedia =
+      input.resource._tag === "repository-file" &&
+      !isWorkspacePreviewEntryPath(resolved.relativePath) &&
+      hostPreviewMimeTypeFromExtension(path.extname(resolved.relativePath)) !== null;
+    if (!isWorkspacePreviewEntryPath(resolved.relativePath) && !repositoryMedia) {
       return yield* new AssetPreviewTypeValidationError({
         resource: input.resource,
       });
@@ -464,6 +468,12 @@ const finalizeWorkspaceFileAsset = Effect.fn("AssetAccess.finalizeWorkspaceFileA
         resource: input.resource,
       });
     }
+    if (repositoryMedia)
+      return yield* finalizeAbsoluteMediaFileAsset({
+        requestedPath: canonicalFile,
+        resource: input.resource,
+        expiresAt: input.expiresAt,
+      });
     const canonicalWorkspaceRoot = yield* fileSystem.realPath(input.workspaceRoot).pipe(
       Effect.mapError(
         (cause) =>
@@ -543,6 +553,7 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
       imageDimensions = finalized.imageDimensions;
       break;
     }
+    case "repository-file":
     case "workspace-file": {
       if (!input.workspaceRoot) {
         return yield* new AssetWorkspaceContextNotFoundError({

@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 import { PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { RepositoryTarget } from "./project.ts";
 import { VcsDriverKind } from "./vcs.ts";
 
 /**
@@ -91,6 +92,7 @@ export const SourceControlCloneRepositoryResult = Schema.Struct({
 export type SourceControlCloneRepositoryResult = typeof SourceControlCloneRepositoryResult.Type;
 
 export const SourceControlPublishRepositoryInput = Schema.Struct({
+  repositoryTarget: Schema.optionalKey(RepositoryTarget),
   cwd: TrimmedNonEmptyString,
   provider: SourceControlProviderKind,
   repository: TrimmedNonEmptyString,

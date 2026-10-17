@@ -1,7 +1,7 @@
 import { AuthFilesystemReadScope } from "@t3tools/contracts";
 import { readEnvironmentScope } from "../../state/session";
 import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
-import type { EnvironmentId } from "@t3tools/contracts";
+import type { EnvironmentId, RepositoryTarget } from "@t3tools/contracts";
 import {
   isWorkspaceBrowserPreviewPath,
   isWorkspaceImagePreviewPath,
@@ -19,14 +19,21 @@ const MAX_HIGHLIGHT_PRELOAD_CHARACTERS = 256 * 1024;
 
 function preloadKey(input: {
   readonly cwd: string;
+  readonly repositoryTarget?: RepositoryTarget | undefined;
   readonly environmentId: EnvironmentId;
   readonly relativePath: string;
 }): string {
-  return JSON.stringify([input.environmentId, input.cwd, input.relativePath]);
+  return JSON.stringify([
+    input.environmentId,
+    input.cwd,
+    input.repositoryTarget,
+    input.relativePath,
+  ]);
 }
 
 export function preloadWorkspaceFileContents(input: {
   readonly cwd: string;
+  readonly repositoryTarget?: RepositoryTarget | undefined;
   readonly environmentId: EnvironmentId;
   readonly relativePath: string;
   readonly theme: ReviewDiffTheme;
@@ -49,7 +56,11 @@ export function preloadWorkspaceFileContents(input: {
     appAtomRegistry,
     projectEnvironment.readFile({
       environmentId: input.environmentId,
-      input: { cwd: input.cwd, relativePath: input.relativePath },
+      input: {
+        cwd: input.cwd,
+        repositoryTarget: input.repositoryTarget,
+        relativePath: input.relativePath,
+      },
     }),
     {
       label: "workspace file preload",

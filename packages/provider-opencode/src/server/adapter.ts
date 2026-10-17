@@ -1,3 +1,4 @@
+import { repositoryContext } from "@t3tools/provider-core/fd/multirepo";
 import type {
   Event as OpenCodeEvent,
   Message as OpenCodeMessage,
@@ -116,6 +117,9 @@ const makeOpenCodeMessageId = Effect.fnUntraced(function* (
  * authoritative terminal signal.
  */
 const OpenCodeProviderCapabilitiesV2 = {
+  multiRepository: {
+    runtimeModes: ["approval-required", "auto-accept-edits", "auto", "full-access"],
+  },
   sessions: {
     // The current adapter owns one directory-bound client/server per session.
     // Keep it isolated until its runtime is made safe for cross-thread pooling.
@@ -703,6 +707,13 @@ export function openCodePermissionRules(
     }
   }
 
+  for (const repository of runtimePolicy.repositories ?? []) {
+    // Native wildcard rules cannot quote literal * or ? in a directory name.
+    // Leave those directories under the existing approval rule, never widen a grant.
+    if (/[?*]/.test(repository.rootPath)) continue;
+    for (const pattern of [repository.rootPath, `${repository.rootPath.replace(/\/$/, "")}/*`])
+      rules.push({ permission: "external_directory", pattern, action: "allow" });
+  }
   return rules;
 }
 
@@ -948,7 +959,11 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: options.instanceId,
     driver: OPENCODE_PROVIDER,
-    getCapabilities: () => Effect.succeed(OpenCodeProviderCapabilitiesV2),
+    getCapabilities: () =>
+      Effect.succeed({
+        ...OpenCodeProviderCapabilitiesV2,
+        ...(options.settings.serverUrl ? { multiRepository: undefined } : {}),
+      }),
     planSelectionTransition: () => Effect.succeed(turnScopedSelectionTransition()),
     openSession: Effect.fn("OpenCodeAdapterV2.openSession")(
       function* (input: ProviderAdapter.ProviderAdapterV2OpenSessionInput) {
@@ -960,6 +975,13 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           serverUrl: options.settings.serverUrl,
           environment: options.environment,
         });
+        if (connection.external && (input.runtimePolicy.repositories?.length ?? 0) > 1)
+          return yield* new ProviderAdapter.ProviderAdapterOpenSessionError({
+            driver: OPENCODE_PROVIDER,
+            providerSessionId: input.providerSessionId,
+            cause:
+              "Multi-repository execution requires a local provider process on the owning environment.",
+          });
         const client = runtime.createOpenCodeSdkClient({
           baseUrl: connection.url,
           directory: cwd,
@@ -3255,6 +3277,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               }
               const systemPrompt = [
                 orchestrationSystemPrompt,
+                repositoryContext(turnInput.runtimePolicy.repositories),
                 buildRuntimeInstructions({
                   harness: "OpenCode",
                   model: turnInput.modelSelection.model,
