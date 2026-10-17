@@ -26,6 +26,9 @@ const THREAD = { kind: "thread", id: "thread-worker-1" } as const;
 const STATES: ReadonlyArray<AssignmentState> = [
   "draft",
   "queued",
+  "launching",
+  "launch-uncertain",
+  "awaiting-verification",
   "running",
   "needs-input",
   "stopping",
@@ -38,6 +41,9 @@ const STATES: ReadonlyArray<AssignmentState> = [
 // One valid event of each kind; payload rules are covered separately.
 const EVENTS: ReadonlyArray<AssignmentEvent> = [
   { type: "queue" },
+  { type: "claim" },
+  { type: "uncertain" },
+  { type: "finish" },
   { type: "start", workerRefs: [THREAD] },
   { type: "request-input", note: "Which database?" },
   { type: "provide-input" },
@@ -58,6 +64,18 @@ const EXPECTED_MOVES: ReadonlyArray<
   ["draft", "queue", "queued"],
   ["draft", "cancel", "cancelled"],
   ["queued", "start", "running"],
+  ["queued", "claim", "launching"],
+  ["launching", "uncertain", "launch-uncertain"],
+  ["launching", "start", "running"],
+  ["launching", "fail", "failed"],
+  ["launching", "record-progress", "launching"],
+  ["launch-uncertain", "start", "running"],
+  ["launch-uncertain", "record-progress", "launch-uncertain"],
+  ["running", "finish", "awaiting-verification"],
+  ["awaiting-verification", "complete", "completed"],
+  ["awaiting-verification", "cancel", "cancelled"],
+  ["awaiting-verification", "fail", "failed"],
+  ["awaiting-verification", "record-progress", "awaiting-verification"],
   ["queued", "fail", "failed"],
   ["queued", "cancel", "cancelled"],
   ["running", "request-input", "needs-input"],
@@ -229,9 +247,9 @@ describe("assignment lifecycle", () => {
     assert.isTrue(Result.isSuccess(resumed));
     if (Result.isSuccess(resumed)) {
       assert.strictEqual(resumed.success.state, "queued");
-      assert.strictEqual(resumed.success.attempt, 1);
-      // Resume continues the same run, so its exact reference stays.
-      assert.deepStrictEqual(resumed.success.workerRefs, [{ kind: "looper-run", id: "run-7" }]);
+      assert.strictEqual(resumed.success.attempt, 2);
+      // The service archives the previous attempt and waits for the new executor acknowledgment.
+      assert.deepStrictEqual(resumed.success.workerRefs, []);
     }
 
     const failed = assignmentIn("failed", { attempt: 2, workerRefs: [THREAD] });

@@ -19,21 +19,38 @@ across projects in the selected environment. Set up the Codex provider with your
 subscription in **Settings → Providers** first. The assistant uses that provider's
 configured default model and keeps a saved conversation you can return to.
 
-Ask it to clarify a project, then tell it to start the agreed work. It can launch
-separate project conversations while you discuss the next project, and keep project
-briefs, priorities and work references in its own workspace. Work uses the existing
-permission controls. You can inspect and stop each worker from its conversation.
-Foredeck is the default executor; choosing Looper requires a working local Looper
-installation and its configured author and reviewer providers.
+Ask it to clarify a project, then tell it to start the agreed work. Briefs, priorities,
+authorization and assignment history are saved in the environment's database. Two
+assignments can run at once; the rest wait in priority order. Changing the topic or a
+priority does not interrupt running work. Each worker gets only its project's agreed
+brief in a fresh conversation. Git work uses isolated worktrees; multi-repository
+projects currently need another isolation strategy and are refused before dispatch.
 
-**Enable local voice** downloads an English speech model once. Record up to one
-minute, finish recording, review or edit the transcript, then send. Audio is
-processed on your device; only the text is sent as a normal message. Web recording
-requires HTTPS or localhost and microphone permission. **Spoken replies** uses an
-installed local system voice; it never falls back to a paid speech service.
-Ending voice or leaving the conversation releases the microphone and stops speech,
-while already dispatched project work continues. Reopen the assistant to review
-progress; it does not run an always-on background monitor after its turn ends.
+Ask the assistant to inspect, stop, resume, retry or cancel an assignment. A stop is
+pending until the worker confirms it. Resuming uses a fresh conversation with the
+retained worktree and the project's brief. Worker questions come back to the assistant;
+permission approvals still need the worker's approval UI. A completed worker turn waits
+for verification of the acceptance criteria. The assistant reports implementation,
+tests, integration and deployment separately.
+
+Foredeck is the default executor. Looper needs its installed skill, a separate runtime
+and worktree, and authenticated author/repair and independent reviewer providers. Its
+configuration must match the agreed brief. Looper requires full-access execution; it
+cannot implement Foredeck's supervised approval mode. Missing prerequisites block that
+assignment without switching executors. Looper stops after its current step.
+
+**Enable local voice** downloads an English speech model once. Tap **Talk** and speak;
+by default a pause ends the recording and sends the transcript. Choose **Review before
+sending** to edit it first. Recordings are limited to one minute. Audio stays on your
+device; only text is sent as a normal message. Web recording requires HTTPS or localhost
+and microphone permission. Spoken replies use an installed local system voice. Tap
+**Talk** or **Stop speaking** to interrupt playback; the normal text composer is always
+available.
+
+Ending voice or leaving the conversation releases the microphone and stops speech.
+The server keeps coordinating dispatched work and recovering saved worker identities
+while it runs, even when the assistant conversation is idle. An uncertain launch stays
+visible and occupies a slot until reconciled; it is never automatically duplicated.
 
 ## Formatting
 

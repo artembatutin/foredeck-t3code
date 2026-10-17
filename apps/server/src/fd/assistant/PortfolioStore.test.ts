@@ -18,6 +18,7 @@ import portfolioMigration from "./migration.ts";
 const PORTFOLIO_TABLES = [
   "fd_assistant_assignments",
   "fd_assistant_brief_revisions",
+  "fd_assistant_dispatches",
   "fd_assistant_project_briefs",
 ];
 
@@ -81,8 +82,11 @@ describe("migration 064", () => {
       assert.isTrue(columns.some((c) => c.name === "repositories_json"));
       assert.deepStrictEqual(yield* runMigrations(), []);
     }).pipe(
-      Effect.provide(PortfolioStore.layer),
-      Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" })),
+      Effect.provide(
+        PortfolioStore.layer.pipe(
+          Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
+        ),
+      ),
     ),
   );
 
@@ -99,7 +103,10 @@ describe("migration 064", () => {
       const before = yield* schemaObjects;
       assert.isFalse(before.some((object) => isPortfolioObject(object.name)));
 
-      assert.deepStrictEqual(yield* runMigrations(), [[64, "AssistantPortfolio"]]);
+      assert.deepStrictEqual(yield* runMigrations(), [
+        [64, "AssistantPortfolio"],
+        [65, "AssistantDispatches"],
+      ]);
       const after = yield* schemaObjects;
       assert.deepStrictEqual(
         after.filter((object) => !isPortfolioObject(object.name)),

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 import {
   CommandId,
   type ProviderInteractionMode,
@@ -36,6 +36,8 @@ export function AssistantVoiceControls(props: {
   const [transcript, setTranscript] = useState("");
   const [speak, setSpeak] = useState(false);
   const [speaking, setSpeaking] = useState(false);
+  const [automatic, setAutomatic] = useState(true);
+  const autoSendReady = useRef(false);
   const worker = useRef<Worker | null>(null);
   const recording = useRef<Awaited<ReturnType<typeof startRecording>> | null>(null);
   const abort = useRef<AbortController | null>(null);
@@ -56,6 +58,7 @@ export function AssistantVoiceControls(props: {
   };
   const cancel = () => {
     generation.current++;
+    autoSendReady.current = false;
     clearTimer();
     abort.current?.abort();
     recording.current = null;
@@ -100,7 +103,11 @@ export function AssistantVoiceControls(props: {
     utterance.voice = voice;
     utterance.addEventListener("start", () => setSpeaking(true));
     utterance.addEventListener("end", () => setSpeaking(false));
-    utterance.addEventListener("error", () => setSpeaking(false));
+    utterance.addEventListener("error", (event) => {
+      setSpeaking(false);
+      if (event.error === "canceled" || event.error === "interrupted") return;
+      setMessage("Spoken reply stopped. Read the reply here or try speaking again.");
+    });
     speechSynthesis.speak(utterance);
   }, [props.messages, speak, phase]);
 
@@ -115,6 +122,11 @@ export function AssistantVoiceControls(props: {
     setMessage(null);
     setProgress(0);
     setPhase("loading");
+    if (
+      typeof speechSynthesis !== "undefined" &&
+      selectLocalVoice(speechSynthesis.getVoices(), navigator.language)
+    )
+      setSpeak(true);
     const current = new Worker(new URL("./voice.worker.ts", import.meta.url), { type: "module" });
     worker.current = current;
     current.addEventListener("error", () => {
@@ -130,6 +142,7 @@ export function AssistantVoiceControls(props: {
       if (reply.type === "ready") setPhase("ready");
       else if (reply.type === "progress") setProgress(Math.round(reply.progress));
       else if (reply.type === "transcript") {
+        autoSendReady.current = true;
         setTranscript(reply.text.trim());
         setPhase("ready");
         if (!reply.text.trim()) setMessage("No speech was detected. Try again.");
@@ -169,7 +182,10 @@ export function AssistantVoiceControls(props: {
     abort.current = new AbortController();
     setPhase("requesting");
     try {
-      const current = await startRecording(abort.current.signal);
+      const current = await startRecording(
+        abort.current.signal,
+        automatic ? () => void finish() : undefined,
+      );
       if (id !== generation.current) return;
       recording.current = current;
       setPhase("recording");
@@ -220,6 +236,20 @@ export function AssistantVoiceControls(props: {
       if (id === generation.current) setPhase("ready");
     }
   };
+
+  const sendAutomatically = useEffectEvent(send);
+  useEffect(() => {
+    if (
+      automatic &&
+      autoSendReady.current &&
+      phase === "ready" &&
+      transcript.trim() &&
+      !props.disabled
+    ) {
+      autoSendReady.current = false;
+      void sendAutomatically();
+    }
+  }, [automatic, phase, transcript, props.disabled]);
 
   return (
     <section aria-label="Assistant voice" className="space-y-2 border-b border-border px-3 py-2">
@@ -282,6 +312,25 @@ export function AssistantVoiceControls(props: {
           {speak ? <Volume2Icon /> : <VolumeXIcon />}
           {speak ? "Spoken replies on" : "Spoken replies off"}
         </Button>
+        {phase !== "off" ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-pressed={automatic}
+            disabled={phase !== "ready"}
+            onClick={() => {
+              autoSendReady.current = false;
+              setAutomatic(!automatic);
+            }}
+          >
+            {automatic ? "Send after a pause" : "Review before sending"}
+          </Button>
+        ) : null}
+        {speaking ? (
+          <span role="status" className="text-sm text-muted-foreground">
+            Speaking
+          </span>
+        ) : null}
         {speaking ? (
           <Button variant="ghost" size="sm" onClick={stopAudio}>
             Stop speaking
@@ -295,7 +344,9 @@ export function AssistantVoiceControls(props: {
       </div>
       {phase === "off" ? (
         <p className="text-xs text-muted-foreground">
-          English voice runs on this device after a one-time model download. No speech API charges.
+          English voice runs on this device after a one-time model download. Speech sends after a
+          pause; you can choose to review it first. Tap Talk or Stop speaking to interrupt a reply.
+          No speech API charges.
         </p>
       ) : null}
       {transcript ? (

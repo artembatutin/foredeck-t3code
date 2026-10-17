@@ -1,10 +1,20 @@
+import { silenceDetector } from "./silence";
 /** Recording owns the microphone until finish/cancel, including a late permission response. */
-export async function startRecording(signal: AbortSignal) {
+export async function startRecording(signal: AbortSignal, onSilence?: () => void) {
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
     video: false,
   });
-  const release = () => stream.getTracks().forEach((track) => track.stop());
+  let silenceTimer: ReturnType<typeof setInterval> | undefined;
+  let monitor: AudioContext | undefined;
+  const release = () => {
+    if (silenceTimer !== undefined) clearInterval(silenceTimer);
+    if (monitor) {
+      void monitor.close().catch(() => {});
+      monitor = undefined;
+    }
+    stream.getTracks().forEach((track) => track.stop());
+  };
   if (signal.aborted) {
     release();
     throw new DOMException("Recording cancelled", "AbortError");
@@ -50,9 +60,28 @@ export async function startRecording(signal: AbortSignal) {
   signal.addEventListener("abort", cancel, { once: true });
   try {
     recorder.start();
+    if (onSilence && typeof AudioContext !== "undefined") {
+      monitor = new AudioContext();
+      const source = monitor.createMediaStreamSource(stream);
+      const analyser = monitor.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+      const samples = new Float32Array(analyser.fftSize);
+      const ended = silenceDetector(performance.now());
+      silenceTimer = setInterval(() => {
+        analyser.getFloatTimeDomainData(samples);
+        const rms = Math.sqrt(
+          samples.reduce((sum, sample) => sum + sample * sample, 0) / samples.length,
+        );
+        if (ended(rms, performance.now())) {
+          clearInterval(silenceTimer);
+          onSilence();
+        }
+      }, 100);
+    }
   } catch (error) {
     signal.removeEventListener("abort", cancel);
-    release();
+    cancel();
     throw error;
   }
   return {

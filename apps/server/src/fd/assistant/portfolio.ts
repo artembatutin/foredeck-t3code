@@ -11,7 +11,7 @@ const Priority = Schema.Struct({
 export type Priority = typeof Priority.Type;
 
 /** The agreed, environment-local brief for one project. */
-const ProjectBrief = Schema.Struct({
+export const ProjectBrief = Schema.Struct({
   projectId: ProjectId,
   goal: Schema.String,
   acceptanceCriteria: Schema.Array(Schema.String),
@@ -25,7 +25,7 @@ const ProjectBrief = Schema.Struct({
 export type ProjectBrief = typeof ProjectBrief.Type;
 
 /** Fields to change. Absent keys keep their value; `priority: null` makes the project unranked. */
-const BriefPatch = Schema.Struct({
+export const BriefPatch = Schema.Struct({
   goal: Schema.optionalKey(Schema.String),
   acceptanceCriteria: Schema.optionalKey(Schema.Array(Schema.String)),
   constraints: Schema.optionalKey(Schema.Array(Schema.String)),
@@ -133,7 +133,10 @@ export function reviseBrief(
       changes.push({ field: "priority", previous: base.priority, next: priority });
     }
   }
-  const authorized = patch.executionAuthorized;
+  const scopeChanged = changes.some((change) =>
+    ["goal", "acceptanceCriteria", "constraints"].includes(change.field),
+  );
+  const authorized = patch.executionAuthorized ?? (scopeChanged ? false : undefined);
   if (authorized !== undefined && authorized !== base.executionAuthorized) {
     next.executionAuthorized = authorized;
     changes.push({
@@ -160,7 +163,10 @@ export function reviseBrief(
 export const AssignmentState = Schema.Literals([
   "draft",
   "queued",
+  "launching",
+  "launch-uncertain",
   "running",
+  "awaiting-verification",
   "needs-input",
   "stopping",
   "stopped",
@@ -170,12 +176,12 @@ export const AssignmentState = Schema.Literals([
 ]);
 export type AssignmentState = typeof AssignmentState.Type;
 
-const ExecutorKind = Schema.Literals(["foredeck", "looper"]);
+export const ExecutorKind = Schema.Literals(["foredeck", "looper"]);
 export type ExecutorKind = typeof ExecutorKind.Type;
 
 /** An exact identifier the executor returned for this attempt. */
 export const WorkerRef = Schema.Struct({
-  kind: Schema.Literals(["thread", "looper-run"]),
+  kind: Schema.Literals(["thread", "run", "looper-run"]),
   id: TrimmedNonEmptyString,
 });
 export type WorkerRef = typeof WorkerRef.Type;
@@ -223,10 +229,17 @@ export function newAssignment(input: {
 /** Every event may carry a progress note recorded with the move. */
 export type AssignmentEvent = { readonly note?: string } & (
   | { readonly type: "queue" }
+  | { readonly type: "claim" }
+  | { readonly type: "uncertain" }
+  | { readonly type: "finish" }
   | { readonly type: "start"; readonly workerRefs: ReadonlyArray<WorkerRef> }
   | { readonly type: "request-input" }
   | { readonly type: "provide-input" }
-  | { readonly type: "record-progress"; readonly evidence?: ReadonlyArray<string> }
+  | {
+      readonly type: "record-progress";
+      readonly workerRefs?: ReadonlyArray<WorkerRef>;
+      readonly evidence?: ReadonlyArray<string>;
+    }
   | { readonly type: "stop" }
   | { readonly type: "confirm-stopped" }
   | { readonly type: "resume" }
@@ -276,17 +289,39 @@ const MOVES: {
   };
 } = {
   queue: { from: ["draft"], to: "queued", requiresAuthorization: true },
-  start: { from: ["queued"], to: "running", requiresAuthorization: true },
+  claim: { from: ["queued"], to: "launching", requiresAuthorization: true },
+  uncertain: { from: ["launching"], to: "launch-uncertain" },
+  finish: { from: ["running"], to: "awaiting-verification" },
+  start: {
+    from: ["queued", "launching", "launch-uncertain"],
+    to: "running",
+    requiresAuthorization: true,
+  },
   "request-input": { from: ["running"], to: "needs-input" },
   "provide-input": { from: ["needs-input"], to: "running" },
-  "record-progress": { from: ["running", "needs-input", "stopping"] },
+  "record-progress": {
+    from: [
+      "running",
+      "needs-input",
+      "stopping",
+      "launching",
+      "launch-uncertain",
+      "awaiting-verification",
+    ],
+  },
   stop: { from: ["running", "needs-input"], to: "stopping" },
   "confirm-stopped": { from: ["stopping"], to: "stopped" },
   resume: { from: ["stopped"], to: "queued", requiresAuthorization: true },
-  fail: { from: ["queued", "running", "needs-input", "stopping"], to: "failed" },
+  fail: {
+    from: ["queued", "launching", "running", "needs-input", "stopping", "awaiting-verification"],
+    to: "failed",
+  },
   retry: { from: ["failed"], to: "queued", requiresAuthorization: true },
-  complete: { from: ["running", "stopping"], to: "completed" },
-  cancel: { from: ["draft", "queued", "stopped", "failed"], to: "cancelled" },
+  complete: { from: ["running", "stopping", "awaiting-verification"], to: "completed" },
+  cancel: {
+    from: ["draft", "queued", "stopped", "failed", "awaiting-verification"],
+    to: "cancelled",
+  },
 };
 
 function appendNote(progress: ReadonlyArray<ProgressNote>, note: string | undefined, at: string) {
@@ -327,7 +362,12 @@ export function transitionAssignment(
       }),
     );
   if (!move.from.includes(assignment.state)) return reject("invalid-transition");
-  if (move.requiresAuthorization && !context.executionAuthorized) return reject("not-authorized");
+  if (
+    move.requiresAuthorization &&
+    !context.executionAuthorized &&
+    !(event.type === "start" && ["launching", "launch-uncertain"].includes(assignment.state))
+  )
+    return reject("not-authorized");
 
   const next: Assignment = {
     ...assignment,
@@ -345,12 +385,14 @@ export function transitionAssignment(
       return Result.succeed({
         ...next,
         evidence: [...assignment.evidence, ...normalizeList(event.evidence ?? [])],
+        workerRefs: uniqueRefs([...assignment.workerRefs, ...(event.workerRefs ?? [])]),
       });
     case "complete": {
       const evidence = [...assignment.evidence, ...normalizeList(event.evidence)];
       if (evidence.length === 0) return reject("missing-evidence");
       return Result.succeed({ ...next, evidence });
     }
+    case "resume":
     case "retry":
       return Result.succeed({
         ...next,
