@@ -291,7 +291,8 @@ function ThreadRouteContent(
   );
   const selectedThreadDetailState = props.selectedThreadDetailState;
   const selectedThreadDetail = Option.getOrNull(selectedThreadDetailState.data);
-  const { selectedThreadCwd } = useSelectedThreadWorktree();
+  const { selectedThreadCwd, selectedThreadWorktreePath, repositoryTarget, repositoryWorkspace } =
+    useSelectedThreadWorktree();
   const composer = useThreadComposerState();
   const gitState = useSelectedThreadGitState();
   const gitActions = useSelectedThreadGitActions();
@@ -451,7 +452,7 @@ function ThreadRouteContent(
     selectedThread !== null && selectedThreadCwd !== null
       ? vcsEnvironment.status({
           environmentId: selectedThread.environmentId,
-          input: { cwd: selectedThreadCwd },
+          input: { cwd: selectedThreadCwd, repositoryTarget },
         })
       : null,
   );
@@ -550,7 +551,8 @@ function ThreadRouteContent(
       const params = {
         environmentId: String(selectedThread.environmentId),
         threadId: String(selectedThread.id),
-        path: path.split("/").filter((segment) => segment.length > 0),
+        path: [path],
+        ...(repositoryWorkspace.selected ? { repositoryId: repositoryWorkspace.selected.id } : {}),
       };
       if (fileInspector.supported) {
         navigation.navigate("ThreadFile", params);
@@ -558,7 +560,7 @@ function ThreadRouteContent(
       }
       navigation.navigate("ThreadFile", params);
     },
-    [fileInspector.supported, navigation, selectedThread],
+    [fileInspector.supported, navigation, selectedThread, repositoryWorkspace.selected],
   );
   // The workspace inspector column spans the full window height. On iOS the
   // panes bring their own nested native headers (which underlap the status
@@ -580,6 +582,8 @@ function ThreadRouteContent(
       selectedThread !== null && selectedThreadCwd !== null ? (
         <ThreadFileNavigatorPane
           cwd={selectedThreadCwd}
+          repositoryTarget={repositoryTarget}
+          repositoryWorkspace={repositoryWorkspace}
           environmentId={selectedThread.environmentId}
           headerInset={inspectorHeaderInset}
           projectName={selectedThreadProject?.title ?? "Files"}
@@ -593,6 +597,8 @@ function ThreadRouteContent(
       selectedThread,
       selectedThreadCwd,
       selectedThreadProject?.title,
+      repositoryTarget,
+      repositoryWorkspace,
     ],
   );
   const RouteInspector = useCallback(
@@ -734,18 +740,22 @@ function ThreadRouteContent(
         !readEnvironmentScope(selectedThread.environmentId, AuthTerminalReadScope)
           ? { uniqueSuffix: uuidv4() }
           : {}),
-        hasRunningTerminal: terminalMenuSessions.some(
-          (session) => session.status === "running" || session.status === "starting",
-        ),
+        hasRunningTerminal:
+          repositoryWorkspace.isMultiRepository ||
+          terminalMenuSessions.some(
+            (session) => session.status === "running" || session.status === "starting",
+          ),
       });
       const preferredWorktreePath = resolvePreferredThreadWorktreePath({
         threadShellWorktreePath: selectedThread.worktreePath ?? null,
         threadDetailWorktreePath: selectedThreadDetailWorktreePath,
       });
-      const cwd = projectScriptCwd({
-        project: { cwd: selectedThreadProject.workspaceRoot },
-        worktreePath: preferredWorktreePath,
-      });
+      const cwd =
+        selectedThreadCwd ??
+        projectScriptCwd({
+          project: { cwd: selectedThreadProject.workspaceRoot },
+          worktreePath: preferredWorktreePath,
+        });
       const env = projectScriptRuntimeEnv({
         project: { cwd: selectedThreadProject.workspaceRoot },
         worktreePath: preferredWorktreePath,
@@ -782,6 +792,8 @@ function ThreadRouteContent(
       selectedThreadDetailWorktreePath,
       selectedThreadProject,
       terminalMenuSessions,
+      selectedThreadCwd,
+      repositoryWorkspace.isMultiRepository,
       knownTerminalSessions,
     ],
   );
@@ -1050,7 +1062,12 @@ function ThreadRouteContent(
           onRemoveQueuedEditAttachment={composer.onRemoveQueuedEditAttachment}
           environmentId={selectedThread.environmentId}
           projectWorkspaceRoot={selectedThreadProject?.workspaceRoot ?? null}
-          threadCwd={selectedThreadCwd}
+          threadCwd={
+            selectedThreadWorktreePath ??
+            selectedThread.workspaceBinding?.defaultCwd ??
+            selectedThreadProject?.workspaceRoot ??
+            null
+          }
           selectedThreadQueueCount={composer.selectedThreadQueueCount}
           queuedMessages={composer.selectedThreadQueuedMessages}
           dispatchingMessageId={composer.dispatchingQueuedMessageId}

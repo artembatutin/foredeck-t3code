@@ -178,6 +178,14 @@ export function createThreadOutboxManager(options: ThreadOutboxManagerOptions) {
       if (staleOrMissing()) {
         return false;
       }
+      if (
+        currentMessages().some(
+          (candidate) =>
+            candidate.messageId === message.messageId && candidate.requiresRepositoryProtocol,
+        )
+      ) {
+        message = { ...message, requiresRepositoryProtocol: true };
+      }
       try {
         await options.storage.write(message);
       } catch (cause) {

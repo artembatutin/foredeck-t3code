@@ -6,6 +6,7 @@ import {
   AuthSettingsWriteScope,
   DEFAULT_SERVER_SETTINGS,
   ProviderInstanceId,
+  ProjectId,
   ThreadId,
   AuthOrchestrationOperateScope,
   ORCHESTRATION_V2_WS_METHODS,
@@ -32,6 +33,43 @@ import {
 import * as RpcAuthorization from "./RpcAuthorization.ts";
 
 describe("RPC authorization scopes", () => {
+  it.effect.each([
+    { scopes: [AuthSettingsWriteScope], missing: AuthOrchestrationOperateScope },
+    { scopes: [AuthOrchestrationOperateScope], missing: AuthSettingsWriteScope },
+  ])("rejects membership changes without $missing before mutation", ({ scopes, missing }) =>
+    Effect.gen(function* () {
+      const group = WsRpcGroup.omit(
+        ...Array.from(WsRpcGroup.requests.keys()).filter(
+          (
+            tag,
+          ): tag is Exclude<
+            keyof typeof RPC_REQUIRED_SCOPES,
+            typeof WS_METHODS.projectsSetRepositories
+          > => tag !== WS_METHODS.projectsSetRepositories,
+        ),
+      );
+      let handled = false;
+      const client = yield* RpcTest.makeClient(group).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            group.toLayerHandler(WS_METHODS.projectsSetRepositories, () =>
+              Effect.sync(() => {
+                handled = true;
+              }).pipe(Effect.andThen(Effect.never)),
+            ),
+            RpcAuthorization.layer(scopes),
+          ),
+        ),
+      );
+      expect(
+        yield* client[WS_METHODS.projectsSetRepositories]({
+          projectId: ProjectId.make("project"),
+          repositories: [],
+        }).pipe(Effect.flip),
+      ).toMatchObject({ requiredPermission: missing });
+      expect(handled).toBe(false);
+    }).pipe(Effect.scoped),
+  );
   it("declares exactly one scope for every RPC in the server group", () => {
     expect(new Set(Object.keys(RPC_REQUIRED_SCOPES))).toEqual(new Set(WsRpcGroup.requests.keys()));
   });

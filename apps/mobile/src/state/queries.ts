@@ -8,6 +8,7 @@ import { useEnvironmentPresentation } from "./presentation";
 import type { VcsRefTarget } from "@t3tools/client-runtime/state/vcs";
 import type {
   EnvironmentId,
+  RepositoryTarget,
   OrchestrationV2ProjectedTurnItem,
   ProjectId,
   ThreadId,
@@ -63,6 +64,7 @@ const threadSearchResultsAtom = createThreadSearchResultsAtomFamily({
 export interface ComposerPathSearchTarget {
   readonly environmentId: EnvironmentId | null;
   readonly cwd: string | null;
+  readonly repositoryTarget?: RepositoryTarget | undefined;
   readonly query: string | null;
 }
 
@@ -192,6 +194,7 @@ export function useThreadSearch(
 export function useBranches(input: {
   readonly environmentId: EnvironmentId | null;
   readonly cwd: string | null;
+  readonly repositoryTarget?: RepositoryTarget | undefined;
   readonly query?: string | null;
 }) {
   const query = input.query?.trim() ?? "";
@@ -201,6 +204,7 @@ export function useBranches(input: {
           environmentId: input.environmentId,
           input: {
             cwd: input.cwd,
+            repositoryTarget: input.repositoryTarget,
             ...(query.length > 0 ? { query } : {}),
             limit: VCS_REF_LIST_LIMIT,
           },
@@ -213,7 +217,7 @@ export function usePaginatedBranches(target: VcsRefTarget) {
   const query = target.query?.trim() ?? "";
   const targetKey =
     target.environmentId !== null && target.cwd !== null
-      ? JSON.stringify([target.environmentId, target.cwd, query])
+      ? JSON.stringify([target.environmentId, target.cwd, target.repositoryTarget, query])
       : null;
   const [pagination, setPagination] = useState<{
     readonly targetKey: string | null;
@@ -231,6 +235,7 @@ export function usePaginatedBranches(target: VcsRefTarget) {
               environmentId: target.environmentId!,
               input: {
                 cwd: target.cwd!,
+                repositoryTarget: target.repositoryTarget,
                 ...(query.length > 0 ? { query } : {}),
                 ...(cursor === undefined ? {} : { cursor }),
                 limit: VCS_REF_LIST_LIMIT,
@@ -238,7 +243,7 @@ export function usePaginatedBranches(target: VcsRefTarget) {
             }),
           )
         : [],
-    [cursors, query, target.cwd, target.environmentId],
+    [cursors, query, target.cwd, target.environmentId, target.repositoryTarget],
   );
   const pagesAtom = useMemo(
     () =>
@@ -321,9 +326,10 @@ export function useComposerPathSearch(target: ComposerPathSearchTarget) {
     () => ({
       environmentId: target.environmentId,
       cwd: target.cwd,
+      repositoryTarget: target.repositoryTarget,
       query: normalizeComposerPathSearchQuery(target.query),
     }),
-    [target.cwd, target.environmentId, target.query],
+    [target.cwd, target.environmentId, target.query, target.repositoryTarget],
   );
   const debouncedTarget = useDebouncedValue(normalizedTarget, COMPOSER_PATH_SEARCH_DEBOUNCE_MS);
   const fileAccessSession = useEnvironmentQuery(
@@ -347,6 +353,7 @@ export function useComposerPathSearch(target: ComposerPathSearchTarget) {
           environmentId: debouncedTarget.environmentId,
           input: {
             cwd: debouncedTarget.cwd,
+            repositoryTarget: debouncedTarget.repositoryTarget,
             query: debouncedTarget.query,
             limit: COMPOSER_PATH_SEARCH_LIMIT,
           },

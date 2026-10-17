@@ -1,3 +1,4 @@
+import { resolveRepositoryFileReference } from "@t3tools/client-runtime/fd/multirepo";
 import { useScopedSettingsWriteAllowed } from "./useScopedSettings";
 import { AuthSettingsWriteScope } from "@t3tools/contracts";
 import { EnvironmentId, type T3ProjectFileScript } from "@t3tools/contracts";
@@ -94,6 +95,9 @@ export function ProjectActionsSettings() {
   const t3File = useT3ProjectFileState(
     representativeMember?.environmentId ?? EnvironmentId.make("none"),
     representativeMember?.workspaceRoot ?? null,
+    representativeMember
+      ? resolveRepositoryFileReference(representativeMember, null, "t3.json").scope
+      : undefined,
   );
   const importableScripts = useMemo(
     () =>

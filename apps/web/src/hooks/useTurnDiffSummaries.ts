@@ -4,13 +4,16 @@ import type { OrchestrationV2ThreadProjection } from "@t3tools/contracts";
 import { inferCheckpointTurnCountByRunId } from "../session-logic";
 import type { TurnDiffSummary } from "../types";
 
-export function useTurnDiffSummaries(projection: OrchestrationV2ThreadProjection | null) {
+export function useTurnDiffSummaries(
+  projection: OrchestrationV2ThreadProjection | null,
+  repositoryId?: string,
+) {
   const turnDiffSummaries = useMemo<ReadonlyArray<TurnDiffSummary>>(() => {
     if (projection === null) {
       return [];
     }
-    return deriveThreadCheckpointSummaries(projection);
-  }, [projection]);
+    return deriveThreadCheckpointSummaries(projection, repositoryId);
+  }, [projection, repositoryId]);
 
   const inferredCheckpointTurnCountByRunId = useMemo(
     () => inferCheckpointTurnCountByRunId(turnDiffSummaries),

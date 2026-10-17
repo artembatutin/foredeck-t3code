@@ -125,6 +125,55 @@ function hostedChangeRequest(body: string, additions = 1) {
   };
 }
 
+it.effect("routes same-number pull requests to independent configured checkouts", () =>
+  Effect.gen(function* () {
+    const apiProject = project({
+      id: "p1",
+      title: "App",
+      workspaceRoot: "/api",
+      repository: "acme/api",
+    });
+    const reads: string[] = [];
+    const writes: string[] = [];
+    const service = yield* makeService({
+      projects: [
+        {
+          ...project({ id: "p1", title: "App", workspaceRoot: "/web/app", repository: "acme/web" }),
+          repositories: [
+            { id: "web", name: "Web", rootPath: "/web" },
+            { id: "api", name: "API", rootPath: "/api" },
+            { id: "gone", name: "Unavailable", rootPath: "/gone" },
+          ],
+        },
+      ],
+      resolveRepositoryIdentity: (cwd) =>
+        Effect.succeed(cwd === "/api" ? apiProject.repositoryIdentity! : null),
+      providers: [
+        fakeProvider(SourceControlProviderKind.make("github"), {
+          getChangeRequestPreview: (input) =>
+            Effect.sync(() => {
+              reads.push(`${input.cwd}:${input.repository}`);
+              return changeRequest(1, "2026-07-02T00:00:00Z");
+            }),
+          runAction: (input) =>
+            Effect.sync(() => {
+              writes.push(`${input.cwd}:${input.repository}`);
+            }),
+        }),
+      ],
+    });
+    const web = { projectId: "p1" as ProjectId, repository: "acme/web", number: 1 };
+    const api = { ...web, repository: "acme/api" };
+    yield* service.preview(web);
+    yield* service.preview(api);
+    yield* service.runAction({ ...api, action: "close" });
+    assert.deepStrictEqual(reads, ["/web:acme/web", "/api:acme/api"]);
+    assert.deepStrictEqual(writes, ["/api:acme/api"]);
+    const invalid = yield* Effect.flip(service.preview({ ...api, repository: "acme/unrelated" }));
+    assert.strictEqual(invalid._tag, "PullRequestOperationError");
+  }),
+);
+
 it.effect("caches narrow previews and invalidates them after refresh or mutation", () =>
   Effect.gen(function* () {
     let reads = 0;

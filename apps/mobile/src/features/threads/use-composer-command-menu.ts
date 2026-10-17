@@ -1,3 +1,4 @@
+import type { RepositoryFileScope } from "@t3tools/client-runtime/fd/multirepo";
 import type {
   EnvironmentId,
   ProjectId,
@@ -178,6 +179,7 @@ export function useComposerCommandMenu({
   threadShells = EMPTY_THREAD_SHELLS,
   currentThreadId = null,
   projectCwd,
+  repositoryScope,
   pullRequestProjectId = null,
   pullRequestRepository = null,
   threadPullRequests,
@@ -198,6 +200,7 @@ export function useComposerCommandMenu({
   /** Left out of `@` thread suggestions: a thread is never context for itself. */
   readonly currentThreadId?: ThreadId | null;
   readonly projectCwd: string | null;
+  readonly repositoryScope?: RepositoryFileScope | undefined;
   readonly pullRequestProjectId?: ProjectId | null;
   readonly pullRequestRepository?: string | null;
   /** The thread's linked pull requests, offered in `#` suggestions from any repository. */
@@ -354,7 +357,8 @@ export function useComposerCommandMenu({
   }, [draftMessage, enabled, selection]);
   const pathSearch = useComposerPathSearch({
     environmentId,
-    cwd: trigger?.kind === "path" ? projectCwd : null,
+    cwd: trigger?.kind === "path" ? (repositoryScope?.repository.rootPath ?? projectCwd) : null,
+    repositoryTarget: repositoryScope?.target,
     query: trigger?.kind === "path" ? trigger.query : null,
   });
   const pullRequestSearch = useComposerPullRequestSearch({
@@ -523,7 +527,9 @@ export function useComposerCommandMenu({
           return {
             id: `path:${entry.path}`,
             type: "path" as const,
-            path: entry.path,
+            path: repositoryScope
+              ? `${repositoryScope.repository.rootPath.replace(/[\\/]+$/, "")}/${entry.path}`
+              : entry.path,
             kind: entry.kind,
             label: parts[parts.length - 1] ?? entry.path,
             description: parts.length > 1 ? parts.slice(0, -1).join("/") : "",
@@ -541,6 +547,7 @@ export function useComposerCommandMenu({
     hasCompactableConversation,
     onUpdateInteractionMode,
     pathSearch.entries,
+    repositoryScope,
     pullRequestSearch.entries,
     projectCwd,
     selectedProviderStatus,

@@ -1,3 +1,4 @@
+import type { RepositoryFileScope } from "@t3tools/client-runtime/fd/multirepo";
 import type {
   EditorId,
   EnvironmentId,
@@ -39,6 +40,7 @@ export interface ThreadDetailsPanelProps extends Pick<
   availableEditors: ReadonlyArray<EditorId>;
   showOpenInPicker: boolean;
   gitCwd: string | null;
+  repositoryScope?: RepositoryFileScope | undefined;
   isGitRepo: boolean;
   envLocked: boolean;
   availableEnvironments: readonly EnvironmentOption[];
@@ -48,6 +50,7 @@ export interface ThreadDetailsPanelProps extends Pick<
   onEnvModeChange: (mode: EnvMode) => void;
   /** The thread's env mode as ChatView resolves it. */
   envMode: EnvMode;
+  worktreeUnavailableReason?: string | undefined;
   activeThreadBranchOverride?: string | null;
   onActiveThreadBranchOverrideChange?: (branch: string | null) => void;
   startFromOrigin: boolean;
@@ -68,6 +71,7 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
   const fileScripts = useT3ProjectFileScripts(
     props.environmentId,
     props.activeProjectScripts ? props.gitCwd : null,
+    props.repositoryScope,
   );
   const activeThreadRef = { environmentId: props.environmentId, threadId: props.threadId };
   const branchToolbarProps = {
@@ -79,6 +83,7 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
     startFromOrigin: props.startFromOrigin,
     onStartFromOriginChange: props.onStartFromOriginChange,
     envMode: props.envMode,
+    worktreeUnavailableReason: props.worktreeUnavailableReason,
     ...(props.activeThreadBranchOverride !== undefined
       ? { activeThreadBranchOverride: props.activeThreadBranchOverride }
       : {}),

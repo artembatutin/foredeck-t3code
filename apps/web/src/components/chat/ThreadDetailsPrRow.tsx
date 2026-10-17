@@ -164,7 +164,10 @@ export function ThreadDetailsPrRow({
       onActed?.();
     },
   });
-  const { handoff, startHandoff } = usePullRequestHandoffs({ environmentId, detail });
+  const { handoff, startHandoff, worktreeUnavailableReason } = usePullRequestHandoffs({
+    environmentId,
+    detail,
+  });
   const [confirmingMerge, setConfirmingMerge] = useState(false);
 
   const rowAction = resolveThreadPanelPullRequestAction(detail);
@@ -439,7 +442,10 @@ export function ThreadDetailsPrRow({
                       size="sm"
                       part="meta"
                       tone={trailingAction.destructive ? "destructive" : "primary"}
-                      disabled={actionPending || handoff !== null}
+                      disabled={
+                        actionPending || handoff !== null || Boolean(worktreeUnavailableReason)
+                      }
+                      title={worktreeUnavailableReason}
                       onClick={trailingAction.onClick}
                     />
                   }

@@ -1,3 +1,8 @@
+import {
+  repositoryWorkspace,
+  resolveRepositoryFileReference,
+} from "@t3tools/client-runtime/fd/multirepo";
+import { usesSharedCheckouts } from "@t3tools/client-runtime/fd/multirepo";
 import { resolveFilesystemReadAccess } from "@t3tools/client-runtime/state/filesystem";
 import { useEnvironmentPresentation } from "../../state/presentation";
 import { environmentSession } from "../../state/session";
@@ -505,11 +510,19 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
   const { canReadFiles } = fileAccess;
   const fileAccessPending =
     selectedProject !== null && selectedProject.workspaceRoot !== "" && fileAccess.isPending;
+  const t3ProjectFileReference = useMemo(
+    () => resolveRepositoryFileReference(selectedProject, null, T3_PROJECT_FILE_NAME),
+    [selectedProject],
+  );
   const t3ProjectFileQuery = useEnvironmentQuery(
     canReadFiles && selectedProject !== null && selectedProject.workspaceRoot !== ""
       ? projectEnvironment.readFile({
           environmentId: selectedProject.environmentId,
-          input: { cwd: selectedProject.workspaceRoot, relativePath: T3_PROJECT_FILE_NAME },
+          input: {
+            cwd: t3ProjectFileReference.scope?.repository.rootPath ?? selectedProject.workspaceRoot,
+            relativePath: t3ProjectFileReference.path,
+            repositoryTarget: t3ProjectFileReference.scope?.target,
+          },
         })
       : null,
   );
@@ -544,19 +557,21 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
         thread.environmentId === selectedProject.environmentId &&
         thread.projectId === selectedProject.id,
     );
-  const defaultWorkspaceMode: WorkspaceMode = canChooseWorkspace
-    ? resolveNewThreadEnvMode({
-        projectSettings,
-        workspaceRoot: selectedProject?.workspaceRoot ?? null,
-        newProjectsRoot: selectedEnvironmentServerConfig?.newProjectsRoot,
-        projectHasThreads: selectedProjectHasThreads,
-      })
-    : "local";
+  const defaultWorkspaceMode: WorkspaceMode =
+    canChooseWorkspace && !usesSharedCheckouts(selectedProject)
+      ? resolveNewThreadEnvMode({
+          projectSettings,
+          workspaceRoot: selectedProject?.workspaceRoot ?? null,
+          newProjectsRoot: selectedEnvironmentServerConfig?.newProjectsRoot,
+          projectHasThreads: selectedProjectHasThreads,
+        })
+      : "local";
   // While the file read is pending and nothing above it decided, the
   // resolved default is provisional. Nothing may write it into the draft
   // during that window (the auto-branch effect does), or the frozen interim
   // value beats the t3.json default once it loads.
   const defaultWorkspaceModeSettled =
+    usesSharedCheckouts(selectedProject) ||
     selectedProjectDraft.workspaceSelection?.mode !== undefined ||
     projectSettings.sources.defaultThreadEnvMode !== "environment" ||
     (!t3ProjectFileQuery.isPending && !fileAccessPending);
@@ -743,14 +758,24 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
   }, [selectedProjectDraftKey]);
   const branchSearchQuery = sanitizeNewRefName(branchQuery);
   const debouncedBranchQuery = useDebouncedValue(branchSearchQuery, BRANCH_SEARCH_DEBOUNCE_MS);
+  const projectWorkspace = useMemo(
+    () => repositoryWorkspace(selectedProject, null, null),
+    [selectedProject],
+  );
   const branchTarget = useMemo(
     () => ({
       environmentId: selectedProject?.environmentId ?? null,
       // `|| null` also skips the stand-in project's empty workspaceRoot.
-      cwd: selectedProject?.workspaceRoot || null,
+      cwd: projectWorkspace.cwd || null,
+      repositoryTarget: projectWorkspace.repositoryTarget,
       query: debouncedBranchQuery,
     }),
-    [debouncedBranchQuery, selectedProject?.environmentId, selectedProject?.workspaceRoot],
+    [
+      debouncedBranchQuery,
+      selectedProject?.environmentId,
+      projectWorkspace.cwd,
+      projectWorkspace.repositoryTarget,
+    ],
   );
   const branchState = usePaginatedBranches(branchTarget);
   const branchSearchIsDebouncing = branchSearchQuery !== debouncedBranchQuery;
@@ -779,7 +804,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
     branchTarget.environmentId !== null && branchTarget.cwd !== null
       ? vcsEnvironment.status({
           environmentId: branchTarget.environmentId,
-          input: { cwd: branchTarget.cwd },
+          input: { cwd: branchTarget.cwd, repositoryTarget: branchTarget.repositoryTarget },
         })
       : null,
   );
@@ -903,6 +928,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
 
   const setWorkspaceMode = useCallback(
     (mode: WorkspaceMode) => {
+      if (mode === "worktree" && usesSharedCheckouts(selectedProject)) return;
       if (!selectedProjectDraftKey) {
         return;
       }
@@ -1155,6 +1181,9 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
         commandId: CommandId.make(metadata.commandId),
         text,
         attachments: draft.attachments,
+        requiresRepositoryProtocol:
+          editingPendingTask?.requiresRepositoryProtocol === true ||
+          usesSharedCheckouts(selectedProject),
         context: draft.context,
         modelSelection: draftModelSelection,
         runtimeMode: draft.runtimeMode ?? defaultRuntimeMode,

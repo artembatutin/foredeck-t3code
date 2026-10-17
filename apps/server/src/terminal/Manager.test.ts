@@ -9,6 +9,8 @@ import {
   type TerminalRestartInput,
   ProviderDriverKind,
   ProviderInstanceId,
+  ThreadId,
+  RepositoryTargetError,
   ServerSettingsError,
   TerminalProviderInstanceNotFoundError,
 } from "@t3tools/contracts";
@@ -436,6 +438,61 @@ it.layer(
       assert.equal(third.threadId, "thread-1");
       expect(ptyAdapter.spawnInputs).toHaveLength(1);
     }),
+  );
+
+  it.effect(
+    "keeps repository terminals at their original location on open, attach, and restart",
+    () =>
+      Effect.gen(function* () {
+        const { manager, ptyAdapter, baseDir } = yield* createManager();
+        const fs = yield* FileSystem.FileSystem;
+        const firstCwd = baseDir + "/first";
+        const secondCwd = baseDir + "/second";
+        yield* fs.makeDirectory(firstCwd);
+        yield* fs.makeDirectory(secondCwd);
+        const input = openInput({
+          cwd: firstCwd,
+          repositoryTarget: {
+            type: "thread",
+            threadId: ThreadId.make("thread-1"),
+            repositoryId: "first",
+          },
+        });
+        yield* manager.open(input);
+        const different = {
+          ...input,
+          cwd: secondCwd,
+          repositoryTarget: { ...input.repositoryTarget!, repositoryId: "second" },
+        };
+        assert.instanceOf(yield* manager.open(different).pipe(Effect.flip), RepositoryTargetError);
+        assert.instanceOf(
+          yield* manager.restart({ ...different, cols: 100, rows: 30 }).pipe(Effect.flip),
+          RepositoryTargetError,
+        );
+        assert.instanceOf(
+          yield* manager.attachStream(different, () => Effect.void).pipe(Effect.flip),
+          RepositoryTargetError,
+        );
+        expect(ptyAdapter.spawnInputs).toHaveLength(1);
+        expect(ptyAdapter.processes[0]?.killed).toBe(false);
+        assert.equal((yield* manager.open(input)).cwd, firstCwd);
+        yield* manager.open({ ...different, terminalId: "term-2" });
+        expect(ptyAdapter.spawnInputs).toHaveLength(2);
+        yield* manager.close({ threadId: input.threadId, terminalId: input.terminalId });
+        assert.instanceOf(yield* manager.open(different).pipe(Effect.flip), RepositoryTargetError);
+        assert.equal(
+          (yield* manager.open({ ...input, repositoryTarget: undefined })).cwd,
+          firstCwd,
+        );
+        yield* manager.close({
+          threadId: input.threadId,
+          terminalId: input.terminalId,
+          deleteHistory: true,
+        });
+        assert.equal((yield* manager.open(different)).cwd, secondCwd);
+        yield* manager.close({ threadId: input.threadId, deleteHistory: true });
+        assert.equal((yield* manager.open(input)).cwd, firstCwd);
+      }),
   );
 
   it.effect("attaches to running sessions without restarting them", () =>

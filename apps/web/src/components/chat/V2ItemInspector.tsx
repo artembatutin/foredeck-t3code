@@ -37,10 +37,9 @@ interface V2ItemInspectorProps {
   readonly workspaceRoot?: string | undefined;
   readonly onOpenThread: (threadId: ThreadId) => void;
   readonly onOpenTurnDiff: (runId: RunId, filePath?: string) => void;
-  readonly onRollbackCheckpoint?: (input: {
-    readonly checkpointId: string;
-    readonly scopeId: string;
-  }) => void;
+  readonly onRollbackCheckpoint?:
+    | ((input: { readonly checkpointId: string; readonly scopeId: string }) => void)
+    | undefined;
   readonly onImageExpand?: ((preview: ExpandedImagePreview) => void) | undefined;
 }
 

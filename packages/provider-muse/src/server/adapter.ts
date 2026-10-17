@@ -1,3 +1,4 @@
+import { repositoryContext } from "@t3tools/provider-core/fd/multirepo";
 import { MspError, type SendUserTurnOptions } from "@muse-code/sdk";
 import {
   MUSE_DEFAULT_MODEL,
@@ -95,6 +96,9 @@ const isOpenSessionError = Schema.is(ProviderAdapter.ProviderAdapterOpenSessionE
 const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
 
 const MuseProviderCapabilitiesV2 = {
+  multiRepository: {
+    runtimeModes: ["approval-required", "auto-accept-edits", "auto", "full-access"],
+  },
   runtimePolicy: { enforcement: "native" },
   sessions: {
     supportsMultipleProviderThreadsPerSession: false,
@@ -302,7 +306,10 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
       const cwd = yield* fileSystem
         .realPath(requestedCwd)
         .pipe(Effect.orElseSucceed(() => requestedCwd));
-      const workspaceRoot = yield* museWorkspaceRoot(cwd);
+      const workspaceRoots = yield* Effect.forEach(
+        input.runtimePolicy.repositories?.map((repository) => repository.rootPath) ?? [cwd],
+        museWorkspaceRoot,
+      );
       const now = yield* DateTime.now;
       let session: OrchestrationV2ProviderSession = {
         id: input.providerSessionId,
@@ -2025,18 +2032,23 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
                 input: [
                   {
                     type: "text",
-                    text: buildRuntimeInstructions({
-                      harness: "Muse Code",
-                      model: session.model ?? undefined,
-                      reasoningEffort: effort,
-                    }),
+                    text: [
+                      repositoryContext(turnInput.runtimePolicy.repositories),
+                      buildRuntimeInstructions({
+                        harness: "Muse Code",
+                        model: session.model ?? undefined,
+                        reasoningEffort: effort,
+                      }),
+                    ]
+                      .filter(Boolean)
+                      .join("\n\n"),
                   },
                   ...parts,
                 ],
                 displayText: turnInput.message.text || "Image attachment",
                 // A resumed session keeps the root it was created with; pin it to
                 // this thread's current checkout so edits land where T3 tracks them.
-                workspaceRoots: [workspaceRoot],
+                workspaceRoots,
                 ifBusy: "queue",
                 ...(effort ? { reasoningEffort: effort } : {}),
               },

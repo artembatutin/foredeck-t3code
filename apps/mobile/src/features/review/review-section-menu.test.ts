@@ -22,6 +22,7 @@ describe("buildReviewSectionMenu", () => {
     const branchChanges = section("git:branch-range", "branch-range");
 
     expect(buildReviewSectionMenu([turn28, turn27, workingTree, branchChanges])).toEqual({
+      conversation: null,
       workingTree,
       branchChanges,
       latestTurn: turn28,
@@ -29,8 +30,18 @@ describe("buildReviewSectionMenu", () => {
     });
   });
 
+  it("lists the combined conversation diff separately from individual turns", () => {
+    const conversation = section("thread", "thread");
+    const turn = section("turn:2", "turn");
+    const menu = buildReviewSectionMenu([conversation, turn]);
+    expect(menu.conversation).toBe(conversation);
+    expect(menu.latestTurn).toBe(turn);
+    expect(menu.turns).toEqual([turn]);
+  });
+
   it("keeps unavailable scopes empty while data loads", () => {
     expect(buildReviewSectionMenu([])).toEqual({
+      conversation: null,
       workingTree: null,
       branchChanges: null,
       latestTurn: null,

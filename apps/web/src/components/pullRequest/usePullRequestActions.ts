@@ -1,3 +1,7 @@
+import {
+  usesSharedCheckouts,
+  MULTIREPO_CHECKOUT_NOTICE,
+} from "@t3tools/client-runtime/fd/multirepo";
 import { useAtomCommand } from "~/state/use-atom-command";
 /**
  * The actions a pull request offers, extracted from the detail panel so smaller surfaces — the
@@ -265,6 +269,10 @@ export function usePullRequestHandoffs({
   environmentId: EnvironmentId;
   detail: PullRequestHandoffDetail | null;
 }) {
+  const projects = useProjects();
+  const project = projects.find(
+    (candidate) => candidate.environmentId === environmentId && candidate.id === detail?.projectId,
+  );
   const newThread = useNewThreadHandler();
   const prepareThread = usePreparePullRequestThreadAction({
     environmentId,
@@ -358,6 +366,14 @@ export function usePullRequestHandoffs({
     mode: "worktree" | "local" = "worktree",
   ) => {
     if (!detail || handoff !== null) return;
+    if (mode === "worktree" && usesSharedCheckouts(project)) {
+      toastManager.add({
+        type: "error",
+        title: "Worktrees unavailable",
+        description: MULTIREPO_CHECKOUT_NOTICE,
+      });
+      return;
+    }
     setHandoff(kind);
     // The menu closes on the press and takes its "Preparing..." label with it, so this is the
     // only thing answering for the checkout. It carries no timeout of its own: a loading toast
@@ -467,5 +483,10 @@ export function usePullRequestHandoffs({
     );
   };
 
-  return { handoff, startAsk, startHandoff };
+  return {
+    handoff,
+    startAsk,
+    startHandoff,
+    worktreeUnavailableReason: usesSharedCheckouts(project) ? MULTIREPO_CHECKOUT_NOTICE : undefined,
+  };
 }

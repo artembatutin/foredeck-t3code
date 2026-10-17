@@ -1,3 +1,4 @@
+import { RepositorySelector, useRepositoryFileWorkspace } from "../../fd/multirepo";
 import { resolveFilesystemReadAccess } from "@t3tools/client-runtime/state/filesystem";
 import { environmentSession } from "../../state/session";
 import { NativeStackScreenOptions } from "../../native/StackHeader";
@@ -6,7 +7,12 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import { Platform, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Svg, { Defs, LinearGradient, Rect, Stop } from "react-native-svg";
-import { EnvironmentId, type ProjectReadFileResult, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  type ProjectReadFileResult,
+  type RepositoryTarget,
+  ThreadId,
+} from "@t3tools/contracts";
 import { videoMimeType } from "@t3tools/shared/video";
 import {
   isWorkspaceBrowserPreviewPath,
@@ -28,8 +34,6 @@ import { useUniwindTheme } from "../../lib/useUniwindTheme";
 import type { MediaVideoPreviewSource } from "../../lib/videoPreviewSource";
 import { useMediaActions } from "../../state/mediaActions";
 import { type MediaActionsSource } from "../../lib/mediaActionsSource";
-import { useThreadSelection } from "../../state/use-thread-selection";
-import { useSelectedThreadWorktree } from "../../state/use-selected-thread-worktree";
 import { useEnvironmentQuery } from "../../state/query";
 import { useEnvironmentPresentation } from "../../state/presentation";
 import { projectEnvironment } from "../../state/projects";
@@ -211,6 +215,7 @@ function defaultViewMode(path: string | null): FileViewMode {
 }
 
 function FileContent(props: {
+  readonly repositoryTarget?: RepositoryTarget | undefined;
   readonly activeMode: FileViewMode;
   readonly cwd: string;
   readonly environmentId: EnvironmentId;
@@ -313,6 +318,7 @@ function FileContent(props: {
       ) : null}
       {props.activeMode === "preview" && isMarkdown ? (
         <FileMarkdownPreview
+          repositoryTarget={props.repositoryTarget}
           cwd={props.cwd}
           environmentId={props.environmentId}
           markdown={props.fileContents}
@@ -342,44 +348,14 @@ type ThreadFileRouteScreenProps = StaticScreenProps<{
   readonly environmentId: string;
   /** Absent for a project draft, which has no thread yet. */
   readonly threadId?: string;
+  readonly projectId?: string;
+  readonly repositoryId?: string;
   readonly path: string[];
   readonly line?: string;
   /** Supplied when there is no thread to resolve the workspace from. */
   readonly cwd?: string;
   readonly projectName?: string;
 }>;
-
-function useThreadFilesWorkspace(params: {
-  readonly environmentId?: string | string[];
-  readonly threadId?: string | string[];
-  readonly cwd?: string | string[];
-  readonly projectName?: string | string[];
-}) {
-  const routeEnvironmentId = firstRouteParam(params.environmentId);
-  const routeThreadId = firstRouteParam(params.threadId);
-  // A project draft has no thread to resolve a workspace from, so it names one itself.
-  const routeCwd = firstRouteParam(params.cwd);
-  const routeProjectName = firstRouteParam(params.projectName);
-  const { selectedThread, selectedThreadProject } = useThreadSelection();
-  const { selectedThreadCwd } = useSelectedThreadWorktree();
-  const environmentId =
-    routeEnvironmentId !== null
-      ? EnvironmentId.make(routeEnvironmentId)
-      : (selectedThread?.environmentId ?? null);
-  const threadId = routeThreadId !== null ? ThreadId.make(routeThreadId) : null;
-  const project = selectedThreadProject as {
-    readonly title?: string;
-    readonly workspaceRoot?: string;
-  } | null;
-
-  return {
-    cwd: routeCwd ?? selectedThreadCwd ?? project?.workspaceRoot ?? null,
-    environmentId,
-    projectName: routeProjectName ?? project?.title ?? "Files",
-    selectedThread,
-    threadId,
-  };
-}
 
 function FilesUnavailable({
   detail = "This thread does not have an active workspace path.",
@@ -428,9 +404,16 @@ export function ThreadFilesTreeScreen(props: ThreadFilesRouteScreenProps) {
   const { fileInspector, layout, showAuxiliaryPane } = useAdaptiveWorkspaceLayout();
   const [searchQuery, setSearchQuery] = useState("");
   const { themeAppearance: highlightTheme } = useAppearancePreferences();
-  const { cwd, environmentId, projectName, selectedThread, threadId } = useThreadFilesWorkspace(
-    props.route.params,
-  );
+  const {
+    cwd,
+    environmentId,
+    projectName,
+    selectedThread,
+    threadId,
+    repositoryTarget,
+    repositoryId,
+    repositoryWorkspace,
+  } = useRepositoryFileWorkspace(props.route.params);
   const revealedInspectorRef = useRef(false);
   const fileAccessSession = useEnvironmentQuery(
     environmentId !== null ? environmentSession.sessionStateAtom(environmentId) : null,
@@ -446,6 +429,7 @@ export function ThreadFilesTreeScreen(props: ThreadFilesRouteScreenProps) {
   const entriesQuery = useFileTreeEntries({
     environmentId,
     cwd: !canReadFiles || fileInspector.supported ? null : cwd,
+    repositoryTarget,
     searchQuery,
   });
   const handleReturnToThread = useCallback(() => {
@@ -471,7 +455,8 @@ export function ThreadFilesTreeScreen(props: ThreadFilesRouteScreenProps) {
       const params = {
         environmentId: String(environmentId),
         threadId: String(threadId),
-        path: path.split("/").filter((segment) => segment.length > 0),
+        path: [path],
+        ...(repositoryId ? { repositoryId } : {}),
       };
       const navigationAction = resolveFileSelectionNavigationAction({
         hasPersistentFileInspector: fileInspector.supported,
@@ -482,13 +467,15 @@ export function ThreadFilesTreeScreen(props: ThreadFilesRouteScreenProps) {
       }
       navigation.navigate("ThreadFile", params);
     },
-    [environmentId, fileInspector.supported, navigation, threadId],
+    [environmentId, fileInspector.supported, navigation, threadId, repositoryId],
   );
   const renderInspector = useCallback(
     (headerInset: number) =>
       environmentId !== null && cwd !== null ? (
         <ThreadFileNavigatorPane
           cwd={cwd}
+          repositoryTarget={repositoryTarget}
+          repositoryWorkspace={repositoryWorkspace}
           environmentId={environmentId}
           headerInset={headerInset}
           projectName={projectName}
@@ -496,7 +483,7 @@ export function ThreadFilesTreeScreen(props: ThreadFilesRouteScreenProps) {
           onSelectFile={handleSelectFile}
         />
       ) : null,
-    [cwd, environmentId, handleSelectFile, projectName],
+    [cwd, environmentId, handleSelectFile, projectName, repositoryTarget, repositoryWorkspace],
   );
   const handlePreviewFile = useCallback(
     (relativePath: string) => {
@@ -505,12 +492,13 @@ export function ThreadFilesTreeScreen(props: ThreadFilesRouteScreenProps) {
       }
       preloadWorkspaceFileContents({
         cwd,
+        repositoryTarget,
         environmentId,
         relativePath,
         theme: highlightTheme,
       });
     },
-    [cwd, environmentId, highlightTheme],
+    [cwd, environmentId, highlightTheme, repositoryTarget],
   );
   useEffect(() => {
     if (fileInspector.supported && cwd !== null && !revealedInspectorRef.current) {
@@ -563,9 +551,10 @@ export function ThreadFilesTreeScreen(props: ThreadFilesRouteScreenProps) {
         onRefresh={entriesQuery.refresh}
         onBack={handleReturnToThread}
       />
+      <RepositorySelector workspace={repositoryWorkspace} />
       <MaterialScreenContent insetHorizontal={layout.usesSplitView}>
         <FileTreeBrowser
-          key={JSON.stringify([environmentId, cwd])}
+          key={JSON.stringify([environmentId, cwd, repositoryTarget])}
           entries={entriesQuery.entries}
           loadingDirectories={entriesQuery.loadingDirectories}
           onLoadDirectory={entriesQuery.loadDirectory}
@@ -594,17 +583,31 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
   const { appearance, setCodeWordBreak } = useAppearancePreferences();
   const iconColor = useUniwindTheme()["--color-icon"];
   const params = props.route.params;
-  const relativePath = normalizeRoutePath(params.path);
+  const requestedPath = normalizeRoutePath(params.path);
   const targetLine = normalizeRouteLine(firstRouteParam(params.line));
-  const { cwd, environmentId, projectName, selectedThread, threadId } = useThreadFilesWorkspace(
-    props.route.params,
-  );
+  const {
+    cwd,
+    environmentId,
+    projectName,
+    selectedThread,
+    threadId,
+    projectId,
+    repositoryTarget,
+    repositoryId,
+    relativePath,
+  } = useRepositoryFileWorkspace(props.route.params, requestedPath);
   const [modeOverride, setModeOverride] = useState<{
     readonly path: string;
     readonly mode: FileViewMode;
   } | null>(null);
   const [previewRevision, setPreviewRevision] = useState(0);
-  const previewKey = JSON.stringify([environmentId, cwd, relativePath, previewRevision]);
+  const previewKey = JSON.stringify([
+    environmentId,
+    cwd,
+    repositoryTarget,
+    relativePath,
+    previewRevision,
+  ]);
   const [fullScreenPreview, setFullScreenPreview] = useState<FilePreviewSource | null>(null);
   const isVideoFile = relativePath !== null && isVideoPreviewFile(relativePath);
   const isAudioFile = relativePath !== null && !isVideoFile && isAudioPreviewFile(relativePath);
@@ -631,6 +634,7 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
     cwd,
     environmentId,
     relativePath: assetPreviewPath,
+    repositoryTarget,
     threadId,
     // A project draft names its workspace root explicitly: there is no thread to resolve one.
     draftCwd: threadId === null ? cwd : null,
@@ -663,7 +667,8 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
       environmentId !== null &&
       relativePath !== null &&
       (assetPreview.resource?._tag === "media-file" ||
-        assetPreview.resource?._tag === "draft-workspace-file")
+        assetPreview.resource?._tag === "draft-workspace-file" ||
+        assetPreview.resource?._tag === "repository-file")
         ? {
             type: "media",
             environmentId,
@@ -707,7 +712,7 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
       needsFileContents
       ? projectEnvironment.readFile({
           environmentId,
-          input: { cwd, relativePath },
+          input: { cwd, repositoryTarget, relativePath },
         })
       : null,
   );
@@ -715,7 +720,7 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
 
   const handleSelectFile = useCallback(
     (path: string) => {
-      const segments = path.split("/").filter(Boolean);
+      const segments = [path];
       // A draft has no thread. `ThreadFile` would stringify null and then wait forever for a
       // thread to resolve, so a draft stays on its own route and carries its workspace along.
       if (threadId === null) {
@@ -725,6 +730,8 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
             ...(cwd === null ? {} : { cwd }),
             projectName,
             path: segments,
+            ...(projectId ? { projectId: String(projectId) } : {}),
+            ...(repositoryId ? { repositoryId } : {}),
           }),
         );
         return;
@@ -733,15 +740,17 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
         environmentId: String(environmentId),
         threadId: String(threadId),
         path: segments,
+        ...(repositoryId ? { repositoryId } : {}),
       });
     },
-    [cwd, environmentId, navigation, projectName, threadId],
+    [cwd, environmentId, navigation, projectName, threadId, projectId, repositoryId],
   );
   const renderInspector = useCallback(
     (headerInset: number) =>
       fileInspector.supported && environmentId !== null && cwd !== null ? (
         <ThreadFileNavigatorPane
           cwd={cwd}
+          repositoryTarget={repositoryTarget}
           environmentId={environmentId}
           headerInset={headerInset}
           projectName={projectName}
@@ -749,7 +758,15 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
           onSelectFile={handleSelectFile}
         />
       ) : undefined,
-    [cwd, environmentId, fileInspector.supported, handleSelectFile, projectName, relativePath],
+    [
+      cwd,
+      environmentId,
+      fileInspector.supported,
+      handleSelectFile,
+      projectName,
+      relativePath,
+      repositoryTarget,
+    ],
   );
   // The workspace inspector column spans the full window height. On iOS the
   // pane brings its own nested native header; elsewhere it pads itself below
@@ -954,6 +971,7 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
           key={previewKey}
           activeMode={resolvedActiveMode}
           cwd={cwd}
+          repositoryTarget={repositoryTarget}
           environmentId={environmentId}
           previewUri={previewUri}
           previewFailure={assetPreview._tag === "Failure" ? assetPreview.reason : null}

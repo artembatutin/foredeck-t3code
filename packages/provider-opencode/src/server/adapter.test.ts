@@ -2614,6 +2614,26 @@ describe("OpenCodeAdapterV2", () => {
     assert.equal(openCodeToolProjectionKind("custom_tool"), "dynamic_tool");
   });
 
+  it("grants only configured external directories while preserving edit and shell approvals", () => {
+    const rules = openCodePermissionRules({
+      ...runtimePolicy("approval-required"),
+      repositories: [
+        { id: "a", name: "A", rootPath: "/client" },
+        { id: "b", name: "B", rootPath: "/other/server" },
+        { id: "c", name: "Literal wildcard", rootPath: "/other/literal*name" },
+      ],
+    });
+    const grants = rules.filter(
+      (rule) => rule.permission === "external_directory" && rule.action === "allow",
+    );
+    assert.deepEqual(
+      grants.map((rule) => rule.pattern),
+      ["/client", "/client/*", "/other/server", "/other/server/*"],
+    );
+    assert.equal(permissionAction(rules, "edit"), "ask");
+    assert.equal(permissionAction(rules, "bash"), "ask");
+  });
+
   it("maps runtime modes to safe OpenCode permission rules", () => {
     const approvalRequired = openCodePermissionRules(runtimePolicy("approval-required"));
     assert.equal(permissionAction(approvalRequired, "read"), "allow");

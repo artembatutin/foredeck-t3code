@@ -1,3 +1,4 @@
+import { repositoryContext } from "../../fd/multirepo/index.ts";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { assistantInstructionsForThread } from "../../fd/assistant/index.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
@@ -234,6 +235,9 @@ const CODEX_CLIENT_CAPABILITIES = {
 } as const;
 
 export const CodexProviderCapabilitiesV2 = {
+  multiRepository: {
+    runtimeModes: ["approval-required", "auto-accept-edits", "auto", "full-access"],
+  },
   sessions: {
     supportsMultipleProviderThreadsPerSession: true,
     supportsModelSwitchInSession: true,
@@ -747,10 +751,15 @@ export function buildCodexTurnStartParams(input: {
       input.runtimePolicy.approvalPolicy === undefined
         ? runtimeModeDefaults.approvalPolicy
         : yield* decodeTurnApprovalPolicy(input.runtimePolicy.approvalPolicy);
-    const sandboxPolicy =
+    const baseSandboxPolicy =
       input.runtimePolicy.sandboxPolicy === undefined
         ? runtimeModeDefaults.sandboxPolicy
         : yield* decodeTurnSandboxPolicy(input.runtimePolicy.sandboxPolicy);
+    const roots = input.runtimePolicy.repositories?.map((repository) => repository.rootPath);
+    const sandboxPolicy =
+      roots !== undefined && roots.length > 1 && baseSandboxPolicy?.type === "workspaceWrite"
+        ? { ...baseSandboxPolicy, writableRoots: roots }
+        : baseSandboxPolicy;
     const selectedEffort = getModelSelectionStringOptionValue(
       input.modelSelection,
       "reasoningEffort",
@@ -787,6 +796,9 @@ export function buildCodexTurnStartParams(input: {
     const assistantInstructions = input.hasT3Mcp
       ? assistantInstructionsForThread(input.appThreadId ?? "")
       : undefined;
+    const repositoriesContext = repositoryContext(input.runtimePolicy.repositories);
+    if (repositoriesContext !== undefined)
+      appContext["t3.repositories"] = { kind: "untrusted", value: repositoriesContext };
     const additionalContext =
       t3Context === undefined && Object.keys(appContext).length === 0 && !assistantInstructions
         ? undefined
@@ -1361,13 +1373,27 @@ export function codexThreadRuntimeParams(input: {
   readonly cwd?: string;
   readonly model?: string;
   readonly config: Readonly<Record<string, Schema.Json>>;
+  readonly sandbox?: CodexSchema.V2ThreadStartParams__SandboxMode;
 } {
   const { mcpSession } = input;
+  const roots = input.runtimePolicy?.repositories?.map((repository) => repository.rootPath);
+  const multi = roots !== undefined && roots.length > 1;
   return {
     ...(input.runtimePolicy?.cwd == null ? {} : { cwd: input.runtimePolicy.cwd }),
     ...(input.modelSelection === undefined ? {} : { model: input.modelSelection.model }),
+    ...(multi
+      ? {
+          sandbox:
+            input.runtimePolicy?.runtimeMode === "full-access"
+              ? ("danger-full-access" as const)
+              : input.runtimePolicy?.runtimeMode === "approval-required"
+                ? ("read-only" as const)
+                : ("workspace-write" as const),
+        }
+      : {}),
     config: {
       ...CODEX_THREAD_CONFIG,
+      ...(multi ? { "sandbox_workspace_write.writable_roots": roots } : {}),
       ...(mcpSession === undefined
         ? {}
         : {
@@ -1384,6 +1410,49 @@ export function codexThreadRuntimeParams(input: {
     },
   };
 }
+
+const decodeRepositorySandbox = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    cwd: Schema.String,
+    sandbox: CodexSchema.V2TurnStartParams__SandboxPolicy,
+  }),
+);
+
+export class CodexRepositorySandboxError extends Schema.TaggedError<CodexRepositorySandboxError>()(
+  "CodexRepositorySandboxError",
+  {},
+) {
+  override get message() {
+    return "The provider did not accept this thread's repository roots and permission mode. Update the CLI or choose a compatible provider.";
+  }
+}
+
+/** The native response must confirm additional roots before any turn can run. */
+export const verifyCodexRepositorySandbox = Effect.fn("CodexAdapterV2.verifyRepositorySandbox")(
+  function* (
+    policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy | undefined,
+    response: unknown,
+    fileSystem: Pick<FileSystem.FileSystem, "realPath">,
+  ) {
+    if (policy?.repositories === undefined || policy.repositories.length < 2) return;
+    const actual = yield* decodeRepositorySandbox(response);
+    const canonical = (value: string) =>
+      fileSystem.realPath(value).pipe(Effect.orElseSucceed(() => value));
+    const expectedCwd = policy.cwd == null ? policy.cwd : yield* canonical(policy.cwd);
+    const actualCwd = yield* canonical(actual.cwd);
+    const expected = codexRuntimeModeTurnDefaults(policy.runtimeMode).sandboxPolicy.type;
+    const valid =
+      actualCwd === expectedCwd &&
+      actual.sandbox.type === expected &&
+      (actual.sandbox.type !== "workspaceWrite" ||
+        policy.repositories.every(
+          (repository) =>
+            actual.sandbox.type === "workspaceWrite" &&
+            actual.sandbox.writableRoots?.includes(repository.rootPath),
+        ));
+    if (!valid) return yield* new CodexRepositorySandboxError({});
+  },
+);
 
 const decodeCodexResumeMetadata = Schema.decodeUnknownEffect(
   Schema.Struct({ thread: Schema.Struct({ id: Schema.String, updatedAt: Schema.Number }) }),
@@ -6608,6 +6677,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   }),
                 ),
               ),
+              Effect.tap((response) =>
+                verifyCodexRepositorySandbox(threadInput.runtimePolicy, response, fileSystem),
+              ),
               Effect.map((response): OrchestrationV2ProviderThread =>
                 providerThreadFromCodexThread({
                   appThreadId: threadInput.threadId,
@@ -6665,6 +6737,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       },
                     }),
                   ),
+                ),
+                Effect.tap((response) =>
+                  verifyCodexRepositorySandbox(threadInput.runtimePolicy, response, fileSystem),
                 ),
                 Effect.flatMap(decodeCodexResumeMetadata),
               );
@@ -7431,6 +7506,20 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       driver: CODEX_PROVIDER,
                       providerThreadId: threadInput.sourceProviderThread.id,
                       cause: normalizeCodexCause(cause),
+                    }),
+                ),
+              );
+              yield* verifyCodexRepositorySandbox(
+                threadInput.runtimePolicy,
+                response,
+                fileSystem,
+              ).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapter.ProviderAdapterForkThreadError({
+                      driver: CODEX_PROVIDER,
+                      providerThreadId: threadInput.sourceProviderThread.id,
+                      cause,
                     }),
                 ),
               );

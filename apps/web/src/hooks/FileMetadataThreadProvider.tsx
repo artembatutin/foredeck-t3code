@@ -16,9 +16,10 @@ export function FileMetadataThreadProvider(props: {
   threadRef: ScopedThreadRef | null;
   cwd: string | undefined;
   checkpoints: OrchestrationV2ThreadProjection["checkpoints"] | undefined;
+  checkpointScopes?: OrchestrationV2ThreadProjection["checkpointScopes"] | undefined;
   children?: ReactNode;
 }) {
-  const { threadRef, cwd, checkpoints, children } = props;
+  const { threadRef, cwd, checkpoints, checkpointScopes, children } = props;
   useAtomValue(threadRef ? projectEnvironment.fileMetadataThread(threadRef) : EMPTY_RETENTION);
   const invalidate = useAtomCommand(projectEnvironment.invalidateFileMetadata, {
     reportFailure: false,
@@ -46,19 +47,24 @@ export function FileMetadataThreadProvider(props: {
       return;
     const oldById = new Map(before.checkpoints.map((checkpoint) => [checkpoint.id, checkpoint]));
     const paths = new Set<string>();
+    const checkpointCwd = (checkpoint: OrchestrationV2ThreadProjection["checkpoints"][number]) =>
+      checkpointScopes?.find((scope) => scope.id === checkpoint.scopeId)?.cwd ?? cwd;
     for (const checkpoint of checkpoints) {
       const old = oldById.get(checkpoint.id);
       oldById.delete(checkpoint.id);
       if (old?.files === checkpoint.files && old?.status === checkpoint.status) continue;
-      for (const file of checkpoint.files) paths.add(resolveWorkspaceFilePath(file.path, cwd));
-      for (const file of old?.files ?? []) paths.add(resolveWorkspaceFilePath(file.path, cwd));
+      for (const file of checkpoint.files)
+        paths.add(resolveWorkspaceFilePath(file.path, checkpointCwd(checkpoint)));
+      for (const file of old?.files ?? [])
+        paths.add(resolveWorkspaceFilePath(file.path, checkpointCwd(checkpoint)));
     }
     // Rewinds can remove checkpoints as well as add them.
     for (const checkpoint of oldById.values())
-      for (const file of checkpoint.files) paths.add(resolveWorkspaceFilePath(file.path, cwd));
+      for (const file of checkpoint.files)
+        paths.add(resolveWorkspaceFilePath(file.path, checkpointCwd(checkpoint)));
     if (paths.size > 0)
       void invalidate({ environmentId: threadRef.environmentId, input: { paths: [...paths] } });
-  }, [threadRef, cwd, checkpoints, invalidate]);
+  }, [threadRef, cwd, checkpoints, checkpointScopes, invalidate]);
 
   return <FileMetadataThreadContext value={threadRef}>{children}</FileMetadataThreadContext>;
 }

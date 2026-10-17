@@ -4005,8 +4005,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       `;
         assert.deepEqual(yield* projectionStore.getCheckpointContext(threadId), {
           runs: [{ id: runId, ordinal: 1, status: "completed" }],
-          checkpointScopes: [{ id: scopeId, runId, kind: "root_run", cwd: "/repo/worktree" }],
-          checkpoints: [{ scopeId, runId, appRunOrdinal: 1, status: "ready", ref }],
+          repositories: [],
+          checkpointScopes: [
+            { id: scopeId, runId, kind: "root_run", cwd: "/repo/worktree", repositoryId: null },
+          ],
+          checkpoints: [
+            { scopeId, runId, appRunOrdinal: 1, ordinalWithinScope: 1, status: "ready", ref },
+          ],
         });
         const missing = yield* projectionStore
           .getCheckpointContext(ThreadId.make("thread:checkpoint-context:missing"))

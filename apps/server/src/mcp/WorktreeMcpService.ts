@@ -1,3 +1,4 @@
+import { RepositorySet } from "../fd/multirepo/index.ts";
 import {
   CommandId,
   MessageId,
@@ -166,6 +167,13 @@ const make = Effect.gen(function* () {
     }
 
     const project = yield* loadProject(scope, projection.thread.projectId);
+    yield* RepositorySet.assertCheckoutMode(
+      projection.thread.workspaceBinding?.repositories,
+      "worktree",
+    ).pipe(asOperationFailed("Cannot hand off this thread"));
+    yield* RepositorySet.assertCheckoutMode(project.repositories, "worktree").pipe(
+      asOperationFailed("Cannot hand off this project"),
+    );
     const projectCwd = project.workspaceRoot;
 
     if (input.path !== undefined && !path.isAbsolute(input.path)) {
@@ -261,6 +269,15 @@ const make = Effect.gen(function* () {
           gitWorkflow
             .createWorktree({
               cwd: projectCwd,
+              ...(project.repositories?.[0]
+                ? {
+                    repositoryTarget: {
+                      type: "project" as const,
+                      projectId: projection.thread.projectId,
+                      repositoryId: project.repositories[0].id,
+                    },
+                  }
+                : {}),
               refName: worktreeBaseRef,
               newRefName: input.branch,
               baseRefName: baseRef,

@@ -22,6 +22,10 @@ const target = {
   ),
 };
 
+vi.mock("../../fd/multirepo", () => ({
+  RepositorySelector: () => null,
+  openRepositoryFile: state.openFile,
+}));
 vi.mock("~/hooks/useActiveProjectTarget", () => ({ useActiveProjectTarget: () => target }));
 vi.mock("~/hooks/useTheme", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }));
 vi.mock("~/rightPanelStore", () => ({
@@ -107,7 +111,7 @@ it("enables search after access resolves and opens a result in its own environme
   await act(() => root.findByProps({ "data-content-search-result": 0 }).props.onClick());
 
   expect(state.readScope).toHaveBeenCalledWith(target.environmentId, AuthFilesystemReadScope);
-  expect(state.openFile).toHaveBeenCalledWith(target.threadRef, "src/index.ts", 3);
+  expect(state.openFile).toHaveBeenCalledWith(target.threadRef, "src/index.ts", 3, undefined);
   expect(onOpenChange).toHaveBeenCalledWith(false);
 });
 

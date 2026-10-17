@@ -1,3 +1,8 @@
+import { isRepositoryFileScope } from "@t3tools/client-runtime/fd/multirepo";
+import {
+  repositoryFileSurfaceId,
+  type RepositoryFileScope,
+} from "@t3tools/client-runtime/fd/multirepo";
 /**
  * Thread-scoped right-panel surface state.
  *
@@ -59,6 +64,7 @@ export type RightPanelSurface =
       kind: "file";
       /** Workspace-relative, or absolute for a host file outside the workspace. */
       relativePath: string;
+      repositoryScope?: RepositoryFileScope;
       revealLine: number | null;
       revealRequestId: number;
       /** Present when the file lives in the thread's attachment store rather
@@ -151,7 +157,12 @@ interface RightPanelStoreState {
   openDevice: (ref: ScopedThreadRef, target: DeviceTabTarget, automatic?: boolean) => void;
   renameDevice: (ref: ScopedThreadRef, surfaceId: string, title: string) => void;
   openBrowser: (ref: ScopedThreadRef, tabId: string | null) => void;
-  openFile: (ref: ScopedThreadRef, relativePath: string, line?: number) => void;
+  openFile: (
+    ref: ScopedThreadRef,
+    relativePath: string,
+    line?: number,
+    repositoryScope?: RepositoryFileScope,
+  ) => void;
   openAttachment: (ref: ScopedThreadRef, attachment: ChatFileAttachment) => void;
   openPullRequest: (
     ref: ScopedThreadRef,
@@ -237,8 +248,10 @@ const fileSurface = (
   relativePath: string,
   revealLine: number | null,
   revealRequestId: number,
+  repositoryScope?: RepositoryFileScope,
 ): RightPanelSurface => ({
-  id: `file:${relativePath}`,
+  id: repositoryFileSurfaceId(relativePath, repositoryScope),
+  ...(repositoryScope ? { repositoryScope } : {}),
   kind: "file",
   relativePath,
   revealLine,
@@ -472,6 +485,11 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
                     const kind = (surface as { kind?: string }).kind;
                     if (kind === "plan" || kind === "agents") return [];
                     if (surface.kind === "file") {
+                      if (
+                        surface.repositoryScope !== undefined &&
+                        !isRepositoryFileScope(surface.repositoryScope)
+                      )
+                        return [];
                       const revealLine =
                         typeof surface.revealLine === "number" &&
                         Number.isFinite(surface.revealLine)
@@ -706,7 +724,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               : next;
           }),
         ),
-      openFile: (ref, requestedPath, line) =>
+      openFile: (ref, requestedPath, line, repositoryScope) =>
         set((state) =>
           userAction(state, scopedThreadKey(ref), (current) => {
             if (requestedPath === ".") {
@@ -719,7 +737,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             const withoutStandaloneExplorer = current.surfaces.filter(
               (surface) => surface.kind !== "files",
             );
-            const surfaceId = `file:${relativePath}` as const;
+            const surfaceId = repositoryFileSurfaceId(relativePath, repositoryScope);
             const existing = withoutStandaloneExplorer.find(
               (surface): surface is Extract<RightPanelSurface, { kind: "file" }> =>
                 surface.id === surfaceId && surface.kind === "file",
@@ -728,6 +746,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               relativePath,
               normalizeRevealLine(line),
               (existing?.revealRequestId ?? 0) + 1,
+              repositoryScope,
             );
             return {
               ...current,

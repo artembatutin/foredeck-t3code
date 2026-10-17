@@ -225,3 +225,48 @@ it.effect("preserves the typed missing-baseline-ref error contract", () => {
     );
   }).pipe(Effect.provide(layer));
 });
+
+it.effect.each(["cancelled", "interrupted", "failed"] as const)(
+  "reads recorded multi-repository snapshots after a %s turn",
+  (status) => {
+    const original = makeProjection();
+    const projection: ProjectionCheckpointContext = {
+      ...original,
+      repositories: [
+        { id: "app", name: "App", rootPath: "/repo" },
+        { id: "api", name: "API", rootPath: "/api" },
+      ],
+      runs: original.runs.map((run) => ({ ...run, status })),
+      checkpointScopes: [
+        {
+          id: secondScopeId,
+          runId: secondRunId,
+          kind: "root_run",
+          cwd: "/repo",
+          repositoryId: "app",
+        },
+      ],
+      checkpoints: [
+        ...original.checkpoints,
+        {
+          scopeId: secondScopeId,
+          runId: null,
+          appRunOrdinal: null,
+          ordinalWithinScope: 0,
+          status: "ready",
+          ref: CheckpointRef.make("refs/t3/test/baseline"),
+        },
+      ],
+    };
+    return Effect.gen(function* () {
+      const query = yield* CheckpointDiffQuery.CheckpointDiffQuery;
+      const result = yield* query.getFullThreadDiff({
+        threadId,
+        toTurnCount: 2,
+        repositoryId: "app",
+      });
+      assert.equal(result.diff, "diff");
+      assert.equal(result.repositoryId, "app");
+    }).pipe(Effect.provide(layerFor({ projection: Effect.succeed(projection) })));
+  },
+);

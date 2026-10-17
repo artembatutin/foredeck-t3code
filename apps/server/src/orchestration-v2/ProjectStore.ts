@@ -6,6 +6,7 @@ import {
   StoredProjectIcon,
   ProjectId,
   ProjectScript,
+  ProjectRepositories,
   ThreadEnvMode,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -33,6 +34,7 @@ export const ProjectRow = Schema.Struct({
   projectId: ProjectId,
   title: Schema.String,
   workspaceRoot: Schema.String,
+  repositories: Schema.optional(ProjectRepositories),
   defaultModelSelection: Schema.NullOr(ModelSelection),
   defaultThreadEnvMode: Schema.NullOr(ThreadEnvMode),
   autoPull: Schema.Boolean,
@@ -47,6 +49,7 @@ export type ProjectRow = typeof ProjectRow.Type;
 
 const ProjectDbRow = Schema.Struct({
   ...ProjectRow.fields,
+  repositories: Schema.optional(Schema.fromJsonString(ProjectRepositories)),
   defaultModelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
   autoPull: Schema.BooleanFromBit,
   projectIcon: Schema.NullOr(Schema.fromJsonString(StoredProjectIcon)),
@@ -59,6 +62,7 @@ function toShell(row: ProjectRow): OrchestrationProjectShell {
     id: row.projectId,
     title: row.title,
     workspaceRoot: row.workspaceRoot,
+    repositories: row.repositories ?? [],
     repositoryIdentity: null,
     defaultModelSelection: row.defaultModelSelection,
     defaultThreadEnvMode: row.defaultThreadEnvMode,
@@ -117,6 +121,7 @@ export const make = Effect.gen(function* () {
         project_id AS "projectId",
         title,
         workspace_root AS "workspaceRoot",
+        repositories_json AS "repositories",
         default_model_selection_json AS "defaultModelSelection",
         default_thread_env_mode AS "defaultThreadEnvMode",
         auto_pull AS "autoPull",
@@ -147,6 +152,7 @@ export const make = Effect.gen(function* () {
             project_id,
             title,
             workspace_root,
+            repositories_json,
             default_model_selection_json,
             default_thread_env_mode,
             auto_pull,
@@ -161,6 +167,7 @@ export const make = Effect.gen(function* () {
             ${encoded.projectId},
             ${encoded.title},
             ${encoded.workspaceRoot},
+            ${encoded.repositories ?? "[]"},
             ${encoded.defaultModelSelection},
             ${encoded.defaultThreadEnvMode},
             ${encoded.autoPull},
@@ -175,6 +182,7 @@ export const make = Effect.gen(function* () {
           DO UPDATE SET
             title = excluded.title,
             workspace_root = excluded.workspace_root,
+            repositories_json = excluded.repositories_json,
             default_model_selection_json = excluded.default_model_selection_json,
             default_thread_env_mode = excluded.default_thread_env_mode,
             auto_pull = excluded.auto_pull,
@@ -221,6 +229,7 @@ export const make = Effect.gen(function* () {
           projectId: payload.projectId,
           title: payload.title,
           workspaceRoot: payload.workspaceRoot,
+          repositories: payload.repositories ?? [],
           defaultModelSelection: payload.defaultModelSelection,
           defaultThreadEnvMode: payload.defaultThreadEnvMode ?? null,
           autoPull: false,
@@ -247,6 +256,7 @@ export const make = Effect.gen(function* () {
         ...row,
         ...(payload.title === undefined ? {} : { title: payload.title }),
         ...(payload.workspaceRoot === undefined ? {} : { workspaceRoot: payload.workspaceRoot }),
+        ...(payload.repositories === undefined ? {} : { repositories: payload.repositories }),
         ...(payload.defaultModelSelection === undefined
           ? {}
           : { defaultModelSelection: payload.defaultModelSelection }),

@@ -7,12 +7,79 @@ import { selectThreadDiffPanelSelection, useDiffPanelStore } from "./diffPanelSt
 const THREAD_REF = scopeThreadRef(EnvironmentId.make("environment-1"), ThreadId.make("thread-1"));
 
 describe("diffPanelStore", () => {
+  it("keeps repository-specific branch bases and same-name file selections separate", () => {
+    const store = useDiffPanelStore.getState();
+    store.selectBranchBaseRef(THREAD_REF, "origin/server", "server");
+    store.selectBranchBaseRef(THREAD_REF, "origin/client", "client");
+    store.selectTurn(THREAD_REF, RunId.make("turn-1"), "src/index.ts", "server");
+    store.selectTurn(THREAD_REF, RunId.make("turn-2"), "src/index.ts", "client");
+    expect(
+      selectThreadDiffPanelSelection(
+        useDiffPanelStore.getState().byThreadKey,
+        THREAD_REF,
+        "server",
+      ),
+    ).toMatchObject({ kind: "turn", turnId: "turn-1", filePath: "src/index.ts" });
+    expect(
+      selectThreadDiffPanelSelection(
+        useDiffPanelStore.getState().byThreadKey,
+        THREAD_REF,
+        "client",
+      ),
+    ).toMatchObject({ kind: "turn", turnId: "turn-2" });
+    store.selectGitScope(THREAD_REF, "branch", "server");
+    store.selectGitScope(THREAD_REF, "branch", "client");
+    expect(
+      selectThreadDiffPanelSelection(
+        useDiffPanelStore.getState().byThreadKey,
+        THREAD_REF,
+        "server",
+      ),
+    ).toEqual({ kind: "branch", baseRef: "origin/server" });
+    expect(
+      selectThreadDiffPanelSelection(
+        useDiffPanelStore.getState().byThreadKey,
+        THREAD_REF,
+        "client",
+      ),
+    ).toEqual({ kind: "branch", baseRef: "origin/client" });
+    store.removeThread(THREAD_REF);
+    expect(useDiffPanelStore.getState().byThreadKey).toEqual({});
+  });
   beforeEach(() =>
     useDiffPanelStore.setState({
       byThreadKey: {},
       branchBaseRefByThreadKey: {},
     }),
   );
+
+  it("keeps conversation history separate from working-copy and turn selections", () => {
+    const store = useDiffPanelStore.getState();
+    store.selectThreadHistory(THREAD_REF, "server");
+    store.selectTurn(THREAD_REF, RunId.make("turn-3"), undefined, "client");
+    expect(
+      selectThreadDiffPanelSelection(
+        useDiffPanelStore.getState().byThreadKey,
+        THREAD_REF,
+        "server",
+      ),
+    ).toEqual({ kind: "thread" });
+    expect(
+      selectThreadDiffPanelSelection(
+        useDiffPanelStore.getState().byThreadKey,
+        THREAD_REF,
+        "client",
+      ),
+    ).toMatchObject({ kind: "turn", turnId: "turn-3" });
+    store.selectGitScope(THREAD_REF, "unstaged", "client");
+    expect(
+      selectThreadDiffPanelSelection(
+        useDiffPanelStore.getState().byThreadKey,
+        THREAD_REF,
+        "server",
+      ),
+    ).toEqual({ kind: "thread" });
+  });
 
   it("defaults each thread to Changes without requiring git status", () => {
     expect(

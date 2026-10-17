@@ -17,6 +17,7 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { RpcClientError } from "effect/rpc";
 
+import { requiresRepositoryProtocol, supportsRepositories } from "../fd/multirepo/index.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
@@ -102,6 +103,7 @@ export class EnvironmentRpcSubscriptionObserver extends Context.Reference<{
 
 export const isRpcClientError = Schema.is(RpcClientError.RpcClientError);
 const isEnvironmentAuthorizationError = Schema.is(EnvironmentAuthorizationError);
+const isEnvironmentRpcUnavailableError = Schema.is(EnvironmentRpcUnavailableError);
 
 /** Ceiling for the doubling delay between same-session expected-failure retries. */
 const MAX_EXPECTED_FAILURE_RETRY_DELAY_MS = 30_000;
@@ -124,9 +126,10 @@ export type EnvironmentRpcStreamValue<TTag extends EnvironmentStreamRpcTag> =
     : never;
 
 export type EnvironmentRpcStreamFailure<TTag extends EnvironmentStreamRpcTag> =
-  RpcMethod<TTag> extends (input: any, options?: any) => Stream.Stream<any, infer E, any>
-    ? E
-    : never;
+  | EnvironmentRpcUnavailableError
+  | (RpcMethod<TTag> extends (input: any, options?: any) => Stream.Stream<any, infer E, any>
+      ? E
+      : never);
 
 const currentSession = Effect.fn("EnvironmentRpc.currentSession")(function* () {
   const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
@@ -176,6 +179,29 @@ export class RpcPermissionGuard extends Context.Reference<{
   }),
 }) {}
 
+const requireRepositoryServer = Effect.fn("EnvironmentRpc.requireRepositoryServer")(function* (
+  session: RpcSession,
+  input: unknown,
+  environmentId: EnvironmentId,
+) {
+  if (!requiresRepositoryProtocol(input)) return;
+  const config = yield* session.initialConfig.pipe(
+    Effect.mapError(
+      () =>
+        new EnvironmentRpcUnavailableError({
+          environmentId,
+          message: "Unable to verify repository support on the connected server.",
+        }),
+    ),
+  );
+  if (!supportsRepositories(config.environment.capabilities))
+    return yield* new EnvironmentRpcUnavailableError({
+      environmentId,
+      message:
+        "Update this server before using repository membership, selection, or multi-repository diffs.",
+    });
+});
+
 const authorizeRequest = Effect.fn("EnvironmentRpc.authorize")(function* (
   method: string,
   input: unknown,
@@ -196,6 +222,7 @@ export const requestGuarded = Effect.fn("EnvironmentRpc.request")(function* <
   });
   const session = yield* currentSession();
   yield* authorizeRequest(tag, input);
+  yield* requireRepositoryServer(session, input, supervisor.target.environmentId);
   const observer = yield* EnvironmentRpcRequestObserver;
   const method = session.client[tag] as (
     input: EnvironmentRpcInput<TTag>,
@@ -220,12 +247,16 @@ export function runStreamGuarded<TTag extends EnvironmentStreamCommandRpcTag>(
   return Stream.unwrap(
     authorizeRequest(tag, input).pipe(
       Effect.andThen(currentSession()),
-      Effect.map((session) => {
-        const method = session.client[tag] as (
-          input: EnvironmentRpcInput<TTag>,
-        ) => Stream.Stream<EnvironmentRpcStreamValue<TTag>, EnvironmentRpcStreamFailure<TTag>>;
-        return method(input);
-      }),
+      Effect.flatMap((session) =>
+        Effect.gen(function* () {
+          const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
+          yield* requireRepositoryServer(session, input, supervisor.target.environmentId);
+          const method = session.client[tag] as (
+            input: EnvironmentRpcInput<TTag>,
+          ) => Stream.Stream<EnvironmentRpcStreamValue<TTag>, EnvironmentRpcStreamFailure<TTag>>;
+          return method(input);
+        }),
+      ),
     ),
   ).pipe(
     Stream.withSpan("EnvironmentRpc.runStream", {
@@ -302,6 +333,11 @@ function subscribeDynamicMapped<TTag extends EnvironmentSubscriptionRpcTag, A>(
                   Stream.unwrap(
                     Effect.gen(function* () {
                       const input = yield* makeInput(session);
+                      yield* requireRepositoryServer(
+                        session,
+                        input,
+                        supervisor.target.environmentId,
+                      );
                       const completeObservation = yield* observer.observe({
                         environmentId: supervisor.target.environmentId,
                         method: tag,
@@ -356,7 +392,9 @@ function subscribeDynamicMapped<TTag extends EnvironmentSubscriptionRpcTag, A>(
                         );
                         const isAuthorizationFailure = cause.reasons.some(
                           (reason) =>
-                            reason._tag === "Fail" && isEnvironmentAuthorizationError(reason.error),
+                            reason._tag === "Fail" &&
+                            (isEnvironmentAuthorizationError(reason.error) ||
+                              isEnvironmentRpcUnavailableError(reason.error)),
                         );
                         if (
                           options.retryExpectedFailureAfter === undefined ||

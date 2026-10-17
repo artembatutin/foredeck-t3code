@@ -1,3 +1,4 @@
+import { withRepositoryCapability } from "../fd/multirepo/index.ts";
 /**
  * ProviderRegistry - Provider snapshot service.
  *
@@ -420,9 +421,13 @@ const snapshotInstanceKey = (provider: ServerProvider): ProviderInstanceId => {
 const buildSnapshotSource = (instance: ProviderInstance): ProviderSnapshotSource => ({
   instanceId: instance.instanceId,
   driverKind: instance.driverKind,
-  getSnapshot: instance.snapshot.getSnapshot,
+  getSnapshot: instance.snapshot.getSnapshot.pipe(
+    Effect.flatMap((snapshot) => withRepositoryCapability(instance, snapshot)),
+  ),
   refresh: instance.snapshot.refresh,
-  streamChanges: instance.snapshot.streamChanges,
+  streamChanges: instance.snapshot.streamChanges.pipe(
+    Stream.mapEffect((snapshot) => withRepositoryCapability(instance, snapshot)),
+  ),
 });
 
 export const layer = Layer.effect(

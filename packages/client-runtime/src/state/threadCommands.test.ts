@@ -1,7 +1,9 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
   CommandId,
+  MessageId,
   RuntimeRequestId,
+  RunId,
   EnvironmentId,
   ORCHESTRATION_V2_WS_METHODS,
   ProjectId,
@@ -10,6 +12,7 @@ import {
   type OrchestrationV2Command,
   type OrchestrationV2ShellSnapshot,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
@@ -89,6 +92,7 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* () {
     target: { environmentId: ENVIRONMENT_ID },
     session: yield* SubscriptionRef.make(
       Option.some({
+        initialConfig: Effect.succeed({ environment: { capabilities: {} } }),
         client: {
           [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command: OrchestrationV2Command) =>
             Effect.gen(function* () {
@@ -125,6 +129,101 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* () {
 });
 
 describe("remote thread lifecycle commands", () => {
+  it.effect.each([true, false])(
+    "rejects incompatible execution before dispatch with retained requirement %s",
+    (retained) =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        if (!retained)
+          h.registry.set(h.snapshotAtom(ENVIRONMENT_ID), {
+            ...SNAPSHOT,
+            threads: [
+              {
+                ...SNAPSHOT.threads[0]!,
+                workspaceBinding: {
+                  version: 1,
+                  defaultCwd: "/app",
+                  repositories: [
+                    { id: "app", name: "App", rootPath: "/app" },
+                    { id: "api", name: "API", rootPath: "/api" },
+                  ],
+                },
+              },
+            ],
+          });
+        const result = yield* Effect.promise(() =>
+          h.commands.startTurn.run(h.registry, {
+            environmentId: ENVIRONMENT_ID,
+            input: {
+              threadId: THREAD_ID,
+              requiresRepositoryProtocol: retained,
+              message: {
+                messageId: MessageId.make("message"),
+                role: "user",
+                text: "Continue",
+                attachments: [],
+              },
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+            },
+          }),
+        );
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure")
+          expect(Cause.pretty(result.cause)).toContain("Update this server");
+        expect(yield* Queue.size(h.requests)).toBe(0);
+      }),
+  );
+
+  it.effect.each(["resume", "fork", "promote", "retry"] as const)(
+    "rejects %s on an older server with a retained repository binding",
+    (action) =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        h.registry.set(h.snapshotAtom(ENVIRONMENT_ID), {
+          ...SNAPSHOT,
+          threads: [
+            {
+              ...SNAPSHOT.threads[0]!,
+              workspaceBinding: {
+                version: 1,
+                defaultCwd: "/app",
+                repositories: [
+                  { id: "app", name: "App", rootPath: "/app" },
+                  { id: "api", name: "API", rootPath: "/api" },
+                ],
+              },
+            },
+          ],
+        });
+        const command =
+          action === "resume"
+            ? h.commands.resumeThreadQueue
+            : action === "fork"
+              ? h.commands.forkFromRun
+              : action === "promote"
+                ? h.commands.promoteQueuedRun
+                : h.commands.retryWorkspacePreparation;
+        const result = yield* Effect.promise(() =>
+          command.run(h.registry, {
+            environmentId: ENVIRONMENT_ID,
+            input: {
+              threadId: THREAD_ID,
+              sourceThreadId: THREAD_ID,
+              targetThreadId: ThreadId.make("fork"),
+              runId: RunId.make("run"),
+              queuedRunId: RunId.make("queued"),
+              targetRunId: RunId.make("run"),
+            },
+          }),
+        );
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure")
+          expect(Cause.pretty(result.cause)).toContain("Update this server");
+        expect(yield* Queue.size(h.requests)).toBe(0);
+      }),
+  );
+
   const actions = [
     ["settle", {}, { settledOverride: "settled", pinnedAt: null, snoozedUntil: null }],
     ["unsettle", { reason: "user" }, { settledOverride: "active", settledAt: null }],

@@ -13,6 +13,7 @@ import { runMigrations } from "../../persistence/Migrations.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import type { AssignmentEvent } from "./portfolio.ts";
 import * as PortfolioStore from "./PortfolioStore.ts";
+import portfolioMigration from "./migration.ts";
 
 const PORTFOLIO_TABLES = [
   "fd_assistant_assignments",
@@ -56,7 +57,35 @@ const memoryStore = PortfolioStore.layer.pipe(Layer.provideMerge(SqlitePersisten
 
 const alpha = ProjectId.make("project-alpha");
 
-describe("migration 063", () => {
+describe("migration 064", () => {
+  it.effect("upgrades migration-63 assistant data without losing briefs or assignments", () =>
+    Effect.gen(function* () {
+      yield* runMigrations({ toMigrationInclusive: 62 });
+      yield* portfolioMigration;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`INSERT INTO effect_sql_migrations (migration_id, name) VALUES (63, 'AssistantPortfolio')`;
+      const store = yield* PortfolioStore.PortfolioStore;
+      const brief = yield* store.reviseBrief({
+        projectId: alpha,
+        patch: { goal: "Keep this brief" },
+      });
+      const assignment = yield* store.createAssignment({
+        assignmentId: "keep",
+        projectId: alpha,
+        executor: "foredeck",
+      });
+      yield* runMigrations();
+      assert.deepStrictEqual(Option.getOrThrow(yield* store.getBrief(alpha)), brief);
+      assert.deepStrictEqual(Option.getOrThrow(yield* store.getAssignment("keep")), assignment);
+      const columns = yield* sql<{ name: string }>`PRAGMA table_info(projection_projects)`;
+      assert.isTrue(columns.some((c) => c.name === "repositories_json"));
+      assert.deepStrictEqual(yield* runMigrations(), []);
+    }).pipe(
+      Effect.provide(PortfolioStore.layer),
+      Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" })),
+    ),
+  );
+
   it.effect("creates the portfolio tables on a fresh database", () =>
     Effect.gen(function* () {
       yield* runMigrations();
@@ -64,13 +93,13 @@ describe("migration 063", () => {
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
-  it.effect("adds only portfolio objects to a database migrated through 062", () =>
+  it.effect("adds only portfolio objects to a database migrated through 063", () =>
     Effect.gen(function* () {
-      yield* runMigrations({ toMigrationInclusive: 62 });
+      yield* runMigrations({ toMigrationInclusive: 63 });
       const before = yield* schemaObjects;
       assert.isFalse(before.some((object) => isPortfolioObject(object.name)));
 
-      assert.deepStrictEqual(yield* runMigrations(), [[63, "AssistantPortfolio"]]);
+      assert.deepStrictEqual(yield* runMigrations(), [[64, "AssistantPortfolio"]]);
       const after = yield* schemaObjects;
       assert.deepStrictEqual(
         after.filter((object) => !isPortfolioObject(object.name)),

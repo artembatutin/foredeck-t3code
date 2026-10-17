@@ -1,3 +1,4 @@
+import { RepositoryTarget } from "./project.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import {
@@ -109,6 +110,7 @@ export type GitResolvedPullRequest = typeof GitResolvedPullRequest.Type;
 
 export const VcsStatusInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
+  repositoryTarget: Schema.optional(RepositoryTarget),
 });
 export type VcsStatusInput = typeof VcsStatusInput.Type;
 
@@ -121,12 +123,14 @@ export type VcsStatusSubscriptionInput = typeof VcsStatusSubscriptionInput.Type;
 
 export const VcsPullInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
+  repositoryTarget: Schema.optional(RepositoryTarget),
 });
 export type VcsPullInput = typeof VcsPullInput.Type;
 
 export const GitRunStackedActionInput = Schema.Struct({
   actionId: TrimmedNonEmptyStringSchema,
   cwd: TrimmedNonEmptyStringSchema,
+  repositoryTarget: Schema.optional(RepositoryTarget),
   action: GitStackedAction,
   commitMessage: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(10_000))),
   featureBranch: Schema.optional(Schema.Boolean),
@@ -139,6 +143,7 @@ export type GitRunStackedActionInput = typeof GitRunStackedActionInput.Type;
 
 export const VcsListRefsInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
+  repositoryTarget: Schema.optional(RepositoryTarget),
   query: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(256))),
   cursor: Schema.optional(NonNegativeInt),
   includeMatchingRemoteRefs: Schema.optional(Schema.Boolean),
@@ -152,6 +157,7 @@ export type VcsListRefsInput = typeof VcsListRefsInput.Type;
 
 export const VcsCreateWorktreeInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
+  repositoryTarget: Schema.optional(RepositoryTarget),
   refName: TrimmedNonEmptyStringSchema,
   newRefName: Schema.optional(TrimmedNonEmptyStringSchema),
   baseRefName: Schema.optional(TrimmedNonEmptyStringSchema),
@@ -161,12 +167,14 @@ export type VcsCreateWorktreeInput = typeof VcsCreateWorktreeInput.Type;
 
 export const GitPullRequestRefInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
+  repositoryTarget: Schema.optional(RepositoryTarget),
   reference: GitPullRequestReference,
 });
 export type GitPullRequestRefInput = typeof GitPullRequestRefInput.Type;
 
 export const GitPreparePullRequestThreadInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
+  repositoryTarget: Schema.optional(RepositoryTarget),
   reference: GitPullRequestReference,
   mode: GitPreparePullRequestThreadMode,
   threadId: Schema.optional(ThreadId),
@@ -175,6 +183,7 @@ export type GitPreparePullRequestThreadInput = typeof GitPreparePullRequestThrea
 
 export const VcsRemoveWorktreeInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
+  repositoryTarget: Schema.optional(RepositoryTarget),
   path: TrimmedNonEmptyStringSchema,
   force: Schema.optional(Schema.Boolean),
 });
@@ -182,6 +191,7 @@ export type VcsRemoveWorktreeInput = typeof VcsRemoveWorktreeInput.Type;
 
 export const VcsCreateRefInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
+  repositoryTarget: Schema.optional(RepositoryTarget),
   refName: TrimmedNonEmptyStringSchema,
   switchRef: Schema.optional(Schema.Boolean),
 });
@@ -194,12 +204,14 @@ export type VcsCreateRefResult = typeof VcsCreateRefResult.Type;
 
 export const VcsSwitchRefInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
+  repositoryTarget: Schema.optional(RepositoryTarget),
   refName: TrimmedNonEmptyStringSchema,
 });
 export type VcsSwitchRefInput = typeof VcsSwitchRefInput.Type;
 
 export const VcsInitInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
+  repositoryTarget: Schema.optional(RepositoryTarget),
   kind: Schema.optional(VcsDriverKind),
 });
 export type VcsInitInput = typeof VcsInitInput.Type;

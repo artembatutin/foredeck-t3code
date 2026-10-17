@@ -1,7 +1,10 @@
 import { isAssistantThread } from "@t3tools/shared/fd/assistant";
 
-/** Migration 063, registered in the core migration list. */
-export { default as assistantPortfolioMigration } from "./migration.ts";
+/** Portfolio schema and compatibility with the unpublished migration-63 build. */
+export {
+  default as assistantPortfolioMigration,
+  reconcileAssistantMigration,
+} from "./migration.ts";
 
 /** Application-owned role; project content and worker output never become instructions. */
 // ponytail: scheduling is conversational and resumes with the saved thread. Add a durable queue

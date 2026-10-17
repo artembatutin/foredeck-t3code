@@ -1,3 +1,4 @@
+import { RepositorySelector } from "../../../fd/multirepo";
 import { useOpenPullRequest } from "../../../native/useOpenPullRequest";
 import {
   type GitActionRequestInput,
@@ -77,7 +78,8 @@ function GitOverviewSheetContent(props: GitOverviewSheetProps) {
   const environmentId = EnvironmentId.make(props.route.params.environmentId);
   const threadId = ThreadId.make(props.route.params.threadId);
   const { selectedThread, selectedEnvironmentRuntime } = useThreadSelection();
-  const { selectedThreadCwd, selectedThreadWorktreePath } = useSelectedThreadWorktree();
+  const { selectedThreadCwd, selectedThreadWorktreePath, repositoryTarget, repositoryWorkspace } =
+    useSelectedThreadWorktree();
   const supportsLinkedPrSnapshots =
     selectedEnvironmentRuntime?.serverConfig?.environment.capabilities.threadPullRequests === true;
   const linkedPrChains = useMemo(
@@ -98,7 +100,7 @@ function GitOverviewSheetContent(props: GitOverviewSheetProps) {
     selectedThread !== null && selectedThreadCwd !== null
       ? vcsEnvironment.status({
           environmentId: selectedThread.environmentId,
-          input: { cwd: selectedThreadCwd },
+          input: { cwd: selectedThreadCwd, repositoryTarget },
         })
       : null,
   );
@@ -285,6 +287,12 @@ function GitOverviewSheetContent(props: GitOverviewSheetProps) {
         ) : undefined
       }
     >
+      <RepositorySelector workspace={repositoryWorkspace} />
+      {repositoryWorkspace.isMultiRepository ? (
+        <Text className="text-sm text-foreground-muted">
+          Shared checkouts · worktrees and whole-turn undo are unavailable.
+        </Text>
+      ) : null}
       <View
         className={`overflow-hidden bg-card android:rounded-[20px] ios:border ios:border-border ${
           isInspector ? "ios:rounded-2xl ios:px-3 ios:py-1" : "ios:rounded-[22px] ios:px-4 ios:py-1"

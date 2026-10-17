@@ -1,3 +1,9 @@
+import {
+  resolveRepositoryFileReference,
+  scopeRepositoryAssetResource,
+} from "@t3tools/client-runtime/fd/multirepo";
+import { useRepositoryFileAccess } from "../fd/multirepo";
+import { openRepositoryFile } from "../fd/multirepo";
 import { MarkdownFindContext, useFindRevealRef } from "./chat/markdownFindContext";
 import {
   buildFileLinkParentSuffixByPath,
@@ -179,8 +185,7 @@ import { readLocalApi } from "../localApi";
 import { useAssetUrlRefresh, useAssetUrlState } from "../assets/assetUrls";
 import { cn } from "../lib/utils";
 import { useRemoteOpenResolution, type RemoteOpenMode } from "../remoteOpen";
-import { useRightPanelStore } from "../rightPanelStore";
-import { readThreadShell, useProjects } from "../state/entities";
+import { readThreadShell, readProject, useProjects } from "../state/entities";
 import { serverEnvironment } from "../state/server";
 import { shellEnvironment } from "../state/shell";
 import { assetEnvironment } from "../state/assets";
@@ -1655,12 +1660,10 @@ export const ChatMarkdownAssetImage = memo(function ChatMarkdownAssetImage(props
     ...(relativePath && (resource._tag === "media-file" || resource._tag === "workspace-file")
       ? {
           onOpenFile: () =>
-            useRightPanelStore
-              .getState()
-              .openFile(
-                { environmentId: props.environmentId, threadId: resource.threadId },
-                relativePath,
-              ),
+            openRepositoryFile(
+              { environmentId: props.environmentId, threadId: resource.threadId },
+              relativePath,
+            ),
         }
       : {}),
   };
@@ -2349,10 +2352,22 @@ function useChatMarkdownState({
       mediaRequestId.current += 1;
     };
   }, [threadRef?.environmentId, threadRef?.threadId, explicitEnvironmentId, cwd, imageBaseDir]);
-  const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
+  const createAssetUrlQuery = useAtomQueryRunner(assetEnvironment.createUrl, {
     reportFailure: false,
     refresh: true,
   });
+  const fileRepositoryTarget = useRepositoryFileAccess();
+  const createAssetUrl: typeof createAssetUrlQuery = useCallback(
+    (input) =>
+      createAssetUrlQuery({
+        ...input,
+        input: {
+          ...input.input,
+          resource: scopeRepositoryAssetResource(input.input.resource, fileRepositoryTarget),
+        },
+      }),
+    [createAssetUrlQuery, fileRepositoryTarget],
+  );
   const searchProjectEntries = useAtomQueryRunner(projectEnvironment.searchEntries, {
     reportFailure: false,
   });
@@ -2379,9 +2394,7 @@ function useChatMarkdownState({
         httpBaseUrl:
           preparedConnection._tag === "Some" ? preparedConnection.value.httpBaseUrl : undefined,
         createAssetUrl,
-        onOpenFile: threadRef
-          ? (path) => useRightPanelStore.getState().openFile(threadRef, path)
-          : undefined,
+        onOpenFile: threadRef ? (path) => openRepositoryFile(threadRef, path) : undefined,
       }).then(
         (preview) => {
           if (preview && mediaRequestId.current === requestId) {
@@ -2611,20 +2624,28 @@ function useChatMarkdownState({
       ) {
         return null;
       }
+      const thread = threadRef ? readThreadShell(threadRef) : null;
+      const project = thread ? readProject({ environmentId, projectId: thread.projectId }) : null;
+      const scope = resolveRepositoryFileReference(project, thread, cwd).scope;
+      const repositoryTarget = fileRepositoryTarget ?? scope?.target;
+      const searchCwd = fileRepositoryTarget ? cwd : (scope?.repository.rootPath ?? cwd);
       const result = await searchProjectEntries({
         environmentId,
         input: {
-          cwd,
+          cwd: searchCwd,
+          repositoryTarget,
           query: workspaceRelativePath,
           limit: WORKSPACE_BASENAME_LOOKUP_LIMIT,
           kind: "file",
         },
       });
-      return result._tag === "Success"
-        ? pickWorkspaceBasenameMatch(workspaceRelativePath, result.value.entries)
-        : null;
+      const match =
+        result._tag === "Success"
+          ? pickWorkspaceBasenameMatch(workspaceRelativePath, result.value.entries)
+          : null;
+      return match && repositoryTarget ? `${searchCwd.replace(/[\\/]+$/, "")}/${match}` : match;
     },
-    [cwd, environmentId, searchProjectEntries],
+    [cwd, environmentId, fileRepositoryTarget, searchProjectEntries, threadRef],
   );
   // A bare filename resolves to the workspace root, which is rarely where the
   // file is, so ask the index before opening. Absolute host paths open as-is.
@@ -2634,8 +2655,7 @@ function useChatMarkdownState({
       // Claimed on every open so a synchronous one supersedes a lookup already
       // in flight.
       const isLatestLookup = claimWorkspaceBasenameLookup();
-      const openAt = (path: string) =>
-        useRightPanelStore.getState().openFile(threadRef, path, line);
+      const openAt = (path: string) => openRepositoryFile(threadRef, path, line);
       if (!cwd || !needsWorkspaceBasenameLookup(panelPath)) {
         openAt(panelPath);
         return;

@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useEffectEvent, useMemo } from "react";
 
-import { EnvironmentProject, EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
+import {
+  threadRuntimeIsActive,
+  type EnvironmentProject,
+  type EnvironmentThreadShell,
+} from "@t3tools/client-runtime/state/shell";
 import type { AtomCommandResult } from "@t3tools/client-runtime/state/runtime";
 import {
   type GitActionRequestInput,
@@ -51,24 +55,31 @@ export function useSelectedThreadGitActions() {
     selectedThread?.environmentId ?? null,
     AuthOrchestrationOperateScope,
   );
-  const canChangeThreadBranch = canWriteSourceControl && canOperateThread;
-  const { selectedThreadCwd, selectedThreadWorktreePath } = useSelectedThreadWorktree();
+  const { selectedThreadCwd, selectedThreadWorktreePath, repositoryTarget, repositoryWorkspace } =
+    useSelectedThreadWorktree();
+  const isMultiRepository = repositoryWorkspace.isMultiRepository;
+  const canChangeThreadBranch =
+    canWriteSourceControl &&
+    canOperateThread &&
+    !(isMultiRepository && threadRuntimeIsActive(selectedThread?.runtime));
   const runStackedAction = useAtomCommand(
     vcsActionManager.runStackedAction({
       environmentId: selectedThread?.environmentId ?? null,
       cwd: selectedThreadCwd,
+      repositoryTarget,
     }),
     { reportFailure: false },
   );
 
-  const selectedThreadGitRootCwd = selectedThreadProject?.workspaceRoot ?? null;
+  const selectedThreadGitRootCwd = selectedThreadCwd;
   const branchTarget = useMemo(
     () => ({
       environmentId: selectedThread?.environmentId ?? null,
       cwd: selectedThreadGitRootCwd,
+      repositoryTarget,
       query: null,
     }),
-    [selectedThread?.environmentId, selectedThreadGitRootCwd],
+    [selectedThread?.environmentId, selectedThreadGitRootCwd, repositoryTarget],
   );
   const branchState = useBranches(branchTarget);
   const updateThreadGitContext = useCallback(
@@ -79,6 +90,7 @@ export function useSelectedThreadGitActions() {
         readonly worktreePath?: string | null;
       },
     ) => {
+      if (isMultiRepository) return AsyncResult.success(undefined);
       if (!readEnvironmentScope(thread.environmentId, AuthOrchestrationOperateScope)) {
         return AsyncResult.failure<never, EnvironmentAuthorizationError>(
           Cause.fail(
@@ -98,7 +110,7 @@ export function useSelectedThreadGitActions() {
         },
       });
     },
-    [updateThreadMetadata],
+    [updateThreadMetadata, isMultiRepository],
   );
 
   const refreshSelectedThreadGitStatus = useCallback(
@@ -116,7 +128,7 @@ export function useSelectedThreadGitActions() {
       const execute = () =>
         refreshStatus({
           environmentId: selectedThread.environmentId,
-          input: { cwd },
+          input: { cwd, repositoryTarget },
         });
       const result = options?.quiet
         ? await execute()
@@ -138,7 +150,7 @@ export function useSelectedThreadGitActions() {
       setPendingConnectionError(null);
       return result.value;
     },
-    [refreshStatus, selectedThread, selectedThreadCwd, selectedThreadProject],
+    [refreshStatus, selectedThread, selectedThreadCwd, selectedThreadProject, repositoryTarget],
   );
 
   // Shell updates replace the selected thread object many times per second while a
@@ -260,7 +272,7 @@ export function useSelectedThreadGitActions() {
         async ({ thread, cwd }) => {
           const result = await switchRef({
             environmentId: thread.environmentId,
-            input: { cwd, refName: branch },
+            input: { cwd, repositoryTarget, refName: branch },
           });
           if (AsyncResult.isFailure(result)) {
             return result;
@@ -283,6 +295,7 @@ export function useSelectedThreadGitActions() {
       selectedThreadWorktreePath,
       syncSelectedThreadBranchState,
       switchRef,
+      repositoryTarget,
     ],
   );
 
@@ -294,7 +307,7 @@ export function useSelectedThreadGitActions() {
         async ({ thread, cwd }) => {
           const result = await createRef({
             environmentId: thread.environmentId,
-            input: { cwd, refName: branch, switchRef: true },
+            input: { cwd, repositoryTarget, refName: branch, switchRef: true },
           });
           if (AsyncResult.isFailure(result)) {
             return result;
@@ -317,6 +330,7 @@ export function useSelectedThreadGitActions() {
       selectedThreadWorktreePath,
       syncSelectedThreadBranchState,
       createRef,
+      repositoryTarget,
     ],
   );
 
@@ -361,7 +375,7 @@ export function useSelectedThreadGitActions() {
       async ({ thread, cwd }) => {
         const result = await pull({
           environmentId: thread.environmentId,
-          input: { cwd },
+          input: { cwd, repositoryTarget },
         });
         if (AsyncResult.isFailure(result)) {
           return result;
@@ -377,7 +391,7 @@ export function useSelectedThreadGitActions() {
         return result;
       },
     );
-  }, [pull, refreshSelectedThreadGitStatus, runSelectedThreadGitMutation]);
+  }, [pull, refreshSelectedThreadGitStatus, runSelectedThreadGitMutation, repositoryTarget]);
 
   const onRunSelectedThreadGitAction = useCallback(
     async (input: GitActionRequestInput): Promise<GitRunStackedActionResult | null> => {
@@ -438,6 +452,7 @@ export function useSelectedThreadGitActions() {
   return {
     canWriteSourceControl,
     canChangeThreadBranch,
+    canCreateWorktree: canChangeThreadBranch && !isMultiRepository,
     refreshSelectedThreadGitStatus,
     refreshSelectedThreadBranches,
     onCheckoutSelectedThreadBranch,

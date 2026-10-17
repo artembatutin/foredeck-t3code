@@ -318,7 +318,7 @@ function PullRequestLinkCheckout({
   readonly link: Extract<NewThreadLink, { kind: "pull-request" }>;
   readonly project: EnvironmentProject;
 }) {
-  const { handoff, startHandoff } = usePullRequestHandoffs({
+  const { handoff, startHandoff, worktreeUnavailableReason } = usePullRequestHandoffs({
     environmentId: project.environmentId,
     detail: {
       projectId: project.id,
@@ -340,7 +340,8 @@ function PullRequestLinkCheckout({
     >
       <Button
         size="sm"
-        disabled={handoff !== null}
+        disabled={handoff !== null || Boolean(worktreeUnavailableReason)}
+        title={worktreeUnavailableReason}
         // The checkout reports its own progress and says the task is in the composer.
         onClick={() =>
           void startHandoff(

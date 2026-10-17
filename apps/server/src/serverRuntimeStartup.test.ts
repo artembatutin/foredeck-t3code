@@ -1,3 +1,5 @@
+import * as Layer from "effect/Layer";
+import * as GitManager from "./git/GitManager.ts";
 import { assert, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
@@ -133,6 +135,15 @@ it.effect("resolveWelcomeBase derives cwd and project name from server config", 
 it.effect("automatic pull only updates enabled, behind, clean default-branch checkouts", () =>
   Effect.gen(function* () {
     const pulled: string[] = [];
+    const coordinated: string[] = [];
+    const coordination = Layer.mock(GitManager.GitManager)({
+      withCheckoutMutation: (input, effect) =>
+        Effect.gen(function* () {
+          assert.strictEqual(input.changesBranch, true);
+          coordinated.push(input.cwd);
+          return yield* effect;
+        }),
+    });
     const git = {
       statusDetails: (cwd: string) =>
         Effect.succeed({
@@ -182,7 +193,7 @@ it.effect("automatic pull only updates enabled, behind, clean default-branch che
         "/feature": true,
         "/disabled": false,
       }),
-    ).pipe(Effect.provideService(GitVcsDriver.GitVcsDriver, git));
+    ).pipe(Effect.provideService(GitVcsDriver.GitVcsDriver, git), Effect.provide(coordination));
 
     assert.deepStrictEqual(pulled, ["/clean"]);
 
@@ -190,7 +201,30 @@ it.effect("automatic pull only updates enabled, behind, clean default-branch che
     yield* ServerRuntimeStartup.autoPullProjects(
       [project("/inherited"), project("/opted-out"), project("/dirty")],
       { ...overrides({ "/opted-out": false }), defaultAutoPull: true },
-    ).pipe(Effect.provideService(GitVcsDriver.GitVcsDriver, git));
+    ).pipe(Effect.provideService(GitVcsDriver.GitVcsDriver, git), Effect.provide(coordination));
     assert.deepStrictEqual(pulled, ["/inherited"]);
+    assert.deepStrictEqual(coordinated, ["/clean", "/inherited"]);
+    pulled.length = 0;
+    yield* ServerRuntimeStartup.autoPullProjects(
+      [
+        {
+          id: ProjectId.make("multi"),
+          workspaceRoot: "/clean/subfolder",
+          autoPull: true,
+          repositories: [
+            { id: "one", name: "One", rootPath: "/clean" },
+            { id: "two", name: "Two", rootPath: "/secondary" },
+          ],
+        },
+        {
+          id: ProjectId.make("single"),
+          workspaceRoot: "/single/subfolder",
+          autoPull: true,
+          repositories: [{ id: "one", name: "One", rootPath: "/single" }],
+        },
+      ],
+      { ...DEFAULT_SERVER_SETTINGS, defaultAutoPull: true },
+    ).pipe(Effect.provideService(GitVcsDriver.GitVcsDriver, git), Effect.provide(coordination));
+    assert.deepStrictEqual([...pulled].sort(), ["/clean", "/secondary", "/single/subfolder"]);
   }),
 );

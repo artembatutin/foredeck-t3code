@@ -27,7 +27,8 @@ export function GitBranchesSheet(_props: GitBranchesSheetProps) {
   const insets = useSafeAreaInsets();
   const { height: windowHeight } = useWindowDimensions();
   const { selectedThread } = useThreadSelection();
-  const { selectedThreadCwd, selectedThreadWorktreePath } = useSelectedThreadWorktree();
+  const { selectedThreadCwd, selectedThreadWorktreePath, repositoryTarget, repositoryWorkspace } =
+    useSelectedThreadWorktree();
   const gitState = useSelectedThreadGitState();
   const gitActions = useSelectedThreadGitActions();
   const { canChangeThreadBranch } = gitActions;
@@ -36,7 +37,7 @@ export function GitBranchesSheet(_props: GitBranchesSheetProps) {
     selectedThread !== null && selectedThreadCwd !== null
       ? vcsEnvironment.status({
           environmentId: selectedThread.environmentId,
-          input: { cwd: selectedThreadCwd },
+          input: { cwd: selectedThreadCwd, repositoryTarget },
         })
       : null,
   );
@@ -128,6 +129,11 @@ export function GitBranchesSheet(_props: GitBranchesSheetProps) {
             <Text className="android:text-foreground android:text-base android:font-t3-medium ios:text-foreground-secondary ios:text-2xs ios:font-t3-bold ios:tracking-[1px] ios:uppercase">
               New worktree
             </Text>
+            {repositoryWorkspace.isMultiRepository ? (
+              <Text className="text-foreground-secondary text-sm">
+                Multi-repository conversations use shared checkouts. Worktrees are unavailable.
+              </Text>
+            ) : null}
             {Platform.OS === "android" ? (
               <Text className="text-foreground-secondary text-sm">Base branch</Text>
             ) : null}
@@ -153,7 +159,7 @@ export function GitBranchesSheet(_props: GitBranchesSheetProps) {
               label="Create worktree"
               tone="primary"
               disabled={
-                !canChangeThreadBranch ||
+                !gitActions.canCreateWorktree ||
                 busy ||
                 worktreeBaseBranch.trim().length === 0 ||
                 worktreeBranchName.trim().length === 0

@@ -115,6 +115,16 @@ function queuedMessage(input: {
 }
 
 describe("thread outbox", () => {
+  it("retains the required repository protocol through an offline queue restart", () => {
+    const message: QueuedThreadMessage = {
+      ...queuedMessage({ messageId: "multi", createdAt: "2026-09-06T12:00:00.000Z" }),
+      requiresRepositoryProtocol: true,
+    };
+    expect(
+      decodeQueuedThreadMessage(JSON.parse(JSON.stringify(encodeQueuedThreadMessage(message)))),
+    ).toEqual(message);
+  });
+
   it("retains structured context through a persisted offline queue round trip", () => {
     const message: QueuedThreadMessage = {
       ...queuedMessage({ messageId: "context-message", createdAt: "2026-09-06T12:00:00.000Z" }),
@@ -844,6 +854,9 @@ describe("thread outbox", () => {
       "environment-1:thread-1": [edited],
     });
     expect(stored.get(message.messageId)).toEqual(edited);
+    await manager.update({ ...edited, requiresRepositoryProtocol: true });
+    await manager.update(edited);
+    expect(stored.get(message.messageId)?.requiresRepositoryProtocol).toBe(true);
 
     await manager.remove(edited);
     await expect(manager.update({ ...message, text: "stale flush" })).resolves.toBe(false);

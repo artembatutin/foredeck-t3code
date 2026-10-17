@@ -1,3 +1,4 @@
+import * as GitManager from "./git/GitManager.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { expect, it } from "@effect/vitest";
 import { DEFAULT_SERVER_SETTINGS, EnvironmentId, ProjectId } from "@t3tools/contracts";
@@ -155,6 +156,7 @@ it.effect("parks automatic pull until activation without delaying command readin
             Effect.as(undefined),
           ),
         }),
+        Layer.mock(GitManager.GitManager)({ withCheckoutMutation: (_input, effect) => effect }),
         Layer.mock(GitVcsDriver.GitVcsDriver)({
           statusDetails: (root) =>
             Deferred.succeed(statusCalled, root).pipe(

@@ -1,3 +1,5 @@
+import { repositoryExecutionBlockReason } from "@t3tools/client-runtime/fd/multirepo";
+import { useRepositoryWorkspace } from "../../fd/multirepo";
 import type { ComposerTextPaste } from "../../native/T3ComposerEditor.types";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
@@ -491,6 +493,14 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     return report !== null;
   }, [currentModelSelection.instanceId, onShowUsageLimits, props.serverConfig]);
 
+  const repositoryWorkspace = useRepositoryWorkspace(project, props.selectedThread);
+  const repositoryScope = useMemo(
+    () =>
+      repositoryWorkspace.selected && repositoryWorkspace.repositoryTarget
+        ? { repository: repositoryWorkspace.selected, target: repositoryWorkspace.repositoryTarget }
+        : undefined,
+    [repositoryWorkspace.selected, repositoryWorkspace.repositoryTarget],
+  );
   const composerMenu = useComposerCommandMenu({
     draftMessage: props.draftMessage,
     ownerKey: composerOwnerKey,
@@ -498,6 +508,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     threadShells: useThreadShells(),
     currentThreadId: props.selectedThread.id,
     projectCwd: props.projectCwd,
+    repositoryScope,
     pullRequestProjectId: props.serverConfig?.environment.capabilities.pullRequests
       ? (project?.id ?? null)
       : null,
@@ -542,9 +553,16 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     states: uploadStates,
   });
   const contextImports = useAtomValue(composerContextImportsAtom);
+  const repositoryBlockedReason = repositoryExecutionBlockReason({
+    isMultiRepository: repositoryWorkspace.isMultiRepository,
+    serverProtocolVersion: props.serverConfig?.environment.capabilities.multiRepository,
+    provider: selectedProviderStatus,
+    runtimeMode: currentRuntimeMode,
+  });
   const sendBlockedReason =
     (queuedEdit?.saving === true ? "Saving…" : null) ??
     props.sendBlockedReason ??
+    repositoryBlockedReason ??
     (pendingPastedTextAttachmentCount > 0 ? "Attaching pasted text" : null) ??
     attachmentBlockReason;
   const canSend =
@@ -813,6 +831,9 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
           </ComposerPopoverAnchor>
         ) : null}
 
+        {repositoryBlockedReason ? (
+          <Text className="px-3 py-2 text-xs text-muted-foreground">{repositoryBlockedReason}</Text>
+        ) : null}
         {selectedProviderStatus?.compatibilityAdvisory?.message &&
         (selectedProviderStatus.compatibilityAdvisory.status === "unsupported" ||
           selectedProviderStatus.compatibilityAdvisory.status === "broken") ? (

@@ -1,3 +1,14 @@
+import { useRepositoryTerminalOpen } from "../fd/multirepo";
+import {
+  resolveRepositoryFileReference,
+  repositoryTerminalLabel,
+  repositoryFileSurfaceId,
+} from "@t3tools/client-runtime/fd/multirepo";
+import {
+  usesSharedCheckouts,
+  MULTIREPO_CHECKOUT_NOTICE,
+} from "@t3tools/client-runtime/fd/multirepo";
+import { RepositorySelector, openRepositoryFile, useRepositoryWorkspace } from "../fd/multirepo";
 import { ThreadFind, ThreadFindCanvas, type ThreadFindControls } from "./chat/ThreadFindProvider";
 import { isAssistantThread } from "@t3tools/shared/fd/assistant";
 import { AssistantVoiceControls } from "~/fd/assistant";
@@ -1004,7 +1015,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
     () => readEnvironmentScope(threadRef.environmentId, AuthTerminalOperateScope),
     [threadRef.environmentId],
   );
-  const openTerminal = useAtomCommand(terminalEnvironment.open, "terminal open");
+  const openTerminal = useRepositoryTerminalOpen();
   const writeTerminal = useAtomCommand(terminalEnvironment.write, "terminal write");
   const closeTerminalMutation = useAtomCommand(terminalEnvironment.close, "terminal close");
   const serverThread = useThreadShell(threadRef);
@@ -1015,6 +1026,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
       ? scopeProjectRef(draftThread.environmentId, draftThread.projectId)
       : null;
   const project = useProject(projectRef);
+  const repositoryWorkspace = useRepositoryWorkspace(project, serverThread);
   const terminalUiState = useTerminalUiStateStore((state) =>
     selectThreadTerminalUiState(state.terminalUiStateByThreadKey, threadRef),
   );
@@ -1047,11 +1059,16 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
     for (const session of drawerTerminalSessions) {
       next.set(
         session.target.terminalId,
-        resolveTerminalSessionLabel(session.target.terminalId, session.state.summary),
+        repositoryTerminalLabel(
+          resolveTerminalSessionLabel(session.target.terminalId, session.state.summary),
+          session.state.summary?.cwd,
+          project,
+          serverThread,
+        ),
       );
     }
     return next;
-  }, [drawerTerminalSessions]);
+  }, [drawerTerminalSessions, project, serverThread]);
   const terminalLaunchLocationsById = useMemo(() => {
     const next = new Map<
       string,
@@ -1070,10 +1087,9 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
       if (!summary) {
         continue;
       }
-      const worktreePathForLaunch =
-        launchContext !== null ? launchContext.worktreePath : summary.worktreePath;
+      const worktreePathForLaunch = summary.worktreePath;
       next.set(session.target.terminalId, {
-        cwd: launchContext?.cwd ?? summary.cwd,
+        cwd: summary.cwd,
         worktreePath: worktreePathForLaunch,
         runtimeEnv: projectScriptRuntimeEnv({
           project: { cwd: project.workspaceRoot },
@@ -1083,7 +1099,7 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
     }
 
     return next;
-  }, [drawerTerminalSessions, launchContext, project]);
+  }, [drawerTerminalSessions, project]);
   const serverOrderedTerminalIds = useMemo(
     () => drawerTerminalSessions.map((session) => session.target.terminalId),
     [drawerTerminalSessions],
@@ -1143,14 +1159,22 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
   }, [launchContext, worktreePath]);
   const cwd = useMemo(
     () =>
-      launchContext?.cwd ??
-      (project
-        ? projectScriptCwd({
-            project: { cwd: project.workspaceRoot },
-            worktreePath: effectiveWorktreePath,
-          })
-        : null),
-    [effectiveWorktreePath, launchContext?.cwd, project],
+      repositoryWorkspace.isMultiRepository
+        ? repositoryWorkspace.cwd
+        : (launchContext?.cwd ??
+          (project
+            ? projectScriptCwd({
+                project: { cwd: project.workspaceRoot },
+                worktreePath: effectiveWorktreePath,
+              })
+            : null)),
+    [
+      effectiveWorktreePath,
+      launchContext?.cwd,
+      project,
+      repositoryWorkspace.isMultiRepository,
+      repositoryWorkspace.cwd,
+    ],
   );
   const runtimeEnv = useMemo(
     () =>
@@ -1428,11 +1452,11 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
     knownTerminalSessions?.find((session) => session.target.terminalId === surface.activeTerminalId)
       ?.state.summary ?? null;
   const worktreePath =
-    launchContext?.worktreePath ?? activeSummary?.worktreePath ?? threadWorktreePath;
+    activeSummary?.worktreePath ?? launchContext?.worktreePath ?? threadWorktreePath;
   const cwd = useMemo(
     () =>
-      launchContext?.cwd ??
       activeSummary?.cwd ??
+      launchContext?.cwd ??
       (project
         ? projectScriptCwd({
             project: { cwd: project.workspaceRoot },
@@ -1457,10 +1481,18 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
       const summary =
         knownTerminalSessions?.find((session) => session.target.terminalId === terminalId)?.state
           .summary ?? null;
-      labels.set(terminalId, resolveTerminalSessionLabel(terminalId, summary));
+      labels.set(
+        terminalId,
+        repositoryTerminalLabel(
+          resolveTerminalSessionLabel(terminalId, summary),
+          summary?.cwd,
+          project,
+          serverThread,
+        ),
+      );
     }
     return labels;
-  }, [knownTerminalSessions, surface.terminalIds]);
+  }, [knownTerminalSessions, surface.terminalIds, project, serverThread]);
   const terminalLaunchLocationsById = useMemo(() => {
     const locations = new Map<
       string,
@@ -1475,10 +1507,10 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
         knownTerminalSessions?.find((session) => session.target.terminalId === terminalId)?.state
           .summary ?? null;
       const terminalWorktreePath =
-        launchContext?.worktreePath ?? summary?.worktreePath ?? threadWorktreePath;
+        summary?.worktreePath ?? launchContext?.worktreePath ?? threadWorktreePath;
       const terminalCwd =
-        launchContext?.cwd ??
         summary?.cwd ??
+        launchContext?.cwd ??
         (project
           ? projectScriptCwd({
               project: { cwd: project.workspaceRoot },
@@ -1620,7 +1652,7 @@ export default function ChatView(props: ChatViewProps) {
   const removeKeybinding = useAtomCommand(serverEnvironment.removeKeybinding, {
     reportFailure: false,
   });
-  const openTerminal = useAtomCommand(terminalEnvironment.open, "terminal open");
+  const openTerminal = useRepositoryTerminalOpen();
   const writeTerminal = useAtomCommand(terminalEnvironment.write, "terminal write");
   const closeTerminalMutation = useAtomCommand(terminalEnvironment.close, "terminal close");
   const createThread = useOrchestrationCommand(threadEnvironment.create, { reportFailure: false });
@@ -2493,6 +2525,35 @@ export default function ChatView(props: ChatViewProps) {
     [activeThread?.environmentId, activeThread?.projectId],
   );
   const activeProject = useProject(activeProjectRef);
+  const draftUsesSharedCheckouts = !isServerThread && usesSharedCheckouts(activeProject);
+  const repositoryWorkspace = useRepositoryWorkspace(
+    activeProject,
+    isServerThread ? serverThread : null,
+    draftThread?.worktreePath,
+  );
+  const selectedRepositoryScope = useMemo(
+    () =>
+      repositoryWorkspace.selected && repositoryWorkspace.repositoryTarget
+        ? { repository: repositoryWorkspace.selected, target: repositoryWorkspace.repositoryTarget }
+        : undefined,
+    [repositoryWorkspace.selected, repositoryWorkspace.repositoryTarget],
+  );
+  const resolvedPanelFile =
+    renderedRightPanelSurface?.kind === "file"
+      ? renderedRightPanelSurface.repositoryScope
+        ? {
+            path: renderedRightPanelSurface.relativePath,
+            scope: renderedRightPanelSurface.repositoryScope,
+          }
+        : resolveRepositoryFileReference(
+            activeProject,
+            isServerThread ? serverThread : null,
+            renderedRightPanelSurface.relativePath,
+          )
+      : null;
+  const fileRepositoryScope =
+    renderedRightPanelSurface?.kind === "file" ? resolvedPanelFile?.scope : selectedRepositoryScope;
+  const fileWorkspaceCwd = fileRepositoryScope?.repository.rootPath ?? repositoryWorkspace.cwd;
   // Environment settings with the active project's overrides applied.
   const activeProjectSettings = useMemo(
     () => resolveProjectSettings(settings, activeProject?.id ?? null, activeProject ?? undefined),
@@ -2643,7 +2704,7 @@ export default function ChatView(props: ChatViewProps) {
       if (!activeProjectKey) return;
       setPendingFileSurfaceIdsByProject((currentByProject) => {
         const current = currentByProject.get(activeProjectKey) ?? EMPTY_PENDING_FILE_SURFACE_IDS;
-        const surfaceId = `file:${relativePath}`;
+        const surfaceId = repositoryFileSurfaceId(relativePath, fileRepositoryScope);
         if (current.has(surfaceId) === pending) return currentByProject;
         const next = new Set(current);
         if (pending) next.add(surfaceId);
@@ -2654,7 +2715,7 @@ export default function ChatView(props: ChatViewProps) {
         return nextByProject;
       });
     },
-    [activeProjectKey],
+    [activeProjectKey, fileRepositoryScope],
   );
   const configuredPreviewUrls = useMemo(
     () => getConfiguredPreviewUrls(activeProjectScripts),
@@ -2934,13 +2995,14 @@ export default function ChatView(props: ChatViewProps) {
 
   const handlePreparedPullRequestThread = useCallback(
     async (input: { branch: string; worktreePath: string | null }) => {
+      if (repositoryWorkspace.isMultiRepository) return;
       await openOrReuseProjectDraftThread({
         branch: input.branch,
         worktreePath: input.worktreePath,
         envMode: input.worktreePath ? "worktree" : "local",
       });
     },
-    [openOrReuseProjectDraftThread],
+    [openOrReuseProjectDraftThread, repositoryWorkspace.isMultiRepository],
   );
 
   useEffect(() => {
@@ -3300,6 +3362,7 @@ export default function ChatView(props: ChatViewProps) {
     providerStatuses.find((status) => status.instanceId === activeRuntime?.providerInstanceId) ??
     activeProviderStatus;
   const supportsConversationRollback =
+    !repositoryWorkspace.isMultiRepository &&
     canOperateThread &&
     conversationProviderStatus !== null &&
     conversationProviderStatus.supportsConversationRollback !== false;
@@ -4139,19 +4202,14 @@ export default function ChatView(props: ChatViewProps) {
       : JSON.stringify([itemId, latestCheckpointCompletedAt]);
   }, [serverVisibleTurnItems, turnDiffSummaries]);
 
-  const gitCwd = activeProject
-    ? projectScriptCwd({
-        project: { cwd: activeProject.workspaceRoot },
-        worktreePath: activeThread?.worktreePath ?? null,
-      })
-    : null;
+  const gitCwd = repositoryWorkspace.cwd;
   const gitStatusCwd = activeThread?.worktreePath ?? gitCwd;
   const gitStatusQuery = useEnvironmentQuery(
     gitStatusCwd === null
       ? null
       : vcsEnvironment.status({
           environmentId,
-          input: { cwd: gitStatusCwd },
+          input: { cwd: gitStatusCwd, repositoryTarget: repositoryWorkspace.repositoryTarget },
         }),
   );
   useWorkspaceMutationRefresh({
@@ -4243,7 +4301,11 @@ export default function ChatView(props: ChatViewProps) {
   const hasTimelineTopBanner = Boolean(timelineThreadError) || visibleProviderStatus !== null;
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
-  const activeWorkspaceRoot = activeThreadWorktreePath ?? activeProjectCwd ?? undefined;
+  const activeWorkspaceRoot =
+    activeThreadWorktreePath ??
+    serverThread?.workspaceBinding?.defaultCwd ??
+    activeProjectCwd ??
+    undefined;
   useLayoutEffect(() => {
     if (
       threadDetailLoading ||
@@ -4255,10 +4317,10 @@ export default function ChatView(props: ChatViewProps) {
     rememberReadyThreadTimeline({
       threadKey: activeThreadKey,
       entries: timelineEntries,
-      markdownCwd: gitCwd,
+      markdownCwd: activeWorkspaceRoot ?? null,
       workspaceRoot: activeWorkspaceRoot ?? null,
     });
-  }, [activeThreadKey, activeWorkspaceRoot, gitCwd, threadDetailLoading, timelineEntries]);
+  }, [activeThreadKey, activeWorkspaceRoot, threadDetailLoading, timelineEntries]);
   const heldPaintContext = paintOnlyDisplayedTimeline
     ? peekHeldThreadTimeline<typeof timelineEntries>()
     : null;
@@ -4829,7 +4891,7 @@ export default function ChatView(props: ChatViewProps) {
       if (!activeThreadId || !activeProject) {
         return;
       }
-      const cwdForOpen = gitCwd ?? activeProject.workspaceRoot;
+      const cwdForOpen = gitCwd;
       if (!cwdForOpen) {
         return;
       }
@@ -4880,7 +4942,7 @@ export default function ChatView(props: ChatViewProps) {
       ) {
         return;
       }
-      const cwdForOpen = gitCwd ?? activeProject.workspaceRoot;
+      const cwdForOpen = gitCwd;
       if (!cwdForOpen) {
         return;
       }
@@ -4924,7 +4986,7 @@ export default function ChatView(props: ChatViewProps) {
     if (!hasTerminalWriteAccess() || !activeThreadRef || !activeThreadId || !activeProject) {
       return;
     }
-    const cwdForOpen = gitCwd ?? activeProject.workspaceRoot;
+    const cwdForOpen = gitCwd;
     if (!cwdForOpen) {
       return;
     }
@@ -5012,11 +5074,18 @@ export default function ChatView(props: ChatViewProps) {
           return { ...current, [activeProject.id]: script.id };
         });
       }
-      const targetCwd = options?.cwd ?? gitCwd ?? activeProject.workspaceRoot;
+      const targetCwd = options?.cwd ?? gitCwd;
+      if (targetCwd === null) return;
       const baseTerminalId =
         terminalUiState.activeTerminalId || activeKnownTerminalIds[0] || DEFAULT_THREAD_TERMINAL_ID;
       const isBaseTerminalBusy = runningTerminalIds.includes(baseTerminalId);
-      const wantsNewTerminal = Boolean(options?.preferNewTerminal) || isBaseTerminalBusy;
+      const baseLocation = activeThreadKnownSessions.find(
+        (session) => session.target.terminalId === baseTerminalId,
+      )?.state.summary;
+      const wantsNewTerminal =
+        Boolean(options?.preferNewTerminal) ||
+        isBaseTerminalBusy ||
+        (repositoryWorkspace.isMultiRepository && baseLocation?.cwd !== targetCwd);
       const shouldCreateNewTerminal =
         wantsNewTerminal ||
         !canReuseTerminal ||
@@ -5131,6 +5200,8 @@ export default function ChatView(props: ChatViewProps) {
       openPreview,
       hasTerminalWriteAccess,
       activeKnownTerminalIds,
+      activeThreadKnownSessions,
+      repositoryWorkspace.isMultiRepository,
       canReuseTerminal,
       allocateTerminalId,
       runningTerminalIds,
@@ -5622,9 +5693,9 @@ export default function ChatView(props: ChatViewProps) {
   const openFileSurface = useCallback(
     (relativePath: string) => {
       if (!activeThreadRef || !activeProject) return;
-      useRightPanelStore.getState().openFile(activeThreadRef, relativePath);
+      openRepositoryFile(activeThreadRef, relativePath, undefined, fileRepositoryScope);
     },
-    [activeProject, activeThreadRef],
+    [activeProject, activeThreadRef, fileRepositoryScope],
   );
   // The thread's own change request, placed against the project it belongs to. Without a
   // project there is nothing to resolve it against, so the caller falls back to the browser.
@@ -5932,7 +6003,8 @@ export default function ChatView(props: ChatViewProps) {
   ]);
   const addTerminalSurface = useCallback(() => {
     if (!hasTerminalWriteAccess() || !activeThreadRef || !activeThreadId || !activeProject) return;
-    const cwd = gitCwd ?? activeProject.workspaceRoot;
+    const cwd = gitCwd;
+    if (cwd === null) return;
     const terminalId = allocateTerminalId();
     useRightPanelStore.getState().openTerminal(activeThreadRef, terminalId);
     setTerminalFocusRequestId((value) => value + 1);
@@ -5972,7 +6044,8 @@ export default function ChatView(props: ChatViewProps) {
         return;
       }
       const terminalId = allocateTerminalId();
-      const cwd = gitCwd ?? activeProject.workspaceRoot;
+      const cwd = gitCwd;
+      if (cwd === null) return;
       useRightPanelStore
         .getState()
         .splitTerminal(activeThreadRef, activeRightPanelSurface.id, terminalId, direction);
@@ -8521,7 +8594,9 @@ export default function ChatView(props: ChatViewProps) {
       if (!supportsConversationRollback) {
         setThreadError(
           activeThread.id,
-          "This provider does not support reverting conversation history. Start a new thread instead.",
+          repositoryWorkspace.isMultiRepository
+            ? MULTIREPO_CHECKOUT_NOTICE
+            : "This provider does not support reverting conversation history. Start a new thread instead.",
         );
         return;
       }
@@ -8928,6 +9003,13 @@ export default function ChatView(props: ChatViewProps) {
       return;
     }
     const multipleModelSelections = sendCtx.multipleModelSelections;
+    if (multipleModelSelections !== null && repositoryWorkspace.isMultiRepository) {
+      setThreadError(
+        activeThread.id,
+        "Multiple-model launches require worktrees. Select one model for a multi-repository conversation.",
+      );
+      return;
+    }
     if (
       multipleModelSelections !== null &&
       serverConfig?.environment.capabilities.requiredWorktreeBootstrap !== true
@@ -10915,7 +10997,11 @@ export default function ChatView(props: ChatViewProps) {
   );
   const onEnvModeChange = useCallback(
     (mode: DraftThreadEnvMode) => {
-      if (multipleModelSelections !== null) return;
+      if (
+        multipleModelSelections !== null ||
+        (mode === "worktree" && repositoryWorkspace.isMultiRepository)
+      )
+        return;
       if (canOverrideServerThreadEnvMode) {
         setPendingServerThreadEnvMode(mode);
         scheduleComposerFocus();
@@ -10939,6 +11025,7 @@ export default function ChatView(props: ChatViewProps) {
       draftThread?.worktreePath,
       isLocalDraftThread,
       multipleModelSelections,
+      repositoryWorkspace.isMultiRepository,
       activeProjectSettings.settings.newWorktreesStartFromOrigin,
       setPendingServerThreadEnvMode,
       scheduleComposerFocus,
@@ -11069,17 +11156,28 @@ export default function ChatView(props: ChatViewProps) {
     setExpandedImage(preview);
   }, []);
   const onOpenTurnDiff = useCallback(
-    (runId: RunId, filePath?: string) => {
+    (runId: RunId, filePath?: string, repositoryId?: string) => {
       if (!isServerThread || !activeThreadRef) return;
       const diffOpen =
         selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, activeThreadRef) ===
         "diff";
       explicitDiffOpenRef.current = diffOpen ? null : activeThreadRef;
-      useDiffPanelStore.getState().selectTurn(activeThreadRef, runId, filePath);
+      const targetRepositoryId = repositoryWorkspace.isMultiRepository
+        ? (repositoryId ?? repositoryWorkspace.selected?.id)
+        : undefined;
+      if (targetRepositoryId) repositoryWorkspace.selectRepository(targetRepositoryId);
+      useDiffPanelStore.getState().selectTurn(activeThreadRef, runId, filePath, targetRepositoryId);
       useRightPanelStore.getState().open(activeThreadRef, "diff");
       onDiffPanelOpen?.();
     },
-    [activeThreadRef, isServerThread, onDiffPanelOpen],
+    [
+      activeThreadRef,
+      isServerThread,
+      onDiffPanelOpen,
+      repositoryWorkspace.isMultiRepository,
+      repositoryWorkspace.selected?.id,
+      repositoryWorkspace.selectRepository,
+    ],
   );
   const onTimelineRollbackCheckpoint = useCallback(
     (input: { readonly checkpointId: string; readonly scopeId: string }) => {
@@ -11249,45 +11347,53 @@ export default function ChatView(props: ChatViewProps) {
       ((activeProject && activeWorkspaceRoot) ||
         (renderedRightPanelSurface.kind === "file" && renderedRightPanelSurface.attachment)) ? (
       <Suspense fallback={null}>
-        <FilePreviewPanel
-          key={`${activeThread.environmentId}:${
-            renderedRightPanelSurface.kind === "file" && renderedRightPanelSurface.attachment
-              ? `attachment:${renderedRightPanelSurface.attachment.id}`
-              : activeWorkspaceRoot
-          }`}
-          environmentId={activeThread.environmentId}
-          cwd={activeWorkspaceRoot ?? ""}
-          projectName={activeProject?.title ?? ""}
-          threadRef={activeThreadRef}
-          composerDraftTarget={composerDraftTarget}
-          keybindings={keybindings}
-          availableEditors={availableEditors}
-          relativePath={
-            renderedRightPanelSurface.kind === "file"
-              ? renderedRightPanelSurface.relativePath
-              : null
-          }
-          {...(renderedRightPanelSurface.kind === "file" && renderedRightPanelSurface.attachment
-            ? { attachment: renderedRightPanelSurface.attachment }
-            : {})}
-          revealLine={
-            renderedRightPanelSurface.kind === "file"
-              ? (renderedRightPanelSurface.revealLine ?? null)
-              : null
-          }
-          revealRequestId={
-            renderedRightPanelSurface.kind === "file"
-              ? renderedRightPanelSurface.revealRequestId
-              : 0
-          }
-          onOpenFile={openFileSurface}
-          onPendingChange={handleFilePendingChange}
-          selectedFilePending={
-            renderedRightPanelSurface.kind === "file" &&
-            pendingFileSurfaceIds.has(renderedRightPanelSurface.id)
-          }
-          workspaceMutationId={workspaceMutationId}
-        />
+        <div className="flex h-full min-h-0 flex-col">
+          {renderedRightPanelSurface.kind === "files" && repositoryWorkspace.isMultiRepository ? (
+            <div className="p-2">
+              <RepositorySelector workspace={repositoryWorkspace} />
+            </div>
+          ) : null}
+          <FilePreviewPanel
+            key={`${activeThread.environmentId}:${
+              renderedRightPanelSurface.kind === "file" && renderedRightPanelSurface.attachment
+                ? `attachment:${renderedRightPanelSurface.attachment.id}`
+                : `${fileWorkspaceCwd}:${fileRepositoryScope?.repository.id ?? ""}`
+            }`}
+            environmentId={activeThread.environmentId}
+            cwd={fileWorkspaceCwd ?? activeWorkspaceRoot ?? ""}
+            repositoryTarget={fileRepositoryScope?.target}
+            projectName={fileRepositoryScope?.repository.name ?? activeProject?.title ?? ""}
+            threadRef={activeThreadRef}
+            composerDraftTarget={composerDraftTarget}
+            keybindings={keybindings}
+            availableEditors={availableEditors}
+            relativePath={
+              renderedRightPanelSurface.kind === "file"
+                ? (resolvedPanelFile?.path ?? renderedRightPanelSurface.relativePath)
+                : null
+            }
+            {...(renderedRightPanelSurface.kind === "file" && renderedRightPanelSurface.attachment
+              ? { attachment: renderedRightPanelSurface.attachment }
+              : {})}
+            revealLine={
+              renderedRightPanelSurface.kind === "file"
+                ? (renderedRightPanelSurface.revealLine ?? null)
+                : null
+            }
+            revealRequestId={
+              renderedRightPanelSurface.kind === "file"
+                ? renderedRightPanelSurface.revealRequestId
+                : 0
+            }
+            onOpenFile={openFileSurface}
+            onPendingChange={handleFilePendingChange}
+            selectedFilePending={
+              renderedRightPanelSurface.kind === "file" &&
+              pendingFileSurfaceIds.has(renderedRightPanelSurface.id)
+            }
+            workspaceMutationId={workspaceMutationId}
+          />
+        </div>
       </Suspense>
     ) : null
   ) : null;
@@ -11308,6 +11414,7 @@ export default function ChatView(props: ChatViewProps) {
     availableEditors,
     showOpenInPicker,
     gitCwd,
+    repositoryScope: selectedRepositoryScope,
     isGitRepo,
     envLocked,
     availableEnvironments: logicalProjectEnvironments,
@@ -11321,6 +11428,10 @@ export default function ChatView(props: ChatViewProps) {
         : undefined,
     onEnvironmentChange,
     onEnvModeChange,
+    worktreeUnavailableReason:
+      repositoryWorkspace.isMultiRepository || draftUsesSharedCheckouts
+        ? MULTIREPO_CHECKOUT_NOTICE
+        : undefined,
     envMode,
     ...(canOverrideServerThreadEnvMode
       ? {
@@ -11623,7 +11734,9 @@ export default function ChatView(props: ChatViewProps) {
                 onOpenThread={onOpenRelatedThread}
                 parentThreadLink={paintOnlyDisplayedTimeline ? null : parentThreadLink}
                 onForkFromRun={paintOnlyDisplayedTimeline ? async () => {} : onForkFromRun}
-                onRollbackCheckpoint={onTimelineRollbackCheckpoint}
+                onRollbackCheckpoint={
+                  repositoryWorkspace.isMultiRepository ? undefined : onTimelineRollbackCheckpoint
+                }
                 supportsConversationRollback={
                   !paintOnlyDisplayedTimeline && supportsConversationRollback
                 }
@@ -11642,7 +11755,7 @@ export default function ChatView(props: ChatViewProps) {
                 markdownCwd={
                   paintOnlyDisplayedTimeline
                     ? (heldPaintContext?.markdownCwd ?? undefined)
-                    : (gitCwd ?? undefined)
+                    : activeWorkspaceRoot
                 }
                 resolvedTheme={resolvedTheme}
                 timestampFormat={timestampFormat}
@@ -11788,8 +11901,9 @@ export default function ChatView(props: ChatViewProps) {
                               reportedModelSelection={reportedModelSelection}
                               multipleModelSelections={multipleModelSelections}
                               supportsMultipleModels={
+                                !repositoryWorkspace.isMultiRepository &&
                                 serverConfig?.environment.capabilities.requiredWorktreeBootstrap ===
-                                true
+                                  true
                               }
                               onMultipleModelSelectionsChange={setMultipleModelSelections}
                               composerRef={composerRef}
@@ -11828,19 +11942,23 @@ export default function ChatView(props: ChatViewProps) {
                               canResume={resumableRunId !== null || hasHeldQueuedRuns}
                               isRevertingCheckpoint={isRevertingCheckpoint}
                               sendDisabledReason={
-                                !canOperateThread
-                                  ? "This connection cannot change threads."
-                                  : isEnvironmentChanging
-                                    ? "Preparing machine"
-                                    : isRevertingCheckpoint
-                                      ? "Rewinding conversation"
-                                      : feedbackUploading
-                                        ? "Sending feedback"
-                                        : threadDetailLoading
-                                          ? "Messages loading"
-                                          : worktreeSetupBlocksSend
-                                            ? "Preparing worktree"
-                                            : projectCloneSendBlockReason
+                                (repositoryWorkspace.isMultiRepository ||
+                                  draftUsesSharedCheckouts) &&
+                                (envMode === "worktree" || Boolean(draftThread?.worktreePath))
+                                  ? MULTIREPO_CHECKOUT_NOTICE
+                                  : !canOperateThread
+                                    ? "This connection cannot change threads."
+                                    : isEnvironmentChanging
+                                      ? "Preparing machine"
+                                      : isRevertingCheckpoint
+                                        ? "Rewinding conversation"
+                                        : feedbackUploading
+                                          ? "Sending feedback"
+                                          : threadDetailLoading
+                                            ? "Messages loading"
+                                            : worktreeSetupBlocksSend
+                                              ? "Preparing worktree"
+                                              : projectCloneSendBlockReason
                               }
                               isPreparingWorktree={isPreparingWorktree && !sendQueuesBehindSetup}
                               queuedRunsControl={queuedRunsControl}
@@ -11892,7 +12010,14 @@ export default function ChatView(props: ChatViewProps) {
                               settings={settings}
                               keybindings={keybindings}
                               terminalOpen={Boolean(terminalUiState.terminalOpen)}
-                              gitCwd={gitCwd}
+                              gitCwd={activeWorkspaceRoot ?? null}
+                              repositoryScope={selectedRepositoryScope}
+                              multiRepository={
+                                repositoryWorkspace.isMultiRepository || draftUsesSharedCheckouts
+                              }
+                              repositoryProtocol={
+                                serverConfig?.environment.capabilities.multiRepository
+                              }
                               pullRequestProjectId={
                                 supportsPullRequests ? (activeProject?.id ?? null) : null
                               }
@@ -11984,6 +12109,11 @@ export default function ChatView(props: ChatViewProps) {
                                 showGitControls={isGitRepo}
                                 {...(routeKind === "draft" && draftId ? { draftId } : {})}
                                 onEnvModeChange={onEnvModeChange}
+                                worktreeUnavailableReason={
+                                  repositoryWorkspace.isMultiRepository
+                                    ? MULTIREPO_CHECKOUT_NOTICE
+                                    : undefined
+                                }
                                 startFromOrigin={startFromOrigin}
                                 onStartFromOriginChange={onStartFromOriginChange}
                                 envMode={envMode}
@@ -12080,7 +12210,11 @@ export default function ChatView(props: ChatViewProps) {
                 open
                 environmentId={activeThread.environmentId}
                 threadId={activeThread.id}
-                cwd={activeProject?.workspaceRoot ?? null}
+                cwd={repositoryWorkspace.cwd}
+                repositoryTarget={repositoryWorkspace.repositoryTarget}
+                worktreeUnavailableReason={
+                  repositoryWorkspace.isMultiRepository ? MULTIREPO_CHECKOUT_NOTICE : undefined
+                }
                 initialReference={pullRequestDialogState.initialReference}
                 onOpenChange={(open) => {
                   if (!open) {
@@ -12275,6 +12409,7 @@ export default function ChatView(props: ChatViewProps) {
       threadRef={activeThreadRef}
       cwd={activeWorkspaceRoot}
       checkpoints={serverProjection?.checkpoints}
+      checkpointScopes={serverProjection?.checkpointScopes}
     >
       {content}
     </FileMetadataThreadProvider>

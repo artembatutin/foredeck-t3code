@@ -30,6 +30,28 @@ beforeEach(() => {
 });
 
 describe("rightPanelStore", () => {
+  it("retains independent same-name file tabs and their repository binding", () => {
+    const scope = (id: string) => ({
+      repository: { id, name: id, rootPath: `/${id}` },
+      target: { type: "thread" as const, threadId: refA.threadId, repositoryId: id },
+    });
+    const store = useRightPanelStore.getState();
+    store.openFile(refA, "src/index.ts", 10, scope("server"));
+    store.openFile(refA, "src/index.ts", 30, scope("client"));
+    const state = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(state.surfaces).toHaveLength(2);
+    expect(state.surfaces[0]).toMatchObject({
+      relativePath: "src/index.ts",
+      revealLine: 10,
+      repositoryScope: scope("server"),
+    });
+    expect(state.surfaces[1]).toMatchObject({
+      relativePath: "src/index.ts",
+      revealLine: 30,
+      repositoryScope: scope("client"),
+    });
+    expect(state.surfaces[0]?.id).not.toBe(state.surfaces[1]?.id);
+  });
   it("records single and bulk tab closes, newest first", () => {
     const store = useRightPanelStore.getState();
     const pr = pullRequestSurface({

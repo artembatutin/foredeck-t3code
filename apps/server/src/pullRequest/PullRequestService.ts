@@ -1,3 +1,4 @@
+import { projectCheckouts } from "../fd/multirepo/index.ts";
 import {
   canonicalRepositoryKey,
   isSshRemoteUrl,
@@ -817,7 +818,7 @@ export const make = Effect.gen(function* () {
       ),
       Effect.flatMap((projects) =>
         Effect.forEach(
-          projects,
+          projects.flatMap(projectCheckouts),
           (project) =>
             project.repositoryIdentity != null
               ? Effect.succeed(project)
@@ -911,9 +912,14 @@ export const make = Effect.gen(function* () {
   const requireProject = (ref: PullRequestRef): Effect.Effect<SupportedProject, PullRequestError> =>
     listWorkspaceProjects({ projectId: ref.projectId }).pipe(
       Effect.flatMap(({ supported }): Effect.Effect<SupportedProject, PullRequestError> => {
-        const own = supported[0];
         const repository = ref.repository.trim();
         const host = ref.host?.trim().toLowerCase();
+        const own =
+          supported.find(
+            (candidate) =>
+              candidate.repository.toLowerCase() === repository.toLowerCase() &&
+              (host === undefined || candidate.host === host),
+          ) ?? supported[0];
         if (own !== undefined && own.repository.toLowerCase() === repository.toLowerCase()) {
           // Hostless references only ever meant the project's own repository, and a hosted one
           // naming it still is; either way the project serves itself.

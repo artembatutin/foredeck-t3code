@@ -14,6 +14,7 @@ import * as Schema from "effect/Schema";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProjectStore from "./ProjectStore.ts";
+import { RepositorySet, resolveRuntimeWorkspace } from "../fd/multirepo/index.ts";
 
 /**
  * ERRORS
@@ -24,9 +25,11 @@ export class RuntimePolicyResolveError extends Schema.TaggedError<RuntimePolicyR
     projectId: ProjectId,
     providerInstanceId: ProviderInstanceId,
     cause: Schema.optional(Schema.Defect()),
+    detail: Schema.optional(Schema.String),
   },
 ) {
   override get message(): string {
+    if (this.detail !== undefined) return this.detail;
     return `Failed to resolve runtime policy for provider instance ${this.providerInstanceId} in project ${this.projectId}.`;
   }
 }
@@ -90,11 +93,14 @@ function providerRuntimeMode(
 export const layerFromProjectStore: Layer.Layer<
   RuntimePolicyV2,
   never,
-  ProjectStore.ProjectStoreV2 | ProviderInstanceRegistry.ProviderInstanceRegistry
+  | ProjectStore.ProjectStoreV2
+  | ProviderInstanceRegistry.ProviderInstanceRegistry
+  | RepositorySet.RepositorySet
 > = Layer.effect(
   RuntimePolicyV2,
   Effect.gen(function* () {
     const projects = yield* ProjectStore.ProjectStoreV2;
+    const repositories = yield* RepositorySet.RepositorySet;
     const providerInstances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
     return RuntimePolicyV2.of({
       resolve: Effect.fn("RuntimePolicyV2.resolve")(function* (input) {
@@ -103,6 +109,51 @@ export const layerFromProjectStore: Layer.Layer<
           instance === undefined
             ? undefined
             : (yield* instance.snapshot.getSnapshot).supportedRuntimeModes;
+        if (input.thread.workspaceBinding !== undefined) {
+          const binding = input.thread.workspaceBinding;
+          const workspace = yield* Effect.gen(function* () {
+            if (
+              RepositorySet.isMultiRepo(binding.repositories) &&
+              supportedRuntimeModes !== undefined &&
+              supportedRuntimeModes.length > 0 &&
+              !supportedRuntimeModes.includes(input.thread.runtimeMode)
+            )
+              return yield* new RuntimePolicyResolveError({
+                projectId: input.thread.projectId,
+                providerInstanceId: input.modelSelection.instanceId,
+                detail:
+                  "The selected permission mode is unavailable for this multi-repository provider. Choose a supported mode.",
+              });
+            const capabilities =
+              RepositorySet.isMultiRepo(binding.repositories) && instance !== undefined
+                ? yield* instance.orchestrationAdapter.getCapabilities()
+                : undefined;
+            return yield* resolveRuntimeWorkspace({
+              binding,
+              worktreePath: input.thread.worktreePath,
+              runtimeMode: input.thread.runtimeMode,
+              capabilities,
+            });
+          }).pipe(
+            Effect.provideService(RepositorySet.RepositorySet, repositories),
+            Effect.mapError(
+              (cause) =>
+                new RuntimePolicyResolveError({
+                  projectId: input.thread.projectId,
+                  providerInstanceId: input.modelSelection.instanceId,
+                  detail: cause.message,
+                  cause,
+                }),
+            ),
+          );
+          return ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode: RepositorySet.isMultiRepo(binding.repositories)
+              ? input.thread.runtimeMode
+              : providerRuntimeMode(input.thread.runtimeMode, supportedRuntimeModes),
+            interactionMode: input.thread.interactionMode,
+            ...workspace,
+          });
+        }
         const cwd =
           input.thread.worktreePath ??
           (yield* projects.get(input.thread.projectId).pipe(
@@ -148,21 +199,36 @@ export function layerWithOverride(
       return {
         resolve: (input) =>
           base.resolve(input).pipe(
-            Effect.map((policy) =>
-              ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
-                ...policy,
-                ...(override.cwd === undefined ? {} : { cwd: override.cwd }),
-                ...(override.approvalPolicy === undefined
-                  ? {}
-                  : { approvalPolicy: override.approvalPolicy }),
-                ...(override.sandboxPolicy === undefined
-                  ? {}
-                  : { sandboxPolicy: override.sandboxPolicy }),
-                ...(override.reasoningEffort === undefined
-                  ? {}
-                  : { reasoningEffort: override.reasoningEffort }),
-              }),
-            ),
+            Effect.flatMap((policy) => {
+              if (
+                RepositorySet.isMultiRepo(policy.repositories) &&
+                ((override.cwd !== undefined && override.cwd !== policy.cwd) ||
+                  override.sandboxPolicy !== undefined)
+              )
+                return Effect.fail(
+                  new RuntimePolicyResolveError({
+                    projectId: input.thread.projectId,
+                    providerInstanceId: input.modelSelection.instanceId,
+                    detail:
+                      "A multi-repository thread's directories and sandbox roots cannot be overridden.",
+                  }),
+                );
+              return Effect.succeed(
+                ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+                  ...policy,
+                  ...(override.cwd === undefined ? {} : { cwd: override.cwd }),
+                  ...(override.approvalPolicy === undefined
+                    ? {}
+                    : { approvalPolicy: override.approvalPolicy }),
+                  ...(override.sandboxPolicy === undefined
+                    ? {}
+                    : { sandboxPolicy: override.sandboxPolicy }),
+                  ...(override.reasoningEffort === undefined
+                    ? {}
+                    : { reasoningEffort: override.reasoningEffort }),
+                }),
+              );
+            }),
           ),
       } satisfies RuntimePolicyV2Shape;
     }),

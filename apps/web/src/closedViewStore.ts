@@ -1,3 +1,4 @@
+import { isRepositoryFileScope } from "@t3tools/client-runtime/fd/multirepo";
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import {
   ChatFileAttachment,
@@ -71,7 +72,8 @@ const isClosedViewEntry = (entry: unknown): entry is ClosedViewEntry => {
         typeof surface.relativePath === "string" &&
         (surface.revealLine === null || Number.isSafeInteger(surface.revealLine)) &&
         Number.isSafeInteger(surface.revealRequestId) &&
-        (surface.attachment === undefined || isAttachment(surface.attachment))
+        (surface.attachment === undefined || isAttachment(surface.attachment)) &&
+        (surface.repositoryScope === undefined || isRepositoryFileScope(surface.repositoryScope))
       );
     case "device":
       return (

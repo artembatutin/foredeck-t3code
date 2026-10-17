@@ -1,3 +1,4 @@
+import { loadRepositoryStatuses, type RepositoryStatusInput } from "../fd/multirepo/index.ts";
 import {
   type EnvironmentId,
   type VcsListRefsInput,
@@ -17,6 +18,7 @@ import { Atom, AtomRegistry } from "effect/reactivity";
 
 import {
   createEnvironmentRpcCommand,
+  createEnvironmentQueryAtomFamily,
   createEnvironmentRpcSubscriptionAtomFamily,
   createEnvironmentSubscriptionAtomFamily,
 } from "./runtime.ts";
@@ -46,6 +48,7 @@ const VCS_REFS_RETRY_SCHEDULE = Schedule.exponential("1 second").pipe(
 
 function canUseVcsRefsCache(input: VcsListRefsInput): boolean {
   return (
+    input.repositoryTarget === undefined &&
     input.query === undefined &&
     input.cursor === undefined &&
     input.includeMatchingRemoteRefs === undefined &&
@@ -279,6 +282,13 @@ export function createVcsEnvironmentAtoms<R, E>(
     });
 
   return {
+    repositoryStatus: createEnvironmentQueryAtomFamily(runtime, {
+      label: "repositories:status-overview",
+      execute: (input: RepositoryStatusInput) =>
+        loadRepositoryStatuses(input, (target) => subscribe(WS_METHODS.subscribeVcsStatus, target)),
+      idleTtlMs: 0,
+      staleTimeMs: 0,
+    }),
     listRefs,
     status: createEnvironmentSubscriptionAtomFamily(runtime, {
       label: "environment-data:vcs:status",

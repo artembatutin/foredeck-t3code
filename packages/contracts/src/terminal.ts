@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { RepositoryTarget, RepositoryTargetError } from "./project.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 /**
@@ -39,6 +40,7 @@ export type TerminalSessionInput = Schema.Codec.Encoded<typeof TerminalSessionIn
 
 export const TerminalOpenInput = Schema.Struct({
   ...TerminalSessionInput.fields,
+  repositoryTarget: Schema.optional(RepositoryTarget),
   cwd: TrimmedNonEmptyStringSchema,
   worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
   cols: Schema.optional(TerminalColsSchema),
@@ -50,6 +52,7 @@ export type TerminalOpenInput = typeof TerminalOpenInput.Type;
 
 export const TerminalAttachInput = Schema.Struct({
   ...TerminalSessionInput.fields,
+  repositoryTarget: Schema.optional(RepositoryTarget),
   cwd: Schema.optional(TrimmedNonEmptyStringSchema),
   worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
   cols: Schema.optional(TerminalColsSchema),
@@ -81,6 +84,7 @@ export type TerminalClearInput = Schema.Codec.Encoded<typeof TerminalClearInput>
 
 export const TerminalRestartInput = Schema.Struct({
   ...TerminalSessionInput.fields,
+  repositoryTarget: Schema.optional(RepositoryTarget),
   cwd: TrimmedNonEmptyStringSchema,
   worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
   cols: TerminalColsSchema,
@@ -372,6 +376,7 @@ export class TerminalResizeError extends Schema.TaggedError<TerminalResizeError>
 }
 
 export const TerminalError = Schema.Union([
+  RepositoryTargetError,
   TerminalCwdError,
   TerminalHistoryError,
   TerminalSessionLookupError,

@@ -606,9 +606,9 @@ function surfaceTitle(
     case "files":
       return "Files";
     case "file":
-      return surface.relativePath.slice(
+      return `${surface.repositoryScope ? `${surface.repositoryScope.repository.name} · ` : ""}${surface.relativePath.slice(
         Math.max(surface.relativePath.lastIndexOf("/"), surface.relativePath.lastIndexOf("\\")) + 1,
-      );
+      )}`;
     case "terminal":
       return (
         terminalLabelsById.get(surface.activeTerminalId) ??

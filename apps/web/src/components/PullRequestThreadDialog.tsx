@@ -1,6 +1,7 @@
 import {
   AuthOrchestrationOperateScope,
   type EnvironmentId,
+  type RepositoryTarget,
   type ThreadId,
 } from "@t3tools/contracts";
 import {
@@ -39,6 +40,8 @@ interface PullRequestThreadDialogProps {
   environmentId: EnvironmentId;
   threadId: ThreadId;
   cwd: string | null;
+  repositoryTarget?: RepositoryTarget | undefined;
+  worktreeUnavailableReason?: string | undefined;
   initialReference: string | null;
   onOpenChange: (open: boolean) => void;
   onPrepared: (input: { branch: string; worktreePath: string | null }) => Promise<void> | void;
@@ -50,6 +53,8 @@ export function PullRequestThreadDialog({
   threadId,
   cwd,
   initialReference,
+  repositoryTarget,
+  worktreeUnavailableReason,
   onOpenChange,
   onPrepared,
 }: PullRequestThreadDialogProps) {
@@ -68,7 +73,7 @@ export function PullRequestThreadDialog({
       ? null
       : vcsEnvironment.status({
           environmentId,
-          input: { cwd },
+          input: { cwd, repositoryTarget },
         }),
   );
   const sourceControlPresentation = useMemo(
@@ -95,8 +100,9 @@ export function PullRequestThreadDialog({
     () => ({
       environmentId,
       cwd,
+      repositoryTarget,
     }),
-    [cwd, environmentId],
+    [cwd, environmentId, repositoryTarget],
   );
   const pullRequestResolution = usePullRequestResolution({
     ...sourceControlScope,
@@ -141,7 +147,11 @@ export function PullRequestThreadDialog({
 
   const handleConfirm = useCallback(
     async (mode: "local" | "worktree") => {
-      if (!preparePullRequestThreadAction.isAllowed) return;
+      if (
+        !preparePullRequestThreadAction.isAllowed ||
+        (mode === "worktree" && worktreeUnavailableReason)
+      )
+        return;
       if (
         mode === "worktree" &&
         !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)
@@ -192,6 +202,7 @@ export function PullRequestThreadDialog({
       resolvedPullRequest,
       terminology.singular,
       threadId,
+      worktreeUnavailableReason,
     ],
   );
 
@@ -285,6 +296,9 @@ export function PullRequestThreadDialog({
             </div>
           ) : null}
 
+          {worktreeUnavailableReason ? (
+            <p className="text-xs text-muted-foreground">{worktreeUnavailableReason}</p>
+          ) : null}
           {errorMessage ? <p className="text-destructive text-xs">{errorMessage}</p> : null}
         </DialogPanel>
         <DialogFooter>
@@ -319,6 +333,7 @@ export function PullRequestThreadDialog({
             disabled={
               !preparePullRequestThreadAction.isAllowed ||
               !canOperateThread ||
+              !!worktreeUnavailableReason ||
               !cwd ||
               !resolvedPullRequest ||
               isResolving ||

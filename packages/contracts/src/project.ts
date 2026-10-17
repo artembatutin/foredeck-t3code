@@ -10,6 +10,7 @@ import {
   NonNegativeInt,
   PositiveInt,
   ProjectId,
+  ThreadId,
   TrimmedNonEmptyString,
   TrimmedString,
   type UnknownUnionMember,
@@ -162,11 +163,65 @@ export const ReceivedProjectIcon = ForwardCompatibleUnion(projectIconMembers, "k
   ),
 );
 
+/** Stable checkout identity; names and server paths are captured in thread bindings. */
+export const ProjectRepository = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  name: TrimmedNonEmptyString,
+  rootPath: TrimmedNonEmptyString,
+});
+export type ProjectRepository = typeof ProjectRepository.Type;
+
+export const ProjectRepositories = Schema.Array(ProjectRepository).check(Schema.isMaxLength(16));
+
+/** Existing ids may be renamed, but must never be assigned to another checkout. */
+export const ProjectRepositoryInput = Schema.Struct({
+  id: Schema.optional(TrimmedNonEmptyString),
+  name: TrimmedNonEmptyString,
+  rootPath: TrimmedNonEmptyString,
+});
+export type ProjectRepositoryInput = typeof ProjectRepositoryInput.Type;
+export const ProjectRepositoryInputs = Schema.Array(ProjectRepositoryInput).check(
+  Schema.isMaxLength(16),
+);
+export type ProjectRepositoryInputs = typeof ProjectRepositoryInputs.Type;
+
+export const ThreadWorkspaceBinding = Schema.Struct({
+  version: Schema.Literal(1),
+  defaultCwd: TrimmedNonEmptyString,
+  repositories: ProjectRepositories,
+});
+export type ThreadWorkspaceBinding = typeof ThreadWorkspaceBinding.Type;
+
+/** Identity is resolved on the destination server; a path never selects membership. */
+export const RepositoryTarget = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("project"),
+    projectId: ProjectId,
+    repositoryId: TrimmedNonEmptyString,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("thread"),
+    threadId: ThreadId,
+    repositoryId: TrimmedNonEmptyString,
+  }),
+]);
+export type RepositoryTarget = typeof RepositoryTarget.Type;
+
+export class RepositoryTargetError extends Schema.TaggedError<RepositoryTargetError>()(
+  "RepositoryTargetError",
+  { detail: Schema.String, cause: Schema.optional(Schema.Defect()) },
+) {
+  override get message() {
+    return this.detail;
+  }
+}
+
 export const Project = Schema.Struct({
   id: ProjectId,
   title: TrimmedNonEmptyString,
   workspaceRoot: TrimmedNonEmptyString,
   repositoryIdentity: Schema.optional(Schema.NullOr(RepositoryIdentity)),
+  repositories: Schema.optional(ProjectRepositories),
   faviconPath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   projectIcon: Schema.optional(Schema.NullOr(ReceivedProjectIcon)),
   defaultModelSelection: Schema.NullOr(ModelSelection),
@@ -197,6 +252,7 @@ export const ProjectChange = Schema.Union([
 export type ProjectChange = typeof ProjectChange.Type;
 
 export const ProjectCreatePayload = Schema.Struct({
+  repositories: Schema.optional(ProjectRepositoryInputs),
   title: TrimmedNonEmptyString,
   workspaceRoot: TrimmedNonEmptyString,
   createWorkspaceRootIfMissing: Schema.optional(Schema.Boolean),
@@ -206,6 +262,7 @@ export const ProjectCreatePayload = Schema.Struct({
 export type ProjectCreatePayload = typeof ProjectCreatePayload.Type;
 
 export const ProjectUpdatePayload = Schema.Struct({
+  repositories: Schema.optional(ProjectRepositoryInputs),
   title: Schema.optional(TrimmedNonEmptyString),
   workspaceRoot: Schema.optional(TrimmedNonEmptyString),
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
@@ -216,6 +273,13 @@ export const ProjectUpdatePayload = Schema.Struct({
   scripts: Schema.optional(Schema.Array(ProjectScript)),
 });
 export type ProjectUpdatePayload = typeof ProjectUpdatePayload.Type;
+
+/** Changes membership on one environment; existing threads keep their saved binding. */
+export const ProjectSetRepositoriesInput = Schema.Struct({
+  projectId: ProjectId,
+  repositories: ProjectRepositoryInputs,
+});
+export type ProjectSetRepositoriesInput = typeof ProjectSetRepositoriesInput.Type;
 
 export const ProjectMutation = Schema.Union([
   Schema.Struct({
@@ -252,6 +316,7 @@ export const ProjectEntryKind = Schema.Literals(["file", "directory"]);
 export type ProjectEntryKind = typeof ProjectEntryKind.Type;
 
 export const ProjectSearchEntriesInput = Schema.Struct({
+  repositoryTarget: Schema.optional(RepositoryTarget),
   cwd: TrimmedNonEmptyString,
   // An empty query is a bounded browse: the index returns frecency-ordered
   // entries, which the file picker uses for its initial results.
@@ -276,6 +341,7 @@ export const ProjectSearchEntriesResult = Schema.Struct({
 export type ProjectSearchEntriesResult = typeof ProjectSearchEntriesResult.Type;
 
 export const ProjectSearchContentsInput = Schema.Struct({
+  repositoryTarget: Schema.optional(RepositoryTarget),
   cwd: TrimmedNonEmptyString,
   // Whitespace is significant in content queries (" foo", regex trailing
   // spaces), so the query is deliberately not trimmed on the wire.
@@ -309,6 +375,7 @@ export const ProjectSearchContentsResult = Schema.Struct({
 export type ProjectSearchContentsResult = typeof ProjectSearchContentsResult.Type;
 
 export const ProjectListEntriesInput = Schema.Struct({
+  repositoryTarget: Schema.optional(RepositoryTarget),
   cwd: TrimmedNonEmptyString,
   // Present for immediate filesystem children, including ignored entries; empty means root.
   // Omitted preserves the indexed recursive listing used by older clients.
@@ -434,6 +501,7 @@ export class ProjectListEntriesError extends Schema.TaggedError<ProjectListEntri
 }
 
 export const ProjectReadFileInput = Schema.Struct({
+  repositoryTarget: Schema.optional(RepositoryTarget),
   cwd: TrimmedNonEmptyString,
   // Workspace-relative, or an absolute host path for a file outside the
   // workspace. Only workspace-relative paths can be written back.
@@ -507,6 +575,7 @@ export class ProjectReadFileError extends Schema.TaggedError<ProjectReadFileErro
 }
 
 export const ProjectWriteFileInput = Schema.Struct({
+  repositoryTarget: Schema.optional(RepositoryTarget),
   cwd: TrimmedNonEmptyString,
   relativePath: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_WRITE_FILE_PATH_MAX_LENGTH)),
   contents: Schema.String,

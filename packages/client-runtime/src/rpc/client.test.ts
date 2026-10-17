@@ -2,6 +2,8 @@ import {
   DEFAULT_SERVER_SETTINGS,
   EnvironmentAuthorizationError,
   EnvironmentId,
+  ProjectId,
+  type ServerConfig,
   type RelayClientInstallProgressEvent,
   type ServerConfigStreamEvent,
   type ServerLifecycleStreamEvent,
@@ -32,6 +34,7 @@ import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import {
   EnvironmentRpcRequestObserver,
+  EnvironmentRpcUnavailableError,
   request,
   runStream,
   subscribe,
@@ -89,6 +92,100 @@ const makeHarness = Effect.fn("TestEnvironmentRpc.makeHarness")(function* () {
 });
 
 describe("environment RPC", () => {
+  it.effect("rejects repository reads and subscriptions before sending to an older server", () =>
+    Effect.gen(function* () {
+      let reads = 0;
+      const client = {
+        [WS_METHODS.projectsReadFile]: () =>
+          Effect.sync(() => {
+            reads++;
+            return {
+              relativePath: "src/index.ts",
+              contents: "selected",
+              byteLength: 8,
+              truncated: false,
+            };
+          }),
+        [WS_METHODS.subscribeVcsStatus]: () =>
+          Stream.die("an unsupported repository subscription must not be sent"),
+      } as unknown as WsRpcProtocolClient;
+      const { activeSession, supervisor } = yield* makeHarness();
+      const config: ServerConfig = {
+        environment: {
+          environmentId: TARGET.environmentId,
+          label: TARGET.label,
+          platform: { os: "darwin", arch: "arm64" },
+          serverVersion: "test",
+          capabilities: { repositoryIdentity: true },
+        },
+        auth: {
+          policy: "loopback-browser",
+          bootstrapMethods: ["one-time-token"],
+          sessionMethods: ["browser-session-cookie", "bearer-access-token"],
+          sessionCookieName: "test",
+        },
+        cwd: "/repository",
+        keybindingsConfigPath: "/repository/keys.json",
+        keybindings: [],
+        issues: [],
+        providers: [],
+        availableEditors: [],
+        observability: {
+          logsDirectoryPath: "/logs",
+          localTracingEnabled: false,
+          otlpTracesEnabled: false,
+          otlpMetricsEnabled: false,
+          otlpLogsEnabled: false,
+        },
+        settings: DEFAULT_SERVER_SETTINGS,
+      };
+      const input = {
+        cwd: "/repository",
+        relativePath: "src/index.ts",
+        repositoryTarget: {
+          type: "project" as const,
+          projectId: ProjectId.make("project"),
+          repositoryId: "service",
+        },
+      };
+      yield* SubscriptionRef.set(
+        activeSession,
+        Option.some({ ...session(client), initialConfig: Effect.succeed(config) }),
+      );
+      yield* Effect.gen(function* () {
+        expect(yield* request(WS_METHODS.projectsReadFile, input).pipe(Effect.flip)).toBeInstanceOf(
+          EnvironmentRpcUnavailableError,
+        );
+        expect(
+          yield* subscribe(WS_METHODS.subscribeVcsStatus, input).pipe(Stream.runHead, Effect.flip),
+        ).toBeInstanceOf(EnvironmentRpcUnavailableError);
+        expect(reads).toBe(0);
+        // Legacy single-repository requests still work against the same server.
+        expect(
+          (yield* request(WS_METHODS.projectsReadFile, {
+            cwd: input.cwd,
+            relativePath: input.relativePath,
+          })).contents,
+        ).toBe("selected");
+        yield* SubscriptionRef.set(
+          activeSession,
+          Option.some({
+            ...session(client),
+            initialConfig: Effect.succeed({
+              ...config,
+              environment: {
+                ...config.environment,
+                capabilities: { ...config.environment.capabilities, multiRepository: 1 },
+              },
+            }),
+          }),
+        );
+        expect((yield* request(WS_METHODS.projectsReadFile, input)).contents).toBe("selected");
+        expect(reads).toBe(2);
+      }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+    }),
+  );
+
   it.effect("reuses the session config stream instead of opening a duplicate subscription", () =>
     Effect.gen(function* () {
       const event: ServerConfigStreamEvent = {

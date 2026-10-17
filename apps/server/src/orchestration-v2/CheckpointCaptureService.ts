@@ -1,7 +1,10 @@
+import { RepositoryCheckpoints, RepositorySet } from "../fd/multirepo/index.ts";
 import {
   CheckpointScopeId,
   CommandId,
   type OrchestrationV2Checkpoint,
+  type RepositoryTurnCheckpoint,
+  type OrchestrationV2DomainEvent,
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2Run,
@@ -56,6 +59,7 @@ export const layer: Layer.Layer<
   CheckpointCaptureServiceV2,
   Effect.gen(function* () {
     const checkpoints = yield* CheckpointService.CheckpointServiceV2;
+    const repositoryCheckpoints = yield* RepositoryCheckpoints.make;
     const eventSink = yield* EventSink.EventSinkV2;
     const ids = yield* IdAllocator.IdAllocatorV2;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -65,11 +69,12 @@ export const layer: Layer.Layer<
       readonly runId: RunId;
       readonly scopeId: CheckpointScopeId;
     }) {
-      const { run, rootNode, scope, providerThread, readyCheckpointOrdinals } =
+      const { run, rootNode, scope, providerThread, readyCheckpointOrdinals, recordedCheckpoints } =
         yield* projections.getCheckpointCaptureContext(input.threadId, input);
       // A stopped run is already terminal. Its checkpoint is the rollback point
       // for the message after it, so capture leaves its status alone.
-      const stopped = run?.status === "interrupted" || run?.status === "cancelled";
+      const stopped =
+        run?.status === "interrupted" || run?.status === "cancelled" || run?.status === "failed";
 
       // The effect is at-least-once. A settled run with a checkpoint proves
       // that an earlier execution committed its result.
@@ -105,8 +110,14 @@ export const layer: Layer.Layer<
 
       const capturedAt = yield* DateTime.now;
       const baselineOrdinalWithinScope = Math.max(0, run.ordinal - 1);
+      const multiRepository = RepositorySet.isMultiRepo(scope.repositories);
+      // A later baseline must never relabel an earlier missing snapshot as ready.
       const hasReadyCheckpoint = (ordinalWithinScope: number) =>
-        readyCheckpointOrdinals.includes(ordinalWithinScope);
+        multiRepository && recordedCheckpoints !== undefined
+          ? recordedCheckpoints.some(
+              (entry) => entry.scopeId === scope.id && entry.ordinal === ordinalWithinScope,
+            )
+          : readyCheckpointOrdinals.includes(ordinalWithinScope);
       const threadStartCheckpoint =
         baselineOrdinalWithinScope === 0 || hasReadyCheckpoint(0)
           ? null
@@ -128,12 +139,52 @@ export const layer: Layer.Layer<
         appRunOrdinal: run.ordinal,
         capturedAt,
       });
+      const additional = multiRepository
+        ? yield* repositoryCheckpoints.captureAdditional({
+            root: scope,
+            run,
+            capturedAt,
+            recorded: recordedCheckpoints ?? [],
+          })
+        : [];
       // Match RunExecutionService: capture loaded the waiting run before
       // materializing baselines. Omit delegatedCompletion so a newer cohort
       // write during capture is not overwritten by this stale snapshot
       // (ProjectionStore preserves the field when absent from the payload).
       const { delegatedCompletion: _delegatedCompletion, ...runWithoutDelegatedCompletion } = run;
       const commandId = CommandId.make(`command:effect:checkpoint.capture:${run.id}`);
+      const repositoryEvents = (yield* Effect.forEach(
+        additional,
+        ({ scope: repositoryScope, checkpoints: snapshots }) =>
+          Effect.gen(function* () {
+            const events: OrchestrationV2DomainEvent[] = [
+              {
+                id: yield* ids.allocate.event({ threadId: input.threadId, commandId }),
+                type: "checkpoint-scope.created",
+                threadId: input.threadId,
+                runId: run.id,
+                nodeId: rootNode.id,
+                driver: providerThread.driver,
+                providerInstanceId: run.providerInstanceId,
+                occurredAt: capturedAt,
+                payload: repositoryScope,
+              },
+            ];
+            for (const snapshot of snapshots)
+              events.push({
+                id: yield* ids.allocate.event({ threadId: input.threadId, commandId }),
+                type: "checkpoint.captured",
+                threadId: input.threadId,
+                ...(snapshot.runId === null ? {} : { runId: snapshot.runId }),
+                nodeId: snapshot.nodeId,
+                driver: providerThread.driver,
+                providerInstanceId: run.providerInstanceId,
+                occurredAt: capturedAt,
+                payload: snapshot,
+              });
+            return events;
+          }),
+      )).flat();
       yield* eventSink.commitCommand({
         commandId,
         threadId: input.threadId,
@@ -141,6 +192,7 @@ export const layer: Layer.Layer<
         acceptedAt: capturedAt,
         effects: [],
         events: [
+          ...repositoryEvents,
           ...(threadStartCheckpoint === null
             ? []
             : [
@@ -195,6 +247,27 @@ export const layer: Layer.Layer<
               rootNode,
               providerThread,
               checkpoint,
+              ...(multiRepository
+                ? {
+                    repositoryCheckpoints: [
+                      RepositoryCheckpoints.turnSummary({
+                        scope,
+                        checkpoint,
+                        baselines: [threadStartCheckpoint, baselineCheckpoint].filter(
+                          (entry) => entry !== null,
+                        ),
+                        recorded: recordedCheckpoints ?? [],
+                      }),
+                      ...additional.map((entry) =>
+                        RepositoryCheckpoints.turnSummary({
+                          ...entry,
+                          baselines: entry.checkpoints,
+                          recorded: recordedCheckpoints ?? [],
+                        }),
+                      ),
+                    ].filter((entry) => entry !== undefined),
+                  }
+                : {}),
               completedAt: capturedAt,
             }),
           },
@@ -257,6 +330,7 @@ function makeCheckpointTurnItem(input: {
   readonly rootNode: OrchestrationV2ExecutionNode;
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly checkpoint: OrchestrationV2Checkpoint;
+  readonly repositoryCheckpoints?: ReadonlyArray<RepositoryTurnCheckpoint>;
   readonly completedAt: DateTime.Utc;
 }): OrchestrationV2TurnItem {
   return {
@@ -281,5 +355,8 @@ function makeCheckpointTurnItem(input: {
     checkpointId: input.checkpoint.id,
     scopeId: input.checkpoint.scopeId,
     files: input.checkpoint.files,
+    ...(input.repositoryCheckpoints === undefined
+      ? {}
+      : { repositoryCheckpoints: input.repositoryCheckpoints }),
   };
 }

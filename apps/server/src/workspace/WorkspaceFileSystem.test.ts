@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - FileSystem cannot create a FIFO.
 import * as NodeChildProcess from "node:child_process";
 
+import { ProjectId } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, describe, expect } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -218,6 +219,34 @@ it.layer(layerTest, { excludeTestServices: true })("WorkspaceFileSystemLive", (i
             { kind: "other" },
           ]);
         }),
+    );
+
+    it.effect("keeps explicitly selected repository files inside that checkout", () =>
+      Effect.gen(function* () {
+        const files = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir;
+        const other = yield* makeTempDir;
+        yield* writeTextFile(cwd, "src/index.ts", "selected repository");
+        yield* writeTextFile(other, "src/index.ts", "other repository");
+        const repositoryTarget = {
+          type: "project" as const,
+          projectId: ProjectId.make("selected"),
+          repositoryId: "one",
+        };
+        expect(
+          (yield* files.readFile({
+            cwd,
+            repositoryTarget,
+            relativePath: path.join(cwd, "src/index.ts"),
+          })).contents,
+        ).toBe("selected repository");
+        expect(
+          (yield* files
+            .readFile({ cwd, repositoryTarget, relativePath: path.join(other, "src/index.ts") })
+            .pipe(Effect.flip))._tag,
+        ).toBe("WorkspacePathOutsideRootError");
+      }),
     );
 
     it.effect("rejects reads outside the workspace root", () =>

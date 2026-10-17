@@ -1,3 +1,4 @@
+import { RepositorySet } from "../multirepo/index.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import { CommandId, MessageId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
@@ -47,6 +48,7 @@ const registryFor = (client: HttpClient.HttpClient, instanceId: ProviderInstance
 
 const runtimePolicyFor = (client: HttpClient.HttpClient, instanceId: ProviderInstanceId) =>
   RuntimePolicy.layerFromProjectStore.pipe(
+    Layer.provide(Layer.mock(RepositorySet.RepositorySet)({})),
     Layer.provide(
       Layer.unwrap(
         DevinCloudDriver.create({

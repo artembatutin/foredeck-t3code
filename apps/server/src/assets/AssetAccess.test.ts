@@ -122,6 +122,53 @@ const layerTest = Layer.mergeAll(
 ).pipe(Layer.provideMerge(NodeServices.layer));
 
 describe("AssetAccess", () => {
+  it.effect("keeps repository media and same-name documents within the selected checkout", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const temp = yield* fs.makeTempDirectoryScoped({ prefix: "t3-repository-assets-" });
+      const roots = [path.join(temp, "server"), path.join(temp, "client")];
+      for (const root of roots) {
+        yield* fs.makeDirectory(root);
+        yield* fs.writeFileString(path.join(root, "report.html"), root);
+        yield* fs.writeFileString(path.join(root, "clip.mp4"), "video fixture");
+      }
+      const issue = (root: string, file: string) =>
+        issueAssetUrl({
+          resource: {
+            _tag: "repository-file",
+            repositoryTarget: {
+              type: "thread",
+              threadId: ThreadId.make("bound"),
+              repositoryId: root,
+            },
+            path: file,
+          },
+          workspaceRoot: root,
+        });
+      const resolve = (relativeUrl: string) => {
+        const suffix = relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+        const separator = suffix.indexOf("/");
+        return resolveAsset(suffix.slice(0, separator), suffix.slice(separator + 1));
+      };
+      const first = yield* issue(roots[0]!, "report.html");
+      const second = yield* issue(roots[1]!, "report.html");
+      expect(first.relativeUrl).not.toBe(second.relativeUrl);
+      expect(yield* resolve(first.relativeUrl)).toMatchObject({
+        path: yield* fs.realPath(path.join(roots[0]!, "report.html")),
+      });
+      expect(yield* resolve(second.relativeUrl)).toMatchObject({
+        path: yield* fs.realPath(path.join(roots[1]!, "report.html")),
+      });
+      const clip = yield* issue(roots[1]!, "clip.mp4");
+      expect(yield* resolve(clip.relativeUrl)).toMatchObject({
+        path: yield* fs.realPath(path.join(roots[1]!, "clip.mp4")),
+      });
+      expect(
+        (yield* issue(roots[0]!, path.join(roots[1]!, "report.html")).pipe(Effect.flip))._tag,
+      ).toBe("AssetWorkspacePathValidationError");
+    }).pipe(Effect.provide(layerTest)),
+  );
   describe("readMcpAppHtml", () => {
     it.effect("accepts snapshots at the stored HTML byte limit", () =>
       Effect.gen(function* () {

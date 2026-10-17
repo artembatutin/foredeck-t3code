@@ -84,6 +84,7 @@ vi.mock("../state/threads", () => ({
 vi.mock("../state/entities", () => ({
   readEnvironmentSupportsServerBrowser: () => false,
   useServerConfigs: () => new Map([[threadRef.environmentId, serverConfig]]),
+  readProject: () => null,
   readThreadShell: () => ({ linkedPullRequest: state.linkedPullRequest }),
   useProjects: () => [{ id: linkedPullRequest.projectId, environmentId: threadRef.environmentId }],
 }));
@@ -202,7 +203,7 @@ it("removes host actions after revocation while keeping file preview and copying
   expect(offeredActions()).toEqual(["copy-relative", "copy-full"]);
   expect(state.copy).toHaveBeenCalledWith("/work/docs/readme.md");
   await act(async () => anchor().props.onClick(menuEvent()));
-  expect(state.openFile).toHaveBeenCalledWith(threadRef, "docs/readme.md", undefined);
+  expect(state.openFile).toHaveBeenCalledWith(threadRef, "docs/readme.md", undefined, undefined);
   expect(state.openEditor).not.toHaveBeenCalled();
 });
 
