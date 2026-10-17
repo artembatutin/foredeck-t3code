@@ -42,8 +42,8 @@ configuration must match the agreed brief. Looper requires full-access execution
 cannot implement Foredeck's supervised approval mode. Missing prerequisites block that
 assignment without switching executors. Looper stops after its current step.
 
-Expand **Persistent assistant** above the composer to inspect saved ideas, priorities,
-work states and evidence. Open a worker separately to keep your place. Questions and
+Use **Ideas** or **Work** to inspect saved context, priorities, work states and evidence.
+These controls appear once there is something saved. Open a worker separately to keep your place. Questions and
 results appear quietly; they do not start a manager turn or interrupt another discussion.
 Ask the assistant to review pending results when you are ready.
 
