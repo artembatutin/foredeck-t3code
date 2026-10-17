@@ -1,5 +1,7 @@
 {
   "integrationFiles": {
+    "apps/desktop/src/app/DesktopAppIdentity.ts": "Selects the fd preview profile for installed preview versions, keeping Chromium sessions and process locks separate from the everyday app.",
+    "apps/desktop/src/app/DesktopAppIdentity.test.ts": "Verifies installed preview profile isolation through the identity service and the fork's existing visible branding.",
     "apps/desktop/scripts/electron-launcher.mjs": "Declares microphone access for the development app's local assistant voice recording.",
     "apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts": "Passes configured roots through native sandbox configuration, confirms accepted roots on creation/resume/fork, and supplies repository context without widening the chosen mode. Adds the fd assistant role only for marked assistant conversations through the existing application-context boundary; runtime permissions stay unchanged.",
     "apps/web/package.json": "Packages the lazy local speech model runtime and its matching browser WASM assets.",
