@@ -10,7 +10,7 @@ import { ASSISTANT_THREAD_PREFIX, isAssistantThread } from "@t3tools/shared/fd/a
 import { resolvePromptLinkModelSelection } from "@t3tools/client-runtime/prompt-links";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { MessageCircleIcon } from "lucide-react";
-import { SidebarMenuButton } from "~/components/ui/sidebar";
+import { SidebarHeaderIconButton } from "~/components/sidebar/SidebarThreadHeader";
 import { toastManager } from "~/components/ui/toast";
 import { useScratchProject } from "~/hooks/useScratchProject";
 import { useThreadShells, useAllEnvironmentShellsBootstrapped } from "~/state/entities";
@@ -105,17 +105,14 @@ export function AssistantEntry({
   };
 
   return (
-    <div className="pt-1">
-      <SidebarMenuButton
-        type="button"
-        isActive={active}
-        aria-current={active ? "page" : undefined}
-        disabled={!environmentId || !ready || !canOperate || opening}
-        onClick={() => void open()}
-      >
-        <MessageCircleIcon />
-        <span>{opening ? "Opening assistant…" : "Assistant"}</span>
-      </SidebarMenuButton>
-    </div>
+    <SidebarHeaderIconButton
+      label={opening ? "Opening assistant…" : "Assistant"}
+      isActive={active}
+      aria-current={active ? "page" : undefined}
+      disabled={!environmentId || !ready || !canOperate || opening}
+      onClick={() => void open()}
+    >
+      <MessageCircleIcon />
+    </SidebarHeaderIconButton>
   );
 }

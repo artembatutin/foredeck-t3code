@@ -8,8 +8,8 @@ vi.mock("@t3tools/client-runtime/prompt-links", () => ({
     selection: { instanceId: "subscription", model: "configured" },
   }),
 }));
-vi.mock("~/components/ui/sidebar", () => ({
-  SidebarMenuButton: (props: object) => <button {...props} />,
+vi.mock("~/components/sidebar/SidebarThreadHeader", () => ({
+  SidebarHeaderIconButton: (props: object) => <button {...props} />,
 }));
 vi.mock("~/components/ui/toast", () => ({ toastManager: { add: vi.fn() } }));
 vi.mock("~/hooks/useScratchProject", () => ({

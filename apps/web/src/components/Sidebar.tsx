@@ -5182,15 +5182,18 @@ export default function Sidebar() {
               searchResultCount={threadSearchResults.length}
               activeSearchResultIndex={activeSearchResultIndex}
               onClearSearch={clearThreadSearch}
-            />
-            <AssistantEntry
-              active={
-                routeTarget?.kind === "server" && isAssistantThread(routeTarget.threadRef.threadId)
-              }
-              environmentId={
-                routeTarget?.kind === "server"
-                  ? routeTarget.threadRef.environmentId
-                  : primaryEnvironmentId
+              trailingActions={
+                <AssistantEntry
+                  active={
+                    routeTarget?.kind === "server" &&
+                    isAssistantThread(routeTarget.threadRef.threadId)
+                  }
+                  environmentId={
+                    routeTarget?.kind === "server"
+                      ? routeTarget.threadRef.environmentId
+                      : primaryEnvironmentId
+                  }
+                />
               }
             />
           </SidebarGroup>
