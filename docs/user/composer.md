@@ -60,15 +60,15 @@ assistant. **Dictation** adds text to the editable composer; send it when ready.
 answer after the turn finishes. Existing drafts, attachments and pending worker answers
 remain editable instead of being sent automatically.
 
-Open **Voice options** by hover, click, keyboard or touch to choose a mode, select an
-installed local voice, or preview it. Enhanced voices are preferred when installed;
+Open **Settings → General → Voice** to choose a mode, select an installed local
+voice, or preview it. Enhanced voices are preferred when installed;
 use your system's voice downloads if the available voices do not suit you. Spoken
 answers are composed separately from written evidence. Tool calls and progress stay
 silent. If no spoken answer is available, use the written conversation.
 
-Tap the microphone for each turn. During playback, tap the square to interrupt
-immediately. Hands-free interruption and continuous listening are not enabled. Ending
-voice or leaving the conversation releases the microphone and stops playback, while
+Tap the microphone for each turn. During playback, tap the speaker icon to interrupt
+immediately. Hands-free interruption and continuous listening are not enabled. Pressing Escape on the microphone control
+or leaving the conversation releases the microphone and stops playback, while
 workers continue on the host.
 
 English recognition runs locally after an initial model download. Recordings are limited

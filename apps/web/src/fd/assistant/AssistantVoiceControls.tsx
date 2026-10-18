@@ -1,19 +1,15 @@
-import { useEffect, useEffectEvent, useId, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 import type { ScopedThreadRef } from "@t3tools/contracts";
-import { MicIcon, SquareIcon, ChevronDownIcon } from "lucide-react";
+import { AudioLinesIcon, EllipsisIcon, MicIcon, MicOffIcon, Volume2Icon } from "lucide-react";
 import { Button } from "~/components/ui/button";
-import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
-import {
-  Select,
-  SelectItem,
-  SelectPopup,
-  SelectTrigger,
-  SelectValue,
-} from "~/components/ui/select";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
+import { toastManager } from "~/components/ui/toast";
+import { useLocalVoices, useVoicePreferences } from "./voicePreferences";
+import styles from "./voiceControl.module.css";
 import { useAtomCommand } from "~/state/use-atom-command";
 import type { ChatMessage } from "~/types";
 import { startRecording } from "./recording";
-import { rankedLocalVoices, selectLocalVoice, shouldSpeakReply } from "./speech";
+import { selectLocalVoice, shouldSpeakReply } from "./speech";
 import { readSpeech } from "./commands";
 
 type Phase = "off" | "loading" | "ready" | "requesting" | "recording" | "transcribing";
@@ -22,14 +18,6 @@ type Reply =
   | { type: "progress"; progress: number }
   | { type: "transcript"; text: string }
   | { type: "error"; message: string };
-const preference = (key: string, fallback: string) => {
-  try {
-    return localStorage.getItem(key) ?? fallback;
-  } catch {
-    return fallback;
-  }
-};
-
 export function AssistantVoiceControls(props: {
   threadRef: ScopedThreadRef;
   messages: ReadonlyArray<ChatMessage>;
@@ -38,15 +26,12 @@ export function AssistantVoiceControls(props: {
   canConverse: boolean;
   onTranscript: (text: string, submit: boolean) => void;
 }) {
-  const optionsId = useId();
   const [phase, setPhase] = useState<Phase>("off");
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [mode, setMode] = useState(() => preference("fd.voice.mode", "dictation"));
-  const [voiceURI, setVoiceURI] = useState(() => preference("fd.voice.voice", ""));
-  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [{ mode, voiceURI }] = useVoicePreferences();
+  const voices = useLocalVoices();
   const [speaking, setSpeaking] = useState(false);
-  const [options, setOptions] = useState(false);
   const worker = useRef<Worker | null>(null);
   const recording = useRef<Awaited<ReturnType<typeof startRecording>> | null>(null);
   const abort = useRef<AbortController | null>(null);
@@ -78,12 +63,7 @@ export function AssistantVoiceControls(props: {
     setPhase("off");
   };
   useEffect(() => {
-    const update = () =>
-      setVoices(rankedLocalVoices(window.speechSynthesis?.getVoices() ?? [], navigator.language));
-    update();
-    window.speechSynthesis?.addEventListener("voiceschanged", update);
     return () => {
-      window.speechSynthesis?.removeEventListener("voiceschanged", update);
       generation.current++;
       if (timer.current) clearTimeout(timer.current);
       abort.current?.abort();
@@ -91,14 +71,16 @@ export function AssistantVoiceControls(props: {
       window.speechSynthesis?.cancel();
     };
   }, []);
+  const previousPreferences = useRef({ mode, voiceURI });
+  const preferencesChanged = useEffectEvent((nextMode: typeof mode, nextVoice: string) => {
+    const previous = previousPreferences.current;
+    previousPreferences.current = { mode: nextMode, voiceURI: nextVoice };
+    if (previous.mode !== nextMode || previous.voiceURI !== nextVoice) end();
+  });
+  useEffect(() => preferencesChanged(mode, voiceURI), [mode, voiceURI]);
   useEffect(() => {
-    try {
-      localStorage.setItem("fd.voice.mode", mode);
-      localStorage.setItem("fd.voice.voice", voiceURI);
-    } catch {
-      /* Storage is optional. */
-    }
-  }, [mode, voiceURI]);
+    if (error) toastManager.add({ type: "error", title: "Voice unavailable", description: error });
+  }, [error]);
   const speak = (text: string) => {
     const voice = selectLocalVoice(voices, navigator.language, voiceURI);
     if (!voice) {
@@ -211,7 +193,6 @@ export function AssistantVoiceControls(props: {
   const enable = () => {
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
       setError("Recording needs HTTPS or the desktop app. You can type instead.");
-      setOptions(true);
       return;
     }
     requested.current = true;
@@ -227,7 +208,6 @@ export function AssistantVoiceControls(props: {
       requested.current = false;
       setPhase("off");
       setError(message);
-      setOptions(true);
     };
     current.addEventListener("error", () =>
       fail("Local recognition could not load. Retry or type a message."),
@@ -242,7 +222,6 @@ export function AssistantVoiceControls(props: {
         if (reply.text.trim()) onTranscript(reply.text.trim());
         else {
           setError("No speech detected. Try again.");
-          setOptions(true);
         }
       } else fail(reply.message);
     });
@@ -267,124 +246,79 @@ export function AssistantVoiceControls(props: {
             : phase === "requesting"
               ? "Microphone…"
               : "";
+  const processing = ["loading", "requesting", "transcribing"].includes(phase);
   const label = speaking
     ? "Interrupt speech"
     : phase === "recording"
-      ? "Finish speaking"
-      : "Microphone";
+      ? "Finish recording"
+      : processing
+        ? "Cancel recording"
+        : error
+          ? "Retry microphone"
+          : "Microphone";
+  const visualState = speaking
+    ? "speaking"
+    : phase === "recording"
+      ? "listening"
+      : processing || status === "Thinking"
+        ? "processing"
+        : error
+          ? "error"
+          : "idle";
+  const Icon =
+    visualState === "speaking"
+      ? Volume2Icon
+      : visualState === "listening"
+        ? AudioLinesIcon
+        : visualState === "processing"
+          ? EllipsisIcon
+          : visualState === "error"
+            ? MicOffIcon
+            : MicIcon;
   return (
-    <div className="flex items-center gap-1">
-      {status ? (
-        <span role="status" className="text-xs text-muted-foreground">
-          {status}
-        </span>
-      ) : null}
-      <Button
-        type="button"
-        variant={phase === "recording" ? "default" : "ghost"}
-        size="icon-sm"
-        aria-label={label}
-        disabled={props.disabled && !speaking && phase !== "recording"}
-        onClick={() => {
-          if (speaking) {
-            stopAudio();
-            return;
-          }
-          if (phase === "off") enable();
-          else if (phase === "ready") void record();
-          else if (phase === "recording") void finish();
-          else end();
-        }}
-      >
-        {speaking || phase === "recording" ? <SquareIcon /> : <MicIcon />}
-      </Button>
-      <Popover open={options} onOpenChange={setOptions}>
-        <PopoverTrigger
-          openOnHover
+    <>
+      <span role="status" className="sr-only">
+        {error ?? status}
+      </span>
+      <Tooltip>
+        <TooltipTrigger
           render={
-            <Button type="button" variant="ghost" size="icon-xs" aria-label="Voice options" />
+            <Button
+              type="button"
+              variant={phase === "recording" || speaking ? "secondary" : "ghost"}
+              size="icon-sm"
+              aria-label={label}
+              aria-pressed={phase === "recording" || speaking}
+              disabled={props.disabled && !speaking && phase !== "recording" && !processing}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  end();
+                }
+              }}
+              onClick={() => {
+                if (speaking) {
+                  stopAudio();
+                  return;
+                }
+                if (phase === "off") enable();
+                else if (phase === "ready") void record();
+                else if (phase === "recording") void finish();
+                else end();
+              }}
+            />
           }
         >
-          <ChevronDownIcon />
-        </PopoverTrigger>
-        <PopoverPopup width="sm" side="top" align="end">
-          <div className="space-y-3 text-sm">
-            <div className="space-y-1.5">
-              <label htmlFor={`${optionsId}-mode`} className="text-xs text-muted-foreground">
-                Mode
-              </label>
-              <Select
-                items={[
-                  { value: "dictation", label: "Dictation" },
-                  { value: "conversation", label: "Conversation" },
-                ]}
-                value={mode}
-                onValueChange={(value) => {
-                  if (value === null) return;
-                  stopAudio();
-                  setMode(value);
-                }}
-              >
-                <SelectTrigger id={`${optionsId}-mode`} size="sm" aria-label="Voice mode">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectPopup>
-                  <SelectItem value="dictation">Dictation</SelectItem>
-                  <SelectItem value="conversation">Conversation</SelectItem>
-                </SelectPopup>
-              </Select>
-              <p className="text-xs text-muted-foreground">
-                {mode === "dictation" ? "Edit before sending." : "Send after a pause."}
-              </p>
-            </div>
-            <div className="space-y-1.5">
-              <label htmlFor={`${optionsId}-voice`} className="text-xs text-muted-foreground">
-                Voice
-              </label>
-              <Select
-                items={[
-                  { value: "", label: "Recommended" },
-                  ...voices.map((v) => ({ value: v.voiceURI, label: `${v.name} (${v.lang})` })),
-                ]}
-                value={voices.some((voice) => voice.voiceURI === voiceURI) ? voiceURI : ""}
-                onValueChange={(value) => {
-                  if (value === null) return;
-                  stopAudio();
-                  setVoiceURI(value);
-                }}
-              >
-                <SelectTrigger id={`${optionsId}-voice`} size="sm" aria-label="Local voice">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectPopup>
-                  <SelectItem value="">Recommended</SelectItem>
-                  {voices.map((v) => (
-                    <SelectItem key={v.voiceURI} value={v.voiceURI}>
-                      {v.name} ({v.lang})
-                    </SelectItem>
-                  ))}
-                </SelectPopup>
-              </Select>
-            </div>
-            <div className="flex gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => speak("The changes are ready. What would you like to explore next?")}
-              >
-                Preview voice
-              </Button>
-              {phase !== "off" ? (
-                <Button type="button" variant="ghost" size="sm" onClick={end}>
-                  End voice
-                </Button>
-              ) : null}
-            </div>
-            {error ? <p role="status">{error}</p> : null}
-          </div>
-        </PopoverPopup>
-      </Popover>
-    </div>
+          <span
+            key={visualState}
+            className={`flex items-center justify-center ${styles.stateIcon}`}
+            aria-hidden="true"
+          >
+            <Icon className={error ? "text-destructive" : undefined} />
+          </span>
+        </TooltipTrigger>
+        <TooltipPopup>{error ?? (status ? `${status} · ${label}` : label)}</TooltipPopup>
+      </Tooltip>
+    </>
   );
 }

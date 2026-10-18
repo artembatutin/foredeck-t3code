@@ -1,3 +1,4 @@
+import { VoiceSettings } from "~/fd/assistant";
 import { SettingsGroup } from "./SettingsGroup";
 import { useScopedSettingsWriteAllowed } from "./useScopedSettings";
 import { Spinner } from "~/components/ui/spinner";
@@ -3074,6 +3075,8 @@ export function GeneralSettingsPanel() {
           }
         />
       </SettingsSection>
+
+      <VoiceSettings />
 
       <SettingsSection id="projects-and-threads" title="Projects & threads">
         <SettingsRow
