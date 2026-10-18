@@ -759,7 +759,7 @@ it.effect("terminates HTTP MCP sessions with DELETE", () =>
         environmentId,
         requestNamespace: "provider-session",
         thread: {
-          threadId: ThreadId.make("thread-provider"),
+          threadId: ThreadId.make("fd-assistant-provider"),
           providerSessionId: "provider-session",
           providerInstanceId: ProviderInstanceId.make("codex"),
         },
@@ -984,7 +984,7 @@ it.effect("admits provider and OAuth client credentials and points only clients 
         environmentId,
         requestNamespace: "provider-session",
         thread: {
-          threadId: ThreadId.make("thread-provider"),
+          threadId: ThreadId.make("fd-assistant-provider"),
           providerSessionId: "provider-session",
           providerInstanceId: ProviderInstanceId.make("codex"),
         },
@@ -1045,7 +1045,7 @@ it.effect("admits provider and OAuth client credentials and points only clients 
         Layer.build,
       );
       const httpClient = yield* HttpClient.HttpClient;
-      const call = (token: string | undefined) =>
+      const call = (token: string | undefined, name = "probe") =>
         Effect.gen(function* () {
           const headers = {
             accept: "application/json, text/event-stream",
@@ -1066,13 +1066,16 @@ it.effect("admits provider and OAuth client credentials and points only clients 
               "mcp-protocol-version": "2025-06-18",
             },
             body: HttpBody.text(
-              `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"probe","arguments":{}}}`,
+              `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"${name}","arguments":{}}}`,
               "application/json",
             ),
           });
         });
 
       expect((yield* call(providerToken)).status).toBe(200);
+      const refused = yield* call(providerToken, "t3_thread_launch");
+      expect(yield* refused.json).toMatchObject({ result: { isError: true } });
+
       expect((yield* call(clientToken)).status).toBe(200);
       expect(seen.map((scope) => scope.requestNamespace)).toEqual([
         "provider-session",

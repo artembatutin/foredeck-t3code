@@ -77,6 +77,12 @@ import Migration0059 from "./Migrations/059_McpAppModelContext.ts";
 import Migration0060 from "./Migrations/060_ThreadSnapshotWindowIndexes.ts";
 import Migration0061 from "./Migrations/061_PullRequestReviewGuides.ts";
 import Migration0062 from "./Migrations/062_ThreadFailureLookupIndex.ts";
+import {
+  assistantPortfolioMigration,
+  assistantDispatchMigration,
+  assistantIdeasMigration,
+  reconcileAssistantMigration,
+} from "../fd/assistant/index.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -154,6 +160,9 @@ export const migrationEntries = [
   [61, "PullRequestReviewGuides", Migration0061],
   [62, "ThreadFailureLookupIndex", Migration0062],
   [63, "ProjectRepositories", multirepoMigration],
+  [64, "AssistantPortfolio", assistantPortfolioMigration],
+  [65, "AssistantDispatches", assistantDispatchMigration],
+  [66, "AssistantIdeas", assistantIdeasMigration],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -236,6 +245,7 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
     toMigrationInclusive === undefined || toMigrationInclusive >= FIRST_V2_MIGRATION_ID;
   const previewMigrations = includesV2 ? yield* reconcileV2PreviewMigration() : [];
   if (includesV2) {
+    yield* reconcileAssistantMigration(toMigrationInclusive);
     yield* assertV2MigrationsCanRun(toMigrationInclusive);
   }
   const executedMigrations = [

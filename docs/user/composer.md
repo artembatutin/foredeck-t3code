@@ -12,6 +12,70 @@ becomes an attachment when inserting it would exceed the message limit. On a
 hardware keyboard, use `Cmd+Shift+V` on Apple devices or `Ctrl+Shift+V` elsewhere
 to keep a large paste editable in the composer instead.
 
+## Project assistant
+
+On desktop and web, open **Assistant** in the sidebar to discuss goals and priorities
+across projects in the selected environment. Set up the Codex provider with your
+subscription in **Settings → Providers** first. The assistant uses that provider's
+configured default model and keeps a saved conversation you can return to. Opening
+it restores the discussion without sending a message or starting work.
+
+Discuss separate ideas within each project, then approve a specific agreed scope. Each
+idea keeps its own outcome, criteria, decisions and open questions. Returning to an
+earlier idea restores its context; a new topic does not replace it. Briefs, priorities,
+authorization and assignment history are saved in the environment's database. Two
+assignments can run at once; the rest wait in priority order. Changing the topic or a
+priority does not interrupt running work. Each worker gets only its idea's agreed
+brief in a fresh conversation. Git work uses isolated worktrees; multi-repository
+projects currently need another isolation strategy and are refused before dispatch.
+
+Ask the assistant to inspect, stop, resume, retry or cancel an assignment. A stop is
+pending until the worker confirms it. Resuming uses a fresh conversation with the
+retained worktree and the idea's authorized brief. Worker questions come back to the assistant;
+permission approvals still need the worker's approval UI. A completed worker turn waits
+for verification of the acceptance criteria. The assistant reports implementation,
+tests, integration and deployment separately.
+
+Foredeck is the default executor. Looper needs its installed skill, a separate runtime
+and worktree, and authenticated author/repair and independent reviewer providers. Its
+configuration must match the agreed brief. Looper requires full-access execution; it
+cannot implement Foredeck's supervised approval mode. Missing prerequisites block that
+assignment without switching executors. Looper stops after its current step.
+
+Use **Ideas** or **Work** to inspect saved context, priorities, work states and evidence.
+These controls appear once there is something saved. Open a worker separately to keep your place. Questions and
+results appear quietly; they do not start a manager turn or interrupt another discussion.
+Ask the assistant to review pending results when you are ready.
+
+The host server keeps coordinating work while it runs, including when a remote client
+disconnects. Closing a desktop app that hosts the server can stop it; a stopped host
+cannot execute. Restarting reconciles saved worker identities. An uncertain launch
+keeps its slot until reconciled and is never automatically duplicated.
+
+## Local voice
+
+The microphone beside attachments and send works in ordinary conversations and the
+assistant. **Dictation** adds text to the editable composer; send it when ready.
+**Conversation** sends after a pause when the composer is empty and speaks a concise
+answer after the turn finishes. Existing drafts, attachments and pending worker answers
+remain editable instead of being sent automatically.
+
+Open **Settings → General → Voice** to choose a mode, select an installed local
+voice, or preview it. Enhanced voices are preferred when installed;
+use your system's voice downloads if the available voices do not suit you. Spoken
+answers are composed separately from written evidence. Tool calls and progress stay
+silent. If no spoken answer is available, use the written conversation.
+
+Tap the microphone for each turn. During playback, tap the speaker icon to interrupt
+immediately. Hands-free interruption and continuous listening are not enabled. Pressing Escape on the microphone control
+or leaving the conversation releases the microphone and stops playback, while
+workers continue on the host.
+
+English recognition runs locally after an initial model download. Recordings are limited
+to one minute. Speech uses installed local voices, without a separately billed speech
+API. Only transcribed text is sent to the conversation provider. Web recording needs
+HTTPS or localhost and microphone permission. Text input remains available if voice fails.
+
 ## Formatting
 
 The composer writes Markdown and shows it styled as you type. Markers such as

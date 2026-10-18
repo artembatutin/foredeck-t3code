@@ -1,3 +1,5 @@
+import { ProjectAssistant } from "./fd/assistant/index.ts";
+import { AssistantOperationError } from "@t3tools/contracts";
 import { RepositoryTargetError } from "@t3tools/contracts";
 import { ClientCompatibility, RepositorySet, WorkspaceResolver } from "./fd/multirepo/index.ts";
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
@@ -1251,6 +1253,9 @@ const layerWsRpc = (
       const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
       const providerSessionManager = yield* ProviderSessionManager.ProviderSessionManagerV2;
       const scheduledTasks = yield* ScheduledTasks.ScheduledTaskService;
+      const assistant = yield* ProjectAssistant.ProjectAssistant;
+      const assistantError = (error: ProjectAssistant.AssistantError) =>
+        new AssistantOperationError({ message: error.message });
       const assertScheduledClient = Effect.fn("ws.scheduledTasks.repositoryCompatibility")(
         function* (taskId: ScheduledTaskId) {
           if (supportsRepositories) return;
@@ -2186,6 +2191,12 @@ const layerWsRpc = (
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(scheduledTasks.getWebhookDelivery(input)),
           ),
+        [WS_METHODS.assistantOverview]: () =>
+          assistant.overview.pipe(Effect.mapError(assistantError)),
+        [WS_METHODS.assistantControl]: (input) =>
+          assistant.control(input).pipe(Effect.asVoid, Effect.mapError(assistantError)),
+        [WS_METHODS.assistantSpeech]: (input) =>
+          assistant.speech(input.threadId).pipe(Effect.mapError(assistantError)),
         [WS_METHODS.serverProbe]: (_input) => Effect.succeed({}),
         [WS_METHODS.serverGetConfig]: (_input) => loadServerConfig({ usageLimitsCommand: false }),
         [WS_METHODS.serverSearchAcpRegistry]: (input) =>

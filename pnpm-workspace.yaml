@@ -20,6 +20,10 @@ allowBuilds:
   node-pty: true
   # Ships N-API prebuilds; its install script only rebuilds from source.
   objc-js: false
+  # Voice inference uses the packaged browser WASM runtime, not native Node binaries.
+  onnxruntime-node: false
+  # Published protobuf JS is sufficient; no development hook setup is needed.
+  protobufjs: false
   "react-native-enriched-markdown@file:apps/mobile/deps/react-native-enriched-markdown-1.2.0-t3.11.tgz": true
   sharp: true
   tsc-rs: true

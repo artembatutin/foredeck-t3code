@@ -12,6 +12,8 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
 import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
 
+import { recoverDeniedInspection } from "../fd/process-inspection/index.ts";
+
 const ProcessIdentity = Schema.Struct({ pid: Schema.Int, startTime: Schema.String });
 type ProcessIdentity = typeof ProcessIdentity.Type;
 
@@ -148,8 +150,8 @@ export const make = Effect.fn("OpenCodeServerLedger.make")(function* (input: {
     });
 
   const psDarwin = (selection: ReadonlyArray<string>) =>
-    spawner
-      .string(
+    Effect.suspend(() =>
+      spawner.string(
         ChildProcess.make(
           "/bin/ps",
           ["-ww", "-o", "pid=,pgid=,stat=,lstart=,args=", ...selection],
@@ -160,8 +162,8 @@ export const make = Effect.fn("OpenCodeServerLedger.make")(function* (input: {
             stderr: "ignore",
           },
         ),
-      )
-      .pipe(Effect.timeout("5 seconds"), Effect.map(parseDarwinPs));
+      ),
+    ).pipe(recoverDeniedInspection, Effect.timeout("5 seconds"), Effect.map(parseDarwinPs));
 
   const observe = (pid: number): Effect.Effect<ObservedProcess | undefined> => {
     if (platform === "linux") return observeLinux(pid).pipe(Effect.orElseSucceed(() => undefined));
@@ -310,6 +312,8 @@ export const make = Effect.fn("OpenCodeServerLedger.make")(function* (input: {
 
   /** Stops recorded servers whose owning T3 server is gone and drops stale entries. */
   const reapOrphans = Effect.gen(function* () {
+    // Without process inspection, preserve records for a later capable server.
+    if (owner === undefined) return;
     const names = yield* fs.readDirectory(directory).pipe(Effect.orElseSucceed(() => []));
     yield* Effect.forEach(
       names.filter((name) => ENTRY_FILE.test(name)),
