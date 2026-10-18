@@ -301,6 +301,7 @@
     "apps/server/src/mcp/McpHttpServer.ts": "Registers the assistant portfolio toolkit in the existing authenticated MCP transport.",
     "apps/server/src/mcp/toolkits/worktree/registration.test.ts": "Supplies the assistant service in the production toolkit registration harness.",
     "apps/server/src/mcp/McpHttpServer.test.ts": "Verifies authenticated assistant calls use the durable dispatch policy while ordinary authenticated tools remain usable.",
+    "packages/provider-opencode/src/server/OpenCodeServerLedger.ts": "Connects permission-denied process inspection recovery to the existing server ledger and preserves orphan records when inspection is unavailable, so optional cleanup cannot block startup.",
     "apps/web/src/components/chat/ChatHeader.tsx": "Suppresses the scratch-project breadcrumb for the persistent assistant role.",
     "packages/contracts/src/index.ts": "Exports typed assistant overview and completed-speech contracts."
   }
