@@ -18,6 +18,10 @@
     "./relay": {
       "types": "./src/relay.ts",
       "import": "./src/relay.ts"
+    },
+    "./fd/work-management": {
+      "types": "./src/fd/work-management/index.ts",
+      "import": "./src/fd/work-management/index.ts"
     }
   },
   "scripts": {

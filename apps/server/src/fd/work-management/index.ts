@@ -1,0 +1,49 @@
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import * as WorkLinkStore from "./persistence/WorkLinkStore.ts";
+import * as WorkMigrations from "./persistence/WorkMigrations.ts";
+import * as WorkSourceStore from "./persistence/WorkSourceStore.ts";
+import * as MarkdownSource from "./sources/markdown/MarkdownSource.ts";
+import { layerRegistry } from "./sources/WorkSourceAdapter.ts";
+import * as WorkService from "./WorkService.ts";
+import * as WorkSyncReactor from "./sync/WorkSyncReactor.ts";
+
+export type { WorkActor } from "./authority.ts";
+export { actorFromSession, layerWsRpc, WS_METHOD_TAGS, wsHandlers } from "./rpc/handlers.ts";
+export * as WorkService from "./WorkService.ts";
+export * as WorkSyncReactor from "./sync/WorkSyncReactor.ts";
+
+/**
+ * Work persistence on the core-migrated SQL client. The `fd_work_migrations` ledger migrates
+ * first, so no Work store is ever built against an older schema.
+ */
+export const layerPersistence = Layer.mergeAll(WorkSourceStore.layer, WorkLinkStore.layer).pipe(
+  Layer.provide(WorkMigrations.layer),
+);
+
+/**
+ * The adapters this server ships. `WORK_MANAGEMENT_CAPABILITY` in the contracts advertises the
+ * same kinds; `index.test.ts` keeps the two in step.
+ */
+export const layerAdapters = Layer.unwrap(
+  Effect.map(MarkdownSource.make, (markdown) => layerRegistry([markdown])),
+);
+
+/** The Work service for transports; needs the persistence layer, project stores and secrets. */
+export const layerLive = WorkService.layer.pipe(
+  Layer.provide(layerAdapters),
+  Layer.provide(ProjectionStore.layer),
+);
+
+/**
+ * Watchers and project retirement. The boot sweep and first reconcile run as the layer builds;
+ * the refresh and project-event tails park until the server activates.
+ */
+export const workerLayer = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const reactor = yield* WorkSyncReactor.WorkSyncReactor;
+    yield* reactor.start;
+  }),
+).pipe(Layer.provide(WorkSyncReactor.layer));

@@ -9,6 +9,8 @@ import {
   AuthStandardClientScopes,
   authScopeResponse,
   AuthSessionState,
+  AuthWorkReadScope,
+  AuthWorkWriteScope,
   sessionGrantsScope,
   sessionHasLegacyPermissions,
 } from "./auth.ts";
@@ -126,6 +128,134 @@ describe("authorization grants", () => {
     },
   ] as const)("sessionGrantsScope accepts $label", ({ session, scope, expected }) => {
     expect(sessionGrantsScope(session, scope)).toBe(expected);
+  });
+});
+
+describe("Work grants", () => {
+  const work = [AuthWorkReadScope, AuthWorkWriteScope] as const;
+
+  // Frozen vocabulary from the release before Work grants.
+  const preWorkDenial = Schema.Struct({
+    requiredScope: Schema.Literals([
+      "orchestration:read",
+      "orchestration:operate",
+      "settings:write",
+      "providers:manage",
+      "environment:maintain",
+      "preview:operate",
+      "diagnostics:read",
+      "terminal:read",
+      "terminal:operate",
+      "filesystem:read",
+      "filesystem:write",
+      "review:write",
+      "source-control:write",
+      "access:read",
+      "access:write",
+      "relay:read",
+      "relay:write",
+    ]),
+    requiredPermission: Schema.optionalKey(Schema.String),
+  });
+  const decodePreWorkDenial = Schema.decodeUnknownSync(preWorkDenial);
+  const decodeEnvironmentScopes = Schema.decodeSync(AuthEnvironmentScopes);
+  const decodeGrantScopes = Schema.decodeSync(AuthGrantScopes);
+  const decodeSession = Schema.decodeSync(AuthSessionState);
+
+  it("decodes as environment and grant scopes", () => {
+    expect(decodeEnvironmentScopes(work)).toEqual(work);
+    expect(decodeGrantScopes(work)).toEqual(work);
+  });
+
+  it("stays out of the legacy scopes presentation", () => {
+    const response = authScopeResponse(["orchestration:read", ...work]);
+    expect(response.scopes).toEqual(["orchestration:read"]);
+    expect(response.permissions).toEqual(["orchestration:read", ...work]);
+  });
+
+  it.each(work)("keeps a %s denial decodable without its label granting Work", (scope) => {
+    const response = authScopeRequiredResponse(scope);
+    expect(decodePreWorkDenial(response)).toEqual({
+      requiredScope: response.requiredScope,
+      requiredPermission: scope,
+    });
+    expect(response.requiredScope).not.toBe(scope);
+    const label = [response.requiredScope];
+    for (const session of [
+      { authenticated: true, scopes: label, permissions: label },
+      { authenticated: true, scopes: label, auth: {} },
+    ]) {
+      expect(sessionGrantsScope(session, scope)).toBe(false);
+    }
+  });
+
+  it("are part of the standard client scopes, so a new pairing carries Work", () => {
+    for (const scope of work) {
+      expect(AuthStandardClientScopes).toContain(scope);
+      expect(
+        sessionGrantsScope(
+          { authenticated: true, scopes: [], permissions: AuthStandardClientScopes },
+          scope,
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it.each([
+    { label: "orchestration", permissions: ["orchestration:read", "orchestration:operate"] },
+    { label: "settings", permissions: ["settings:write"] },
+    { label: "filesystem", permissions: ["filesystem:read", "filesystem:write"] },
+    { label: "explicitly empty", permissions: [] },
+  ] as const)("are denied to $label grants", ({ permissions }) => {
+    for (const scope of work) {
+      expect(sessionGrantsScope({ authenticated: true, scopes: [], permissions }, scope)).toBe(
+        false,
+      );
+    }
+  });
+
+  it.each([
+    { label: "a pre-granular server", auth: {} },
+    { label: "a first granular-scope server", auth: { serverUpdateScope: "environment:maintain" } },
+  ] as const)("are denied to legacy-only grants from $label", ({ auth }) => {
+    const session = {
+      authenticated: true,
+      scopes: [
+        "orchestration:read",
+        "orchestration:operate",
+        "terminal:operate",
+        "access:read",
+        "access:write",
+        "relay:read",
+        "relay:write",
+      ],
+      auth,
+    } as const;
+    for (const scope of work) expect(sessionGrantsScope(session, scope)).toBe(false);
+  });
+
+  it("does not let write imply read", () => {
+    const session = { authenticated: true, scopes: [], permissions: [AuthWorkWriteScope] };
+    expect(sessionGrantsScope(session, AuthWorkWriteScope)).toBe(true);
+    expect(sessionGrantsScope(session, AuthWorkReadScope)).toBe(false);
+  });
+
+  it("leaves auth responses without Work unchanged", () => {
+    const session = decodeSession({
+      authenticated: true,
+      auth: {
+        policy: "remote-reachable",
+        bootstrapMethods: ["one-time-token"],
+        sessionMethods: ["bearer-access-token"],
+        sessionCookieName: "session",
+        serverUpdateScope: "environment:maintain",
+      },
+      scopes: ["orchestration:read"],
+      permissions: ["orchestration:read", "filesystem:read"],
+    });
+    expect(session.scopes).toEqual(["orchestration:read"]);
+    expect(session.permissions).toEqual(["orchestration:read", "filesystem:read"]);
+    expect(sessionGrantsScope(session, "filesystem:read")).toBe(true);
   });
 });
 

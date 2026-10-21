@@ -20,6 +20,8 @@ import {
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
+import { AuthWorkReadScope, AuthWorkWriteScope } from "@t3tools/contracts";
+import { WORK_RPC_READ_SCOPES, WORK_WS_METHODS } from "@t3tools/contracts/fd/work-management";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -70,6 +72,20 @@ describe("RPC authorization scopes", () => {
       expect(handled).toBe(false);
     }).pipe(Effect.scoped),
   );
+  it("keeps Work reads behind work:read and Work writes behind their guarded scopes", () => {
+    for (const method of Object.values(WORK_WS_METHODS)) {
+      expect(Object.hasOwn(RPC_REQUIRED_SCOPES, method)).toBe(true);
+    }
+    for (const method of Object.keys(WORK_RPC_READ_SCOPES)) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthWorkReadScope);
+    }
+    expect(requiredScopeForRpcMethod(WORK_WS_METHODS.workItemsUpdate)).toBe(AuthWorkWriteScope);
+    expect(requiredScopeForRpcMethod(WORK_WS_METHODS.workSourcesSave)).toBe(AuthSettingsWriteScope);
+    expect(requiredScopeForRpcMethod(WORK_WS_METHODS.workThreadsStart)).toBe(
+      AuthOrchestrationOperateScope,
+    );
+  });
+
   it("declares exactly one scope for every RPC in the server group", () => {
     expect(new Set(Object.keys(RPC_REQUIRED_SCOPES))).toEqual(new Set(WsRpcGroup.requests.keys()));
   });

@@ -16,6 +16,8 @@ import {
   AuthSourceControlWriteScope,
   AuthTerminalOperateScope,
   AuthTerminalReadScope,
+  AuthWorkReadScope,
+  AuthWorkWriteScope,
 } from "@t3tools/contracts";
 
 export const AUTH_SCOPE_OPTIONS: ReadonlyArray<{
@@ -102,5 +104,15 @@ export const AUTH_SCOPE_OPTIONS: ReadonlyArray<{
     scope: AuthRelayWriteScope,
     title: "Manage relay",
     description: "Change managed tunnel connectivity.",
+  },
+  {
+    scope: AuthWorkReadScope,
+    title: "View work items",
+    description: "Browse work sources and items and the threads linked to them.",
+  },
+  {
+    scope: AuthWorkWriteScope,
+    title: "Change work items",
+    description: "Create, edit, and change the status of work items. Viewing needs its own grant.",
   },
 ];

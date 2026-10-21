@@ -1,4 +1,5 @@
 import { ProjectAssistant } from "./fd/assistant/index.ts";
+import * as WorkManagement from "./fd/work-management/index.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
 import * as Clock from "effect/Clock";
@@ -302,7 +303,10 @@ const layerHttpServer = Layer.unwrap(
 
 const layerPlatformServices = NodeServices.layer;
 
-const layerPersistence = Layer.empty.pipe(Layer.provideMerge(SqlitePersistence.layerConfig));
+// Work's own migration ledger runs after core migrations and before its stores are built.
+const layerPersistence = WorkManagement.layerPersistence.pipe(
+  Layer.provideMerge(SqlitePersistence.layerConfig),
+);
 
 const layerVcsDriverRegistry = VcsDriverRegistry.layer.pipe(Layer.provide(VcsProjectConfig.layer));
 
@@ -584,6 +588,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   // telemetry instead of waiting for the next status probe.
   ProviderUsageLimitsIngestion.layer,
   ProjectAssistant.workerLayer,
+  WorkManagement.workerLayer,
   layerProviderInstallationRefresh,
   ReplayMarkers.layer,
   // Catches overrides left behind by a project deleted before this cleanup
@@ -593,6 +598,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
 ).pipe(
   // Core Services
   Layer.provideMerge(ProjectAssistant.layerLive),
+  Layer.provideMerge(WorkManagement.layerLive),
   Layer.provideMerge(layerOrchestrationApplication),
   Layer.provideMerge(RuntimeLayer.layerEventInfrastructure),
   Layer.provideMerge(Layer.merge(ProjectStore.layer, ThreadSearch.layer)),
