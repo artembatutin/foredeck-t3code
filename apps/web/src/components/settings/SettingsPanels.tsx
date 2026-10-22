@@ -661,6 +661,10 @@ export function useSettingsRestore(onRestored?: () => void) {
         : []),
       ...(settings.confirmQuit !== DEFAULT_UNIFIED_SETTINGS.confirmQuit ? ["Quit shortcut"] : []),
       ...(isTextGenerationModelDirty ? ["Text generation model"] : []),
+      ...(settings.threadTitleGenerationEnabled !==
+      DEFAULT_UNIFIED_SETTINGS.threadTitleGenerationEnabled
+        ? ["Generate thread titles"]
+        : []),
       ...getChangedBrowserSettingLabels(settings),
       ...(settings.enableAgentBrowserAccess !== DEFAULT_UNIFIED_SETTINGS.enableAgentBrowserAccess
         ? ["Agent browser access"]
@@ -711,6 +715,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.responseStreamingMode,
       settings.persistComposerContextStrip,
       settings.enableProviderUpdateChecks,
+      settings.threadTitleGenerationEnabled,
       settings.continueThreadsAfterServerUpdate,
       settings.sidebarAutoSettleAfterDays,
       settings.sidebarAutoSettleKeepPullRequests,
@@ -840,6 +845,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       confirmThreadUnpin: DEFAULT_UNIFIED_SETTINGS.confirmThreadUnpin,
       confirmQuit: DEFAULT_UNIFIED_SETTINGS.confirmQuit,
       textGenerationModelSelection: DEFAULT_UNIFIED_SETTINGS.textGenerationModelSelection,
+      threadTitleGenerationEnabled: DEFAULT_UNIFIED_SETTINGS.threadTitleGenerationEnabled,
       fontFamilySans: DEFAULT_UNIFIED_SETTINGS.fontFamilySans,
       fontFamilyComposer: DEFAULT_UNIFIED_SETTINGS.fontFamilyComposer,
       fontFamilyCode: DEFAULT_UNIFIED_SETTINGS.fontFamilyCode,
@@ -3372,6 +3378,36 @@ export function GeneralSettingsPanel() {
                 ) : null}
               </div>
             )
+          }
+        />
+        <SettingsRow
+          serverScoped
+          settingKeys={["threadTitleGenerationEnabled"]}
+          {...searchableSetting("thread-title-generation")}
+          description="Name new threads with the text generation model, which receives the first message. When off, threads keep their first message as the title."
+          resetAction={
+            settings.threadTitleGenerationEnabled !==
+            DEFAULT_UNIFIED_SETTINGS.threadTitleGenerationEnabled ? (
+              <SettingResetButton
+                label="thread title generation"
+                onClick={() =>
+                  updateSettings({
+                    threadTitleGenerationEnabled:
+                      DEFAULT_UNIFIED_SETTINGS.threadTitleGenerationEnabled,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["threadTitleGenerationEnabled"]}
+              checked={settings.threadTitleGenerationEnabled}
+              onCheckedChange={(checked) =>
+                updateSettings({ threadTitleGenerationEnabled: Boolean(checked) })
+              }
+              aria-label="Generate thread titles"
+            />
           }
         />
       </SettingsSection>

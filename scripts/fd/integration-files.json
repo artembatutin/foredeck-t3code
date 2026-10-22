@@ -336,6 +336,15 @@
     "packages/contracts/src/auth.test.ts": "Verifies Work grants decode, join the standard pairing scopes, keep denials decodable, and are never inferred from other grants.",
     "packages/shared/src/authScopeOptions.ts": "Labels the Work grants in the existing pairing and session permission UI.",
     "apps/web/src/components/Sidebar.drag.ts": "Accepts per-thread card heights so compact and detailed cards preserve spacing when dragged between sidebar sections.",
-    "apps/web/src/components/Sidebar.drag.test.ts": "Verifies drag previews for mixed compact and detailed thread cards, including restoring settled threads."
+    "apps/web/src/components/Sidebar.drag.test.ts": "Verifies drag previews for mixed compact and detailed thread cards, including restoring settled threads.",
+    "apps/server/src/orchestration-v2/ThreadTitleRegenerationService.ts": "Skips thread title generation when the threadTitleGenerationEnabled server setting is off, so no thread content reaches a provider for naming; the check belongs at the single generation service every trigger runs through.",
+    "apps/server/src/orchestration-v2/ThreadTitleRegenerationService.test.ts": "Verifies that disabled thread title generation never calls the text generation provider and keeps the seeded title.",
+    "apps/server/src/mcp/toolkits/environment/tools.ts": "Exposes the threadTitleGenerationEnabled preference to agents through the existing environment preference read and update tools.",
+    "apps/server/src/mcp/toolkits/environment/handlers.ts": "Returns the threadTitleGenerationEnabled preference from the existing environment preference tools.",
+    "apps/web/src/state/entities.ts": "Hides Regenerate title in web thread menus when the environment has threadTitleGenerationEnabled off.",
+    "apps/mobile/src/state/thread-list-environments.ts": "Hides Regenerate title in mobile thread lists when the environment has threadTitleGenerationEnabled off.",
+    "apps/mobile/src/state/thread-list-environments.test.ts": "Verifies mobile thread lists hide title regeneration while threadTitleGenerationEnabled is off.",
+    "apps/mobile/src/features/home/useThreadListActions.ts": "Skips mobile bulk title regeneration for environments with threadTitleGenerationEnabled off.",
+    "apps/mobile/src/features/settings/SettingsServerControlsRouteScreen.tsx": "Adds the Generate thread titles switch to mobile server controls, alongside the other environment-wide toggles."
   }
 }

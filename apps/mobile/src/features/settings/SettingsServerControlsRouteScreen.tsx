@@ -423,6 +423,20 @@ function ServerSettingsDetail(props: { readonly page: SettingsPage }) {
                       onValueChange={(value) => write({ enableAgentBrowserAccess: value })}
                     />
                   </SettingsSection>
+                  <SettingsSection title="Thread titles">
+                    <SettingsSwitchRow
+                      icon="sparkles"
+                      label="Generate thread titles"
+                      subtitle={
+                        projectSelected
+                          ? "Environment-wide setting. Select All projects to change it."
+                          : "Name new threads with the text generation model, which receives the first message. When off, threads keep their first message as the title."
+                      }
+                      value={uniform("threadTitleGenerationEnabled")}
+                      disabled={disabledFor("threadTitleGenerationEnabled")}
+                      onValueChange={(value) => write({ threadTitleGenerationEnabled: value })}
+                    />
+                  </SettingsSection>
                 </>
               ) : null}
 

@@ -107,6 +107,11 @@ To generate a fresh title from the conversation, open a thread's menu and choose
 **Regenerate title**. The action is unavailable while title generation is in progress
 or when the connected environment needs a server update.
 
+Titles are written by the text generation model, which receives the thread's messages. To keep
+thread content from being sent for naming, turn off **Generate thread titles** under Settings →
+General → Text generation. New threads then keep their first message as the title, and
+**Regenerate title** is hidden.
+
 Agents connected through T3 Code can use the same server-owned metadata workflow to
 rename a thread, regenerate its title, or link and unlink a pull request. These changes
 appear on web, desktop, and mobile without requiring the originating browser to remain

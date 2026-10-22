@@ -70,6 +70,10 @@ const make = Effect.gen(function* () {
     const outcome:
       | { readonly type: "stale" }
       | { readonly type: "complete"; readonly title?: string } = yield* Effect.gen(function* () {
+      // Off sends nothing to a provider; the thread keeps its seeded title.
+      if (!(yield* serverSettings.getSettings).threadTitleGenerationEnabled) {
+        return { type: "complete" as const };
+      }
       const projection = yield* threads.getThreadRecords(
         input.threadId,
         ["messages"],

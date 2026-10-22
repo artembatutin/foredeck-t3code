@@ -563,6 +563,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["generated thread titles source control content default provider"],
   },
   {
+    id: "thread-title-generation",
+    title: "Generate thread titles",
+    to: "/settings/general",
+    scope: "environment-defaults",
+    searchTerms: ["automatic thread names rename regenerate title privacy provider"],
+  },
+  {
     id: "app-version",
     title: "Version",
     to: "/settings/general",

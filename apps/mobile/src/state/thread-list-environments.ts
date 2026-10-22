@@ -35,6 +35,7 @@ function selectEnvironment(config: ServerConfig) {
     ),
     machineKind: resolveEnvironmentMachineKind(config),
     capabilities: config.environment.capabilities,
+    titleGenerationEnabled: config.settings.threadTitleGenerationEnabled !== false,
   };
 }
 
@@ -69,7 +70,10 @@ function collectEnvironments(environments: ReadonlyMap<EnvironmentId, ListEnviro
   const pinReorderEnvironmentIds = new Set<EnvironmentId>();
   const activeReorderEnvironmentIds = new Set<EnvironmentId>();
   const titleRegenerationEnvironmentIds = new Set<EnvironmentId>();
-  for (const [id, { providers, machineKind, capabilities }] of environments) {
+  for (const [
+    id,
+    { providers, machineKind, capabilities, titleGenerationEnabled },
+  ] of environments) {
     providersByEnvironmentId.set(id, providers);
     machineByEnvironmentId.set(id, machineKind);
     if (capabilities.threadSettlement === true) settlementEnvironmentIds.add(id);
@@ -78,7 +82,9 @@ function collectEnvironments(environments: ReadonlyMap<EnvironmentId, ListEnviro
     if (capabilities.threadPinning === true) pinningEnvironmentIds.add(id);
     if (capabilities.threadPinReorder === true) pinReorderEnvironmentIds.add(id);
     if (capabilities.threadActiveReorder === true) activeReorderEnvironmentIds.add(id);
-    if (capabilities.threadTitleRegeneration === true) titleRegenerationEnvironmentIds.add(id);
+    if (capabilities.threadTitleRegeneration === true && titleGenerationEnabled) {
+      titleRegenerationEnvironmentIds.add(id);
+    }
   }
   return {
     providersByEnvironmentId,
@@ -113,6 +119,7 @@ export function createThreadListEnvironmentsAtom(
         prior &&
         prior.providers === selected.providers &&
         prior.machineKind === selected.machineKind &&
+        prior.titleGenerationEnabled === selected.titleGenerationEnabled &&
         capabilityKeys.every(
           (key) => (prior.capabilities[key] === true) === (selected.capabilities[key] === true),
         );

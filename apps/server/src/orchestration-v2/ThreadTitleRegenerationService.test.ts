@@ -46,6 +46,7 @@ const adapter = {
 function makeHarness(
   options: {
     readonly generateTitle?: TextGeneration.TextGeneration["Service"]["generateThreadTitle"];
+    readonly threadTitleGenerationEnabled?: boolean;
   } = {},
 ) {
   const layerDatabase = SqlitePersistence.layerMemory;
@@ -55,7 +56,11 @@ function makeHarness(
     layerRegistry,
     { databaseLayer: layerDatabase, runEffectWorker: false },
   );
-  const layerServerSettings = ServerSettings.layerTest({});
+  const layerServerSettings = ServerSettings.layerTest(
+    options.threadTitleGenerationEnabled === undefined
+      ? {}
+      : { threadTitleGenerationEnabled: options.threadTitleGenerationEnabled },
+  );
   const layerThreadManagement = ThreadManagement.layer.pipe(
     Layer.provide(layerOrchestrator),
     Layer.provide(layerServerSettings),
@@ -329,6 +334,33 @@ describe("ThreadTitleRegenerationService", () => {
         assert.include(call?.message, "USER:\nInvestigate the flaky login test");
         const projection = yield* threads.getThreadProjection(threadId);
         assert.equal(projection.thread.title, "Fresh title");
+        assert.isNotOk(projection.thread.titleRegeneration);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+  );
+
+  it.effect("sends nothing to a provider when title generation is off", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness({ threadTitleGenerationEnabled: false });
+      yield* Effect.gen(function* () {
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const titleRegeneration = yield* ThreadTitleRegeneration.ThreadTitleRegenerationService;
+        const threadId = yield* createThread({
+          command: "command:title:disabled:create",
+          thread: "thread:title:disabled",
+        });
+        yield* dispatchUserMessage({
+          command: "command:title:disabled:message",
+          threadId,
+          text: "Private conversation",
+        });
+        const requestId = yield* armRegeneration({ command: "command:title:disabled:1", threadId });
+
+        yield* titleRegeneration.execute({ threadId, requestId, kind: { type: "regenerate" } });
+
+        assert.equal(harness.generateThreadTitle.mock.calls.length, 0);
+        const projection = yield* threads.getThreadProjection(threadId);
+        assert.equal(projection.thread.title, "Seed title");
         assert.isNotOk(projection.thread.titleRegeneration);
       }).pipe(Effect.provide(harness.layer));
     }),

@@ -74,9 +74,10 @@ function environmentSupportsAutoSettleOptOut(
 function environmentSupportsTitleRegeneration(
   environmentId: EnvironmentThreadShell["environmentId"],
 ) {
+  const config = appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId);
   return (
-    appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)?.environment.capabilities
-      .threadTitleRegeneration === true
+    config?.environment.capabilities.threadTitleRegeneration === true &&
+    config.settings.threadTitleGenerationEnabled !== false
   );
 }
 

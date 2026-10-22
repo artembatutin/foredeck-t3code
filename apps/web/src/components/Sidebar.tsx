@@ -4323,11 +4323,13 @@ export default function Sidebar() {
           serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSnooze === true &&
           canSnooze(thread, { now: selectionNow.toISOString() }),
       );
-      const titleRegenerationThreads = selectedThreads.filter(
-        (thread) =>
-          serverConfigs.get(thread.environmentId)?.environment.capabilities
-            .threadTitleRegeneration === true,
-      );
+      const titleRegenerationThreads = selectedThreads.filter((thread) => {
+        const config = serverConfigs.get(thread.environmentId);
+        return (
+          config?.environment.capabilities.threadTitleRegeneration === true &&
+          config.settings.threadTitleGenerationEnabled !== false
+        );
+      });
       const regeneratableTitleThreads = titleRegenerationThreads.filter(
         (thread) => thread.titleRegeneration == null,
       );
@@ -4654,7 +4656,8 @@ export default function Sidebar() {
             .threadAutoSettleOptOut === true;
         const supportsTitleRegeneration =
           serverConfigs.get(thread.environmentId)?.environment.capabilities
-            .threadTitleRegeneration === true;
+            .threadTitleRegeneration === true &&
+          serverConfigs.get(thread.environmentId)?.settings.threadTitleGenerationEnabled !== false;
         const isRegeneratingTitle = thread.titleRegeneration != null;
         const isSettled = settledThreadKeysRef.current.has(threadKey);
         const isSnoozed = snoozedThreadKeysRef.current.has(threadKey);
