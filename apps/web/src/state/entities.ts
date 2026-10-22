@@ -238,10 +238,12 @@ export function readEnvironmentSupportsServerBrowser(environmentId: EnvironmentI
   );
 }
 
+/** Also false when the environment has thread title generation turned off. */
 export function readEnvironmentSupportsTitleRegeneration(environmentId: EnvironmentId): boolean {
+  const config = appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId);
   return (
-    appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)?.environment.capabilities
-      .threadTitleRegeneration === true
+    config?.environment.capabilities.threadTitleRegeneration === true &&
+    config.settings.threadTitleGenerationEnabled !== false
   );
 }
 

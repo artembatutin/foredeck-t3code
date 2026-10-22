@@ -133,6 +133,28 @@ describe("thread list environment projection", () => {
     }
   });
 
+  it("hides title regeneration while the environment has title generation off", () => {
+    const h = harness();
+    try {
+      const capable = {
+        ...config,
+        environment: {
+          ...config.environment,
+          capabilities: { ...config.environment.capabilities, threadTitleRegeneration: true },
+        },
+      };
+      h.write({
+        ...capable,
+        settings: { ...capable.settings, threadTitleGenerationEnabled: false },
+      });
+      expect(h.read().titleRegenerationEnvironmentIds.size).toBe(0);
+      h.write(capable);
+      expect([...h.read().titleRegenerationEnvironmentIds]).toEqual([ID]);
+    } finally {
+      h.registry.dispose();
+    }
+  });
+
   it.each([
     ["instanceId", ProviderInstanceId.make("other")],
     ["driver", ProviderDriverKind.make("claudeAgent")],
