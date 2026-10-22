@@ -10,7 +10,7 @@
     "apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts": "Passes configured roots through native sandbox configuration, confirms accepted roots on creation/resume/fork, and supplies repository context without widening the chosen mode. Adds the fd assistant role only for marked assistant conversations through the existing application-context boundary; runtime permissions stay unchanged.",
     "apps/web/package.json": "Packages the lazy local speech model runtime and its matching browser WASM assets.",
     "apps/web/vite.config.ts": "Resolves the speech runtime's external-WASM export so only the explicitly packaged local voice assets ship.",
-    "apps/web/src/components/Sidebar.tsx": "Mounts the fd assistant entry in the selected environment's existing sidebar.",
+    "apps/web/src/components/Sidebar.tsx": "Mounts the fd assistant entry in the selected environment's existing sidebar. Composes compact fd thread cards with provider badges beside the title, retaining optional branch and machine details and supplying their heights to drag previews.",
     "apps/web/src/components/sidebar/SidebarThreadHeader.tsx": "Provides a trailing icon action slot and selected state for the fd assistant in the existing search-row controls.",
     "apps/web/src/components/ChatView.tsx": "Composes fd selection for Git and file browsing and preserves each open file tab's saved repository instead of retargeting it when selection changes. Uses fd terminal targeting, retains per-session launch directories, labels repository context and allocates a new terminal when a script targets a different repository.  Mounts the durable assistant work panel; voice lives in the shared composer.",
     "apps/desktop/src/app/DesktopEnvironment.test.ts": "Verifies ordinary and staged display names from the existing desktop branding composition.",
@@ -334,6 +334,8 @@
     "packages/contracts/package.json": "Exports the fd work-management contracts through the ./fd/work-management subpath; nothing enters the root barrel.",
     "packages/contracts/src/auth.ts": "Adds the exact work:read and work:write grants with legacy-decodable denial labels and includes them in the standard client scopes so new pairings carry Work.",
     "packages/contracts/src/auth.test.ts": "Verifies Work grants decode, join the standard pairing scopes, keep denials decodable, and are never inferred from other grants.",
-    "packages/shared/src/authScopeOptions.ts": "Labels the Work grants in the existing pairing and session permission UI."
+    "packages/shared/src/authScopeOptions.ts": "Labels the Work grants in the existing pairing and session permission UI.",
+    "apps/web/src/components/Sidebar.drag.ts": "Accepts per-thread card heights so compact and detailed cards preserve spacing when dragged between sidebar sections.",
+    "apps/web/src/components/Sidebar.drag.test.ts": "Verifies drag previews for mixed compact and detailed thread cards, including restoring settled threads."
   }
 }

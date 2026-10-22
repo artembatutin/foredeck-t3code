@@ -31,13 +31,17 @@ function layout(
   active: string,
   over: string,
   scale = 1,
-  cardHeight = 82,
+  cardHeight: number | ((key: string) => number) = 82,
 ) {
   let top = 100;
   const rects = items.map((item) => {
     const height =
       item.kind === "thread"
-        ? (item.section === "pinned" || item.section === "active" ? cardHeight : 36) * scale
+        ? (item.section === "pinned" || item.section === "active"
+            ? typeof cardHeight === "function"
+              ? cardHeight(item.key)
+              : cardHeight
+            : 36) * scale
         : item.marker === "pinned-header" || item.marker === "pinned-divider"
           ? 0
           : (item.marker.endsWith("placeholder") ? 0 : 32) * scale;
@@ -735,6 +739,47 @@ describe("sidebar drag projection", () => {
       expect(returning.get(placeholderId)?.scaleY).toBe(0);
     },
   );
+
+  it.each([1, 1.25])("preserves mixed card heights while pinning at scale %s", (scale) => {
+    const items = [
+      pinnedHeader,
+      thread("p", "pinned"),
+      divider,
+      thread("a", "active"),
+      thread("b", "active"),
+      settledHeader,
+      thread("s", "settled"),
+    ];
+    const cardHeightFor = (key: string) => (key === "a" ? 82 : 64);
+    const strategy = createSidebarSortingStrategy({
+      items,
+      cardHeightFor,
+      settledOrder: ["s"],
+      settledExpanded: true,
+    });
+    const args = layout(items, "a", "p", scale, cardHeightFor);
+    expect(strategy({ ...args, index: 5 })?.y).toBe(0);
+  });
+
+  it.each([1, 1.25])("restores a settled thread to its own compact height at scale %s", (scale) => {
+    const items = [
+      pinnedHeader,
+      thread("p", "pinned"),
+      divider,
+      thread("a", "active"),
+      settledHeader,
+      thread("s", "settled"),
+    ];
+    const cardHeightFor = (key: string) => (key === "s" ? 64 : 82);
+    const strategy = createSidebarSortingStrategy({
+      items,
+      cardHeightFor,
+      settledOrder: ["s"],
+      settledExpanded: true,
+    });
+    const args = layout(items, "s", "a", scale, cardHeightFor);
+    expect(strategy({ ...args, index: 4 })?.y).toBe(64 * scale + 1);
+  });
 
   it("uses shelf height for empty target sizing when card height differs from its default", () => {
     const items = [
