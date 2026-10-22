@@ -1,3 +1,4 @@
+import type { RepositoryTarget } from "@t3tools/contracts";
 import type { AssetResource, ProjectReadFileError, ScopedThreadRef } from "@t3tools/contracts";
 import { isAbsolutePath, workspaceRelativeFilePath } from "@t3tools/shared/path";
 
@@ -63,12 +64,19 @@ export function setMarkdownTaskChecked(
  * yet, so it names its workspace root instead of a thread to resolve one from.
  */
 export function workspaceAssetResource(input: {
+  readonly repositoryTarget?: RepositoryTarget | undefined;
   readonly kind: "workspace-file" | "media-file";
   readonly threadRef: ScopedThreadRef;
   readonly draft: boolean;
   readonly workspaceRoot: string;
   readonly absolutePath: string;
 }): AssetResource {
+  if (input.repositoryTarget)
+    return {
+      _tag: "repository-file",
+      repositoryTarget: input.repositoryTarget,
+      path: input.absolutePath,
+    };
   if (input.draft) {
     return { _tag: "draft-workspace-file", cwd: input.workspaceRoot, path: input.absolutePath };
   }

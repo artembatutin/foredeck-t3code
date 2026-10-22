@@ -133,6 +133,32 @@ describe("createdPullRequestKey", () => {
     ).toBeNull();
   });
 
+  it("does not misattribute an opaque URL to a multi-repository project's primary", () => {
+    const multi = {
+      ...project,
+      repositories: [
+        { id: "one", name: "One", rootPath: "/one" },
+        { id: "two", name: "Two", rootPath: "/two" },
+      ],
+    };
+    expect(
+      createdPullRequestKey(
+        prResult({ status: "created", number: 3, url: "https://ghe.internal/x/3" }),
+        multi,
+      ),
+    ).toBeNull();
+    expect(
+      createdPullRequestKey(
+        prResult({
+          status: "created",
+          number: 3,
+          url: "https://github.acme.test/other/repo/pull/3",
+        }),
+        multi,
+      )?.repository,
+    ).toBe("other/repo");
+  });
+
   it("yields nothing when no pull request came out of the action", () => {
     expect(
       createdPullRequestKey(prResult({ status: "skipped_not_requested" }), project),

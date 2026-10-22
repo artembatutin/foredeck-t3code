@@ -1,4 +1,6 @@
+import { repositoryContext } from "../../fd/multirepo/index.ts";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
+import { assistantInstructionsForThread } from "../../fd/assistant/index.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import {
@@ -233,6 +235,9 @@ const CODEX_CLIENT_CAPABILITIES = {
 } as const;
 
 export const CodexProviderCapabilitiesV2 = {
+  multiRepository: {
+    runtimeModes: ["approval-required", "auto-accept-edits", "auto", "full-access"],
+  },
   sessions: {
     supportsMultipleProviderThreadsPerSession: true,
     supportsModelSwitchInSession: true,
@@ -719,6 +724,8 @@ function codexRuntimeModeTurnDefaults(runtimeMode: RuntimeMode): {
 
 export function buildCodexTurnStartParams(input: {
   readonly nativeThreadId: string;
+  readonly appThreadId?: string;
+  readonly assistantAccountType?: string;
   readonly codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>;
   readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
   readonly modelSelection: ModelSelection;
@@ -731,15 +738,28 @@ export function buildCodexTurnStartParams(input: {
   readonly appContext?: ProviderAdapter.ProviderAdapterV2TurnInput["appContext"];
 }) {
   return Effect.gen(function* () {
+    if (
+      assistantInstructionsForThread(input.appThreadId ?? "") &&
+      input.assistantAccountType !== "chatgpt"
+    ) {
+      return yield* toProtocolError(
+        "The project assistant requires a subscription login. Sign in with ChatGPT in Settings → Providers.",
+      );
+    }
     const runtimeModeDefaults = codexRuntimeModeTurnDefaults(input.runtimePolicy.runtimeMode);
     const approvalPolicy =
       input.runtimePolicy.approvalPolicy === undefined
         ? runtimeModeDefaults.approvalPolicy
         : yield* decodeTurnApprovalPolicy(input.runtimePolicy.approvalPolicy);
-    const sandboxPolicy =
+    const baseSandboxPolicy =
       input.runtimePolicy.sandboxPolicy === undefined
         ? runtimeModeDefaults.sandboxPolicy
         : yield* decodeTurnSandboxPolicy(input.runtimePolicy.sandboxPolicy);
+    const roots = input.runtimePolicy.repositories?.map((repository) => repository.rootPath);
+    const sandboxPolicy =
+      roots !== undefined && roots.length > 1 && baseSandboxPolicy?.type === "workspaceWrite"
+        ? { ...baseSandboxPolicy, writableRoots: roots }
+        : baseSandboxPolicy;
     const selectedEffort = getModelSelectionStringOptionValue(
       input.modelSelection,
       "reasoningEffort",
@@ -773,10 +793,36 @@ export function buildCodexTurnStartParams(input: {
             },
           )
         : undefined;
+    const assistantInstructions = input.hasT3Mcp
+      ? assistantInstructionsForThread(input.appThreadId ?? "")
+      : undefined;
+    const repositoriesContext = repositoryContext(input.runtimePolicy.repositories);
+    if (repositoriesContext !== undefined)
+      appContext["t3.repositories"] = { kind: "untrusted", value: repositoriesContext };
     const additionalContext =
-      t3Context === undefined && Object.keys(appContext).length === 0
+      t3Context === undefined && Object.keys(appContext).length === 0 && !assistantInstructions
         ? undefined
-        : { ...t3Context, ...appContext };
+        : {
+            ...t3Context,
+            ...appContext,
+            ...(input.hasT3Mcp
+              ? {
+                  foredeck_voice: {
+                    kind: "application" as const,
+                    value:
+                      "Before your final answer, use voice_reply to compose a separate spoken response: one or two natural owner-facing sentences, leading with the result or question. Keep detailed evidence in your written answer. Never send tool narration, progress or logs to voice_reply. This does not start audio; the client chooses when to speak.",
+                  },
+                }
+              : {}),
+            ...(assistantInstructions
+              ? {
+                  foredeck_assistant: {
+                    kind: "application" as const,
+                    value: assistantInstructions,
+                  },
+                }
+              : {}),
+          };
     const collaborationMode: CodexSchema.ClientRequest__CollaborationMode | undefined =
       input.runtimePolicy.interactionMode !== "plan" && developerInstructions === undefined
         ? undefined
@@ -1336,13 +1382,27 @@ export function codexThreadRuntimeParams(input: {
   readonly cwd?: string;
   readonly model?: string;
   readonly config: Readonly<Record<string, Schema.Json>>;
+  readonly sandbox?: CodexSchema.V2ThreadStartParams__SandboxMode;
 } {
   const { mcpSession } = input;
+  const roots = input.runtimePolicy?.repositories?.map((repository) => repository.rootPath);
+  const multi = roots !== undefined && roots.length > 1;
   return {
     ...(input.runtimePolicy?.cwd == null ? {} : { cwd: input.runtimePolicy.cwd }),
     ...(input.modelSelection === undefined ? {} : { model: input.modelSelection.model }),
+    ...(multi
+      ? {
+          sandbox:
+            input.runtimePolicy?.runtimeMode === "full-access"
+              ? ("danger-full-access" as const)
+              : input.runtimePolicy?.runtimeMode === "approval-required"
+                ? ("read-only" as const)
+                : ("workspace-write" as const),
+        }
+      : {}),
     config: {
       ...CODEX_THREAD_CONFIG,
+      ...(multi ? { "sandbox_workspace_write.writable_roots": roots } : {}),
       ...(mcpSession === undefined
         ? {}
         : {
@@ -1359,6 +1419,49 @@ export function codexThreadRuntimeParams(input: {
     },
   };
 }
+
+const decodeRepositorySandbox = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    cwd: Schema.String,
+    sandbox: CodexSchema.V2TurnStartParams__SandboxPolicy,
+  }),
+);
+
+export class CodexRepositorySandboxError extends Schema.TaggedError<CodexRepositorySandboxError>()(
+  "CodexRepositorySandboxError",
+  {},
+) {
+  override get message() {
+    return "The provider did not accept this thread's repository roots and permission mode. Update the CLI or choose a compatible provider.";
+  }
+}
+
+/** The native response must confirm additional roots before any turn can run. */
+export const verifyCodexRepositorySandbox = Effect.fn("CodexAdapterV2.verifyRepositorySandbox")(
+  function* (
+    policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy | undefined,
+    response: unknown,
+    fileSystem: Pick<FileSystem.FileSystem, "realPath">,
+  ) {
+    if (policy?.repositories === undefined || policy.repositories.length < 2) return;
+    const actual = yield* decodeRepositorySandbox(response);
+    const canonical = (value: string) =>
+      fileSystem.realPath(value).pipe(Effect.orElseSucceed(() => value));
+    const expectedCwd = policy.cwd == null ? policy.cwd : yield* canonical(policy.cwd);
+    const actualCwd = yield* canonical(actual.cwd);
+    const expected = codexRuntimeModeTurnDefaults(policy.runtimeMode).sandboxPolicy.type;
+    const valid =
+      actualCwd === expectedCwd &&
+      actual.sandbox.type === expected &&
+      (actual.sandbox.type !== "workspaceWrite" ||
+        policy.repositories.every(
+          (repository) =>
+            actual.sandbox.type === "workspaceWrite" &&
+            actual.sandbox.writableRoots?.includes(repository.rootPath),
+        ));
+    if (!valid) return yield* new CodexRepositorySandboxError({});
+  },
+);
 
 const decodeCodexResumeMetadata = Schema.decodeUnknownEffect(
   Schema.Struct({ thread: Schema.Struct({ id: Schema.String, updatedAt: Schema.Number }) }),
@@ -6286,9 +6389,16 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         ) =>
           Effect.gen(function* () {
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
+            const assistantAccount = assistantInstructionsForThread(turnInput.threadId)
+              ? yield* client.request("account/read", { refreshToken: false })
+              : undefined;
             const mcpSession = yield* mcpSessions.read(turnInput.threadId);
             const turnStartParams = yield* buildCodexTurnStartParams({
               nativeThreadId: threadId,
+              appThreadId: turnInput.threadId,
+              ...(assistantAccount?.account
+                ? { assistantAccountType: assistantAccount.account.type }
+                : {}),
               codexInput,
               runtimePolicy: turnInput.runtimePolicy,
               modelSelection: turnInput.modelSelection,
@@ -6576,6 +6686,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   }),
                 ),
               ),
+              Effect.tap((response) =>
+                verifyCodexRepositorySandbox(threadInput.runtimePolicy, response, fileSystem),
+              ),
               Effect.map((response): OrchestrationV2ProviderThread =>
                 providerThreadFromCodexThread({
                   appThreadId: threadInput.threadId,
@@ -6633,6 +6746,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       },
                     }),
                   ),
+                ),
+                Effect.tap((response) =>
+                  verifyCodexRepositorySandbox(threadInput.runtimePolicy, response, fileSystem),
                 ),
                 Effect.flatMap(decodeCodexResumeMetadata),
               );
@@ -7399,6 +7515,20 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       driver: CODEX_PROVIDER,
                       providerThreadId: threadInput.sourceProviderThread.id,
                       cause: normalizeCodexCause(cause),
+                    }),
+                ),
+              );
+              yield* verifyCodexRepositorySandbox(
+                threadInput.runtimePolicy,
+                response,
+                fileSystem,
+              ).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapter.ProviderAdapterForkThreadError({
+                      driver: CODEX_PROVIDER,
+                      providerThreadId: threadInput.sourceProviderThread.id,
+                      cause,
                     }),
                 ),
               );

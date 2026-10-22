@@ -17,6 +17,7 @@ import { threadPullRequestsOf } from "@t3tools/shared/threadPullRequests";
 import type {
   OrchestrationV2AppThread,
   OrchestrationV2CheckpointScope,
+  OrchestrationV2Checkpoint,
   OrchestrationV2ExecutionNode,
   OrchestrationV2PlanArtifact,
   PlanId,
@@ -61,6 +62,7 @@ import {
   MessageId,
   RuntimeRequestId,
   CheckpointScopeId,
+  ProjectRepositories,
   ThreadId,
   TurnItemId,
   NodeId,
@@ -213,6 +215,7 @@ export type ProjectionSettlementCandidate = Pick<
   };
 
 const ProjectionCheckpointContext = Schema.Struct({
+  repositories: Schema.optionalKey(ProjectRepositories),
   runs: Schema.Array(
     OrchestrationV2RunJsonSchema.mapFields(({ id, ordinal, status }) => ({ id, ordinal, status })),
   ),
@@ -222,11 +225,13 @@ const ProjectionCheckpointContext = Schema.Struct({
       runId,
       kind,
       cwd,
+      repositoryId: Schema.optionalKey(Schema.NullOr(Schema.String)),
     })),
   ),
   checkpoints: Schema.Array(
     OrchestrationV2CheckpointJsonSchema.mapFields(
-      ({ scopeId, runId, appRunOrdinal, status, ref }) => ({
+      ({ scopeId, runId, appRunOrdinal, ordinalWithinScope, status, ref }) => ({
+        ordinalWithinScope: Schema.optionalKey(ordinalWithinScope),
         scopeId,
         runId,
         appRunOrdinal,
@@ -238,6 +243,9 @@ const ProjectionCheckpointContext = Schema.Struct({
 });
 export type ProjectionCheckpointContext = typeof ProjectionCheckpointContext.Type;
 const decodeCheckpointContext = Schema.decodeUnknownEffect(ProjectionCheckpointContext);
+const decodeCheckpointRepositories = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectRepositories),
+);
 
 /** Durable capture targets, without transcript or checkpoint file payloads. */
 export interface ProjectionCheckpointCaptureContext {
@@ -246,6 +254,11 @@ export interface ProjectionCheckpointCaptureContext {
   readonly scope: OrchestrationV2CheckpointScope | undefined;
   readonly providerThread: OrchestrationV2ProviderThread | undefined;
   readonly readyCheckpointOrdinals: ReadonlyArray<number>;
+  readonly recordedCheckpoints?: ReadonlyArray<{
+    readonly scopeId: CheckpointScopeId;
+    readonly ordinal: number;
+    readonly status: OrchestrationV2Checkpoint["status"];
+  }>;
 }
 
 /** Exact durable targets used by interrupt, restart, and steering effects. */
@@ -531,6 +544,10 @@ export interface ProjectionStoreV2Shape {
     threadId: ThreadId,
     requestId: RuntimeRequestId,
   ) => Effect.Effect<ProjectionRuntimeResponseContext, ProjectionStoreV2Error>;
+  /** Fast legacy-path guard, including immutable bindings after project membership changes. */
+  readonly usesMultiRepositoryCheckout: (
+    cwd: string,
+  ) => Effect.Effect<boolean, ProjectionStoreV2Error>;
   readonly getCheckpointContext: (
     threadId: ThreadId,
   ) => Effect.Effect<ProjectionCheckpointContext, ProjectionStoreV2Error>;
@@ -1526,6 +1543,7 @@ export function threadShellFromProjection(
     interactionMode: projection.thread.interactionMode,
     branch: projection.thread.branch,
     worktreePath: projection.thread.worktreePath,
+    workspaceBinding: projection.thread.workspaceBinding,
     pullRequests: threadPullRequestsOf(projection.thread),
     ...(projection.thread.linkedPullRequest === undefined
       ? {}
@@ -1794,6 +1812,7 @@ function shellFromState(input: {
     interactionMode: input.state.thread.interactionMode,
     branch: input.state.thread.branch,
     worktreePath: input.state.thread.worktreePath,
+    workspaceBinding: input.state.thread.workspaceBinding,
     pullRequests: threadPullRequestsOf(input.state.thread),
     ...(input.state.thread.linkedPullRequest === undefined
       ? {}
@@ -4710,12 +4729,36 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         )
         .pipe(Effect.mapError(controlReadError(threadId)));
 
+    const usesMultiRepositoryCheckout: ProjectionStoreV2Shape["usesMultiRepositoryCheckout"] = (
+      cwd,
+    ) =>
+      sql`SELECT 1 FROM orchestration_v2_projection_threads AS t,
+          json_each(t.payload_json, '$.workspaceBinding.repositories') AS repository
+        WHERE json_array_length(t.payload_json, '$.workspaceBinding.repositories') > 1
+          AND t.deleted_at IS NULL
+          AND (
+            json_extract(repository.value, '$.rootPath') = ${cwd}
+            OR (
+              substr(${cwd}, 1, length(rtrim(json_extract(repository.value, '$.rootPath'), '/\\'))) = rtrim(json_extract(repository.value, '$.rootPath'), '/\\')
+              AND substr(${cwd}, length(rtrim(json_extract(repository.value, '$.rootPath'), '/\\')) + 1, 1) IN ('/', '\\')
+            )
+          ) LIMIT 1`.pipe(
+        Effect.map((rows) => rows.length > 0),
+        Effect.mapError(
+          (cause) =>
+            new ProjectionStoreReadError({ threadId: ThreadId.make("thread:repositories"), cause }),
+        ),
+      );
+
     const getCheckpointContext: ProjectionStoreV2Shape["getCheckpointContext"] = (threadId) =>
       sql
         .withTransaction(
           Effect.gen(function* () {
-            const threads = yield* sql<{ readonly thread_id: string }>`
-            SELECT thread_id FROM orchestration_v2_projection_threads
+            const threads = yield* sql<{
+              readonly thread_id: string;
+              readonly repositories: string | null;
+            }>`
+            SELECT thread_id, json_extract(payload_json, '$.workspaceBinding.repositories') AS repositories FROM orchestration_v2_projection_threads
             WHERE thread_id = ${threadId} LIMIT 1
           `;
             if (threads.length === 0) {
@@ -4732,21 +4775,30 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             `,
               sql`
               SELECT scope_id AS id, run_id AS "runId", kind,
-                json_extract(payload_json, '$.cwd') AS cwd
+                json_extract(payload_json, '$.cwd') AS cwd,
+                json_extract(payload_json, '$.repository.id') AS repositoryId
               FROM orchestration_v2_projection_checkpoint_scopes
               WHERE thread_id = ${threadId}
               ORDER BY ordinal_within_parent ASC, scope_id ASC
             `,
               sql`
               SELECT scope_id AS "scopeId", run_id AS "runId",
-                app_run_ordinal AS "appRunOrdinal", status,
+                app_run_ordinal AS "appRunOrdinal", ordinal_within_scope AS "ordinalWithinScope", status,
                 json_extract(payload_json, '$.ref') AS ref
               FROM orchestration_v2_projection_checkpoints
               WHERE thread_id = ${threadId}
               ORDER BY scope_id ASC, ordinal_within_scope ASC
             `,
             ]);
-            return yield* decodeCheckpointContext({ runs, checkpointScopes, checkpoints });
+            return yield* decodeCheckpointContext({
+              runs,
+              checkpointScopes,
+              checkpoints,
+              repositories:
+                threads[0]?.repositories == null
+                  ? []
+                  : yield* decodeCheckpointRepositories(threads[0].repositories),
+            });
           }),
         )
         .pipe(
@@ -4782,9 +4834,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               AND (thread_id = ${threadId}
                 OR owner_node_id IN (SELECT node_id FROM orchestration_v2_projection_nodes WHERE thread_id = ${threadId})
                 OR provider_thread_id IN (SELECT provider_thread_id FROM orchestration_v2_projection_subagents WHERE thread_id = ${threadId}))`,
-              sql<{ readonly ordinal: number }>`SELECT ordinal_within_scope AS ordinal
+              sql<{
+                readonly scopeId: CheckpointScopeId;
+                readonly ordinal: number;
+                readonly status: OrchestrationV2Checkpoint["status"];
+              }>`SELECT scope_id AS "scopeId", ordinal_within_scope AS ordinal, status
             FROM orchestration_v2_projection_checkpoints
-            WHERE thread_id = ${threadId} AND scope_id = ${target.scopeId} AND status = 'ready'`,
+            WHERE thread_id = ${threadId}`,
             ]);
             return {
               run,
@@ -4800,7 +4856,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 providerRows[0] === undefined
                   ? undefined
                   : yield* decodeProviderThreadPayload(providerRows[0].payload_json),
-              readyCheckpointOrdinals: readyRows.map(({ ordinal }) => ordinal),
+              readyCheckpointOrdinals: readyRows
+                .filter((row) => row.scopeId === target.scopeId && row.status === "ready")
+                .map(({ ordinal }) => ordinal),
+              recordedCheckpoints: readyRows.map(({ scopeId, ordinal, status }) => ({
+                scopeId,
+                ordinal,
+                status,
+              })),
             };
           }),
         )
@@ -6116,6 +6179,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getThreadProviderContext,
       getRuntimeResponseContext,
       getCheckpointContext,
+      usesMultiRepositoryCheckout,
       getCheckpointCaptureContext,
       getRunMessage,
       canStartQueuedRun,
@@ -6585,6 +6649,24 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
             ),
           };
         }),
+      usesMultiRepositoryCheckout: (cwd) =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            [...state.projections.values()].some(
+              ({ thread }) =>
+                thread.deletedAt === null &&
+                (thread.workspaceBinding?.repositories.length ?? 0) > 1 &&
+                thread.workspaceBinding?.repositories.some((repository) => {
+                  const root = repository.rootPath.replace(/[\\/]+$/, "");
+                  return (
+                    cwd === repository.rootPath ||
+                    cwd.startsWith(root + "/") ||
+                    cwd.startsWith(root + "\\")
+                  );
+                }),
+            ),
+          ),
+        ),
       getCheckpointContext: (threadId) =>
         Effect.gen(function* () {
           const projection = (yield* Ref.get(replayState)).projections.get(threadId);
@@ -6592,16 +6674,21 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
             return yield* new ProjectionStoreThreadNotFoundError({ threadId });
           }
           return {
+            repositories: projection.thread.workspaceBinding?.repositories ?? [],
             runs: projection.runs.map(({ id, ordinal, status }) => ({ id, ordinal, status })),
-            checkpointScopes: projection.checkpointScopes.map(({ id, runId, kind, cwd }) => ({
-              id,
-              runId,
-              kind,
-              cwd,
-            })),
+            checkpointScopes: projection.checkpointScopes.map(
+              ({ id, runId, kind, cwd, repository }) => ({
+                id,
+                runId,
+                kind,
+                cwd,
+                repositoryId: repository?.id ?? null,
+              }),
+            ),
             checkpoints: projection.checkpoints.map(
-              ({ scopeId, runId, appRunOrdinal, status, ref }) => ({
+              ({ scopeId, runId, appRunOrdinal, ordinalWithinScope, status, ref }) => ({
                 scopeId,
+                ordinalWithinScope,
                 runId,
                 appRunOrdinal,
                 status,
@@ -6623,6 +6710,11 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
             providerThread: projection.providerThreads.find(
               (candidate) => candidate.id === run?.providerThreadId,
             ),
+            recordedCheckpoints: projection.checkpoints.map((checkpoint) => ({
+              scopeId: checkpoint.scopeId,
+              ordinal: checkpoint.ordinalWithinScope,
+              status: checkpoint.status,
+            })),
             readyCheckpointOrdinals: projection.checkpoints
               .filter(
                 (candidate) => candidate.scopeId === target.scopeId && candidate.status === "ready",

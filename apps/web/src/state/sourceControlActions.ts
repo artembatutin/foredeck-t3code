@@ -14,6 +14,7 @@ import {
   AuthSourceControlWriteScope,
   EnvironmentAuthorizationError,
   type EnvironmentId,
+  type RepositoryTarget,
   type GitResolvePullRequestResult,
   type SourceControlCloneProtocol,
   type SourceControlProviderKind,
@@ -41,6 +42,7 @@ export type SourceControlActionKind =
   | "preparePullRequestThread";
 
 export interface SourceControlActionScope {
+  readonly repositoryTarget?: RepositoryTarget | undefined;
   readonly environmentId: EnvironmentId | null;
   readonly cwd: string | null;
 }
@@ -146,6 +148,7 @@ function resolveScope(scope: SourceControlActionScope) {
   return {
     environmentId: scope.environmentId,
     cwd: scope.cwd,
+    repositoryTarget: scope.repositoryTarget,
   };
 }
 
@@ -178,7 +181,7 @@ export function useVcsInitAction(scope: SourceControlActionScope) {
     }
     return init({
       environmentId: target.environmentId,
-      input: { cwd: target.cwd },
+      input: { cwd: target.cwd, repositoryTarget: target.repositoryTarget },
     });
   }, [init, scope]);
   return useAction({ kind: "init", label: "Initializing repository", scope, action });
@@ -190,7 +193,7 @@ export function useVcsPullAction(scope: SourceControlActionScope) {
     scope.environmentId !== null && scope.cwd !== null
       ? vcsEnvironment.status({
           environmentId: scope.environmentId,
-          input: { cwd: scope.cwd },
+          input: { cwd: scope.cwd, repositoryTarget: scope.repositoryTarget },
         })
       : null,
   );
@@ -209,7 +212,7 @@ export function useVcsPullAction(scope: SourceControlActionScope) {
     }
     return pull({
       environmentId: target.environmentId,
-      input: { cwd: target.cwd },
+      input: { cwd: target.cwd, repositoryTarget: target.repositoryTarget },
     });
   }, [pull, scope]);
   return useAction({
@@ -229,7 +232,7 @@ export function useGitStackedAction(scope: SourceControlActionScope) {
     scope.environmentId !== null && scope.cwd !== null
       ? vcsEnvironment.status({
           environmentId: scope.environmentId,
-          input: { cwd: scope.cwd },
+          input: { cwd: scope.cwd, repositoryTarget: scope.repositoryTarget },
         })
       : null,
   );
@@ -270,7 +273,7 @@ export function useSourceControlPublishRepositoryAction(scope: SourceControlActi
     scope.environmentId !== null && scope.cwd !== null
       ? vcsEnvironment.status({
           environmentId: scope.environmentId,
-          input: { cwd: scope.cwd },
+          input: { cwd: scope.cwd, repositoryTarget: scope.repositoryTarget },
         })
       : null,
   );
@@ -298,6 +301,7 @@ export function useSourceControlPublishRepositoryAction(scope: SourceControlActi
         environmentId: target.environmentId,
         input: {
           cwd: target.cwd,
+          ...(target.repositoryTarget ? { repositoryTarget: target.repositoryTarget } : {}),
           ...input,
         },
       });
@@ -349,6 +353,7 @@ export function usePreparePullRequestThreadAction(scope: SourceControlActionScop
         environmentId: target.environmentId,
         input: {
           cwd: target.cwd,
+          repositoryTarget: target.repositoryTarget,
           reference: input.reference,
           mode: input.mode,
           ...(input.threadId ? { threadId: input.threadId } : {}),
@@ -369,6 +374,7 @@ export interface PullRequestResolutionTarget {
   readonly environmentId: EnvironmentId | null;
   readonly cwd: string | null;
   readonly reference: string | null;
+  readonly repositoryTarget?: RepositoryTarget | undefined;
 }
 
 export function readCachedPullRequestResolution(
@@ -382,7 +388,11 @@ export function readCachedPullRequestResolution(
       appAtomRegistry.get(
         gitEnvironment.pullRequestResolution({
           environmentId: target.environmentId,
-          input: { cwd: target.cwd, reference: target.reference },
+          input: {
+            cwd: target.cwd,
+            reference: target.reference,
+            repositoryTarget: target.repositoryTarget,
+          },
         }),
       ),
     ),
@@ -397,6 +407,7 @@ export function usePullRequestResolutionState(target: PullRequestResolutionTarge
           input: {
             cwd: target.cwd,
             reference: target.reference,
+            repositoryTarget: target.repositoryTarget,
           },
         })
       : null,

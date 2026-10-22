@@ -5,10 +5,35 @@ and publish repositories, create pull requests, and review changes.
 
 ## Review turn changes
 
-A turn's changed files and diff show only the turn's own work. When a turn pulls, merges, or
+In a single-repository conversation, a turn's changed files and diff show only the turn's own work. When a turn pulls, merges, or
 rebases, the files Git brought in are left out. A file stays in the list when the turn edited it,
 committed it, or fixed a conflict in it. Use the branch comparison to review everything that changed
 against your base branch. Restore still returns the complete saved workspace.
+
+## Work across repositories
+
+Use the repository selector in source control, review, or files to choose a checkout.
+Branch changes, staging, commits, pushes, pulls, and PR checkout apply to that repository.
+**Repository status** loads a bounded overview on demand; refresh it to read current state.
+Unavailable checkouts report their own errors while the others remain usable.
+
+Changed files are grouped by repository. In review, choose a turn or **Conversation**, then
+choose the repository whose saved diff you want to read. Identical paths in different
+repositories remain separate. Missing snapshots or baselines are reported as unavailable;
+they are never replaced with current files. These snapshots can include changes made by
+other conversations or external tools sharing the checkout, so they are not proof of which
+agent authored an edit. Whole-turn undo is unavailable for multi-repository conversations.
+
+The file browser, search, mentions, and previews retain their repository context. New
+terminals use the selected checkout; existing terminals retain the directory where they
+started, even after changing selection or reconnecting. Use a new terminal to work in a
+different repository.
+
+App-managed mutations are serialized per checkout. Branch changes, pulls, commits, pushes,
+and pull request actions are rejected while any conversation is actively using that shared
+checkout, including the current conversation. Wait for active conversations to finish before
+running these actions. This does not isolate external Git commands or edits from other tools.
+Commits and publishing remain separate operations for each repository.
 
 ## Connect an account
 

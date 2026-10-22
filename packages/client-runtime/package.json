@@ -418,6 +418,10 @@
     "./pull-request-markdown": {
       "types": "./src/pullRequestMarkdown.ts",
       "default": "./src/pullRequestMarkdown.ts"
+    },
+    "./fd/multirepo": {
+      "types": "./src/fd/multirepo/index.ts",
+      "default": "./src/fd/multirepo/index.ts"
     }
   },
   "scripts": {

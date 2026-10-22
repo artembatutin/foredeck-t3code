@@ -7,6 +7,7 @@ import {
   type GitRunStackedActionResult,
   GitStackedAction,
   type ThreadId,
+  type RepositoryTarget,
   type ProjectId,
   WS_METHODS,
 } from "@t3tools/contracts";
@@ -58,6 +59,7 @@ export interface VcsActionState {
 }
 
 export interface VcsActionTarget {
+  readonly repositoryTarget?: RepositoryTarget | undefined;
   readonly environmentId: EnvironmentIdType | null;
   readonly cwd: string | null;
 }
@@ -423,7 +425,7 @@ export function createVcsActionManager<R, E>(
   const getRunStackedActionCommand = (requestedTarget: VcsActionTarget) => {
     const targetKey = getVcsActionTargetKey(requestedTarget);
     const commandKey =
-      targetKey ??
+      (targetKey === null ? null : JSON.stringify([targetKey, requestedTarget.repositoryTarget])) ??
       JSON.stringify([
         "vcs-action-target:unavailable",
         requestedTarget.environmentId,
@@ -468,6 +470,9 @@ export function createVcsActionManager<R, E>(
         const rpcInput: GitRunStackedActionInput = {
           actionId: transportActionId,
           cwd: target.cwd,
+          ...(requestedTarget.repositoryTarget
+            ? { repositoryTarget: requestedTarget.repositoryTarget }
+            : {}),
           action: input.action,
           ...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
           ...(input.featureBranch ? { featureBranch: true } : {}),

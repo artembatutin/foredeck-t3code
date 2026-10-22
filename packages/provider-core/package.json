@@ -182,6 +182,10 @@
     "./server/usageLimits": {
       "types": "./src/server/usageLimits.ts",
       "import": "./src/server/usageLimits.ts"
+    },
+    "./fd/multirepo": {
+      "types": "./src/fd/multirepo/index.ts",
+      "import": "./src/fd/multirepo/index.ts"
     }
   },
   "scripts": {

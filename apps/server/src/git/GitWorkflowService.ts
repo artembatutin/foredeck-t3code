@@ -35,6 +35,7 @@ import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 export class GitWorkflowService extends Context.Service<
   GitWorkflowService,
   {
+    readonly withCheckoutMutation: GitManager.GitManager["Service"]["withCheckoutMutation"];
     readonly isRepository: (cwd: string) => Effect.Effect<boolean, GitManagerServiceError>;
     readonly hasCommit: (input: {
       readonly cwd: string;
@@ -284,6 +285,7 @@ export const make = Effect.gen(function* () {
       ensureGit(operation, input.cwd).pipe(Effect.andThen(run(input)));
 
   return GitWorkflowService.of({
+    withCheckoutMutation: gitManager.withCheckoutMutation,
     isRepository: (cwd) =>
       registry.detect({ cwd }).pipe(
         Effect.map((handle) => handle?.kind === "git"),
@@ -353,7 +355,12 @@ export const make = Effect.gen(function* () {
     invalidateStatus: gitManager.invalidateStatus,
     pullCurrentBranch: (cwd) =>
       ensureGitCommand("GitWorkflowService.pullCurrentBranch", cwd).pipe(
-        Effect.andThen(git.pullCurrentBranch(cwd)),
+        Effect.andThen(
+          gitManager.withCheckoutMutation(
+            { cwd, operation: "pullCurrentBranch", changesBranch: true },
+            git.pullCurrentBranch(cwd),
+          ),
+        ),
       ),
     runStackedAction: (input, options) =>
       ensureGit("GitWorkflowService.runStackedAction", input.cwd).pipe(
@@ -383,7 +390,12 @@ export const make = Effect.gen(function* () {
       ),
     fetchRemote: (input) =>
       ensureGitCommand("GitWorkflowService.fetchRemote", input.cwd).pipe(
-        Effect.andThen(git.fetchRemote(input)),
+        Effect.andThen(
+          gitManager.withCheckoutMutation(
+            { cwd: input.cwd, operation: "fetchRemote", changesBranch: false },
+            git.fetchRemote(input),
+          ),
+        ),
       ),
     remoteExists: (input) =>
       ensureGitCommand("GitWorkflowService.remoteExists", input.cwd).pipe(
@@ -399,27 +411,57 @@ export const make = Effect.gen(function* () {
       ),
     removeWorktree: (input) =>
       ensureGitCommand("GitWorkflowService.removeWorktree", input.cwd).pipe(
-        Effect.andThen(git.removeWorktree(input)),
+        Effect.andThen(
+          gitManager.withCheckoutMutation(
+            { cwd: input.cwd, operation: "removeWorktree", changesBranch: false },
+            git.removeWorktree(input),
+          ),
+        ),
       ),
     pruneWorktrees: (input) =>
       ensureGitCommand("GitWorkflowService.pruneWorktrees", input.cwd).pipe(
-        Effect.andThen(git.pruneWorktrees(input)),
+        Effect.andThen(
+          gitManager.withCheckoutMutation(
+            { cwd: input.cwd, operation: "pruneWorktrees", changesBranch: false },
+            git.pruneWorktrees(input),
+          ),
+        ),
       ),
     deleteLocalBranch: (input) =>
       ensureGitCommand("GitWorkflowService.deleteLocalBranch", input.cwd).pipe(
-        Effect.andThen(git.deleteLocalBranch(input)),
+        Effect.andThen(
+          gitManager.withCheckoutMutation(
+            { cwd: input.cwd, operation: "deleteLocalBranch", changesBranch: true },
+            git.deleteLocalBranch(input),
+          ),
+        ),
       ),
     createRef: (input) =>
       ensureGitCommand("GitWorkflowService.createRef", input.cwd).pipe(
-        Effect.andThen(git.createRef(input)),
+        Effect.andThen(
+          gitManager.withCheckoutMutation(
+            { cwd: input.cwd, operation: "createRef", changesBranch: input.switchRef === true },
+            git.createRef(input),
+          ),
+        ),
       ),
     switchRef: (input) =>
       ensureGitCommand("GitWorkflowService.switchRef", input.cwd).pipe(
-        Effect.andThen(Effect.scoped(git.switchRef(input))),
+        Effect.andThen(
+          gitManager.withCheckoutMutation(
+            { cwd: input.cwd, operation: "switchRef", changesBranch: true },
+            Effect.scoped(git.switchRef(input)),
+          ),
+        ),
       ),
     renameBranch: (input) =>
       ensureGit("GitWorkflowService.renameBranch", input.cwd).pipe(
-        Effect.andThen(git.renameBranch(input)),
+        Effect.andThen(
+          gitManager.withCheckoutMutation(
+            { cwd: input.cwd, operation: "renameBranch", changesBranch: true },
+            git.renameBranch(input),
+          ),
+        ),
       ),
   });
 });

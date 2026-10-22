@@ -267,6 +267,9 @@ export const ServerProvider = Schema.Struct({
   // meter once its activities load. Clients reserve the meter's space on it.
   reportsContextWindow: Schema.optional(Schema.Boolean),
   supportedRuntimeModes: Schema.optional(ForwardCompatibleArray(RuntimeMode)),
+  multiRepository: Schema.optional(
+    Schema.Struct({ runtimeModes: ForwardCompatibleArray(RuntimeMode) }),
+  ),
   requiresNewThreadForModelChange: Schema.optional(Schema.Boolean),
   supportsConversationRollback: Schema.optional(Schema.Boolean),
   supportsTextGeneration: Schema.optional(Schema.Boolean),

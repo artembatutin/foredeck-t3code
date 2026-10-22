@@ -1,3 +1,4 @@
+import { RepositorySet, commandWorkspaceRestriction } from "../fd/multirepo/index.ts";
 import type {
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
@@ -1611,6 +1612,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           .pipe(
             Effect.flatMap((resolvedRuntimePolicy) =>
               checkpointService.prepareRootRunScope({
+                repositories: resolvedRuntimePolicy.repositories,
                 threadId,
                 runId: queuedRun.id,
                 rootNodeId: rootNode.id,
@@ -2252,7 +2254,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
+    const project = yield* projects.get(command.projectId).pipe(
+      Effect.mapError(
+        (cause) =>
+          new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause,
+          }),
+      ),
+    );
     const thread: OrchestrationV2AppThread = {
+      ...(Option.isNone(project) || (project.value.repositories?.length ?? 0) === 0
+        ? {}
+        : {
+            workspaceBinding: {
+              version: 1 as const,
+              defaultCwd: project.value.workspaceRoot,
+              repositories: project.value.repositories ?? [],
+            },
+          }),
       createdBy: command.createdBy,
       creationSource: command.creationSource,
       id: command.threadId,
@@ -4354,6 +4375,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         );
       const checkpointScope = yield* checkpointService
         .prepareRootRunScope({
+          repositories: resolvedRuntimePolicy.repositories,
           threadId: input.command.threadId,
           runId: targetRun.id,
           rootNodeId: nextRootNodeId,
@@ -5054,6 +5076,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             : yield* runtimePolicy.resolve({ thread: projection.thread, modelSelection }).pipe(
                 Effect.flatMap((resolvedRuntimePolicy) =>
                   checkpointService.prepareRootRunScope({
+                    repositories: resolvedRuntimePolicy.repositories,
                     threadId: command.threadId,
                     runId,
                     rootNodeId,
@@ -5414,6 +5437,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   mapDispatchError(command),
                   Effect.flatMap((resolvedRuntimePolicy) =>
                     checkpointService.prepareRootRunScope({
+                      repositories: resolvedRuntimePolicy.repositories,
                       threadId: command.threadId,
                       runId,
                       rootNodeId,
@@ -6098,6 +6122,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               );
       const checkpointScope = yield* checkpointService
         .prepareRootRunScope({
+          repositories: resolvedRuntimePolicy.repositories,
           threadId: command.threadId,
           runId,
           rootNodeId,
@@ -8154,6 +8179,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .pipe(mapDispatchError(command));
       const checkpointScope = yield* checkpointService
         .prepareRootRunScope({
+          repositories: resolvedRuntimePolicy.repositories,
           threadId: command.threadId,
           runId: state.run.id,
           rootNodeId: state.rootNode.id,
@@ -10868,6 +10894,37 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.command_type": command.type,
       "orchestration_v2.thread_id": commandThreadId(command),
     });
+
+    const restriction = commandWorkspaceRestriction(command);
+    if (restriction !== undefined) {
+      yield* Effect.gen(function* () {
+        const thread =
+          "threadId" in restriction.target
+            ? yield* projectionStore.getThread(restriction.target.threadId)
+            : undefined;
+        const projectId =
+          "projectId" in restriction.target ? restriction.target.projectId : thread!.projectId;
+        const project = yield* projects.get(projectId);
+        yield* RepositorySet.assertCheckoutMode(
+          thread?.workspaceBinding?.repositories,
+          restriction.operation,
+        );
+        if (thread === undefined && Option.isSome(project))
+          yield* RepositorySet.assertCheckoutMode(
+            project.value.repositories,
+            restriction.operation,
+          );
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause,
+            }),
+        ),
+      );
+    }
 
     const events = yield* Ref.make<Array<OrchestrationV2DomainEvent>>([]);
     const effects = yield* Ref.make<Array<PendingOrchestrationEffectV2>>([]);

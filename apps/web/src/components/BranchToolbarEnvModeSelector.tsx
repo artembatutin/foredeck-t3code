@@ -24,6 +24,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 const PREVIOUS_WORKTREE_SELECT_VALUE = "previous-worktree";
 
 interface BranchToolbarEnvModeSelectorProps {
+  worktreeUnavailableReason?: string | undefined;
   forceNewWorktree?: boolean;
   envLocked: boolean;
   effectiveEnvMode: EnvMode;
@@ -35,6 +36,7 @@ interface BranchToolbarEnvModeSelectorProps {
 }
 
 export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSelector({
+  worktreeUnavailableReason,
   forceNewWorktree = false,
   envLocked,
   effectiveEnvMode,
@@ -45,7 +47,9 @@ export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSe
   onUsePreviousWorktree,
 }: BranchToolbarEnvModeSelectorProps) {
   const composerFloatingLayerProps = useComposerMenuProps();
-  const showPreviousWorktree = Boolean(previousWorktreeLabel && onUsePreviousWorktree);
+  const showPreviousWorktree = Boolean(
+    !worktreeUnavailableReason && previousWorktreeLabel && onUsePreviousWorktree,
+  );
   const envModeItems = useMemo(
     () => [
       {
@@ -108,6 +112,7 @@ export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSe
           onUsePreviousWorktree?.();
           return;
         }
+        if (value === "worktree" && worktreeUnavailableReason) return;
         onEnvModeChange(value as EnvMode);
       }}
       items={envModeItems}
@@ -159,7 +164,11 @@ export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSe
               {resolveCurrentWorkspaceLabel(activeWorktreePath)}
             </span>
           </SelectItem>
-          <SelectItem value="worktree">
+          <SelectItem
+            value="worktree"
+            disabled={Boolean(worktreeUnavailableReason)}
+            title={worktreeUnavailableReason}
+          >
             <span className="inline-flex items-center gap-1.5">
               <FolderGit2Icon className="size-3" />
               {resolveEnvModeLabel("worktree")}

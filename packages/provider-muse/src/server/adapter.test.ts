@@ -526,6 +526,33 @@ describe("MuseAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.effect(
+    "passes every bound repository to a turn while preserving the primary process cwd",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeMuse();
+        const policy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          ...runtimePolicy,
+          repositories: [
+            { id: "a", name: "Client", rootPath: "/client" },
+            { id: "b", name: "Service", rootPath: "/separate/service" },
+          ],
+        });
+        const harness = yield* makeHarness(
+          fake,
+          INSTANCE_ID,
+          undefined,
+          undefined,
+          undefined,
+          policy,
+        );
+        yield* startConversation(harness, fake);
+        const call = fake.calls.find((call) => call.method === "turn/start");
+        assert.deepEqual(call?.params.workspaceRoots, ["/client", "/separate/service"]);
+        assert.include(JSON.stringify(call?.params.input), "Service");
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect("pins Windows turns to Muse's verbatim root and starts Muse in the plain path", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeMuse();

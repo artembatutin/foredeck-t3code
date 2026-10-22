@@ -1,3 +1,5 @@
+import { setRepositoryReviewSection } from "./reviewState";
+import { RepositoryHistory, RepositoryStatus, RepositorySelector } from "../../fd/multirepo";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { formatDiffCount } from "@t3tools/client-runtime/diff-count";
 import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
@@ -131,6 +133,7 @@ function ReviewHeader(
                       sectionAction(props.sectionMenu.branchChanges, "Changes"),
                       sectionAction(props.sectionMenu.workingTree, "Uncommitted"),
                       sectionAction(props.sectionMenu.latestTurn, "Latest turn"),
+                      sectionAction(props.sectionMenu.conversation, "Conversation"),
                     ],
                   },
                   ...(props.sectionMenu.turns.length > 0
@@ -462,8 +465,12 @@ export function ReviewSheet(props: ReviewSheetProps) {
   const retryEnvironment = useAtomCommand(environmentCatalog.retryNow, "environment retry");
   const isEnvironmentReady = environment.presentation?.connection.phase === "connected";
   const { draftMessage } = useThreadDraftForThread({ environmentId, threadId });
-  const reviewCache = useReviewCacheForThread({ environmentId, threadId });
-  const { selectedThreadCwd } = useSelectedThreadWorktree();
+  const { selectedThreadCwd, repositoryTarget, repositoryWorkspace } = useSelectedThreadWorktree();
+  const reviewCache = useReviewCacheForThread({
+    environmentId,
+    threadId,
+    repositoryId: repositoryWorkspace.selected?.id,
+  });
   const columnMetrics = useNativeColumnLayoutMetrics();
   const safeArea = columnMetrics?.safeArea ?? insets;
   const topContentInset = Platform.OS === "ios" ? safeArea.top : 0;
@@ -481,6 +488,9 @@ export function ReviewSheet(props: ReviewSheetProps) {
     selectSection,
     isSelectedSectionPending,
     diffPreviewRevision,
+    historyProjection,
+    historyRunId,
+    isHistorySelection,
   } = useReviewSections({
     enabled: isEnvironmentReady,
     environmentId,
@@ -503,6 +513,7 @@ export function ReviewSheet(props: ReviewSheetProps) {
     threadKey: reviewCache.threadKey,
     environmentId,
     cwd: selectedThreadCwd,
+    repositoryTarget,
     selectedSection,
     revision: diffPreviewRevision,
     draftMessage,
@@ -740,6 +751,31 @@ export function ReviewSheet(props: ReviewSheetProps) {
 
       <MaterialScreenContent>
         <View className="flex-1 bg-sheet android:bg-sheet-solid">
+          {repositoryWorkspace.isMultiRepository ? (
+            <View className="px-4 py-2">
+              <RepositorySelector workspace={repositoryWorkspace} />
+              <RepositoryStatus
+                environmentId={environmentId}
+                workspace={repositoryWorkspace}
+                enabled={isEnvironmentReady}
+              />
+            </View>
+          ) : null}
+          {isHistorySelection && historyProjection ? (
+            <RepositoryHistory
+              projection={historyProjection}
+              runId={historyRunId}
+              selectedId={repositoryWorkspace.selected?.id}
+              onSelect={(id) => {
+                if (!selectedSection) return;
+                setRepositoryReviewSection(
+                  { environmentId, threadId, repositoryId: id },
+                  selectedSection.id,
+                );
+                repositoryWorkspace.selectRepository(id);
+              }}
+            />
+          ) : null}
           {showConnectionNotice ? (
             <View className="flex-1" style={{ paddingTop: topContentInset }}>
               <EnvironmentConnectionNotice

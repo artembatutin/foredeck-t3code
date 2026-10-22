@@ -1678,12 +1678,15 @@ export function requiredScopesForServerSettingsPatch(
 export function requiredScopesForProjectMutation(
   mutation: ProjectMutation,
 ): ReadonlyArray<AuthEnvironmentScope> {
-  if (mutation.type === "project.delete" || mutation.scripts === undefined) {
-    return [AuthOrchestrationOperateScope];
-  }
+  if (mutation.type === "project.delete") return [AuthOrchestrationOperateScope];
   return [
-    AuthOrchestrationOperateScope,
-    ...requiredScopesForServerSettingsPatch({ defaultProjectScripts: mutation.scripts }),
+    ...new Set([
+      AuthOrchestrationOperateScope,
+      ...(mutation.repositories === undefined ? [] : [AuthSettingsWriteScope]),
+      ...(mutation.scripts === undefined
+        ? []
+        : requiredScopesForServerSettingsPatch({ defaultProjectScripts: mutation.scripts })),
+    ]),
   ];
 }
 

@@ -1,0 +1,21 @@
+/* Animate only a state change, never repaint continuously while recording. */
+.stateIcon {
+  animation: voice-state-enter 180ms ease-out;
+}
+
+@keyframes voice-state-enter {
+  from {
+    opacity: 0.35;
+    transform: scale(0.75);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stateIcon {
+    animation: none;
+  }
+}

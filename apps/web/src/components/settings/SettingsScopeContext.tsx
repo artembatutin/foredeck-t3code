@@ -1,3 +1,4 @@
+import { resolveRepositoryFileReference } from "@t3tools/client-runtime/fd/multirepo";
 import { T3_PROJECT_FILE_NAME, type T3ProjectFile } from "@t3tools/contracts";
 import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
 import { useAtomValue } from "@effect/atom-react";
@@ -25,23 +26,16 @@ function useMemberProjectFiles(scope: ReturnType<typeof resolveSettingsScope>) {
         Atom.make((get) => {
           const files = new Map<string, T3ProjectFile | null>();
           for (const member of members) {
+            const file = resolveRepositoryFileReference(member, null, T3_PROJECT_FILE_NAME);
+            const cwd = file.scope?.repository.rootPath ?? member.workspaceRoot;
             const result = get(
-              getProjectFileQueryAtom(
-                member.environmentId,
-                member.workspaceRoot,
-                T3_PROJECT_FILE_NAME,
-              ),
+              getProjectFileQueryAtom(member.environmentId, cwd, file.path, file.scope?.target),
             );
             if (result.waiting) continue;
             // A pending in-app save overlays the query, like useProjectFileQuery.
             const data =
-              get(
-                optimisticFileAtom(
-                  member.environmentId,
-                  member.workspaceRoot,
-                  T3_PROJECT_FILE_NAME,
-                ),
-              )?.data ?? Option.getOrNull(AsyncResult.value(result));
+              get(optimisticFileAtom(member.environmentId, cwd, file.path))?.data ??
+              Option.getOrNull(AsyncResult.value(result));
             files.set(
               member.physicalProjectKey,
               data === null || data.truncated ? null : parseT3ProjectFile(data.contents),

@@ -1,3 +1,4 @@
+import { retainQueuedRepositoryRequirement } from "@t3tools/client-runtime/fd/multirepo";
 import { appAtomRegistry } from "./atom-registry";
 import { createThreadOutboxManager } from "./thread-outbox-manager";
 import type { QueuedThreadMessage } from "./thread-outbox-model";
@@ -21,8 +22,15 @@ export async function flushThreadOutbox(): Promise<void> {
   await flushThreadOutboxWrites();
 }
 
-export function enqueueThreadOutboxMessage(message: QueuedThreadMessage): Promise<void> {
-  return threadOutboxManager.enqueue(message);
+export async function enqueueThreadOutboxMessage(message: QueuedThreadMessage): Promise<void> {
+  // Reading persisted drafts must not initialize the native connection runtime.
+  const { environmentSnapshotAtom } = await import("./shell");
+  return threadOutboxManager.enqueue(
+    retainQueuedRepositoryRequirement(
+      message,
+      appAtomRegistry.get(environmentSnapshotAtom(message.environmentId)),
+    ),
+  );
 }
 
 /** Waits for pending writes to settle; false if the message was rolled back. */

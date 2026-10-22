@@ -1,3 +1,8 @@
+import {
+  AssistantToolkit,
+  assistantToolLayer,
+  assistantToolRefusal,
+} from "../fd/assistant/index.ts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -172,6 +177,13 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
         presentedToken: token.length > 0,
         offerOAuth: Option.isSome(clients) && !looksLikeProviderToken(token),
       });
+    }
+    if (invocation.thread?.threadId.startsWith("fd-assistant-") && request.method === "POST") {
+      const refusal = assistantToolRefusal(
+        invocation.thread.threadId,
+        yield* request.json.pipe(Effect.orElseSucceed(() => undefined)),
+      );
+      if (refusal) return HttpServerResponse.jsonUnsafe(refusal);
     }
     return yield* httpEffect.pipe(
       Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
@@ -872,6 +884,7 @@ export const layer = Layer.mergeAll(
   layerThreadToolkit,
   layerAttachmentToolkit,
   layerProjectRegistration,
+  toolkitRegistration(AssistantToolkit, assistantToolLayer),
   layerEnvironmentToolkit,
   layerPreviewControlsRegistration,
   layerWorktreeToolkitRegistration,

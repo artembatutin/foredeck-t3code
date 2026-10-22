@@ -1,4 +1,4 @@
-import type { AssetResource, EnvironmentId, ThreadId } from "@t3tools/contracts";
+import type { AssetResource, EnvironmentId, RepositoryTarget, ThreadId } from "@t3tools/contracts";
 import { useMemo } from "react";
 
 import { useAssetUrlState, useRefreshAssetUrl } from "../../state/assets";
@@ -11,6 +11,7 @@ import {
 
 export function useWorkspaceFileAssetUrlState(props: {
   readonly cwd: string | null;
+  readonly repositoryTarget?: RepositoryTarget | undefined;
   readonly environmentId: EnvironmentId | null;
   readonly relativePath: string | null;
   readonly threadId: ThreadId | null;
@@ -31,6 +32,12 @@ export function useWorkspaceFileAssetUrlState(props: {
   const draftCwd = props.draftCwd ?? null;
   const resource = useMemo<AssetResource | null>(() => {
     if (absolutePath === null || relativePath === null) return null;
+    if (props.repositoryTarget)
+      return {
+        _tag: "repository-file",
+        repositoryTarget: props.repositoryTarget,
+        path: relativePath,
+      };
     if (props.threadId !== null) {
       return {
         _tag:
@@ -46,7 +53,7 @@ export function useWorkspaceFileAssetUrlState(props: {
     // A project draft has no thread, so it names its workspace root explicitly.
     if (draftCwd === null) return null;
     return { _tag: "draft-workspace-file", cwd: draftCwd, path: relativePath };
-  }, [absolutePath, relativePath, props.threadId, draftCwd]);
+  }, [absolutePath, relativePath, props.threadId, props.repositoryTarget, draftCwd]);
   const state = useAssetUrlState(props.environmentId, resource);
   const refresh = useRefreshAssetUrl(props.environmentId, resource);
   return { ...state, resource, refresh };

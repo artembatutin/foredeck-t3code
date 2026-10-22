@@ -247,7 +247,14 @@ export function ThreadMarkdownImage(props: {
   readonly environmentId: EnvironmentId;
   readonly resource: Extract<
     AssetResource,
-    { readonly _tag: "attachment" | "media-file" | "draft-workspace-file" | "tool-output-image" }
+    {
+      readonly _tag:
+        | "attachment"
+        | "media-file"
+        | "draft-workspace-file"
+        | "tool-output-image"
+        | "repository-file";
+    }
   >;
   readonly alt: string | null;
   readonly srcFragment?: string;
@@ -265,7 +272,13 @@ export function ThreadMarkdownImage(props: {
           ? `attachment:${props.resource.attachmentId}`
           : props.resource._tag === "tool-output-image"
             ? `tool-output:${props.resource.itemId}:${props.resource.index}`
-            : `workspace:${props.resource.path}`
+            : props.resource._tag === "repository-file"
+              ? JSON.stringify([
+                  props.environmentId,
+                  props.resource.repositoryTarget,
+                  props.resource.path,
+                ])
+              : `workspace:${props.resource.path}`
       }
       unavailable={assetUrl._tag === "Failure"}
       unavailableDetail={
@@ -275,7 +288,9 @@ export function ThreadMarkdownImage(props: {
       }
       knownSize={assetUrl._tag === "Success" ? assetUrl.imageDimensions : undefined}
       format={
-        (props.resource._tag === "media-file" || props.resource._tag === "draft-workspace-file") &&
+        (props.resource._tag === "media-file" ||
+          props.resource._tag === "draft-workspace-file" ||
+          props.resource._tag === "repository-file") &&
         /\.svg$/i.test(props.resource.path)
           ? "svg"
           : undefined

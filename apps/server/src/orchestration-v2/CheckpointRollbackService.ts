@@ -1,3 +1,4 @@
+import { RepositorySet } from "../fd/multirepo/index.ts";
 import {
   CheckpointId,
   CheckpointScopeId,
@@ -40,6 +41,7 @@ export class CheckpointRollbackExecutionError extends Schema.TaggedError<Checkpo
       "provider-turn-unavailable",
       "unexpected-failure",
       "shared-workspace",
+      "multi-repository",
     ]),
     threadId: ThreadId,
     providerThreadId: ProviderThreadId,
@@ -55,6 +57,8 @@ export class CheckpointRollbackExecutionError extends Schema.TaggedError<Checkpo
         return `Active provider changed before rollback target ${this.checkpointId} could execute on thread ${this.threadId}.`;
       case "provider-turn-unavailable":
         return `Provider turn for rollback target ${this.checkpointId} is unavailable on provider thread ${this.providerThreadId}.`;
+      case "multi-repository":
+        return new RepositorySet.RepositorySetError({ reason: "rollback" }).message;
       case "shared-workspace":
         return SHARED_WORKSPACE_RESTORE_MESSAGE;
       case "unexpected-failure":
@@ -124,6 +128,13 @@ export const layer: Layer.Layer<
         "nodes",
         "providerTurns",
       ]);
+      if (RepositorySet.isMultiRepo(projection.thread.workspaceBinding?.repositories))
+        return yield* new CheckpointRollbackExecutionError({
+          reason: "multi-repository",
+          threadId: input.threadId,
+          providerThreadId: input.providerThreadId,
+          checkpointId: input.checkpointId,
+        });
       const providerThread = projection.providerThreads.find(
         (candidate) => candidate.id === input.providerThreadId,
       );

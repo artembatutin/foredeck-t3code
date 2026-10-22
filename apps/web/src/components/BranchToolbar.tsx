@@ -79,6 +79,7 @@ export interface BranchToolbarHandle {
 interface BranchToolbarProps {
   layout?: "composer" | "panel";
   panelSection?: "all" | "workspace" | "branch";
+  worktreeUnavailableReason?: string | undefined;
   forceNewWorktree?: boolean;
   ref?: Ref<BranchToolbarHandle>;
   environmentId: EnvironmentId;
@@ -141,6 +142,7 @@ function showWorkspaceContextMenu(event: ReactMouseEvent, workspacePath: string)
 interface RunContextSelectorProps {
   displayMode?: "toolbar" | "panel";
   workspaceRoot?: string;
+  worktreeUnavailableReason?: string | undefined;
   forceNewWorktree: boolean;
   autoEnvironmentLabel?: string | undefined;
   onAutoEnvironment?: (() => void) | undefined;
@@ -163,6 +165,7 @@ const RunContextSelector = memo(function RunContextSelector({
   displayMode = "toolbar",
   workspaceRoot,
   forceNewWorktree,
+  worktreeUnavailableReason,
   autoEnvironmentLabel,
   onAutoEnvironment,
   envLocked,
@@ -384,14 +387,23 @@ const RunContextSelector = memo(function RunContextSelector({
                 <MiddleTruncate value={resolveCurrentWorkspaceLabel(activeWorktreePath)} />
               </span>
             </MenuRadioItem>
-            <MenuRadioItem disabled={envModeLocked} value="worktree" closeOnClick>
+            <MenuRadioItem
+              disabled={envModeLocked || Boolean(worktreeUnavailableReason)}
+              title={worktreeUnavailableReason}
+              value="worktree"
+              closeOnClick
+            >
               <span className="flex min-w-0 items-center gap-1.5">
                 <FolderGit2Icon className="size-3" />
                 <span className="min-w-0 truncate">{resolveEnvModeLabel("worktree")}</span>
               </span>
             </MenuRadioItem>
             {previousWorktreeLabel ? (
-              <MenuRadioItem disabled={envModeLocked} value="previous-worktree" closeOnClick>
+              <MenuRadioItem
+                disabled={envModeLocked || Boolean(worktreeUnavailableReason)}
+                value="previous-worktree"
+                closeOnClick
+              >
                 <PreviousWorktreeItemContent branch={previousWorktreeBranch} />
               </MenuRadioItem>
             ) : null}
@@ -596,6 +608,7 @@ export const BranchToolbar = memo(function BranchToolbar({
   layout = "composer",
   panelSection = "all",
   forceNewWorktree = false,
+  worktreeUnavailableReason,
   ref,
   environmentId,
   threadId,
@@ -664,6 +677,7 @@ export const BranchToolbar = memo(function BranchToolbar({
     ? resolvePreviousWorktreeLabel(previousWorktreeSeed)
     : null;
   const onUsePreviousWorktree = useCallback(() => {
+    if (worktreeUnavailableReason) return;
     if (!previousWorktreeSeed || !activeProjectRef) return;
     // Same shape the branch selector writes when picking a branch that
     // already lives in a worktree: point the draft at the existing tree.
@@ -673,7 +687,14 @@ export const BranchToolbar = memo(function BranchToolbar({
       envMode: "worktree",
       projectRef: activeProjectRef,
     });
-  }, [activeProjectRef, draftId, previousWorktreeSeed, setDraftThreadContext, threadRef]);
+  }, [
+    activeProjectRef,
+    draftId,
+    previousWorktreeSeed,
+    setDraftThreadContext,
+    threadRef,
+    worktreeUnavailableReason,
+  ]);
 
   useImperativeHandle(
     ref,
@@ -728,6 +749,7 @@ export const BranchToolbar = memo(function BranchToolbar({
             effectiveEnvMode={effectiveEnvMode}
             activeWorktreePath={activeWorktreePath}
             onEnvModeChange={onEnvModeChange}
+            worktreeUnavailableReason={worktreeUnavailableReason}
             previousWorktreeLabel={previousWorktreeLabel}
             previousWorktreeBranch={previousWorktreeSeed?.branch ?? null}
             onUsePreviousWorktree={onUsePreviousWorktree}
@@ -782,6 +804,7 @@ export const BranchToolbar = memo(function BranchToolbar({
             effectiveEnvMode={effectiveEnvMode}
             activeWorktreePath={activeWorktreePath}
             onEnvModeChange={onEnvModeChange}
+            worktreeUnavailableReason={worktreeUnavailableReason}
             previousWorktreeLabel={previousWorktreeLabel}
             previousWorktreeBranch={previousWorktreeSeed?.branch ?? null}
             onUsePreviousWorktree={onUsePreviousWorktree}
@@ -822,6 +845,7 @@ export const BranchToolbar = memo(function BranchToolbar({
               effectiveEnvMode={effectiveEnvMode}
               activeWorktreePath={activeWorktreePath}
               onEnvModeChange={onEnvModeChange}
+              worktreeUnavailableReason={worktreeUnavailableReason}
               previousWorktreeLabel={previousWorktreeLabel}
               previousWorktreeBranch={previousWorktreeSeed?.branch ?? null}
               onUsePreviousWorktree={onUsePreviousWorktree}

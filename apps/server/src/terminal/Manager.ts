@@ -1,3 +1,4 @@
+import { assertTerminalLaunchLocation, makeTerminalLocations } from "../fd/multirepo/index.ts";
 /**
  * TerminalManager - Terminal session orchestration service interface.
  *
@@ -1600,6 +1601,8 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       }
     });
 
+  const repositoryTerminals = makeTerminalLocations(fileSystem, path);
+
   const historyPath = (threadId: string, terminalId: string) => {
     const threadPart = toSafeThreadId(threadId);
     if (terminalId === DEFAULT_TERMINAL_ID) {
@@ -1899,6 +1902,9 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     threadId: string,
     terminalId: string,
   ) {
+    yield* repositoryTerminals
+      .forget(historyPath(threadId, terminalId))
+      .pipe(Effect.ignoreCause({ log: true }));
     yield* fileSystem.remove(historyPath(threadId, terminalId), { force: true }).pipe(
       Effect.catch((error) =>
         Effect.logWarning("failed to delete terminal history", {
@@ -1933,6 +1939,8 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         (name) =>
           name === `${toSafeThreadId(threadId)}.log` ||
           name === `${legacySafeThreadId(threadId)}.log` ||
+          name === `${toSafeThreadId(threadId)}.log.repository-cwd` ||
+          name === `${legacySafeThreadId(threadId)}.log.repository-cwd` ||
           name.startsWith(threadPrefix),
       ),
       (name) =>
@@ -2607,6 +2615,8 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 
     const sessionKey = toSessionKey(input.threadId, terminalId);
     const existing = yield* getSession(input.threadId, terminalId);
+    if (Option.isSome(existing)) yield* assertTerminalLaunchLocation(input, existing.value);
+    yield* repositoryTerminals.prepare(historyPath(input.threadId, terminalId), input);
     if (Option.isNone(existing)) {
       yield* flushPersist(input.threadId, terminalId);
       const history = yield* readHistory(input.threadId, terminalId);
@@ -2761,6 +2771,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         }
 
         const session = existing.value;
+        yield* assertTerminalLaunchLocation(input, session);
         const targetCols = input.cols ?? session.cols;
         const targetRows = input.rows ?? session.rows;
 
@@ -3048,6 +3059,9 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 
       const sessionKey = toSessionKey(input.threadId, terminalId);
       const existingSession = yield* getSession(input.threadId, terminalId);
+      if (Option.isSome(existingSession))
+        yield* assertTerminalLaunchLocation(input, existingSession.value);
+      yield* repositoryTerminals.prepare(historyPath(input.threadId, terminalId), input);
       let session: TerminalSessionState;
       if (Option.isNone(existingSession)) {
         const cols = input.cols ?? DEFAULT_OPEN_COLS;

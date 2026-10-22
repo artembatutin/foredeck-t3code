@@ -456,6 +456,15 @@ export const layer: Layer.Layer<
           return;
         }
       }
+      // The run is already persisted as active. Wait for a branch mutation that
+      // began before admission; subsequent branch changes see the active run.
+      if ((projection.thread.workspaceBinding?.repositories.length ?? 0) > 1) {
+        for (const repository of projection.thread.workspaceBinding?.repositories ?? []) {
+          yield* gitWorkflow
+            .withCheckoutMutation({ cwd: repository.rootPath, operation: "startTurn" }, Effect.void)
+            .pipe(Effect.mapError((cause) => new ProviderTurnStartError({ ...input, cause })));
+        }
+      }
       const { worktreePath, branch } = projection.thread;
       if (worktreePath !== null && branch !== null) {
         const exists = yield* fileSystem

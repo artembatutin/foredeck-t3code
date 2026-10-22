@@ -1,3 +1,5 @@
+import { RepositorySelector, useRepositoryWorkspace } from "../fd/multirepo";
+import type { RepositoryTarget } from "@t3tools/contracts";
 import { ThreadDetailsControl } from "./chat/ThreadDetailsControl";
 import { useAtomValue } from "@effect/atom-react";
 import {
@@ -97,7 +99,7 @@ import {
   useVcsInitAction,
   useVcsPullAction,
 } from "~/lib/sourceControlActions";
-import { useThreadProjection, useThreadShell } from "~/state/entities";
+import { useProject, useThreadProjection, useThreadShell } from "~/state/entities";
 import { readEnvironmentScope, useEnvironmentScope } from "~/state/session";
 import { useEnvironmentQuery } from "~/state/query";
 import { serverEnvironment } from "~/state/server";
@@ -166,18 +168,22 @@ const GIT_STATUS_WINDOW_REFRESH_DEBOUNCE_MS = 250;
 
 type RefreshVcsStatus = (target: {
   readonly environmentId: ScopedThreadRef["environmentId"];
-  readonly input: { readonly cwd: string };
+  readonly input: {
+    readonly cwd: string;
+    readonly repositoryTarget?: RepositoryTarget | undefined;
+  };
 }) => Promise<unknown>;
 
 function requestVcsStatusRefresh(
   refresh: RefreshVcsStatus,
   environmentId: ScopedThreadRef["environmentId"] | null,
   cwd: string | null,
+  repositoryTarget?: RepositoryTarget,
 ): void {
   if (environmentId === null || cwd === null) {
     return;
   }
-  void refresh({ environmentId, input: { cwd } });
+  void refresh({ environmentId, input: { cwd, repositoryTarget } });
 }
 const RUNNING_SOURCE_CONTROL_ACTIONS = ["runStackedAction", "pull", "publishRepository"] as const;
 
@@ -459,6 +465,7 @@ function GitActionSuccessButtonContent({ success }: { success: InlineGitActionSu
 }
 
 interface PublishRepositoryDialogProps {
+  repositoryTarget?: RepositoryTarget | undefined;
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
   readonly environmentId: ScopedThreadRef["environmentId"] | null;
@@ -495,8 +502,9 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
     () => ({
       environmentId: props.environmentId,
       cwd: props.gitCwd,
+      repositoryTarget: props.repositoryTarget,
     }),
-    [props.environmentId, props.gitCwd],
+    [props.environmentId, props.gitCwd, props.repositoryTarget],
   );
   const publishRepositoryAction = useSourceControlPublishRepositoryAction(sourceControlScope);
   const publishAccountByProvider = useMemo(() => {
@@ -993,7 +1001,7 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
 
 export default function GitActionsControl({
   presentation = "toolbar",
-  gitCwd,
+  gitCwd: fallbackCwd,
   activeThreadRef,
   draftId,
   displayMode = "toolbar",
@@ -1008,7 +1016,6 @@ export default function GitActionsControl({
     "thread branch metadata update",
   );
   const activeEnvironmentId = activeThreadRef?.environmentId ?? null;
-  const successScopeKey = `${activeEnvironmentId ?? ""}\u0000${gitCwd ?? ""}`;
   const canWriteSourceControl = useEnvironmentScope(
     activeEnvironmentId,
     AuthSourceControlWriteScope,
@@ -1038,6 +1045,14 @@ export default function GitActionsControl({
   const activeServerThread =
     activeServerThreadShell ?? activeServerThreadProjection?.projection.thread ?? null;
   const isLocalDraftThread = activeDraftThread !== null && activeServerThread === null;
+  const projectId = activeServerThread?.projectId ?? activeDraftThread?.projectId;
+  const activeProject = useProject(
+    activeEnvironmentId && projectId ? { environmentId: activeEnvironmentId, projectId } : null,
+  );
+  const repositoryWorkspace = useRepositoryWorkspace(activeProject, activeServerThread);
+  const repositoryTarget = repositoryWorkspace.repositoryTarget;
+  const gitCwd = activeProject ? repositoryWorkspace.cwd : fallbackCwd;
+  const successScopeKey = `${activeEnvironmentId ?? ""}\u0000${gitCwd ?? ""}`;
   const canChangeThreadBranch = canWriteSourceControl && (isLocalDraftThread || canOperateThread);
   const setDraftThreadContext = useComposerDraftStore((store) => store.setDraftThreadContext);
   const [isCommitDialogOpen, setIsCommitDialogOpen] = useState(false);
@@ -1049,8 +1064,8 @@ export default function GitActionsControl({
   const [pendingDefaultBranchAction, setPendingDefaultBranchAction] =
     useState<PendingDefaultBranchAction | null>(null);
   const sourceControlScope = useMemo(
-    () => ({ environmentId: activeEnvironmentId, cwd: gitCwd }),
-    [activeEnvironmentId, gitCwd],
+    () => ({ environmentId: activeEnvironmentId, cwd: gitCwd, repositoryTarget }),
+    [activeEnvironmentId, gitCwd, repositoryTarget],
   );
   const vcsActionState = useAtomValue(vcsActionManager.stateAtom(sourceControlScope));
   const visibleInlineSuccess = inlineSuccess?.scopeKey === successScopeKey ? inlineSuccess : null;
@@ -1065,7 +1080,7 @@ export default function GitActionsControl({
 
   const persistThreadBranchSync = useCallback(
     (branch: string | null, manualSelection = false) => {
-      if (!activeThreadRef) {
+      if (!activeThreadRef || repositoryWorkspace.isMultiRepository) {
         return;
       }
 
@@ -1108,6 +1123,7 @@ export default function GitActionsControl({
       draftId,
       setDraftThreadContext,
       updateThreadMetadata,
+      repositoryWorkspace.isMultiRepository,
     ],
   );
 
@@ -1127,7 +1143,7 @@ export default function GitActionsControl({
     activeEnvironmentId !== null && gitCwd !== null
       ? vcsEnvironment.status({
           environmentId: activeEnvironmentId,
-          input: { cwd: gitCwd },
+          input: { cwd: gitCwd, repositoryTarget },
         })
       : null,
   );
@@ -1228,7 +1244,7 @@ export default function GitActionsControl({
       }
       refreshTimeout = window.setTimeout(() => {
         refreshTimeout = null;
-        requestVcsStatusRefresh(refreshVcsStatus, activeEnvironmentId, gitCwd);
+        requestVcsStatusRefresh(refreshVcsStatus, activeEnvironmentId, gitCwd, repositoryTarget);
       }, GIT_STATUS_WINDOW_REFRESH_DEBOUNCE_MS);
     };
     const handleVisibilityChange = () => {
@@ -1247,7 +1263,7 @@ export default function GitActionsControl({
       window.removeEventListener("focus", scheduleRefreshCurrentGitStatus);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [activeEnvironmentId, gitCwd, refreshVcsStatus]);
+  }, [activeEnvironmentId, gitCwd, refreshVcsStatus, repositoryTarget]);
 
   // React 19.2 leaves useEffectEvent stale inside the memoized details panel.
   // Bind each render's actions to its checkout and thread, including retained toast actions.
@@ -1705,6 +1721,7 @@ export default function GitActionsControl({
 
   return (
     <>
+      {presentation !== "menu" ? <RepositorySelector workspace={repositoryWorkspace} /> : null}
       {presentation === "menu" ? (
         !isRepo ? (
           <MenuItem
@@ -1740,7 +1757,13 @@ export default function GitActionsControl({
             )}
             <MenuSub
               onOpenChange={(open) => {
-                if (open) requestVcsStatusRefresh(refreshVcsStatus, activeEnvironmentId, gitCwd);
+                if (open)
+                  requestVcsStatusRefresh(
+                    refreshVcsStatus,
+                    activeEnvironmentId,
+                    gitCwd,
+                    repositoryTarget,
+                  );
               }}
             >
               <MenuSubTrigger density="touch" disabled={isGitActionRunning}>
@@ -1872,7 +1895,12 @@ export default function GitActionsControl({
               <Menu
                 onOpenChange={(open) => {
                   if (open) {
-                    requestVcsStatusRefresh(refreshVcsStatus, activeEnvironmentId, gitCwd);
+                    requestVcsStatusRefresh(
+                      refreshVcsStatus,
+                      activeEnvironmentId,
+                      gitCwd,
+                      repositoryTarget,
+                    );
                   }
                 }}
               >
@@ -2108,6 +2136,7 @@ export default function GitActionsControl({
         environmentId={activeEnvironmentId}
         threadRef={activeThreadRef}
         gitCwd={gitCwd}
+        repositoryTarget={repositoryTarget}
       />
 
       <Dialog

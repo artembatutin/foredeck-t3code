@@ -1,10 +1,12 @@
+import { openRepositoryFile } from "./fd/multirepo";
+import type { RepositoryFileScope } from "@t3tools/client-runtime/fd/multirepo";
 import type { ScopedThreadRef } from "@t3tools/contracts";
 import { isWindowsAbsolutePath, normalizeProjectPathForComparison } from "@t3tools/shared/path";
 
-import { useRightPanelStore } from "./rightPanelStore";
 import { resolvePathLinkTarget } from "@t3tools/shared/fileLinks";
 
 interface OpenDiffFilePrimaryActionInput {
+  readonly repositoryScope?: RepositoryFileScope | undefined;
   readonly threadRef: ScopedThreadRef | null;
   readonly filePath: string;
   readonly activeCwd: string | undefined;
@@ -82,6 +84,7 @@ export function openDiffFilePrimaryAction({
   filePath,
   activeCwd,
   repositoryRoot,
+  repositoryScope,
   openInEditor,
 }: OpenDiffFilePrimaryActionInput): void {
   const workspaceFilePath = resolveDiffPathForWorkspace({
@@ -92,7 +95,7 @@ export function openDiffFilePrimaryAction({
   if (!workspaceFilePath) return;
 
   if (threadRef) {
-    useRightPanelStore.getState().openFile(threadRef, workspaceFilePath);
+    openRepositoryFile(threadRef, workspaceFilePath, undefined, repositoryScope);
     return;
   }
 

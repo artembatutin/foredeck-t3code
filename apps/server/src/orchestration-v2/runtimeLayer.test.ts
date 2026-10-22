@@ -811,6 +811,34 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
           assert.match(String(shared.cause), /isolated worktree/);
           assert.equal(yield* orchestrator.getThreadEventSequence(threadId), sequence);
           assert.deepEqual(yield* outbox.listByCommandId(sharedCommandId), []);
+          // Configuring repositories later must not change this older thread's undo policy.
+          const projects = yield* ProjectStore.ProjectStoreV2;
+          const projectId = ProjectId.make("runtime-rollback-readiness-project");
+          yield* projects.apply({
+            sequence: 1,
+            eventId: EventId.make("rollback-project-membership"),
+            aggregateKind: "project",
+            aggregateId: projectId,
+            occurredAt: DateTime.formatIso(now),
+            commandId: null,
+            causationEventId: null,
+            correlationId: null,
+            metadata: {},
+            type: "project.created",
+            payload: {
+              projectId,
+              title: "Expanded project",
+              workspaceRoot: process.cwd(),
+              repositories: [
+                { id: "original", name: "Original", rootPath: process.cwd() },
+                { id: "additional", name: "Additional", rootPath: "/additional" },
+              ],
+              defaultModelSelection: null,
+              scripts: [],
+              createdAt: DateTime.formatIso(now),
+              updatedAt: DateTime.formatIso(now),
+            },
+          });
           const conversationOnly = yield* orchestrator.dispatch({
             type: "checkpoint.rollback",
             commandId: CommandId.make("runtime-rollback-conversation"),
@@ -877,7 +905,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
       const run = initial.runs[0]!;
       const providerThread = initial.providerThreads[0]!;
       const now = yield* DateTime.now;
-      const providerSession = {
+      const providerSession: ProviderAdapter.ProviderAdapterV2SessionRuntime["providerSession"] = {
         id: providerThread.providerSessionId!,
         driver,
         providerInstanceId: modelSelection.instanceId,

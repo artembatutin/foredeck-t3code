@@ -203,7 +203,7 @@ export const make = Effect.gen(function* () {
     input: ProjectReadFileInput,
   ) {
     const requestedPath = input.relativePath.trim();
-    if (path.isAbsolute(requestedPath)) {
+    if (path.isAbsolute(requestedPath) && input.repositoryTarget === undefined) {
       const realTargetPath = yield* Effect.tryPromise({
         try: () => NodeFSP.realpath(requestedPath),
         catch: (cause) =>
@@ -221,7 +221,9 @@ export const make = Effect.gen(function* () {
 
     const target = yield* workspacePaths.resolveRelativePathWithinRoot({
       workspaceRoot: input.cwd,
-      relativePath: input.relativePath,
+      relativePath: path.isAbsolute(requestedPath)
+        ? path.relative(input.cwd, requestedPath)
+        : input.relativePath,
     });
 
     const realWorkspaceRoot = yield* Effect.tryPromise({

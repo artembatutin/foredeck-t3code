@@ -16,6 +16,7 @@ import {
   SettingsEnvironmentFilterHeader,
 } from "./components/SettingsEnvironmentFilterHeader";
 import { useSettingsEnvironmentFilter, type SettingsTarget } from "./settings-environment-filter";
+import { RepositorySettings } from "../../fd/multirepo";
 
 export function SettingsProjectOverviewRouteScreen() {
   const insets = useSafeAreaInsets();
@@ -139,6 +140,19 @@ function ProjectOverviewContent(props: {
         </View>
       </SettingsSection>
 
+      {props.members.map((member) => {
+        const environment = props.environments.find(
+          (entry) => entry.environmentId === member.environmentId,
+        );
+        return (
+          <RepositorySettings
+            key={`${member.environmentId}:${member.id}`}
+            project={member}
+            serverConfig={environment?.serverConfig ?? null}
+            environmentLabel={environment?.label ?? "Environment"}
+          />
+        );
+      })}
       <SettingsSection title="Checkouts">
         {props.members.map((member, index) => {
           const environment = props.environments.find(

@@ -1,4 +1,9 @@
-import { NonNegativeInt, ThreadId, type VcsError } from "@t3tools/contracts";
+import {
+  NonNegativeInt,
+  ThreadId,
+  type VcsError,
+  type RepositoryTargetError,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
 import type { ProjectionRepositoryError } from "../persistence/Errors.ts";
@@ -86,6 +91,7 @@ export type CheckpointStoreError = VcsError;
 
 export type CheckpointServiceError =
   | CheckpointStoreError
+  | RepositoryTargetError
   | ProjectionRepositoryError
   | CheckpointDiffResultInvalidError
   | CheckpointThreadNotFoundError

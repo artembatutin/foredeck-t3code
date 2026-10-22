@@ -1,6 +1,7 @@
+import { RepositorySelector, type useRepositoryWorkspace } from "../../fd/multirepo";
 import { resolveFilesystemReadAccess } from "@t3tools/client-runtime/state/filesystem";
 import { environmentSession } from "../../state/session";
-import type { EnvironmentId } from "@t3tools/contracts";
+import type { EnvironmentId, RepositoryTarget } from "@t3tools/contracts";
 import { SymbolView } from "../../components/AppSymbol";
 import { MaterialScreenContent } from "../../components/MaterialScreenContent";
 import { useCallback, useMemo, useState, type ComponentProps } from "react";
@@ -27,6 +28,8 @@ import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
 
 export function ThreadFileNavigatorPane(props: {
   readonly cwd: string;
+  readonly repositoryTarget?: RepositoryTarget | undefined;
+  readonly repositoryWorkspace?: ReturnType<typeof useRepositoryWorkspace>;
   readonly environmentId: EnvironmentId;
   readonly headerInset: number;
   readonly projectName: string;
@@ -53,6 +56,7 @@ export function ThreadFileNavigatorPane(props: {
   const { canReadFiles } = fileAccess;
   const entriesQuery = useFileTreeEntries({
     environmentId: props.environmentId,
+    repositoryTarget: props.repositoryTarget,
     cwd: canReadFiles ? props.cwd : null,
     searchQuery,
   });
@@ -60,12 +64,13 @@ export function ThreadFileNavigatorPane(props: {
     (relativePath: string) => {
       preloadWorkspaceFileContents({
         cwd: props.cwd,
+        repositoryTarget: props.repositoryTarget,
         environmentId: props.environmentId,
         relativePath,
         theme: highlightTheme,
       });
     },
-    [highlightTheme, props.cwd, props.environmentId],
+    [highlightTheme, props.cwd, props.environmentId, props.repositoryTarget],
   );
   const nativeHeaderRightBarButtonItems = useMemo(
     () =>
@@ -85,7 +90,7 @@ export function ThreadFileNavigatorPane(props: {
 
   const fileTree = (
     <FileTreeBrowser
-      key={JSON.stringify([props.environmentId, props.cwd])}
+      key={JSON.stringify([props.environmentId, props.cwd, props.repositoryTarget])}
       entries={entriesQuery.entries}
       loadingDirectories={entriesQuery.loadingDirectories}
       onLoadDirectory={entriesQuery.loadDirectory}
@@ -110,6 +115,9 @@ export function ThreadFileNavigatorPane(props: {
   if (Platform.OS === "ios") {
     return (
       <View className="flex-1 border-l border-border bg-sheet">
+        {props.repositoryWorkspace ? (
+          <RepositorySelector workspace={props.repositoryWorkspace} />
+        ) : null}
         <ScreenStack style={{ flex: 1 }}>
           <Screen
             activityState={2}
@@ -223,6 +231,9 @@ export function ThreadFileNavigatorPane(props: {
           </View>
         ) : null}
       </View>
+      {props.repositoryWorkspace ? (
+        <RepositorySelector workspace={props.repositoryWorkspace} />
+      ) : null}
       <MaterialScreenContent insetHorizontal>{fileTree}</MaterialScreenContent>
     </View>
   );

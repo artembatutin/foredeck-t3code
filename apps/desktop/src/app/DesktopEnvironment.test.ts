@@ -215,3 +215,21 @@ describe("DesktopEnvironment", () => {
     }),
   );
 });
+
+it.effect("installed assistant previews default to an isolated home without a launch wrapper", () =>
+  Effect.gen(function* () {
+    const preview = yield* makeEnvironment({
+      isPackaged: true,
+      appVersion: "0.0.45-preview.20261017.2",
+    });
+    assert.equal(preview.baseDir, "/Users/alice/.foredeck-assistant-preview");
+    assert.equal(preview.stateDir, "/Users/alice/.foredeck-assistant-preview/userdata");
+    const explicit = yield* makeEnvironment(
+      { isPackaged: true, appVersion: "0.0.45-preview.20261017.2" },
+      { T3CODE_HOME: "/isolated/custom" },
+    );
+    assert.equal(explicit.baseDir, "/isolated/custom");
+    const ordinary = yield* makeEnvironment({ isPackaged: true });
+    assert.equal(ordinary.baseDir, "/Users/alice/.t3");
+  }),
+);

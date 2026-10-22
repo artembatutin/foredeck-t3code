@@ -370,6 +370,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
 
       assert.notProperty(preview, "publish");
       assert.notProperty(previewChannel, "publish");
+      assert.equal(previewChannel.appId, "com.foredeck.assistant.preview");
+      assert.equal(previewChannel.productName, "Foredeck Assistant Preview");
       assert.deepStrictEqual(release.publish, [
         {
           provider: "github",

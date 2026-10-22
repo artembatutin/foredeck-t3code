@@ -16,6 +16,7 @@ export interface CheckpointDiffState {
 }
 
 export interface CheckpointDiffTarget {
+  readonly repositoryId?: string | undefined;
   readonly environmentId: EnvironmentId | null;
   readonly threadId: ThreadId | null;
   readonly fromTurnCount: number | null;

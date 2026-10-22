@@ -1,3 +1,4 @@
+import { RepositorySet } from "../fd/multirepo/index.ts";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { CommandId, type Project, ProjectId, ProviderInstanceId } from "@t3tools/contracts";
@@ -70,6 +71,7 @@ const layerTest = layerTestFor(layerMetadata);
 
 /** Every dependency of ProjectService.make, so a test can swap one of them. */
 const layerProjectServiceDependencies = Layer.mergeAll(
+  RepositorySet.layerDefault,
   RuntimeLayer.layerEventSink,
   ProjectStore.layer,
   ProjectionStore.layer,

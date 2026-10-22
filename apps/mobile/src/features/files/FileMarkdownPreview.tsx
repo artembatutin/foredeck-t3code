@@ -1,4 +1,4 @@
-import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import type { EnvironmentId, RepositoryTarget, ThreadId } from "@t3tools/contracts";
 import { resolveMobileMarkdownMediaSource } from "../../lib/markdownMediaSource";
 import { getBrowseDirectoryPath } from "@t3tools/client-runtime/state/projects";
 import { useCallback, useMemo, useState } from "react";
@@ -86,6 +86,7 @@ export function useMarkdownPreviewStyles(): MarkdownPreviewStyles {
 }
 
 export function FileMarkdownPreview(props: {
+  readonly repositoryTarget?: RepositoryTarget | undefined;
   readonly cwd: string;
   readonly captured?: boolean;
   readonly environmentId: EnvironmentId;
@@ -118,12 +119,14 @@ export function FileMarkdownPreview(props: {
       const media = resolveMobileMarkdownMediaSource(image.href, {
         threadId: props.threadId ?? undefined,
         workspaceRoot: markdownDirectory,
+        repositoryTarget: props.repositoryTarget,
         imageEmbed: true,
       });
       const preview = resolveMarkdownMediaPreview(image.href, {
         environmentId: props.environmentId,
         threadId: props.threadId ?? undefined,
         workspaceRoot: markdownDirectory,
+        repositoryTarget: props.repositoryTarget,
         captured: props.captured,
         imageEmbed: true,
       });
@@ -175,13 +178,20 @@ export function FileMarkdownPreview(props: {
         />
       );
     },
-    [markdownDirectory, props.environmentId, props.threadId, props.captured],
+    [
+      markdownDirectory,
+      props.environmentId,
+      props.threadId,
+      props.captured,
+      props.repositoryTarget,
+    ],
   );
   const styles = useMarkdownPreviewStyles();
   const resolveImageSource = useMarkdownImageSource({
     environmentId: props.environmentId,
     threadId: props.threadId,
     workspaceRoot: markdownDirectory,
+    repositoryTarget: props.repositoryTarget,
     captured: props.captured,
   });
   const openMedia = useCallback(
@@ -190,6 +200,7 @@ export function FileMarkdownPreview(props: {
         environmentId: props.environmentId,
         threadId: props.threadId ?? undefined,
         workspaceRoot: markdownDirectory,
+        repositoryTarget: props.repositoryTarget,
         captured: props.captured,
         imageEmbed,
       });
@@ -198,7 +209,13 @@ export function FileMarkdownPreview(props: {
       else setExpandedFile(media.source);
       return true;
     },
-    [markdownDirectory, props.environmentId, props.threadId, props.captured],
+    [
+      markdownDirectory,
+      props.environmentId,
+      props.threadId,
+      props.captured,
+      props.repositoryTarget,
+    ],
   );
   const onImagePress = useCallback(
     (href: string) => {

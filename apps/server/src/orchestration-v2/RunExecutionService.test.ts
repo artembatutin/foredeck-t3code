@@ -3692,6 +3692,25 @@ it.effect("emits run_interrupt_result when hard-stop finalizes the active attemp
   }),
 );
 
+it.effect("captures failed multi-repository runs without changing their failure state", () =>
+  Effect.gen(function* () {
+    const { finalEvents, committedEffects } = yield* captureRootRunTermination({
+      key: "failed-multiple-repositories",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      multiRepository: true,
+      events: (ids) => Stream.make(rootTerminalEvent(ids, "failed")),
+    });
+    assert.deepEqual(
+      committedEffects.map((effect) => effect.request.type),
+      ["checkpoint.capture"],
+    );
+    assert.equal(
+      finalEvents.find((event) => event.type === "run.updated")?.payload.status,
+      "failed",
+    );
+  }),
+);
+
 it.effect.each(["completed", "interrupted", "cancelled", "failed"] as const)(
   "refreshes pull requests after the current root run %s",
   (status) =>
@@ -3861,6 +3880,7 @@ function captureRootRunTermination(input: {
   readonly startTurn?: ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"];
   readonly refreshAfterTurn?: Effect.Effect<void>;
   readonly canCheckpointFilesystem?: boolean;
+  readonly multiRepository?: boolean;
 }) {
   return Effect.gen(function* () {
     const ids = backgroundScenarioIds(input.key);
@@ -4003,6 +4023,24 @@ function captureRootRunTermination(input: {
         } as OrchestrationV2ExecutionNode,
         checkpointScope: {
           id: CheckpointScopeId.make(`checkpoint-scope:${input.key}`),
+          threadId: ids.threadId,
+          runId: ids.runId,
+          nodeId: ids.rootNodeId,
+          parentScopeId: null,
+          providerThreadId: ids.providerThreadId,
+          kind: "root_run",
+          ordinalWithinParent: 0,
+          advancesAppRunCount: true,
+          cwd: "/one",
+          createdAt: yield* DateTime.now,
+          ...(input.multiRepository
+            ? {
+                repositories: [
+                  { id: "one", name: "One", rootPath: "/one" },
+                  { id: "two", name: "Two", rootPath: "/two" },
+                ],
+              }
+            : {}),
         } as OrchestrationV2CheckpointScope,
         providerThread: {
           id: ids.providerThreadId,

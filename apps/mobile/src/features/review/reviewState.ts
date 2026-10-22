@@ -124,9 +124,10 @@ export interface ReviewAsyncState {
 function buildThreadKey(input: {
   readonly environmentId?: EnvironmentId;
   readonly threadId?: ThreadId;
+  readonly repositoryId?: string | undefined;
 }): string | null {
   return input.environmentId && input.threadId
-    ? scopedThreadKey(input.environmentId, input.threadId)
+    ? `${scopedThreadKey(input.environmentId, input.threadId)}${input.repositoryId ? `:repository:${input.repositoryId}` : ""}`
     : null;
 }
 
@@ -137,6 +138,7 @@ function buildSectionCacheKey(threadKey: string, sectionId: string): string {
 export function useReviewCacheForThread(input: {
   readonly environmentId?: EnvironmentId;
   readonly threadId?: ThreadId;
+  readonly repositoryId?: string | undefined;
 }): ReviewCacheForThread {
   const threadKey = buildThreadKey(input);
   const gitSections = useAtomValue(
@@ -177,6 +179,18 @@ export function useReviewCacheForThread(input: {
     revealedLargeFileIdsBySection,
     viewedFileIdsBySection,
   };
+}
+
+export function setRepositoryReviewSection(
+  input: {
+    readonly environmentId: EnvironmentId;
+    readonly threadId: ThreadId;
+    readonly repositoryId: string;
+  },
+  sectionId: string,
+) {
+  const key = buildThreadKey(input);
+  if (key) setReviewSelectedSectionId(key, sectionId);
 }
 
 export function setReviewGitSections(

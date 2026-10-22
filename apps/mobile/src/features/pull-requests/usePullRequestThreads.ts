@@ -1,3 +1,4 @@
+import { usesSharedCheckouts } from "@t3tools/client-runtime/fd/multirepo";
 import { useNavigation, useNavigationState, useRoute } from "@react-navigation/native";
 import { threadPullRequestLinkMode } from "@t3tools/client-runtime/thread-pull-request-compatibility";
 import {
@@ -16,7 +17,7 @@ import { useAndroidWorkspaceSelection } from "../workspace/useAndroidWorkspaceSe
 import { pullRequestComposerContext } from "../../lib/composerContext";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { uuidv4 } from "../../lib/uuid";
-import { useEnvironmentServerConfig } from "../../state/entities";
+import { useProject, useEnvironmentServerConfig } from "../../state/entities";
 import { composerPullRequests } from "../../state/pull-requests";
 import { useEnvironmentQuery } from "../../state/query";
 import { useEnvironmentScope } from "../../state/session";
@@ -65,6 +66,11 @@ export function usePullRequestThreads(
     setLastRelations({ key, data: relations.data });
   const threads =
     (relations.data ?? (lastRelations.key === key ? lastRelations.data : null))?.threads ?? [];
+  const project = useProject({
+    environmentId: target.environmentId,
+    projectId: target.input.projectId,
+  });
+  const multiRepository = usesSharedCheckouts(project);
   const connected = usePullRequestConnected(params.environmentId);
   const canOperate = useEnvironmentScope(target.environmentId, AuthOrchestrationOperateScope);
   // Composing offline only writes a local draft. The outbox checks grants on delivery.
@@ -85,7 +91,7 @@ export function usePullRequestThreads(
     pending.current = true;
     setBusy(true);
     try {
-      if (connected && !thread && !canCheckout)
+      if (connected && !thread && !multiRepository && !canCheckout)
         throw new Error("Starting work from this PR requires source control write access.");
       await waitForComposerDraftsLoaded();
       const draftKey = thread
@@ -94,7 +100,7 @@ export function usePullRequestThreads(
             environmentId: target.environmentId,
             projectId: target.input.projectId,
           });
-      if (!thread)
+      if (!thread && !multiRepository)
         updateComposerDraftSettings(draftKey, {
           workspaceSelection: {
             mode: "worktree",

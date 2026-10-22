@@ -52,7 +52,10 @@ vi.mock("./use-thread-selection", () => ({
   },
 }));
 vi.mock("./use-selected-thread-worktree", () => ({
-  useSelectedThreadWorktree: () => harness.worktree,
+  useSelectedThreadWorktree: () => ({
+    ...harness.worktree,
+    repositoryWorkspace: { isMultiRepository: false, selected: null },
+  }),
 }));
 
 import { useSelectedThreadGitActions } from "./use-selected-thread-git-actions";

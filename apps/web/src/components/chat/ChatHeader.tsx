@@ -1,3 +1,4 @@
+import { isAssistantThread } from "@t3tools/shared/fd/assistant";
 import {
   AuthOrchestrationOperateScope,
   type EnvironmentId,
@@ -313,7 +314,7 @@ export const ChatHeader = memo(function ChatHeader({
         {/* The project always leads the header: knowing which project a
             thread lives in is priority zero, and the thread title alone
             doesn't answer it. */}
-        {activeProject ? (
+        {activeProject && !isAssistantThread(activeThreadId) ? (
           <>
             <WorkspaceBreadcrumbItem className="shrink">
               <Tooltip>

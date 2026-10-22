@@ -1,3 +1,4 @@
+import { ProjectRepositories, ProjectRepository, ThreadWorkspaceBinding } from "./project.ts";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -317,6 +318,8 @@ export const OrchestrationV2IdentityCapabilities = Schema.Struct({
 export type OrchestrationV2IdentityCapabilities = typeof OrchestrationV2IdentityCapabilities.Type;
 
 export const OrchestrationV2ProviderCapabilities = Schema.Struct({
+  /** Absent on older providers: they cannot execute a repository set. */
+  multiRepository: Schema.optional(Schema.Struct({ runtimeModes: Schema.Array(RuntimeMode) })),
   sessions: OrchestrationV2SessionCapabilities,
   threads: OrchestrationV2ThreadCapabilities,
   turns: OrchestrationV2TurnCapabilities,
@@ -362,6 +365,7 @@ export const OrchestrationV2LimitRecoveryUpdate = Schema.Struct({
 export type OrchestrationV2LimitRecoveryUpdate = typeof OrchestrationV2LimitRecoveryUpdate.Type;
 
 export const OrchestrationV2AppThread = Schema.Struct({
+  workspaceBinding: Schema.optional(ThreadWorkspaceBinding),
   ...OrchestrationV2CreationFields,
   id: ThreadId,
   projectId: ProjectId,
@@ -795,6 +799,8 @@ export function isOrchestrationV2WorkActive(
 }
 
 export const OrchestrationV2CheckpointScope = Schema.Struct({
+  repositories: Schema.optional(ProjectRepositories),
+  repository: Schema.optional(ProjectRepository),
   id: CheckpointScopeId,
   threadId: ThreadId,
   runId: Schema.NullOr(RunId),
@@ -1302,9 +1308,21 @@ export const OrchestrationV2Checkpoint = Schema.Struct({
   ref: CheckpointRef,
   status: Schema.Literals(["ready", "missing", "error", "stale"]),
   files: Schema.Array(OrchestrationV2CheckpointFileSummary),
+  filesAvailable: Schema.optionalKey(Schema.Boolean),
   capturedAt: Schema.DateTimeUtc,
 });
 export type OrchestrationV2Checkpoint = typeof OrchestrationV2Checkpoint.Type;
+
+export const RepositoryTurnCheckpoint = Schema.Struct({
+  repository: ProjectRepository,
+  checkpointId: CheckpointId,
+  scopeId: CheckpointScopeId,
+  status: OrchestrationV2Checkpoint.fields.status,
+  baselineStatus: OrchestrationV2Checkpoint.fields.status,
+  files: Schema.Array(OrchestrationV2CheckpointFileSummary),
+  filesAvailable: Schema.Boolean,
+});
+export type RepositoryTurnCheckpoint = typeof RepositoryTurnCheckpoint.Type;
 
 export const OrchestrationV2CheckpointRollbackRequest = Schema.Struct({
   scopeId: CheckpointScopeId,
@@ -1564,6 +1582,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
     checkpointId: CheckpointId,
     scopeId: CheckpointScopeId,
     files: Schema.Array(OrchestrationV2CheckpointFileSummary),
+    repositoryCheckpoints: Schema.optionalKey(Schema.Array(RepositoryTurnCheckpoint)),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -1938,6 +1957,7 @@ export type OrchestrationV2LatestVisibleMessageSummary =
   typeof OrchestrationV2LatestVisibleMessageSummary.Type;
 
 export const OrchestrationV2ThreadShell = Schema.Struct({
+  workspaceBinding: Schema.optional(ThreadWorkspaceBinding),
   ...OrchestrationV2CreationFields,
   id: ThreadId,
   projectId: ProjectId,
@@ -2356,6 +2376,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     checkpointId: CheckpointId,
     scopeId: CheckpointScopeId,
     files: Schema.Array(OrchestrationV2CheckpointFileSummary),
+    repositoryCheckpoints: Schema.optionalKey(Schema.Array(RepositoryTurnCheckpoint)),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,

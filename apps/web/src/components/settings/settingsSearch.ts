@@ -165,6 +165,18 @@ const SOURCE_CONTROL_HOST_SEARCH_ITEMS = sourceControlClients.definitions.flatMa
  */
 export const SETTINGS_SEARCH_ITEMS = [
   {
+    id: "voice-mode",
+    title: "Voice mode",
+    to: "/settings/general",
+    searchTerms: ["microphone dictation conversation transcript speech"],
+  },
+  {
+    id: "voice-speaking-voice",
+    title: "Speaking voice",
+    to: "/settings/general",
+    searchTerms: ["local voices preview speech synthesis audio"],
+  },
+  {
     id: "storage-worktree-keep-when",
     targetId: "storage-worktrees",
     title: "Keep worktrees with local changes",

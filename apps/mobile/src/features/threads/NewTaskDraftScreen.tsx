@@ -1,3 +1,9 @@
+import { repositoryExecutionBlockReason } from "@t3tools/client-runtime/fd/multirepo";
+import { useRepositoryWorkspace, RepositorySelector } from "../../fd/multirepo";
+import {
+  usesSharedCheckouts,
+  MULTIREPO_CHECKOUT_NOTICE,
+} from "@t3tools/client-runtime/fd/multirepo";
 import { useAtomValue } from "@effect/atom-react";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
@@ -492,6 +498,27 @@ export function NewTaskDraftScreen(props: {
       selectedEnvironmentServerConfig?.providers ?? [],
       selectedEnvironmentServerConfig?.usageLimitSources ?? [],
     );
+  const repositoryWorkspace = useRepositoryWorkspace(selectedProject, null);
+  const repositoryScope = useMemo(
+    () =>
+      !flow.selectedWorktreePath &&
+      repositoryWorkspace.selected &&
+      repositoryWorkspace.repositoryTarget
+        ? { repository: repositoryWorkspace.selected, target: repositoryWorkspace.repositoryTarget }
+        : undefined,
+    [flow.selectedWorktreePath, repositoryWorkspace.selected, repositoryWorkspace.repositoryTarget],
+  );
+  const repositoryBlockedReason =
+    usesSharedCheckouts(selectedProject) &&
+    (flow.workspaceMode === "worktree" || flow.selectedWorktreePath !== null)
+      ? MULTIREPO_CHECKOUT_NOTICE
+      : repositoryExecutionBlockReason({
+          isMultiRepository: repositoryWorkspace.isMultiRepository,
+          serverProtocolVersion:
+            selectedEnvironmentServerConfig?.environment.capabilities.multiRepository,
+          provider: flow.selectedProviderStatus,
+          runtimeMode: flow.runtimeMode,
+        });
   const composerWorkspaceCwd =
     (flow.workspaceMode === "worktree"
       ? selectedProject?.workspaceRoot
@@ -511,6 +538,7 @@ export function NewTaskDraftScreen(props: {
       : null,
     pullRequestRepository: selectedProject?.repositoryIdentity?.displayName ?? null,
     projectCwd: composerWorkspaceCwd,
+    repositoryScope,
     selectedProviderStatus: flow.selectedProviderStatus,
     hasThread: false,
     hasCompactableConversation: false,
@@ -1259,6 +1287,7 @@ export function NewTaskDraftScreen(props: {
     const initialMessageText = draft.text.trim();
 
     if (
+      repositoryBlockedReason !== null ||
       attachmentBlockReason !== null ||
       !modelSelection ||
       (initialMessageText.length === 0 && draft.attachments.length === 0) ||
@@ -1416,6 +1445,7 @@ export function NewTaskDraftScreen(props: {
     !isImportingContext &&
     !cloneBlocksStart &&
     taskPermissionReason === null &&
+    repositoryBlockedReason === null &&
     attachmentBlockReason === null &&
     !modelUnavailable &&
     Boolean(flow.selectedProject) &&
@@ -1447,6 +1477,7 @@ export function NewTaskDraftScreen(props: {
   };
   const promptEditor = (
     <>
+      <RepositorySelector workspace={repositoryWorkspace} />
       <ComposerEditor
         draftKey={flow.draftKey}
         environmentId={selectedProject.environmentId}
@@ -1459,6 +1490,7 @@ export function NewTaskDraftScreen(props: {
             StackActions.push("NewTaskFile", {
               environmentId: String(selectedProject.environmentId),
               cwd: composerWorkspaceCwd,
+              projectId: String(selectedProject.id),
               projectName: selectedProject.title,
               path: fileRoutePathSegments(path),
             }),
@@ -1617,9 +1649,17 @@ export function NewTaskDraftScreen(props: {
   const workspaceControls = (
     <View className="flex-row items-center gap-1 px-2">
       <ComposerInlineControl
-        accessibilityHint={`Switches to ${flow.workspaceMode === "local" ? "a new worktree" : "the current checkout"}`}
+        accessibilityHint={
+          usesSharedCheckouts(flow.selectedProject)
+            ? MULTIREPO_CHECKOUT_NOTICE
+            : `Switches to ${flow.workspaceMode === "local" ? "a new worktree" : "the current checkout"}`
+        }
         accessibilityLabel={workspaceLabel}
-        disabled={isComposerInteractionLocked || voiceInput.isBusy}
+        disabled={
+          isComposerInteractionLocked ||
+          voiceInput.isBusy ||
+          (usesSharedCheckouts(flow.selectedProject) && flow.workspaceMode === "local")
+        }
         renderIcon={(size) => (
           <NewTaskWorkspaceIcon
             workspaceMode={flow.workspaceMode}
@@ -1693,6 +1733,9 @@ export function NewTaskDraftScreen(props: {
       ) : null}
       {flow.canChooseWorkspace ? <View className="pb-1">{workspaceControls}</View> : null}
 
+      {repositoryBlockedReason ? (
+        <Text className="px-3 py-2 text-xs text-muted-foreground">{repositoryBlockedReason}</Text>
+      ) : null}
       {taskPermissionReason ? (
         <Text className="px-3 py-2 text-xs text-muted-foreground">{taskPermissionReason}</Text>
       ) : null}
@@ -1837,6 +1880,7 @@ export function NewTaskDraftScreen(props: {
                 <ComposerActionButton
                   accessibilityLabel={
                     taskPermissionReason ??
+                    repositoryBlockedReason ??
                     attachmentBlockReason ??
                     (cloneBlocksStart
                       ? projectClone === null || projectClone.phase === "running"

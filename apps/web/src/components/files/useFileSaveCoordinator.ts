@@ -1,3 +1,4 @@
+import { useRepositoryFileAccess } from "../../fd/multirepo";
 import { AuthFilesystemWriteScope, type EnvironmentId } from "@t3tools/contracts";
 import { createRef, useEffect, useMemo } from "react";
 
@@ -26,6 +27,7 @@ export function useFileSaveCoordinator({
   relativePath,
   onPendingChange,
 }: FileSaveOptions): Pick<FileSaveCoordinator, "change"> {
+  const repositoryTarget = useRepositoryFileAccess();
   const canWriteFiles = useEnvironmentScope(environmentId, AuthFilesystemWriteScope);
   const writeFile = useAtomCommand(projectEnvironment.writeFile);
   const session = useMemo(() => {
@@ -40,10 +42,21 @@ export function useFileSaveCoordinator({
           persist: (nextContents) =>
             writeFile({
               environmentId,
-              input: { cwd, relativePath, contents: nextContents },
+              input: {
+                cwd,
+                relativePath,
+                contents: nextContents,
+                ...(repositoryTarget ? { repositoryTarget } : {}),
+              },
             }),
           onConfirmed: (confirmedContents) =>
-            confirmProjectFileQueryData(environmentId, cwd, relativePath, confirmedContents),
+            confirmProjectFileQueryData(
+              environmentId,
+              cwd,
+              relativePath,
+              confirmedContents,
+              repositoryTarget,
+            ),
         });
         coordinatorRef.current = coordinator;
         return () => {
@@ -52,7 +65,7 @@ export function useFileSaveCoordinator({
         };
       },
     };
-  }, [cwd, environmentId, onPendingChange, relativePath, writeFile]);
+  }, [cwd, environmentId, onPendingChange, relativePath, writeFile, repositoryTarget]);
 
   // StrictMode replays effect setup. Retired file sessions stay inert, while the
   // replay gets a fresh coordinator instead of reusing a disposed one.

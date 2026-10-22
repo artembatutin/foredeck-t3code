@@ -6,7 +6,7 @@ import { tanstackRouter } from "@tanstack/router-plugin/vite";
 import compression from "compression";
 import { defineProject, type TestProjectInlineConfiguration } from "vite-plus/test/config";
 import "vite-plus/test/config";
-import { defineConfig, type Connect, type Plugin } from "vite-plus";
+import { defineConfig, defaultClientConditions, type Connect, type Plugin } from "vite-plus";
 import pkg from "./package.json" with { type: "json" };
 
 import {
@@ -221,6 +221,8 @@ export default defineConfig(() => {
       "import.meta.env.APP_VERSION": JSON.stringify(configuredAppVersion),
     },
     resolve: {
+      // Local voice supplies its matching WASM assets; do not also bundle the unused default runtime.
+      conditions: ["onnxruntime-web-use-extern-wasm", ...defaultClientConditions],
       tsconfigPaths: true,
       dedupe: ["react", "react-dom"],
     },

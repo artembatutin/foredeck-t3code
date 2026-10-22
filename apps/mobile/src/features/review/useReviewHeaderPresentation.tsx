@@ -1,3 +1,4 @@
+import { useSelectedThreadWorktree } from "../../state/use-selected-thread-worktree";
 import { useEnvironmentQuery } from "../../state/query";
 import { useSelectedThreadGitActions } from "../../state/use-selected-thread-git-actions";
 import { useSelectedThreadGitState } from "../../state/use-selected-thread-git-state";
@@ -28,13 +29,14 @@ export function useReviewHeaderPresentation(props: {
   readonly onRefresh: () => Promise<void>;
 }): ReviewHeaderPresentation {
   const { selectedThread } = useThreadSelection();
+  const { repositoryTarget } = useSelectedThreadWorktree();
   const gitState = useSelectedThreadGitState();
   const gitActions = useSelectedThreadGitActions();
   const gitStatusQuery = useEnvironmentQuery(
     selectedThread !== null && props.selectedThreadCwd !== null
       ? vcsEnvironment.status({
           environmentId: selectedThread.environmentId,
-          input: { cwd: props.selectedThreadCwd },
+          input: { cwd: props.selectedThreadCwd, repositoryTarget },
         })
       : null,
   );

@@ -48,6 +48,7 @@ const QueuedThreadCreationSchema = Schema.Struct({
 
 export const QueuedThreadMessageSchema = Schema.Struct({
   schemaVersion: Schema.Literals([1, 2, THREAD_OUTBOX_SCHEMA_VERSION, 4]),
+  requiresRepositoryProtocol: Schema.optional(Schema.Boolean),
   environmentId: EnvironmentId,
   threadId: ThreadId,
   messageId: MessageId,
@@ -80,6 +81,7 @@ export interface QueuedThreadCreation {
 }
 
 export interface QueuedThreadMessage {
+  readonly requiresRepositoryProtocol?: boolean;
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly messageId: MessageId;

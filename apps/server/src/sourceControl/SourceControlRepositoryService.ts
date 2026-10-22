@@ -26,6 +26,7 @@ import {
   parseGitCloneProgressLine,
   type GitCloneProgressLine,
 } from "../project/gitCloneProgress.ts";
+import * as GitManager from "../git/GitManager.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as BitbucketApi from "@t3tools/source-control-bitbucket/server/BitbucketApi";
 import * as SourceControlProviderRegistry from "./SourceControlProviderRegistry.ts";
@@ -168,6 +169,7 @@ export const make = Effect.gen(function* () {
   const config = yield* ServerConfig.ServerConfig;
   const fileSystem = yield* FileSystem.FileSystem;
   const git = yield* GitVcsDriver.GitVcsDriver;
+  const gitManager = yield* GitManager.GitManager;
   const path = yield* Path.Path;
   const providers = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
 
@@ -481,7 +483,12 @@ export const make = Effect.gen(function* () {
         mapRepositoryError("discardClone", SourceControlProviderKind.make("unknown")),
       ),
     publishRepository: (input) =>
-      publishRepository(input).pipe(mapRepositoryError("publishRepository", input.provider)),
+      gitManager
+        .withCheckoutMutation(
+          { cwd: input.cwd, operation: "publishRepository" },
+          publishRepository(input),
+        )
+        .pipe(mapRepositoryError("publishRepository", input.provider)),
   });
 });
 

@@ -1,10 +1,15 @@
+import { AssistantVoiceControls } from "~/fd/assistant";
+import {
+  repositoryExecutionBlockReason,
+  type RepositoryFileScope,
+} from "@t3tools/client-runtime/fd/multirepo";
+import { openRepositoryFile } from "../../fd/multirepo";
 import { formatProviderSkillDisplayName } from "@t3tools/shared/inlineSkills";
 import { useComposerTypingGuard } from "./useComposerTypingGuard";
 import { DESKTOP_PASTE_AS_TEXT_EVENT } from "../../lib/desktopPasteAsText";
 import { runtimeModeConfig, runtimeModeOptions as runtimeModes } from "./runtimeModeConfig";
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
 import { usePrimaryEnvironmentId } from "../../state/environments";
-import { useRightPanelStore } from "~/rightPanelStore";
 import { AttachmentFilePreview } from "../files/AttachmentFilePreview";
 import { Dialog, DialogPopup, DialogTitle } from "../ui/dialog";
 import {
@@ -1645,6 +1650,9 @@ export interface ChatComposerProps {
   keybindings: ResolvedKeybindingsConfig;
   terminalOpen: boolean;
   gitCwd: string | null;
+  repositoryScope?: RepositoryFileScope | undefined;
+  multiRepository?: boolean | undefined;
+  repositoryProtocol?: number | undefined;
   pullRequestProjectId: ProjectId | null;
   pullRequestRepository: string | null;
   /** The thread's linked pull requests, offered in `#` suggestions from any repository. */
@@ -1793,6 +1801,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     keybindings,
     terminalOpen,
     gitCwd,
+    repositoryScope,
+    multiRepository,
+    repositoryProtocol,
     pullRequestProjectId,
     pullRequestRepository,
     threadPullRequests,
@@ -1952,7 +1963,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         if (preview) onExpandImage(preview);
       },
       openFile: setPreviewFileId,
-      openMention: (path: string) => useRightPanelStore.getState().openFile(routeThreadRef, path),
+      openMention: (path: string) => openRepositoryFile(routeThreadRef, path),
       expandVideo: (fileId: string) => {
         const file = composerFiles.find((candidate) => candidate.id === fileId);
         if (!file || !isVideoAttachment(file)) return;
@@ -2244,10 +2255,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     projectModelSelection: activeProjectDefaultModelSelection,
     settings,
   });
-  const providerSendBlockReason = getAntigravitySendBlockReason(
-    selectedProviderEntry?.snapshot,
-    selectedModel,
-  );
+  const providerSendBlockReason =
+    repositoryExecutionBlockReason({
+      isMultiRepository: multiRepository === true,
+      serverProtocolVersion: repositoryProtocol,
+      provider: selectedProviderEntry?.snapshot,
+      runtimeMode,
+    }) ?? getAntigravitySendBlockReason(selectedProviderEntry?.snapshot, selectedModel);
   const sendDisabledReason =
     externalSendDisabledReason ??
     (multipleModelSelections?.length === 0 ? "Select at least one model." : null) ??
@@ -2634,7 +2648,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const environmentThreadShells = useThreadShells(isPathTrigger);
   const workspaceEntries = useComposerPathSearch({
     environmentId,
-    cwd: isPathTrigger ? gitCwd : null,
+    cwd: isPathTrigger ? (repositoryScope?.repository.rootPath ?? gitCwd) : null,
+    repositoryTarget: repositoryScope?.target,
     query: isPathTrigger ? pathTriggerQuery : null,
   });
   const compactSlashCommandAvailable =
@@ -2733,7 +2748,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         ...workspaceEntries.entries.map((entry) => ({
           id: `path:${entry.kind}:${entry.path}`,
           type: "path" as const,
-          path: entry.path,
+          path: repositoryScope
+            ? `${repositoryScope.repository.rootPath.replace(/[\\/]+$/, "")}/${entry.path}`
+            : entry.path,
           pathKind: entry.kind,
           label: basenameOfPath(entry.path),
           description: entry.path.slice(0, Math.max(0, entry.path.lastIndexOf("/"))),
@@ -2892,6 +2909,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     selectedProviderStatus,
     settings.showSkillsInSlashMenu,
     workspaceEntries.entries,
+    repositoryScope,
   ]);
 
   const composerMenuOpen = Boolean(composerTrigger);
@@ -6334,6 +6352,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     [expandMobileComposer, insertComposerText, isComposerCollapsedMobile],
   );
 
+  const [voiceSubmitPending, setVoiceSubmitPending] = useState(false);
+  useEffect(() => {
+    if (!voiceSubmitPending) return;
+    setVoiceSubmitPending(false);
+    submitComposer();
+  }, [voiceSubmitPending, submitComposer]);
+
   // Context produced by other panels (diff comments, preview picks) asks the store to place
   // its chip; while this composer is mounted for the draft, that means the caret.
   const insertContextReferencesAtCaret = useCallback(
@@ -7844,6 +7869,41 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       </Tooltip>
                     </>
                   ) : null}
+                  <AssistantVoiceControls
+                    key={`${environmentId}:${activeThreadId ?? draftId}:${activePendingUserInput?.requestId ?? "turn"}:${activePendingProgress?.activeQuestion?.id ?? ""}`}
+                    threadRef={routeThreadRef}
+                    messages={promptHistoryMessages}
+                    thinking={phase === "running"}
+                    disabled={
+                      !canOperateThread ||
+                      isConnecting ||
+                      isSendBusy ||
+                      isComposerApprovalState ||
+                      projectSelectionRequired ||
+                      isChoiceOnlyPendingQuestion
+                    }
+                    canConverse={
+                      !activePendingProgress &&
+                      !prompt.trim() &&
+                      composerImages.length === 0 &&
+                      composerFiles.length === 0
+                    }
+                    onTranscript={(text, submit) => {
+                      if (activePendingProgress?.activeQuestion) {
+                        const answer = `${activePendingProgress.customAnswer} ${text}`.trim();
+                        onChangeActivePendingUserInputCustomAnswer(
+                          activePendingProgress.activeQuestion.id,
+                          answer,
+                          answer.length,
+                          answer.length,
+                          isLiteralPendingAnswer,
+                        );
+                        return;
+                      }
+                      if (insertComposerTextAtEnd(text, { ensureLeadingBoundary: true }) && submit)
+                        setVoiceSubmitPending(true);
+                    }}
+                  />
                   <ComposerFooterPrimaryActions
                     compact={isComposerResting || isComposerPrimaryActionsCompact}
                     canOperateThread={canOperateThread}

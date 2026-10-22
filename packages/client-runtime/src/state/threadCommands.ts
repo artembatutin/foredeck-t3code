@@ -1,3 +1,5 @@
+import { requiresMultiRepositoryExecution, supportsRepositories } from "../fd/multirepo/index.ts";
+import { getInitialServerConfig, EnvironmentRpcUnavailableError } from "../rpc/client.ts";
 import type { ThreadId } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -6,6 +8,7 @@ import { Atom } from "effect/reactivity";
 import {
   WS_METHODS,
   type EnvironmentId,
+  type ProjectId,
   type OrchestrationV2ShellSnapshot,
 } from "@t3tools/contracts";
 
@@ -142,6 +145,22 @@ export function createThreadEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | Crypto.Crypto | R, E>,
   snapshotAtom: (environmentId: EnvironmentId) => Atom.Atom<OrchestrationV2ShellSnapshot | null>,
 ) {
+  const requireRepositoryProtocol = (
+    snapshot: OrchestrationV2ShellSnapshot | null,
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    projectId?: ProjectId,
+    retained = false,
+  ) =>
+    Effect.gen(function* () {
+      if (!retained && !requiresMultiRepositoryExecution(snapshot, { threadId, projectId })) return;
+      const config = yield* getInitialServerConfig();
+      if (!supportsRepositories(config.environment.capabilities))
+        return yield* new EnvironmentRpcUnavailableError({
+          environmentId,
+          message: "Update this server before running a multi-repository conversation.",
+        });
+    });
   const scheduler = createAtomCommandScheduler();
   const concurrency = {
     mode: "serial" as const,
@@ -277,7 +296,17 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     startTurn: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:start-turn",
-      execute: (input: StartThreadTurnInput) => startThreadTurn(input),
+      execute: (input: StartThreadTurnInput, registry, environmentId) =>
+        Effect.gen(function* () {
+          yield* requireRepositoryProtocol(
+            registry.get(snapshotAtom(environmentId)),
+            environmentId,
+            input.threadId,
+            input.bootstrap?.createThread?.projectId,
+            input.requiresRepositoryProtocol,
+          );
+          return yield* startThreadTurn(input);
+        }),
       scheduler,
       concurrency,
     }),
@@ -319,7 +348,12 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     forkFromRun: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:fork-from-run",
-      execute: (input: ForkThreadFromRunInput) => forkThreadFromRun(input),
+      execute: (input: ForkThreadFromRunInput, registry, environmentId) =>
+        requireRepositoryProtocol(
+          registry.get(snapshotAtom(environmentId)),
+          environmentId,
+          input.sourceThreadId,
+        ).pipe(Effect.andThen(forkThreadFromRun(input))),
       scheduler,
       concurrency: {
         mode: "serial",
@@ -338,7 +372,12 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     resumeThreadQueue: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:resume-queue",
-      execute: (input: ThreadCommandInput) => resumeThreadQueue(input),
+      execute: (input: ThreadCommandInput, registry, environmentId) =>
+        requireRepositoryProtocol(
+          registry.get(snapshotAtom(environmentId)),
+          environmentId,
+          input.threadId,
+        ).pipe(Effect.andThen(resumeThreadQueue(input))),
       scheduler,
       concurrency,
     }),
@@ -350,7 +389,12 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     promoteQueuedRun: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:promote-queued-run",
-      execute: (input: PromoteQueuedRunInput) => promoteQueuedRun(input),
+      execute: (input: PromoteQueuedRunInput, registry, environmentId) =>
+        requireRepositoryProtocol(
+          registry.get(snapshotAtom(environmentId)),
+          environmentId,
+          input.threadId,
+        ).pipe(Effect.andThen(promoteQueuedRun(input))),
       scheduler,
       concurrency,
     }),
@@ -362,7 +406,12 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     retryWorkspacePreparation: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:retry-workspace-preparation",
-      execute: (input: RetryWorkspacePreparationInput) => retryWorkspacePreparation(input),
+      execute: (input: RetryWorkspacePreparationInput, registry, environmentId) =>
+        requireRepositoryProtocol(
+          registry.get(snapshotAtom(environmentId)),
+          environmentId,
+          input.threadId,
+        ).pipe(Effect.andThen(retryWorkspacePreparation(input))),
       scheduler,
       concurrency,
     }),

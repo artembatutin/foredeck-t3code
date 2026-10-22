@@ -1,3 +1,8 @@
+import {
+  usesSharedCheckouts,
+  MULTIREPO_CHECKOUT_NOTICE,
+  resolveRepositoryFileReference,
+} from "@t3tools/client-runtime/fd/multirepo";
 import { parseChangeRequestUrl } from "@t3tools/shared/changeRequestUrl";
 import { useAtomValue } from "@effect/atom-react";
 import { usePullRequestStack } from "~/state/usePullRequestStack";
@@ -956,7 +961,7 @@ export function PullRequestDetailPanel({
   // the thread is already on one server's copy of the branch.
   const pickableEnvironments = useMemo(
     () =>
-      context === "page"
+      context === "page" && !usesSharedCheckouts(project)
         ? resolvePickableEnvironments(
             { environmentId, projectId: reference.projectId },
             projects,
@@ -967,7 +972,7 @@ export function PullRequestDetailPanel({
             })),
           )
         : [],
-    [context, environmentId, environments, projects, reference.projectId],
+    [context, environmentId, environments, projects, project, reference.projectId],
   );
   // Which server the reader chose, and only for the pull request they chose it on: this one panel
   // shows a different pull request every time it is opened, and the choice does not follow.
@@ -984,10 +989,22 @@ export function PullRequestDetailPanel({
   const actingEnvironmentId = acting?.environmentId ?? environmentId;
   const checkoutRoot =
     acting?.workspaceRoot ?? detail?.workspaceRoot ?? project?.workspaceRoot ?? null;
+  const actingProject =
+    projects.find(
+      (candidate) =>
+        candidate.environmentId === actingEnvironmentId &&
+        candidate.id === (acting?.projectId ?? reference.projectId),
+    ) ?? null;
+  const multiRepository = usesSharedCheckouts(actingProject);
+  const checkoutRepositoryTarget =
+    checkoutRoot === null
+      ? undefined
+      : resolveRepositoryFileReference(actingProject, null, checkoutRoot).scope?.target;
   const canOperateThread = useEnvironmentScope(actingEnvironmentId, AuthOrchestrationOperateScope);
   const prepareThread = usePreparePullRequestThreadAction({
     environmentId: actingEnvironmentId,
     cwd: checkoutRoot,
+    repositoryTarget: checkoutRepositoryTarget,
   });
 
   const finishAction = async (
@@ -1106,7 +1123,7 @@ export function PullRequestDetailPanel({
   };
 
   const attachTarget = composerDraftTarget ?? null;
-  const canPrepareWorktree = prepareThread.isAllowed && canOperateThread;
+  const canPrepareWorktree = prepareThread.isAllowed && canOperateThread && !multiRepository;
   const canFixFindings = attachTarget !== null || canPrepareWorktree;
   const handoffLabels = pullRequestHandoffLabels(attachTarget !== null);
   // The guide is written from the menu as well as its tab, so a reader can ask for a rewrite
@@ -1271,6 +1288,14 @@ export function PullRequestDetailPanel({
       return;
     }
     if (checkoutRoot === null) return;
+    if (mode === "worktree" && multiRepository) {
+      toastManager.add({
+        type: "error",
+        title: "Worktrees unavailable",
+        description: MULTIREPO_CHECKOUT_NOTICE,
+      });
+      return;
+    }
     if (
       !prepareThread.isAllowed ||
       !readEnvironmentScope(actingEnvironmentId, AuthSourceControlWriteScope)
@@ -1336,14 +1361,16 @@ export function PullRequestDetailPanel({
     }
     // The same thread again, now that there is somewhere to point it at. A local checkout has
     // no worktree of its own, so the thread runs where the repository already is.
-    const pointed = await newThread(projectRef, {
-      branch: prepared.value.branch,
-      worktreePath: prepared.value.worktreePath,
-      envMode: prepared.value.worktreePath === null ? "local" : "worktree",
-    }).then(
-      (session) => session !== null,
-      () => false,
-    );
+    const pointed =
+      multiRepository ||
+      (await newThread(projectRef, {
+        branch: prepared.value.branch,
+        worktreePath: prepared.value.worktreePath,
+        envMode: prepared.value.worktreePath === null ? "local" : "worktree",
+      }).then(
+        (session) => session !== null,
+        () => false,
+      ));
     if (!pointed) {
       setHandoff(null);
       // The checkout is on disk; only the thread failed to move onto it. Writing the task now
@@ -1689,7 +1716,11 @@ export function PullRequestDetailPanel({
           <TooltipPopup>Check out this pull request</TooltipPopup>
         </Tooltip>
         <MenuPopup align="end" side="bottom">
-          <MenuItem disabled={!canPrepareWorktree} onClick={() => startCheckout("worktree")}>
+          <MenuItem
+            disabled={!canPrepareWorktree}
+            title={multiRepository ? MULTIREPO_CHECKOUT_NOTICE : undefined}
+            onClick={() => startCheckout("worktree")}
+          >
             <GitBranchIcon className="mt-1 size-3.5 shrink-0 self-start" />
             <span className="flex min-w-0 flex-col">
               <span>In a separate worktree</span>

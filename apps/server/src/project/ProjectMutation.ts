@@ -23,6 +23,7 @@ export const projectMutationOperation = Effect.fn("projectMutationOperation")(fu
           ? {}
           : { defaultModelSelection: mutation.defaultModelSelection }),
         ...(mutation.scripts === undefined ? {} : { scripts: mutation.scripts }),
+        ...(mutation.repositories === undefined ? {} : { repositories: mutation.repositories }),
       });
 
     case "project.update":
@@ -41,6 +42,7 @@ export const projectMutationOperation = Effect.fn("projectMutationOperation")(fu
           ? {}
           : { defaultThreadEnvMode: mutation.defaultThreadEnvMode }),
         ...(mutation.scripts === undefined ? {} : { scripts: mutation.scripts }),
+        ...(mutation.repositories === undefined ? {} : { repositories: mutation.repositories }),
       });
 
     case "project.delete":

@@ -1,5 +1,6 @@
 import {
   CheckpointId,
+  type ProjectRepository,
   CheckpointRef,
   CheckpointScopeId,
   NodeId,
@@ -117,6 +118,7 @@ const isCheckpointRestoreError = Schema.is(CheckpointRestoreError);
 
 export interface CheckpointServiceV2Shape {
   readonly prepareRootRunScope: (input: {
+    readonly repositories?: ReadonlyArray<ProjectRepository> | undefined;
     readonly threadId: ThreadId;
     readonly runId: RunId;
     readonly rootNodeId: NodeId;
@@ -185,6 +187,7 @@ function checkpointIdForScopeOrdinal(
 }
 
 function makeRootRunScope(input: {
+  readonly repositories?: ReadonlyArray<ProjectRepository> | undefined;
   readonly idAllocator: IdAllocator.IdAllocatorV2["Service"];
   readonly threadId: ThreadId;
   readonly runId: RunId;
@@ -198,6 +201,7 @@ function makeRootRunScope(input: {
       threadId: input.threadId,
       name: ROOT_CHECKPOINT_SCOPE_NAME,
     });
+    const primary = (input.repositories?.length ?? 0) > 1 ? input.repositories?.[0] : undefined;
     return {
       id: scopeId,
       threadId: input.threadId,
@@ -208,7 +212,8 @@ function makeRootRunScope(input: {
       kind: "root_run",
       ordinalWithinParent: 0,
       advancesAppRunCount: true,
-      cwd: input.cwd,
+      cwd: primary?.rootPath ?? input.cwd,
+      ...(primary === undefined ? {} : { repositories: input.repositories, repository: primary }),
       createdAt: input.createdAt,
     } satisfies OrchestrationV2CheckpointScope;
   });
@@ -225,6 +230,7 @@ function makeCheckpoint(input: {
   readonly ref: CheckpointRef;
   readonly status: OrchestrationV2Checkpoint["status"];
   readonly files: OrchestrationV2Checkpoint["files"];
+  readonly filesAvailable?: boolean;
   readonly capturedAt: DateTime.Utc;
 }): OrchestrationV2Checkpoint {
   return {
@@ -239,6 +245,7 @@ function makeCheckpoint(input: {
     ref: input.ref,
     status: input.status,
     files: input.files,
+    ...(input.filesAvailable === undefined ? {} : { filesAvailable: input.filesAvailable }),
     capturedAt: input.capturedAt,
   };
 }
@@ -480,10 +487,10 @@ export const layer: Layer.Layer<
                     scopeId: input.scope.id,
                     checkpointRef,
                     cause: String(cause),
-                  }).pipe(Effect.as([])),
+                  }).pipe(Effect.as(null)),
                 ),
               )
-            : [];
+            : null;
 
           return makeCheckpoint({
             id: checkpointId,
@@ -495,7 +502,8 @@ export const layer: Layer.Layer<
             appRunOrdinal: input.appRunOrdinal,
             ref: checkpointRef,
             status: "ready",
-            files,
+            files: files ?? [],
+            ...(input.scope.repository === undefined ? {} : { filesAvailable: files !== null }),
             capturedAt: input.capturedAt,
           });
         }),

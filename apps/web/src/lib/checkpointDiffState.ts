@@ -8,9 +8,10 @@ import { useCheckpointDiff as useCheckpointDiffQuery } from "../state/queries";
 export function useCheckpointDiff(
   target: CheckpointDiffTarget,
   options?: { readonly enabled?: boolean },
-): CheckpointDiffState {
+): CheckpointDiffState & { readonly refresh: () => void } {
   const state = useCheckpointDiffQuery(target, options);
   return {
+    refresh: state.refresh,
     data: state.data,
     error: state.error,
     isPending: state.isPending,

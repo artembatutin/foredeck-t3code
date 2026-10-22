@@ -1,3 +1,5 @@
+import { resolveRepositoryFileReference } from "@t3tools/client-runtime/fd/multirepo";
+import { usesSharedCheckouts } from "@t3tools/client-runtime/fd/multirepo";
 import { useAtomValue } from "@effect/atom-react";
 import {
   scopedProjectKey,
@@ -160,10 +162,15 @@ export function useNewThreadHandler() {
       // skipped entirely when a higher-priority source decides, and its
       // query atom caches per project after the first call.
       const resolveDefaultEnvMode = async (): Promise<DraftThreadEnvMode> => {
+        if (usesSharedCheckouts(project)) return "local";
         const consultProjectFile =
           project !== undefined && projectSettings.settings.defaultThreadEnvMode === null;
         const projectFile = consultProjectFile
-          ? await readT3ProjectFile(project.environmentId, project.workspaceRoot)
+          ? await readT3ProjectFile(
+              project.environmentId,
+              project.workspaceRoot,
+              resolveRepositoryFileReference(project, null, "t3.json").scope,
+            )
           : null;
         return resolveNewThreadEnvMode({
           projectSettings: resolveProjectSettings(

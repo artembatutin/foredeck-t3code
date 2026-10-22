@@ -1,3 +1,7 @@
+import { ProjectAssistant } from "./fd/assistant/index.ts";
+import { AssistantOperationError } from "@t3tools/contracts";
+import { RepositoryTargetError } from "@t3tools/contracts";
+import { ClientCompatibility, RepositorySet, WorkspaceResolver } from "./fd/multirepo/index.ts";
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
@@ -30,6 +34,8 @@ import {
   AuthOrchestrationOperateScope,
   type AuthEnvironmentScope,
   type ScheduledTaskListResult,
+  type ScheduledTaskId,
+  ScheduledTaskError,
   AuthSessionId,
   ClientConnectionMethod,
   ClientDeviceType,
@@ -140,7 +146,10 @@ import {
   toShellApplicationEvent,
   type ShellApplicationEvent,
 } from "./orchestration-v2/ShellStream.ts";
-import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "./orchestration-v2/ProjectionStore.ts";
+import {
+  ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
+  layer as layerThreadProjections,
+} from "./orchestration-v2/ProjectionStore.ts";
 import { bufferLiveStream } from "./orchestration-v2/LiveStreamBudget.ts";
 import { coalesceThreadLiveStream } from "./orchestration-v2/ThreadLiveEventCoalescer.ts";
 import {
@@ -1203,9 +1212,13 @@ const layerWsRpc = (
   clientAnalyticsProps: Readonly<Record<string, unknown>>,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
   serverBrowser: ServerBrowser.ServerBrowser["Service"],
+  supportsRepositories: boolean,
+  repositoryWorkspaceService: Effect.Success<typeof WorkspaceResolver.make>,
+  repositoryClient: Effect.Success<typeof ClientCompatibility.make>,
 ) =>
   ServerWsRpcGroup.toLayer(
     Effect.gen(function* () {
+      const repositoryWorkspace = repositoryWorkspaceService.forClient(supportsRepositories);
       const currentSessionId = currentSession.sessionId;
       const sql = yield* SqlClient.SqlClient;
       const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -1240,6 +1253,26 @@ const layerWsRpc = (
       const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
       const providerSessionManager = yield* ProviderSessionManager.ProviderSessionManagerV2;
       const scheduledTasks = yield* ScheduledTasks.ScheduledTaskService;
+      const assistant = yield* ProjectAssistant.ProjectAssistant;
+      const assistantError = (error: ProjectAssistant.AssistantError) =>
+        new AssistantOperationError({ message: error.message });
+      const assertScheduledClient = Effect.fn("ws.scheduledTasks.repositoryCompatibility")(
+        function* (taskId: ScheduledTaskId) {
+          if (supportsRepositories) return;
+          const task = (yield* scheduledTasks.list()).tasks.find((task) => task.id === taskId);
+          if (task === undefined) return;
+          yield* repositoryClient
+            .assertWorkspace(false, {
+              projectId: task.projectId,
+              threadIds: task.threadId === null ? [] : [task.threadId],
+            })
+            .pipe(
+              Effect.mapError(
+                (cause) => new ScheduledTaskError({ taskId, message: cause.message, cause }),
+              ),
+            );
+        },
+      );
       const secretRequests = yield* SecretRequests.SecretRequests;
       const pullRequests = yield* PullRequestService.PullRequestService;
       const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
@@ -1456,6 +1489,18 @@ const layerWsRpc = (
       const importAcpRegistrySession = Effect.fn("ws.acpRegistry.importSession")(function* (
         input: AcpRegistryImportSessionInput,
       ) {
+        yield* repositoryClient
+          .assertWorkspace(supportsRepositories, { projectId: input.projectId })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new AcpRegistryOperationError({
+                  reason: "session_import_failed",
+                  message: cause.message,
+                  cause,
+                }),
+            ),
+          );
         return yield* acpRegistryRuntimeCoordinator.withSessionMutation(
           Effect.gen(function* () {
             yield* acpRegistryProject(input.projectId);
@@ -1855,16 +1900,19 @@ const layerWsRpc = (
               startup
                 .enqueueCommand(
                   // A retry also restarts the preparation work the launch owns.
-                  (command.type === "prepared-run.retry"
-                    ? threadLaunch.retryPreparation(command)
-                    : ThreadMessageIntake.dispatchCommand(
-                        ThreadManagementService.withCreationProvenance(command, {
-                          createdBy: "user",
-                          creationSource:
-                            "creationSource" in command ? command.creationSource : "web",
-                        }),
-                      )
-                  ).pipe(Effect.provide(intakeContext)),
+                  Effect.andThen(
+                    repositoryClient.assertCommand(supportsRepositories, command),
+                    (command.type === "prepared-run.retry"
+                      ? threadLaunch.retryPreparation(command)
+                      : ThreadMessageIntake.dispatchCommand(
+                          ThreadManagementService.withCreationProvenance(command, {
+                            createdBy: "user",
+                            creationSource:
+                              "creationSource" in command ? command.creationSource : "web",
+                          }),
+                        )
+                    ).pipe(Effect.provide(intakeContext)),
+                  ),
                 )
                 .pipe(
                   Effect.tap(() => recordClientCommandAnalytics(command)),
@@ -1901,7 +1949,13 @@ const layerWsRpc = (
             Effect.mapError(
               (cause) =>
                 new OrchestrationGetTurnDiffError({
-                  message: "Failed to load turn diff",
+                  message:
+                    cause._tag === "RepositoryTargetError"
+                      ? cause.message
+                      : cause._tag === "CheckpointRefUnavailableError" ||
+                          cause._tag === "CheckpointTurnRangeUnavailableError"
+                        ? "This repository has no available snapshot for the requested turn range."
+                        : "Failed to load turn diff",
                   cause,
                 }),
             ),
@@ -1911,7 +1965,13 @@ const layerWsRpc = (
             Effect.mapError(
               (cause) =>
                 new OrchestrationGetFullThreadDiffError({
-                  message: "Failed to load full thread diff",
+                  message:
+                    cause._tag === "RepositoryTargetError"
+                      ? cause.message
+                      : cause._tag === "CheckpointRefUnavailableError" ||
+                          cause._tag === "CheckpointTurnRangeUnavailableError"
+                        ? "This repository has no available snapshot for the requested conversation range."
+                        : "Failed to load full thread diff",
                   cause,
                 }),
             ),
@@ -1970,6 +2030,27 @@ const layerWsRpc = (
             "orchestration_v2.command_id": input.commandId,
             "orchestration_v2.project_id": input.projectId,
           }).pipe(
+            Effect.andThen(
+              repositoryClient
+                .assertWorkspace(supportsRepositories, {
+                  projectId: input.projectId,
+                  threadIds:
+                    input.threadId === undefined || input.reuseExistingThread !== true
+                      ? []
+                      : [input.threadId],
+                })
+                .pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new OrchestrationV2ThreadLaunchError({
+                        commandId: input.commandId,
+                        projectId: input.projectId,
+                        message: cause.message,
+                        cause,
+                      }),
+                  ),
+                ),
+            ),
             Effect.andThen(
               startup
                 .enqueueCommand(
@@ -2070,9 +2151,19 @@ const layerWsRpc = (
           scheduledTasks.list().pipe(Effect.map(withVisibleWebhookUrls)),
         [WS_METHODS.scheduledTasksSubscribe]: (_input) =>
           scheduledTasks.subscribeList().pipe(Stream.map(withVisibleWebhookUrls)),
-        [WS_METHODS.scheduledTasksUpsert]: (input) => scheduledTasks.upsert(input),
+        [WS_METHODS.scheduledTasksUpsert]: (input) =>
+          repositoryClient
+            .assertWorkspace(supportsRepositories, {
+              projectId: input.projectId,
+              threadIds: input.threadId == null ? [] : [input.threadId],
+            })
+            .pipe(
+              Effect.mapError((cause) => new ScheduledTaskError({ message: cause.message, cause })),
+              Effect.andThen(scheduledTasks.upsert(input)),
+            ),
         [WS_METHODS.scheduledTasksSetEnabled]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
+            Effect.andThen(input.enabled ? assertScheduledClient(input.id) : Effect.void),
             Effect.andThen(scheduledTasks.setEnabled(input)),
           ),
         [WS_METHODS.scheduledTasksDelete]: (input) =>
@@ -2081,6 +2172,7 @@ const layerWsRpc = (
           ),
         [WS_METHODS.scheduledTasksRunNow]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
+            Effect.andThen(assertScheduledClient(input.id)),
             Effect.andThen(scheduledTasks.runNow(input)),
           ),
         [WS_METHODS.scheduledTasksRotateWebhookToken]: (input) =>
@@ -2099,6 +2191,12 @@ const layerWsRpc = (
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(scheduledTasks.getWebhookDelivery(input)),
           ),
+        [WS_METHODS.assistantOverview]: () =>
+          assistant.overview.pipe(Effect.mapError(assistantError)),
+        [WS_METHODS.assistantControl]: (input) =>
+          assistant.control(input).pipe(Effect.asVoid, Effect.mapError(assistantError)),
+        [WS_METHODS.assistantSpeech]: (input) =>
+          assistant.speech(input.threadId).pipe(Effect.mapError(assistantError)),
         [WS_METHODS.serverProbe]: (_input) => Effect.succeed({}),
         [WS_METHODS.serverGetConfig]: (_input) => loadServerConfig({ usageLimitsCommand: false }),
         [WS_METHODS.serverSearchAcpRegistry]: (input) =>
@@ -2631,74 +2729,108 @@ const layerWsRpc = (
         [WS_METHODS.projectCloneRetry]: (input) =>
           projectCloneTracker.retry(input.projectId).pipe(Effect.map((applied) => ({ applied }))),
         [WS_METHODS.subscribeProjectClones]: () => projectCloneTracker.stream,
-        [WS_METHODS.sourceControlPublishRepository]: (input) =>
-          sourceControlRepositories.publishRepository(input).pipe(
-            // A new remote can change the cached identity. Only the `cwd` entry
-            // refreshes, so after a publish from a linked worktree the project
-            // root entry waits for its TTL.
-            Effect.tap(() => repositoryIdentityResolver.resolve(input.cwd, { refresh: true })),
-            Effect.tap(() => refreshGitStatus(input.cwd)),
-          ),
-        [WS_METHODS.projectsSearchEntries]: (input) =>
-          workspaceEntries.search(input).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProjectSearchEntriesError({
-                  cwd: input.cwd,
-                  queryLength: input.query.length,
-                  limit: input.limit,
-                  ...projectEntriesFailureContext(cause),
-                  cause,
-                }),
+        [WS_METHODS.sourceControlPublishRepository]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            sourceControlRepositories.publishRepository(input).pipe(
+              // A new remote can change the cached identity. Only the `cwd` entry
+              // refreshes, so after a publish from a linked worktree the project
+              // root entry waits for its TTL.
+              Effect.tap(() => repositoryIdentityResolver.resolve(input.cwd, { refresh: true })),
+              Effect.tap(() => refreshGitStatus(input.cwd)),
             ),
           ),
-        [WS_METHODS.projectsSearchContents]: (input) =>
-          workspaceEntries.searchContents(input).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProjectSearchContentsError({
-                  cwd: input.cwd,
-                  queryLength: input.query.length,
-                  limit: input.limit,
-                  ...projectEntriesFailureContext(cause),
-                  cause,
-                }),
+        [WS_METHODS.projectsSearchEntries]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            workspaceEntries.search(input).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProjectSearchEntriesError({
+                    cwd: input.cwd,
+                    queryLength: input.query.length,
+                    limit: input.limit,
+                    ...projectEntriesFailureContext(cause),
+                    cause,
+                  }),
+              ),
             ),
           ),
-        [WS_METHODS.projectsListEntries]: (input) =>
-          workspaceEntries.list(input).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProjectListEntriesError({
+        [WS_METHODS.projectsSearchContents]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            workspaceEntries.searchContents(input).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProjectSearchContentsError({
+                    cwd: input.cwd,
+                    queryLength: input.query.length,
+                    limit: input.limit,
+                    ...projectEntriesFailureContext(cause),
+                    cause,
+                  }),
+              ),
+            ),
+          ),
+        [WS_METHODS.projectsListEntries]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            workspaceEntries.list(input).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProjectListEntriesError({
+                    ...input,
+                    ...projectEntriesFailureContext(cause),
+                    cause,
+                  }),
+              ),
+            ),
+          ),
+        [WS_METHODS.projectsReadFile]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            workspaceFileSystem.readFile(input).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProjectReadFileError({
+                    ...input,
+                    ...projectFileFailureContext(cause),
+                    cause,
+                  }),
+              ),
+            ),
+          ),
+        [WS_METHODS.projectsWriteFile]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            workspaceFileSystem.writeFile(input).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProjectWriteFileError({
+                    cwd: input.cwd,
+                    relativePath: input.relativePath,
+                    ...projectFileFailureContext(cause),
+                    cause,
+                  }),
+              ),
+            ),
+          ),
+        [WS_METHODS.projectsSetRepositories]: (input) =>
+          Effect.gen(function* () {
+            const commandId = yield* serverCommandId("project-repositories");
+            return yield* startup
+              .enqueueCommand(
+                mutateProject({
+                  type: "project.update",
+                  commandId,
                   ...input,
-                  ...projectEntriesFailureContext(cause),
-                  cause,
                 }),
-            ),
-          ),
-        [WS_METHODS.projectsReadFile]: (input) =>
-          workspaceFileSystem.readFile(input).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProjectReadFileError({
-                  ...input,
-                  ...projectFileFailureContext(cause),
-                  cause,
-                }),
-            ),
-          ),
-        [WS_METHODS.projectsWriteFile]: (input) =>
-          workspaceFileSystem.writeFile(input).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProjectWriteFileError({
-                  cwd: input.cwd,
-                  relativePath: input.relativePath,
-                  ...projectFileFailureContext(cause),
-                  cause,
-                }),
-            ),
-          ),
+              )
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProjectMutationError({
+                      commandId,
+                      message: cause.message,
+                      cause,
+                    }),
+                ),
+              );
+          }),
         [WS_METHODS.projectsMutate]: (mutation) =>
           startup.enqueueCommand(mutateProject(mutation)).pipe(
             Effect.mapError(
@@ -2734,6 +2866,41 @@ const layerWsRpc = (
         [WS_METHODS.assetsCreateUrl]: (input) =>
           Effect.gen(function* () {
             const path = yield* Path.Path;
+            if (input.resource._tag === "repository-file") {
+              const repository = yield* repositoryWorkspace.resolve(
+                input.resource.repositoryTarget,
+              );
+              return yield* issueAssetUrl({
+                resource: input.resource,
+                workspaceRoot: repository.rootPath,
+              });
+            }
+            if (
+              input.resource._tag === "workspace-file" ||
+              (input.resource._tag === "media-file" && !path.isAbsolute(input.resource.path))
+            ) {
+              const resolved = yield* repositoryWorkspace.resolveThreadPath(
+                input.resource.threadId,
+                input.resource.path,
+              );
+              if (resolved) {
+                yield* repositoryClient
+                  .assertWorkspace(supportsRepositories, { threadIds: [input.resource.threadId] })
+                  .pipe(
+                    Effect.mapError(
+                      (cause) => new RepositoryTargetError({ detail: cause.message, cause }),
+                    ),
+                  );
+                return yield* issueAssetUrl({
+                  resource: {
+                    _tag: "repository-file",
+                    repositoryTarget: resolved.target,
+                    path: resolved.path,
+                  },
+                  workspaceRoot: resolved.repository.rootPath,
+                });
+              }
+            }
             // An absolute media path can be linked from a thread on another environment.
             if (
               input.resource._tag === "attachment" ||
@@ -2816,94 +2983,137 @@ const layerWsRpc = (
           }),
         [WS_METHODS.assetsPersistChatAttachments]: (input) =>
           persistChatAttachments(input).pipe(Effect.map((attachments) => ({ attachments }))),
-        [WS_METHODS.subscribeVcsStatus]: (input) =>
-          vcsStatusBroadcaster.streamStatus(input, {
-            automaticRemoteRefreshInterval: automaticGitFetchInterval,
-          }),
+        [WS_METHODS.subscribeVcsStatus]: (rawInput) =>
+          repositoryWorkspace.stream(rawInput, (input) =>
+            vcsStatusBroadcaster.streamStatus(input, {
+              automaticRemoteRefreshInterval: automaticGitFetchInterval,
+            }),
+          ),
         [WS_METHODS.subscribeWorktreeSetup]: (input) => worktreeSetupTracker.stream(input.threadId),
         [WS_METHODS.worktreeSetupCancel]: (input) =>
           worktreeSetupTracker
             .cancel(input.threadId)
             .pipe(Effect.map((cancelled) => ({ cancelled }))),
-        [WS_METHODS.vcsRefreshStatus]: (input) => vcsStatusBroadcaster.refreshStatus(input.cwd),
-        [WS_METHODS.vcsPull]: (input) =>
-          gitWorkflow.pullCurrentBranch(input.cwd).pipe(
-            Effect.matchCauseEffect({
-              onFailure: (cause) => Effect.failCause(cause),
-              onSuccess: (result) =>
-                refreshGitStatus(input.cwd).pipe(Effect.ignore({ log: true }), Effect.as(result)),
-            }),
+        [WS_METHODS.vcsRefreshStatus]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            vcsStatusBroadcaster.refreshStatus(input.cwd),
           ),
-        [WS_METHODS.gitRunStackedAction]: (input) =>
-          Stream.callback<GitActionProgressEvent, GitManagerServiceError>((queue) =>
-            gitWorkflow
-              .runStackedAction(input, {
-                actionId: input.actionId,
-                progressReporter: {
-                  publish: (event) => Queue.offer(queue, event).pipe(Effect.asVoid),
-                },
-              })
-              .pipe(
-                Effect.matchCauseEffect({
-                  onFailure: (cause) => Queue.failCause(queue, cause),
-                  onSuccess: (result) =>
-                    (input.threadId === undefined
-                      ? Effect.void
-                      : linkCreatedPullRequest({
-                          threadId: input.threadId,
-                          result,
-                          commandId: serverCommandId("pr-created-link"),
-                        }).pipe(
-                          Effect.provideService(Orchestrator.OrchestratorV2, orchestrationEngine),
-                          Effect.provideService(ProjectService.ProjectService, projectService),
-                        )
-                    ).pipe(
-                      Effect.andThen(
-                        refreshPushedPullRequests(input, result).pipe(
-                          Effect.provideService(Orchestrator.OrchestratorV2, orchestrationEngine),
-                          Effect.provideService(ProjectStore.ProjectStoreV2, projectStore),
-                          Effect.provideService(
-                            PullRequestService.PullRequestService,
-                            pullRequests,
+        [WS_METHODS.vcsPull]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            gitWorkflow.pullCurrentBranch(input.cwd).pipe(
+              Effect.matchCauseEffect({
+                onFailure: (cause) => Effect.failCause(cause),
+                onSuccess: (result) =>
+                  refreshGitStatus(input.cwd).pipe(Effect.ignore({ log: true }), Effect.as(result)),
+              }),
+            ),
+          ),
+        [WS_METHODS.gitRunStackedAction]: (rawInput) =>
+          repositoryWorkspace.stream(rawInput, (input) =>
+            Stream.callback<GitActionProgressEvent, GitManagerServiceError>((queue) =>
+              gitWorkflow
+                .runStackedAction(input, {
+                  actionId: input.actionId,
+                  progressReporter: {
+                    publish: (event) => Queue.offer(queue, event).pipe(Effect.asVoid),
+                  },
+                })
+                .pipe(
+                  Effect.matchCauseEffect({
+                    onFailure: (cause) => Queue.failCause(queue, cause),
+                    onSuccess: (result) =>
+                      (input.threadId === undefined
+                        ? Effect.void
+                        : linkCreatedPullRequest({
+                            threadId: input.threadId,
+                            result,
+                            commandId: serverCommandId("pr-created-link"),
+                          }).pipe(
+                            Effect.provideService(Orchestrator.OrchestratorV2, orchestrationEngine),
+                            Effect.provideService(ProjectService.ProjectService, projectService),
+                          )
+                      ).pipe(
+                        Effect.andThen(
+                          refreshPushedPullRequests(input, result).pipe(
+                            Effect.provideService(Orchestrator.OrchestratorV2, orchestrationEngine),
+                            Effect.provideService(ProjectStore.ProjectStoreV2, projectStore),
+                            Effect.provideService(
+                              PullRequestService.PullRequestService,
+                              pullRequests,
+                            ),
                           ),
                         ),
+                        Effect.andThen(refreshGitStatus(input.cwd)),
+                        Effect.andThen(Queue.end(queue).pipe(Effect.asVoid)),
                       ),
-                      Effect.andThen(refreshGitStatus(input.cwd)),
-                      Effect.andThen(Queue.end(queue).pipe(Effect.asVoid)),
-                    ),
-                }),
-              ),
+                  }),
+                ),
+            ),
           ),
-        [WS_METHODS.gitResolvePullRequest]: (input) => gitWorkflow.resolvePullRequest(input),
-        [WS_METHODS.gitPreparePullRequestThread]: (input) =>
-          gitWorkflow
-            .preparePullRequestThread(input)
-            .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
-        [WS_METHODS.vcsListRefs]: (input) => gitWorkflow.listRefs(input),
-        [WS_METHODS.vcsCreateWorktree]: (input) =>
-          gitWorkflow.createWorktree(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
-        [WS_METHODS.vcsRemoveWorktree]: (input) =>
-          gitWorkflow.removeWorktree(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
-        [WS_METHODS.vcsCreateRef]: (input) =>
-          gitWorkflow.createRef(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
-        [WS_METHODS.vcsSwitchRef]: (input) =>
-          gitWorkflow.switchRef(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
-        [WS_METHODS.vcsInit]: (input) =>
-          vcsProvisioning.initRepository(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
-        [WS_METHODS.reviewGetDiffPreview]: (input) => review.getDiffPreview(input),
-        [WS_METHODS.reviewGetDiffFileContents]: (input) => review.getDiffFileContents(input),
-        [WS_METHODS.terminalOpen]: (input) => terminalManager.open(input),
+        [WS_METHODS.gitResolvePullRequest]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) => gitWorkflow.resolvePullRequest(input)),
+        [WS_METHODS.gitPreparePullRequestThread]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            gitWorkflow
+              .preparePullRequestThread(input)
+              .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+          ),
+        [WS_METHODS.vcsListRefs]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) => gitWorkflow.listRefs(input)),
+        [WS_METHODS.vcsCreateWorktree]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            gitWorkflow.createWorktree(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+          ),
+        [WS_METHODS.vcsRemoveWorktree]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            gitWorkflow.removeWorktree(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+          ),
+        [WS_METHODS.vcsCreateRef]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            gitWorkflow.createRef(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+          ),
+        [WS_METHODS.vcsSwitchRef]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            gitWorkflow.switchRef(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+          ),
+        [WS_METHODS.vcsInit]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) =>
+            vcsProvisioning
+              .initRepository(input)
+              .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+          ),
+        [WS_METHODS.reviewGetDiffPreview]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) => review.getDiffPreview(input)),
+        [WS_METHODS.reviewGetDiffFileContents]: (rawInput) =>
+          repositoryWorkspace.run(rawInput, (input) => review.getDiffFileContents(input)),
+        [WS_METHODS.terminalOpen]: (input) =>
+          Effect.gen(function* () {
+            return yield* terminalManager.open(
+              yield* repositoryWorkspace.resolveTerminalInput(input),
+            );
+          }),
         [WS_METHODS.terminalAttach]: (input) =>
-          Stream.callback<TerminalAttachStreamEvent, TerminalError>((queue) =>
-            Effect.acquireRelease(
-              terminalManager.attachStream(input, (event) => Queue.offer(queue, event)),
-              (unsubscribe) => Effect.sync(unsubscribe),
-            ).pipe(Effect.catchCause((cause) => Queue.failCause(queue, cause))),
+          Stream.callback<TerminalAttachStreamEvent, TerminalError | RepositoryTargetError>(
+            (queue) =>
+              Effect.acquireRelease(
+                Effect.gen(function* () {
+                  const resolved = yield* repositoryWorkspace.resolveTerminalInput(input);
+                  return yield* terminalManager.attachStream(resolved, (event) =>
+                    Queue.offer(queue, event),
+                  );
+                }),
+                (unsubscribe) => Effect.sync(unsubscribe),
+              ).pipe(Effect.catchCause((cause) => Queue.failCause(queue, cause))),
           ),
         [WS_METHODS.terminalWrite]: (input) => terminalManager.write(input),
         [WS_METHODS.terminalResize]: (input) => terminalManager.resize(input),
         [WS_METHODS.terminalClear]: (input) => terminalManager.clear(input),
-        [WS_METHODS.terminalRestart]: (input) => terminalManager.restart(input),
+        [WS_METHODS.terminalRestart]: (input) =>
+          Effect.gen(function* () {
+            return yield* terminalManager.restart(
+              yield* repositoryWorkspace.resolveTerminalInput(input),
+            );
+          }),
         [WS_METHODS.terminalClose]: (input) => terminalManager.close(input),
         [WS_METHODS.terminalObserve]: (input) =>
           Stream.callback<TerminalAttachStreamEvent, TerminalError>((queue) =>
@@ -3164,6 +3374,13 @@ export const WS_RPC_SERVER_OPTIONS = {
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
     const previewAutomationBroker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
+    const repositoryWorkspace = yield* WorkspaceResolver.make.pipe(
+      Effect.provide(Layer.merge(RepositorySet.layerDefault, layerThreadProjections)),
+    );
+    const repositoryClient = yield* ClientCompatibility.make.pipe(
+      Effect.provide(layerThreadProjections),
+    );
+
     const serverBrowser = yield* ServerBrowser.ServerBrowser;
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
     const pullRequests = yield* PullRequestService.PullRequestService;
@@ -3222,6 +3439,9 @@ export const layer = Layer.unwrap(
               clientAnalyticsProps,
               previewAutomationBroker,
               serverBrowser,
+              ClientCompatibility.supportsRepositories(requestUrl.value),
+              repositoryWorkspace,
+              repositoryClient,
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               // Request fibers run in the handlers' context, so this reporter sees

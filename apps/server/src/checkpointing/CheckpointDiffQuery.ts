@@ -20,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
+import { RepositoryHistory } from "../fd/multirepo/index.ts";
 import { checkpointRefForScopeOrdinal } from "../orchestration-v2/CheckpointService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import {
@@ -86,6 +87,7 @@ const isTurnDiffResult = Schema.is(OrchestrationGetTurnDiffResult);
 function buildTurnDiffResult(
   input: {
     readonly threadId: ThreadId;
+    readonly repositoryId?: string;
     readonly fromTurnCount: number;
     readonly toTurnCount: number;
   },
@@ -93,6 +95,7 @@ function buildTurnDiffResult(
 ): OrchestrationGetTurnDiffResultType {
   return {
     threadId: input.threadId,
+    ...(input.repositoryId === undefined ? {} : { repositoryId: input.repositoryId }),
     fromTurnCount: input.fromTurnCount,
     toTurnCount: input.toTurnCount,
     diff,
@@ -116,6 +119,17 @@ export const make = Effect.gen(function* () {
         "checkpoint.ignore_whitespace": ignoreWhitespace,
       });
 
+      const projection = yield* threads.getCheckpointContext(input.threadId).pipe(
+        Effect.mapError(
+          () =>
+            new CheckpointThreadNotFoundError({
+              operation,
+              threadId: input.threadId,
+            }),
+        ),
+        Effect.withSpan("checkpoint.turnDiff.lookupContext"),
+      );
+      const selection = yield* RepositoryHistory.select(projection, input.repositoryId);
       if (input.fromTurnCount === input.toTurnCount) {
         const emptyDiff = buildTurnDiffResult(input, "");
         if (!isTurnDiffResult(emptyDiff)) {
@@ -127,30 +141,27 @@ export const make = Effect.gen(function* () {
         return emptyDiff;
       }
 
-      const projection = yield* threads.getCheckpointContext(input.threadId).pipe(
-        Effect.mapError(
-          () =>
-            new CheckpointThreadNotFoundError({
-              operation,
-              threadId: input.threadId,
-            }),
-        ),
-        Effect.withSpan("checkpoint.turnDiff.lookupContext"),
-      );
-      const completedRunIds = new Set(
-        projection.runs.filter((run) => run.status === "completed").map((run) => run.id),
+      const snapshotRunIds = new Set(
+        projection.runs
+          .filter((run) => RepositoryHistory.isReadableRun(run.status, selection.multiRepository))
+          .map((run) => run.id),
       );
       const readyCheckpoints = projection.checkpoints.filter(
         (checkpoint) =>
+          (!selection.multiRepository || checkpoint.scopeId === selection.scope?.id) &&
           checkpoint.status === "ready" &&
           checkpoint.appRunOrdinal !== null &&
           checkpoint.runId !== null &&
-          completedRunIds.has(checkpoint.runId),
+          snapshotRunIds.has(checkpoint.runId),
       );
-      const maxTurnCount = readyCheckpoints.reduce(
-        (max, checkpoint) => Math.max(max, checkpoint.appRunOrdinal ?? 0),
-        0,
-      );
+      const maxTurnCount = selection.multiRepository
+        ? projection.runs
+            .filter((run) => RepositoryHistory.isReadableRun(run.status, selection.multiRepository))
+            .reduce((max, run) => Math.max(max, run.ordinal), 0)
+        : readyCheckpoints.reduce(
+            (max, checkpoint) => Math.max(max, checkpoint.appRunOrdinal ?? 0),
+            0,
+          );
       if (input.toTurnCount > maxTurnCount) {
         return yield* new CheckpointTurnRangeUnavailableError({
           operation,
@@ -186,11 +197,19 @@ export const make = Effect.gen(function* () {
       // tracks the latest owner, while ordinal zero stays the baseline.
       const firstScope =
         input.fromTurnCount === 0
-          ? projection.checkpointScopes.find((scope) => scope.kind === "root_run")
+          ? selection.multiRepository
+            ? selection.scope
+            : projection.checkpointScopes.find((scope) => scope.kind === "root_run")
           : undefined;
+      const baseline = selection.multiRepository
+        ? projection.checkpoints.find(
+            (checkpoint) =>
+              checkpoint.scopeId === firstScope?.id && checkpoint.ordinalWithinScope === 0,
+          )
+        : undefined;
       const fromCheckpointRef =
         input.fromTurnCount === 0
-          ? firstScope === undefined
+          ? firstScope === undefined || (selection.multiRepository && baseline?.status !== "ready")
             ? undefined
             : yield* checkpointRefForScopeOrdinal({
                 scopeId: firstScope.id,
@@ -267,28 +286,11 @@ export const make = Effect.gen(function* () {
       "checkpoint.diff_kind": "full-thread",
     });
 
-    if (input.toTurnCount === 0) {
-      const emptyDiff = buildTurnDiffResult(
-        {
-          threadId: input.threadId,
-          fromTurnCount: 0,
-          toTurnCount: 0,
-        },
-        "",
-      );
-      if (!isTurnDiffResult(emptyDiff)) {
-        return yield* new CheckpointDiffResultInvalidError({
-          operation,
-          threadId: input.threadId,
-        });
-      }
-      return emptyDiff satisfies OrchestrationGetFullThreadDiffResult;
-    }
-
     const turnDiff = yield* getTurnDiff({
       threadId: input.threadId,
       fromTurnCount: 0,
       toTurnCount: input.toTurnCount,
+      ...(input.repositoryId === undefined ? {} : { repositoryId: input.repositoryId }),
       ignoreWhitespace,
     });
     if (!isTurnDiffResult(turnDiff)) {

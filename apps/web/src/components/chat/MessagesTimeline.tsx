@@ -1,3 +1,4 @@
+import { openRepositoryFile, RepositoryChangedFiles } from "../../fd/multirepo";
 import { ThreadFindTimelineContext } from "./ThreadFindProvider";
 import { shouldPreserveAssistantLineBreaks } from "@t3tools/shared/markdownPipeline";
 import { MarkdownFindContext, useFindRevealRef } from "./markdownFindContext";
@@ -6,7 +7,6 @@ import { WorkLogBlock, WorkLogButton, WorkLogDetails, WorkLogList, WorkLogRow } 
 import { PullRequestGlyph } from "../pullRequest/pullRequestIcons";
 import type { WorktreeSetupSnapshot } from "@t3tools/contracts";
 import { ReadOnlySourcePreview } from "../files/AttachmentFilePreview";
-import { useRightPanelStore } from "~/rightPanelStore";
 import {
   getQuestionAnswerPreview,
   getQuestionAnswerText,
@@ -341,16 +341,15 @@ interface TimelineRowSharedState {
   findActive: boolean;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   displayThreadKey?: string;
-  onOpenTurnDiff: (runId: RunId, filePath?: string) => void;
+  onOpenTurnDiff: (runId: RunId, filePath?: string, repositoryId?: string) => void;
   onOpenThread: (threadId: OrchestrationV2TurnItem["threadId"]) => void;
   onForkFromRun: (input: {
     readonly sourceThreadId: ThreadId;
     readonly runId: RunId;
   }) => Promise<void>;
-  onRollbackCheckpoint: (input: {
-    readonly checkpointId: string;
-    readonly scopeId: string;
-  }) => void;
+  onRollbackCheckpoint?:
+    | ((input: { readonly checkpointId: string; readonly scopeId: string }) => void)
+    | undefined;
   onToggleTurnFold: (runId: RunId) => void;
   onToggleAttemptFold: (attemptId: RunAttemptId) => void;
   onFileOpen: (attachment: ChatFileAttachment) => void;
@@ -484,7 +483,7 @@ interface MessagesTimelineProps {
   displayThreadKey?: string;
   /** The rows are a held snapshot of the previous thread while the next one loads. */
   paintOnly?: boolean;
-  onOpenTurnDiff: (runId: RunId, filePath?: string) => void;
+  onOpenTurnDiff: (runId: RunId, filePath?: string, repositoryId?: string) => void;
   onOpenThread: (threadId: OrchestrationV2TurnItem["threadId"]) => void;
   parentThreadLink?: {
     readonly threadId: ThreadId;
@@ -494,10 +493,9 @@ interface MessagesTimelineProps {
     readonly sourceThreadId: ThreadId;
     readonly runId: RunId;
   }) => Promise<void>;
-  onRollbackCheckpoint: (input: {
-    readonly checkpointId: string;
-    readonly scopeId: string;
-  }) => void;
+  onRollbackCheckpoint?:
+    | ((input: { readonly checkpointId: string; readonly scopeId: string }) => void)
+    | undefined;
   supportsConversationRollback: boolean;
   onRevertToTurnCount: (targetTurnCount: number, messageId: MessageId) => void;
   onUseArtifactTemplate?: (template: CodexArtifactTemplate) => void;
@@ -4248,9 +4246,19 @@ const AssistantChangedFilesSection = memo(function AssistantChangedFilesSection(
   routeThreadKey: string;
   resolvedTheme: "light" | "dark";
   displayThreadKey?: string;
-  onOpenTurnDiff: (runId: RunId, filePath?: string) => void;
+  onOpenTurnDiff: (runId: RunId, filePath?: string, repositoryId?: string) => void;
 }) {
+  const ctx = use(TimelineRowCtx);
   if (!turnSummary) return null;
+  if (turnSummary.repositoryGroups)
+    return (
+      <RepositoryChangedFiles
+        summary={turnSummary}
+        environmentId={ctx.activeThreadEnvironmentId}
+        resolvedTheme={resolvedTheme}
+        onOpenTurnDiff={onOpenTurnDiff}
+      />
+    );
   const checkpointFiles = turnSummary.files;
   if (checkpointFiles.length === 0) return null;
 
@@ -4279,7 +4287,7 @@ function AssistantChangedFilesSectionInner({
   routeThreadKey: string;
   resolvedTheme: "light" | "dark";
   displayThreadKey?: string;
-  onOpenTurnDiff: (runId: RunId, filePath?: string) => void;
+  onOpenTurnDiff: (runId: RunId, filePath?: string, repositoryId?: string) => void;
 }) {
   const ctx = use(TimelineRowCtx);
   const persistedExpanded = useUiStateStore(
@@ -4343,8 +4351,7 @@ function UserMessageMentionChip(props: {
             aria-label={`Preview ${props.record.path}`}
             data-markdown-copy={props.copyMarkdown}
             onClick={() => {
-              if (ctx.threadRef)
-                useRightPanelStore.getState().openFile(ctx.threadRef, props.record.path);
+              if (ctx.threadRef) openRepositoryFile(ctx.threadRef, props.record.path);
             }}
           >
             <WorkspaceEntryIcon

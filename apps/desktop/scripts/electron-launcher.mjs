@@ -274,6 +274,7 @@ export function resolveMacBundleInfoPlistStrings(executableName) {
       "foredeck-t3 captures the active window when you use the snapshot shortcut.",
     NSDocumentsFolderUsageDescription:
       "foredeck-t3 reads project files you open in the desktop app.",
+    NSMicrophoneUsageDescription: "Foredeck uses the microphone when you record a voice message.",
   };
 }
 

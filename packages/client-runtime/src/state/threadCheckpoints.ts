@@ -7,8 +7,11 @@ import type {
   RunId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import { repositoryHistoryGroups, selectRepositoryCheckpoints } from "../fd/multirepo/index.ts";
 
 export interface ThreadCheckpointSummary {
+  readonly repositoryId?: string;
+  readonly repositoryGroups?: ReturnType<typeof repositoryHistoryGroups>["groups"];
   readonly checkpointId?: CheckpointId;
   readonly scopeId?: CheckpointScopeId;
   readonly runId: RunId;
@@ -28,8 +31,9 @@ export interface ThreadCheckpointSummary {
 /** Derives the checkpoint/diff rows needed by review UIs from native V2 entities. */
 export function deriveThreadCheckpointSummaries(
   projection: OrchestrationV2ThreadProjection,
+  repositoryId?: string,
 ): ReadonlyArray<ThreadCheckpointSummary> {
-  return projection.checkpoints.flatMap((checkpoint) => {
+  return selectRepositoryCheckpoints(projection, repositoryId).flatMap((checkpoint) => {
     if (checkpoint.appRunOrdinal === null || checkpoint.runId === null) return [];
     const assistantMessageId =
       projection.messages.findLast(
@@ -37,6 +41,11 @@ export function deriveThreadCheckpointSummaries(
       )?.id ?? null;
     return [
       {
+        ...(repositoryId === undefined ? {} : { repositoryId }),
+        ...(repositoryId === undefined &&
+        (projection.thread.workspaceBinding?.repositories.length ?? 0) > 1
+          ? { repositoryGroups: repositoryHistoryGroups(projection, checkpoint.runId).groups }
+          : {}),
         checkpointId: checkpoint.id,
         scopeId: checkpoint.scopeId,
         runId: checkpoint.runId,

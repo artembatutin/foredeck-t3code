@@ -36,10 +36,13 @@ vi.mock("../../state/presentation", () => ({
   }),
 }));
 vi.mock("../../state/use-thread-detail", () => ({
-  useSelectedThreadProjection: () => ({ projection: {} }),
+  useSelectedThreadProjection: () => ({ projection: { runs: [], checkpoints: [] } }),
 }));
 vi.mock("../../state/use-selected-thread-worktree", () => ({
-  useSelectedThreadWorktree: () => ({ selectedThreadCwd: "/repo" }),
+  useSelectedThreadWorktree: () => ({
+    selectedThreadCwd: "/repo",
+    repositoryWorkspace: { isMultiRepository: false, selected: null },
+  }),
 }));
 vi.mock("../../state/query", () => ({
   useEnvironmentQuery: (atom: unknown) => ({

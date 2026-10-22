@@ -491,6 +491,10 @@
       "types": "./src/PtyAdapter.ts",
       "import": "./src/PtyAdapter.ts"
     },
+    "./fd/assistant": {
+      "types": "./src/fd/assistant/index.ts",
+      "import": "./src/fd/assistant/index.ts"
+    },
     "./fd/appearance": {
       "types": "./src/fd/appearance/index.ts",
       "import": "./src/fd/appearance/index.ts"

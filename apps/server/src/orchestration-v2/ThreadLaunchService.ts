@@ -1,3 +1,4 @@
+import { RepositorySet } from "../fd/multirepo/index.ts";
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
@@ -144,7 +145,7 @@ export class ThreadLaunchError extends Schema.TaggedError<ThreadLaunchError>()(
   },
 ) {
   override get message(): string {
-    return `Thread launch ${this.commandId} failed during ${this.operation}.`;
+    return `Thread launch ${this.commandId} failed during ${this.operation}.${Schema.is(ThreadLaunchWorkspaceError)(this.cause) ? ` ${this.cause.message}` : ""}`;
   }
 }
 
@@ -163,6 +164,15 @@ export class ThreadLaunchBaseRefError extends Schema.TaggedError<ThreadLaunchBas
   }
 }
 
+export class ThreadLaunchWorkspaceError extends Schema.TaggedError<ThreadLaunchWorkspaceError>()(
+  "ThreadLaunchWorkspaceError",
+  { detail: Schema.String, cause: Schema.optional(Schema.Defect()) },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
 export class ThreadLaunchService extends Context.Service<
   ThreadLaunchService,
   {
@@ -177,6 +187,11 @@ export class ThreadLaunchService extends Context.Service<
      * `launch` accepts such a launch and reports the failure inside the
      * thread; a caller that needs it before a thread exists checks first.
      */
+    readonly checkWorkspaceStrategy: (
+      input: Pick<ThreadLaunchInput, "projectId" | "workspaceStrategy"> & {
+        readonly threadId?: ThreadId | undefined;
+      },
+    ) => Effect.Effect<void, ThreadLaunchWorkspaceError>;
     readonly checkWorktreeBase: (
       input: Pick<ThreadLaunchInput, "projectId" | "workspaceStrategy">,
     ) => Effect.Effect<void, ThreadLaunchBaseRefError>;
@@ -261,6 +276,30 @@ const make = Effect.gen(function* () {
     }
   });
 
+  const checkWorkspaceStrategy: ThreadLaunchService["Service"]["checkWorkspaceStrategy"] =
+    Effect.fn("ThreadLaunchService.checkWorkspaceStrategy")(
+      function* (input) {
+        if (input.workspaceStrategy.type === "root") return;
+        const project = Option.getOrUndefined(yield* projects.getById(input.projectId));
+        if (!project)
+          return yield* new ThreadLaunchWorkspaceError({ detail: "Project not found." });
+        yield* RepositorySet.assertCheckoutMode(project.repositories, "worktree");
+        if (input.threadId) {
+          const thread = yield* threads.getThreadShell(input.threadId);
+          if (thread && thread.projectId !== input.projectId) {
+            return yield* new ThreadLaunchWorkspaceError({
+              detail: "The conversation belongs to another project.",
+            });
+          }
+          yield* RepositorySet.assertCheckoutMode(
+            thread?.workspaceBinding?.repositories,
+            "worktree",
+          );
+        }
+      },
+      Effect.mapError((cause) => new ThreadLaunchWorkspaceError({ detail: cause.message, cause })),
+    );
+
   const checkWorktreeBase: ThreadLaunchService["Service"]["checkWorktreeBase"] = Effect.fn(
     "ThreadLaunchService.checkWorktreeBase",
   )(function* (input) {
@@ -314,6 +353,18 @@ const make = Effect.gen(function* () {
       ),
     );
 
+    if (input.workspaceStrategy.type !== "root") {
+      yield* RepositorySet.assertCheckoutMode(project.repositories, "worktree").pipe(
+        Effect.mapError(mapError(input, "provision-worktree", threadId)),
+      );
+      const bound = yield* threads
+        .getThreadProjection(threadId)
+        .pipe(Effect.mapError(mapError(input, "provision-worktree", threadId)));
+      yield* RepositorySet.assertCheckoutMode(
+        bound.thread.workspaceBinding?.repositories,
+        "worktree",
+      ).pipe(Effect.mapError(mapError(input, "provision-worktree", threadId)));
+    }
     const reused = input.reusedWorktree;
     const tracked = input.workspaceStrategy.type === "worktree" || reused !== undefined;
     let createdWorktreePath: string | null = null;
@@ -456,6 +507,15 @@ const make = Effect.gen(function* () {
           .createWorktree(
             {
               cwd: project.workspaceRoot,
+              ...(project.repositories?.[0]
+                ? {
+                    repositoryTarget: {
+                      type: "project" as const,
+                      projectId: input.projectId,
+                      repositoryId: project.repositories[0].id,
+                    },
+                  }
+                : {}),
               refName: startRef,
               newRefName: branch!,
               baseRefName: input.workspaceStrategy.baseRef,
@@ -802,6 +862,9 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
+      yield* checkWorkspaceStrategy(input).pipe(
+        Effect.mapError(mapError(input, "provision-worktree")),
+      );
       if (input.reuseExistingThread === true && input.threadId === undefined) {
         return yield* mapError(
           input,
@@ -1090,7 +1153,13 @@ const make = Effect.gen(function* () {
     );
   };
 
-  return ThreadLaunchService.of({ launch, checkWorktreeBase, retryPreparation, prepareRun });
+  return ThreadLaunchService.of({
+    launch,
+    checkWorkspaceStrategy,
+    checkWorktreeBase,
+    retryPreparation,
+    prepareRun,
+  });
 });
 
 export const layer = Layer.effect(ThreadLaunchService, make);

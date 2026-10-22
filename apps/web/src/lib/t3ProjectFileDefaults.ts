@@ -1,3 +1,7 @@
+import {
+  repositoryFileRequest,
+  type RepositoryFileScope,
+} from "@t3tools/client-runtime/fd/multirepo";
 import { T3_PROJECT_FILE_NAME, type EnvironmentId, type T3ProjectFile } from "@t3tools/contracts";
 import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
 import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
@@ -21,16 +25,18 @@ import { appAtomRegistry } from "~/rpc/atomRegistry";
 export async function readT3ProjectFile(
   environmentId: EnvironmentId,
   workspaceRoot: string,
+  repositoryScope?: RepositoryFileScope,
 ): Promise<T3ProjectFile | null> {
+  const file = repositoryFileRequest(workspaceRoot, T3_PROJECT_FILE_NAME, repositoryScope);
   const result = await executeAtomQuery(
     appAtomRegistry,
-    getProjectFileQueryAtom(environmentId, workspaceRoot, T3_PROJECT_FILE_NAME),
+    getProjectFileQueryAtom(environmentId, file.cwd, file.path, file.repositoryTarget),
     { reportDefect: false, reportFailure: false },
   );
   const data = resolveProjectFileQueryData(
     environmentId,
-    workspaceRoot,
-    T3_PROJECT_FILE_NAME,
+    file.cwd,
+    file.path,
     result._tag === "Success" ? result.value : null,
   );
   if (data === null || data.truncated) return null;

@@ -54,6 +54,7 @@ const makeScope = (
 });
 
 interface ThreadFixture {
+  readonly workspaceBinding?: OrchestrationV2ThreadProjection["thread"]["workspaceBinding"];
   readonly branch?: string | null;
   readonly worktreePath?: string | null;
   readonly archivedAt?: string | null;
@@ -86,6 +87,7 @@ const project: Project = {
 } as Project;
 
 interface HarnessOptions {
+  readonly repositories?: Project["repositories"];
   readonly thread?: ThreadFixture | null;
   readonly threadReadError?: "projection" | "dispatch";
   readonly capabilities?: ReadonlySet<McpInvocationContext.McpCapability>;
@@ -194,7 +196,7 @@ const makeHarness = (options: HarnessOptions = {}) => {
       ? (Effect.fail("simulated project read failure") as never)
       : Effect.succeed(
           id === projectId && options.projectMissing !== true
-            ? Option.some(project)
+            ? Option.some({ ...project, repositories: options.repositories })
             : Option.none(),
         ),
   );
@@ -389,6 +391,31 @@ const runStatus = (harness: ReturnType<typeof makeHarness>) =>
   }).pipe(Effect.provide(harness.layer));
 
 describe("t3_worktree_handoff", () => {
+  it.effect(
+    "rejects configured and historical multi-repository bindings before preparing a checkout",
+    () =>
+      Effect.gen(function* () {
+        const repositories = [
+          { id: "primary", name: "Primary", rootPath: workspaceRoot },
+          { id: "missing", name: "Missing service", rootPath: "/missing/service" },
+        ];
+        for (const options of [
+          { repositories },
+          {
+            thread: {
+              workspaceBinding: { version: 1 as const, defaultCwd: workspaceRoot, repositories },
+            },
+          },
+        ]) {
+          const harness = makeHarness(options);
+          const error = yield* runHandoff(harness, { branch: "feature/multi" }).pipe(Effect.flip);
+          expect(error.message).toContain("Multi-repository");
+          expect(harness.createWorktree).not.toHaveBeenCalled();
+          expect(harness.dispatch).not.toHaveBeenCalled();
+        }
+      }),
+  );
+
   it.effect("creates a worktree from the current branch and re-points the thread", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
