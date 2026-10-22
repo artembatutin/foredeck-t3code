@@ -1,3 +1,4 @@
+import { ThreadCardContent, threadCardHeight } from "~/fd/sidebar-thread-layout";
 import { type EnvironmentId, type ScopedProjectRef } from "@t3tools/contracts";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "./ThreadHoverCard";
 import { CollapsibleSectionHeader } from "./ui/collapsible-section-header";
@@ -921,7 +922,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
         onKeyDown={handleKeyDown}
       >
         <span className="sr-only">{preview}</span>
-        <div className="relative z-10 h-[4.875rem] px-(--sidebar-row-content-inset) py-(--sidebar-content-inset)">
+        <ThreadCardContent>
           <div className="flex h-5 min-w-0 items-center gap-1.5">
             <SquarePenIcon aria-hidden className={draftPenClassName} />
             {props.project ? (
@@ -951,7 +952,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
           <div aria-hidden className="mt-0.5 truncate text-sm font-medium text-foreground/90">
             {preview}
           </div>
-        </div>
+        </ThreadCardContent>
       </div>
     </li>
   );
@@ -1955,6 +1956,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   }
 
   const diff = latestRunDiff(thread);
+  const hasCardDetails = Boolean(thread.branch) || showsScratchMachine;
 
   return (
     <li
@@ -1962,8 +1964,10 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
       {...sortableRootProps}
       {...(fileDropHandlers ?? {})}
       className={cn(
-        // Matches the h-[4.875rem] content box; the py-0.5 padding is added on top.
-        "list-none py-0.5 [content-visibility:auto] [contain-intrinsic-size:auto_78px]",
+        "list-none py-0.5 [content-visibility:auto]",
+        hasCardDetails
+          ? "[contain-intrinsic-size:auto_78px]"
+          : "[contain-intrinsic-size:auto_60px]",
         sortable?.isDragging && "relative z-20",
       )}
     >
@@ -1987,7 +1991,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
           }
         >
           {accessibleTitle}
-          <div className="relative z-10 h-[4.875rem] px-(--sidebar-row-content-inset) py-(--sidebar-content-inset)">
+          <ThreadCardContent hasDetails={hasCardDetails}>
             <div className="flex h-5 min-w-0 items-center gap-1.5">
               {draftIndicator}
               {props.project ? (
@@ -2150,39 +2154,13 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                   release click still fires and is consumed. */}
               {props.sweepAction !== null ? dragDestination : null}
             </div>
-            <div className="mt-1 flex min-w-0">
+            <div className="mt-1 flex min-w-0 items-center gap-1.5 text-secondary-label text-xs">
               {title}
               {isRegeneratingTitle ? (
                 <span role="status" className="sr-only">
                   Regenerating title
                 </span>
               ) : null}
-            </div>
-            <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-secondary-label text-xs">
-              {/* Always the branch. The plan step used to take this slot while
-                  working, but it truncated to a half-sentence and dropped the
-                  branch, so the row lost its most stable identifier. */}
-              {thread.branch ? (
-                <>
-                  <ThreadWorktreeIndicator thread={thread} />
-                  <span className="flex min-w-0 flex-1 text-muted-foreground/40">
-                    <MiddleTruncate value={thread.branch} showTitle={false} />
-                  </span>
-                </>
-              ) : showsScratchMachine ? (
-                <>
-                  <EnvironmentMachineIcon
-                    aria-hidden
-                    kind={props.environmentMachine}
-                    className="size-3 shrink-0 text-muted-foreground/40"
-                  />
-                  <span className="min-w-0 flex-1 truncate text-muted-foreground/40">
-                    {props.scratchMachineLabel}
-                  </span>
-                </>
-              ) : (
-                <span className="flex-1" />
-              )}
               {terminalStatusIcon}
               {prBadge}
               {diff ? (
@@ -2214,7 +2192,35 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                 />
               </span>
             </div>
-          </div>
+            {hasCardDetails ? (
+              <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-secondary-label text-xs">
+                {/* Always the branch. The plan step used to take this slot while
+                  working, but it truncated to a half-sentence and dropped the
+                  branch, so the row lost its most stable identifier. */}
+                {thread.branch ? (
+                  <>
+                    <ThreadWorktreeIndicator thread={thread} />
+                    <span className="flex min-w-0 flex-1 text-muted-foreground/40">
+                      <MiddleTruncate value={thread.branch} showTitle={false} />
+                    </span>
+                  </>
+                ) : showsScratchMachine ? (
+                  <>
+                    <EnvironmentMachineIcon
+                      aria-hidden
+                      kind={props.environmentMachine}
+                      className="size-3 shrink-0 text-muted-foreground/40"
+                    />
+                    <span className="min-w-0 flex-1 truncate text-muted-foreground/40">
+                      {props.scratchMachineLabel}
+                    </span>
+                  </>
+                ) : (
+                  <span className="flex-1" />
+                )}
+              </div>
+            ) : null}
+          </ThreadCardContent>
           {props.jumpLabel ? <JumpHintBadge label={props.jumpLabel} /> : null}
         </TooltipTrigger>
         {detailsTooltip}
@@ -3945,6 +3951,15 @@ export default function Sidebar() {
         settledVisibleCount,
         routeThreadKey,
         snoozedThreadCount: snoozedThreads.length,
+        cardHeightFor: (key) => {
+          const thread = threadByKey.get(key);
+          return (
+            threadCardHeight(
+              thread !== undefined &&
+                (Boolean(thread.branch) || scratchMachineLabelFor(thread) !== null),
+            ) + 4
+          );
+        },
       }),
     [
       draggedActiveOrder,
@@ -3955,6 +3970,8 @@ export default function Sidebar() {
       settledVisibleCount,
       sidebarListItems,
       snoozedThreads.length,
+      threadByKey,
+      scratchMachineLabelFor,
     ],
   );
   // Hidden and filtered threads keep their keys. Reserve those slots without

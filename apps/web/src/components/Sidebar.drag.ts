@@ -109,6 +109,8 @@ export function createSidebarSortingStrategy(input: {
   routeThreadKey?: string | null;
   snoozedThreadCount?: number;
   cardHeight?: number;
+  /** Unscaled card height, including row padding, when restoring a slim row. */
+  cardHeightFor?: (key: string) => number;
   slimHeight?: number;
   /** Space each pinned boundary opens for its label while dragging. The
    * markers stay zero height at rest, so nothing is reserved until pickup. */
@@ -135,6 +137,7 @@ export function createSidebarSortingStrategy(input: {
     };
     let cardHeight = input.cardHeight;
     let slimHeight = input.slimHeight;
+    let unscaledCardHeight = 82;
     let headerScale: number | undefined;
     for (const [index, item] of items.entries()) {
       if (item.kind === "marker") {
@@ -144,14 +147,19 @@ export function createSidebarSortingStrategy(input: {
         }
         continue;
       }
-      if (item.section === "pinned" || item.section === "active" || item.section === "working")
-        cardHeight ??= rects[index]?.height;
-      else slimHeight ??= rects[index]?.height;
+      if (item.section === "pinned" || item.section === "active" || item.section === "working") {
+        if (cardHeight === undefined) {
+          cardHeight = rects[index]?.height;
+          unscaledCardHeight = input.cardHeightFor?.(item.key) ?? 82;
+        }
+      } else slimHeight ??= rects[index]?.height;
       if (item.key !== active.key) groups[item.section].push(item);
     }
-    // Cards are 4.875rem + 0.25rem padding; slim rows/placeholders are h-9.
+    // Card heights include row padding; slim rows/placeholders are h-9.
     const scale =
-      slimHeight !== undefined ? slimHeight / 36 : (headerScale ?? (cardHeight ?? 82) / 82);
+      slimHeight !== undefined
+        ? slimHeight / 36
+        : (headerScale ?? (cardHeight ?? unscaledCardHeight) / unscaledCardHeight);
     cardHeight ??= 82 * scale;
     slimHeight ??= 36 * scale;
     const labelHeight = (input.boundaryLabelHeight ?? 0) * scale;
@@ -209,7 +217,9 @@ export function createSidebarSortingStrategy(input: {
       const fallback =
         item.kind === "thread" &&
         (item.section === "pinned" || item.section === "active" || item.section === "working")
-          ? cardHeight
+          ? input.cardHeightFor
+            ? input.cardHeightFor(item.key) * scale
+            : cardHeight
           : slimHeight;
       const moved = item.kind === "thread" && item.key === active.key;
       return item.kind === "marker" &&

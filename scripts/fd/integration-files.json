@@ -287,6 +287,9 @@
     "packages/provider-opencode/src/server/driver.ts": "Advertises multi-repository support only for a local v2 server configuration.",
     "packages/provider-opencode/src/server/v2/adapter.ts": "Carries repository directory rules through session creation/resume and turn instructions using the native v2 permission service.",
     "packages/shared/package.json": "Exposes the shared fd appearance and branding feature entry points consumed by all three clients.",
-    "packages/shared/src/themePalettes.ts": "Registers an internal Foredeck mobile palette id and reserves it without replacing legacy palette values or valid custom ids."
+    "packages/shared/src/themePalettes.ts": "Registers an internal Foredeck mobile palette id and reserves it without replacing legacy palette values or valid custom ids.",
+    "apps/web/src/components/Sidebar.tsx": "Composes compact fd thread cards with provider badges beside the title, retaining optional branch and machine details and supplying their heights to drag previews.",
+    "apps/web/src/components/Sidebar.drag.ts": "Accepts per-thread card heights so compact and detailed cards preserve spacing when dragged between sidebar sections.",
+    "apps/web/src/components/Sidebar.drag.test.ts": "Verifies drag previews for mixed compact and detailed thread cards, including restoring settled threads."
   }
 }
