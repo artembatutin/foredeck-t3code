@@ -8,6 +8,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
+import { WorkManagementCapability } from "./fd/work-management/index.ts";
 
 /** Wire version for orchestration snapshots, streams, commands, and RPC payloads. */
 export const MULTIREPO_PROTOCOL_VERSION = 1;
@@ -226,6 +227,9 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
       "server"`) and streams them over `/api/preview-stream`. Clients
       without a local browser runtime open server tabs here. */
   serverBrowser: Schema.optionalKey(Schema.Boolean),
+  /** Foredeck Work. Absent on servers without it; a shape this build cannot read decodes as
+      absent. Read it through `workManagementSupport`, which also rejects other versions. */
+  workManagement: ForwardCompatibleOptional(WorkManagementCapability),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

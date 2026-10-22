@@ -10,6 +10,7 @@ import {
   AuthOrchestrationOperateScope,
   AuthSettingsWriteScope,
   AuthSourceControlWriteScope,
+  AuthWorkWriteScope,
   ThreadId,
   EnvironmentId,
   ScheduledTaskId,
@@ -335,6 +336,36 @@ it.effect("rejects protected unary and streamed RPCs outside a guarded command",
     expect(streamed._tag).toBe("EnvironmentAuthorizationError");
     expect(writes).toBe(0);
   }),
+);
+
+it.effect("Work writes, source saves and thread starts need their own destination grants", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const registry = yield* setup;
+      const update = createCommandPermissions(runtime, WS_METHODS.workItemsUpdate);
+      const save = createCommandPermissions(runtime, WS_METHODS.workSourcesSave);
+      const start = createCommandPermissions(runtime, WS_METHODS.workThreadsStart);
+      // orchestration:operate alone starts threads but neither writes items nor saves sources.
+      registry.set(sessions(env), AsyncResult.success(grant(true)));
+      expect(registry.get(start.permissionAtom(env))).toBe(true);
+      expect(registry.get(update.permissionAtom(env))).toBe(false);
+      expect(registry.get(save.permissionAtom(env))).toBe(false);
+      expect((yield* update.authorize(registry, env).pipe(Effect.flip))._tag).toBe(
+        "EnvironmentAuthorizationError",
+      );
+      const scopes = [AuthWorkWriteScope, AuthSettingsWriteScope];
+      registry.set(
+        sessions(env),
+        AsyncResult.success({ ...grant(false), scopes, permissions: scopes }),
+      );
+      expect(registry.get(update.permissionAtom(env))).toBe(true);
+      expect(registry.get(save.permissionAtom(env))).toBe(true);
+      expect(registry.get(start.permissionAtom(env))).toBe(false);
+      yield* update.authorize(registry, env);
+      registry.set(sessions(env), AsyncResult.success(grant(false)));
+      expect(registry.get(update.permissionAtom(env))).toBe(false);
+    }),
+  ),
 );
 
 it.effect("assistant controls recheck the destination grant after it is revoked", () =>

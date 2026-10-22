@@ -1,4 +1,5 @@
 import { ProjectAssistant } from "./fd/assistant/index.ts";
+import * as WorkManagement from "./fd/work-management/index.ts";
 import { AssistantOperationError } from "@t3tools/contracts";
 import { RepositoryTargetError } from "@t3tools/contracts";
 import { ClientCompatibility, RepositorySet, WorkspaceResolver } from "./fd/multirepo/index.ts";
@@ -558,6 +559,8 @@ const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 
 // Middleware added later wraps middleware added earlier, so instrumentation wraps authorization.
 const ServerWsRpcGroup = WsRpcGroup.middleware(RpcInstrumentation);
+// Work's handlers come from their own layer; one handler object over every method is too deep.
+const CoreServerWsRpcGroup = ServerWsRpcGroup.omit(...WorkManagement.WS_METHOD_TAGS);
 // When a resuming client's cursor is more than this many events behind the
 // current head, skip the per-event catch-up replay and send a fresh shell
 // snapshot instead. Replaying each intervening event costs a shell refetch;
@@ -1216,7 +1219,7 @@ const layerWsRpc = (
   repositoryWorkspaceService: Effect.Success<typeof WorkspaceResolver.make>,
   repositoryClient: Effect.Success<typeof ClientCompatibility.make>,
 ) =>
-  ServerWsRpcGroup.toLayer(
+  CoreServerWsRpcGroup.toLayer(
     Effect.gen(function* () {
       const repositoryWorkspace = repositoryWorkspaceService.forClient(supportsRepositories);
       const currentSessionId = currentSession.sessionId;
@@ -1877,7 +1880,7 @@ const layerWsRpc = (
         return result;
       });
 
-      const handlers = ServerWsRpcGroup.of({
+      const handlers = CoreServerWsRpcGroup.of({
         [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command) =>
           Effect.annotateCurrentSpan({
             "orchestration_v2.command_id": command.commandId,
@@ -3433,15 +3436,18 @@ export const layer = Layer.unwrap(
           return httpEffect;
         }).pipe(
           Effect.provide(
-            layerWsRpc(
-              session,
-              clientOrigin,
-              clientAnalyticsProps,
-              previewAutomationBroker,
-              serverBrowser,
-              ClientCompatibility.supportsRepositories(requestUrl.value),
-              repositoryWorkspace,
-              repositoryClient,
+            Layer.merge(
+              layerWsRpc(
+                session,
+                clientOrigin,
+                clientAnalyticsProps,
+                previewAutomationBroker,
+                serverBrowser,
+                ClientCompatibility.supportsRepositories(requestUrl.value),
+                repositoryWorkspace,
+                repositoryClient,
+              ),
+              WorkManagement.layerWsRpc(session),
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               // Request fibers run in the handlers' context, so this reporter sees

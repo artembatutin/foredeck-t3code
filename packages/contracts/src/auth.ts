@@ -97,6 +97,9 @@ export const AuthAccessReadScope = "access:read" as const;
 export const AuthAccessWriteScope = "access:write" as const;
 export const AuthRelayReadScope = "relay:read" as const;
 export const AuthRelayWriteScope = "relay:write" as const;
+/** Exact Work grants: never implied by another scope, and write does not imply read. */
+export const AuthWorkReadScope = "work:read" as const;
+export const AuthWorkWriteScope = "work:write" as const;
 export const AuthEnvironmentScope = Schema.Literals([
   AuthOrchestrationReadScope,
   AuthOrchestrationOperateScope,
@@ -115,6 +118,8 @@ export const AuthEnvironmentScope = Schema.Literals([
   AuthAccessWriteScope,
   AuthRelayReadScope,
   AuthRelayWriteScope,
+  AuthWorkReadScope,
+  AuthWorkWriteScope,
 ]);
 export type AuthEnvironmentScope = typeof AuthEnvironmentScope.Type;
 export const AuthEnvironmentScopes = Schema.Array(AuthEnvironmentScope);
@@ -163,10 +168,17 @@ const legacyParents: Partial<Record<AuthEnvironmentScope, AuthEnvironmentScope>>
   [AuthTerminalReadScope]: AuthTerminalOperateScope,
 };
 
+// Labels only: no grant check reads these, so Work is never inferred from orchestration.
+const legacyRequiredScopes: Partial<Record<AuthEnvironmentScope, AuthEnvironmentScope>> = {
+  ...legacyParents,
+  [AuthWorkReadScope]: AuthOrchestrationReadScope,
+  [AuthWorkWriteScope]: AuthOrchestrationOperateScope,
+};
+
 /** Keep permission denials decodable by clients with the original scope enum. */
 export function authScopeRequiredResponse(requiredPermission: AuthEnvironmentScope) {
   return {
-    requiredScope: legacyParents[requiredPermission] ?? requiredPermission,
+    requiredScope: legacyRequiredScopes[requiredPermission] ?? requiredPermission,
     requiredPermission,
   };
 }
@@ -216,6 +228,8 @@ export const AuthStandardClientScopes = [
   AuthFilesystemReadScope,
   AuthFilesystemWriteScope,
   AuthRelayReadScope,
+  AuthWorkReadScope,
+  AuthWorkWriteScope,
 ] as const;
 export const AuthAdministrativeScopes = [
   ...AuthStandardClientScopes,
