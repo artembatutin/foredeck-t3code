@@ -78,9 +78,7 @@ describe("workManagementSupport", () => {
     expect(WORK_MANAGEMENT_CAPABILITY.sourceKinds).toEqual(["markdown"]);
     const support = workManagementSupport(withWork(WORK_MANAGEMENT_CAPABILITY));
     expect(support?.features).toEqual(
-      new Set(["sources", "items.write", "comments", "links", "people"]),
+      new Set(["sources", "items.write", "comments", "links", "threads.start", "people"]),
     );
-    // The handler refuses thread starts until the execution phase lands.
-    expect(support?.features.has("threads.start")).toBe(false);
   });
 });

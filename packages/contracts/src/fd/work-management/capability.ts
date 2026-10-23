@@ -61,6 +61,5 @@ export const workManagementCapability = (input: {
  */
 export const WORK_MANAGEMENT_CAPABILITY: WorkManagementCapability = workManagementCapability({
   sourceKinds: ["markdown"],
-  // Thread starts arrive with the execution phase; until then the handler refuses them.
-  features: ["sources", "items.write", "comments", "links", "people"],
+  features: ["sources", "items.write", "comments", "links", "threads.start", "people"],
 });

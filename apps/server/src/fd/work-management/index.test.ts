@@ -6,6 +6,8 @@ import * as Layer from "effect/Layer";
 
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
+import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
+import * as ServerSettings from "../../serverSettings.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import { layerAdapters, layerLive, layerPersistence, WorkService } from "./index.ts";
 import { WorkSourceAdapterRegistry } from "./sources/WorkSourceAdapter.ts";
@@ -38,6 +40,8 @@ describe("work-management composition", () => {
           Layer.provideMerge(SqlitePersistence.layerMemory),
           Layer.provide(Layer.mock(ProjectStore.ProjectStoreV2)({})),
           Layer.provide(Layer.mock(ServerSecretStore.ServerSecretStore)({})),
+          Layer.provide(Layer.mock(ThreadLaunch.ThreadLaunchService)({})),
+          Layer.provide(ServerSettings.layerTest()),
           Layer.provide(NodeServices.layer),
         ),
       ),

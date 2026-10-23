@@ -8,9 +8,11 @@ import * as Effect from "effect/Effect";
 import * as RpcGroup from "effect/rpc/RpcGroup";
 
 import { RpcInstrumentation } from "../../../observability/RpcInstrumentation.ts";
+import * as ServerRuntimeStartup from "../../../serverRuntimeStartup.ts";
 import type { WorkActor } from "../authority.ts";
 import { toWorkError, type WorkDomainError } from "../errors.ts";
 import * as WorkService from "../WorkService.ts";
+import * as WorkThreads from "../WorkThreads.ts";
 
 /**
  * The Work procedures with the server's middleware, in core's order (instrumentation wraps
@@ -45,9 +47,11 @@ const wire = <A>(effect: Effect.Effect<A, WorkDomainError>): Effect.Effect<A, Wo
  */
 export const wsHandlers = (input: {
   readonly work: WorkService.WorkService["Service"];
+  readonly workThreads: WorkThreads.WorkThreads["Service"];
+  readonly startup: ServerRuntimeStartup.ServerRuntimeStartup["Service"];
   readonly actor: WorkActor;
 }) => {
-  const { work, actor } = input;
+  const { work, workThreads, startup, actor } = input;
   return {
     [WORK_WS_METHODS.workSourcesList]: (query) => wire(work.listSources(actor, query)),
     [WORK_WS_METHODS.workSourcesSave]: (payload) => wire(work.saveSource(actor, payload)),
@@ -73,13 +77,20 @@ export const wsHandlers = (input: {
     [WORK_WS_METHODS.workLinksSet]: (payload) => wire(work.setLink(actor, payload)),
     [WORK_WS_METHODS.workRefresh]: (payload) => wire(work.refresh(actor, payload)),
     [WORK_WS_METHODS.workSubscribeRefreshes]: () => work.subscribeRefreshes,
-    // Thread starts arrive with the execution phase; the method exists so clients can negotiate.
-    [WORK_WS_METHODS.workThreadsStart]: () =>
-      Effect.fail(
-        new WorkError({
-          reason: "unsupported",
-          message: "Starting a thread from a Work item is not available on this server yet.",
-        }),
+    // Direct WebSocket calls are not gated on command readiness, so the launch queues like core's.
+    [WORK_WS_METHODS.workThreadsStart]: (payload) =>
+      Effect.annotateCurrentSpan({
+        "work.source_id": payload.ref.sourceId,
+        "work.item_id": payload.ref.itemId,
+      }).pipe(
+        Effect.andThen(
+          startup.enqueueCommand(wire(workThreads.start(actor, payload))).pipe(
+            Effect.catchTags({
+              ServerRuntimeStartupError: (error) =>
+                Effect.fail(new WorkError({ reason: "unavailable", message: error.message })),
+            }),
+          ),
+        ),
       ),
   } satisfies WorkHandlers;
 };
@@ -89,6 +100,8 @@ export const layerWsRpc = (session: Parameters<typeof actorFromSession>[0]) =>
   WorkServerRpcGroup.toLayer(
     Effect.gen(function* () {
       const work = yield* WorkService.WorkService;
-      return wsHandlers({ work, actor: actorFromSession(session) });
+      const workThreads = yield* WorkThreads.WorkThreads;
+      const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
+      return wsHandlers({ work, workThreads, startup, actor: actorFromSession(session) });
     }),
   );
