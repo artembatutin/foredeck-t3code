@@ -770,6 +770,7 @@ const make = Effect.gen(function* () {
     ref: { sourceId: link.sourceId, itemId: link.itemId },
     threadId: link.threadId,
     source: link.source,
+    ...(link.origin === null ? {} : { origin: link.origin }),
     linkedAt: link.linkedAt,
     snapshot: link.snapshot,
     run: link.run,

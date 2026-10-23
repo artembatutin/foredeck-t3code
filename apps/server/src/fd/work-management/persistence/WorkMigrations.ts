@@ -61,9 +61,17 @@ const WorkThreadLinks = Effect.gen(function* () {
   yield* sql`CREATE INDEX fd_work_thread_links_thread ON fd_work_thread_links (thread_id)`;
 });
 
+// Unchecked, so a later origin needs no table rebuild; an origin this build does not know reads
+// as absent. NULL is a link Work made itself.
+const WorkThreadLinkOrigin = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`ALTER TABLE fd_work_thread_links ADD COLUMN origin TEXT`;
+});
+
 export const workMigrationEntries = [
   [1, "WorkSources", WorkSources],
   [2, "WorkThreadLinks", WorkThreadLinks],
+  [3, "WorkThreadLinkOrigin", WorkThreadLinkOrigin],
 ] as const;
 
 const run = Migrator.make({});

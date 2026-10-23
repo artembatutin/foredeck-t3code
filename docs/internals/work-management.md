@@ -39,13 +39,15 @@ that died with the process and is dropped.
 The sync reactor drops links when their thread is deleted, and on settlement the
 links that existed when the thread settled, and records each linked run's
 terminal status, which is how a client knows to offer "Mark done?" or "Back to
-todo?". Settling is the owner saying the thread is finished, so unsettling does
-not bring the link back. The thread event tail is live only: a sweep at boot and
-every five minutes recovers outcomes committed while the reactor was not
-listening, drops links the tail missed and refreshes the displayed snapshot
-fields. A snapshot's revision stays the item as the thread first saw it (or as
-the automatic start left it), the baseline for "Changed since the thread
-started". Nothing polls item lists.
+todo?". Factory-origin links (`origin: "factory"`) offer no reverse prompts,
+because Factory moves the item's status itself; Work stores the origin but never
+imports Factory. Settling is the owner saying the thread is finished, so
+unsettling does not bring the link back. The thread event tail is live only: a
+sweep at boot and every five minutes recovers outcomes committed while the
+reactor was not listening, drops links the tail missed and refreshes the
+displayed snapshot fields. A snapshot's revision stays the item as the thread
+first saw it (or as the automatic start left it), the baseline for "Changed since
+the thread started". Nothing polls item lists.
 
 ## Canonical checkout
 

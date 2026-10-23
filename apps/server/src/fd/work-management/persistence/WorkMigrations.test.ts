@@ -1,12 +1,15 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import { ThreadId } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { migrationManifest, runMigrations } from "../../../persistence/Migrations.ts";
 import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
+import * as WorkLinkStore from "./WorkLinkStore.ts";
 import * as WorkMigrations from "./WorkMigrations.ts";
 import * as WorkSourceStore from "./WorkSourceStore.ts";
 
@@ -100,6 +103,71 @@ describe("runWorkMigrations", () => {
       assert.deepStrictEqual(yield* WorkMigrations.runWorkMigrations(), []);
       assert.deepStrictEqual(yield* runMigrations(), []);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+});
+
+describe("WorkThreadLinkOrigin migration", () => {
+  it.effect("upgrades a database with links from before origins without touching them", () =>
+    Effect.gen(function* () {
+      // The ledger as an older build left it: ids 1-2 only.
+      const older = WorkMigrations.workMigrationEntries.filter(([id]) => id <= 2);
+      yield* Migrator.make({})({
+        loader: Migrator.fromRecord(
+          Object.fromEntries(older.map(([id, name, migration]) => [`${id}_${name}`, migration])),
+        ),
+        table: WorkMigrations.WORK_MIGRATIONS_TABLE,
+      });
+      const sql = yield* SqlClient.SqlClient;
+      const sourceId = "7e2aa85e-9347-44ce-b019-cb8dfd365b20";
+      const at = "2026-10-20T09:15:00.000Z";
+      yield* sql`
+        INSERT INTO fd_work_sources (
+          source_id, project_id, kind, identity, label, config_json, secret_name, state, version,
+          created_at, updated_at, disconnected_at
+        )
+        VALUES (
+          ${sourceId}, 'project-alpha', 'markdown', 'work/tasks', 'Tasks',
+          '{"kind":"markdown","directory":"work/tasks","autoStart":true}', NULL, 'active', 1,
+          ${at}, ${at}, NULL
+        )
+      `;
+      const snapshot = {
+        key: "fd-aaaaaa",
+        title: "Item",
+        status: "todo" as const,
+        url: null,
+        revision: "r1",
+        autoStarted: false,
+      };
+      yield* sql`
+        INSERT INTO fd_work_thread_links (
+          source_id, item_id, thread_id, link_source, snapshot_json, run_json, linked_at
+        )
+        VALUES (
+          ${sourceId}, 'fd-aaaaaa', 'thread-1', 'started', ${JSON.stringify(snapshot)}, NULL, ${at}
+        )
+      `;
+
+      assert.deepStrictEqual(yield* WorkMigrations.runWorkMigrations(), [
+        [3, "WorkThreadLinkOrigin"],
+      ]);
+      assert.deepStrictEqual(yield* workLedger, workManifest);
+      assert.deepStrictEqual(
+        yield* sql`SELECT thread_id AS "threadId", origin FROM fd_work_thread_links`,
+        [{ threadId: "thread-1", origin: null }],
+      );
+      const stored = yield* WorkLinkStore.WorkLinkStore.pipe(
+        Effect.flatMap((links) => links.listByThread(ThreadId.make("thread-1"))),
+        Effect.provide(WorkLinkStore.layer),
+      );
+      assert.deepStrictEqual(
+        stored.map((link) => ({ origin: link.origin, snapshot: link.snapshot })),
+        [{ origin: null, snapshot }],
+      );
+
+      assert.deepStrictEqual(yield* WorkMigrations.runWorkMigrations(), []);
+      assert.deepStrictEqual(yield* workLedger, workManifest);
+    }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
   );
 });
 

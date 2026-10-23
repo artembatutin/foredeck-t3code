@@ -353,11 +353,17 @@ export type WorkThreadMode = typeof WorkThreadMode.Type;
 export const WorkThreadLinkSource = Schema.Literals(["started", "manual", "agent"]);
 export type WorkThreadLinkSource = typeof WorkThreadLinkSource.Type;
 
+/** The feature that made a link on Work's behalf; absent for links Work made itself. */
+export const WorkThreadLinkOrigin = Schema.Literal("factory");
+export type WorkThreadLinkOrigin = typeof WorkThreadLinkOrigin.Type;
+
 /** A thread attached to an item. The snapshot is what the thread was started from. */
 export const WorkThreadLink = Schema.Struct({
   ref: WorkItemRef,
   threadId: ThreadId,
   source: WorkThreadLinkSource,
+  /** An origin from a newer server decodes as absent. */
+  origin: ForwardCompatibleOptional(WorkThreadLinkOrigin),
   linkedAt: IsoDateTime,
   snapshot: Schema.Struct({
     key: Schema.String,

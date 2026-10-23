@@ -148,11 +148,13 @@ export const changedSinceLink = (
 /**
  * The reverse prompts a linked item offers. "Back to todo?" undoes an automatic start whose run
  * failed or stopped; "Mark done?" follows a run that completed while the item is still open.
+ * A Factory link offers neither: Factory moves the item's status itself.
  */
 export const linkPrompts = (
-  link: Pick<WorkThreadLink, "snapshot" | "run">,
+  link: Pick<WorkThreadLink, "snapshot" | "run" | "origin">,
   item: Pick<WorkItemSummary, "status">,
 ): { readonly backToTodo: boolean; readonly markDone: boolean } => {
+  if (link.origin === "factory") return { backToTodo: false, markDone: false };
   const runStatus = link.run?.status;
   return {
     backToTodo:

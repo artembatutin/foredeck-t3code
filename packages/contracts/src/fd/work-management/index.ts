@@ -34,6 +34,7 @@ export {
   WorkTransition,
   WorkThreadMode,
   WorkThreadLinkSource,
+  WorkThreadLinkOrigin,
   WorkThreadLink,
   WorkItemChild,
   WorkItemDetail,

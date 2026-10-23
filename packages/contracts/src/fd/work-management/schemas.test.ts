@@ -24,6 +24,7 @@ import {
   WorkSourceList,
   WorkStartThreadInput,
   WorkStatus,
+  WorkThreadLink,
 } from "./index.ts";
 
 const uuid = "7e2aa85e-9347-44ce-b019-cb8dfd365b20";
@@ -340,6 +341,41 @@ describe("WorkSourceSaveInput", () => {
     expect(decodeSaveInput({ ...base, apiToken: "token" })._tag).toBe("Some");
     expect(decodeSaveInput({ ...base, credential: "clear" })._tag).toBe("Some");
     expect(decodeSaveInput({ ...base, apiToken: "token", credential: "clear" })._tag).toBe("None");
+  });
+});
+
+describe("WorkThreadLink", () => {
+  const decode = Schema.decodeUnknownSync(WorkThreadLink);
+  const link = {
+    ref: { sourceId: uuid, itemId: "fd-abc123" },
+    threadId: "thread-1",
+    source: "started",
+    linkedAt: "2026-10-20T09:15:00.000Z",
+    snapshot: {
+      key: "fd-abc123",
+      title: "Ship",
+      status: "todo",
+      url: null,
+      revision: "r",
+      autoStarted: false,
+    },
+    run: null,
+  };
+
+  it("reads a link without an origin unchanged", () => {
+    const decoded = decode(link);
+    expect(decoded).toEqual(link);
+    expect("origin" in decoded).toBe(false);
+  });
+
+  it("reads a Factory origin", () => {
+    expect(decode({ ...link, origin: "factory" }).origin).toBe("factory");
+  });
+
+  it("reads an origin from a newer server as absent instead of failing the link", () => {
+    const decoded = decode({ ...link, origin: "someday" });
+    expect(decoded.origin).toBeUndefined();
+    expect(decoded).toEqual(link);
   });
 });
 

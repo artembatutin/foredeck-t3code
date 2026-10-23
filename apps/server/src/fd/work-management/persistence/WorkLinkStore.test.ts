@@ -4,6 +4,7 @@ import { ProjectId, ThreadId } from "@t3tools/contracts";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
@@ -81,6 +82,7 @@ describe("WorkLinkStore", () => {
         itemId: itemA,
         threadId: thread1,
         source: "started",
+        origin: null,
         snapshot: input.snapshot,
         run: null,
         linkedAt: first.link.linkedAt,
@@ -95,6 +97,59 @@ describe("WorkLinkStore", () => {
       assert.isFalse(repeat.inserted);
       assert.deepStrictEqual(repeat.link, first.link);
       assert.deepStrictEqual(yield* links.listByThread(thread1), [first.link]);
+    }).pipe(Effect.provide(persistence)),
+  );
+
+  it.effect("keeps a Factory origin through every list and a repeated link", () =>
+    Effect.gen(function* () {
+      yield* seedSources;
+      const links = yield* WorkLinkStore.WorkLinkStore;
+      const input = {
+        sourceId: tasksId,
+        itemId: itemA,
+        threadId: thread1,
+        source: "started" as const,
+        snapshot: snapshot("fd-aaaaaa"),
+      };
+      const { link: factory } = yield* links.link({ ...input, origin: "factory" });
+      assert.strictEqual(factory.origin, "factory");
+      yield* TestClock.adjust("1 minute");
+      const { link: plain } = yield* links.link({ ...input, itemId: itemB, source: "manual" });
+      assert.isNull(plain.origin);
+
+      // A repeat without an origin returns the stored link, origin and all.
+      const repeat = yield* links.link(input);
+      assert.isFalse(repeat.inserted);
+      assert.strictEqual(repeat.link.origin, "factory");
+
+      const origins = (rows: ReadonlyArray<WorkLinkStore.StoredWorkLink>) =>
+        rows.map((row) => `${row.itemId}:${row.origin ?? "none"}`);
+      const both = [`${itemB}:none`, `${itemA}:factory`];
+      assert.deepStrictEqual(origins(yield* links.listByThread(thread1)), both);
+      assert.deepStrictEqual(origins(yield* links.listByItem(tasksId, itemA)), [
+        `${itemA}:factory`,
+      ]);
+      assert.deepStrictEqual(origins(yield* links.listByProject(alpha)), both);
+      assert.deepStrictEqual(origins((yield* links.listAll(10)).links), both);
+      assert.deepStrictEqual(yield* links.listByItem(tasksId, itemA), [factory]);
+    }).pipe(Effect.provide(persistence)),
+  );
+
+  it.effect("reads an origin written by a newer build as absent", () =>
+    Effect.gen(function* () {
+      yield* seedSources;
+      const links = yield* WorkLinkStore.WorkLinkStore;
+      const { link } = yield* links.link({
+        sourceId: tasksId,
+        itemId: itemA,
+        threadId: thread1,
+        source: "started",
+        origin: "factory",
+        snapshot: snapshot("fd-aaaaaa"),
+      });
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE fd_work_thread_links SET origin = 'someday'`;
+      assert.deepStrictEqual(yield* links.listByThread(thread1), [{ ...link, origin: null }]);
     }).pipe(Effect.provide(persistence)),
   );
 

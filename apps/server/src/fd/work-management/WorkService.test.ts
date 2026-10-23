@@ -6,7 +6,11 @@ import {
   ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
-import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
+import {
+  WorkItemId,
+  WorkSourceId,
+  type WorkThreadLink,
+} from "@t3tools/contracts/fd/work-management";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -15,6 +19,7 @@ import * as Stream from "effect/Stream";
 
 import type { WorkActor } from "./authority.ts";
 import { WorkRateLimited, WorkUnauthenticated, type WorkDomainError } from "./errors.ts";
+import * as WorkLinkStore from "./persistence/WorkLinkStore.ts";
 import * as WorkSourceStore from "./persistence/WorkSourceStore.ts";
 import type { WorkSourceAdapter } from "./sources/WorkSourceAdapter.ts";
 import {
@@ -945,6 +950,56 @@ describe("WorkService links", () => {
       );
       assert.deepStrictEqual((yield* work.listLinks(owner, { threadId: open })).links, []);
       assert.deepStrictEqual((yield* work.listLinks(owner, {})).links, []);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("returns a Factory link's origin and leaves it off Work's own links", () => {
+    const markdown = fakeAdapter("markdown");
+    const harness = seeded(markdown.adapter);
+    const manual = ThreadId.make("thread-manual");
+    const factory = ThreadId.make("thread-factory");
+    harness.threads.set(manual, threadShell(manual, alpha));
+    harness.threads.set(factory, threadShell(factory, alpha));
+    return Effect.gen(function* () {
+      const work = yield* WorkService.WorkService;
+      const store = yield* WorkLinkStore.WorkLinkStore;
+      const source = yield* work.saveSource(owner, {
+        projectId: alpha,
+        label: "Tasks",
+        config: markdownConfig("tasks"),
+      });
+      const item = yield* work.createItem(owner, { sourceId: source.sourceId, title: "Ship it" });
+      yield* work.setLink(owner, { ref: item.ref, threadId: manual, action: "link" });
+      yield* store.link({
+        ...item.ref,
+        threadId: factory,
+        source: "started",
+        origin: "factory",
+        snapshot: {
+          key: item.key,
+          title: item.title,
+          status: item.status,
+          url: item.url,
+          revision: item.revision,
+          autoStarted: true,
+        },
+      });
+
+      const origins = (result: { readonly links: ReadonlyArray<WorkThreadLink> }) =>
+        result.links
+          .map((link) => [link.threadId, "origin" in link ? link.origin : "absent"])
+          .sort();
+      const expected = [
+        [factory, "factory"],
+        [manual, "absent"],
+      ];
+      assert.deepStrictEqual(origins(yield* work.listLinks(owner, { ref: item.ref })), expected);
+      assert.deepStrictEqual(origins(yield* work.listLinks(owner, { projectId: alpha })), expected);
+      assert.deepStrictEqual(origins(yield* work.listLinks(owner, {})), expected);
+      assert.deepStrictEqual(origins(yield* work.getItem(owner, { ref: item.ref })), expected);
+      assert.deepStrictEqual(origins(yield* work.listLinks(owner, { threadId: factory })), [
+        [factory, "factory"],
+      ]);
     }).pipe(Effect.provide(harness.layer));
   });
 

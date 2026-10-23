@@ -1,8 +1,9 @@
-import { IsoDateTime, ProjectId, ThreadId } from "@t3tools/contracts";
+import { ForwardCompatibleNullable, IsoDateTime, ProjectId, ThreadId } from "@t3tools/contracts";
 import {
   WorkItemId,
   WorkSourceId,
   WorkThreadLink,
+  WorkThreadLinkOrigin,
   WorkThreadLinkSource,
 } from "@t3tools/contracts/fd/work-management";
 import * as Context from "effect/Context";
@@ -25,15 +26,20 @@ export const StoredWorkLink = Schema.Struct({
   itemId: WorkItemId,
   threadId: ThreadId,
   source: WorkThreadLinkSource,
+  origin: Schema.NullOr(WorkThreadLinkOrigin),
   snapshot: WorkThreadLinkSnapshot,
   run: WorkThreadLink.fields.run,
   linkedAt: IsoDateTime,
 });
 export type StoredWorkLink = typeof StoredWorkLink.Type;
 
-/** The row shape; `snapshot` and `run` travel as JSON columns, `run` NULL when absent. */
+/**
+ * The row shape; `snapshot` and `run` travel as JSON columns, `run` NULL when absent. An origin
+ * written by a newer build reads as NULL.
+ */
 const LinkDbRow = Schema.Struct({
   ...StoredWorkLink.fields,
+  origin: ForwardCompatibleNullable(WorkThreadLinkOrigin),
   snapshot: Schema.fromJsonString(WorkThreadLinkSnapshot),
   run: Schema.NullOr(Schema.fromJsonString(WorkThreadLinkRun)),
 });
@@ -54,6 +60,8 @@ export class WorkLinkStore extends Context.Service<
       readonly itemId: WorkItemId;
       readonly threadId: ThreadId;
       readonly source: WorkThreadLinkSource;
+      /** Set by a feature linking on Work's behalf; Work's own links leave it out. */
+      readonly origin?: WorkThreadLinkOrigin;
       readonly snapshot: StoredWorkLink["snapshot"];
     }) => Effect.Effect<
       { readonly link: StoredWorkLink; readonly inserted: boolean },
@@ -146,6 +154,7 @@ const make = Effect.gen(function* () {
         item_id AS "itemId",
         thread_id AS "threadId",
         link_source AS source,
+        origin,
         snapshot_json AS snapshot,
         run_json AS run,
         linked_at AS "linkedAt"
@@ -171,11 +180,11 @@ const make = Effect.gen(function* () {
     Request: LinkDbRow,
     execute: (row) => sql`
       INSERT INTO fd_work_thread_links (
-        source_id, item_id, thread_id, link_source, snapshot_json, run_json, linked_at
+        source_id, item_id, thread_id, link_source, origin, snapshot_json, run_json, linked_at
       )
       VALUES (
-        ${row.sourceId}, ${row.itemId}, ${row.threadId}, ${row.source}, ${row.snapshot},
-        ${row.run}, ${row.linkedAt}
+        ${row.sourceId}, ${row.itemId}, ${row.threadId}, ${row.source}, ${row.origin},
+        ${row.snapshot}, ${row.run}, ${row.linkedAt}
       )
     `,
   });
@@ -257,6 +266,7 @@ const make = Effect.gen(function* () {
       const created: StoredWorkLink = {
         ...key,
         source: input.source,
+        origin: input.origin ?? null,
         snapshot: input.snapshot,
         run: null,
         linkedAt: yield* now,

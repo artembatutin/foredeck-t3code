@@ -102,6 +102,24 @@ describe("linkPrompts", () => {
       linkPrompts(link({ run: { status: "completed", at: "x" } }), { status: "done" }).markDone,
     ).toBe(false);
   });
+
+  it("offers nothing on a Factory link, whatever its run did", () => {
+    const none = { backToTodo: false, markDone: false };
+    expect(
+      linkPrompts(link({ origin: "factory", run: { status: "failed", at: "x" } }), {
+        status: "in_progress",
+      }),
+    ).toEqual(none);
+    expect(
+      linkPrompts(link({ origin: "factory", run: { status: "completed", at: "x" } }), {
+        status: "todo",
+      }),
+    ).toEqual(none);
+    // The same links without an origin still prompt.
+    expect(
+      linkPrompts(link({ run: { status: "completed", at: "x" } }), { status: "todo" }).markDone,
+    ).toBe(true);
+  });
 });
 
 describe("helpers", () => {
