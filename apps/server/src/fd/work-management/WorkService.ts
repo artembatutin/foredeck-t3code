@@ -633,6 +633,7 @@ const make = Effect.gen(function* () {
           WorkInvalid: (error) => Effect.succeed({ ok: false, message: error.message }),
           WorkUnavailable: (error) => Effect.succeed({ ok: false, message: error.message }),
           WorkUnauthenticated: (error) => Effect.succeed({ ok: false, message: error.message }),
+          WorkForbidden: (error) => Effect.succeed({ ok: false, message: error.message }),
           WorkUnsupported: (error) => Effect.succeed({ ok: false, message: error.message }),
           WorkRateLimited: (error) => Effect.succeed({ ok: false, message: error.message }),
         }),
