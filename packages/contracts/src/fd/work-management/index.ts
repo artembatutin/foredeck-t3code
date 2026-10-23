@@ -76,3 +76,4 @@ export {
   WORK_CLIENT_GUARDED_RPC_SCOPES,
   WORK_RPC_INSTRUMENTATION,
 } from "./rpc.ts";
+export { WorkMcpFailure } from "./mcp.ts";

@@ -114,7 +114,7 @@
     "apps/server/src/mcp/WorktreeMcpService.test.ts": "Verifies missing configured repositories and removed historical associations cannot bypass MCP worktree restrictions.",
     "apps/server/src/mcp/WorktreeMcpService.ts": "Rejects handoff for configured or historically bound multi-repository workspaces before any Git changes.",
     "apps/server/src/observability/RpcInstrumentation.ts": "Classifies the typed assistant RPC methods in the existing instrumentation map. Spreads the fd Work method classification.",
-    "apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts": "Supplies validated repository directories through native SDK options and enables their local instruction loading.",
+    "apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts": "Supplies validated repository directories through native SDK options and enables their local instruction loading. Pre-approves the read-only work_list and work_read tools in read-only sandboxes.",
     "apps/server/src/orchestration-v2/Adapters/GrokAdapterV2.test.ts": "Provides the repository validator in the existing runtime-policy test composition; unsupported providers retain their single-checkout behavior.",
     "apps/server/src/orchestration-v2/CheckpointCaptureService.ts": "Adds repository scope snapshots and grouped availability to the existing atomic turn-completion event commit.",
     "apps/server/src/orchestration-v2/CheckpointRollbackService.ts": "Rejects multi-repository rollback again at effect execution while preserving capture and read-only history.",
@@ -325,8 +325,8 @@
     "packages/provider-opencode/src/server/adapter.ts": "Adds repository-scoped directory permissions and context to native sessions, rejecting external-server execution for local repository sets.",
     "packages/provider-opencode/src/server/driver.ts": "Advertises multi-repository support only for a local v2 server configuration.",
     "packages/provider-opencode/src/server/v2/adapter.ts": "Carries repository directory rules through session creation/resume and turn instructions using the native v2 permission service.",
-    "apps/server/src/mcp/McpHttpServer.ts": "Registers the assistant portfolio toolkit in the existing authenticated MCP transport.",
-    "apps/server/src/mcp/toolkits/worktree/registration.test.ts": "Supplies the assistant service in the production toolkit registration harness.",
+    "apps/server/src/mcp/McpHttpServer.ts": "Registers the assistant portfolio toolkit in the existing authenticated MCP transport. Registers the fd Work toolkit beside it.",
+    "apps/server/src/mcp/toolkits/worktree/registration.test.ts": "Supplies the assistant service in the production toolkit registration harness. Supplies the Work service stubs and asserts the work_* tools are published with object-root inputs.",
     "apps/server/src/mcp/McpHttpServer.test.ts": "Verifies authenticated assistant calls use the durable dispatch policy while ordinary authenticated tools remain usable.",
     "packages/provider-opencode/src/server/OpenCodeServerLedger.ts": "Connects permission-denied process inspection recovery to the existing server ledger and preserves orphan records when inspection is unavailable, so optional cleanup cannot block startup.",
     "apps/web/src/components/chat/ChatHeader.tsx": "Suppresses the scratch-project breadcrumb for the persistent assistant role.",
@@ -345,6 +345,7 @@
     "apps/mobile/src/state/thread-list-environments.ts": "Hides Regenerate title in mobile thread lists when the environment has threadTitleGenerationEnabled off.",
     "apps/mobile/src/state/thread-list-environments.test.ts": "Verifies mobile thread lists hide title regeneration while threadTitleGenerationEnabled is off.",
     "apps/mobile/src/features/home/useThreadListActions.ts": "Skips mobile bulk title regeneration for environments with threadTitleGenerationEnabled off.",
-    "apps/mobile/src/features/settings/SettingsServerControlsRouteScreen.tsx": "Adds the Generate thread titles switch to mobile server controls, alongside the other environment-wide toggles."
+    "apps/mobile/src/features/settings/SettingsServerControlsRouteScreen.tsx": "Adds the Generate thread titles switch to mobile server controls, alongside the other environment-wide toggles.",
+    "apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts": "Includes the fd Work toolkit in the read-only allowlist cross-check."
   }
 }

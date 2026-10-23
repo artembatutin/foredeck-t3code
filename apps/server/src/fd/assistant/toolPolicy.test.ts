@@ -11,6 +11,7 @@ it("routes manager worker mutations through the queue without restricting ordina
     "t3_thread_send_attachments",
     "t3_pending_request_respond",
     "t3_thread_interrupt",
+    "work_start_thread",
   ]) {
     const request = {
       jsonrpc: "2.0",
@@ -30,6 +31,9 @@ it("routes manager worker mutations through the queue without restricting ordina
     "t3_thread_read",
     "t3_pending_request_read",
     "t3_project_list",
+    "work_read",
+    "work_update",
+    "work_comment",
   ]) {
     assert.isUndefined(
       assistantToolRefusal("fd-assistant-owner", {
