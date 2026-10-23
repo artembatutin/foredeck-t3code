@@ -422,6 +422,10 @@
     "./fd/multirepo": {
       "types": "./src/fd/multirepo/index.ts",
       "default": "./src/fd/multirepo/index.ts"
+    },
+    "./fd/work-management": {
+      "types": "./src/fd/work-management/index.ts",
+      "default": "./src/fd/work-management/index.ts"
     }
   },
   "scripts": {
