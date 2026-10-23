@@ -63,6 +63,21 @@ describe("evaluateSettle", () => {
     ["ai_attribution", facts({ commits: [commit({ body: "Generated-by: a tool" })] })],
     ["ai_attribution", facts({ commits: [commit({ body: "Notes.\n\nassisted-by: a tool" })] })],
     ["ai_attribution", facts({ commits: [commit({ body: "This was Generated With a tool." })] })],
+    [
+      "ai_attribution",
+      facts({ commits: [commit({ body: "Notes were generated\nwith a tool." })] }),
+    ],
+    [
+      "ai_attribution",
+      facts({
+        commits: [commit({ subject: "feat: add branch facts (Generated-by: automation)" })],
+      }),
+    ],
+    [
+      "ai_attribution",
+      facts({ commits: [commit({ body: "Implementation Assisted-by: automation." })] }),
+    ],
+    ["ai_attribution", facts({ commits: [commit({ body: "Notes.\n\n  Generated-by: a tool" })] })],
   ];
 
   it.each(repairable)("reports %s as its only, repairable problem", (rule, input) => {
@@ -122,14 +137,16 @@ describe("evaluateSettle", () => {
     expect(rules(input)).toEqual(["dirty_worktree", "ai_identity"]);
   });
 
-  it.each(["feat: support gptq weights", "fix: handle codexes", "docs: thank Claudette"])(
-    "ignores a listed name inside another word: %s",
-    (subject) => {
-      expect(evaluateSettle(facts({ commits: [commit({ subject })] }), branch)).toEqual({
-        status: "settled",
-      });
-    },
-  );
+  it.each([
+    "feat: support gptq weights",
+    "fix: handle codexes",
+    "docs: thank Claudette",
+    "docs: describe generated files and the by-line",
+  ])("settles words that only resemble a listed name or attribution: %s", (subject) => {
+    expect(evaluateSettle(facts({ commits: [commit({ subject })] }), branch)).toEqual({
+      status: "settled",
+    });
+  });
 
   it.each(["CLAUDE", "OpenAI", "Gpt-4", "the cognition tool", "(anthropic)"])(
     "matches a listed name case-insensitively at word boundaries: %s",
