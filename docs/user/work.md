@@ -2,7 +2,7 @@
 
 Work keeps one list of the things you want done in a project and lets you or an
 agent act on them. Items come from **Work sources**: a folder of Markdown task
-files in the repository. Agents read and update the same items through the
+files in the repository, or a GitHub repository's issues. Agents read and update the same items through the
 `work_*` tools, and a thread started from an item stays linked to it.
 
 ## Open Work
@@ -64,6 +64,22 @@ Free Markdown. Checkboxes are just Markdown.
 
 There is no delete. Set a task to `cancelled`, or remove the file yourself.
 Task files are ordinary repository files: commit them like any other change.
+
+## GitHub Issues
+
+A GitHub source lists one repository's issues. It uses the same GitHub
+credential as pull requests (**Settings → Source Control**, then `GH_TOKEN`,
+then `gh auth login`), so issues and pull requests share one rate limit. A
+fine-grained token needs **Issues: read and write**, **Metadata: read** and
+**Pull requests: read** on the repository; a token made for pull requests alone
+may not be able to change issues.
+
+GitHub issues are open or closed, so Work shows them as **To do**, **Done** or
+**Cancelled** (closed as not planned or duplicate). They have no in-progress
+state; a linked thread shows that work is happening. Labels, the assignee, the
+title, the description and comments can be changed from Work; sub-issues and
+dependencies are shown but changed on GitHub. A transferred or deleted issue
+shows as not found; unlink it from its threads.
 
 ## Threads started from an item
 
