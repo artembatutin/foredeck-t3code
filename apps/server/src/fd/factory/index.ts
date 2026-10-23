@@ -6,6 +6,8 @@ import * as FactorySettingsStore from "./persistence/FactorySettingsStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 
+export * as FactorySettings from "./FactorySettings.ts";
+
 /**
  * Factory persistence on the core-migrated SQL client. The `fd_factory_migrations` ledger
  * migrates first, so no Factory store is ever built against an older schema.

@@ -62,3 +62,8 @@ export const standardPipeline: FactoryPipeline = {
     afterChildren: [standardStages.integrate, standardStages.pr, standardStages.follow_through],
   },
 };
+
+/** The pipelines this server ships, by id. Project settings may select only these. */
+export const pipelines: ReadonlyMap<string, FactoryPipeline> = new Map([
+  [standardPipeline.id, standardPipeline],
+]);
