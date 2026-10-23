@@ -151,6 +151,10 @@ terminals so native undo keeps working there.
 `navigation.back` (`mod+[` by default) and `navigation.forward` (`mod+]`) move
 through the pages you have visited, like a browser's back and forward buttons.
 
+`work.open` (`mod+shift+u` by default) opens [Work](./work.md). On Linux desktops
+using IBus, `Ctrl+Shift+U` starts Unicode entry instead; bind Work to another
+shortcut there.
+
 `chat.new` may ask you to choose a project when there is more than one.
 `chat.newLocal` skips that chooser. Both use your
 [new-thread defaults](./thread-sidebar.md#start-a-thread). `chat.newWithoutProject`

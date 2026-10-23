@@ -5,6 +5,23 @@ agent act on them. Items come from **Work sources**: a folder of Markdown task
 files in the repository. Agents read and update the same items through the
 `work_*` tools, and a thread started from an item stays linked to it.
 
+## Open Work
+
+Choose **Work** in the sidebar, **Open work** in the command palette, or press
+`mod+shift+u`. Pick a project; the list shows its items from every source.
+**Ready** shows unblocked `todo` items nobody is working on, **Active** items with
+an open linked thread, **Done** finished or cancelled items, and **All**
+everything. Select an item to read, edit, comment, change its status, start a
+thread or link one. **Add to prompt** opens a new thread in the item's project
+with a reference to the item in the composer.
+
+To add a source, open the project's settings and use **Work sources**. In a
+thread, the details panel lists the thread's linked items; use **Link work item**
+there or in the command palette.
+
+If Work says the connection cannot read it, this device was paired before Work
+existed. Pair it again from a session that has Work access.
+
 ## Task files
 
 A Markdown source is a folder in the project's main checkout, `.foredeck/work`
@@ -64,8 +81,10 @@ thread.
 
 When **Mark as in progress on start** is on for a Markdown source (the
 default), a `todo` task moves to `in_progress` when its thread starts. If that
-thread's run fails or is stopped, Work offers to move the task back to `todo`.
-Nothing changes back on its own.
+thread's run fails or is stopped, the item offers **Back to todo?**; when a run
+completes, it offers to mark the item done. Both can be undone, and nothing
+changes on its own. **Send update to thread** appears when the item changed
+after its thread started, and opens the thread with a draft you can edit.
 
 ## Agents
 
