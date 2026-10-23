@@ -1,26 +1,41 @@
-import { useAtomValue } from "@effect/atom-react";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
+  beginWorkDraft,
   changedSinceLink,
+  editWorkDraft,
   linkPrompts,
+  mergeComposerText,
+  rebaseWorkDraft,
+  refreshWork,
   RUN_STATE_LABELS,
   runStateOf,
+  settleWorkDraft,
+  type WorkDraft,
+  workDraftChanged,
+  workDraftConflictReady,
+  workDraftPatch,
   workItemReferenceText,
+  workStatusInput,
+  workStatusUndo,
+  workUndoMessage,
+  type WorkWriteOutcome,
+  workWriteOutcome,
 } from "@t3tools/client-runtime/fd/work-management";
 import type { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import {
   isWorkNativeStatus,
   type WorkItemDetail as WorkItemDetailValue,
+  type WorkItemPatch,
   type WorkItemRef,
+  type WorkItemSummary,
   type WorkNativeStatus,
+  type WorkSetStatusInput,
   type WorkThreadLink,
   type WorkTransition,
 } from "@t3tools/contracts/fd/work-management";
 import { useNavigate } from "@tanstack/react-router";
-import * as Cause from "effect/Cause";
-import * as Option from "effect/Option";
 import { ExternalLinkIcon, LinkIcon, MessageSquarePlusIcon, PlayIcon, XIcon } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
@@ -44,9 +59,10 @@ import { randomUUID } from "../../lib/utils";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { buildThreadRouteParams } from "../../threadRoutes";
 import { LinkThreadDialog } from "./LinkThreadDialog";
-import { STATUS_LABELS, WorkStatusBadge, workCommandError } from "./shared";
+import { STATUS_LABELS, WorkStatusBadge } from "./shared";
 import { StartWorkThreadDialog, type StartWorkThreadTarget } from "./StartWorkThreadDialog";
-import { workCommands, workEnvironment } from "./state";
+import { useWorkWritable, workCommands, workEnvironment } from "./state";
+import { WorkItemFieldControls, WorkRelationshipEditor } from "./WorkItemFields";
 
 /** The inline detail of one Work item: everything an owner can do with it. */
 export function WorkItemDetail({
@@ -62,6 +78,18 @@ export function WorkItemDetail({
 }) {
   const query = useEnvironmentQuery(
     workEnvironment.detail({ environmentId, input: { ref: itemRef } }),
+  );
+  const requestRefresh = useAtomCommand(workCommands.refresh);
+  const refreshQuery = query.refresh;
+  // Explicit refresh drops the server's cached copy of this source, then reads again.
+  const fullRefresh = useCallback(
+    () =>
+      void refreshWork({
+        requestServerRefresh: () =>
+          requestRefresh({ environmentId, input: { sourceId: itemRef.sourceId } }),
+        refreshQueries: refreshQuery,
+      }),
+    [environmentId, itemRef.sourceId, refreshQuery, requestRefresh],
   );
   const item = query.data;
   if (item === null) {
@@ -83,6 +111,7 @@ export function WorkItemDetail({
       item={item}
       refreshing={query.isPending}
       onRefresh={query.refresh}
+      onFullRefresh={fullRefresh}
       onClose={onClose}
     />
   );
@@ -94,6 +123,7 @@ function LoadedWorkItem({
   item,
   refreshing,
   onRefresh,
+  onFullRefresh,
   onClose,
 }: {
   environmentId: EnvironmentId;
@@ -101,6 +131,7 @@ function LoadedWorkItem({
   item: WorkItemDetailValue;
   refreshing: boolean;
   onRefresh: () => void;
+  onFullRefresh: () => void;
   onClose: () => void;
 }) {
   const navigate = useNavigate();
@@ -110,9 +141,13 @@ function LoadedWorkItem({
   const setStatus = useAtomCommand(workCommands.setStatus);
   const comment = useAtomCommand(workCommands.comment);
   const setLink = useAtomCommand(workCommands.setLink);
-  const canWrite = useAtomValue(workCommands.updateItem.permissionAtom(environmentId));
-  const [titleDraft, setTitleDraft] = useState<string | null>(null);
-  const [bodyDraft, setBodyDraft] = useState<string | null>(null);
+  const canWrite = useWorkWritable(environmentId, workCommands.updateItem, "items.write");
+  const canComment = useWorkWritable(environmentId, workCommands.comment, "comments");
+  const canLink = useWorkWritable(environmentId, workCommands.setLink, "links");
+  const canStart = useWorkWritable(environmentId, workCommands.startThread, "threads.start");
+  // Each draft keeps the revision it was started from; refreshes below never touch it.
+  const [titleDraft, setTitleDraft] = useState<WorkDraft | null>(null);
+  const [bodyDraft, setBodyDraft] = useState<WorkDraft | null>(null);
   const [commentDraft, setCommentDraft] = useState("");
   const [labelDraft, setLabelDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -139,69 +174,105 @@ function LoadedWorkItem({
   const can = (field: WorkItemDetailValue["capabilities"]["fields"][number]) =>
     writable && item.capabilities.fields.includes(field);
 
-  /** Shows a failed command's message; every write goes through this. */
-  const report = <R extends { readonly _tag: "Success" | "Failure" }>(result: R): R => {
-    if (result._tag === "Failure") {
-      setError(workCommandError(result as R & { readonly cause: Cause.Cause<unknown> }));
-    } else setError(null);
-    return result;
-  };
-
-  const changeStatus = async (input: { status?: WorkNativeStatus; transitionId?: string }) => {
-    setCandidates(null);
-    const result = await setStatus({
-      environmentId,
-      // No revision guard: a status write is idempotent, and an Undo toast outlives the
-      // revision it was created with.
-      input: { ref: item.ref, ...input },
-    });
-    const failure =
-      result._tag === "Failure" ? Option.getOrNull(Cause.findErrorOption(result.cause)) : null;
-    // An ambiguous status is answered with its transitions to choose from, not an error.
-    if (failure?._tag === "WorkError" && failure.candidates !== undefined) {
-      setCandidates(failure.candidates);
-      return result;
+  /** Shows a write's outcome inline; a stale write reloads the item so the owner sees why. */
+  const report = <A,>(outcome: WorkWriteOutcome<A>): WorkWriteOutcome<A> => {
+    switch (outcome._tag) {
+      case "success":
+        setError(null);
+        break;
+      case "stale":
+        setError(`${item.key} changed since it was loaded. It has been reloaded; try again.`);
+        onRefresh();
+        break;
+      case "candidates":
+        setError(null);
+        break;
+      case "failed":
+        setError(outcome.message);
+        break;
     }
-    return report(result);
+    return outcome;
   };
 
-  const saveTitle = async () => {
-    if (titleDraft === null || titleDraft.trim() === item.title) return setTitleDraft(null);
-    const result = report(
-      await updateItem({
-        environmentId,
-        input: { ref: item.ref, title: titleDraft.trim(), expectedRevision: item.revision },
-      }),
+  const update = async (patch: Omit<WorkItemPatch, "ref">) =>
+    report(
+      workWriteOutcome(await updateItem({ environmentId, input: { ref: item.ref, ...patch } })),
     );
-    if (result._tag === "Success") setTitleDraft(null);
+
+  const runUndo = async (input: WorkSetStatusInput) => {
+    const message = workUndoMessage(
+      item.key,
+      workWriteOutcome(await setStatus({ environmentId, input })),
+    );
+    if (message !== null) {
+      toastManager.add({ type: "error", title: "Undo not applied", description: message });
+    }
   };
 
-  const saveBody = async () => {
-    if (bodyDraft === null) return;
-    const result = report(
-      await updateItem({
-        environmentId,
-        input: { ref: item.ref, body: bodyDraft, expectedRevision: item.revision },
-      }),
+  /**
+   * Changes status guarded by the revision on screen, then offers an Undo guarded by the
+   * revision the change produced, so it cannot overwrite a later change by anyone else.
+   */
+  const changeStatus = async (
+    change: { readonly status: WorkNativeStatus } | { readonly transitionId: string },
+    title?: (after: WorkItemSummary) => string,
+  ) => {
+    setCandidates(null);
+    const before = item;
+    const outcome = report(
+      workWriteOutcome(await setStatus({ environmentId, input: workStatusInput(before, change) })),
     );
-    if (result._tag === "Success") setBodyDraft(null);
+    // An ambiguous status is answered with its transitions to choose from, not an error.
+    if (outcome._tag === "candidates") setCandidates(outcome.candidates);
+    if (outcome._tag !== "success") return;
+    const undo = workStatusUndo(before, outcome.value);
+    toastManager.add({
+      type: "success",
+      title:
+        title?.(outcome.value) ??
+        `${item.key}: ${outcome.value.nativeStatus?.name ?? STATUS_LABELS[outcome.value.status]}`,
+      ...(undo === null
+        ? {}
+        : { actionProps: { children: "Undo", onClick: () => void runUndo(undo) } }),
+    });
+  };
+
+  const saveDraft = async (
+    draft: WorkDraft,
+    setDraft: (next: (current: WorkDraft | null) => WorkDraft | null) => void,
+  ) => {
+    if (!workDraftChanged(draft, item)) return setDraft(() => null);
+    const outcome = workWriteOutcome(
+      await updateItem({ environmentId, input: workDraftPatch(item.ref, draft) }),
+    );
+    if (outcome._tag === "failed") setError(outcome.message);
+    else setError(null);
+    if (outcome._tag === "stale") onRefresh();
+    setDraft((current) => {
+      if (current === null) return null;
+      // Text typed while the save was in flight stays, based on the revision just written.
+      if (outcome._tag === "success" && current.value !== draft.value) {
+        return rebaseWorkDraft(current, outcome.value.revision);
+      }
+      return settleWorkDraft(current, outcome);
+    });
   };
 
   const addComment = async () => {
     if (commentDraft.trim().length === 0) return;
-    const result = report(
-      await comment({
-        environmentId,
-        input: { ref: item.ref, body: commentDraft, clientRequestId: randomUUID() },
-      }),
+    const outcome = report(
+      workWriteOutcome(
+        await comment({
+          environmentId,
+          input: { ref: item.ref, body: commentDraft, clientRequestId: randomUUID() },
+        }),
+      ),
     );
-    if (result._tag === "Success") setCommentDraft("");
+    if (outcome._tag === "success") setCommentDraft("");
   };
 
-  const changeLabels = async (patch: {
-    add: ReadonlyArray<string>;
-    remove: ReadonlyArray<string>;
-  }) => report(await updateItem({ environmentId, input: { ref: item.ref, labels: patch } }));
+  const changeLabels = (patch: { add: ReadonlyArray<string>; remove: ReadonlyArray<string> }) =>
+    update({ labels: patch });
 
   const openThread = (threadId: ThreadId) =>
     void navigate({
@@ -214,47 +285,30 @@ function LoadedWorkItem({
     if (opened === null) return;
     const store = useComposerDraftStore.getState();
     const existing = store.getComposerDraft(opened.draftId)?.prompt ?? "";
-    const text = workItemReferenceText(item);
-    store.setPrompt(opened.draftId, existing.trim().length === 0 ? text : `${existing}\n\n${text}`);
+    store.setPrompt(opened.draftId, mergeComposerText(existing, workItemReferenceText(item)));
   };
 
-  /** Opens the thread with a draft telling it what changed, for the owner to edit and send. */
+  /**
+   * Opens the thread with what changed added to its draft, for the owner to edit and send.
+   * Anything the owner already typed there stays.
+   */
   const sendUpdate = (link: WorkThreadLink) => {
     const ref = scopeThreadRef(environmentId, link.threadId);
-    useComposerDraftStore
-      .getState()
-      .setPrompt(
-        ref,
+    const store = useComposerDraftStore.getState();
+    const existing = store.getComposerDraft(ref)?.prompt ?? "";
+    store.setPrompt(
+      ref,
+      mergeComposerText(
+        existing,
         `${item.key} changed since this thread started. ${workItemReferenceText(item)}`,
-      );
+      ),
+    );
     openThread(link.threadId);
   };
 
-  const backToTodo = async () => {
-    const result = await changeStatus({ status: "todo" });
-    if (result._tag === "Success") {
-      toastManager.add({
-        type: "success",
-        title: `${item.key} is back to To do`,
-        actionProps: {
-          children: "Undo",
-          onClick: () => void changeStatus({ status: "in_progress" }),
-        },
-      });
-    }
-  };
+  const backToTodo = () => changeStatus({ status: "todo" }, () => `${item.key} is back to To do`);
 
-  const markDone = async () => {
-    const previous = item.status;
-    const result = await changeStatus({ status: "done" });
-    if (result._tag === "Success" && isWorkNativeStatus(previous)) {
-      toastManager.add({
-        type: "success",
-        title: `${item.key} marked done`,
-        actionProps: { children: "Undo", onClick: () => void changeStatus({ status: previous }) },
-      });
-    }
-  };
+  const markDone = () => changeStatus({ status: "done" }, () => `${item.key} marked done`);
 
   const statusOptions: ReadonlyArray<WorkNativeStatus> = item.capabilities.statuses;
   return (
@@ -264,21 +318,47 @@ function LoadedWorkItem({
           <div className="min-w-0 flex-1 space-y-1">
             <p className="text-muted-foreground text-xs">{item.key}</p>
             {titleDraft !== null ? (
-              <Input
-                aria-label="Title"
-                value={titleDraft}
-                autoFocus
-                onChange={(event) => setTitleDraft(event.target.value)}
-                onBlur={() => void saveTitle()}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") void saveTitle();
-                  if (event.key === "Escape") setTitleDraft(null);
-                }}
-              />
+              <>
+                <Input
+                  aria-label="Title"
+                  value={titleDraft.value}
+                  autoFocus
+                  onChange={(event) =>
+                    setTitleDraft((current) =>
+                      current === null ? null : editWorkDraft(current, event.target.value),
+                    )
+                  }
+                  onBlur={() => {
+                    // A conflicting draft waits for the owner's choice instead of saving again.
+                    if (titleDraft.conflict === null) void saveDraft(titleDraft, setTitleDraft);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && titleDraft.conflict === null) {
+                      void saveDraft(titleDraft, setTitleDraft);
+                    }
+                    if (event.key === "Escape") setTitleDraft(null);
+                  }}
+                />
+                {titleDraft.conflict !== null ? (
+                  <DraftConflict
+                    draft={titleDraft}
+                    item={item}
+                    current={titleDraft.conflict.current?.title ?? item.title}
+                    onReapply={(revision) =>
+                      setTitleDraft((current) =>
+                        current === null ? null : rebaseWorkDraft(current, revision),
+                      )
+                    }
+                    onDiscard={() => setTitleDraft(null)}
+                  />
+                ) : null}
+              </>
             ) : (
               <h2
                 className="font-medium text-base"
-                onDoubleClick={() => (can("title") ? setTitleDraft(item.title) : undefined)}
+                onDoubleClick={() =>
+                  can("title") ? setTitleDraft(beginWorkDraft("title", item)) : undefined
+                }
               >
                 {item.title}
               </h2>
@@ -329,10 +409,20 @@ function LoadedWorkItem({
             </MenuPopup>
           </Menu>
           {item.blocked ? <Badge variant="warning">Blocked</Badge> : null}
-          {item.priority ? <Badge variant="outline">{item.priority} priority</Badge> : null}
-          {item.assignee ? <Badge variant="secondary">{item.assignee.label}</Badge> : null}
+          {item.priority && !can("priority") ? (
+            <Badge variant="outline">{item.priority} priority</Badge>
+          ) : null}
+          {item.assignee && !can("assignee") ? (
+            <Badge variant="secondary">{item.assignee.label}</Badge>
+          ) : null}
+          <WorkItemFieldControls
+            environmentId={environmentId}
+            item={item}
+            can={can}
+            update={update}
+          />
           <div className="flex-1" />
-          <Button size="sm" variant="ghost" disabled={refreshing} onClick={onRefresh}>
+          <Button size="sm" variant="ghost" disabled={refreshing} onClick={onFullRefresh}>
             Refresh
           </Button>
         </div>
@@ -359,6 +449,7 @@ function LoadedWorkItem({
         <div className="flex flex-wrap gap-2">
           <Button
             size="sm"
+            disabled={!canStart && !openLink}
             onClick={() =>
               setStartTarget({
                 environmentId,
@@ -375,12 +466,7 @@ function LoadedWorkItem({
             <MessageSquarePlusIcon />
             Add to prompt
           </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={!writable}
-            onClick={() => setLinkOpen(true)}
-          >
+          <Button size="sm" variant="outline" disabled={!canLink} onClick={() => setLinkOpen(true)}>
             <LinkIcon />
             Link to a thread
           </Button>
@@ -418,13 +504,15 @@ function LoadedWorkItem({
                     <Button
                       size="xs"
                       variant="ghost"
-                      disabled={!writable}
+                      disabled={!canLink}
                       onClick={async () => {
                         report(
-                          await setLink({
-                            environmentId,
-                            input: { ref: item.ref, threadId: link.threadId, action: "unlink" },
-                          }),
+                          workWriteOutcome(
+                            await setLink({
+                              environmentId,
+                              input: { ref: item.ref, threadId: link.threadId, action: "unlink" },
+                            }),
+                          ),
                         );
                       }}
                     >
@@ -475,7 +563,11 @@ function LoadedWorkItem({
             item.bodyFidelity === "exact" &&
             !item.bodyTruncated &&
             bodyDraft === null ? (
-              <Button size="xs" variant="ghost" onClick={() => setBodyDraft(item.body)}>
+              <Button
+                size="xs"
+                variant="ghost"
+                onClick={() => setBodyDraft(beginWorkDraft("body", item))}
+              >
                 Edit
               </Button>
             ) : null}
@@ -490,11 +582,32 @@ function LoadedWorkItem({
             <div className="space-y-2">
               <Textarea
                 aria-label="Description"
-                value={bodyDraft}
-                onChange={(event) => setBodyDraft(event.target.value)}
+                value={bodyDraft.value}
+                onChange={(event) =>
+                  setBodyDraft((current) =>
+                    current === null ? null : editWorkDraft(current, event.target.value),
+                  )
+                }
               />
+              {bodyDraft.conflict !== null ? (
+                <DraftConflict
+                  draft={bodyDraft}
+                  item={item}
+                  current={item.body}
+                  onReapply={(revision) =>
+                    setBodyDraft((current) =>
+                      current === null ? null : rebaseWorkDraft(current, revision),
+                    )
+                  }
+                  onDiscard={() => setBodyDraft(null)}
+                />
+              ) : null}
               <div className="flex gap-2">
-                <Button size="xs" onClick={() => void saveBody()}>
+                <Button
+                  size="xs"
+                  disabled={bodyDraft.conflict !== null}
+                  onClick={() => void saveDraft(bodyDraft, setBodyDraft)}
+                >
                   Save
                 </Button>
                 <Button size="xs" variant="ghost" onClick={() => setBodyDraft(null)}>
@@ -536,7 +649,7 @@ function LoadedWorkItem({
                 onKeyDown={(event) => {
                   if (event.key !== "Enter" || labelDraft.trim().length === 0) return;
                   void changeLabels({ add: [labelDraft.trim()], remove: [] }).then((result) => {
-                    if (result._tag === "Success") setLabelDraft("");
+                    if (result._tag === "success") setLabelDraft("");
                   });
                 }}
               />
@@ -547,11 +660,21 @@ function LoadedWorkItem({
         {item.parent ||
         item.blockedBy.length > 0 ||
         item.children.length > 0 ||
-        item.blocking.length > 0 ? (
+        item.blocking.length > 0 ||
+        can("parent") ||
+        can("blockedBy") ? (
           <section className="space-y-1 text-sm" aria-label="Relationships">
             <h3 className="font-medium text-sm">Relationships</h3>
-            {item.parent ? <p>Parent: {item.parent}</p> : null}
-            {item.blockedBy.length > 0 ? <p>Blocked by: {item.blockedBy.join(", ")}</p> : null}
+            {can("parent") ? (
+              <WorkRelationshipEditor item={item} field="parent" update={update} />
+            ) : item.parent ? (
+              <p>Parent: {item.parent}</p>
+            ) : null}
+            {can("blockedBy") ? (
+              <WorkRelationshipEditor item={item} field="blockedBy" update={update} />
+            ) : item.blockedBy.length > 0 ? (
+              <p>Blocked by: {item.blockedBy.join(", ")}</p>
+            ) : null}
             {item.blocking.length > 0 ? <p>Blocking: {item.blocking.join(", ")}</p> : null}
             {item.children.map((child) => (
               <p key={child.itemId}>
@@ -578,7 +701,7 @@ function LoadedWorkItem({
           {item.commentsTruncated ? (
             <p className="text-muted-foreground text-xs">Older comments are not shown.</p>
           ) : null}
-          {writable && item.capabilities.comments === "add" ? (
+          {canComment && item.invalid === null && item.capabilities.comments === "add" ? (
             <div className="space-y-2">
               <Textarea
                 aria-label="New comment"
@@ -616,5 +739,55 @@ function LoadedWorkItem({
         onOpenChange={setLinkOpen}
       />
     </aside>
+  );
+}
+
+/**
+ * A save that came back stale: the owner sees the current version beside their edit and decides.
+ * The draft stays editable throughout. Reapplying is offered once the item shown is newer than the
+ * draft's base, so the owner overwrites exactly the version on screen.
+ */
+export function DraftConflict({
+  draft,
+  item,
+  current,
+  onReapply,
+  onDiscard,
+}: {
+  draft: WorkDraft;
+  item: Pick<WorkItemSummary, "revision" | "key">;
+  current: string;
+  onReapply: (revision: string) => void;
+  onDiscard: () => void;
+}) {
+  const loaded = workDraftConflictReady(draft, item.revision);
+  return (
+    <div className="space-y-2 rounded-md border p-2 text-xs" role="alert">
+      <p className="font-medium">{item.key} changed while you were editing.</p>
+      {loaded ? (
+        <>
+          <p className="text-muted-foreground">Current version:</p>
+          <p className="max-h-40 overflow-y-auto whitespace-pre-wrap">
+            {current.trim().length === 0 ? "(empty)" : current}
+          </p>
+        </>
+      ) : (
+        <p className="text-muted-foreground">Loading the current version...</p>
+      )}
+      <p className="text-muted-foreground">Your edit is kept above; keep editing or choose:</p>
+      <div className="flex gap-2">
+        <Button
+          size="xs"
+          variant="outline"
+          disabled={!loaded}
+          onClick={() => onReapply(item.revision)}
+        >
+          Reapply my edit
+        </Button>
+        <Button size="xs" variant="ghost" onClick={onDiscard}>
+          Discard my edit
+        </Button>
+      </div>
+    </div>
   );
 }

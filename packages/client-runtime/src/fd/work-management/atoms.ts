@@ -1,6 +1,9 @@
 import { type EnvironmentId, type ServerConfig, WS_METHODS } from "@t3tools/contracts";
 import {
   type WorkManagementSupport,
+  type WorkNativeStatus,
+  type WorkSourceId,
+  type WorkSourceKind,
   WorkItemDetail,
   WorkLinksResult,
   WorkListResult,
@@ -17,6 +20,24 @@ import {
   createEnvironmentRpcSubscriptionAtomFamily,
 } from "../../state/runtime.ts";
 import { workSupport } from "./model.ts";
+import { collectWorkPages, workPageLimit, type WorkSourcePages } from "./paging.ts";
+
+/** One list view: the sources it reads, its server-side filters and how many pages it wants. */
+export interface WorkPagedListInput {
+  readonly environmentId: EnvironmentId;
+  readonly sources: ReadonlyArray<{
+    readonly sourceId: WorkSourceId;
+    readonly kind: WorkSourceKind;
+  }>;
+  readonly search?: string | undefined;
+  readonly statuses?: ReadonlyArray<WorkNativeStatus> | undefined;
+  readonly pageCount: number;
+}
+
+export interface WorkPagedSource {
+  readonly sourceId: WorkSourceId;
+  readonly pages: WorkSourcePages;
+}
 
 /**
  * Work reads for one client. Every query refetches when the environment's Work epoch moves, so
@@ -32,8 +53,61 @@ export function createWorkEnvironmentAtoms<R, E>(
   });
   const refreshTrigger = ({ environmentId }: { readonly environmentId: EnvironmentId }) =>
     refreshes({ environmentId, input: {} });
+  const list = createEnvironmentRpcQueryAtomFamily(runtime, {
+    label: "environment-data:work:list",
+    persistence: persistQuery(WorkListResult),
+    tag: WS_METHODS.workItemsList,
+    staleTimeMs: 30_000,
+    refreshTrigger,
+  });
+  // Keyed by a canonical string so every view of the same list shares one atom, whatever object
+  // its caller built. Refreshing it refreshes the page queries it last read.
+  const pagedListFamily = Atom.family((key: string) => {
+    const input = JSON.parse(key) as WorkPagedListInput;
+    let lastRead: ReadonlyArray<Atom.Atom<unknown>> = [];
+    return Atom.readable(
+      (get): ReadonlyArray<WorkPagedSource> => {
+        const read: Array<Atom.Atom<unknown>> = [];
+        const sources = input.sources.map((source) => ({
+          sourceId: source.sourceId,
+          pages: collectWorkPages(input.pageCount, (cursor) => {
+            const atom = list({
+              environmentId: input.environmentId,
+              input: {
+                sourceId: source.sourceId,
+                limit: workPageLimit(source.kind),
+                ...(input.search === undefined ? {} : { search: input.search }),
+                ...(input.statuses === undefined ? {} : { statuses: [...input.statuses] }),
+                ...(cursor === undefined ? {} : { cursor }),
+              },
+            });
+            read.push(atom);
+            return get(atom);
+          }),
+        }));
+        lastRead = read;
+        return sources;
+      },
+      (refresh) => {
+        for (const atom of lastRead) refresh(atom);
+      },
+    ).pipe(Atom.withLabel("work:paged-list"));
+  });
+  const pagedList = (input: WorkPagedListInput) =>
+    pagedListFamily(
+      JSON.stringify({
+        environmentId: input.environmentId,
+        sources: input.sources.map((source) => ({ sourceId: source.sourceId, kind: source.kind })),
+        ...(input.search === undefined || input.search.length === 0
+          ? {}
+          : { search: input.search }),
+        ...(input.statuses === undefined ? {} : { statuses: [...input.statuses] }),
+        pageCount: Math.max(1, input.pageCount),
+      }),
+    );
   return {
     refreshes,
+    pagedList,
     sources: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:work:sources",
       persistence: persistQuery(WorkSourceList),
@@ -41,13 +115,7 @@ export function createWorkEnvironmentAtoms<R, E>(
       staleTimeMs: 30_000,
       refreshTrigger,
     }),
-    list: createEnvironmentRpcQueryAtomFamily(runtime, {
-      label: "environment-data:work:list",
-      persistence: persistQuery(WorkListResult),
-      tag: WS_METHODS.workItemsList,
-      staleTimeMs: 30_000,
-      refreshTrigger,
-    }),
+    list,
     detail: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:work:detail",
       persistence: persistQuery(WorkItemDetail),

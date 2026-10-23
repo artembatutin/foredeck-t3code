@@ -1,3 +1,4 @@
+import { workLinkCandidates } from "@t3tools/client-runtime/fd/work-management";
 import type { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import { useMemo, useState } from "react";
@@ -39,19 +40,10 @@ export function LinkThreadDialog({
   const [query, setQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
-  const candidates = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    return shells
-      .filter(
-        (shell) =>
-          shell.environmentId === environmentId &&
-          shell.projectId === projectId &&
-          shell.archivedAt === null &&
-          !linkedThreadIds.includes(shell.id) &&
-          (needle.length === 0 || shell.title.toLowerCase().includes(needle)),
-      )
-      .slice(0, 50);
-  }, [environmentId, linkedThreadIds, projectId, query, shells]);
+  const candidates = useMemo(
+    () => workLinkCandidates(shells, { environmentId, projectId, linked: linkedThreadIds, query }),
+    [environmentId, linkedThreadIds, projectId, query, shells],
+  );
 
   const link = async (threadId: ThreadId) => {
     setPending(true);

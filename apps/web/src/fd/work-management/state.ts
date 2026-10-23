@@ -7,12 +7,17 @@ import {
   WORK_READ_SCOPE,
 } from "@t3tools/client-runtime/fd/work-management";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
-import type { WorkManagementSupport, WorkThreadLink } from "@t3tools/contracts/fd/work-management";
+import type {
+  WorkManagementFeature,
+  WorkManagementSupport,
+  WorkThreadLink,
+} from "@t3tools/contracts/fd/work-management";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/reactivity";
 import { useMemo } from "react";
 
 import { connectionAtomRuntime } from "../../connection/runtime";
+import { useConnectedEnvironmentIds } from "../../state/environments";
 import { environmentServerConfigsAtom } from "../../state/server";
 import { useEnvironmentScope, useEnvironmentsWithScope } from "../../state/session";
 
@@ -80,4 +85,29 @@ export function useThreadWorkLinks(
 ): ReadonlyArray<WorkThreadLink> {
   const grouped = useAtomValue(enabled ? threadLinksAtom(environmentId) : EMPTY_THREAD_LINKS_ATOM);
   return grouped.get(threadId) ?? EMPTY_LINKS;
+}
+
+const DENIED_ATOM = Atom.make(false);
+
+/**
+ * Whether a Work write can run now: the environment advertises the feature, this session holds
+ * the command's grant (rechecked on execution) and the environment is connected. Every write
+ * control is gated on this; the server stays authoritative.
+ */
+export function useWorkWritable(
+  environmentId: EnvironmentId | null,
+  command: { readonly permissionAtom: (environmentId: EnvironmentId) => Atom.Atom<boolean> },
+  feature: WorkManagementFeature,
+): boolean {
+  const support = useWorkSupport();
+  const connected = useConnectedEnvironmentIds();
+  const permitted = useAtomValue(
+    environmentId === null ? DENIED_ATOM : command.permissionAtom(environmentId),
+  );
+  return (
+    environmentId !== null &&
+    permitted &&
+    connected.includes(environmentId) &&
+    support.get(environmentId)?.features.has(feature) === true
+  );
 }

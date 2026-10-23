@@ -1,4 +1,3 @@
-import { useAtomValue } from "@effect/atom-react";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { usesSharedCheckouts } from "@t3tools/client-runtime/fd/multirepo";
 import {
@@ -28,7 +27,7 @@ import { newThreadId } from "../../lib/utils";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { buildThreadRouteParams } from "../../threadRoutes";
 import { workCommandError } from "./shared";
-import { workCommands } from "./state";
+import { useWorkWritable, workCommands } from "./state";
 
 const MODES: ReadonlyArray<{ value: WorkThreadMode; label: string; help: string }> = [
   { value: "scope", label: "Scope", help: "Investigate and reply with a plan; no file changes." },
@@ -55,8 +54,10 @@ export function StartWorkThreadDialog({
   const projects = useProjects();
   const serverConfigs = useServerConfigs();
   const start = useAtomCommand(workCommands.startThread);
-  const permitted = useAtomValue(
-    workCommands.startThread.permissionAtom(target?.environmentId ?? ("" as EnvironmentId)),
+  const permitted = useWorkWritable(
+    target?.environmentId ?? null,
+    workCommands.startThread,
+    "threads.start",
   );
   const project =
     target === null
@@ -186,7 +187,7 @@ export function StartWorkThreadDialog({
             ) : null}
             {!permitted ? (
               <p className="text-muted-foreground text-xs">
-                This connection cannot start threads on this environment.
+                This connection cannot start threads on this environment right now.
               </p>
             ) : null}
             {error ? <p className="text-destructive text-xs">{error}</p> : null}

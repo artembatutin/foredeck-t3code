@@ -268,7 +268,7 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                               onClick={async () => {
                                 setBusy(item.assignmentId);
                                 try {
-                                  await control({
+                                  const result = await control({
                                     environmentId: threadRef.environmentId,
                                     input: {
                                       assignmentId: item.assignmentId,
@@ -276,6 +276,8 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                                       action,
                                     },
                                   });
+                                  // Show the new state now rather than at the next slow refresh.
+                                  if (result._tag === "Success") await refresh();
                                 } finally {
                                   setBusy(null);
                                 }

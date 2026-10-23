@@ -1,4 +1,3 @@
-import { useAtomValue } from "@effect/atom-react";
 import {
   scopedProjectKey,
   scopeProjectRef,
@@ -16,7 +15,7 @@ import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { openLinkWorkItemDialog } from "./LinkWorkItemDialog";
 import { STATUS_LABELS } from "./shared";
-import { useWorkReadable, workCommands, workEnvironment } from "./state";
+import { useWorkReadable, useWorkWritable, workCommands, workEnvironment } from "./state";
 
 /** The Work items linked to a thread, with the way to open, unlink and link another. */
 export function LinkedWorkSection({
@@ -46,7 +45,7 @@ function LinkedWorkRows({
   const navigate = useNavigate();
   const query = useEnvironmentQuery(workEnvironment.links({ environmentId, input: { threadId } }));
   const setLink = useAtomCommand(workCommands.setLink);
-  const canWrite = useAtomValue(workCommands.setLink.permissionAtom(environmentId));
+  const canWrite = useWorkWritable(environmentId, workCommands.setLink, "links");
   const links = query.data?.links ?? [];
   const open = (link: WorkThreadLink) =>
     void navigate({

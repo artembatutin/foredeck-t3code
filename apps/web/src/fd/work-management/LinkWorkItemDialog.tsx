@@ -27,7 +27,7 @@ import { useThreadShell } from "../../state/entities";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { WorkStatusBadge, workCommandError } from "./shared";
-import { useWorkReadable, workCommands, workEnvironment } from "./state";
+import { useWorkReadable, useWorkWritable, workCommands, workEnvironment } from "./state";
 
 /**
  * Which thread has the link-work-item dialog open. Set by any entry point (palette, thread
@@ -80,6 +80,7 @@ function LinkWorkItemDialog({
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const setLink = useAtomCommand(workCommands.setLink);
+  const canLink = useWorkWritable(environmentId, workCommands.setLink, "links");
   const selected = sourceId ?? available[0]?.sourceId ?? null;
 
   useEffect(() => {
@@ -161,7 +162,7 @@ function LinkWorkItemDialog({
                 <li key={item.ref.itemId}>
                   <button
                     type="button"
-                    disabled={pending}
+                    disabled={pending || !canLink}
                     className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent"
                     onClick={() => void link(item)}
                   >
@@ -172,6 +173,11 @@ function LinkWorkItemDialog({
                 </li>
               ))}
             </ul>
+            {!canLink ? (
+              <p className="text-muted-foreground text-xs">
+                This connection cannot link Work items right now.
+              </p>
+            ) : null}
             {list.error ? <p className="text-destructive text-xs">{list.error}</p> : null}
             {error ? <p className="text-destructive text-xs">{error}</p> : null}
           </div>

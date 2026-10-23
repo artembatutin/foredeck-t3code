@@ -1,4 +1,44 @@
-export { createWorkCommands, createWorkEnvironmentAtoms, createWorkSupportAtom } from "./atoms.ts";
+export {
+  createWorkCommands,
+  createWorkEnvironmentAtoms,
+  createWorkSupportAtom,
+  type WorkPagedListInput,
+  type WorkPagedSource,
+} from "./atoms.ts";
+export {
+  collectWorkPages,
+  refreshWork,
+  shouldAutoLoadWorkPage,
+  WORK_AUTO_PAGE_LIMIT,
+  WORK_WANTED_VISIBLE,
+  workPageLimit,
+  workViewStatuses,
+  type WorkSourcePages,
+} from "./paging.ts";
+export {
+  beginWorkDraft,
+  beginWorkRelationshipDraft,
+  editWorkDraft,
+  mergeComposerText,
+  parseWorkItemIds,
+  rebaseWorkDraft,
+  settleWorkDraft,
+  workDraftChanged,
+  workDraftConflictReady,
+  workDraftPatch,
+  workLinkCandidates,
+  workRelationshipPatch,
+  workRelationshipText,
+  workStatusInput,
+  workStatusUndo,
+  workUndoMessage,
+  workWriteOutcome,
+  type WorkDraft,
+  type WorkDraftField,
+  type WorkRelationshipDraft,
+  type WorkRelationshipField,
+  type WorkWriteOutcome,
+} from "./writes.ts";
 export {
   changedSinceLink,
   DEFAULT_WORK_LIST_PREFERENCES,

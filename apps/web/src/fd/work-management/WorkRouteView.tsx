@@ -1,15 +1,19 @@
-import { useAtomValue } from "@effect/atom-react";
+import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import { scopedProjectKey, scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { derivePhysicalProjectKey } from "@t3tools/client-runtime/state/project-grouping";
 import {
   itemInView,
   linksByItem,
   readWorkListPreferences,
+  refreshWork,
   RUN_STATE_LABELS,
   runStateOf,
+  shouldAutoLoadWorkPage,
   WORK_VIEWS,
+  type WorkPagedSource,
   type WorkRunState,
   type WorkView,
+  workViewStatuses,
   writeWorkListPreferences,
 } from "@t3tools/client-runtime/fd/work-management";
 import type { EnvironmentId } from "@t3tools/contracts";
@@ -20,8 +24,7 @@ import {
   workItemRefString,
 } from "@t3tools/contracts/fd/work-management";
 import { useNavigate } from "@tanstack/react-router";
-import * as Option from "effect/Option";
-import { AsyncResult, Atom } from "effect/reactivity";
+import { Atom } from "effect/reactivity";
 import { PlusIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
@@ -58,9 +61,16 @@ import {
   useThreadShells,
 } from "../../state/entities";
 import { useEnvironmentQuery } from "../../state/query";
+import { useAtomCommand } from "../../state/use-atom-command";
 import { CreateWorkItemDialog } from "./CreateWorkItemDialog";
 import { SOURCE_KIND_LABELS, WorkRepairNotice, WorkSourceGlyph, WorkStatusBadge } from "./shared";
-import { useReadableWorkEnvironments, useWorkSupport, workEnvironment } from "./state";
+import {
+  useReadableWorkEnvironments,
+  useWorkSupport,
+  useWorkWritable,
+  workCommands,
+  workEnvironment,
+} from "./state";
 import { WorkItemDetail } from "./WorkItemDetail";
 
 const PREFERENCES_KEY = "t3code:work-list-preferences";
@@ -167,33 +177,33 @@ export function WorkRouteView({ search }: { search: WorkSearch }) {
     [search.source, sources],
   );
 
-  const listAtom = useMemo(() => {
-    if (environmentId === null) return null;
-    const term = search.q?.trim();
-    const statuses =
-      view === "done"
-        ? (["done", "cancelled"] as const)
-        : view === "all"
-          ? undefined
-          : (["todo", "in_progress"] as const);
-    return Atom.make((get) =>
-      shownSources.map((source) => {
-        const result = get(
-          workEnvironment.list({
+  const term = search.q?.trim() || undefined;
+  // Pages loaded so far; any change to what the list shows starts again from the first page.
+  const listKey = `${environmentId}|${shownSources.map((source) => source.sourceId).join(",")}|${view}|${term ?? ""}`;
+  const [paging, setPaging] = useState({ key: listKey, pageCount: 1 });
+  const pageCount = paging.key === listKey ? paging.pageCount : 1;
+  const loadMore = useCallback(
+    () => setPaging({ key: listKey, pageCount: pageCount + 1 }),
+    [listKey, pageCount],
+  );
+  const listAtom = useMemo(
+    () =>
+      environmentId === null || shownSources.length === 0
+        ? null
+        : workEnvironment.pagedList({
             environmentId,
-            input: {
+            sources: shownSources.map((source) => ({
               sourceId: source.sourceId,
-              limit: 100,
-              ...(term ? { search: term } : {}),
-              ...(statuses === undefined ? {} : { statuses: [...statuses] }),
-            },
+              kind: source.kind,
+            })),
+            search: term,
+            statuses: workViewStatuses(view),
+            pageCount,
           }),
-        );
-        return { source, result };
-      }),
-    );
-  }, [environmentId, search.q, shownSources, view]);
+    [environmentId, pageCount, shownSources, term, view],
+  );
   const lists = useAtomValue(listAtom ?? EMPTY_LISTS_ATOM);
+  const refreshList = useAtomRefresh(listAtom ?? EMPTY_LISTS_ATOM);
   const linksQuery = useEnvironmentQuery(
     selectedProject === undefined
       ? null
@@ -219,33 +229,62 @@ export function WorkRouteView({ search }: { search: WorkSearch }) {
     return states;
   }, [environmentId, linksQuery.data, shells]);
 
-  const pending = lists.some(({ result }) => result._tag === "Initial" || result.waiting);
-  const items = lists
-    .flatMap(({ source, result }) =>
-      Option.match(AsyncResult.value(result), {
-        onNone: () => [],
-        onSome: (value) => value.items.map((item) => ({ source, item })),
-      }),
-    )
-    .filter(({ item }) => itemInView(view, item, runStates.get(workItemRefString(item.ref)) ?? []))
-    .toSorted((left, right) =>
-      (right.item.updatedAt ?? "").localeCompare(left.item.updatedAt ?? ""),
-    );
-  const failures = lists.flatMap(({ source, result }) =>
-    result._tag === "Failure" ? [source.label] : [],
+  const sourceById = useMemo(
+    () => new Map(shownSources.map((source) => [source.sourceId, source] as const)),
+    [shownSources],
   );
-  const lastRefreshed = Math.max(
-    0,
-    ...lists.map(({ result }) => (result._tag === "Success" ? result.timestamp : 0)),
+  const pending = lists.some(({ pages }) => pages.waiting);
+  const hasMore = lists.some(({ pages }) => pages.nextCursor !== null);
+  const items = useMemo(
+    () =>
+      lists
+        .flatMap(({ sourceId, pages }) => {
+          const source = sourceById.get(sourceId);
+          return source === undefined ? [] : pages.items.map((item) => ({ source, item }));
+        })
+        .filter(({ item }) =>
+          itemInView(view, item, runStates.get(workItemRefString(item.ref)) ?? []),
+        )
+        .toSorted((left, right) =>
+          (right.item.updatedAt ?? "").localeCompare(left.item.updatedAt ?? ""),
+        ),
+    [lists, runStates, sourceById, view],
   );
+  // A filtered view that came up short reads further pages by itself, within a small budget.
+  // Adjusted during render: each step raises the page count, so it settles within the budget.
+  if (shouldAutoLoadWorkPage({ visible: items.length, hasMore, waiting: pending, pageCount })) {
+    setPaging({ key: listKey, pageCount: pageCount + 1 });
+  }
+  const failures = lists.flatMap(({ sourceId, pages }) =>
+    pages.failed ? [sourceById.get(sourceId)?.label ?? sourceId] : [],
+  );
+  const lastRefreshed = Math.max(0, ...lists.map(({ pages }) => pages.updatedAt));
 
+  const requestRefresh = useAtomCommand(workCommands.refresh);
+  const refreshSources = sourcesQuery.refresh;
+  const refreshLinks = linksQuery.refresh;
+  const projectId = selectedProject?.id;
+  // Drops the server's caches (every client refetches through the refresh subscription) and
+  // refreshes this view's own queries, for the button and the live interval alike.
   const refresh = useCallback(() => {
-    sourcesQuery.refresh();
-    linksQuery.refresh();
-  }, [linksQuery, sourcesQuery]);
+    if (environmentId === null) return;
+    void refreshWork({
+      requestServerRefresh: () =>
+        requestRefresh({
+          environmentId,
+          input: projectId === undefined ? {} : { projectId },
+        }),
+      refreshQueries: () => {
+        refreshSources();
+        refreshLinks();
+        refreshList();
+      },
+    });
+  }, [environmentId, projectId, refreshLinks, refreshList, refreshSources, requestRefresh]);
   useLiveRefresh(environmentId === null ? null : refresh, {
     key: selectedProject?.id ?? "none",
   });
+  const canCreate = useWorkWritable(environmentId, workCommands.createItem, "items.write");
 
   const selectedRef = search.item === undefined ? undefined : parseWorkItemRefString(search.item);
   const supported = support.size > 0;
@@ -307,7 +346,9 @@ export function WorkRouteView({ search }: { search: WorkSearch }) {
         <p className="text-destructive text-sm">Could not read {failures.join(", ")}.</p>
       ) : null}
       {items.length === 0 ? (
-        <p className="py-8 text-center text-muted-foreground text-sm">Nothing here.</p>
+        <p className="py-8 text-center text-muted-foreground text-sm">
+          {pending ? "Loading..." : hasMore ? "Nothing here yet." : "Nothing here."}
+        </p>
       ) : (
         <ul className="divide-y rounded-lg border" aria-label="Work items">
           {items.map(({ source, item }) => (
@@ -326,6 +367,13 @@ export function WorkRouteView({ search }: { search: WorkSearch }) {
           ))}
         </ul>
       )}
+      {hasMore ? (
+        <div className="flex justify-center">
+          <Button size="sm" variant="outline" disabled={pending} onClick={loadMore}>
+            Load more
+          </Button>
+        </div>
+      ) : null}
     </>
   );
 
@@ -430,7 +478,7 @@ export function WorkRouteView({ search }: { search: WorkSearch }) {
                       onChange={(event) => setQuery(event.target.value)}
                     />
                   </div>
-                  {sources.some((source) => source.capabilities.create) ? (
+                  {canCreate && sources.some((source) => source.capabilities.create) ? (
                     <Button
                       size="sm"
                       variant="outline"
@@ -476,12 +524,7 @@ export function WorkRouteView({ search }: { search: WorkSearch }) {
   );
 }
 
-const EMPTY_LISTS_ATOM = Atom.make(
-  [] as ReadonlyArray<{
-    source: WorkSource;
-    result: AsyncResult.AsyncResult<{ readonly items: ReadonlyArray<WorkItemSummary> }, unknown>;
-  }>,
-);
+const EMPTY_LISTS_ATOM = Atom.make([] as ReadonlyArray<WorkPagedSource>);
 
 function ListSkeleton() {
   return (

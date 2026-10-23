@@ -1,4 +1,3 @@
-import { useAtomValue } from "@effect/atom-react";
 import { WORK_READ_SCOPE, workSupport } from "@t3tools/client-runtime/fd/work-management";
 import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import type { ServerConfig } from "@t3tools/contracts";
@@ -26,7 +25,7 @@ import { useEnvironmentQuery } from "../../state/query";
 import { useEnvironmentScope } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { SOURCE_KIND_LABELS, WorkRepairNotice, workCommandError } from "./shared";
-import { workCommands, workEnvironment } from "./state";
+import { useWorkWritable, workCommands, workEnvironment } from "./state";
 
 const DEFAULT_DIRECTORY = ".foredeck/work";
 
@@ -70,12 +69,13 @@ function SourcesEditor({
       input: { projectId: project.id, includeDisconnected: true },
     }),
   );
-  const permitted = useAtomValue(workCommands.saveSource.permissionAtom(environmentId));
+  const permitted = useWorkWritable(environmentId, workCommands.saveSource, "sources");
   const disconnect = useAtomCommand(workCommands.disconnectSource);
   const restore = useAtomCommand(workCommands.restoreSource);
   const save = useAtomCommand(workCommands.saveSource);
   const test = useAtomCommand(workCommands.testSource);
   const [adding, setAdding] = useState(false);
+  const [replacing, setReplacing] = useState<string | null>(null);
   const [messages, setMessages] = useState<Record<string, string>>({});
   const sources = query.data?.sources ?? [];
   const note = (sourceId: string, message: string) =>
@@ -160,6 +160,18 @@ function SourcesEditor({
                 Test
               </Button>
             ) : null}
+            {source.kind === "jira" && source.state === "active" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                disabled={!permitted}
+                onClick={() =>
+                  setReplacing((current) => (current === source.sourceId ? null : source.sourceId))
+                }
+              >
+                {source.credential.configured ? "Replace token" : "Set token"}
+              </Button>
+            ) : null}
             {source.kind === "jira" && source.credential.configured && source.state === "active" ? (
               <Button
                 size="xs"
@@ -182,6 +194,22 @@ function SourcesEditor({
           {source.state === "active" && source.health.message ? (
             <p className="text-muted-foreground text-xs">{source.health.message}</p>
           ) : null}
+          {source.config.kind === "jira" && source.state === "active" ? (
+            <p className="text-muted-foreground text-xs">
+              The token is shared by every Jira source for {source.config.email} on{" "}
+              {source.config.siteUrl}; replacing or removing it applies to all of them.
+            </p>
+          ) : null}
+          {replacing === source.sourceId && permitted ? (
+            <ReplaceTokenForm
+              project={project}
+              source={source}
+              onDone={(message) => {
+                setReplacing(null);
+                if (message !== null) note(source.sourceId, message);
+              }}
+            />
+          ) : null}
           {messages[source.sourceId] ? (
             <p className="text-muted-foreground text-xs">{messages[source.sourceId]}</p>
           ) : null}
@@ -189,7 +217,7 @@ function SourcesEditor({
       ))}
       {!permitted ? (
         <p className="text-muted-foreground text-sm">
-          This connection needs the settings permission to change Work sources.
+          Changing Work sources needs a live connection with the settings permission.
         </p>
       ) : adding ? (
         <AddSourceForm project={project} kinds={kinds} onDone={() => setAdding(false)} />
@@ -371,6 +399,70 @@ function AddSourceForm({
           {pending ? "Adding..." : "Add"}
         </Button>
         <Button size="sm" variant="ghost" disabled={pending} onClick={onDone}>
+          Cancel
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Repairs an expired or cleared Jira token in place. The server tests the token before storing
+ * it and applies it to every source sharing the site and account, so nothing is disconnected.
+ */
+function ReplaceTokenForm({
+  project,
+  source,
+  onDone,
+}: {
+  project: EnvironmentProject;
+  source: WorkSource;
+  onDone: (message: string | null) => void;
+}) {
+  const save = useAtomCommand(workCommands.saveSource);
+  const [token, setToken] = useState("");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const submit = async () => {
+    const apiToken = token.trim();
+    if (apiToken.length === 0) return;
+    setPending(true);
+    const result = await save({
+      environmentId: project.environmentId,
+      input: {
+        sourceId: source.sourceId,
+        projectId: project.id,
+        label: source.label,
+        config: source.config,
+        apiToken,
+        expectedVersion: source.version,
+      },
+    });
+    setPending(false);
+    // The token is sent once and never kept here.
+    setToken("");
+    if (result._tag === "Success") {
+      onDone("Token replaced for every source on this site and account.");
+    } else setError(workCommandError(result));
+  };
+  return (
+    <div className="space-y-2 rounded-md border p-3">
+      <SecretInput
+        aria-label="New API token"
+        placeholder="New API token"
+        value={token}
+        onChange={(event) => setToken(event.target.value)}
+      />
+      {error ? <p className="text-destructive text-xs">{error}</p> : null}
+      <div className="flex gap-2">
+        <Button
+          size="sm"
+          disabled={pending || token.trim().length === 0}
+          onClick={() => void submit()}
+        >
+          {pending ? "Testing..." : "Save token"}
+        </Button>
+        <Button size="sm" variant="ghost" disabled={pending} onClick={() => onDone(null)}>
           Cancel
         </Button>
       </div>
