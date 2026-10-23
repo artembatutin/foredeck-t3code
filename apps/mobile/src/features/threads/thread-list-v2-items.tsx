@@ -30,6 +30,7 @@ import { AppText as Text } from "../../components/AppText";
 import { ControlPillMenu } from "../../components/ControlPill";
 import { EnvironmentMachineSymbol } from "../../components/EnvironmentMachineSymbol";
 import { ProjectFavicon } from "../../components/ProjectFavicon";
+import { WorkingSpinner } from "../../fd/working-indicator";
 import { ProviderIcon, ProviderInstanceIcon } from "../../components/ProviderIcon";
 import { cn } from "../../lib/cn";
 import { copyTextWithHaptic } from "../../lib/copyTextWithHaptic";
@@ -1003,24 +1004,44 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
           />
         ) : null}
         {statusLabel ? (
-          <View className="flex-row items-center gap-1">
-            <SymbolView
-              name={statusLabel.icon}
-              size={13}
-              tintColorClassName={
-                selected ? selectedThreadRowColors.iconTintClassName : statusLabel.iconTintClassName
-              }
-              type="monochrome"
-              weight="semibold"
-            />
-            <Text
-              className={cn(
-                "text-xs font-t3-bold",
-                selected ? selectedThreadRowColors.foregroundClassName : statusLabel.className,
-              )}
-            >
-              {statusLabel.label}
-            </Text>
+          <View
+            className="flex-row items-center gap-1"
+            accessible
+            accessibilityLabel={statusLabel.label}
+          >
+            {status === "working" ? (
+              <WorkingSpinner
+                size={13}
+                colorClassName={
+                  selected
+                    ? selectedThreadRowColors.iconTintClassName
+                    : statusLabel.iconTintClassName
+                }
+              />
+            ) : (
+              <SymbolView
+                name={statusLabel.icon}
+                size={13}
+                tintColorClassName={
+                  selected
+                    ? selectedThreadRowColors.iconTintClassName
+                    : statusLabel.iconTintClassName
+                }
+                type="monochrome"
+                weight="semibold"
+              />
+            )}
+            {/* The spinner alone says "Working"; a goal keeps its label. */}
+            {statusLabel.label === "Working" ? null : (
+              <Text
+                className={cn(
+                  "text-xs font-t3-bold",
+                  selected ? selectedThreadRowColors.foregroundClassName : statusLabel.className,
+                )}
+              >
+                {statusLabel.label}
+              </Text>
+            )}
           </View>
         ) : (
           <Text

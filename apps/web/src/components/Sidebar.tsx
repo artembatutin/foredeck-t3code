@@ -2,6 +2,7 @@ import { ThreadCardContent, threadCardHeight } from "~/fd/sidebar-thread-layout"
 import { type EnvironmentId, type ScopedProjectRef } from "@t3tools/contracts";
 import { isAssistantThread } from "@t3tools/shared/fd/assistant";
 import { AssistantEntry } from "~/fd/assistant";
+import { WorkingSpinner } from "~/fd/working-indicator";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "./ThreadHoverCard";
 import { CollapsibleSectionHeader } from "./ui/collapsible-section-header";
 import {
@@ -74,7 +75,6 @@ import {
   CheckIcon,
   CircleAlertIcon,
   CircleCheckIcon,
-  CircleDashedIcon,
   ClockIcon,
   EyeIcon,
   FolderIcon,
@@ -2066,7 +2066,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                           )}
                         >
                           {topStatus.icon === "working" ? (
-                            <CircleDashedIcon aria-hidden className="size-4 shrink-0" />
+                            <WorkingSpinner className="size-3.5 shrink-0" />
                           ) : topStatus.icon === "input" ? (
                             <MessageCircleQuestionIcon aria-hidden className="size-4 shrink-0" />
                           ) : topStatus.icon === "approval" ? (
@@ -2079,7 +2079,12 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                           {/* The label alone is the live region: a role="status"
                             wrapper around the ticking duration would make
                             screen readers announce every second. */}
-                          <span role="status">{topStatus.label}</span>
+                          <span
+                            role="status"
+                            className={cn(topStatus.label === "Working" && "sr-only")}
+                          >
+                            {topStatus.label}
+                          </span>
                           {status === "working" ? (
                             <span aria-hidden>
                               <WorkingDuration startedAt={resolveWorkingStartedAt(thread)} />
