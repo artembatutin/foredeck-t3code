@@ -208,6 +208,7 @@ import { Checkbox } from "./ui/checkbox";
 import { ProjectFavicon } from "./ProjectFavicon";
 import { ProjectFilePicker } from "./files/ProjectFilePicker";
 import { openLinkPullRequestDialog } from "./pullRequest/LinkPullRequestDialog";
+import { workPaletteActions } from "../fd/work-management";
 import { ProjectContentSearchDialog } from "./search/ProjectContentSearchDialog";
 import { toggleThemeEditorForTheme } from "./settings/themeEditorStore";
 import { searchSettings, SETTINGS_SECTION_LABELS } from "./settings/settingsSearch";
@@ -470,6 +471,13 @@ export function CommandPalette({ children }: { children: ReactNode }) {
         event.stopPropagation();
         setOpen(false);
         void navigate({ to: "/usage" });
+        return;
+      }
+      if (command === "work.open") {
+        event.preventDefault();
+        event.stopPropagation();
+        setOpen(false);
+        void navigate({ to: "/work" });
         return;
       }
       const mode = overlayModeForCommand(command);
@@ -2220,6 +2228,16 @@ function OpenCommandPaletteDialog(props: {
       },
     });
   }
+
+  actionItems.push(
+    ...workPaletteActions({
+      activeThread:
+        activeThread === null ? null : scopeThreadRef(activeThread.environmentId, activeThread.id),
+      openWork: async () => {
+        await navigate({ to: "/work" });
+      },
+    }),
+  );
 
   actionItems.push({
     kind: "action",

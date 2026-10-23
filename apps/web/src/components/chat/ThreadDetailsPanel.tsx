@@ -1,4 +1,5 @@
 import type { RepositoryFileScope } from "@t3tools/client-runtime/fd/multirepo";
+import { LinkedWorkSection } from "~/fd/work-management";
 import type {
   EditorId,
   EnvironmentId,
@@ -186,6 +187,10 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
               environmentId={props.environmentId}
               threadId={props.threadId}
             />
+          ) : null}
+
+          {density === "full" && !props.draftId ? (
+            <LinkedWorkSection environmentId={props.environmentId} threadId={props.threadId} />
           ) : null}
         </>
       )}

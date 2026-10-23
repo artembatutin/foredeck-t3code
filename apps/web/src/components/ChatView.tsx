@@ -306,6 +306,7 @@ import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { RightPanelTabs } from "./RightPanelTabs";
 import { LinkPullRequestDialogHost } from "./pullRequest/LinkPullRequestDialog";
+import { LinkWorkItemDialogHost } from "../fd/work-management";
 import { ThreadPullRequestsPanel } from "./pullRequest/ThreadPullRequestsPanel";
 import { useDeviceState } from "~/state/device";
 import { DeviceSetup } from "./device/DeviceSetup";
@@ -12383,6 +12384,7 @@ export default function ChatView(props: ChatViewProps) {
         </AlertDialogPopup>
       </AlertDialog>
       <LinkPullRequestDialogHost />
+      <LinkWorkItemDialogHost />
       {expandedImage && (
         <ExpandedImageDialog
           key={expandedImageKey(expandedImage)}
