@@ -3,6 +3,7 @@ import * as NodeCrypto from "node:crypto";
 
 import { type FactoryDeliveryId, FactoryVerifyReceipt } from "@t3tools/contracts/fd/factory";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import type * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -32,10 +33,24 @@ export class FactoryVerifyCommandError extends Schema.TaggedError<FactoryVerifyC
   }
 }
 
+/**
+ * The verify command resolved to a Windows batch script, which runs only through `cmd.exe`.
+ * Factory runs verify commands without a shell, so the owner has to name the program itself.
+ */
+export class FactoryVerifyShellRequiredError extends Schema.TaggedError<FactoryVerifyShellRequiredError>()(
+  "FactoryVerifyShellRequiredError",
+  { path: Schema.String },
+) {
+  override get message(): string {
+    return `Factory runs verify commands without a shell, but the verify command for worktree ${this.path} resolves to a Windows batch script. Set the verify command to the program itself.`;
+  }
+}
+
 export type FactoryVerifyRunError =
   | FactoryWorktreeMissingError
   | FactoryBranchReadError
   | FactoryVerifyCommandError
+  | FactoryVerifyShellRequiredError
   | FactoryEvidence.FactoryEvidenceError;
 
 const RECEIPT_VERSION = 1;
@@ -61,11 +76,12 @@ export const verifySettingsHash = (settings: FactoryDeliverySettings): string =>
 
 /**
  * Runs a project's verify command against a delivery worktree's commit (port of Looper's
- * receipts). The command runs as an argument array with the worktree as cwd; its stdout and stderr
- * stream into `verify-<n>.log` in the delivery's evidence folder as they arrive. A run that ends,
- * fails or times out on a clean tree with HEAD unchanged becomes a receipt, also written as
- * `verify-<n>.json`; the engine decides whether it passed. A tree dirty before or after the run,
- * or a HEAD the command moved, is refused: no receipt, and the log stays for diagnosis.
+ * receipts). The command runs as an argument array with the worktree as cwd, never through a
+ * shell; its stdout and stderr stream into `verify-<n>.log` in the delivery's evidence folder as
+ * they arrive. A run that ends, fails or times out on a clean tree with HEAD unchanged becomes a
+ * receipt, also written as `verify-<n>.json`; the engine decides whether it passed. A tree dirty
+ * before or after the run, or a HEAD the command moved, is refused: no receipt, and the log stays
+ * for diagnosis.
  */
 export class FactoryVerifyRunner extends Context.Service<
   FactoryVerifyRunner,
@@ -135,6 +151,8 @@ const make = Effect.gen(function* () {
    */
   const runLogged = (input: {
     readonly settings: FactoryDeliverySettings;
+    /** The resolved, shell-free executable to run. */
+    readonly executable: string;
     readonly cwd: string;
     readonly logPath: string;
   }) =>
@@ -166,11 +184,10 @@ const make = Effect.gen(function* () {
       const queueChunk = (chunk: Uint8Array) => {
         Queue.offerUnsafe(chunks, chunk);
       };
-      const { executable, args } = input.settings.verifyCommand;
       const result = yield* processRunner
         .run({
-          command: executable,
-          args,
+          command: input.executable,
+          args: input.settings.verifyCommand.args,
           cwd: input.cwd,
           timeout: Duration.minutes(input.settings.limits.verifyTimeoutMinutes),
           timeoutBehavior: "timedOutResult",
@@ -198,6 +215,17 @@ const make = Effect.gen(function* () {
 
   return FactoryVerifyRunner.of({
     run: Effect.fn("FactoryVerifyRunner.run")(function* (input) {
+      // On Windows the process runner hands `.cmd` and `.bat` files to `cmd.exe` as one command
+      // line. Refuse those before anything runs, and pass on the resolved path so the process
+      // runner cannot resolve the command differently.
+      const resolved = yield* resolveSpawnCommand(
+        input.settings.verifyCommand.executable,
+        input.settings.verifyCommand.args,
+      );
+      if (resolved.shell) {
+        return yield* new FactoryVerifyShellRequiredError({ path: input.worktreePath });
+      }
+
       const before = yield* readWorktree(input.worktreePath);
       // A run proves a commit only on a clean tree; a dirty one is refused before it runs.
       if (!before.clean) {
@@ -209,6 +237,7 @@ const make = Effect.gen(function* () {
       const startedAt = yield* DateTime.now;
       const result = yield* runLogged({
         settings: input.settings,
+        executable: resolved.command,
         cwd: input.worktreePath,
         logPath,
       });

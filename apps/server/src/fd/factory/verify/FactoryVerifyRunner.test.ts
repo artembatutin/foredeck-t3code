@@ -9,6 +9,7 @@ import {
   FactoryVerifyReceipt,
 } from "@t3tools/contracts/fd/factory";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -329,6 +330,30 @@ it.layer(makeLayer(ProcessRunner.layer), { excludeTestServices: true })(
       }),
     );
 
+    it.effect("refuses a Windows batch-script verify command before anything runs", () =>
+      Effect.gen(function* () {
+        const worktree = yield* makeWorktree;
+        const verifyCommand = { executable: "npm", args: ["test"] };
+        const settings = { ...decodeSettings({ verifyCommand }), verifyCommand };
+
+        const error = yield* Effect.flip(
+          run("windows-shim", worktree, settings).pipe(
+            Effect.provideService(HostProcess.Platform, "win32"),
+            Effect.provideService(SpawnExecutableResolution, (command) =>
+              command === "npm" ? "C:\\Program Files\\nodejs\\npm.cmd" : undefined,
+            ),
+          ),
+        );
+
+        assert.strictEqual(error._tag, "FactoryVerifyShellRequiredError");
+        assert.strictEqual(
+          error.message,
+          `Factory runs verify commands without a shell, but the verify command for worktree ${worktree} resolves to a Windows batch script. Set the verify command to the program itself.`,
+        );
+        assert.isFalse(yield* exists(yield* evidenceDirectory("windows-shim")));
+      }),
+    );
+
     it.effect("fails with a typed error and no git output when HEAD cannot be read", () =>
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
@@ -344,7 +369,7 @@ it.layer(makeLayer(ProcessRunner.layer), { excludeTestServices: true })(
   },
 );
 
-describe("FactoryVerifyRunner timeouts", () => {
+describe("FactoryVerifyRunner through a recording process runner", () => {
   const requested: Array<ProcessRunner.ProcessRunInput> = [];
   // Opens once both of the command's lines have reached the runner's chunk callbacks; after that
   // only the timeout can end the run, and the test clock decides when it fires.
@@ -403,7 +428,7 @@ describe("FactoryVerifyRunner timeouts", () => {
         assert.deepStrictEqual(sortedLines(log), ["err-before-timeout", "out-before-timeout"]);
         assert.strictEqual(receipt.outputHash, sha256(log));
 
-        const [input] = requested;
+        const input = requested.at(-1);
         assert.strictEqual(input?.command, process.execPath);
         assert.deepStrictEqual(input?.args, settings.verifyCommand.args);
         assert.strictEqual(input?.cwd, worktree);
@@ -411,6 +436,30 @@ describe("FactoryVerifyRunner timeouts", () => {
         assert.isTrue(
           Duration.equals(Duration.fromInputUnsafe(input?.timeout ?? 0), Duration.minutes(7)),
         );
+      }),
+    );
+
+    it.effect("hands the process runner the executable a Windows lookup resolved", () =>
+      Effect.gen(function* () {
+        const worktree = yield* makeWorktree;
+        // Only the lookup knows this name; it resolves to a program, not a batch script.
+        const verifyCommand = {
+          executable: "fd-factory-verify-tool",
+          args: ["-e", `console.log("resolved")`],
+        };
+        const settings = { ...decodeSettings({ verifyCommand }), verifyCommand };
+
+        const receipt = yield* receiptOf("windows-exe", worktree, settings).pipe(
+          Effect.provideService(HostProcess.Platform, "win32"),
+          Effect.provideService(SpawnExecutableResolution, (command) =>
+            command === "fd-factory-verify-tool" ? process.execPath : undefined,
+          ),
+        );
+
+        assert.strictEqual(receipt.code, 0);
+        assert.deepStrictEqual(receipt.command, verifyCommand);
+        assert.strictEqual(requested.at(-1)?.command, process.execPath);
+        assert.deepStrictEqual(requested.at(-1)?.args, verifyCommand.args);
       }),
     );
   });
