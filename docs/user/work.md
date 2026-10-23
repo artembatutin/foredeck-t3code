@@ -2,7 +2,8 @@
 
 Work keeps one list of the things you want done in a project and lets you or an
 agent act on them. Items come from **Work sources**: a folder of Markdown task
-files in the repository, or a GitHub repository's issues. Agents read and update the same items through the
+files in the repository, a GitHub repository's issues, or a Jira Cloud project's
+issues. Agents read and update the same items through the
 `work_*` tools, and a thread started from an item stays linked to it.
 
 ## Open Work
@@ -80,6 +81,26 @@ state; a linked thread shows that work is happening. Labels, the assignee, the
 title, the description and comments can be changed from Work; sub-issues and
 dependencies are shown but changed on GitHub. A transferred or deleted issue
 shows as not found; unlink it from its threads.
+
+## Jira Cloud
+
+A Jira source lists one Jira Cloud project's issues. Add it with the site URL
+(`https://your-site.atlassian.net`), the project key, your Atlassian email and an
+**unscoped** API token from your Atlassian account settings. The token stays on
+the server and is shared by every source on the same site and email, so a second
+project on that site does not ask for it again. **Remove token** forgets it for
+all of them; a source without a token shows that it needs one. Jira Data Center,
+scoped tokens and Atlassian sign-in are not supported yet. Tokens expire on the
+date you chose when creating them; when one does, the source asks for a new one.
+
+Work shows Jira's own status name and maps its category to **To do**, **In
+progress** or **Done** (**Cancelled** for resolutions such as Won't Do or
+Duplicate). Changing the status applies the Jira transition that reaches it; when
+several do, Work lists them to choose from, and transitions that need extra fields
+are done in Jira. Descriptions are shown as Markdown; content Work cannot show,
+such as tables, appears as a placeholder, and such a description is edited in
+Jira so nothing is lost. Issue links are read to show what blocks an issue and are
+changed in Jira.
 
 ## Threads started from an item
 
