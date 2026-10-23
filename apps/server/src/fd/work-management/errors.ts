@@ -99,6 +99,15 @@ export class WorkUnauthenticated extends Schema.TaggedError<WorkUnauthenticated>
   }
 }
 
+/** The source refused the credential this request (a permission, not an expired token). */
+export class WorkForbidden extends Schema.TaggedError<WorkForbidden>()("WorkForbidden", {
+  detail: Schema.String,
+}) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
 export class WorkRateLimited extends Schema.TaggedError<WorkRateLimited>()("WorkRateLimited", {
   retryAt: Schema.optionalKey(Schema.String),
 }) {
@@ -120,6 +129,7 @@ export type WorkDomainError =
   | WorkInvalid
   | WorkUnavailable
   | WorkUnauthenticated
+  | WorkForbidden
   | WorkRateLimited;
 
 const HOST_MESSAGE_LIMIT = 500;
@@ -160,6 +170,8 @@ export const toWorkError = (error: WorkDomainError): WorkError => {
       return new WorkError({ reason: "unavailable", message: error.message });
     case "WorkUnauthenticated":
       return new WorkError({ reason: "unauthenticated", message: error.message });
+    case "WorkForbidden":
+      return new WorkError({ reason: "forbidden", message: error.message });
     case "WorkRateLimited":
       return new WorkError({
         reason: "rate_limited",

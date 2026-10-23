@@ -11,7 +11,9 @@ import {
   workItemRefString,
   WorkItemTitle,
   WorkLinksQuery,
+  WorkLinksResult,
   WorkListQuery,
+  WorkListResult,
   WorkNativeStatus,
   WorkProjectDirectory,
   WorkSearchText,
@@ -193,6 +195,27 @@ describe("WorkSourceList", () => {
     const newer = { ...source, sourceId: "0b9d7f8e-1c2a-4e5b-9a7d-3f6e8c1b2a40", kind: "linear" };
     expect(decode({ sources: [source, newer] })).toEqual({ sources: [source] });
   });
+
+  it("keeps a source whose capabilities or health use values from a newer server", () => {
+    const newer = {
+      ...source,
+      capabilities: {
+        ...source.capabilities,
+        statuses: ["todo", "in_review"],
+        fields: ["title", "estimate"],
+        comments: "edit",
+      },
+      health: { status: "degraded", message: "Slow" },
+    };
+    const [decoded] = decode({ sources: [newer] }).sources;
+    expect(decoded?.capabilities).toEqual({
+      ...source.capabilities,
+      statuses: ["todo"],
+      fields: ["title"],
+      comments: "none",
+    });
+    expect(decoded?.health).toEqual({ status: "error", message: "Slow" });
+  });
 });
 
 describe("WorkListQuery", () => {
@@ -317,5 +340,63 @@ describe("WorkSourceSaveInput", () => {
     expect(decodeSaveInput({ ...base, apiToken: "token" })._tag).toBe("Some");
     expect(decodeSaveInput({ ...base, credential: "clear" })._tag).toBe("Some");
     expect(decodeSaveInput({ ...base, apiToken: "token", credential: "clear" })._tag).toBe("None");
+  });
+});
+
+const decodeListResult = Schema.decodeUnknownSync(WorkListResult);
+const decodeLinksResult = Schema.decodeUnknownSync(WorkLinksResult);
+
+describe("payloads from a newer server", () => {
+  const ref = { sourceId: uuid, itemId: "fd-abc123" };
+
+  it("reads unknown item statuses and priorities without dropping the item", () => {
+    const item = {
+      ref,
+      kind: "markdown",
+      key: "fd-abc123",
+      title: "Ship",
+      status: "triage",
+      nativeStatus: null,
+      blocked: false,
+      priority: "urgent",
+      labels: [],
+      assignee: null,
+      parent: null,
+      blockedBy: [],
+      url: null,
+      updatedAt: null,
+      revision: "r",
+      invalid: null,
+    };
+    const { items } = decodeListResult({
+      items: [item],
+      nextCursor: null,
+      stale: false,
+    });
+    expect(items.map((entry) => [entry.status, entry.priority])).toEqual([["unknown", null]]);
+  });
+
+  it("keeps a link whose thread mode this build does not know", () => {
+    const link = (mode: string) => ({
+      ref,
+      threadId: "thread-1",
+      source: "started",
+      linkedAt: "2026-10-20T09:15:00.000Z",
+      snapshot: {
+        key: "fd-abc123",
+        title: "Ship",
+        status: "todo",
+        url: null,
+        revision: "r",
+        mode,
+        autoStarted: false,
+      },
+      run: null,
+    });
+    const { links } = decodeLinksResult({
+      links: [link("review"), link("scope")],
+      truncated: false,
+    });
+    expect(links.map((entry) => entry.snapshot.mode ?? null)).toEqual([null, "scope"]);
   });
 });

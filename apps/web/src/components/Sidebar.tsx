@@ -3,6 +3,7 @@ import { type EnvironmentId, type ScopedProjectRef } from "@t3tools/contracts";
 import { isAssistantThread } from "@t3tools/shared/fd/assistant";
 import { AssistantEntry } from "~/fd/assistant";
 import { WorkingSpinner } from "~/fd/working-indicator";
+import { ThreadWorkBadge } from "~/fd/work-management";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "./ThreadHoverCard";
 import { CollapsibleSectionHeader } from "./ui/collapsible-section-header";
 import {
@@ -1849,6 +1850,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
               remain visible AND clickable while the row is hovered. Only
               the time/jump label yields to the settle affordance. */}
             {prBadge}
+            <ThreadWorkBadge environmentId={thread.environmentId} threadId={thread.id} />
             {sortable?.isDragging ? (
               dragDestination
             ) : (
@@ -2170,6 +2172,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
               ) : null}
               {terminalStatusIcon}
               {prBadge}
+              <ThreadWorkBadge environmentId={thread.environmentId} threadId={thread.id} />
               {diff ? (
                 <span className="shrink-0 font-mono">
                   <span className="text-diff-addition-foreground">

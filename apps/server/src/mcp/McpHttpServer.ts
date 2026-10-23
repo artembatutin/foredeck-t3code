@@ -3,6 +3,7 @@ import {
   assistantToolLayer,
   assistantToolRefusal,
 } from "../fd/assistant/index.ts";
+import { WorkToolkit, workToolLayer } from "../fd/work-management/index.ts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -885,6 +886,7 @@ export const layer = Layer.mergeAll(
   layerAttachmentToolkit,
   layerProjectRegistration,
   toolkitRegistration(AssistantToolkit, assistantToolLayer),
+  toolkitRegistration(WorkToolkit, workToolLayer),
   layerEnvironmentToolkit,
   layerPreviewControlsRegistration,
   layerWorktreeToolkitRegistration,

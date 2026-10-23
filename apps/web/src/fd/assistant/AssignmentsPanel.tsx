@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useAtomValue } from "@effect/atom-react";
 import type { AssistantOverview, ScopedThreadRef, ThreadId } from "@t3tools/contracts";
@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { useProjects, useThreadShells } from "~/state/entities";
 import { useAtomCommand } from "~/state/use-atom-command";
+import { useLiveRefresh } from "~/hooks/useLiveRefresh";
 import { Button } from "~/components/ui/button";
 import { Badge } from "~/components/ui/badge";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "~/components/ui/popover";
@@ -34,7 +35,7 @@ const statusLabels: Record<string, string> = {
   cancelled: "Cancelled",
 };
 
-function WorkPopover({
+function PortfolioPopover({
   title,
   count,
   icon,
@@ -65,7 +66,7 @@ function WorkPopover({
   );
 }
 
-export function WorkPanel({ threadRef }: { threadRef: ScopedThreadRef }) {
+export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) {
   const read = useAtomCommand(readOverview, { reportFailure: false });
   const control = useAtomCommand(controlAssignment);
   const allowed = useAtomValue(controlAssignment.permissionAtom(threadRef.environmentId));
@@ -79,23 +80,18 @@ export function WorkPanel({ threadRef }: { threadRef: ScopedThreadRef }) {
   const snapshot = loaded?.environmentId === threadRef.environmentId ? loaded.snapshot : null;
   const [error, setError] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
-  useEffect(() => {
-    let alive = true;
-    let timer: ReturnType<typeof setTimeout>;
-    const refresh = async () => {
-      const result = await read({ environmentId: threadRef.environmentId, input: {} });
-      if (!alive) return;
-      setError(result._tag === "Failure");
-      if (result._tag === "Success")
-        setLoaded({ environmentId: threadRef.environmentId, snapshot: result.value });
-      timer = setTimeout(() => void refresh(), 3000);
-    };
-    void refresh();
-    return () => {
-      alive = false;
-      clearTimeout(timer);
-    };
+  const refresh = useCallback(async () => {
+    const environmentId = threadRef.environmentId;
+    const result = await read({ environmentId, input: {} });
+    setError(result._tag === "Failure");
+    if (result._tag === "Success") setLoaded({ environmentId, snapshot: result.value });
   }, [read, threadRef.environmentId]);
+  // The first read happens on mount; later ones follow focus, arrival and the shared live
+  // interval instead of a fixed short loop.
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+  useLiveRefresh(() => void refresh(), { key: threadRef.environmentId });
   const projectName = (id: string) =>
     projects.find((p) => p.id === id && p.environmentId === threadRef.environmentId)?.title ?? id;
   const work = snapshot?.assignments ?? [];
@@ -113,9 +109,12 @@ export function WorkPanel({ threadRef }: { threadRef: ScopedThreadRef }) {
     availableWorkerThread(item, threadRef.environmentId, threads);
 
   return (
-    <section aria-label="Ideas and work" className="flex flex-wrap items-center gap-1 px-3 pt-2">
+    <section
+      aria-label="Ideas and assignments"
+      className="flex flex-wrap items-center gap-1 px-3 pt-2"
+    >
       {ideas.length > 0 ? (
-        <WorkPopover title="Ideas" count={ideas.length} icon={<LightbulbIcon />}>
+        <PortfolioPopover title="Ideas" count={ideas.length} icon={<LightbulbIcon />}>
           {(close) =>
             ideas.map((idea) => {
               const threadId = workerThread(ideaAssignment(idea, work));
@@ -166,10 +165,10 @@ export function WorkPanel({ threadRef }: { threadRef: ScopedThreadRef }) {
               );
             })
           }
-        </WorkPopover>
+        </PortfolioPopover>
       ) : null}
       {work.length > 0 ? (
-        <WorkPopover title="Work" count={work.length} icon={<BriefcaseBusinessIcon />}>
+        <PortfolioPopover title="Assignments" count={work.length} icon={<BriefcaseBusinessIcon />}>
           {(close) =>
             work.map((item) => {
               const threadId = workerThread(item);
@@ -269,7 +268,7 @@ export function WorkPanel({ threadRef }: { threadRef: ScopedThreadRef }) {
                               onClick={async () => {
                                 setBusy(item.assignmentId);
                                 try {
-                                  await control({
+                                  const result = await control({
                                     environmentId: threadRef.environmentId,
                                     input: {
                                       assignmentId: item.assignmentId,
@@ -277,6 +276,8 @@ export function WorkPanel({ threadRef }: { threadRef: ScopedThreadRef }) {
                                       action,
                                     },
                                   });
+                                  // Show the new state now rather than at the next slow refresh.
+                                  if (result._tag === "Success") await refresh();
                                 } finally {
                                   setBusy(null);
                                 }
@@ -300,7 +301,7 @@ export function WorkPanel({ threadRef }: { threadRef: ScopedThreadRef }) {
               );
             })
           }
-        </WorkPopover>
+        </PortfolioPopover>
       ) : null}
       {error ? (
         <Popover>

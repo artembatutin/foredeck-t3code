@@ -230,6 +230,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["name icon emoji image checkout remove delete"],
   },
   {
+    id: "work-sources",
+    title: "Work sources",
+    to: "/settings/projects",
+    scope: "project",
+    searchTerms: ["work tasks markdown github issues jira tickets backlog token"],
+  },
+  {
     id: "default-model",
     title: "Default model",
     to: "/settings/general",

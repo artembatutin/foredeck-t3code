@@ -1,4 +1,4 @@
 export { AssistantEntry } from "./AssistantEntry";
 export { AssistantVoiceControls } from "./AssistantVoiceControls";
-export { WorkPanel } from "./WorkPanel";
+export { AssignmentsPanel } from "./AssignmentsPanel";
 export { VoiceSettings } from "./VoiceSettings";

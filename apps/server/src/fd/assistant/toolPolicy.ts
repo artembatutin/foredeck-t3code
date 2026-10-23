@@ -12,6 +12,7 @@ const managedOperations = new Set([
   "t3_thread_send_attachments",
   "t3_pending_request_respond",
   "t3_thread_interrupt",
+  "work_start_thread",
 ]);
 const ToolCall = Schema.Struct({
   jsonrpc: Schema.Literal("2.0"),
@@ -39,7 +40,7 @@ export function assistantToolRefusal(threadId: string | undefined, body: unknown
       content: [
         {
           type: "text",
-          text: "Use assistant_assign, assistant_control or assistant_answer. Project assistant work must pass through the durable queue and its permission checks.",
+          text: "Use assistant_assign, assistant_control or assistant_answer. Project assistant work must pass through the durable queue and its permission checks. Work items are started by the owner from Work; read and update them with the work_* tools.",
         },
       ],
     },

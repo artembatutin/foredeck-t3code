@@ -42,7 +42,7 @@ configuration must match the agreed brief. Looper requires full-access execution
 cannot implement Foredeck's supervised approval mode. Missing prerequisites block that
 assignment without switching executors. Looper stops after its current step.
 
-Use **Ideas** or **Work** to inspect saved context, priorities, work states and evidence.
+Use **Ideas** or **Assignments** to inspect saved context, priorities, assignment states and evidence.
 These controls appear once there is something saved. Open a worker separately to keep your place. Questions and
 results appear quietly; they do not start a manager turn or interrupt another discussion.
 Ask the assistant to review pending results when you are ready.

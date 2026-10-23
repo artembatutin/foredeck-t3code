@@ -60,7 +60,6 @@ export const workManagementCapability = (input: {
  * server's feature test asserts its registered adapters match these kinds.
  */
 export const WORK_MANAGEMENT_CAPABILITY: WorkManagementCapability = workManagementCapability({
-  sourceKinds: ["markdown"],
-  // Thread starts arrive with the execution phase; until then the handler refuses them.
-  features: ["sources", "items.write", "comments", "links", "people"],
+  sourceKinds: ["markdown", "github", "jira"],
+  features: ["sources", "items.write", "comments", "links", "threads.start", "people"],
 });

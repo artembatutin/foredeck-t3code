@@ -1,3 +1,4 @@
+import { WorkCommentSheet, WorkItemScreen, WorkListScreen } from "./fd/work-management";
 import { PullRequestGuideStopScreen } from "./features/pull-requests/guide/PullRequestGuideScreen";
 import { PullRequestInlineCommentScreen } from "./features/pull-requests/PullRequestInlineCommentScreen";
 import { PullRequestDiscussionScreen } from "./features/pull-requests/PullRequestDiscussionScreen";
@@ -571,6 +572,7 @@ const NewTaskSheetStack = createNativeStackNavigator({
 // not flip the sidebar in or change the active thread.
 const WORKSPACE_OVERLAY_ROUTES = new Set([
   "PullRequestReview",
+  "WorkComment",
   "PullRequestInlineComment",
   "ConnectOnboarding",
   "Connections",
@@ -782,6 +784,27 @@ const RootStackConfig = createWorkspaceStackNavigator({
         ...FORM_SHEET_PRESENTATION_OPTIONS,
         sheetAllowedDetents: [0.75, 0.92],
         sheetGrabberVisible: true,
+        headerShown: false,
+      },
+    }),
+    WorkList: createNativeStackScreen({
+      screen: WorkListScreen,
+      linking: "work",
+      options: SOLID_HEADER_OPTIONS,
+    }),
+    WorkItem: createNativeStackScreen({
+      screen: WorkItemScreen,
+      linking: "work/:environmentId/:projectId/:sourceId/:itemId",
+      options: SOLID_HEADER_OPTIONS,
+    }),
+    WorkComment: createNativeStackScreen({
+      screen: WorkCommentSheet,
+      options: {
+        ...(Platform.OS === "android"
+          ? { presentation: "fullScreenModal" as const }
+          : FORM_SHEET_PRESENTATION_OPTIONS),
+        sheetAllowedDetents: Platform.OS === "android" ? undefined : [0.6, 0.92],
+        sheetGrabberVisible: Platform.OS !== "android",
         headerShown: false,
       },
     }),

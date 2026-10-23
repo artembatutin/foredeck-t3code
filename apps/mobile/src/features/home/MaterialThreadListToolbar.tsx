@@ -12,6 +12,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { MenuAction } from "@react-native-menu/menu";
 
 import { AndroidHeaderIconButton } from "../../components/AndroidScreenHeader";
+import { useWorkHeaderAction } from "../../fd/work-management";
 import { CompactBrandTitle } from "../../components/CompactBrandTitle";
 import { MaterialFloatingActionButton } from "../../components/MaterialFloatingActionButton";
 import { AndroidAnchoredMenu } from "../../components/AndroidAnchoredMenu";
@@ -36,6 +37,7 @@ export function MaterialThreadListToolbar(props: {
   readonly onLayout?: (event: LayoutChangeEvent) => void;
   readonly onRequestVisibility?: () => void;
 }) {
+  const workAction = useWorkHeaderAction();
   const insets = useSafeAreaInsets();
   const navigation = useNavigation();
   const workspace = useWorkspaceTabs();
@@ -130,6 +132,13 @@ export function MaterialThreadListToolbar(props: {
                 icon="magnifyingglass"
                 onPress={openSearch}
               />
+              {workAction ? (
+                <AndroidHeaderIconButton
+                  accessibilityLabel="Work"
+                  icon={{ ios: "checklist", android: "check" }}
+                  onPress={workAction.onPress}
+                />
+              ) : null}
               <AndroidHeaderIconButton
                 accessibilityLabel="Open settings"
                 icon="gearshape"

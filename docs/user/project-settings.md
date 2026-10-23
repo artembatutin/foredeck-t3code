@@ -77,6 +77,14 @@ unsupported choices before sending. Supported local integrations are Codex, Clau
 and Muse; OpenCode connected to an external server is unsupported. Update both server and
 clients before using multi-repository projects.
 
+## Work sources
+
+Open the project's settings and use **Work sources** to add where the project's
+[Work](./work.md) items come from. **Test** checks a source without changing it,
+**Disconnect** hides it and keeps its thread links, and **Restore** brings it back.
+Adding a source for the same folder or repository again restores the disconnected
+one instead of creating a second.
+
 ## Worktree branch names
 
 In **Settings → Source Control → Worktree branch naming**, choose a static prefix,

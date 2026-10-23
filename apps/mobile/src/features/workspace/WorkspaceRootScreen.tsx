@@ -7,6 +7,8 @@ import { SafeAreaInsetsContext, useSafeAreaInsets } from "react-native-safe-area
 import { CompactBrandTitle } from "../../components/CompactBrandTitle";
 import { AndroidScreenHeader } from "../../components/AndroidScreenHeader";
 import { NativeStackScreenOptions } from "../../native/StackHeader";
+import { useWorkHeaderAction } from "../../fd/work-management";
+import { withNativeGlassHeaderItem } from "../layout/native-glass-header-items";
 import { NativePrimaryColumnContext } from "../../native/v5-workspace-context";
 import {
   useNativeColumnLayoutMetrics,
@@ -53,6 +55,7 @@ function WorkspaceRootTitle(props: {
 
 function WorkspaceRootContent() {
   const navigation = useNavigation();
+  const workAction = useWorkHeaderAction();
   const { width: windowWidth } = useWindowDimensions();
   const { layout } = useAdaptiveWorkspaceLayout();
   const primaryColumn = use(NativePrimaryColumnContext);
@@ -104,11 +107,30 @@ function WorkspaceRootContent() {
       >
         {Platform.OS === "ios" ? (
           <NativeStackScreenOptions
-            optionsVersion={[state.selectedTab, state.selectionRevision, width, sidebarNavigation]}
+            optionsVersion={[
+              state.selectedTab,
+              state.selectionRevision,
+              width,
+              sidebarNavigation,
+              workAction !== null,
+            ]}
             options={{
               title: TAB_TITLES[state.selectedTab],
               headerShown: true,
               unstable_headerLeftItems: () => [],
+              unstable_headerRightItems: () =>
+                workAction === null
+                  ? []
+                  : [
+                      withNativeGlassHeaderItem({
+                        accessibilityLabel: "Work",
+                        icon: { type: "sfSymbol", name: "checklist" } as const,
+                        identifier: "home-work",
+                        label: "",
+                        onPress: workAction.onPress,
+                        type: "button",
+                      }),
+                    ],
               headerTitle: renderHeaderTitle,
             }}
           />

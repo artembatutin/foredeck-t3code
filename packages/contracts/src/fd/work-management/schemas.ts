@@ -126,12 +126,46 @@ export const WorkSourceConfig = Schema.Union([
 ]);
 export type WorkSourceConfig = typeof WorkSourceConfig.Type;
 
-export const WorkSourceHealthStatus = Schema.Literals([
-  "ok",
-  "auth_required",
-  "rate_limited",
+/**
+ * A literal set a newer server may grow: a value this build does not know decodes as
+ * `fallback` instead of failing the payload around it. Encoding is unchanged.
+ */
+const literalsOr = <const L extends ReadonlyArray<string>>(literals: L, fallback: L[number]) => {
+  const known = Schema.is(Schema.Literals(literals));
+  return Schema.String.pipe(
+    Schema.decodeTo(
+      Schema.Literals(literals),
+      SchemaTransformation.transform<L[number], string>({
+        decode: (value) => (known(value) ? value : fallback),
+        encode: (value) => value,
+      }),
+    ),
+  );
+};
+
+/**
+ * A list of literals a newer server may add to: members this build does not know are left out.
+ * Plain strings on the wire, so it nests inside a forward-compatible list element (where nested
+ * `ForwardCompatibleArray` holes would drop the whole element).
+ */
+const knownLiterals = <const L extends ReadonlyArray<string>>(literals: L) => {
+  const known = Schema.is(Schema.Literals(literals));
+  return Schema.Array(Schema.String).pipe(
+    Schema.decodeTo(
+      Schema.Array(Schema.Literals(literals)),
+      SchemaTransformation.transform<ReadonlyArray<L[number]>, ReadonlyArray<string>>({
+        decode: (values) => values.filter(known),
+        encode: (values) => values,
+      }),
+    ),
+  );
+};
+
+/** A health this build does not know reads as a generic error the owner can look into. */
+export const WorkSourceHealthStatus = literalsOr(
+  ["ok", "auth_required", "rate_limited", "error"],
   "error",
-]);
+);
 export type WorkSourceHealthStatus = typeof WorkSourceHealthStatus.Type;
 
 export const WorkSourceHealth = Schema.Struct({
@@ -142,6 +176,15 @@ export const WorkSourceHealth = Schema.Struct({
 export type WorkSourceHealth = typeof WorkSourceHealth.Type;
 
 const WORK_NATIVE_STATUSES = ["todo", "in_progress", "done", "cancelled"] as const;
+const WORK_ITEM_FIELDS = [
+  "title",
+  "body",
+  "priority",
+  "labels",
+  "assignee",
+  "parent",
+  "blockedBy",
+] as const;
 
 /** Statuses Work can write. `blocked` is derived from open blockers, never stored. */
 export const WorkNativeStatus = Schema.Literals(WORK_NATIVE_STATUSES);
@@ -170,25 +213,19 @@ export type WorkPriority = typeof WorkPriority.Type;
 export const WorkPerson = Schema.Struct({ id: Schema.String, label: Schema.String });
 export type WorkPerson = typeof WorkPerson.Type;
 
-export const WorkItemField = Schema.Literals([
-  "title",
-  "body",
-  "priority",
-  "labels",
-  "assignee",
-  "parent",
-  "blockedBy",
-]);
+export const WorkItemField = Schema.Literals(WORK_ITEM_FIELDS);
 export type WorkItemField = typeof WorkItemField.Type;
 
 /** What a source can do, declared per adapter rather than probed. Surfaces hide the rest. */
 export const WorkSourceCapabilities = Schema.Struct({
   create: Schema.Boolean,
   // Literal sets inside list payloads grow over time; an unknown member drops its entry, never
-  // the response.
-  statuses: ForwardCompatibleArray(WorkNativeStatus),
-  fields: ForwardCompatibleArray(WorkItemField),
-  comments: Schema.Literals(["none", "add"]),
+  // the source or the response.
+  statuses: knownLiterals(WORK_NATIVE_STATUSES),
+  fields: knownLiterals(WORK_ITEM_FIELDS),
+  // A comment mode this build does not know offers no comment control rather than dropping the
+  // whole source.
+  comments: literalsOr(["none", "add"], "none"),
   transitions: Schema.Boolean,
   people: Schema.Boolean,
 });

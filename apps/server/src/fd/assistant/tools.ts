@@ -45,7 +45,7 @@ export const AssistantToolkit = Toolkit.make(
   Tool.make("assistant_revise_brief", {
     ...common,
     description:
-      "Persist an agreed project brief or correction. Save goals, criteria, constraints, questions, priority rank/reason and explicit execution authorization. Ask about ambiguous priority. A change does not interrupt workers; queued work with changed scope needs a new assignment. Markdown notes are not authoritative.",
+      "Persist an agreed project brief or correction. Save goals, criteria, constraints, questions, priority rank/reason and explicit execution authorization. Ask about ambiguous priority. A change does not interrupt workers; queued work with changed scope needs a new assignment.",
     parameters: Schema.Struct({
       projectId: ProjectId,
       ideaId: TrimmedNonEmptyString,

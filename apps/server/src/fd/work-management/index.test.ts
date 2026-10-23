@@ -1,11 +1,16 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { WORK_MANAGEMENT_CAPABILITY } from "@t3tools/contracts/fd/work-management";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
+import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
+import { FetchHttpClient } from "effect/http";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
+import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
+import * as ServerSettings from "../../serverSettings.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import { layerAdapters, layerLive, layerPersistence, WorkService } from "./index.ts";
 import { WorkSourceAdapterRegistry } from "./sources/WorkSourceAdapter.ts";
@@ -22,7 +27,16 @@ describe("work-management composition", () => {
       for (const kind of registry.kinds) {
         assert.strictEqual(registry.get(kind)?.kind, kind);
       }
-    }).pipe(Effect.provide(layerAdapters.pipe(Layer.provide(NodeServices.layer)))),
+    }).pipe(
+      Effect.provide(
+        layerAdapters.pipe(
+          Layer.provide(NodeServices.layer),
+          Layer.provide(Layer.mock(GitHubApi.GitHubApi)({})),
+          Layer.provide(SourceControlRateLimit.layer),
+          Layer.provide(FetchHttpClient.layer),
+        ),
+      ),
+    ),
   );
 
   it.effect("builds the live service over the persistence layer", () =>
@@ -38,6 +52,11 @@ describe("work-management composition", () => {
           Layer.provideMerge(SqlitePersistence.layerMemory),
           Layer.provide(Layer.mock(ProjectStore.ProjectStoreV2)({})),
           Layer.provide(Layer.mock(ServerSecretStore.ServerSecretStore)({})),
+          Layer.provide(Layer.mock(ThreadLaunch.ThreadLaunchService)({})),
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provide(Layer.mock(GitHubApi.GitHubApi)({})),
+          Layer.provide(SourceControlRateLimit.layer),
+          Layer.provide(FetchHttpClient.layer),
           Layer.provide(NodeServices.layer),
         ),
       ),
