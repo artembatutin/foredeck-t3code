@@ -1,3 +1,4 @@
+import { copilotUsageReader } from "../fd/copilot-usage/index.ts";
 import {
   officialAcpRegistryIconUrlForAgentId,
   ProviderDriverKind,
@@ -1109,10 +1110,13 @@ export const makeAcpRegistryDriver = <Settings extends AcpRegistrySettings>(opti
     }),
 });
 
-export const AcpRegistryDriver = makeAcpRegistryDriver({
-  driverKind: DRIVER_KIND,
-  displayName: "ACP Registry",
-  configSchema: AcpRegistrySettings,
-  defaultConfig: () => decodeSettings({}),
-  adapterDriver: AcpRegistryAdapterV2Driver,
-});
+export const AcpRegistryDriver = {
+  ...makeAcpRegistryDriver({
+    driverKind: DRIVER_KIND,
+    displayName: "ACP Registry",
+    configSchema: AcpRegistrySettings,
+    defaultConfig: () => decodeSettings({}),
+    adapterDriver: AcpRegistryAdapterV2Driver,
+  }),
+  usage: copilotUsageReader,
+};

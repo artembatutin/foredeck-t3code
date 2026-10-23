@@ -6,8 +6,7 @@ desktop when the terminal is not focused. Customize `usage.open` in
 
 ## Understand your usage
 
-**Usage** combines Codex, Claude Code, Grok Build, OpenCode, Antigravity, Pi, and Cursor history
-from your connected environments. It shows token use, cache savings, model breakdowns, and estimated API-equivalent
+**Usage** combines provider history, including GitHub Copilot CLI, from your connected environments. It shows token use, cache savings, model breakdowns, and estimated API-equivalent
 cost, split by token type and by speed. These estimates are not your subscription bill.
 **Premium** is what Fast and Ultrafast requests cost above standard rates. Cost that cannot be
 split, such as a provider-reported cost for a model without public rates, shows as **Other**.
@@ -37,6 +36,13 @@ variable to the same directory. Pi includes recorded tool and summary costs unde
 Use absolute paths or `~/` paths in the account's environment settings; relative environment paths
 depend on each project's working directory and cannot be reliably discovered by Usage. Accounts
 sharing a history directory count once.
+
+GitHub Copilot CLI usage is included for configured Copilot ACP providers. History comes from
+`~/.copilot/session-state`, or `session-state` under the provider’s `COPILOT_HOME`.
+Totals appear when Copilot saves a usage checkpoint or closes a session; older CLI versions may
+only save them on close. Usage is dated by the saved snapshot. Dollar costs are API-equivalent
+estimates, not your Copilot bill or premium-request balance. In chat, the context indicator uses
+live Copilot telemetry and shows session AI credits when Copilot reports them.
 
 When your app and server support different providers, usage totals may cover only the providers
 your app understands. Update the app to include newly supported providers.

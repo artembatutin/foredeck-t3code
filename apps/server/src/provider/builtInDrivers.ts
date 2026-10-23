@@ -88,7 +88,8 @@ export type BuiltInUsageReadersEnv =
   | ProviderUsageReaderEnv<typeof AntigravityDriver>
   | ProviderUsageReaderEnv<typeof CursorDriver>
   | ProviderUsageReaderEnv<typeof PiDriver>
-  | ProviderUsageReaderEnv<typeof DevinDriver>;
+  | ProviderUsageReaderEnv<typeof DevinDriver>
+  | ProviderUsageReaderEnv<typeof AcpRegistryDriver>;
 
 /**
  * The drivers that keep usage history, in the order the usage page reads
@@ -102,6 +103,7 @@ export const BUILT_IN_USAGE_DRIVERS: ReadonlyArray<
   CodexDriver,
   GrokDriver,
   PiDriver,
+  AcpRegistryDriver,
   OpenCodeDriver,
   AntigravityDriver,
   CursorDriver,

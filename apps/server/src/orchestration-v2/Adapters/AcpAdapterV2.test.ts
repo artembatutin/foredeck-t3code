@@ -1679,6 +1679,20 @@ describe("AcpAdapterV2", () => {
                     yield* raw("subagent.completed", { toolCallId: task }, agent);
                   }
                   yield* raw("subagent.completed", { toolCallId: "task-bg" }, "agent-bg");
+                  // Request metrics can precede the first context-window measurement.
+                  yield* raw("assistant.usage", {
+                    inputTokens: 1100,
+                    outputTokens: 100,
+                    cacheReadTokens: 900,
+                    cost: 3,
+                  });
+                  yield* raw("session.usage_checkpoint", { totalNanoAiu: 2500000000 });
+                  yield* raw("session.usage_info", { currentTokens: 1200, tokenLimit: 128000 });
+                  yield* raw(
+                    "session.usage_info",
+                    { currentTokens: 50, tokenLimit: 100 },
+                    "agent-bg",
+                  );
                   yield* chunk("all done.");
                   return { stopReason: "end_turn" as const };
                 }),
@@ -1731,6 +1745,19 @@ describe("AcpAdapterV2", () => {
           ),
         );
       assert.deepEqual([...lastText(threadId).values()].join(""), "Launching all done.");
+      const usageUpdates = events.flatMap((event) =>
+        event.type === "provider_thread.updated" && event.providerThread.contextUsage
+          ? [event.providerThread.contextUsage]
+          : [],
+      );
+      assert.deepEqual(usageUpdates.at(-1), {
+        usedTokens: 1200,
+        maxTokens: 128000,
+        lastInputTokens: 1100,
+        lastOutputTokens: 100,
+        lastCachedInputTokens: 900,
+        cost: { amount: 2.5, currency: "AI credits", scope: "session" },
+      });
       const tasks = new Map(
         events.flatMap((event) =>
           event.type === "subagent.updated"

@@ -272,6 +272,101 @@ function cursorSource(summary: { readonly sources: readonly UsageSource[] }) {
 }
 
 describe("UsageService", () => {
+  it.live(
+    "includes Copilot ACP history in priced summaries without recounting resumed sessions",
+    () =>
+      Effect.gen(function* () {
+        const { home, settings } = yield* setup;
+        const dir = NodePath.join(home, "copilot", "session-state", "session-one");
+        const file = NodePath.join(dir, "events.jsonl");
+        yield* Effect.promise(() => NodeFSP.mkdir(dir, { recursive: true }));
+        const snapshot = (id: string, inputTokens: number) =>
+          JSON.stringify({
+            id,
+            type: "session.shutdown",
+            timestamp: "2026-08-01T10:00:00Z",
+            data: {
+              modelMetrics: {
+                "priced-model": {
+                  usage: { inputTokens, outputTokens: 5, cacheReadTokens: 20, cacheWriteTokens: 2 },
+                  requests: { cost: 3 },
+                  totalNanoAiu: 9999999999,
+                },
+              },
+            },
+          }) + "\n";
+        yield* Effect.promise(() =>
+          NodeFSP.writeFile(
+            file,
+            JSON.stringify({ type: "session.start", data: { sessionId: "session-one" } }) +
+              "\n" +
+              snapshot("one", 32),
+          ),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* UsageService.make;
+          const summary = yield* service.readSummary(WINDOW);
+          const bucket = summary.buckets.find((entry) => entry.provider === "copilot");
+          assert.isDefined(bucket);
+          assert.strictEqual(bucket!.costSource, "modelPriced");
+          assert.approximately(bucket!.costUsd, 0.044, 0.000001);
+          assert.strictEqual(totalTokens(bucket!.totals), 37);
+          assert.strictEqual(
+            summary.sources.find((source) => source.fingerprint.provider === "copilot")?.status,
+            "ok",
+          );
+          yield* Effect.promise(() =>
+            NodeFSP.appendFile(file, snapshot("two", 42) + snapshot("three", 42)),
+          );
+          const updated = yield* service.readSummary(WINDOW);
+          const decoded = yield* decodeUsageSummary(updated);
+          const merged = mergeUsage(
+            [
+              {
+                environmentId: EnvironmentId.make("copilot-host"),
+                label: "Host",
+                summary: decoded,
+              },
+            ],
+            decoded.contractVersion,
+          );
+          assert.strictEqual(
+            merged.providers.find((entry) => entry.provider === "copilot")?.totalTokens,
+            47,
+          );
+        }).pipe(
+          Effect.provide(
+            layerService({
+              prefix: "copilot-history",
+              home,
+              settings: {
+                ...settings,
+                providerInstances: {
+                  ...settings.providerInstances,
+                  [ProviderInstanceId.make("copilot")]: {
+                    driver: ProviderDriverKind.make("acpRegistry"),
+                    config: { agentId: "github-copilot-cli" },
+                  },
+                  [ProviderInstanceId.make("copilot-local")]: {
+                    driver: ProviderDriverKind.make("acpRegistry"),
+                    config: { source: "local", commandPath: "/bin/copilot" },
+                  },
+                },
+              },
+              environment: { COPILOT_HOME: NodePath.join(home, "copilot") },
+              ratesDocument: {
+                "priced-model": {
+                  input_cost_per_token: 0.001,
+                  output_cost_per_token: 0.002,
+                  cache_read_input_token_cost: 0.001,
+                  cache_creation_input_token_cost: 0.002,
+                },
+              },
+            }),
+          ),
+        );
+      }).pipe(Effect.scoped),
+  );
   it.live("includes local CLI history in priced, decoded and merged usage summaries", () =>
     Effect.gen(function* () {
       const { home, settings } = yield* setup;

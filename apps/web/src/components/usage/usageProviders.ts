@@ -51,6 +51,11 @@ export const PROVIDER_PRESENTATION = {
     color: "#b88631",
     driverKind: ProviderDriverKind.make("devin"),
   },
+  copilot: {
+    label: "GitHub Copilot",
+    color: "#9b70d0",
+    driverKind: ProviderDriverKind.make("acpRegistry"),
+  },
 } satisfies Record<UsageProviderKind, UsageProviderPresentation>;
 
 /** Stable provider reading order across charts, summaries, tables, and hover rows. */

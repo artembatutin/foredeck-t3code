@@ -7,6 +7,8 @@ import type {
   AcpAdapterV2SubagentUpdate,
 } from "@t3tools/provider-acp/server/adapter";
 
+import { copilotUsageEvents, makeCopilotUsageReporter } from "../fd/copilot-usage/index.ts";
+
 // Copilot CLI streams subagent text as plain `agent_message_chunk`s on the
 // root session. Only its opt-in raw event feed says who wrote a chunk: each
 // chunk is preceded by an `assistant.*_delta` carrying the spawning `task`
@@ -16,10 +18,11 @@ import type {
 const COPILOT_META_KEY = "github.com/copilot";
 const COPILOT_SESSION_EVENT = "github.com/copilot/sessionEvent";
 
-/** Subscribes to the raw events subagent routing needs, and nothing else. */
+/** Subscribes to subagent attribution and native usage telemetry. */
 export const copilotClientCapabilitiesMeta = {
   [COPILOT_META_KEY]: {
     events: [
+      ...copilotUsageEvents,
       "subagent.started",
       "subagent.completed",
       "subagent.failed",
@@ -68,47 +71,53 @@ export function makeCopilotSubagentRouting() {
     }
   };
 
-  const registerExtensions = (context: AcpAdapterV2ExtensionContext) =>
-    context.runtime.handleExtNotification(COPILOT_SESSION_EVENT, CopilotSessionEvent, (event) => {
-      const data = event.data ?? {};
-      const task = typeof data.parentToolCallId === "string" ? data.parentToolCallId : undefined;
-      switch (event.type) {
-        case "assistant.message_delta":
-        case "assistant.reasoning_delta": {
-          if (typeof data.deltaContent !== "string") return Effect.void;
-          session(event.sessionId).delta = {
-            kind: event.type,
-            text: data.deltaContent,
-            ...(task === undefined ? {} : { task }),
-          };
-          return Effect.void;
-        }
-        case "subagent.started": {
-          if (event.agentId !== undefined && typeof data.toolCallId === "string") {
-            session(event.sessionId).taskByAgentId.set(event.agentId, data.toolCallId);
+  const registerExtensions = (context: AcpAdapterV2ExtensionContext) => {
+    const reportUsage = makeCopilotUsageReporter(context.reportUsage);
+    return context.runtime.handleExtNotification(
+      COPILOT_SESSION_EVENT,
+      CopilotSessionEvent,
+      (event) => {
+        const data = event.data ?? {};
+        const task = typeof data.parentToolCallId === "string" ? data.parentToolCallId : undefined;
+        switch (event.type) {
+          case "assistant.message_delta":
+          case "assistant.reasoning_delta": {
+            if (typeof data.deltaContent !== "string") return Effect.void;
+            session(event.sessionId).delta = {
+              kind: event.type,
+              text: data.deltaContent,
+              ...(task === undefined ? {} : { task }),
+            };
+            return Effect.void;
           }
-          return Effect.void;
-        }
-        case "subagent.completed":
-        case "subagent.failed": {
-          const current = sessions.get(event.sessionId);
-          if (current !== undefined && event.agentId !== undefined) {
-            current.taskByAgentId.delete(event.agentId);
-            release(event.sessionId, current);
+          case "subagent.started": {
+            if (event.agentId !== undefined && typeof data.toolCallId === "string") {
+              session(event.sessionId).taskByAgentId.set(event.agentId, data.toolCallId);
+            }
+            return Effect.void;
           }
-          if (typeof data.toolCallId !== "string") return Effect.void;
-          // Background tasks end only here; their tool call settles at launch.
-          return context.finishSubagent({
-            sessionId: event.sessionId,
-            childSessionId: childSessionId(data.toolCallId),
-            status: event.type === "subagent.failed" ? "failed" : "completed",
-            result: typeof data.error === "string" ? data.error : null,
-          });
+          case "subagent.completed":
+          case "subagent.failed": {
+            const current = sessions.get(event.sessionId);
+            if (current !== undefined && event.agentId !== undefined) {
+              current.taskByAgentId.delete(event.agentId);
+              release(event.sessionId, current);
+            }
+            if (typeof data.toolCallId !== "string") return Effect.void;
+            // Background tasks end only here; their tool call settles at launch.
+            return context.finishSubagent({
+              sessionId: event.sessionId,
+              childSessionId: childSessionId(data.toolCallId),
+              status: event.type === "subagent.failed" ? "failed" : "completed",
+              result: typeof data.error === "string" ? data.error : null,
+            });
+          }
+          default:
+            return reportUsage(event);
         }
-        default:
-          return Effect.void;
-      }
-    });
+      },
+    );
+  };
 
   /** Moves a subagent's chunks and tool calls onto its own child session. */
   const normalizeSessionUpdate = (

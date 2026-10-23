@@ -1,3 +1,4 @@
+import { isCopilotSettings } from "../fd/copilot-usage/index.ts";
 import {
   normalizeDevinSessionUpdate,
   normalizeDevinToolCall,
@@ -205,10 +206,7 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
     options.settings.source === "local" ? `local:${options.instanceId}` : registryAgentId;
   const isDevin = registryAgentId === "devin";
   // Local installs launch the `copilot` binary directly with no registry id.
-  const isCopilot =
-    registryAgentId === "github-copilot-cli" ||
-    (options.settings.source === "local" &&
-      /^copilot(\.exe|\.cmd)?$/i.test(options.settings.commandPath.split(/[\\/]/).pop() ?? ""));
+  const isCopilot = isCopilotSettings(options.settings);
   const copilotRouting = isCopilot ? makeCopilotSubagentRouting() : undefined;
   const flavor: AcpAdapterV2Flavor = {
     driver: options.driverKind ?? ACP_REGISTRY_PROVIDER,

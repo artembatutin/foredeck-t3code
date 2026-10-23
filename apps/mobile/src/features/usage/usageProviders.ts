@@ -14,6 +14,7 @@ export const PROVIDER_ORDER: readonly UsageProviderKind[] = [
   "antigravity",
   "pi",
   "devin",
+  "copilot",
 ];
 
 export const PROVIDER_LABEL: Record<UsageProviderKind, string> = {
@@ -25,6 +26,7 @@ export const PROVIDER_LABEL: Record<UsageProviderKind, string> = {
   antigravity: "Antigravity",
   pi: "Pi",
   devin: "Devin CLI",
+  copilot: "GitHub Copilot",
 };
 
 /**
@@ -42,6 +44,7 @@ export function useProviderColors(): Record<UsageProviderKind, string> {
     antigravity: "#8c7bd1",
     pi: "#4d9f8a",
     devin: "#b88631",
+    copilot: "#9b70d0",
   };
 }
 
