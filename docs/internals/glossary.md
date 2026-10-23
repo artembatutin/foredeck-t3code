@@ -52,6 +52,15 @@ Terms whose meaning matters across T3 Code. Architecture and lifecycle constrain
 | Pull request sync    | The worker that refreshes each distinct linked review once per cadence and discovers native stack layers. Explicit refreshes and failed stack reads trigger another read.                |
 | Current pull request | The link used by single-review controls and older clients. Open work takes precedence; a completed single chain points at its top layer. Unrelated terminal links use the latest update. |
 
+## Work
+
+| Term        | Meaning                                                                                                                       |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Work source | A configured place Work items come from in one project: a Markdown task folder, a GitHub repository or a Jira project.        |
+| Work item   | One task, issue or ticket from a Work source, identified by its source and the source's own key.                              |
+| Work link   | A Work-owned association between a Work item and a thread, with a snapshot of the item at link time and the last run outcome. |
+| Revision    | An item's opaque version token. Title and body writes carry the revision they were based on and fail as stale otherwise.      |
+
 ## Composer context
 
 | Term                 | Meaning                                                                                                                             |
