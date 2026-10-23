@@ -75,7 +75,7 @@ describe("workManagementSupport", () => {
 
   it("advertises only the shipped source kinds and features", () => {
     expect(WORK_MANAGEMENT_CAPABILITY.version).toBe(1);
-    expect(WORK_MANAGEMENT_CAPABILITY.sourceKinds).toEqual(["markdown", "github"]);
+    expect(WORK_MANAGEMENT_CAPABILITY.sourceKinds).toEqual(["markdown", "github", "jira"]);
     const support = workManagementSupport(withWork(WORK_MANAGEMENT_CAPABILITY));
     expect(support?.features).toEqual(
       new Set(["sources", "items.write", "comments", "links", "threads.start", "people"]),

@@ -6,6 +6,7 @@ import * as WorkLinkStore from "./persistence/WorkLinkStore.ts";
 import * as WorkMigrations from "./persistence/WorkMigrations.ts";
 import * as WorkSourceStore from "./persistence/WorkSourceStore.ts";
 import * as GitHubIssuesSource from "./sources/github/GitHubIssuesSource.ts";
+import * as JiraSource from "./sources/jira/JiraSource.ts";
 import * as MarkdownSource from "./sources/markdown/MarkdownSource.ts";
 import { layerRegistry } from "./sources/WorkSourceAdapter.ts";
 import * as WorkService from "./WorkService.ts";
@@ -33,7 +34,7 @@ export const layerPersistence = Layer.mergeAll(WorkSourceStore.layer, WorkLinkSt
  * same kinds; `index.test.ts` keeps the two in step.
  */
 export const layerAdapters = Layer.unwrap(
-  Effect.all([MarkdownSource.make, GitHubIssuesSource.make()]).pipe(
+  Effect.all([MarkdownSource.make, GitHubIssuesSource.make(), JiraSource.make()]).pipe(
     Effect.map((adapters) => layerRegistry(adapters)),
   ),
 );

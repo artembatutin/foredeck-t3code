@@ -60,6 +60,6 @@ export const workManagementCapability = (input: {
  * server's feature test asserts its registered adapters match these kinds.
  */
 export const WORK_MANAGEMENT_CAPABILITY: WorkManagementCapability = workManagementCapability({
-  sourceKinds: ["markdown", "github"],
+  sourceKinds: ["markdown", "github", "jira"],
   features: ["sources", "items.write", "comments", "links", "threads.start", "people"],
 });
