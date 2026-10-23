@@ -2231,6 +2231,7 @@ function OpenCommandPaletteDialog(props: {
 
   actionItems.push(
     ...workPaletteActions({
+      environments,
       activeThread:
         activeThread === null ? null : scopeThreadRef(activeThread.environmentId, activeThread.id),
       openWork: async () => {

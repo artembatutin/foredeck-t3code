@@ -1,21 +1,30 @@
-import type { ScopedThreadRef } from "@t3tools/contracts";
+import { workSupport } from "@t3tools/client-runtime/fd/work-management";
+import type { EnvironmentId, ScopedThreadRef, ServerConfig } from "@t3tools/contracts";
 import { LinkIcon, ListChecksIcon } from "lucide-react";
 
 import type { CommandPaletteActionItem } from "../../components/CommandPalette.logic";
 import { ITEM_ICON_CLASS } from "../../components/CommandPalette.logic";
 import { openLinkWorkItemDialog } from "./LinkWorkItemDialog";
-import { workSupportAtom } from "./state";
-import { appAtomRegistry } from "../../rpc/atomRegistry";
 
 /**
  * The palette's Work actions: open the page from anywhere, and link an item to the active
  * thread when its environment offers Work.
  */
 export function workPaletteActions(input: {
+  /** The palette's own environments; their server configs say who offers Work. */
+  readonly environments: ReadonlyArray<{
+    readonly environmentId: EnvironmentId;
+    readonly serverConfig?: Pick<ServerConfig, "environment"> | null | undefined;
+  }>;
   readonly activeThread: ScopedThreadRef | null;
   readonly openWork: () => Promise<void>;
 }): ReadonlyArray<CommandPaletteActionItem> {
-  const support = appAtomRegistry.get(workSupportAtom);
+  const support = new Map(
+    input.environments.flatMap((environment) => {
+      const offered = workSupport(environment.serverConfig);
+      return offered === undefined ? [] : [[environment.environmentId, offered] as const];
+    }),
+  );
   if (support.size === 0) return [];
   const actions: Array<CommandPaletteActionItem> = [
     {

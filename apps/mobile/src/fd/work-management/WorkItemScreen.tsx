@@ -110,7 +110,9 @@ function LoadedItem({
     setError(null);
     const result = await setStatus({
       environmentId,
-      input: { ref: item.ref, ...input, expectedRevision: item.revision },
+      // No revision guard: a status write is idempotent, and an Undo toast outlives the
+      // revision it was created with.
+      input: { ref: item.ref, ...input },
     });
     if (result._tag === "Success") return true;
     const failure = Option.getOrNull(Cause.findErrorOption(result.cause));

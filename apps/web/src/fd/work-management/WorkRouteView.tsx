@@ -1,5 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import { scopedProjectKey, scopeProjectRef } from "@t3tools/client-runtime/environment";
+import { derivePhysicalProjectKey } from "@t3tools/client-runtime/state/project-grouping";
 import {
   itemInView,
   linksByItem,
@@ -282,11 +283,8 @@ export function WorkRouteView({ search }: { search: WorkSearch }) {
           onClick={() =>
             void navigate({
               to: "/settings/projects",
-              search: {
-                project: scopedProjectKey(
-                  scopeProjectRef(selectedProject.environmentId, selectedProject.id),
-                ),
-              } as never,
+              // Settings key projects by checkout, not by id.
+              search: { project: derivePhysicalProjectKey(selectedProject) } as never,
             })
           }
         >
