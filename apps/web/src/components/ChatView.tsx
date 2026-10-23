@@ -11,7 +11,7 @@ import {
 import { RepositorySelector, openRepositoryFile, useRepositoryWorkspace } from "../fd/multirepo";
 import { ThreadFind, ThreadFindCanvas, type ThreadFindControls } from "./chat/ThreadFindProvider";
 import { isAssistantThread } from "@t3tools/shared/fd/assistant";
-import { WorkPanel } from "~/fd/assistant";
+import { AssignmentsPanel } from "~/fd/assistant";
 import { THREAD_FIND_BAR_RESERVED_HEIGHT } from "./chat/ThreadFindBar";
 import { usageLimitRecoveryBannerItem } from "./chat/UsageLimitRecoveryBanner";
 import {
@@ -11881,7 +11881,7 @@ export default function ChatView(props: ChatViewProps) {
                             />
                           ) : null}
                           {isServerThread && isAssistantThread(threadId) ? (
-                            <WorkPanel key={routeThreadKey} threadRef={routeThreadRef} />
+                            <AssignmentsPanel key={routeThreadKey} threadRef={routeThreadRef} />
                           ) : null}
                           {!composerMounted ? null : (
                             <ChatComposer
