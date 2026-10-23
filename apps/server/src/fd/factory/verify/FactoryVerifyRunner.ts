@@ -3,19 +3,19 @@ import * as NodeCrypto from "node:crypto";
 
 import { type FactoryDeliveryId, FactoryVerifyReceipt } from "@t3tools/contracts/fd/factory";
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import type * as Cause from "effect/Cause";
+import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
-import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
-import * as Queue from "effect/Queue";
+import * as Option from "effect/Option";
+import * as ChildProcess from "effect/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
-import * as ProcessRunner from "../../../processRunner.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import type { FactoryDeliverySettings } from "../FactorySettings.ts";
 import { FactoryBranchReadError, FactoryWorktreeMissingError } from "../git/branchFacts.ts";
@@ -41,8 +41,6 @@ export type FactoryVerifyRunError =
 const RECEIPT_VERSION = 1;
 const encodeReceipt = Schema.encodeEffect(Schema.fromJsonString(FactoryVerifyReceipt));
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-/** Caps what the process runner buffers in memory, stderr included; stdout streams to the log. */
-const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 /**
  * Identifies the settings a receipt was made under: the verify command and its timeout, the
@@ -61,8 +59,8 @@ export const verifySettingsHash = (settings: FactoryDeliverySettings): string =>
 
 /**
  * Runs a project's verify command against a delivery worktree's commit (port of Looper's
- * receipts). The command runs as an argument array with the worktree as cwd; its stdout streams
- * to `verify-<n>.log` in the delivery's evidence folder and its stderr follows. A run that ends,
+ * receipts). The command runs as an argument array with the worktree as cwd; its stdout and stderr
+ * stream into `verify-<n>.log` in the delivery's evidence folder as they arrive. A run that ends,
  * fails or times out on a clean tree with HEAD unchanged becomes a receipt, also written as
  * `verify-<n>.json`; the engine decides whether it passed. A tree dirty before or after the run,
  * or a HEAD the command moved, is refused: no receipt, and the log stays for diagnosis.
@@ -81,7 +79,7 @@ export class FactoryVerifyRunner extends Context.Service<
 const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const git = yield* GitVcsDriver.GitVcsDriver;
-  const processRunner = yield* ProcessRunner.ProcessRunner;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const evidence = yield* FactoryEvidence.FactoryEvidence;
   const platform = `${yield* HostProcess.Platform}-${yield* HostProcess.Architecture}`;
 
@@ -128,8 +126,10 @@ const make = Effect.gen(function* () {
   });
 
   /**
-   * Runs the command, streaming stdout and then stderr into a new log while hashing it. A timed-out
-   * run's log holds the stdout streamed until then; the process runner drops its stderr.
+   * Runs the command with stdout and stderr merged into a new log as they arrive, hashing the log
+   * as it is written. Nothing is buffered until exit, so output written before a timeout or a
+   * signal stays in the log. The process runner is not used because it holds stderr until the
+   * process exits and drops it on a timeout.
    */
   const runLogged = (input: {
     readonly settings: FactoryDeliverySettings;
@@ -143,54 +143,48 @@ const make = Effect.gen(function* () {
           path: input.logPath,
           cause,
         });
+      const commandFailed = (cause: unknown) =>
+        new FactoryVerifyCommandError({ path: input.cwd, cause });
       // `wx`: a log is never overwritten, even by a concurrent run that picked the same number.
       const log = yield* fileSystem
         .open(input.logPath, { flag: "wx" })
         .pipe(Effect.mapError(writeFailed));
       const hash = NodeCrypto.createHash("sha256");
+      // Uninterruptible so a timeout never leaves a chunk hashed but unwritten, or the reverse.
       const append = (bytes: Uint8Array) =>
-        Effect.suspend(() => {
-          hash.update(bytes);
-          return log.writeAll(bytes);
-        }).pipe(Effect.mapError(writeFailed));
-
-      const chunks = yield* Queue.unbounded<Uint8Array, Cause.Done>();
-      const writer = yield* Stream.fromQueue(chunks).pipe(
-        Stream.runForEach(append),
-        Effect.forkScoped,
-      );
-      const { executable, args } = input.settings.verifyCommand;
-      const result = yield* processRunner
-        .run({
-          command: executable,
-          args,
-          cwd: input.cwd,
-          timeout: Duration.minutes(input.settings.limits.verifyTimeoutMinutes),
-          timeoutBehavior: "timedOutResult",
-          maxOutputBytes: MAX_BUFFERED_BYTES,
-          outputMode: "truncate",
-          truncatedMarker: "\n[stderr truncated]\n",
-          onStdoutChunk: (chunk) => {
-            Queue.offerUnsafe(chunks, chunk);
-          },
-        })
-        .pipe(
-          Effect.map((output) => ({
-            code: output.code === null ? null : Number(output.code),
-            timedOut: output.timedOut,
-            stderr: output.stderr,
-          })),
-          Effect.catch((cause) =>
-            // The exit code read fails only when a signal ended the process: a result, not an error.
-            cause._tag === "ProcessReadError" && cause.stream === "exitCode"
-              ? Effect.succeed({ code: null, timedOut: false, stderr: "" })
-              : Effect.fail(new FactoryVerifyCommandError({ path: input.cwd, cause })),
-          ),
+        log.writeAll(bytes).pipe(
+          Effect.tap(() => Effect.sync(() => hash.update(bytes))),
+          Effect.uninterruptible,
+          Effect.mapError(writeFailed),
         );
-      yield* Queue.end(chunks);
-      yield* Fiber.join(writer);
-      if (result.stderr !== "") yield* append(Buffer.from(result.stderr, "utf8"));
-      return { code: result.code, timedOut: result.timedOut, outputHash: hash.digest("hex") };
+
+      const { executable, args } = input.settings.verifyCommand;
+      // None when the timeout ended the run; closing its scope kills the process group.
+      const exit = yield* Effect.gen(function* () {
+        const resolved = yield* resolveSpawnCommand(executable, args);
+        const child = yield* spawner
+          .spawn(
+            ChildProcess.make(resolved.command, resolved.args, {
+              cwd: input.cwd,
+              shell: resolved.shell,
+            }),
+          )
+          .pipe(Effect.mapError(commandFailed));
+        yield* child.all.pipe(Stream.mapError(commandFailed), Stream.runForEach(append));
+        return yield* child.exitCode.pipe(
+          Effect.map((code): number | null => code),
+          // Reading the exit code fails only when a signal ended the process: a result, not an error.
+          Effect.catchTags({ PlatformError: () => Effect.succeed(null) }),
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.timeoutOption(Duration.minutes(input.settings.limits.verifyTimeoutMinutes)),
+      );
+      return {
+        code: Option.getOrNull(exit),
+        timedOut: Option.isNone(exit),
+        outputHash: hash.digest("hex"),
+      };
     }).pipe(Effect.scoped);
 
   return FactoryVerifyRunner.of({
