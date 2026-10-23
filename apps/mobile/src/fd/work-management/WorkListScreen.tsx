@@ -1,13 +1,17 @@
-import { useAtomValue } from "@effect/atom-react";
+import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import { LegendList } from "@legendapp/list/react-native";
 import {
   itemInView,
   linksByItem,
+  refreshWork,
   RUN_STATE_LABELS,
   runStateOf,
+  shouldAutoLoadWorkPage,
   WORK_VIEWS,
+  type WorkPagedSource,
   type WorkRunState,
   type WorkView,
+  workViewStatuses,
 } from "@t3tools/client-runtime/fd/work-management";
 import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import {
@@ -16,17 +20,24 @@ import {
   workItemRefString,
 } from "@t3tools/contracts/fd/work-management";
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
-import * as Option from "effect/Option";
-import { AsyncResult, Atom } from "effect/reactivity";
-import { useLayoutEffect, useMemo, useState } from "react";
+import { Atom } from "effect/reactivity";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { Pressable, RefreshControl, View } from "react-native";
 
-import { AppText as Text } from "../../components/AppText";
+import { AppText as Text, AppTextInput } from "../../components/AppText";
 import { ControlPillMenu } from "../../components/ControlPill";
 import { useProjects, useThreadShells } from "../../state/entities";
 import { useEnvironmentQuery } from "../../state/query";
+import { useAtomCommand } from "../../state/use-atom-command";
+import { CreateWorkItemForm } from "./CreateWorkItemForm";
 import { STATUS_LABELS, WorkRepairNotice } from "./shared";
-import { useReadableWorkEnvironments, useWorkSupport, workEnvironment } from "./state";
+import {
+  useReadableWorkEnvironments,
+  useWorkSupport,
+  useWorkWritable,
+  workCommands,
+  workEnvironment,
+} from "./state";
 
 export type WorkListParams = {
   readonly environmentId?: EnvironmentId;
@@ -40,15 +51,7 @@ interface Row {
   readonly running: WorkRunState | undefined;
 }
 
-const EMPTY_LISTS = Atom.make(
-  [] as ReadonlyArray<{
-    readonly source: WorkSource;
-    readonly result: AsyncResult.AsyncResult<
-      { readonly items: ReadonlyArray<WorkItemSummary> },
-      unknown
-    >;
-  }>,
-);
+const EMPTY_LISTS = Atom.make([] as ReadonlyArray<WorkPagedSource>);
 
 /** One project's Work items from every source, with a view filter and pull to refresh. */
 export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
@@ -79,6 +82,13 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
         candidate.id === selected.projectId,
     ) ?? projects[0];
   const [view, setView] = useState<WorkView>("ready");
+  const [query, setQuery] = useState("");
+  const [term, setTerm] = useState("");
+  const [creating, setCreating] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setTerm(query.trim()), 250);
+    return () => clearTimeout(timer);
+  }, [query]);
 
   useLayoutEffect(() => {
     navigation.setOptions({ title: project === undefined ? "Work" : `Work · ${project.title}` });
@@ -93,31 +103,29 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
         }),
   );
   const sources = useMemo(() => sourcesQuery.data?.sources ?? [], [sourcesQuery.data]);
-  const listsAtom = useMemo(() => {
-    if (project === undefined) return null;
-    const statuses =
-      view === "done"
-        ? (["done", "cancelled"] as const)
-        : view === "all"
-          ? undefined
-          : (["todo", "in_progress"] as const);
-    return Atom.make((get) =>
-      sources.map((source) => ({
-        source,
-        result: get(
-          workEnvironment.list({
+  // Pages loaded so far; any change to what the list shows starts again from the first page.
+  const listKey = `${project?.environmentId}|${project?.id}|${sources.map((source) => source.sourceId).join(",")}|${view}|${term}`;
+  const [paging, setPaging] = useState({ key: listKey, pageCount: 1 });
+  const pageCount = paging.key === listKey ? paging.pageCount : 1;
+  const loadMore = useCallback(
+    () => setPaging({ key: listKey, pageCount: pageCount + 1 }),
+    [listKey, pageCount],
+  );
+  const listsAtom = useMemo(
+    () =>
+      project === undefined || sources.length === 0
+        ? null
+        : workEnvironment.pagedList({
             environmentId: project.environmentId,
-            input: {
-              sourceId: source.sourceId,
-              limit: 100,
-              ...(statuses === undefined ? {} : { statuses: [...statuses] }),
-            },
+            sources: sources.map((source) => ({ sourceId: source.sourceId, kind: source.kind })),
+            search: term.length === 0 ? undefined : term,
+            statuses: workViewStatuses(view),
+            pageCount,
           }),
-        ),
-      })),
-    );
-  }, [project, sources, view]);
+    [pageCount, project, sources, term, view],
+  );
   const lists = useAtomValue(listsAtom ?? EMPTY_LISTS);
+  const refreshLists = useAtomRefresh(listsAtom ?? EMPTY_LISTS);
   const linksQuery = useEnvironmentQuery(
     project === undefined
       ? null
@@ -142,13 +150,12 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
         links.map((link) => runStateOf(byThread.get(link.threadId))),
       );
     }
+    const sourceById = new Map(sources.map((source) => [source.sourceId, source] as const));
     return lists
-      .flatMap(({ source, result }) =>
-        Option.match(AsyncResult.value(result), {
-          onNone: () => [],
-          onSome: (value) => value.items.map((item) => ({ source, item })),
-        }),
-      )
+      .flatMap(({ sourceId, pages }) => {
+        const source = sourceById.get(sourceId);
+        return source === undefined ? [] : pages.items.map((item) => ({ source, item }));
+      })
       .filter(({ item }) => itemInView(view, item, states.get(workItemRefString(item.ref)) ?? []))
       .sort((left, right) => (right.item.updatedAt ?? "").localeCompare(left.item.updatedAt ?? ""))
       .map(({ source, item }) => {
@@ -162,8 +169,40 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
           ),
         };
       });
-  }, [linksQuery.data, lists, project, shells, view]);
-  const pending = lists.some(({ result }) => result._tag === "Initial" || result.waiting);
+  }, [linksQuery.data, lists, project, shells, sources, view]);
+  const pending = lists.some(({ pages }) => pages.waiting);
+  const hasMore = lists.some(({ pages }) => pages.nextCursor !== null);
+  const failures = lists.flatMap(({ sourceId, pages }) =>
+    pages.failed ? [sources.find((source) => source.sourceId === sourceId)?.label ?? sourceId] : [],
+  );
+  // A filtered view that came up short reads further pages by itself, within a small budget.
+  // Adjusted during render: each step raises the page count, so it settles within the budget.
+  if (shouldAutoLoadWorkPage({ visible: rows.length, hasMore, waiting: pending, pageCount })) {
+    setPaging({ key: listKey, pageCount: pageCount + 1 });
+  }
+
+  const requestRefresh = useAtomCommand(workCommands.refresh);
+  const refreshSources = sourcesQuery.refresh;
+  const refreshLinks = linksQuery.refresh;
+  // Pull to refresh drops the server's caches, then refreshes this list's own queries.
+  const refresh = useCallback(() => {
+    if (project === undefined) return;
+    void refreshWork({
+      requestServerRefresh: () =>
+        requestRefresh({ environmentId: project.environmentId, input: { projectId: project.id } }),
+      refreshQueries: () => {
+        refreshSources();
+        refreshLinks();
+        refreshLists();
+      },
+    });
+  }, [project, refreshLinks, refreshLists, refreshSources, requestRefresh]);
+  const canCreate = useWorkWritable(
+    project?.environmentId ?? null,
+    workCommands.createItem,
+    "items.write",
+  );
+  const creatable = sources.filter((source) => source.capabilities.create);
 
   if (support.size === 0) {
     return (
@@ -214,7 +253,42 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
         >
           <Pill label={WORK_VIEWS.find((entry) => entry.value === view)?.label ?? "Ready"} />
         </ControlPillMenu>
+        {canCreate && creatable.length > 0 ? (
+          <Pressable accessibilityRole="button" onPress={() => setCreating((open) => !open)}>
+            <Pill label={creating ? "Close" : "New item"} />
+          </Pressable>
+        ) : null}
       </View>
+      <View className="px-4 pb-2">
+        <AppTextInput
+          accessibilityLabel="Search work"
+          className="min-h-10 rounded-xl bg-card px-3 text-base text-foreground"
+          placeholder="Search"
+          value={query}
+          autoCapitalize="none"
+          returnKeyType="search"
+          onChangeText={setQuery}
+        />
+      </View>
+      {creating && project !== undefined ? (
+        <CreateWorkItemForm
+          environmentId={project.environmentId}
+          sources={creatable}
+          onCancel={() => setCreating(false)}
+          onCreated={(item) => {
+            setCreating(false);
+            navigation.navigate("WorkItem", {
+              environmentId: project.environmentId,
+              projectId: project.id,
+              sourceId: item.ref.sourceId,
+              itemId: item.ref.itemId,
+            });
+          }}
+        />
+      ) : null}
+      {failures.length > 0 ? (
+        <Text className="px-4 text-sm text-destructive">Could not read {failures.join(", ")}.</Text>
+      ) : null}
       {sources.length === 0 && sourcesQuery.data !== null ? (
         <View className="flex-1 items-center justify-center p-6">
           <Text className="text-center text-foreground-muted">
@@ -237,17 +311,31 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
           }
           ListEmptyComponent={
             pending ? null : (
-              <Text className="py-8 text-center text-foreground-muted">Nothing here.</Text>
+              <Text className="py-8 text-center text-foreground-muted">
+                {hasMore ? "Nothing here yet. Scroll to load more." : "Nothing here."}
+              </Text>
             )
           }
+          onEndReached={() => {
+            if (hasMore && !pending) loadMore();
+          }}
+          onEndReachedThreshold={0.5}
+          ListFooterComponent={
+            hasMore ? (
+              <Pressable
+                accessibilityRole="button"
+                disabled={pending}
+                className="items-center py-4 active:opacity-70"
+                onPress={loadMore}
+              >
+                <Text className="text-sm text-foreground-muted">
+                  {pending ? "Loading…" : "Load more"}
+                </Text>
+              </Pressable>
+            ) : null
+          }
           refreshControl={
-            <RefreshControl
-              refreshing={pending && rows.length > 0}
-              onRefresh={() => {
-                sourcesQuery.refresh();
-                linksQuery.refresh();
-              }}
-            />
+            <RefreshControl refreshing={pending && rows.length > 0} onRefresh={refresh} />
           }
           renderItem={({ item: row }) => (
             <Pressable

@@ -1,4 +1,3 @@
-import { useAtomValue } from "@effect/atom-react";
 import type { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import { useNavigation } from "@react-navigation/native";
 import { Pressable, View } from "react-native";
@@ -8,7 +7,7 @@ import { ControlPillMenu } from "../../components/ControlPill";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { STATUS_LABELS } from "./shared";
-import { useWorkReadable, workCommands, workEnvironment } from "./state";
+import { useWorkReadable, useWorkWritable, workCommands, workEnvironment } from "./state";
 
 /** The Work items linked to a thread, above its feed; nothing without Work access. */
 export function LinkedWorkRow(props: {
@@ -34,7 +33,7 @@ function LinkedWorkItems(props: {
     }),
   );
   const setLink = useAtomCommand(workCommands.setLink);
-  const canWrite = useAtomValue(workCommands.setLink.permissionAtom(props.environmentId));
+  const canWrite = useWorkWritable(props.environmentId, workCommands.setLink, "links");
   const links = query.data?.links ?? [];
   if (links.length === 0) return null;
   return (
