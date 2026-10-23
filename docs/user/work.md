@@ -20,6 +20,10 @@ To add a source, open the project's settings and use **Work sources**. In a
 thread, the details panel lists the thread's linked items; use **Link work item**
 there or in the command palette.
 
+On mobile, tap the checklist in the threads header (iOS) or toolbar (Android).
+Threads show their linked items above the conversation, and **Settings →
+Projects & threads → Overview** manages a project's Work sources.
+
 If Work says the connection cannot read it, this device was paired before Work
 existed. Pair it again from a session that has Work access.
 
