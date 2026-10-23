@@ -387,9 +387,52 @@ describe("WorkService sources", () => {
           includeDisconnected: false,
         });
         assert.deepStrictEqual(
-          sources.sources.map((source) => source.credential.configured),
-          [false, false],
+          sources.sources.map((source) => [source.credential.configured, source.health.status]),
+          [
+            [false, "auth_required"],
+            [false, "auth_required"],
+          ],
         );
+
+        // One replacement, on either source, repairs every source on the site and account.
+        const repaired = yield* work.saveSource(owner, {
+          sourceId: one.sourceId,
+          projectId: alpha,
+          label: "ONE",
+          config: jiraConfig("ONE"),
+          apiToken: "token-3",
+        });
+        assert.deepStrictEqual(repaired.credential, { configured: true });
+        const afterRepair = yield* work.listSources(owner, {
+          projectId: alpha,
+          includeDisconnected: false,
+        });
+        assert.deepStrictEqual(
+          afterRepair.sources.map((source) => [source.credential.configured, source.health.status]),
+          [
+            [true, "ok"],
+            [true, "ok"],
+          ],
+        );
+
+        // A replacement the site refuses is never stored, so the working token survives.
+        jira.fail = new WorkUnauthenticated({ detail: "Jira refused the token." });
+        const two2 = afterRepair.sources.find((source) => source.sourceId === two.sourceId)!;
+        assert.strictEqual(
+          yield* failureOf(
+            work.saveSource(owner, {
+              sourceId: two.sourceId,
+              expectedVersion: two2.version,
+              projectId: alpha,
+              label: "TWO",
+              config: jiraConfig("TWO"),
+              apiToken: "typo",
+            }),
+          ),
+          "WorkUnauthenticated",
+        );
+        jira.fail = null;
+        assert.strictEqual(harness.secrets.get(name), "token-3");
       }).pipe(Effect.provide(harness.layer));
     },
   );
@@ -769,6 +812,46 @@ describe("WorkService items", () => {
       yield* work.refresh(owner, {});
       yield* work.listItems(owner, query);
       assert.deepStrictEqual(yield* health, { status: "ok" });
+    }).pipe(Effect.provide(harness.layer));
+  });
+});
+
+describe("WorkService stale writes", () => {
+  it.effect("drops cached reads when a write finds the item changed at its source", () => {
+    const markdown = fakeAdapter("markdown");
+    const harness = seeded(markdown.adapter);
+    return Effect.gen(function* () {
+      const work = yield* WorkService.WorkService;
+      const source = yield* work.saveSource(owner, {
+        projectId: alpha,
+        label: "Tasks",
+        config: markdownConfig("tasks"),
+      });
+      const item = yield* work.createItem(owner, { sourceId: source.sourceId, title: "Ship" });
+      const cached = yield* work.getItem(owner, { ref: item.ref });
+      // Someone edits the task behind Work's cache (a tracker client, an agent's own tool).
+      const { adapter, runtime } = yield* work.resolveSource(item.ref.sourceId);
+      const outside = yield* adapter.update(
+        runtime,
+        { ref: item.ref, title: "Changed elsewhere", expectedRevision: cached.revision },
+        owner,
+      );
+      assert.strictEqual((yield* work.getItem(owner, { ref: item.ref })).revision, cached.revision);
+
+      assert.strictEqual(
+        yield* failureOf(
+          work.updateItem(owner, {
+            ref: item.ref,
+            title: "Mine",
+            expectedRevision: cached.revision,
+          }),
+        ),
+        "WorkStale",
+      );
+      // The reload a conflict asks for now shows the current version.
+      const reloaded = yield* work.getItem(owner, { ref: item.ref });
+      assert.strictEqual(reloaded.revision, outside.revision);
+      assert.strictEqual(reloaded.title, "Changed elsewhere");
     }).pipe(Effect.provide(harness.layer));
   });
 });

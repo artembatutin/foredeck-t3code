@@ -13,8 +13,6 @@ export const AGENT_COMMENTS_MAX = 20;
 export const LABELS_MAX = 32;
 export const BLOCKERS_MAX = 50;
 export const OPEN_LINKS_MAX = 2_000;
-/** A link younger than this whose thread does not exist yet is a launch still in flight. */
-export const LAUNCH_GRACE_MS = 60_000;
 
 export interface BoundedText {
   readonly text: string;

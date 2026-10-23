@@ -3,6 +3,7 @@ import {
   AuthSettingsWriteScope,
   AuthWorkReadScope,
   AuthWorkWriteScope,
+  type OrchestrationV2Run,
   type OrchestrationV2ThreadShell,
   type ProjectId,
   ProviderInstanceId,
@@ -33,6 +34,7 @@ import type { WorkActor } from "../authority.ts";
 import {
   WorkInvalid,
   WorkItemNotFound,
+  WorkStale,
   WorkUnauthenticated,
   type WorkDomainError,
 } from "../errors.ts";
@@ -105,7 +107,10 @@ export const threadShell = (
   id: ThreadId,
   projectId: ProjectId,
   overrides: Partial<
-    Pick<OrchestrationV2ThreadShell, "archivedAt" | "settledAt" | "deletedAt">
+    Pick<
+      OrchestrationV2ThreadShell,
+      "archivedAt" | "settledAt" | "deletedAt" | "activeRunId" | "latestRunId"
+    >
   > = {},
 ): OrchestrationV2ThreadShell => ({
   ...v2PullRequestThread({
@@ -223,6 +228,11 @@ export interface FakeAdapter {
     readonly entered: Deferred.Deferred<void>;
     readonly release: Deferred.Deferred<void>;
   } | null;
+  /** While set, `snapshots` reports that it read and waits to be released before returning. */
+  snapshotsGate: {
+    readonly entered: Deferred.Deferred<void>;
+    readonly release: Deferred.Deferred<void>;
+  } | null;
 }
 
 /**
@@ -236,6 +246,8 @@ export const fakeAdapter = (
     readonly watch?: Queue.Queue<void, Cause.Done>;
     /** Runs when a watch stream ends, before the stop is counted. */
     readonly onWatchEnd?: Effect.Effect<unknown>;
+    /** The id `create` gives its n-th item; `item-<n>` by default. */
+    readonly mintId?: (n: number) => string;
   } = {},
 ): FakeAdapter => {
   const items = new Map<string, WorkSourceItemDetail>();
@@ -248,9 +260,14 @@ export const fakeAdapter = (
     readonly actorId: string;
   }> = [];
   const watchers = { started: 0, stopped: 0 };
-  const state: { fail: WorkDomainError | null; createGate: FakeAdapter["createGate"] } = {
+  const state: {
+    fail: WorkDomainError | null;
+    createGate: FakeAdapter["createGate"];
+    snapshotsGate: FakeAdapter["snapshotsGate"];
+  } = {
     fail: null,
     createGate: null,
+    snapshotsGate: null,
   };
   let minted = 0;
 
@@ -273,6 +290,14 @@ export const fakeAdapter = (
       ? Effect.fail(new WorkItemNotFound({ itemId }))
       : Effect.succeed(detail);
   };
+  /** Refuses a write based on another revision, as every real adapter does. */
+  const checked = (
+    detail: WorkSourceItemDetail,
+    expectedRevision: string | undefined,
+  ): Effect.Effect<WorkSourceItemDetail, WorkStale> =>
+    expectedRevision === undefined || expectedRevision === detail.revision
+      ? Effect.succeed(detail)
+      : Effect.fail(new WorkStale({ itemId: detail.ref.itemId, current: summaryOf(detail) }));
   const put = (runtime: WorkSourceRuntime, detail: WorkSourceItemDetail) => {
     items.set(keyOf(runtime, detail.ref.itemId), detail);
     return summaryOf(detail);
@@ -329,7 +354,7 @@ export const fakeAdapter = (
             yield* Deferred.await(gate.release);
           }
           minted += 1;
-          const itemId = WorkItemId.make(`item-${minted}`);
+          const itemId = WorkItemId.make(options.mintId?.(minted) ?? `item-${minted}`);
           return put(runtime, {
             ...fakeDetail({ sourceId: runtime.sourceId, itemId }, kind, input.title),
             body: input.body ?? "",
@@ -340,6 +365,7 @@ export const fakeAdapter = (
     update: (runtime, patch) =>
       call("update", () =>
         find(runtime, patch.ref.itemId).pipe(
+          Effect.flatMap((detail) => checked(detail, patch.expectedRevision)),
           Effect.map((detail) =>
             put(runtime, {
               ...detail,
@@ -353,6 +379,7 @@ export const fakeAdapter = (
     setStatus: (runtime, input) =>
       call("setStatus", () =>
         find(runtime, input.ref.itemId).pipe(
+          Effect.flatMap((detail) => checked(detail, input.expectedRevision)),
           Effect.map((detail) =>
             put(runtime, {
               ...detail,
@@ -373,12 +400,18 @@ export const fakeAdapter = (
       ),
     snapshots: (runtime, itemIds) =>
       call("snapshots", () =>
-        Effect.succeed(
-          itemIds.flatMap((itemId) => {
+        Effect.gen(function* () {
+          const read = itemIds.flatMap((itemId) => {
             const detail = items.get(keyOf(runtime, itemId));
             return detail === undefined ? [] : [summaryOf(detail)];
-          }),
-        ),
+          });
+          const gate = state.snapshotsGate;
+          if (gate !== null) {
+            yield* Deferred.succeed(gate.entered, undefined);
+            yield* Deferred.await(gate.release);
+          }
+          return read;
+        }),
       ),
     ...(watchQueue === undefined
       ? {}
@@ -420,6 +453,12 @@ export const fakeAdapter = (
     set createGate(value) {
       state.createGate = value;
     },
+    get snapshotsGate() {
+      return state.snapshotsGate;
+    },
+    set snapshotsGate(value) {
+      state.snapshotsGate = value;
+    },
   };
 };
 
@@ -430,6 +469,11 @@ export const fakeAdapter = (
 export const makeHarness = (adapters: ReadonlyArray<WorkSourceAdapter>) => {
   const projects = new Map<ProjectId, ProjectStore.ProjectRow>();
   const threads = new Map<ThreadId, OrchestrationV2ThreadShell>();
+  /** Run records by thread, as far as the reactor reads them (id, status, completion). */
+  const runs = new Map<
+    ThreadId,
+    ReadonlyArray<Pick<OrchestrationV2Run, "id" | "status" | "completedAt">>
+  >();
   const secrets = new Map<string, string>();
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
@@ -455,6 +499,15 @@ export const makeHarness = (adapters: ReadonlyArray<WorkSourceAdapter>) => {
     }),
     Layer.mock(ProjectionStore.ProjectionStoreV2)({
       getThreadShell: (threadId) => Effect.sync(() => threads.get(threadId) ?? null),
+      getThreadRecords: (threadId, _fields, filter) =>
+        Effect.sync(
+          () =>
+            ({
+              runs: (runs.get(threadId) ?? []).filter(
+                (run) => filter?.runIds === undefined || filter.runIds.includes(run.id),
+              ),
+            }) as never,
+        ),
     }),
     Layer.mock(ServerSecretStore.ServerSecretStore)({
       get: (name) =>
@@ -478,7 +531,7 @@ export const makeHarness = (adapters: ReadonlyArray<WorkSourceAdapter>) => {
     Layer.provideMerge(persistence),
     Layer.provide(NodeServices.layer),
   );
-  return { layer, projects, threads, secrets };
+  return { layer, projects, threads, runs, secrets };
 };
 
 export type Harness = ReturnType<typeof makeHarness>;

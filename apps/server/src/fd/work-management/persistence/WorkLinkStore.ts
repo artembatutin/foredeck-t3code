@@ -65,8 +65,15 @@ export class WorkLinkStore extends Context.Service<
       itemId: WorkItemId,
       threadId: ThreadId,
     ) => Effect.Effect<boolean, WorkStoreError>;
-    /** Remove every link of a thread; returns how many there were. */
-    readonly unlinkThread: (threadId: ThreadId) => Effect.Effect<number, WorkStoreError>;
+    /**
+     * Remove a thread's links; returns how many there were. With `linkedUpTo` (an ISO time),
+     * only links made at or before it go: a settlement removes the links it ended, not one made
+     * on purpose afterwards.
+     */
+    readonly unlinkThread: (
+      threadId: ThreadId,
+      options?: { readonly linkedUpTo?: string },
+    ) => Effect.Effect<number, WorkStoreError>;
     /** Remove every link of a source; returns how many there were. */
     readonly deleteBySource: (sourceId: WorkSourceId) => Effect.Effect<number, WorkStoreError>;
     readonly listByThread: (
@@ -92,6 +99,16 @@ export class WorkLinkStore extends Context.Service<
       itemId: WorkItemId,
       threadId: ThreadId,
       snapshot: StoredWorkLink["snapshot"],
+    ) => Effect.Effect<void, WorkStoreError>;
+    /**
+     * Refreshes only the displayed fields of a snapshot in place, so a concurrent write of its
+     * revision baseline, mode or auto-start mark is never overwritten by an older read.
+     */
+    readonly updateSnapshotDisplay: (
+      sourceId: WorkSourceId,
+      itemId: WorkItemId,
+      threadId: ThreadId,
+      display: Pick<StoredWorkLink["snapshot"], "key" | "title" | "status" | "url">,
     ) => Effect.Effect<void, WorkStoreError>;
     readonly updateRun: (
       sourceId: WorkSourceId,
@@ -176,10 +193,12 @@ const make = Effect.gen(function* () {
   });
 
   const deleteByThread = SqlSchema.findAll({
-    Request: ThreadId,
+    Request: Schema.Struct({ threadId: ThreadId, linkedUpTo: Schema.NullOr(Schema.String) }),
     Result: DeletedRows,
-    execute: (threadId) => sql`
-      DELETE FROM fd_work_thread_links WHERE thread_id = ${threadId}
+    execute: ({ threadId, linkedUpTo }) => sql`
+      DELETE FROM fd_work_thread_links
+      WHERE thread_id = ${threadId}
+        ${linkedUpTo === null ? sql`` : sql`AND linked_at <= ${linkedUpTo}`}
       RETURNING thread_id AS "threadId"
     `,
   });
@@ -197,6 +216,23 @@ const make = Effect.gen(function* () {
     Request: Schema.Struct({ ...LinkKey.fields, snapshot: LinkDbRow.fields.snapshot }),
     execute: ({ sourceId, itemId, threadId, snapshot }) => sql`
       UPDATE fd_work_thread_links SET snapshot_json = ${snapshot}
+      WHERE source_id = ${sourceId} AND item_id = ${itemId} AND thread_id = ${threadId}
+    `,
+  });
+
+  const writeSnapshotDisplay = SqlSchema.void({
+    Request: Schema.Struct({
+      ...LinkKey.fields,
+      key: Schema.String,
+      title: Schema.String,
+      status: Schema.String,
+      url: Schema.NullOr(Schema.String),
+    }),
+    execute: ({ sourceId, itemId, threadId, key, title, status, url }) => sql`
+      UPDATE fd_work_thread_links
+      SET snapshot_json = json_set(
+        snapshot_json, '$.key', ${key}, '$.title', ${title}, '$.status', ${status}, '$.url', ${url}
+      )
       WHERE source_id = ${sourceId} AND item_id = ${itemId} AND thread_id = ${threadId}
     `,
   });
@@ -239,8 +275,8 @@ const make = Effect.gen(function* () {
         Effect.map((rows) => rows.length > 0),
         Effect.catchTags(storageFailure("unlink")),
       ),
-    unlinkThread: (threadId) =>
-      deleteByThread(threadId).pipe(
+    unlinkThread: (threadId, options) =>
+      deleteByThread({ threadId, linkedUpTo: options?.linkedUpTo ?? null }).pipe(
         Effect.map((rows) => rows.length),
         Effect.catchTags(storageFailure("unlinkThread")),
       ),
@@ -259,6 +295,10 @@ const make = Effect.gen(function* () {
     updateSnapshot: (sourceId, itemId, threadId, snapshot) =>
       writeSnapshot({ sourceId, itemId, threadId, snapshot }).pipe(
         Effect.catchTags(storageFailure("updateSnapshot")),
+      ),
+    updateSnapshotDisplay: (sourceId, itemId, threadId, display) =>
+      writeSnapshotDisplay({ sourceId, itemId, threadId, ...display }).pipe(
+        Effect.catchTags(storageFailure("updateSnapshotDisplay")),
       ),
     updateRun: (sourceId, itemId, threadId, run) =>
       writeRun({ sourceId, itemId, threadId, run }).pipe(

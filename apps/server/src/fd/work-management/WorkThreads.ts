@@ -16,10 +16,10 @@ import type {
   WorkWorkspaceStrategy,
 } from "@t3tools/contracts/fd/work-management";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
-import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
@@ -32,7 +32,6 @@ import * as ServerSettings from "../../serverSettings.ts";
 import { RepositorySet } from "../multirepo/index.ts";
 import { requireGrants, type WorkActor } from "./authority.ts";
 import { type WorkDomainError, WorkInvalid, WorkUnavailable } from "./errors.ts";
-import { LAUNCH_GRACE_MS } from "./model/bounds.ts";
 import { renderWorkPrompt, workBranchName, workThreadTitle } from "./model/prompt.ts";
 import * as WorkLinkStore from "./persistence/WorkLinkStore.ts";
 import * as WorkService from "./WorkService.ts";
@@ -57,9 +56,11 @@ export interface WorkThreadStart {
 }
 
 /**
- * Starts an agent thread from a Work item. Starts of one item are serialized, the link row is
- * written before the launch so a concurrent start sees it, and an open linked thread is
- * returned instead of a second launch unless the caller forces one.
+ * Starts an agent thread from a Work item. Starts of one item (in its canonical spelling) are
+ * serialized, the link row is written before the launch so a concurrent start sees it, and an
+ * open linked thread is returned instead of a second launch unless the caller forces one. The
+ * link is a reservation for as long as the launch runs; a launch that ends without a thread
+ * removes it, however it ended.
  */
 export class WorkThreads extends Context.Service<
   WorkThreads,
@@ -107,13 +108,15 @@ const make = Effect.gen(function* () {
       const rows = yield* links
         .listByItem(ref.sourceId, ref.itemId)
         .pipe(Effect.mapError(storeFailure));
-      const now = yield* Clock.currentTimeMillis;
       for (const link of rows) {
+        // A reservation is released only once its thread exists or its link is gone, so it is
+        // checked before the thread.
+        if (yield* work.isLaunching(link.threadId)) return link.threadId;
         const shell = yield* projections
           .getThreadShell(link.threadId)
           .pipe(Effect.mapError(threadReadFailure));
         if (shell === null) {
-          if (now - Date.parse(link.linkedAt) < LAUNCH_GRACE_MS) return link.threadId;
+          // No launch holds it and no thread exists: a launch that died with the process.
           yield* links
             .unlink(link.sourceId, link.itemId, link.threadId)
             .pipe(Effect.mapError(storeFailure));
@@ -126,9 +129,24 @@ const make = Effect.gen(function* () {
       return undefined;
     });
 
+  /** Drops a reservation whose launch ended without creating its thread. */
+  const releaseUnlaunched = (ref: WorkItemRef, threadId: ThreadId) =>
+    projections.getThreadShell(threadId).pipe(
+      Effect.flatMap((shell) =>
+        shell === null ? links.unlink(ref.sourceId, ref.itemId, threadId) : Effect.void,
+      ),
+      // Left for the sweep when it cannot be decided now; nothing reserves it any more.
+      Effect.catchCause((cause) => Effect.logWarning("work launch reservation left", cause)),
+    );
+
   const start: WorkThreads["Service"]["start"] = (actor, input) =>
+    requireGrants(actor, [AuthWorkReadScope, AuthOrchestrationOperateScope]).pipe(
+      Effect.andThen(work.canonicalRef(input.ref)),
+      Effect.flatMap((ref) => startItem(actor, { ...input, ref }).pipe(withItemLock(ref))),
+    );
+
+  const startItem = (actor: WorkActor, input: WorkThreadStart) =>
     Effect.gen(function* () {
-      yield* requireGrants(actor, [AuthWorkReadScope, AuthOrchestrationOperateScope]);
       const { stored, adapter, runtime } = yield* work.resolveSource(input.ref.sourceId, {
         interactive: true,
       });
@@ -210,8 +228,11 @@ const make = Effect.gen(function* () {
         `work-start:${input.ref.sourceId}:${input.ref.itemId}:${threadId}`,
       );
 
-      // Written first so a concurrent start (after this lock) or a crash both see the attempt.
-      yield* links
+      // Written first so a concurrent start (after this lock) or a crash both see the attempt,
+      // and reserved until the launch ends so the link sweep never takes a slow launch for a
+      // dead one. Whatever ends the launch without a thread (a failure, a defect, the caller
+      // going away) removes the link, so a retry never resumes a thread that does not exist.
+      const reserve = links
         .link({
           sourceId: input.ref.sourceId,
           itemId: input.ref.itemId,
@@ -229,7 +250,7 @@ const make = Effect.gen(function* () {
         })
         .pipe(Effect.mapError(storeFailure));
 
-      const launched = yield* launches
+      const launch = launches
         .launch({
           commandId,
           threadId,
@@ -258,39 +279,55 @@ const make = Effect.gen(function* () {
               ? new WorkInvalid({ detail: error.message })
               : new WorkUnavailable({ detail: error.message, cause: error }),
           ),
-          Effect.tapError(() =>
-            links.unlink(input.ref.sourceId, input.ref.itemId, threadId).pipe(Effect.ignore),
-          ),
         );
 
-      // Only Markdown moves on its own; remote trackers keep their workflow.
+      const launched = yield* Effect.uninterruptibleMask((restore) =>
+        work.reserveLaunch(threadId).pipe(
+          Effect.andThen(reserve),
+          Effect.andThen(restore(launch)),
+          Effect.onExit((exit) =>
+            Exit.isSuccess(exit) ? Effect.void : releaseUnlaunched(input.ref, threadId),
+          ),
+          Effect.scoped,
+        ),
+      );
+
+      // Only Markdown moves on its own; remote trackers keep their workflow. The move is
+      // conditional on the item the thread was started from, so an item someone finished,
+      // cancelled or changed during the launch is left alone.
       if (
         !launched.resumed &&
         stored.config.kind === "markdown" &&
         stored.config.autoStart &&
         item.status === "todo"
       ) {
-        yield* adapter.setStatus(runtime, { ref: input.ref, status: "in_progress" }, actor).pipe(
-          Effect.flatMap((updated) =>
-            links.updateSnapshot(input.ref.sourceId, input.ref.itemId, threadId, {
-              key: updated.key,
-              title: updated.title,
-              status: updated.status,
-              url: updated.url,
-              revision: updated.revision,
-              mode: input.mode,
-              autoStarted: true,
-            }),
-          ),
-          Effect.catchCause((cause) =>
-            Effect.logWarning("work item auto-start status change skipped", cause),
-          ),
-        );
+        yield* adapter
+          .setStatus(
+            runtime,
+            { ref: input.ref, status: "in_progress", expectedRevision: item.revision },
+            actor,
+          )
+          .pipe(
+            Effect.flatMap((updated) =>
+              links.updateSnapshot(input.ref.sourceId, input.ref.itemId, threadId, {
+                key: updated.key,
+                title: updated.title,
+                status: updated.status,
+                url: updated.url,
+                revision: updated.revision,
+                mode: input.mode,
+                autoStarted: true,
+              }),
+            ),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("work item auto-start status change skipped", cause),
+            ),
+          );
       }
 
       yield* work.bumpEpoch;
       return { threadId: launched.threadId, resumed: launched.resumed };
-    }).pipe(withItemLock(input.ref));
+    });
 
   return WorkThreads.of({ start });
 });

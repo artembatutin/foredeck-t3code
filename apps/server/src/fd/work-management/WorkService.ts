@@ -6,6 +6,7 @@ import {
   AuthWorkReadScope,
   AuthWorkWriteScope,
   type ProjectId,
+  type ThreadId,
 } from "@t3tools/contracts";
 import {
   type WorkCommentInput,
@@ -15,6 +16,7 @@ import {
   type WorkItemGetInput,
   WorkItemId,
   type WorkItemPatch,
+  type WorkItemRef,
   type WorkItemSummary,
   type WorkLinkSetInput,
   type WorkLinkSetResult,
@@ -50,6 +52,7 @@ import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
@@ -68,6 +71,7 @@ import {
 } from "./errors.ts";
 import { attributeComment } from "./model/attribution.ts";
 import { AGENT_COMMENT_MAX_CHARS, OPEN_LINKS_MAX } from "./model/bounds.ts";
+import { canonicalItemId } from "./model/itemId.ts";
 import * as WorkLinkStore from "./persistence/WorkLinkStore.ts";
 import * as WorkSourceStore from "./persistence/WorkSourceStore.ts";
 import { directoriesOverlap } from "./sources/sourceRoot.ts";
@@ -193,6 +197,14 @@ export class WorkService extends Context.Service<
     readonly retireProject: (projectId: ProjectId) => Effect.Effect<void, WorkDomainError>;
     /** Marks every Work read stale and wakes subscribers. */
     readonly bumpEpoch: Effect.Effect<void>;
+    /** The spelling locks, caches and link rows key on; an unknown source keeps the input. */
+    readonly canonicalRef: (ref: WorkItemRef) => Effect.Effect<WorkItemRef, WorkDomainError>;
+    /**
+     * Marks a thread launch as in flight until the scope closes. A link whose thread does not
+     * exist yet is a live reservation while this holds, however long the launch takes.
+     */
+    readonly reserveLaunch: (threadId: ThreadId) => Effect.Effect<void, never, Scope.Scope>;
+    readonly isLaunching: (threadId: ThreadId) => Effect.Effect<boolean>;
   }
 >()("t3/fd/work-management/WorkService") {}
 
@@ -216,6 +228,11 @@ const secretNameFor = (config: WorkSourceConfig): string | null =>
 
 const unavailable = (detail: string) => (cause: unknown) => new WorkUnavailable({ detail, cause });
 
+const TOKEN_REMOVED: WorkSourceHealth = {
+  status: "auth_required",
+  message: "The API token was removed; add one to read this source.",
+};
+
 interface ReplayEntry {
   readonly at: number;
   /** Settles with the first attempt's outcome; a retry in flight waits on it. */
@@ -237,6 +254,22 @@ const make = Effect.gen(function* () {
   const bumpEpoch = SubscriptionRef.update(epoch, (value) => value + 1);
   const health = new Map<WorkSourceId, WorkSourceHealth>();
   const replays = new Map<string, ReplayEntry>();
+  const launching = new Map<ThreadId, number>();
+
+  const reserveLaunch: WorkService["Service"]["reserveLaunch"] = (threadId) =>
+    Effect.acquireRelease(
+      Effect.sync(() => {
+        launching.set(threadId, (launching.get(threadId) ?? 0) + 1);
+      }),
+      () =>
+        Effect.sync(() => {
+          const count = (launching.get(threadId) ?? 1) - 1;
+          if (count > 0) launching.set(threadId, count);
+          else launching.delete(threadId);
+        }),
+    );
+  const isLaunching: WorkService["Service"]["isLaunching"] = (threadId) =>
+    Effect.sync(() => launching.has(threadId));
 
   const adapterFor = (kind: WorkSourceConfig["kind"]) => {
     const adapter = registry.get(kind);
@@ -316,6 +349,20 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const canonicalRef: WorkService["Service"]["canonicalRef"] = (ref) =>
+    sources.get(ref.sourceId).pipe(
+      Effect.mapError(unavailable("Work sources could not be read.")),
+      Effect.map(
+        Option.match({
+          onNone: () => ref,
+          onSome: (stored) => {
+            const itemId = canonicalItemId(stored.kind, ref.itemId);
+            return itemId === ref.itemId ? ref : { sourceId: ref.sourceId, itemId };
+          },
+        }),
+      ),
+    );
+
   const healthOf = (sourceId: WorkSourceId): WorkSourceHealth =>
     health.get(sourceId) ?? { status: "ok" };
 
@@ -354,6 +401,11 @@ const make = Effect.gen(function* () {
             });
           case "WorkUnavailable":
             return setHealth(sourceId, { status: "error", message: error.message });
+          // The item changed at the source behind the cache (another tracker client, an
+          // agent's own tool): drop the cached reads, so the reload a conflict asks for shows
+          // the current version instead of the one the stale write was based on.
+          case "WorkStale":
+            return bumpEpoch;
           default:
             return Effect.void;
         }
@@ -424,11 +476,43 @@ const make = Effect.gen(function* () {
         Effect.forEach(
           rows.filter((stored) => stored.secretName === name && stored.sourceId !== except),
           (stored) =>
-            sources
-              .update({ sourceId: stored.sourceId, secretName: null })
-              .pipe(
-                Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }),
-              ),
+            Effect.suspend(() => {
+              health.set(stored.sourceId, TOKEN_REMOVED);
+              return sources
+                .update({ sourceId: stored.sourceId, secretName: null })
+                .pipe(
+                  Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }),
+                );
+            }),
+          { discard: true },
+        ),
+      ),
+    );
+
+  /**
+   * Points every source on the token's site and account at a freshly stored token, so one
+   * replacement repairs all of them, and forgets their stale authentication failures.
+   */
+  const adoptSecret = (name: string, except: WorkSourceId | undefined) =>
+    sources.list({ includeDisconnected: true }).pipe(
+      Effect.mapError(storeFailure),
+      Effect.flatMap((rows) =>
+        Effect.forEach(
+          rows.filter(
+            (stored) => stored.sourceId !== except && secretNameFor(stored.config) === name,
+          ),
+          (stored) =>
+            Effect.suspend(() => {
+              health.delete(stored.sourceId);
+              return stored.secretName === name
+                ? Effect.void
+                : sources.update({ sourceId: stored.sourceId, secretName: name }).pipe(
+                    Effect.asVoid,
+                    Effect.catchTags({
+                      WorkStoreError: (error) => Effect.fail(storeFailure(error)),
+                    }),
+                  );
+            }),
           { discard: true },
         ),
       ),
@@ -503,7 +587,18 @@ const make = Effect.gen(function* () {
       }
       const rootPath = yield* projectRoot(input.projectId);
 
+      // The token is shared by every source on the same site and account. A replacement is
+      // tested before it is stored, so a mistyped token never displaces a working one.
       const name = secretNameFor(input.config);
+      const secret =
+        name === null || input.credential === "clear"
+          ? undefined
+          : (input.apiToken ?? Option.getOrUndefined(yield* readSecret(name)));
+      // A source whose token was just cleared is knowingly unauthenticated; testing it would only
+      // refuse the save the owner asked for.
+      if (input.credential !== "clear") {
+        yield* adapter.test({ config: input.config, rootPath, secret });
+      }
       let secretName: string | null = null;
       if (name !== null) {
         if (input.credential === "clear") {
@@ -516,15 +611,10 @@ const make = Effect.gen(function* () {
             .set(name, encoder.encode(input.apiToken))
             .pipe(Effect.mapError(unavailable("The source credential could not be stored.")));
           secretName = name;
+          yield* adoptSecret(name, input.sourceId);
         } else {
-          secretName = Option.isSome(yield* readSecret(name)) ? name : null;
+          secretName = secret === undefined ? null : name;
         }
-      }
-      const secret = Option.getOrUndefined(yield* readSecret(secretName));
-      // A source whose token was just cleared is knowingly unauthenticated; testing it would only
-      // refuse the save the owner asked for.
-      if (input.credential !== "clear") {
-        yield* adapter.test({ config: input.config, rootPath, secret });
       }
 
       const persist: Effect.Effect<
@@ -563,7 +653,8 @@ const make = Effect.gen(function* () {
       const stored = yield* persist.pipe(
         Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }),
       );
-      health.delete(stored.sourceId);
+      if (input.credential === "clear") health.set(stored.sourceId, TOKEN_REMOVED);
+      else health.delete(stored.sourceId);
       // The row exists whether or not prepare succeeds, so subscribers hear about it either way.
       yield* adapter
         .prepare(toRuntime(stored, rootPath, secret, true))
@@ -599,11 +690,14 @@ const make = Effect.gen(function* () {
       const restored = yield* sources
         .restore(input.sourceId, input.expectedVersion)
         .pipe(Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }));
-      // The token may have been released while this source was disconnected.
+      // The shared token may have been released, or replaced for a sibling, while this source
+      // was disconnected; it uses whatever its site and account hold now.
+      const name = secretNameFor(restored.config);
+      const current = name !== null && Option.isSome(yield* readSecret(name)) ? name : null;
       const stored =
-        restored.secretName !== null && Option.isNone(yield* readSecret(restored.secretName))
+        current !== restored.secretName
           ? yield* sources
-              .update({ sourceId: restored.sourceId, secretName: null })
+              .update({ sourceId: restored.sourceId, secretName: current })
               .pipe(
                 Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }),
               )
@@ -685,13 +779,11 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       yield* requireGrants(actor, [AuthWorkReadScope]);
       const { adapter } = yield* resolveSource(input.ref.sourceId, { interactive: true });
+      const ref = yield* canonicalRef(input.ref);
       const at = yield* currentEpoch;
-      const detail = yield* Cache.get(
-        itemCache,
-        encodeItemKey([input.ref.sourceId, input.ref.itemId, at]),
-      );
+      const detail = yield* Cache.get(itemCache, encodeItemKey([ref.sourceId, ref.itemId, at]));
       const itemLinks = yield* links
-        .listByItem(input.ref.sourceId, input.ref.itemId)
+        .listByItem(ref.sourceId, ref.itemId)
         .pipe(Effect.mapError(storeFailure));
       return { ...detail, links: itemLinks.map(toLink), capabilities: adapter.capabilities };
     });
@@ -700,7 +792,12 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       yield* requireGrants(actor, [AuthWorkReadScope]);
       const { adapter, runtime } = yield* resolveSource(query.sourceId, { interactive: true });
-      const people = yield* observed(query.sourceId, adapter.people(runtime, query));
+      const itemId =
+        query.itemId === undefined ? undefined : canonicalItemId(adapter.kind, query.itemId);
+      const people = yield* observed(
+        query.sourceId,
+        adapter.people(runtime, itemId === undefined ? query : { ...query, itemId }),
+      );
       return { people };
     });
 
@@ -768,18 +865,19 @@ const make = Effect.gen(function* () {
       return created;
     });
 
-  const updateItem: WorkService["Service"]["updateItem"] = (actor, patch) =>
+  const updateItem: WorkService["Service"]["updateItem"] = (actor, input) =>
     Effect.gen(function* () {
       yield* requireGrants(actor, [AuthWorkWriteScope]);
       if (
-        (patch.title !== undefined || patch.body !== undefined) &&
-        patch.expectedRevision === undefined
+        (input.title !== undefined || input.body !== undefined) &&
+        input.expectedRevision === undefined
       ) {
         return yield* new WorkInvalid({
           detail: "Title and body edits need the revision they were based on.",
         });
       }
-      const { adapter, runtime } = yield* resolveSource(patch.ref.sourceId, { interactive: true });
+      const { adapter, runtime } = yield* resolveSource(input.ref.sourceId, { interactive: true });
+      const patch = { ...input, ref: yield* canonicalRef(input.ref) };
       const updated = yield* observed(patch.ref.sourceId, adapter.update(runtime, patch, actor));
       yield* bumpEpoch;
       return updated;
@@ -789,7 +887,11 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       yield* requireGrants(actor, [AuthWorkWriteScope]);
       const { adapter, runtime } = yield* resolveSource(input.ref.sourceId, { interactive: true });
-      const updated = yield* observed(input.ref.sourceId, adapter.setStatus(runtime, input, actor));
+      const request = { ...input, ref: yield* canonicalRef(input.ref) };
+      const updated = yield* observed(
+        input.ref.sourceId,
+        adapter.setStatus(runtime, request, actor),
+      );
       yield* bumpEpoch;
       return updated;
     });
@@ -807,12 +909,13 @@ const make = Effect.gen(function* () {
         });
       }
       const { adapter, runtime } = yield* resolveSource(input.ref.sourceId, { interactive: true });
+      const ref = yield* canonicalRef(input.ref);
       const body = attributeComment(input.body, actor);
       const result = yield* replayed(
         actor,
         "comment",
         input.clientRequestId,
-        observed(input.ref.sourceId, adapter.comment(runtime, input.ref.itemId, body, actor)),
+        observed(ref.sourceId, adapter.comment(runtime, ref.itemId, body, actor)),
       );
       yield* bumpEpoch;
       return result;
@@ -838,8 +941,9 @@ const make = Effect.gen(function* () {
         return { links: rows.map(toLink), truncated: false };
       }
       if (query.ref !== undefined) {
+        const ref = yield* canonicalRef(query.ref);
         const rows = yield* links
-          .listByItem(query.ref.sourceId, query.ref.itemId)
+          .listByItem(ref.sourceId, ref.itemId)
           .pipe(Effect.mapError(storeFailure));
         return { links: rows.map(toLink), truncated: false };
       }
@@ -858,14 +962,15 @@ const make = Effect.gen(function* () {
       return { links: open.flat().map(toLink), truncated: all.truncated };
     });
 
-  const setLink: WorkService["Service"]["setLink"] = (actor, input) =>
+  const setLink: WorkService["Service"]["setLink"] = (actor, request) =>
     Effect.gen(function* () {
       yield* requireGrants(actor, [AuthWorkWriteScope]);
+      const input = { ...request, ref: yield* canonicalRef(request.ref) };
       if (input.action === "unlink") {
-        yield* links
+        const removed = yield* links
           .unlink(input.ref.sourceId, input.ref.itemId, input.threadId)
           .pipe(Effect.mapError(storeFailure));
-        yield* bumpEpoch;
+        if (removed) yield* bumpEpoch;
         return { linked: false };
       }
       const { adapter, runtime } = yield* resolveSource(input.ref.sourceId, { interactive: true });
@@ -961,6 +1066,9 @@ const make = Effect.gen(function* () {
     snapshots,
     retireProject,
     bumpEpoch,
+    canonicalRef,
+    reserveLaunch,
+    isLaunching,
   });
 });
 
