@@ -26,16 +26,26 @@ different name under an id is refused instead of skipped (see
 ## Links live in Work, not on the thread
 
 Thread links are rows in `fd_work_thread_links`, never fields on the thread
-shell, so core projections and upstream merges stay untouched. A link is written
-before a thread launch so a concurrent start of the same item sees it, and starts
-of one item are serialized in-process (one server owns a T3 home). A link whose
-thread does not exist after `LAUNCH_GRACE_MS` is a crashed launch and is dropped.
+shell, so core projections and upstream merges stay untouched. Item ids are
+canonicalized per source kind (`model/itemId.ts`) before they key locks, caches
+or link rows, because trackers accept several spellings of one item. A link is
+written before a thread launch so a concurrent start of the same item sees it,
+and starts of one item are serialized in-process (one server owns a T3 home).
+While the launch runs, an in-memory reservation (`WorkService.reserveLaunch`)
+marks the link live however long the launch takes; a launch that ends without a
+thread removes its link. A link without a thread or a reservation is a launch
+that died with the process and is dropped.
 
-The sync reactor drops links when their thread is deleted or settled and records
-each linked run's terminal status, which is how a client knows to offer "Back to
+The sync reactor drops links when their thread is deleted, and on settlement the
+links that existed when the thread settled, and records each linked run's
+terminal status, which is how a client knows to offer "Mark done?" or "Back to
 todo?". Settling is the owner saying the thread is finished, so unsettling does
-not bring the link back. A five-minute sweep reconciles what the live event tail
-missed and refreshes link snapshots; nothing polls item lists.
+not bring the link back. The thread event tail is live only: a sweep at boot and
+every five minutes recovers outcomes committed while the reactor was not
+listening, drops links the tail missed and refreshes the displayed snapshot
+fields. A snapshot's revision stays the item as the thread first saw it (or as
+the automatic start left it), the baseline for "Changed since the thread
+started". Nothing polls item lists.
 
 ## Canonical checkout
 

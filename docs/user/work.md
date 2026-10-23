@@ -14,7 +14,9 @@ Choose **Work** in the sidebar, **Open work** in the command palette, or press
 an open linked thread, **Done** finished or cancelled items, and **All**
 everything. Select an item to read, edit, comment, change its status, start a
 thread or link one. **Add to prompt** opens a new thread in the item's project
-with a reference to the item in the composer.
+with a reference to the item in the composer. If an item changes while you edit
+its title or description, Work keeps your edit and shows the current version so
+you can reapply your edit or discard it.
 
 To add a source, open the project's settings and use **Work sources**. In a
 thread, the details panel lists the thread's linked items; use **Link work item**
@@ -95,7 +97,9 @@ the server and is shared by every source on the same site and email, so a second
 project on that site does not ask for it again. **Remove token** forgets it for
 all of them; a source without a token shows that it needs one. Jira Data Center,
 scoped tokens and Atlassian sign-in are not supported yet. Tokens expire on the
-date you chose when creating them; when one does, the source asks for a new one.
+date you chose when creating them; when one does, use **Replace token** on the
+source. Work checks the new token before saving it for every source on that site
+and email, so nothing needs to be disconnected.
 
 Work shows Jira's own status name and maps its category to **To do**, **In
 progress** or **Done** (**Cancelled** for resolutions such as Won't Do or
@@ -121,11 +125,15 @@ attempt. Deleting or settling the thread removes the link; unlinking keeps the
 thread.
 
 When **Mark as in progress on start** is on for a Markdown source (the
-default), a `todo` task moves to `in_progress` when its thread starts. If that
+default), a `todo` task moves to `in_progress` when its thread starts, unless
+someone changed the task while the thread was starting. If that
 thread's run fails or is stopped, the item offers **Back to todo?**; when a run
 completes, it offers to mark the item done. Both can be undone, and nothing
-changes on its own. **Send update to thread** appears when the item changed
-after its thread started, and opens the thread with a draft you can edit.
+changes on its own. Undo applies only while nobody else has changed the item
+since; otherwise Work tells you and leaves the newer change in place. **Send
+update to thread** appears when the item changed after its thread started, and
+opens the thread with a note added to its draft; anything you had already typed
+there stays.
 
 ## Agents
 
