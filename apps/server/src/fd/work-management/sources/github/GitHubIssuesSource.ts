@@ -133,8 +133,19 @@ const mentionsOptionalField = (error: unknown) =>
 /** GraphQL search syntax quotes phrases; a quote in the text is dropped rather than escaped. */
 const searchTerm = (text: string) => text.replaceAll('"', " ").trim();
 
+/**
+ * An issue number written in decimal digits, or undefined. `Number` alone would also read `1e0`
+ * or `0x1` as issue 1, a spelling the Work id canonicalization (`model/itemId.ts`) does not
+ * share, so two spellings could reach one issue under different locks and links.
+ */
+const issueNumber = (itemId: string): number | undefined => {
+  if (!/^\d+$/.test(itemId)) return undefined;
+  const number = Number(itemId);
+  return Number.isSafeInteger(number) && number >= 1 ? number : undefined;
+};
+
 export interface GitHubIssuesOptions {
-  /** Minimum time between two writes to one source; GitHub asks for a second. */
+  /** Minimum time between two write requests to one source; GitHub asks for a second. */
   readonly writeSpacingMs?: number;
 }
 
@@ -194,7 +205,10 @@ export const make = (options: GitHubIssuesOptions = {}) =>
         .rest({ host: configOf(runtime).host, allowReserve: runtime.interactive, ...input })
         .pipe(Effect.mapError(fromGitHubError(itemId === undefined ? {} : { itemId })));
 
-    /** Writes to one source are serialized and spaced, as GitHub's secondary limits ask. */
+    /**
+     * Write operations to one source run one at a time, so the spacing `restWrite` keeps between
+     * their requests holds even when an update takes several.
+     */
     const write = <A, E>(runtime: WorkSourceRuntime, effect: Effect.Effect<A, E>) =>
       Effect.suspend(() => {
         let lock = writeLocks.get(runtime.sourceId);
@@ -202,19 +216,26 @@ export const make = (options: GitHubIssuesOptions = {}) =>
           lock = Semaphore.makeUnsafe(1);
           writeLocks.set(runtime.sourceId, lock);
         }
-        return lock.withPermits(1)(
-          Effect.gen(function* () {
-            const now = yield* Clock.currentTimeMillis;
-            const wait = (lastWrite.get(runtime.sourceId) ?? 0) + writeSpacing - now;
-            if (writeSpacing > 0 && wait > 0) yield* Effect.sleep(Duration.millis(wait));
-            return yield* effect.pipe(
-              Effect.ensuring(
-                Clock.currentTimeMillis.pipe(
-                  Effect.map((at) => void lastWrite.set(runtime.sourceId, at)),
-                ),
-              ),
-            );
-          }),
+        return lock.withPermits(1)(effect);
+      });
+
+    /** One mutating request, spaced from the source's previous one as GitHub's secondary limits ask. */
+    const restWrite = (
+      runtime: WorkSourceRuntime,
+      input: Omit<GitHubApi.GitHubRestInput, "host">,
+      itemId?: string,
+    ) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        const wait =
+          (lastWrite.get(runtime.sourceId) ?? Number.NEGATIVE_INFINITY) + writeSpacing - now;
+        if (writeSpacing > 0 && wait > 0) yield* Effect.sleep(Duration.millis(wait));
+        return yield* rest(runtime, input, itemId).pipe(
+          Effect.ensuring(
+            Clock.currentTimeMillis.pipe(
+              Effect.map((at) => void lastWrite.set(runtime.sourceId, at)),
+            ),
+          ),
         );
       });
 
@@ -238,10 +259,8 @@ export const make = (options: GitHubIssuesOptions = {}) =>
 
     const detail = (runtime: WorkSourceRuntime, itemId: string) =>
       Effect.gen(function* () {
-        const number = Number(itemId);
-        if (!Number.isSafeInteger(number) || number < 1) {
-          return yield* new WorkItemNotFound({ itemId });
-        }
+        const number = issueNumber(itemId);
+        if (number === undefined) return yield* new WorkItemNotFound({ itemId });
         const response = yield* graphql(
           runtime,
           "work.issue",
@@ -424,7 +443,7 @@ export const make = (options: GitHubIssuesOptions = {}) =>
                 detail: "GitHub issues take a title, body, labels and an assignee here.",
               });
             }
-            const response = yield* rest(runtime, {
+            const response = yield* restWrite(runtime, {
               operation: "work.issue.create",
               method: "POST",
               path: `${repositoryPath(config)}/issues`,
@@ -447,6 +466,7 @@ export const make = (options: GitHubIssuesOptions = {}) =>
           Effect.gen(function* () {
             const config = configOf(runtime);
             const itemId = patch.ref.itemId;
+            if (issueNumber(itemId) === undefined) return yield* new WorkItemNotFound({ itemId });
             const path = `${repositoryPath(config)}/issues/${itemId}`;
             if (
               patch.parent !== undefined ||
@@ -459,7 +479,7 @@ export const make = (options: GitHubIssuesOptions = {}) =>
             }
             yield* checkRevision(runtime, itemId, patch.expectedRevision);
             if (patch.title !== undefined || patch.body !== undefined) {
-              yield* rest(
+              yield* restWrite(
                 runtime,
                 {
                   operation: "work.issue.update",
@@ -484,6 +504,7 @@ export const make = (options: GitHubIssuesOptions = {}) =>
           runtime,
           Effect.gen(function* () {
             const itemId = input.ref.itemId;
+            if (issueNumber(itemId) === undefined) return yield* new WorkItemNotFound({ itemId });
             if (input.transitionId !== undefined || input.status === undefined) {
               return yield* new WorkUnsupported({ detail: "GitHub issues have no transitions." });
             }
@@ -494,7 +515,7 @@ export const make = (options: GitHubIssuesOptions = {}) =>
               });
             }
             yield* checkRevision(runtime, itemId, input.expectedRevision);
-            yield* rest(
+            yield* restWrite(
               runtime,
               {
                 operation: "work.issue.status",
@@ -511,7 +532,8 @@ export const make = (options: GitHubIssuesOptions = {}) =>
         write(
           runtime,
           Effect.gen(function* () {
-            const response = yield* rest(
+            if (issueNumber(itemId) === undefined) return yield* new WorkItemNotFound({ itemId });
+            const response = yield* restWrite(
               runtime,
               {
                 operation: "work.issue.comment",
@@ -560,7 +582,7 @@ export const make = (options: GitHubIssuesOptions = {}) =>
       Effect.gen(function* () {
         if (labels === undefined) return;
         if (labels.add.length > 0) {
-          yield* rest(
+          yield* restWrite(
             runtime,
             {
               operation: "work.issue.labels.add",
@@ -572,7 +594,7 @@ export const make = (options: GitHubIssuesOptions = {}) =>
           );
         }
         for (const label of labels.remove) {
-          yield* rest(
+          yield* restWrite(
             runtime,
             {
               operation: "work.issue.labels.remove",
@@ -587,7 +609,10 @@ export const make = (options: GitHubIssuesOptions = {}) =>
         }
       });
 
-    /** One assignee: the previous ones are removed and the new one added through the endpoints. */
+    /**
+     * Work shows one assignee, so setting it removes every other one. The full list is read fresh
+     * over REST: summaries only carry the first few, and an issue can have up to ten.
+     */
     const applyAssignee = (
       runtime: WorkSourceRuntime,
       path: string,
@@ -595,11 +620,16 @@ export const make = (options: GitHubIssuesOptions = {}) =>
       assignee: string | null,
     ) =>
       Effect.gen(function* () {
-        const current = yield* detail(runtime, itemId);
-        const previous = current.assignee === null ? [] : [current.assignee.id];
-        const removed = previous.filter((login) => login !== assignee);
+        const response = yield* rest(runtime, { operation: "work.issue.assignees", path }, itemId);
+        const current = yield* decodeRestIssue(response.body).pipe(
+          Effect.mapError(fromGitHubError({ itemId })),
+        );
+        const previous = (current.assignees ?? []).map((user) => user.login);
+        // Logins are case-insensitive on GitHub.
+        const target = assignee?.toLowerCase();
+        const removed = previous.filter((login) => login.toLowerCase() !== target);
         if (removed.length > 0) {
-          yield* rest(
+          yield* restWrite(
             runtime,
             {
               operation: "work.issue.assignees.remove",
@@ -610,8 +640,8 @@ export const make = (options: GitHubIssuesOptions = {}) =>
             itemId,
           );
         }
-        if (assignee !== null && !previous.includes(assignee)) {
-          yield* rest(
+        if (assignee !== null && !previous.some((login) => login.toLowerCase() === target)) {
+          yield* restWrite(
             runtime,
             {
               operation: "work.issue.assignees.add",

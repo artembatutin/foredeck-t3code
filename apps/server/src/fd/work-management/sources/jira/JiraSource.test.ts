@@ -2,8 +2,11 @@ import { assert, describe, it } from "@effect/vitest";
 import { ProjectId } from "@t3tools/contracts";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, type HttpClientRequest, HttpClientResponse } from "effect/http";
 
 import { owner } from "../../testkit/fakes.ts";
@@ -41,6 +44,8 @@ interface Seen {
   readonly path: string;
   readonly body: unknown;
   readonly authorization: string | undefined;
+  /** When the request was sent, on the test clock. */
+  readonly at: number;
 }
 
 const issueJson = (key: string, overrides: Record<string, unknown> = {}) => ({
@@ -70,9 +75,10 @@ const decoder = new TextDecoder();
 const fakeJira = (answer: (seen: Seen) => Answer) => {
   const seen: Array<Seen> = [];
   const client = HttpClient.make((request: HttpClientRequest.HttpClientRequest) =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
       const url = new URL(request.url);
       const entry: Seen = {
+        at: yield* Clock.currentTimeMillis,
         method: request.method,
         path: url.pathname,
         body:
@@ -99,8 +105,25 @@ const fakeJira = (answer: (seen: Seen) => Answer) => {
   return { seen, layer };
 };
 
-const adapterWith = (fake: ReturnType<typeof fakeJira>) =>
-  JiraSource.make({ readRetries: 0, issueWriteSpacingMs: 0 }).pipe(Effect.provide(fake.layer));
+const adapterWith = (
+  fake: ReturnType<typeof fakeJira>,
+  options: JiraSource.JiraSourceOptions = { readRetries: 0, issueWriteSpacingMs: 0 },
+) => JiraSource.make(options).pipe(Effect.provide(fake.layer));
+
+/**
+ * Moves the test clock a second at a time, so a fiber that only starts sleeping after an earlier
+ * one wakes still wakes at its own deadline.
+ */
+const advanceSeconds = (seconds: number) =>
+  Effect.forEach(Array.from({ length: seconds }), () => TestClock.adjust("1 second"), {
+    discard: true,
+  });
+
+const commentCreated = { body: { id: "c1" } };
+const perIssueLimit: Answer = {
+  status: 429,
+  headers: { "retry-after": "30", "ratelimit-reason": "jira-per-issue-on-write" },
+};
 
 describe("JiraSource", () => {
   it.effect("searches with explicit fields and maps issues", () =>
@@ -368,6 +391,206 @@ describe("JiraSource", () => {
         adapter.list(runtime({ secret: undefined }), { sourceId, limit: 50 }),
       );
       assert.strictEqual(missing._tag, "WorkUnauthenticated");
+    }),
+  );
+  it.effect("holds only the limited issue's later writes after a per-issue limit", () =>
+    Effect.gen(function* () {
+      let limitNext = true;
+      const fake = fakeJira((seen) => {
+        if (
+          seen.method === "POST" &&
+          seen.path === "/rest/api/3/issue/PROJ-1/comment" &&
+          limitNext
+        ) {
+          limitNext = false;
+          return perIssueLimit;
+        }
+        return seen.method === "POST" && seen.path.endsWith("/comment")
+          ? commentCreated
+          : { body: { issues: [] } };
+      });
+      const adapter = yield* adapterWith(fake);
+      const limited = yield* Effect.flip(
+        adapter.comment(runtime(), WorkItemId.make("PROJ-1"), "a", owner),
+      );
+      assert.strictEqual(limited._tag, "WorkRateLimited");
+
+      const held = yield* adapter
+        .comment(runtime(), WorkItemId.make("PROJ-1"), "b", owner)
+        .pipe(Effect.forkChild);
+      // Another issue and the site's reads go straight through.
+      yield* adapter.comment(runtime(), WorkItemId.make("PROJ-2"), "c", owner);
+      yield* adapter.list(runtime(), { sourceId, limit: 50 });
+      yield* TestClock.adjust("29 seconds");
+      assert.deepStrictEqual(
+        fake.seen.map((seen) => [seen.method, seen.path, seen.at]),
+        [
+          ["POST", "/rest/api/3/issue/PROJ-1/comment", 0],
+          ["POST", "/rest/api/3/issue/PROJ-2/comment", 0],
+          ["POST", "/rest/api/3/search/jql", 0],
+        ],
+      );
+      yield* TestClock.adjust("1 second");
+      yield* Fiber.join(held);
+      assert.deepStrictEqual(
+        fake.seen.slice(3).map((seen) => [seen.path, seen.at]),
+        [["/rest/api/3/issue/PROJ-1/comment", 30_000]],
+      );
+    }),
+  );
+
+  it.effect("pauses every background request after a site-wide limit", () =>
+    Effect.gen(function* () {
+      let limitNext = true;
+      const fake = fakeJira((seen) => {
+        if (limitNext) {
+          limitNext = false;
+          return {
+            status: 429,
+            headers: { "retry-after": "30", "ratelimit-reason": "jira-burst-based" },
+          };
+        }
+        return seen.method === "POST" && seen.path.endsWith("/comment")
+          ? commentCreated
+          : { body: { issues: [] } };
+      });
+      const adapter = yield* adapterWith(fake);
+      const limited = yield* Effect.flip(
+        adapter.comment(runtime(), WorkItemId.make("PROJ-1"), "a", owner),
+      );
+      assert.strictEqual(limited._tag, "WorkRateLimited");
+      const otherIssue = yield* Effect.flip(
+        adapter.comment(runtime(), WorkItemId.make("PROJ-2"), "b", owner),
+      );
+      assert.strictEqual(otherIssue._tag, "WorkRateLimited");
+      const read = yield* Effect.flip(adapter.list(runtime(), { sourceId, limit: 50 }));
+      assert.strictEqual(read._tag, "WorkRateLimited");
+      assert.strictEqual(fake.seen.length, 1);
+
+      yield* TestClock.adjust("30 seconds");
+      yield* adapter.comment(runtime(), WorkItemId.make("PROJ-2"), "b", owner);
+      assert.strictEqual(fake.seen.length, 2);
+    }),
+  );
+
+  it.effect("spaces each write request to one issue, including within an update", () =>
+    Effect.gen(function* () {
+      const fake = fakeJira((seen) =>
+        seen.method === "PUT"
+          ? { status: 204 }
+          : seen.path.endsWith("/comment") && seen.method === "POST"
+            ? commentCreated
+            : { body: issueJson("PROJ-5") },
+      );
+      const adapter = yield* adapterWith(fake, { readRetries: 0, issueWriteSpacingMs: 2_000 });
+      const ref = { sourceId, itemId: WorkItemId.make("PROJ-5") };
+      const update = yield* adapter
+        .update(runtime(), { ref, title: "New", assignee: "acc-2" }, owner)
+        .pipe(Effect.forkChild);
+      const comment = yield* adapter
+        .comment(runtime(), ref.itemId, "done", owner)
+        .pipe(Effect.forkChild);
+      yield* advanceSeconds(60);
+      yield* Fiber.join(update);
+      yield* Fiber.join(comment);
+      assert.deepStrictEqual(
+        fake.seen
+          .filter((seen) => seen.method !== "GET")
+          .map((seen) => [seen.method, seen.path, seen.at]),
+        [
+          ["PUT", "/rest/api/3/issue/PROJ-5", 0],
+          ["PUT", "/rest/api/3/issue/PROJ-5/assignee", 2_000],
+          ["POST", "/rest/api/3/issue/PROJ-5/comment", 4_000],
+        ],
+      );
+    }),
+  );
+
+  it.effect("retries reads with backoff, including the POST search, up to four attempts", () =>
+    Effect.gen(function* () {
+      let failures = 3;
+      const fake = fakeJira(() => {
+        if (failures > 0) {
+          failures -= 1;
+          return { status: 503 };
+        }
+        return { body: { issues: [] } };
+      });
+      const adapter = yield* adapterWith(fake, { issueWriteSpacingMs: 0 });
+      const listed = yield* adapter.list(runtime(), { sourceId, limit: 50 }).pipe(Effect.forkChild);
+      yield* advanceSeconds(60);
+      yield* Fiber.join(listed);
+      assert.strictEqual(fake.seen.length, 4);
+      assert.isTrue(fake.seen.every((seen) => seen.method === "POST"));
+      // Each retry waits a little longer than the one before it.
+      const gaps = fake.seen.slice(1).map((seen, index) => seen.at - fake.seen[index]!.at);
+      assert.isTrue(gaps.every((gap, index) => gap > 0 && (index === 0 || gap > gaps[index - 1]!)));
+
+      failures = 10;
+      const read = yield* adapter
+        .get(runtime(), WorkItemId.make("PROJ-1"))
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* advanceSeconds(60);
+      const error = yield* Fiber.join(read);
+      assert.strictEqual(error._tag, "WorkUnavailable");
+      assert.strictEqual(fake.seen.slice(4).length, 4);
+      assert.notInclude(JSON.stringify(error), TOKEN);
+    }),
+  );
+
+  it.effect("never retries a write", () =>
+    Effect.gen(function* () {
+      const fake = fakeJira((seen) =>
+        seen.method === "GET" ? { body: issueJson("PROJ-6") } : { status: 503 },
+      );
+      const adapter = yield* adapterWith(fake, { issueWriteSpacingMs: 0 });
+      const writes = () => fake.seen.filter((seen) => seen.method !== "GET");
+      const ref = { sourceId, itemId: WorkItemId.make("PROJ-6") };
+
+      const comment = yield* adapter
+        .comment(runtime(), ref.itemId, "x", owner)
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* advanceSeconds(60);
+      assert.strictEqual((yield* Fiber.join(comment))._tag, "WorkUnavailable");
+      assert.strictEqual(writes().length, 1);
+
+      const update = yield* adapter
+        .update(runtime(), { ref, title: "y" }, owner)
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* advanceSeconds(60);
+      assert.strictEqual((yield* Fiber.join(update))._tag, "WorkUnavailable");
+      assert.deepStrictEqual(
+        writes().map((seen) => seen.method),
+        ["POST", "PUT"],
+      );
+    }),
+  );
+
+  it.effect("serializes writes to one issue across sources on the same site", () =>
+    Effect.gen(function* () {
+      const fake = fakeJira((seen) =>
+        seen.method === "POST" && seen.path.endsWith("/comment")
+          ? commentCreated
+          : { body: issueJson("PROJ-5") },
+      );
+      const adapter = yield* adapterWith(fake, { readRetries: 0, issueWriteSpacingMs: 2_000 });
+      // A second source over the same Jira project.
+      const other = runtime({
+        sourceId: WorkSourceId.make("0b9d7f8e-1c2a-4e5b-9a7d-3f6e8c1b2a40"),
+      });
+      const first = yield* adapter
+        .comment(runtime(), WorkItemId.make("PROJ-5"), "one", owner)
+        .pipe(Effect.forkChild);
+      const second = yield* adapter
+        .comment(other, WorkItemId.make("PROJ-5"), "two", owner)
+        .pipe(Effect.forkChild);
+      yield* advanceSeconds(10);
+      yield* Fiber.join(first);
+      yield* Fiber.join(second);
+      assert.deepStrictEqual(
+        fake.seen.filter((seen) => seen.method === "POST").map((seen) => seen.at),
+        [0, 2_000],
+      );
     }),
   );
 });

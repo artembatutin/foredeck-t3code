@@ -2,9 +2,12 @@ import { assert, describe, it } from "@effect/vitest";
 import { ProjectId } from "@t3tools/contracts";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
 import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
+import * as TestClock from "effect/testing/TestClock";
 
 import { owner } from "../../testkit/fakes.ts";
 import type { WorkSourceRuntime } from "../WorkSourceAdapter.ts";
@@ -62,6 +65,8 @@ interface Call {
   readonly query?: string;
   readonly variables?: Record<string, unknown>;
   readonly allowReserve?: boolean;
+  /** When the request was sent, on the test clock. */
+  readonly at?: number;
 }
 
 /** A GitHubApi whose answers come from a handler per operation. */
@@ -79,16 +84,20 @@ const stubApi = (answer: (call: Call) => Effect.Effect<string, GitHubApi.GitHubA
       calls.push(call);
       return answer(call);
     },
-    rest: (input) => {
-      const call: Call = {
-        kind: "rest",
-        operation: input.operation,
-        method: input.method ?? "GET",
-        path: input.path,
-        body: input.body,
-      };
-      calls.push(call);
-      return answer(call).pipe(
+    rest: (input) =>
+      Effect.gen(function* () {
+        const call: Call = {
+          kind: "rest",
+          operation: input.operation,
+          method: input.method ?? "GET",
+          path: input.path,
+          body: input.body,
+          at: yield* Clock.currentTimeMillis,
+        };
+        calls.push(call);
+        return call;
+      }).pipe(
+        Effect.flatMap(answer),
         Effect.map((body) => ({
           status: 200,
           headers: {},
@@ -96,15 +105,34 @@ const stubApi = (answer: (call: Call) => Effect.Effect<string, GitHubApi.GitHubA
           truncated: false,
           invalidUtf8: false,
         })),
-      );
-    },
+      ),
     credential: () => Effect.succeed({ token: Redacted.make("token"), fingerprint: "fp" }),
   });
   return { calls, layer };
 };
 
-const adapterWith = (api: ReturnType<typeof stubApi>) =>
-  GitHubIssuesSource.make({ writeSpacingMs: 0 }).pipe(Effect.provide(api.layer));
+const adapterWith = (api: ReturnType<typeof stubApi>, writeSpacingMs = 0) =>
+  GitHubIssuesSource.make({ writeSpacingMs }).pipe(Effect.provide(api.layer));
+
+/** The REST issue a fresh assignee read answers with. */
+const restIssue = (number: number, assignees: ReadonlyArray<string>) =>
+  JSON.stringify({
+    number,
+    node_id: `I_${number}`,
+    updated_at: "2026-10-20T10:00:00Z",
+    assignees: assignees.map((login) => ({ login })),
+  });
+
+/**
+ * Moves the test clock a second at a time, so a fiber that only starts sleeping after an earlier
+ * one wakes still wakes at its own deadline.
+ */
+const advanceSeconds = (seconds: number) =>
+  Effect.forEach(Array.from({ length: seconds }), () => TestClock.adjust("1 second"), {
+    discard: true,
+  });
+
+const isWrite = (call: Call) => call.kind === "rest" && call.method !== "GET";
 
 describe("GitHubIssuesSource", () => {
   it.effect(
@@ -329,6 +357,114 @@ describe("GitHubIssuesSource", () => {
       assert.deepStrictEqual([...detail.blockedBy], [WorkItemId.make("2")]);
       assert.deepStrictEqual(detail.assignee, { id: "octo", label: "Octo Cat" });
       assert.strictEqual(detail.revision, "2026-10-20T10:00:00Z|I_6");
+    }),
+  );
+  it.effect("spaces every request of a multi-request update and of a queued write", () =>
+    Effect.gen(function* () {
+      const api = stubApi((call) =>
+        call.kind === "graphql"
+          ? Effect.succeed(detailBody(7))
+          : call.method === "GET"
+            ? Effect.succeed(restIssue(7, ["ann", "bob"]))
+            : call.operation === "work.issue.comment"
+              ? Effect.succeed(JSON.stringify({ id: 99 }))
+              : Effect.succeed("{}"),
+      );
+      const adapter = yield* adapterWith(api, 1_000);
+      const ref = { sourceId, itemId: WorkItemId.make("7") };
+      const update = yield* adapter
+        .update(
+          runtime,
+          {
+            ref,
+            title: "New",
+            labels: { add: ["p1"], remove: ["bug"] },
+            assignee: "cat",
+          },
+          owner,
+        )
+        .pipe(Effect.forkChild);
+      const comment = yield* adapter
+        .comment(runtime, ref.itemId, "hi", owner)
+        .pipe(Effect.forkChild);
+      yield* advanceSeconds(60);
+      yield* Fiber.join(update);
+      yield* Fiber.join(comment);
+      const writes = api.calls.filter(isWrite);
+      assert.deepStrictEqual(
+        writes.map((call) => [call.operation, call.at]),
+        [
+          ["work.issue.update", 0],
+          ["work.issue.labels.add", 1_000],
+          ["work.issue.labels.remove", 2_000],
+          ["work.issue.assignees.remove", 3_000],
+          ["work.issue.assignees.add", 4_000],
+          ["work.issue.comment", 5_000],
+        ],
+      );
+    }),
+  );
+
+  it.effect("clears or replaces every assignee from a fresh read, not only the first", () =>
+    Effect.gen(function* () {
+      const api = stubApi((call) =>
+        call.kind === "graphql"
+          ? // The summary only names the first assignee.
+            Effect.succeed(detailBody(8, { assignees: { nodes: [{ login: "ann" }] } }))
+          : call.method === "GET"
+            ? Effect.succeed(restIssue(8, ["ann", "Bob", "cat"]))
+            : Effect.succeed("{}"),
+      );
+      const adapter = yield* adapterWith(api);
+      const ref = { sourceId, itemId: WorkItemId.make("8") };
+      const assigneeWrites = () =>
+        api.calls
+          .filter((call) => isWrite(call) && call.path === "repos/acme/app/issues/8/assignees")
+          .map((call) => [call.method, call.body]);
+
+      yield* adapter.update(runtime, { ref, assignee: null }, owner);
+      assert.deepStrictEqual(assigneeWrites(), [["DELETE", { assignees: ["ann", "Bob", "cat"] }]]);
+      const read = api.calls.find((call) => call.operation === "work.issue.assignees");
+      assert.deepStrictEqual([read?.method, read?.path], ["GET", "repos/acme/app/issues/8"]);
+
+      api.calls.length = 0;
+      yield* adapter.update(runtime, { ref, assignee: "dan" }, owner);
+      assert.deepStrictEqual(assigneeWrites(), [
+        ["DELETE", { assignees: ["ann", "Bob", "cat"] }],
+        ["POST", { assignees: ["dan"] }],
+      ]);
+
+      // Keeping one of them removes the rest and adds nothing; logins ignore case.
+      api.calls.length = 0;
+      yield* adapter.update(runtime, { ref, assignee: "bob" }, owner);
+      assert.deepStrictEqual(assigneeWrites(), [["DELETE", { assignees: ["ann", "cat"] }]]);
+    }),
+  );
+
+  it.effect("reads only decimal issue numbers, so no other spelling reaches an issue", () =>
+    Effect.gen(function* () {
+      const api = stubApi((call) =>
+        call.kind === "graphql" ? Effect.succeed(detailBody(1)) : Effect.succeed("{}"),
+      );
+      const adapter = yield* adapterWith(api);
+      for (const spelling of ["1e0", "0x1", "1.0"]) {
+        const itemId = WorkItemId.make(spelling);
+        const ref = { sourceId, itemId };
+        assert.strictEqual(
+          (yield* Effect.flip(adapter.get(runtime, itemId)))._tag,
+          "WorkItemNotFound",
+        );
+        assert.strictEqual(
+          (yield* Effect.flip(adapter.setStatus(runtime, { ref, status: "done" }, owner)))._tag,
+          "WorkItemNotFound",
+        );
+        assert.strictEqual(
+          (yield* Effect.flip(adapter.comment(runtime, itemId, "hi", owner)))._tag,
+          "WorkItemNotFound",
+        );
+      }
+      assert.deepStrictEqual(api.calls, []);
+      assert.strictEqual((yield* adapter.get(runtime, WorkItemId.make("1"))).ref.itemId, "1");
     }),
   );
 });

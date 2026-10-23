@@ -1,6 +1,5 @@
 import type { WorkItemSummary, WorkSourceConfig } from "@t3tools/contracts/fd/work-management";
 import * as Clock from "effect/Clock";
-import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
@@ -72,18 +71,13 @@ const originOf = (config: JiraConfig) => {
 export const jiraIdentity = (config: JiraConfig) =>
   `${new URL(originOf(config)).host.toLowerCase()}/${config.projectKey.trim().toUpperCase()}`;
 
-export interface JiraSourceOptions extends JiraApi.JiraApiOptions {
-  /** Minimum time between two writes to one issue; Jira limits per-issue write bursts. */
-  readonly issueWriteSpacingMs?: number;
-}
+export type JiraSourceOptions = JiraApi.JiraApiOptions;
 
 /** Jira Cloud issues of one project, through an unscoped API token stored on the server. */
 export const make = (options: JiraSourceOptions = {}) =>
   Effect.gen(function* () {
     const api = yield* JiraApi.make(options);
-    const spacing = options.issueWriteSpacingMs ?? 2_000;
     const issueLocks = new Map<string, Semaphore.Semaphore>();
-    const lastIssueWrite = new Map<string, number>();
     /** Issue ids written recently per source, named in searches until the index has them. */
     const recentWrites = new Map<string, Map<string, number>>();
 
@@ -117,38 +111,30 @@ export const make = (options: JiraSourceOptions = {}) =>
         }),
       );
 
-    /** Writes to one issue run one at a time and spaced, which also absorbs per-issue limits. */
+    /**
+     * Writes to one issue run one at a time; the transport spaces each of their requests. The
+     * lock is per site and issue, not per source: two sources over one Jira project write the
+     * same issues.
+     */
     const issueWrite = <A>(
       runtime: WorkSourceRuntime,
       key: string,
       effect: Effect.Effect<A, WorkDomainError>,
     ) =>
       Effect.suspend(() => {
-        const lockKey = `${runtime.sourceId}\0${key}`;
+        const lockKey = `${originOf(configOf(runtime))}\0${key}`;
         let lock = issueLocks.get(lockKey);
         if (lock === undefined) {
           lock = Semaphore.makeUnsafe(1);
           issueLocks.set(lockKey, lock);
         }
-        return lock.withPermits(1)(
-          Effect.gen(function* () {
-            const now = yield* Clock.currentTimeMillis;
-            const wait = (lastIssueWrite.get(lockKey) ?? 0) + spacing - now;
-            if (spacing > 0 && wait > 0) yield* Effect.sleep(Duration.millis(wait));
-            return yield* effect.pipe(
-              Effect.ensuring(
-                Clock.currentTimeMillis.pipe(
-                  Effect.map((at) => void lastIssueWrite.set(lockKey, at)),
-                ),
-              ),
-            );
-          }),
-        );
+        return lock.withPermits(1)(effect);
       });
 
     const readIssue = (runtime: WorkSourceRuntime, key: string, expand?: string) =>
       call(runtime, {
         operation: "jira.issue",
+        kind: "read",
         path: `/rest/api/3/issue/${encodeURIComponent(key)}`,
         query: { fields: "*navigable,-comment", ...(expand === undefined ? {} : { expand }) },
         itemId: key,
@@ -162,6 +148,7 @@ export const make = (options: JiraSourceOptions = {}) =>
         const issue = yield* readIssue(runtime, key, "transitions");
         const comments = yield* call(runtime, {
           operation: "jira.comments",
+          kind: "read",
           path: `/rest/api/3/issue/${encodeURIComponent(key)}/comment`,
           query: { maxResults: "50", orderBy: "-created" },
           itemId: key,
@@ -203,6 +190,7 @@ export const make = (options: JiraSourceOptions = {}) =>
         const reconcileIssues = yield* reconcileIds(runtime);
         const response = yield* call(runtime, {
           operation: "jira.search",
+          kind: "read",
           method: "POST",
           path: "/rest/api/3/search/jql",
           body: {
@@ -227,6 +215,7 @@ export const make = (options: JiraSourceOptions = {}) =>
     const people = (runtime: WorkSourceRuntime, query: string, itemId?: string) =>
       call(runtime, {
         operation: "jira.assignable",
+        kind: "read",
         path: "/rest/api/3/user/assignable/search",
         query: {
           query,
@@ -245,6 +234,7 @@ export const make = (options: JiraSourceOptions = {}) =>
     const issueTypeFor = (runtime: WorkSourceRuntime) =>
       call(runtime, {
         operation: "jira.createmeta",
+        kind: "read",
         path: `/rest/api/3/issue/createmeta/${encodeURIComponent(configOf(runtime).projectKey.toUpperCase())}/issuetypes`,
       }).pipe(
         Effect.flatMap((response) =>
@@ -277,6 +267,7 @@ export const make = (options: JiraSourceOptions = {}) =>
       Effect.gen(function* () {
         const response = yield* call(runtime, {
           operation: "jira.transitions",
+          kind: "read",
           path: `/rest/api/3/issue/${encodeURIComponent(key)}/transitions`,
           query: { expand: "transitions.fields" },
           itemId: key,
@@ -330,6 +321,7 @@ export const make = (options: JiraSourceOptions = {}) =>
             : (resolutions.find((value) => value.name === "Done") ?? resolutions[0]);
         yield* call(runtime, {
           operation: "jira.transition",
+          kind: "write",
           method: "POST",
           path: `/rest/api/3/issue/${encodeURIComponent(key)}/transitions`,
           body: {
@@ -375,7 +367,11 @@ export const make = (options: JiraSourceOptions = {}) =>
             secret === undefined ? undefined : { email: config.email, token: secret };
           const request = (input: Omit<JiraApi.JiraRequest, "interactive">) =>
             api.request(config.siteUrl, credential, { ...input, interactive: true });
-          yield* request({ operation: "jira.myself", path: "/rest/api/3/myself" }).pipe(
+          yield* request({
+            operation: "jira.myself",
+            kind: "read",
+            path: "/rest/api/3/myself",
+          }).pipe(
             Effect.flatMap((response) =>
               decodeMyself(response.body).pipe(Effect.mapError(unexpected)),
             ),
@@ -391,6 +387,7 @@ export const make = (options: JiraSourceOptions = {}) =>
           );
           const info = yield* request({
             operation: "jira.serverInfo",
+            kind: "read",
             path: "/rest/api/3/serverInfo",
           }).pipe(
             Effect.flatMap((response) =>
@@ -402,6 +399,7 @@ export const make = (options: JiraSourceOptions = {}) =>
           }
           yield* request({
             operation: "jira.project",
+            kind: "read",
             path: `/rest/api/3/project/${encodeURIComponent(projectKey)}`,
           }).pipe(
             Effect.flatMap((response) =>
@@ -437,6 +435,7 @@ export const make = (options: JiraSourceOptions = {}) =>
           const issueType = yield* issueTypeFor(runtime);
           const response = yield* call(runtime, {
             operation: "jira.create",
+            kind: "write",
             method: "POST",
             path: "/rest/api/3/issue",
             body: {
@@ -473,7 +472,9 @@ export const make = (options: JiraSourceOptions = {}) =>
             }
             if (patch.body !== undefined) {
               const current = yield* detail(runtime, key);
-              if (current.bodyFidelity === "lossy") {
+              // A description Work shows only in part, or cannot write back as it reads, would
+              // lose content on save.
+              if (current.bodyFidelity === "lossy" || current.bodyTruncated) {
                 return yield* new WorkUnsupported({
                   detail: "This description has content Work cannot show; edit it in Jira.",
                 });
@@ -512,6 +513,7 @@ export const make = (options: JiraSourceOptions = {}) =>
             if (Object.keys(fields).length > 0 || labels.length > 0) {
               yield* call(runtime, {
                 operation: "jira.update",
+                kind: "write",
                 method: "PUT",
                 path: `/rest/api/3/issue/${encodeURIComponent(key)}`,
                 body: {
@@ -524,6 +526,7 @@ export const make = (options: JiraSourceOptions = {}) =>
             if (patch.assignee !== undefined) {
               yield* call(runtime, {
                 operation: "jira.assign",
+                kind: "write",
                 method: "PUT",
                 path: `/rest/api/3/issue/${encodeURIComponent(key)}/assignee`,
                 body: { accountId: patch.assignee },
@@ -556,6 +559,7 @@ export const make = (options: JiraSourceOptions = {}) =>
           key,
           call(runtime, {
             operation: "jira.comment",
+            kind: "write",
             method: "POST",
             path: `/rest/api/3/issue/${encodeURIComponent(key)}/comment`,
             body: { body: markdownToAdf(body) },

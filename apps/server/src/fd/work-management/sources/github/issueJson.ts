@@ -141,6 +141,10 @@ export const RestIssueJson = Schema.fromJsonString(
     node_id: Schema.String,
     updated_at: Schema.String,
     pull_request: Schema.optional(Schema.Unknown),
+    /** Every assignee; GraphQL summaries only expose the first few. */
+    assignees: Schema.optional(
+      Schema.NullOr(Schema.Array(Schema.Struct({ login: Schema.String }))),
+    ),
   }),
 );
 export const RestCommentJson = Schema.fromJsonString(Schema.Struct({ id: Schema.Number }));

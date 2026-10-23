@@ -27,12 +27,14 @@ import {
  * The Jira Cloud REST transport. URLs are built only from the configured site's origin; links
  * inside payloads are data and never followed. Bodies are bounded, reads retry with backoff,
  * writes never retry, and rate limits pause the site in the server-wide rate-limit registry
- * (except per-issue write limits, which only that issue's serialized writes wait out).
+ * (except per-issue write limits, which only later writes to that issue wait out).
  */
 
 const REQUEST_TIMEOUT = Duration.seconds(30);
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const SITE_CONCURRENCY = 4;
+/** A per-issue limit longer than this fails the write instead of holding it open. */
+const MAX_ISSUE_WAIT_MS = 60_000;
 const JIRA_PROVIDER = SourceControlProviderKind.make("jira");
 /** Copied from the Bitbucket transport: a credential that is not header-safe is never sent. */
 const HEADER_SAFE = /^[\x21-\x7e]+$/u;
@@ -47,6 +49,12 @@ export interface JiraCredential {
 
 export interface JiraRequest {
   readonly operation: string;
+  /**
+   * A read is retried with backoff after a network failure or a 5xx, whatever its method (search
+   * is a POST); a write never is. A write naming `itemId` is spaced per issue and waits out that
+   * issue's own rate limit.
+   */
+  readonly kind: "read" | "write";
   readonly method?: "GET" | "POST" | "PUT" | "DELETE";
   /** Relative to the site, starting with `/rest/`. Query strings are passed in `query`. */
   readonly path: string;
@@ -54,7 +62,7 @@ export interface JiraRequest {
   readonly body?: unknown;
   /** User-initiated: may go through a pause the server recorded for background reads. */
   readonly interactive: boolean;
-  /** The item a 404 names, so it reads as not found instead of a bad request. */
+  /** The issue key a 404 names, so it reads as not found instead of a bad request. */
   readonly itemId?: string;
 }
 
@@ -64,8 +72,10 @@ export interface JiraResponse {
 }
 
 export interface JiraApiOptions {
-  /** Extra attempts for idempotent reads after a network failure or a 5xx answer. */
+  /** Extra attempts for reads after a network failure or a 5xx answer. */
   readonly readRetries?: number;
+  /** Minimum time between two write requests to one issue; Jira limits per-issue write bursts. */
+  readonly issueWriteSpacingMs?: number;
 }
 
 /** The site's origin, or a reason it cannot be used. Only https sites are trusted. */
@@ -117,6 +127,9 @@ export const make = (options: JiraApiOptions = {}) =>
     const rateLimit = yield* SourceControlRateLimit.SourceControlRateLimit;
     const siteLocks = new Map<string, Semaphore.Semaphore>();
     const readRetries = options.readRetries ?? 3;
+    const issueSpacing = options.issueWriteSpacingMs ?? 2_000;
+    /** Per site and issue: when the last write ended and until when Jira holds the issue. */
+    const issueWrites = new Map<string, { last: number; blockedUntil: number }>();
 
     const lockFor = (origin: string) => {
       let lock = siteLocks.get(origin);
@@ -172,6 +185,37 @@ export const make = (options: JiraApiOptions = {}) =>
             : HttpClientRequest.bodyJsonUnsafe(input.body),
         );
 
+        const issueKey =
+          input.kind === "write" && input.itemId !== undefined
+            ? `${site.origin}\0${input.itemId}`
+            : undefined;
+        /** Callers serialize writes to one issue; this spaces them and honours its own limit. */
+        const awaitIssue = Effect.gen(function* () {
+          if (issueKey === undefined) return;
+          const state = issueWrites.get(issueKey);
+          if (state === undefined) return;
+          const now = yield* Clock.currentTimeMillis;
+          if (state.blockedUntil - now > MAX_ISSUE_WAIT_MS) {
+            return yield* new WorkRateLimited({
+              retryAt: DateTime.formatIso(DateTime.makeUnsafe(state.blockedUntil)),
+            });
+          }
+          const wait = Math.max(state.last + issueSpacing, state.blockedUntil) - now;
+          if (wait > 0) yield* Effect.sleep(Duration.millis(wait));
+        });
+        const recordIssueWrite = (blockedUntil?: number) =>
+          issueKey === undefined
+            ? Effect.void
+            : Clock.currentTimeMillis.pipe(
+                Effect.map((now) => {
+                  const previous = issueWrites.get(issueKey)?.blockedUntil ?? 0;
+                  issueWrites.set(issueKey, {
+                    last: now,
+                    blockedUntil: Math.max(blockedUntil ?? 0, previous > now ? previous : 0),
+                  });
+                }),
+              );
+
         const attempt = Effect.gen(function* () {
           const lease = yield* rateLimit.check(key, { allowPaused: input.interactive }).pipe(
             Effect.mapError(
@@ -224,7 +268,8 @@ export const make = (options: JiraApiOptions = {}) =>
               "per-issue-on-write",
             );
             // A per-issue write limit holds only that issue; anything else pauses the site.
-            if (!perIssue) yield* rateLimit.recordRateLimit({ ...key, lease, retryAt });
+            if (perIssue) yield* recordIssueWrite(retryAt);
+            else yield* rateLimit.recordRateLimit({ ...key, lease, retryAt });
             return yield* new WorkRateLimited(
               retryAt === undefined
                 ? {}
@@ -258,19 +303,26 @@ export const make = (options: JiraApiOptions = {}) =>
           });
         });
 
-        const retried =
-          method === "GET" && readRetries > 0
-            ? attempt.pipe(
-                Effect.retry({
-                  while: (error) => error._tag === "RetryableFailure",
-                  times: readRetries,
-                  schedule: Schedule.exponential(Duration.millis(500)).pipe(Schedule.jittered),
-                }),
-              )
-            : attempt;
-        return yield* lockFor(site.origin)
-          .withPermits(1)(retried)
-          .pipe(Effect.catchTags({ RetryableFailure: (failure) => Effect.fail(failure.error) }));
+        // The backoff sleeps outside the site's permits so it never holds up other requests.
+        const once = lockFor(site.origin).withPermits(1)(attempt);
+        if (input.kind === "read") {
+          return yield* (
+            readRetries > 0
+              ? once.pipe(
+                  Effect.retry({
+                    while: (error) => error._tag === "RetryableFailure",
+                    times: readRetries,
+                    schedule: Schedule.exponential(Duration.millis(500)).pipe(Schedule.jittered),
+                  }),
+                )
+              : once
+          ).pipe(Effect.catchTags({ RetryableFailure: (failure) => Effect.fail(failure.error) }));
+        }
+        yield* awaitIssue;
+        return yield* once.pipe(
+          Effect.catchTags({ RetryableFailure: (failure) => Effect.fail(failure.error) }),
+          Effect.ensuring(recordIssueWrite()),
+        );
       });
 
     return { request };
