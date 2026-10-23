@@ -17,6 +17,7 @@ import {
 } from "./components/SettingsEnvironmentFilterHeader";
 import { useSettingsEnvironmentFilter, type SettingsTarget } from "./settings-environment-filter";
 import { RepositorySettings } from "../../fd/multirepo";
+import { WorkSources } from "../../fd/work-management";
 
 export function SettingsProjectOverviewRouteScreen() {
   const insets = useSafeAreaInsets();
@@ -147,6 +148,19 @@ function ProjectOverviewContent(props: {
         return (
           <RepositorySettings
             key={`${member.environmentId}:${member.id}`}
+            project={member}
+            serverConfig={environment?.serverConfig ?? null}
+            environmentLabel={environment?.label ?? "Environment"}
+          />
+        );
+      })}
+      {props.members.map((member) => {
+        const environment = props.environments.find(
+          (entry) => entry.environmentId === member.environmentId,
+        );
+        return (
+          <WorkSources
+            key={`work:${member.environmentId}:${member.id}`}
             project={member}
             serverConfig={environment?.serverConfig ?? null}
             environmentLabel={environment?.label ?? "Environment"}

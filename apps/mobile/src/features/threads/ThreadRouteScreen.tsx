@@ -1,4 +1,5 @@
 import { useOpenPullRequest } from "../../native/useOpenPullRequest";
+import { LinkedWorkRow } from "../../fd/work-management";
 import { makeTurnCommandMetadata } from "../../lib/commandMetadata";
 import { buildProjectThreadStartTurnInput } from "../../lib/projectThreadStartTurn";
 import { useWorktreeSetup } from "./use-worktree-setup";
@@ -994,6 +995,12 @@ function ThreadRouteContent(
         progress={gitActionProgress}
         onDismiss={dismissGitActionResult}
         onOpenPullRequest={openPullRequest}
+      />
+
+      <LinkedWorkRow
+        environmentId={selectedThread.environmentId}
+        threadId={selectedThread.id}
+        projectId={selectedThread.projectId}
       />
 
       <ThreadPane>
