@@ -1,3 +1,4 @@
+import { issue } from "../state.ts";
 import type { FactoryStageHandler } from "./registry.ts";
 
 /**
@@ -6,9 +7,9 @@ import type { FactoryStageHandler } from "./registry.ts";
  */
 export const agentStage: FactoryStageHandler<"agent"> = {
   kind: "agent",
-  begin: (delivery, stage) => ({
-    delivery: { ...delivery, stage: stage.name, awaiting: { type: "launch", role: stage.role } },
-    effects: [
+  begin: (delivery, stage) =>
+    issue(
+      { ...delivery, stage: stage.name },
       {
         type: "launch_thread",
         role: stage.role,
@@ -17,6 +18,5 @@ export const agentStage: FactoryStageHandler<"agent"> = {
             ? { type: "worktree", branch: delivery.branch, baseRef: delivery.baseRef }
             : { type: "existing_worktree", worktreePath: delivery.worktreePath },
       },
-    ],
-  }),
+    ),
 };

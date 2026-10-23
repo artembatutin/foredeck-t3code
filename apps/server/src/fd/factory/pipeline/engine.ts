@@ -1,8 +1,8 @@
 import { standardStages } from "./definitions.ts";
 import type { FactoryStageDefinition } from "./definitions.ts";
+import { issue } from "./state.ts";
 import type {
   FactoryAdvance,
-  FactoryAwaiting,
   FactoryBlock,
   FactoryDeliveryState,
   FactoryEffect,
@@ -13,18 +13,8 @@ import { stageHandler } from "./stages/registry.ts";
 /** Repairable settle problems get this many mechanical fix-commit turns before the delivery blocks. */
 const FIX_COMMIT_TURNS = 1;
 
-/** The awaited state each effect answers to, so a worker failure is matched to its effect. */
-const AWAITING_BY_EFFECT: Readonly<Record<FactoryEffect["type"], FactoryAwaiting["type"]>> = {
-  launch_thread: "launch",
-  send_fix_commit_turn: "turn",
-  check_settle: "settle",
-  run_command: "command",
-};
-
-const step = (delivery: FactoryDeliveryState, ...effects: FactoryEffect[]): FactoryAdvance => ({
-  delivery,
-  effects,
-});
+/** A step that issues no effect; `issue` makes the steps that do. */
+const step = (delivery: FactoryDeliveryState): FactoryAdvance => ({ delivery, effects: [] });
 
 /** A stale event's result: the very same state and no effects. */
 const unchanged = (delivery: FactoryDeliveryState) => step(delivery);
@@ -42,18 +32,31 @@ const begin = (delivery: FactoryDeliveryState, stage: FactoryStageDefinition): F
       );
 };
 
-const sameRun = (
-  awaiting: FactoryAwaiting | null,
-  type: "run" | "settle",
-  event: { readonly threadId: string; readonly runId: string },
-) =>
-  awaiting?.type === type && awaiting.threadId === event.threadId && awaiting.runId === event.runId;
+const isEffectOf = <T extends FactoryEffect["type"]>(
+  effect: FactoryEffect,
+  type: T,
+): effect is Extract<FactoryEffect, { readonly type: T }> => effect.type === type;
+
+/** The awaited effect when a worker result of `type` names it; undefined when the result is stale. */
+const awaitedEffect = <T extends FactoryEffect["type"]>(
+  delivery: FactoryDeliveryState,
+  effectId: number,
+  type: T,
+) => {
+  const { awaiting } = delivery;
+  return awaiting?.type === "effect" &&
+    awaiting.effect.id === effectId &&
+    isEffectOf(awaiting.effect, type)
+    ? awaiting.effect
+    : undefined;
+};
 
 /**
  * Folds one event into a delivery and returns the effects the worker must carry out. Pure: no
  * services, I/O or clock, and the input is never mutated, so a delivery's events replay to the
- * same state. An event that does not answer what the delivery awaits (another thread, run or
- * command attempt, a stage it is not in, a delivery that is not running) changes nothing.
+ * same state. An event that does not answer what the delivery awaits (a result for another
+ * effect, a run of another thread or an earlier run, a stage it is not in, a delivery that is not
+ * running) changes nothing.
  *
  * This covers a single item from start to a verified commit: the author thread, the branch
  * settle check with at most one fix-commit turn, then the verify command.
@@ -69,28 +72,34 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
 
   switch (event.type) {
     case "thread.launched": {
-      if (awaiting?.type !== "launch") return unchanged(delivery);
+      const launch = awaitedEffect(delivery, event.effectId, "launch_thread");
+      if (launch === undefined) return unchanged(delivery);
       return step({
         ...delivery,
         worktreePath: delivery.worktreePath ?? event.worktreePath,
         baseline: event.baseline,
-        threads: { ...delivery.threads, [awaiting.role]: event.threadId },
+        threads: { ...delivery.threads, [launch.role]: event.threadId },
         awaiting: { type: "run", threadId: event.threadId, runId: event.runId },
       });
     }
 
     case "turn.started": {
-      if (awaiting?.type !== "turn" || awaiting.threadId !== event.threadId) {
-        return unchanged(delivery);
-      }
+      const turn = awaitedEffect(delivery, event.effectId, "send_fix_commit_turn");
+      if (turn === undefined) return unchanged(delivery);
       return step({
         ...delivery,
-        awaiting: { type: "run", threadId: event.threadId, runId: event.runId },
+        awaiting: { type: "run", threadId: turn.threadId, runId: event.runId },
       });
     }
 
     case "run.finished": {
-      if (!sameRun(awaiting, "run", event)) return unchanged(delivery);
+      if (
+        awaiting?.type !== "run" ||
+        awaiting.threadId !== event.threadId ||
+        awaiting.runId !== event.runId
+      ) {
+        return unchanged(delivery);
+      }
       if (event.status !== "completed") {
         return blocked(delivery, {
           reason: "run_ended",
@@ -99,10 +108,11 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
           runStatus: event.status,
         });
       }
-      return step(
-        { ...delivery, awaiting: { type: "settle", threadId: event.threadId, runId: event.runId } },
-        { type: "check_settle", threadId: event.threadId, runId: event.runId },
-      );
+      return issue(delivery, {
+        type: "check_settle",
+        threadId: event.threadId,
+        runId: event.runId,
+      });
     }
 
     case "thread.deleted":
@@ -111,28 +121,21 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
         : unchanged(delivery);
 
     case "settle.checked": {
-      if (!sameRun(awaiting, "settle", event)) return unchanged(delivery);
+      const check = awaitedEffect(delivery, event.effectId, "check_settle");
+      if (check === undefined) return unchanged(delivery);
       const { result } = event;
       if (result.status === "settled") return begin(delivery, standardStages.verify);
       if (result.status === "repairable" && delivery.fixCommitTurns < FIX_COMMIT_TURNS) {
-        return step(
-          {
-            ...delivery,
-            awaiting: { type: "turn", threadId: event.threadId },
-            fixCommitTurns: delivery.fixCommitTurns + 1,
-          },
-          { type: "send_fix_commit_turn", threadId: event.threadId, problems: result.problems },
+        return issue(
+          { ...delivery, fixCommitTurns: delivery.fixCommitTurns + 1 },
+          { type: "send_fix_commit_turn", threadId: check.threadId, problems: result.problems },
         );
       }
       return blocked(delivery, { reason: "unsettled", problems: result.problems });
     }
 
     case "command.finished": {
-      if (
-        awaiting?.type !== "command" ||
-        awaiting.attempt !== event.attempt ||
-        event.stage !== delivery.stage
-      ) {
+      if (awaitedEffect(delivery, event.effectId, "run_command") === undefined) {
         return unchanged(delivery);
       }
       const { outcome } = event;
@@ -152,8 +155,12 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
     }
 
     case "effect.failed":
-      return awaiting?.type === AWAITING_BY_EFFECT[event.effect]
-        ? blocked(delivery, { reason: "effect_failed", effect: event.effect, detail: event.detail })
+      return awaiting?.type === "effect" && awaiting.effect.id === event.effectId
+        ? blocked(delivery, {
+            reason: "effect_failed",
+            effect: awaiting.effect,
+            detail: event.detail,
+          })
         : unchanged(delivery);
   }
 };

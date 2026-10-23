@@ -12,7 +12,6 @@ import { advance } from "./engine.ts";
 import { queuedDeliveryState } from "./state.ts";
 import type {
   FactoryAdvance,
-  FactoryAwaiting,
   FactoryCommandOutcome,
   FactoryDeliveryState,
   FactoryEffect,
@@ -46,17 +45,27 @@ const receipt = (overrides: Partial<FactoryVerifyReceipt> = {}): FactoryVerifyRe
   ...overrides,
 });
 
+// Effect ids, issued in order. Every path starts with the author launch (1) and the settle check
+// of run-1 (2). A settled branch then runs verify (3); a repairable one gets the fix-commit turn
+// (3), the settle check of run-2 (4) and verify (5).
+const LAUNCH = 1;
+const FIRST_CHECK = 2;
+const VERIFY = 3;
+const FIX_TURN = 3;
+const SECOND_CHECK = 4;
+
 const start: FactoryEvent = { type: "start" };
-const launched: FactoryEvent = {
+const launched = (effectId = LAUNCH): FactoryEvent => ({
   type: "thread.launched",
+  effectId,
   threadId: author,
   runId: firstRun,
   worktreePath,
   baseline,
-};
-const turnStarted = (runId: RunId, threadId = author): FactoryEvent => ({
+});
+const turnStarted = (effectId: number, runId: RunId): FactoryEvent => ({
   type: "turn.started",
-  threadId,
+  effectId,
   runId,
 });
 const runFinished = (
@@ -64,16 +73,21 @@ const runFinished = (
   status: FactoryTerminalRunStatus = "completed",
   threadId = author,
 ): FactoryEvent => ({ type: "run.finished", threadId, runId, status });
-const settleChecked = (
-  runId: RunId,
-  result: FactorySettleResult,
-  threadId = author,
-): FactoryEvent => ({ type: "settle.checked", threadId, runId, result });
-const commandFinished = (
-  attempt: number,
-  outcome: FactoryCommandOutcome,
-  stage: "verify" | "review" = "verify",
-): FactoryEvent => ({ type: "command.finished", stage, attempt, outcome });
+const settleChecked = (effectId: number, result: FactorySettleResult): FactoryEvent => ({
+  type: "settle.checked",
+  effectId,
+  result,
+});
+const commandFinished = (effectId: number, outcome: FactoryCommandOutcome): FactoryEvent => ({
+  type: "command.finished",
+  effectId,
+  outcome,
+});
+const effectFailed = (effectId: number, detail = "The worker failed."): FactoryEvent => ({
+  type: "effect.failed",
+  effectId,
+  detail,
+});
 const passed: FactoryCommandOutcome = { type: "receipt", receipt: receipt() };
 
 const settled: FactorySettleResult = { status: "settled" };
@@ -89,13 +103,20 @@ const run = (delivery: FactoryDeliveryState, ...events: FactoryEvent[]): Factory
 
 const queued = queuedDeliveryState({ branch: "fd/item-7", baseRef: "main" });
 const awaitingLaunch = run(queued, start).delivery;
-const awaitingRun = run(awaitingLaunch, launched).delivery;
+const awaitingRun = run(awaitingLaunch, launched()).delivery;
 const awaitingSettle = run(awaitingRun, runFinished(firstRun)).delivery;
-const awaitingFixTurn = run(awaitingSettle, settleChecked(firstRun, repairable)).delivery;
-const awaitingFixRun = run(awaitingFixTurn, turnStarted(fixRun)).delivery;
-const awaitingVerify = run(awaitingSettle, settleChecked(firstRun, settled)).delivery;
-const verified = run(awaitingVerify, commandFinished(1, passed)).delivery;
+const awaitingFixTurn = run(awaitingSettle, settleChecked(FIRST_CHECK, repairable)).delivery;
+const awaitingFixRun = run(awaitingFixTurn, turnStarted(FIX_TURN, fixRun)).delivery;
+const awaitingSecondSettle = run(awaitingFixRun, runFinished(fixRun)).delivery;
+const awaitingVerify = run(awaitingSettle, settleChecked(FIRST_CHECK, settled)).delivery;
+const verified = run(awaitingVerify, commandFinished(VERIFY, passed)).delivery;
 const blockedOnRun = run(awaitingRun, runFinished(firstRun, "failed")).delivery;
+
+/** The step that issues `effect` as the delivery's next effect and awaits it. */
+const issued = (delivery: FactoryDeliveryState, effect: FactoryEffect): FactoryAdvance => ({
+  delivery: { ...delivery, effectsIssued: effect.id, awaiting: { type: "effect", effect } },
+  effects: [effect],
+});
 
 const blockedState = (
   delivery: FactoryDeliveryState,
@@ -117,17 +138,17 @@ describe("advance purity", () => {
   it("never mutates its input and returns equal results for equal inputs", () => {
     const steps: ReadonlyArray<readonly [FactoryDeliveryState, FactoryEvent]> = [
       [queued, start],
-      [awaitingLaunch, launched],
+      [awaitingLaunch, launched()],
       [awaitingRun, runFinished(firstRun)],
       [awaitingRun, runFinished(firstRun, "failed")],
       [awaitingRun, { type: "thread.deleted", threadId: author }],
-      [awaitingSettle, settleChecked(firstRun, repairable)],
-      [awaitingFixTurn, turnStarted(fixRun)],
+      [awaitingSettle, settleChecked(FIRST_CHECK, repairable)],
+      [awaitingFixTurn, turnStarted(FIX_TURN, fixRun)],
       [awaitingFixRun, runFinished(fixRun)],
-      [awaitingSettle, settleChecked(firstRun, settled)],
-      [awaitingVerify, commandFinished(1, passed)],
-      [awaitingVerify, commandFinished(1, { type: "refused", refusals: ["tree_dirty"] })],
-      [awaitingVerify, { type: "effect.failed", effect: "run_command", detail: "No shell." }],
+      [awaitingSettle, settleChecked(FIRST_CHECK, settled)],
+      [awaitingVerify, commandFinished(VERIFY, passed)],
+      [awaitingVerify, commandFinished(VERIFY, { type: "refused", refusals: ["tree_dirty"] })],
+      [awaitingVerify, effectFailed(VERIFY, "No shell.")],
       [verified, start],
     ];
     for (const [delivery, event] of steps) {
@@ -285,25 +306,21 @@ describe("the engine's imports", () => {
 
 describe("starting a delivery", () => {
   it("runs the author stage on a new worktree for the delivery branch", () => {
-    expect(advance(queued, start)).toEqual({
-      delivery: {
-        ...queued,
-        status: "running",
-        stage: "author",
-        awaiting: { type: "launch", role: "author" },
-      },
-      effects: [
+    expect(advance(queued, start)).toEqual(
+      issued(
+        { ...queued, status: "running", stage: "author" },
         {
+          id: LAUNCH,
           type: "launch_thread",
           role: "author",
           workspace: { type: "worktree", branch: "fd/item-7", baseRef: "main" },
         },
-      ],
-    });
+      ),
+    );
   });
 
   it("records the launched author thread, its worktree and the baseline", () => {
-    expect(advance(awaitingLaunch, launched)).toEqual({
+    expect(advance(awaitingLaunch, launched())).toEqual({
       delivery: {
         ...awaitingLaunch,
         worktreePath,
@@ -324,21 +341,26 @@ describe("starting a delivery", () => {
     const started = advance(shared, start);
     expect(started.effects).toEqual([
       {
+        id: LAUNCH,
         type: "launch_thread",
         role: "author",
         workspace: { type: "existing_worktree", worktreePath: "/worktrees/parent-3" },
       },
     ]);
-    expect(advance(started.delivery, launched).delivery.worktreePath).toBe("/worktrees/parent-3");
+    expect(advance(started.delivery, launched()).delivery.worktreePath).toBe("/worktrees/parent-3");
   });
 });
 
 describe("the author run ending", () => {
   it("checks that the branch settles after a completed run", () => {
-    expect(advance(awaitingRun, runFinished(firstRun))).toEqual({
-      delivery: { ...awaitingRun, awaiting: { type: "settle", threadId: author, runId: firstRun } },
-      effects: [{ type: "check_settle", threadId: author, runId: firstRun }],
-    });
+    expect(advance(awaitingRun, runFinished(firstRun))).toEqual(
+      issued(awaitingRun, {
+        id: FIRST_CHECK,
+        type: "check_settle",
+        threadId: author,
+        runId: firstRun,
+      }),
+    );
   });
 
   it.each(["failed", "cancelled", "interrupted", "rolled_back"] as const)(
@@ -369,54 +391,41 @@ describe("the author run ending", () => {
 
 describe("settling the branch", () => {
   it("runs the verify command once the branch settles", () => {
-    expect(advance(awaitingSettle, settleChecked(firstRun, settled))).toEqual({
-      delivery: {
-        ...awaitingSettle,
-        stage: "verify",
-        awaiting: { type: "command", attempt: 1 },
-        commandRuns: 1,
-      },
-      effects: [{ type: "run_command", stage: "verify", attempt: 1 }],
-    });
+    expect(advance(awaitingSettle, settleChecked(FIRST_CHECK, settled))).toEqual(
+      issued(
+        { ...awaitingSettle, stage: "verify" },
+        { id: VERIFY, type: "run_command", stage: "verify" },
+      ),
+    );
   });
 
   it("asks the author thread for one fix-commit turn, then blocks if the branch still does not settle", () => {
-    const repair = advance(awaitingSettle, settleChecked(firstRun, repairable));
-    expect(repair).toEqual({
-      delivery: {
-        ...awaitingSettle,
-        awaiting: { type: "turn", threadId: author },
-        fixCommitTurns: 1,
-      },
-      effects: [{ type: "send_fix_commit_turn", threadId: author, problems: [dirty] }],
-    });
+    const repair = advance(awaitingSettle, settleChecked(FIRST_CHECK, repairable));
+    expect(repair).toEqual(
+      issued(
+        { ...awaitingSettle, fixCommitTurns: 1 },
+        { id: FIX_TURN, type: "send_fix_commit_turn", threadId: author, problems: [dirty] },
+      ),
+    );
 
-    const rechecked = run(repair.delivery, turnStarted(fixRun), runFinished(fixRun));
-    expect(rechecked.effects).toEqual([{ type: "check_settle", threadId: author, runId: fixRun }]);
+    const rechecked = run(repair.delivery, turnStarted(FIX_TURN, fixRun), runFinished(fixRun));
+    expect(rechecked.effects).toEqual([
+      { id: SECOND_CHECK, type: "check_settle", threadId: author, runId: fixRun },
+    ]);
 
     const problems = ["Commit 1a2b3c4 has a subject that is not a Conventional Commit."];
     expect(
-      advance(rechecked.delivery, settleChecked(fixRun, { status: "repairable", problems })),
+      advance(rechecked.delivery, settleChecked(SECOND_CHECK, { status: "repairable", problems })),
     ).toEqual(blockedState(rechecked.delivery, { reason: "unsettled", problems }));
   });
 
   it("runs verify when the fix-commit turn settles the branch", () => {
-    expect(
-      run(
-        awaitingFixTurn,
-        turnStarted(fixRun),
-        runFinished(fixRun),
-        settleChecked(fixRun, settled),
+    expect(advance(awaitingSecondSettle, settleChecked(SECOND_CHECK, settled))).toEqual(
+      issued(
+        { ...awaitingSecondSettle, stage: "verify" },
+        { id: SECOND_CHECK + 1, type: "run_command", stage: "verify" },
       ),
-    ).toEqual({
-      delivery: {
-        ...awaitingFixRun,
-        stage: "verify",
-        awaiting: { type: "command", attempt: 1 },
-        commandRuns: 1,
-      },
-      effects: [{ type: "run_command", stage: "verify", attempt: 1 }],
-    });
+    );
   });
 
   it("blocks when the fix-commit run does not complete", () => {
@@ -433,7 +442,7 @@ describe("settling the branch", () => {
   it("blocks at once on an AI identity, without a fix-commit turn", () => {
     const problems = ["Commit 1a2b3c4 names an AI agent as its author."];
     expect(
-      advance(awaitingSettle, settleChecked(firstRun, { status: "unrepairable", problems })),
+      advance(awaitingSettle, settleChecked(FIRST_CHECK, { status: "unrepairable", problems })),
     ).toEqual(blockedState(awaitingSettle, { reason: "unsettled", problems }));
   });
 });
@@ -441,12 +450,12 @@ describe("settling the branch", () => {
 describe("the verify command finishing", () => {
   it("records a passing receipt and stops at the verified checkpoint", () => {
     const pass = receipt();
-    expect(advance(awaitingVerify, commandFinished(1, { type: "receipt", receipt: pass }))).toEqual(
-      {
-        delivery: { ...awaitingVerify, status: "stopped", awaiting: null, receipts: [pass] },
-        effects: [],
-      },
-    );
+    expect(
+      advance(awaitingVerify, commandFinished(VERIFY, { type: "receipt", receipt: pass })),
+    ).toEqual({
+      delivery: { ...awaitingVerify, status: "stopped", awaiting: null, receipts: [pass] },
+      effects: [],
+    });
   });
 
   it.each([
@@ -455,16 +464,16 @@ describe("the verify command finishing", () => {
     ["signal-killed", receipt({ code: null })],
   ] as const)("records a %s receipt and blocks", (_, failed) => {
     expect(
-      advance(awaitingVerify, commandFinished(1, { type: "receipt", receipt: failed })),
+      advance(awaitingVerify, commandFinished(VERIFY, { type: "receipt", receipt: failed })),
     ).toEqual(blockedState({ ...awaitingVerify, receipts: [failed] }, { reason: "verify_failed" }));
   });
 
   it.each([[["head_changed"]], [["tree_dirty"]], [["head_changed", "tree_dirty"]]] as const)(
     "blocks without a receipt when the server refuses one (%j)",
     (refusals) => {
-      expect(advance(awaitingVerify, commandFinished(1, { type: "refused", refusals }))).toEqual(
-        blockedState(awaitingVerify, { reason: "receipt_refused", refusals }),
-      );
+      expect(
+        advance(awaitingVerify, commandFinished(VERIFY, { type: "refused", refusals })),
+      ).toEqual(blockedState(awaitingVerify, { reason: "receipt_refused", refusals }));
     },
   );
 });
@@ -475,9 +484,11 @@ describe("a worker failure", () => {
     ["send_fix_commit_turn", awaitingFixTurn],
     ["check_settle", awaitingSettle],
     ["run_command", awaitingVerify],
-  ] as const)("of the awaited %s effect blocks with its detail", (effect, delivery) => {
+  ] as const)("of the awaited %s effect blocks with that effect and its detail", (_, delivery) => {
+    if (delivery.awaiting?.type !== "effect") throw new Error("the state awaits an effect");
+    const { effect } = delivery.awaiting;
     const detail = "The worktree is missing.";
-    expect(advance(delivery, { type: "effect.failed", effect, detail })).toEqual(
+    expect(advance(delivery, effectFailed(effect.id, detail))).toEqual(
       blockedState(delivery, { reason: "effect_failed", effect, detail }),
     );
   });
@@ -502,6 +513,7 @@ describe("stale events", () => {
     "author, awaiting the settle check": awaitingSettle,
     "author, awaiting the fix-commit turn": awaitingFixTurn,
     "author, awaiting the fix-commit run": awaitingFixRun,
+    "author, awaiting the second settle check": awaitingSecondSettle,
     "verify, awaiting the command": awaitingVerify,
     "verify, stopped at the checkpoint": verified,
     blocked: blockedOnRun,
@@ -517,6 +529,11 @@ describe("stale events", () => {
     "author, awaiting the settle check": ["settle.checked", "thread.deleted", "effect.failed"],
     "author, awaiting the fix-commit turn": ["turn.started", "thread.deleted", "effect.failed"],
     "author, awaiting the fix-commit run": ["run.finished", "thread.deleted"],
+    "author, awaiting the second settle check": [
+      "settle.checked",
+      "thread.deleted",
+      "effect.failed",
+    ],
     "verify, awaiting the command": ["command.finished", "thread.deleted", "effect.failed"],
     "verify, stopped at the checkpoint": [],
     blocked: [],
@@ -524,41 +541,32 @@ describe("stale events", () => {
     cancelled: [],
   };
 
-  const effectFor = (awaiting: FactoryAwaiting | null): FactoryEffect["type"] => {
-    switch (awaiting?.type) {
-      case "turn":
-        return "send_fix_commit_turn";
-      case "settle":
-        return "check_settle";
-      case "command":
-        return "run_command";
-      default:
-        return "launch_thread";
-    }
-  };
-
-  /** An event of `type` carrying the ids the delivery awaits, where it awaits any. */
+  /**
+   * An event of `type` naming what the delivery awaits: the awaited effect's id, or the awaited
+   * run. A worker result of another type than the awaited effect still names its id.
+   */
   const eventFor = (type: FactoryEvent["type"], delivery: FactoryDeliveryState): FactoryEvent => {
     const { awaiting } = delivery;
-    const threadId = awaiting !== null && "threadId" in awaiting ? awaiting.threadId : author;
-    const runId = awaiting !== null && "runId" in awaiting ? awaiting.runId : firstRun;
+    const effectId = awaiting?.type === "effect" ? awaiting.effect.id : LAUNCH;
+    const threadId = awaiting?.type === "run" ? awaiting.threadId : author;
+    const runId = awaiting?.type === "run" ? awaiting.runId : firstRun;
     switch (type) {
       case "start":
         return start;
       case "thread.launched":
-        return launched;
+        return launched(effectId);
       case "turn.started":
-        return turnStarted(fixRun, threadId);
+        return turnStarted(effectId, fixRun);
       case "run.finished":
         return runFinished(runId, "completed", threadId);
       case "thread.deleted":
         return { type, threadId: author };
       case "settle.checked":
-        return settleChecked(runId, settled, threadId);
+        return settleChecked(effectId, settled);
       case "command.finished":
-        return commandFinished(awaiting?.type === "command" ? awaiting.attempt : 1, passed);
+        return commandFinished(effectId, passed);
       case "effect.failed":
-        return { type, effect: effectFor(awaiting), detail: "The worker failed." };
+        return effectFailed(effectId);
     }
   };
 
@@ -599,24 +607,61 @@ describe("stale events", () => {
       awaitingFixRun,
       runFinished(firstRun, "failed"),
     ],
+    ["a launch report naming an effect not issued", awaitingLaunch, launched(LAUNCH + 1)],
     [
-      "a settle check of another thread",
-      awaitingSettle,
-      settleChecked(firstRun, repairable, otherThread),
+      "the launch's report of run-1 standing in for the fix-commit turn",
+      awaitingFixTurn,
+      turnStarted(LAUNCH, firstRun),
     ],
-    ["a settle check of another run", awaitingSettle, settleChecked(otherRun, repairable)],
-    ["a turn on another thread", awaitingFixTurn, turnStarted(fixRun, otherThread)],
-    ["another thread's deletion", awaitingRun, { type: "thread.deleted", threadId: otherThread }],
-    ["a result for another command attempt", awaitingVerify, commandFinished(2, passed)],
-    ["a command result for another stage", awaitingVerify, commandFinished(1, passed, "review")],
     [
-      "a failure of an effect the delivery does not await",
+      "the first settle check's result while the second is awaited",
+      awaitingSecondSettle,
+      settleChecked(FIRST_CHECK, settled),
+    ],
+    [
+      "the first settle check's failure while the second is awaited",
+      awaitingSecondSettle,
+      effectFailed(FIRST_CHECK),
+    ],
+    [
+      "a command result naming another effect",
       awaitingVerify,
-      { type: "effect.failed", effect: "check_settle", detail: "The worker failed." },
+      commandFinished(FIRST_CHECK, passed),
     ],
+    [
+      "a result of another effect type naming the awaited effect",
+      awaitingVerify,
+      settleChecked(VERIFY, settled),
+    ],
+    ["another thread's deletion", awaitingRun, { type: "thread.deleted", threadId: otherThread }],
   ] as const)("ignore %s", (_, delivery, event: FactoryEvent) => {
     const result = advance(delivery, event);
     expect(result.delivery).toBe(delivery);
     expect(result.effects).toEqual([]);
+  });
+
+  it("let the fix-commit turn's own run through after a stale report of an earlier run", () => {
+    expect(
+      run(
+        awaitingFixTurn,
+        turnStarted(LAUNCH, firstRun),
+        runFinished(firstRun),
+        turnStarted(FIX_TURN, fixRun),
+        runFinished(fixRun),
+      ).effects,
+    ).toEqual([{ id: SECOND_CHECK, type: "check_settle", threadId: author, runId: fixRun }]);
+  });
+
+  it("block on the second settle check's failure after ignoring the first's", () => {
+    const detail = "The worktree is missing.";
+    expect(
+      run(awaitingSecondSettle, effectFailed(FIRST_CHECK), effectFailed(SECOND_CHECK, detail)),
+    ).toEqual(
+      blockedState(awaitingSecondSettle, {
+        reason: "effect_failed",
+        effect: { id: SECOND_CHECK, type: "check_settle", threadId: author, runId: fixRun },
+        detail,
+      }),
+    );
   });
 });

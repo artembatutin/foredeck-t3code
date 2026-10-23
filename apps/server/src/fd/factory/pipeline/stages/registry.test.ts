@@ -31,16 +31,20 @@ describe("stageHandler", () => {
     const lookup = stageHandler("agent");
     if (lookup.type !== "supported") throw new Error("agent stages are supported");
 
-    const fresh = lookup.handler.begin(delivery, standardStages.review);
-    expect(fresh).toEqual({
-      delivery: { ...delivery, stage: "review", awaiting: { type: "launch", role: "reviewer" } },
-      effects: [
-        {
-          type: "launch_thread",
-          role: "reviewer",
-          workspace: { type: "worktree", branch: "fd/item-7", baseRef: "main" },
-        },
-      ],
+    const launch = {
+      id: 1,
+      type: "launch_thread",
+      role: "reviewer",
+      workspace: { type: "worktree", branch: "fd/item-7", baseRef: "main" },
+    } as const;
+    expect(lookup.handler.begin(delivery, standardStages.review)).toEqual({
+      delivery: {
+        ...delivery,
+        stage: "review",
+        effectsIssued: 1,
+        awaiting: { type: "effect", effect: launch },
+      },
+      effects: [launch],
     });
 
     const shared = lookup.handler.begin(
@@ -49,6 +53,7 @@ describe("stageHandler", () => {
     );
     expect(shared.effects).toEqual([
       {
+        id: 1,
         type: "launch_thread",
         role: "author",
         workspace: { type: "existing_worktree", worktreePath: "/worktrees/item-7" },
@@ -56,21 +61,22 @@ describe("stageHandler", () => {
     ]);
   });
 
-  it("begins a command stage with a new attempt number on every run", () => {
+  it("begins a command stage by running the stage's command, as a new effect every run", () => {
     const lookup = stageHandler("command");
     if (lookup.type !== "supported") throw new Error("command stages are supported");
 
+    const command = { id: 1, type: "run_command", stage: "verify" } as const;
     const first = lookup.handler.begin(delivery, standardStages.verify);
     expect(first).toEqual({
       delivery: {
         ...delivery,
         stage: "verify",
-        awaiting: { type: "command", attempt: 1 },
-        commandRuns: 1,
+        effectsIssued: 1,
+        awaiting: { type: "effect", effect: command },
       },
-      effects: [{ type: "run_command", stage: "verify", attempt: 1 }],
+      effects: [command],
     });
     const second = lookup.handler.begin(first.delivery, standardStages.verify);
-    expect(second.effects).toEqual([{ type: "run_command", stage: "verify", attempt: 2 }]);
+    expect(second.effects).toEqual([{ ...command, id: 2 }]);
   });
 });
