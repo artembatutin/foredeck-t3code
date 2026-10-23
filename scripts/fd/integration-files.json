@@ -113,6 +113,8 @@
     "apps/server/src/git/linkCreatedPullRequest.ts": "Avoids attributing an unrecognized created PR URL to the primary repository of a multi-repository project.",
     "apps/server/src/mcp/WorktreeMcpService.test.ts": "Verifies missing configured repositories and removed historical associations cannot bypass MCP worktree restrictions.",
     "apps/server/src/mcp/WorktreeMcpService.ts": "Rejects handoff for configured or historically bound multi-repository workspaces before any Git changes.",
+    "apps/server/src/processRunner.ts": "Adds an optional onStderrChunk callback mirroring onStdoutChunk, so Factory verify logs keep stderr written before a timeout, a signal or past the buffered limit. Existing callers and buffered results are unchanged.",
+    "apps/server/src/processRunner.test.ts": "Verifies the optional stderr callback receives chunks before exit, before a timed-out result and beyond the buffered limit.",
     "apps/server/src/observability/RpcInstrumentation.ts": "Classifies the typed assistant RPC methods in the existing instrumentation map. Spreads the fd Work method classification.",
     "apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts": "Supplies validated repository directories through native SDK options and enables their local instruction loading. Pre-approves the read-only work_list and work_read tools in read-only sandboxes.",
     "apps/server/src/orchestration-v2/Adapters/GrokAdapterV2.test.ts": "Provides the repository validator in the existing runtime-policy test composition; unsupported providers retain their single-checkout behavior.",

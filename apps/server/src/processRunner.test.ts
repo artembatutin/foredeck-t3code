@@ -292,6 +292,87 @@ describe("runProcess", () => {
     }),
   );
 
+  it.effect("delivers stderr chunks to onStderrChunk before the process exits", () =>
+    Effect.gen(function* () {
+      const delivered = yield* Deferred.make<void>();
+      const received: Array<string> = [];
+      const spawner = makeSpawner(() =>
+        Effect.succeed(
+          makeHandle({
+            stderr: "warning: slow test",
+            exitCode: Deferred.await(delivered).pipe(Effect.as(ChildProcessSpawner.ExitCode(1))),
+          }),
+        ),
+      );
+
+      const result = yield* runWith(spawner)({
+        command: "fake",
+        args: ["stderr-exit"],
+        onStderrChunk: (chunk) => {
+          received.push(new TextDecoder().decode(chunk));
+          Deferred.doneUnsafe(delivered, Effect.void);
+        },
+      });
+
+      expect(received).toEqual(["warning: slow test"]);
+      expect(result.stderr).toBe("warning: slow test");
+      expect(result.code).toBe(1);
+    }),
+  );
+
+  it.effect("delivers stderr written before a timed out result", () =>
+    Effect.gen(function* () {
+      const delivered = yield* Deferred.make<void>();
+      const received: Array<string> = [];
+      const spawner = makeSpawner(() =>
+        Effect.succeed(
+          makeHandle({
+            stderr: Stream.concat(Stream.encodeText(Stream.make("partial failure")), Stream.never),
+            exitCode: Effect.never,
+          }),
+        ),
+      );
+      const resultFiber = yield* runWith(spawner)({
+        command: "fake",
+        args: ["hang"],
+        timeout: "50 millis",
+        timeoutBehavior: "timedOutResult",
+        onStderrChunk: (chunk) => {
+          received.push(new TextDecoder().decode(chunk));
+          Deferred.doneUnsafe(delivered, Effect.void);
+        },
+      }).pipe(Effect.forkScoped);
+
+      yield* Deferred.await(delivered);
+      yield* TestClock.adjust(Duration.millis(50));
+      const result = yield* Fiber.join(resultFiber);
+
+      expect(received).toEqual(["partial failure"]);
+      expect(result).toMatchObject({ stderr: "", code: null, timedOut: true });
+    }),
+  );
+
+  it.effect("delivers every stderr chunk beyond the buffered limit", () =>
+    Effect.gen(function* () {
+      let deliveredBytes = 0;
+      const spawner = makeSpawner(() => Effect.succeed(makeHandle({ stderr: "y".repeat(2048) })));
+
+      const result = yield* runWith(spawner)({
+        command: "fake",
+        args: ["stderr-bytes", "2048"],
+        maxOutputBytes: 128,
+        outputMode: "truncate",
+        onStderrChunk: (chunk) => {
+          deliveredBytes += chunk.byteLength;
+        },
+      });
+
+      expect(deliveredBytes).toBe(2048);
+      expect(result.stderr.length).toBeLessThanOrEqual(128);
+      expect(result.stderrTruncated).toBe(true);
+    }),
+  );
+
   it.effect("writes stdin before waiting for exit", () =>
     Effect.gen(function* () {
       const stdinWritten = yield* Deferred.make<void>();
