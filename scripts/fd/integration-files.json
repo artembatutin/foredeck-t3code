@@ -331,7 +331,7 @@
     "packages/provider-opencode/src/server/OpenCodeServerLedger.ts": "Connects permission-denied process inspection recovery to the existing server ledger and preserves orphan records when inspection is unavailable, so optional cleanup cannot block startup.",
     "apps/web/src/components/chat/ChatHeader.tsx": "Suppresses the scratch-project breadcrumb for the persistent assistant role.",
     "packages/contracts/src/index.ts": "Exports typed assistant overview and completed-speech contracts.",
-    "packages/contracts/package.json": "Exports the fd work-management contracts through the ./fd/work-management subpath; nothing enters the root barrel.",
+    "packages/contracts/package.json": "Exports the fd work-management contracts through the ./fd/work-management subpath; nothing enters the root barrel. Exports the fd factory contracts through the ./fd/factory subpath, likewise kept out of the root barrel.",
     "packages/contracts/src/auth.ts": "Adds the exact work:read and work:write grants with legacy-decodable denial labels and includes them in the standard client scopes so new pairings carry Work.",
     "packages/contracts/src/auth.test.ts": "Verifies Work grants decode, join the standard pairing scopes, keep denials decodable, and are never inferred from other grants.",
     "packages/shared/src/authScopeOptions.ts": "Labels the Work grants in the existing pairing and session permission UI.",
