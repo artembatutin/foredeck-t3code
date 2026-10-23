@@ -73,7 +73,7 @@ describe("renderWorkPrompt", () => {
     expect(prompt).toContain("Labels: work, jira");
     expect(prompt).toContain(`work-item: ${sourceId}:fd-7k3qa2`);
     expect(prompt).toContain("titled `fd-7k3qa2: ...`");
-    expect(prompt).toContain("Do not edit the frontmatter of .foredeck/work/*.md");
+    expect(prompt).toContain("Do not edit the frontmatter of `.foredeck/work/*.md`");
   });
 
   it("keeps only recent comments and appends the owner's text", () => {

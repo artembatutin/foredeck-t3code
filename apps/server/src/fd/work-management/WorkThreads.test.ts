@@ -15,6 +15,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
+import { getAutoBootstrapThreadModelSelection } from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import type { WorkActor } from "./authority.ts";
 import * as WorkLinkStore from "./persistence/WorkLinkStore.ts";
@@ -47,13 +48,15 @@ interface LaunchControl {
   failNext: boolean;
 }
 
-const setup = (options: { readonly threadEnvMode?: "worktree" } = {}) =>
+const setup = (
+  options: { readonly threadEnvMode?: "worktree"; readonly noProjectModel?: boolean } = {},
+) =>
   Effect.sync(() => {
     const markdown = fakeAdapter("markdown");
     const harness = makeHarness([markdown.adapter]);
     harness.projects.set(projectId, {
       ...projectRow(projectId, "/projects/alpha"),
-      defaultModelSelection: modelSelection,
+      defaultModelSelection: options.noProjectModel === true ? null : modelSelection,
       defaultThreadEnvMode: options.threadEnvMode ?? null,
     });
     const control: LaunchControl = {
@@ -251,6 +254,26 @@ describe("WorkThreads.start", () => {
         );
         assert.strictEqual(error._tag, "WorkPermissionDenied");
         assert.strictEqual(control.launched.length, 0);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect("falls back to the automatic model when nothing names one", () =>
+    Effect.gen(function* () {
+      const { control, layer } = yield* setup({ noProjectModel: true });
+      yield* Effect.gen(function* () {
+        const threads = yield* WorkThreads.WorkThreads;
+        const item = yield* createItem;
+        yield* threads.start(starter, {
+          ref: item.ref,
+          creationSource: "web",
+          mode: "scope",
+          force: false,
+        });
+        assert.deepStrictEqual(
+          control.launched[0]?.modelSelection,
+          getAutoBootstrapThreadModelSelection(),
+        );
       }).pipe(Effect.provide(layer));
     }),
   );

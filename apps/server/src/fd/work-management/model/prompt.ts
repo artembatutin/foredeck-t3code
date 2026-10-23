@@ -107,7 +107,7 @@ export const renderWorkPrompt = (input: {
       ...(input.directory === undefined
         ? []
         : [
-            `- Do not edit the frontmatter of ${input.directory}/*.md in your worktree; the work_* tools write the canonical copy.`,
+            `- Do not edit the frontmatter of \`${input.directory}/*.md\` in your worktree; the \`work_*\` tools write the canonical copy.`,
           ]),
     ].join("\n"),
   );

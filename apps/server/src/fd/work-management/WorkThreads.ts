@@ -27,6 +27,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
+import { getAutoBootstrapThreadModelSelection } from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { RepositorySet } from "../multirepo/index.ts";
 import { requireGrants, type WorkActor } from "./authority.ts";
@@ -185,16 +186,13 @@ const make = Effect.gen(function* () {
           .pipe(Effect.mapError((error) => new WorkInvalid({ detail: error.message })));
       }
 
+      // The same chain a new thread in the UI follows, ending at the automatic selection the
+      // clients show as "Automatic" when nothing is configured.
       const modelSelection =
         input.modelSelection ??
         resolved.defaultModelSelection ??
         input.fallbackModelSelection ??
-        undefined;
-      if (modelSelection === undefined) {
-        return yield* new WorkInvalid({
-          detail: "The project has no default model; choose one to start a thread.",
-        });
-      }
+        getAutoBootstrapThreadModelSelection();
 
       const threadId =
         input.threadId ??
