@@ -56,6 +56,17 @@ it, stepping down to the broadest within the bound, and fails before anything ru
 The ceiling bounds launches only; a turn on an existing thread runs in the mode the thread has,
 which its owner may change.
 
+## Agents start deliveries with Work's grant
+
+`factory_deliver` starts threads, so it takes the grant Work gives an agent for starting threads
+([agent grants](./work-management.md#agent-grants), `actorFromCaller`): a read-only client or a
+plan-mode thread only reads, and a thread caller acts only while its run is live. With a rule of
+its own, a thread that `work_start_thread` refuses could start threads for the same item through
+Factory. The caller's runtime mode becomes the delivery's ceiling. `factory_submit_review` is the
+exception: a reviewer works in plan mode by design, and the tool records only the calling thread's
+own review, so it checks instead that the caller is the delivery's registered reviewer
+([`mcp/handlers.ts`](../../apps/server/src/fd/factory/mcp/handlers.ts)).
+
 ## Work never imports Factory
 
 Work decides what to build and Factory decides how, so Work stays complete without Factory: the
@@ -117,9 +128,12 @@ matter as much as the refs: a delivery cancelled while its launch was preparing 
 after the next start has looked. A cancelled or finished delivery keeps its branch, worktree and
 commits; continuing that work is a resume of that delivery, never a new one. A repository Git
 cannot read is left to the launch to report, as `checkWorktreeBase` leaves a base it cannot
-resolve. Starts of one item are serialized in-process from reading its earlier deliveries to
-storing the new one, as Work's thread starts are: a delivery stored and cancelled in between would
-free the active-item index and leave both deliveries on one name.
+resolve. A repository with no commit yet is refused at start, though: core launches a thread there
+without a worktree and its base check lets `HEAD` through, so Factory reads HEAD itself
+([`headCommit.ts`](../../apps/server/src/fd/factory/git/headCommit.ts)). Starts of one item are
+serialized in-process from reading its earlier deliveries to storing the new one, as Work's thread
+starts are: a delivery stored and cancelled in between would free the active-item index and leave
+both deliveries on one name.
 
 ## A review judges the verified commit
 

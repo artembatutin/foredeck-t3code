@@ -80,6 +80,8 @@ interface World {
   projectExists: boolean;
   itemReadable: boolean;
   baseRefused: boolean;
+  /** Whether the repository has a commit at HEAD. */
+  committed: boolean;
   /** Runs inside each base check, before its answer. */
   onCheck: Effect.Effect<void> | null;
 }
@@ -111,7 +113,11 @@ const fakes = (world: World) =>
       get: (id) =>
         Effect.sync(() =>
           world.projectExists
-            ? Option.some({ projectId: id, workspaceRoot } as unknown as ProjectStore.ProjectRow)
+            ? Option.some({
+                projectId: id,
+                title: "Alpha",
+                workspaceRoot,
+              } as unknown as ProjectStore.ProjectRow)
             : Option.none(),
         ),
     }),
@@ -155,10 +161,20 @@ const fakes = (world: World) =>
     Layer.mock(FactoryReview.FactoryReview)({}),
     Layer.mock(FactoryRecord.FactoryRecord)({}),
     Layer.mock(FactoryPullRequest.FactoryPullRequest)({}),
-    // Answers the ref lookups a start makes for a free branch name, from `world.refs`.
+    // Answers the ref lookups a start makes for a free branch name, from `world.refs`, and its
+    // read of a commit at HEAD.
     Layer.mock(GitVcsDriver.GitVcsDriver)({
       execute: ({ cwd, args }) =>
         Effect.sync(() => {
+          if (args[0] === "rev-parse") {
+            return {
+              exitCode: ChildProcessSpawner.ExitCode(world.committed ? 0 : 1),
+              stdout: world.committed ? `${"c".repeat(40)}\n` : "",
+              stderr: "",
+              stdoutTruncated: false,
+              stderrTruncated: false,
+            };
+          }
           const pattern = args.at(-1) ?? "";
           world.refReads.push({ cwd, pattern });
           const name = pattern.replace(/^refs\/\*\*\//, "");
@@ -195,6 +211,7 @@ const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
     projectExists: true,
     itemReadable: true,
     baseRefused: false,
+    committed: true,
     onCheck: null,
   };
   return body(world).pipe(Effect.provide(makeLayer(world)), Effect.scoped);
@@ -376,6 +393,19 @@ describe("FactoryService.start", () => {
         world.baseRefused = true;
         const error = yield* Effect.flip(start(canonicalRef));
         assert.strictEqual(error._tag, "ThreadLaunchBaseRefError");
+        yield* assertNothingStarted(world);
+      }),
+    ),
+  );
+
+  it.effect("refuses a repository with no commit yet, which core's base check lets through", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        yield* useVerify;
+        world.committed = false;
+        const error = yield* Effect.flip(start(canonicalRef));
+        assert.strictEqual(error._tag, "ThreadLaunchBaseRefError");
+        assert.deepStrictEqual(world.checks, []);
         yield* assertNothingStarted(world);
       }),
     ),

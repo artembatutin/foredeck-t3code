@@ -590,6 +590,10 @@ export interface World {
   readonly startWith: (options: {
     readonly runtimeModeCeiling?: RuntimeMode;
   }) => Effect.Effect<StartedAuthor, never, Services>;
+  /** Returns a delivery started some other way (an MCP tool) once its author's turn is running. */
+  readonly launched: (
+    deliveryId: FactoryDeliveryId,
+  ) => Effect.Effect<StartedAuthor, never, Services>;
   /**
    * Ends the provider turn of `runId` and waits until orchestration has finished the run and
    * Factory has handled its end, including every effect that followed. Returns the run's status.
@@ -665,11 +669,10 @@ export const withProject = <A, E>(
       );
 
       const service = yield* Factory.FactoryService.FactoryService;
-      const startWith: World["startWith"] = (options) =>
+      const launched: World["launched"] = (deliveryId) =>
         Effect.gen(function* () {
-          const started = yield* service.start({ ...options, itemRef: item.ref });
           yield* drainFactory;
-          const { awaiting, worktreePath } = (yield* delivery(started.deliveryId)).state;
+          const { awaiting, worktreePath } = (yield* delivery(deliveryId)).state;
           assert.strictEqual(awaiting?.type, "run");
           if (awaiting?.type !== "run" || worktreePath === null) {
             return assert.fail("The author launch did not record its run and worktree.");
@@ -678,13 +681,13 @@ export const withProject = <A, E>(
           // releases it.
           assert.strictEqual(yield* runReached(awaiting.runId, ["starting", ...ended]), "starting");
           yield* drainOrchestration;
-          return {
-            deliveryId: started.deliveryId,
-            threadId: awaiting.threadId,
-            runId: awaiting.runId,
-            worktreePath,
-          };
+          return { deliveryId, threadId: awaiting.threadId, runId: awaiting.runId, worktreePath };
         }).pipe(Effect.orDie);
+      const startWith: World["startWith"] = (options) =>
+        service.start({ ...options, itemRef: item.ref }).pipe(
+          Effect.orDie,
+          Effect.flatMap(({ deliveryId }) => launched(deliveryId)),
+        );
 
       const endRun: World["endRun"] = (runId, status) =>
         Effect.gen(function* () {
@@ -716,6 +719,7 @@ export const withProject = <A, E>(
         exists: (target) => fileSystem.exists(target).pipe(Effect.orElseSucceed(() => false)),
         start: startWith({}),
         startWith,
+        launched,
         endRun,
       });
     }).pipe(

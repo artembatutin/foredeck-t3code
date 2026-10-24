@@ -13,6 +13,7 @@ const managedOperations = new Set([
   "t3_pending_request_respond",
   "t3_thread_interrupt",
   "work_start_thread",
+  "factory_deliver",
 ]);
 const ToolCall = Schema.Struct({
   jsonrpc: Schema.Literal("2.0"),

@@ -14,6 +14,9 @@ export class FactoryMcpFailure extends Schema.TaggedError<FactoryMcpFailure>()(
      * delivery blocked on this submission (a second invalid review in the round, or code that
      * changed during review) and takes no further one. `invalid_request` and `not_found` answer
      * a status read that names nothing, or names a delivery or item Factory cannot find.
+     * `factory_deliver` refuses a caller that only reads with `forbidden`, a kind this server
+     * cannot deliver with `unsupported_kind`, and a start Factory refused with one code per
+     * reason, from `not_configured` to `no_free_branch`; nothing is written for any of them.
      */
     code: Schema.Literals([
       "not_reviewer",
@@ -24,6 +27,13 @@ export class FactoryMcpFailure extends Schema.TaggedError<FactoryMcpFailure>()(
       "invalid_request",
       "not_found",
       "unavailable",
+      "forbidden",
+      "unsupported_kind",
+      "not_configured",
+      "delivery_active",
+      "project_missing",
+      "no_base_commit",
+      "no_free_branch",
     ]),
     message: Schema.String,
   },

@@ -9,8 +9,8 @@ import { WorkService } from "../../work-management/index.ts";
 import * as FactoryService from "../FactoryService.ts";
 
 /**
- * The `factory_*` MCP tools: how a Factory reviewer hands its review to the server, and how any
- * agent reads where a delivery stands. Every failure
+ * The `factory_*` MCP tools: how a Factory reviewer hands its review to the server, how any
+ * agent reads where a delivery stands, and how an agent starts one. Every failure
  * is either a Factory failure or a refusal the access layer raises before the handler runs, so
  * both are declared.
  */
@@ -79,4 +79,28 @@ export const FactoryToolkit = Toolkit.make(
       ThreadManagement.ThreadManagementService,
     ],
   }).annotate(Tool.Readonly, true),
+  Tool.make("factory_deliver", {
+    description:
+      "Start a Factory delivery of a Work item: an author thread on a new worktree and branch, server-run verification, review and repair rounds, then a pull request. Its threads never run in a broader runtime mode than yours. An item can have one delivery that is not done or cancelled; follow it with factory_status.",
+    parameters: Schema.Struct({
+      item: ItemReference,
+      sourceId: Schema.optionalKey(SourceId),
+      projectId: Schema.optionalKey(TargetProject),
+      kind: Schema.optionalKey(
+        Schema.Literals(["single", "parent"]).annotate({
+          description:
+            "single (the default) delivers the item itself. parent, which plans children first, is not available yet.",
+        }),
+      ),
+    }),
+    success: Schema.Unknown,
+    failure: Schema.Union([FactoryMcpFailure, OrchestratorMcpFailure]),
+    failureMode: "return",
+    dependencies: [
+      FactoryService.FactoryService,
+      WorkService.WorkService,
+      McpInvocationContext.McpInvocationContext,
+      ThreadManagement.ThreadManagementService,
+    ],
+  }),
 );

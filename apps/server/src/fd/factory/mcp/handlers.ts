@@ -1,5 +1,13 @@
-import { AuthWorkReadScope, type ProjectId } from "@t3tools/contracts";
-import { FactoryDeliveryId, FactoryMcpFailure } from "@t3tools/contracts/fd/factory";
+import {
+  AuthOrchestrationOperateScope,
+  AuthWorkReadScope,
+  type ProjectId,
+} from "@t3tools/contracts";
+import {
+  FactoryDeliveryId,
+  type FactoryErrorReason,
+  FactoryMcpFailure,
+} from "@t3tools/contracts/fd/factory";
 import { WorkSourceId, workItemRefString } from "@t3tools/contracts/fd/work-management";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -9,6 +17,7 @@ import { requireThreadScope } from "../../../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import { loadCaller, resolveProjectId } from "../../../mcp/threadAccess.ts";
 import {
+  actorFromCaller,
   parseWorkItemReference,
   resolveWorkTarget,
   type WorkActor,
@@ -16,6 +25,7 @@ import {
 } from "../../work-management/index.ts";
 import * as FactoryService from "../FactoryService.ts";
 import { toFactoryDelivery } from "../snapshot.ts";
+import { toFactoryError } from "../wireError.ts";
 import { FactoryToolkit } from "./tools.ts";
 
 const decodeDeliveryId = Schema.decodeUnknownOption(FactoryDeliveryId);
@@ -39,7 +49,37 @@ const storeUnavailable = () =>
     message: "Factory could not read its deliveries. Try again.",
   });
 
-/** The item a status read names, resolved among its project's sources as `work_read` does. */
+/** A refused start's code: its own for each refusal an agent can act on, else by wire reason. */
+const startCode = (
+  error: FactoryService.FactoryStartError,
+  reason: FactoryErrorReason,
+): FactoryMcpFailure["code"] => {
+  switch (error._tag) {
+    case "FactoryVerifyCommandMissingError":
+      return "not_configured";
+    case "FactoryDeliveryActive":
+      return "delivery_active";
+    case "FactoryProjectMissingError":
+      return "project_missing";
+    case "ThreadLaunchBaseRefError":
+      return "no_base_commit";
+    case "FactoryBranchUnavailableError":
+      return "no_free_branch";
+    default:
+      return reason === "not_found" || reason === "invalid_request" ? reason : "unavailable";
+  }
+};
+
+/**
+ * A refused start as an agent hears it, with the fixed text the RPC methods answer with: never
+ * what Work, Git or the store reported.
+ */
+const startFailure = (error: FactoryService.FactoryStartError) => {
+  const { reason, message } = toFactoryError(error);
+  return new FactoryMcpFailure({ code: startCode(error, reason), message });
+};
+
+/** The item a tool names, resolved among its project's sources as `work_read` does. */
 const resolveItem = (params: {
   readonly item: string;
   readonly sourceId?: string;
@@ -150,5 +190,38 @@ export const toolLayer = McpToolAccess.toLayer(FactoryToolkit, {
       }
       return yield* invalidRequest("Pass exactly one of delivery and item.");
     }),
+  ),
+  // A delivery starts threads, so it takes Work's grant for thread starts (`actorFromCaller`):
+  // a read-only client, refused before this runs, or a plan-mode thread only reads. The caller's
+  // runtime mode becomes the delivery's ceiling, which Factory applies at each of its launches.
+  factory_deliver: McpToolAccess.startsThreads(
+    () => ({}),
+    ({ item, sourceId, projectId, kind }, started) =>
+      Effect.gen(function* () {
+        if (!actorFromCaller(yield* loadCaller()).grants.includes(AuthOrchestrationOperateScope)) {
+          return yield* new FactoryMcpFailure({
+            code: "forbidden",
+            message:
+              "A Factory delivery starts threads, and a plan-mode thread or read-only client only reads.",
+          });
+        }
+        if (kind === "parent") {
+          return yield* new FactoryMcpFailure({
+            code: "unsupported_kind",
+            message:
+              "Factory cannot deliver a parent item yet: planning its children is not available. Omit kind to deliver the item itself.",
+          });
+        }
+        const itemRef = yield* resolveItem({
+          item,
+          ...(sourceId === undefined ? {} : { sourceId }),
+          ...(projectId === undefined ? {} : { projectId }),
+        });
+        const service = yield* FactoryService.FactoryService;
+        const delivery = yield* service
+          .start({ itemRef, runtimeModeCeiling: started.runtimeMode })
+          .pipe(Effect.mapError(startFailure));
+        return { delivery: toFactoryDelivery(delivery) };
+      }),
   ),
 });

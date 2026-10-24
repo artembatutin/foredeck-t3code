@@ -30,6 +30,7 @@ import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import { type FactoryBranchUnavailableError, freshBranchName } from "./git/freshBranch.ts";
+import { hasNoCommit } from "./git/headCommit.ts";
 import { readSettle } from "./git/settleCheck.ts";
 import { readWorktreeState } from "./git/worktreeState.ts";
 import { FactoryStoreError } from "./persistence/errors.ts";
@@ -161,7 +162,7 @@ export class FactoryCancelRefusedError extends Schema.TaggedError<FactoryCancelR
 }
 
 /** Why a start was refused. Every refusal comes before the delivery's row is written. */
-type FactoryStartError =
+export type FactoryStartError =
   | WorkDomainError
   | FactorySettings.FactorySettingsStorageError
   | FactorySettings.FactoryVerifyCommandMissingError
@@ -336,8 +337,17 @@ const make = Effect.gen(function* () {
         }).pipe(Effect.provideContext(gitContext));
         // The workspace the author's launch asks for (see `agentStage`), checked before any row
         // exists: the launch itself would accept a base with no commit and fail inside the
-        // thread.
+        // thread. Core's check lets HEAD through in a repository with no commits yet, so Factory
+        // looks for one itself.
         const workspace = { type: "worktree", baseRef: "HEAD", branch } as const;
+        if (yield* hasNoCommit(project.workspaceRoot).pipe(Effect.provideContext(gitContext))) {
+          return yield* new ThreadLaunch.ThreadLaunchBaseRefError({
+            projectId,
+            projectTitle: project.title,
+            workspaceRoot: project.workspaceRoot,
+            baseRef: workspace.baseRef,
+          });
+        }
         yield* launches.checkWorktreeBase({ projectId, workspaceStrategy: workspace });
 
         const deliveryId = FactoryDeliveryId.make(
