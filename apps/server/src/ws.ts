@@ -1,5 +1,6 @@
 import { ProjectAssistant } from "./fd/assistant/index.ts";
 import * as WorkManagement from "./fd/work-management/index.ts";
+import * as Factory from "./fd/factory/index.ts";
 import { AssistantOperationError } from "@t3tools/contracts";
 import { RepositoryTargetError } from "@t3tools/contracts";
 import { ClientCompatibility, RepositorySet, WorkspaceResolver } from "./fd/multirepo/index.ts";
@@ -559,8 +560,12 @@ const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 
 // Middleware added later wraps middleware added earlier, so instrumentation wraps authorization.
 const ServerWsRpcGroup = WsRpcGroup.middleware(RpcInstrumentation);
-// Work's handlers come from their own layer; one handler object over every method is too deep.
-const CoreServerWsRpcGroup = ServerWsRpcGroup.omit(...WorkManagement.WS_METHOD_TAGS);
+// Work's and Factory's handlers come from their own layers; one handler object over every method
+// is too deep.
+const CoreServerWsRpcGroup = ServerWsRpcGroup.omit(
+  ...WorkManagement.WS_METHOD_TAGS,
+  ...Factory.WS_METHOD_TAGS,
+);
 // When a resuming client's cursor is more than this many events behind the
 // current head, skip the per-event catch-up replay and send a fresh shell
 // snapshot instead. Replaying each intervening event costs a shell refetch;
@@ -3436,7 +3441,7 @@ export const layer = Layer.unwrap(
           return httpEffect;
         }).pipe(
           Effect.provide(
-            Layer.merge(
+            Layer.mergeAll(
               layerWsRpc(
                 session,
                 clientOrigin,
@@ -3448,6 +3453,7 @@ export const layer = Layer.unwrap(
                 repositoryClient,
               ),
               WorkManagement.layerWsRpc(session),
+              Factory.layerWsRpc,
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               // Request fibers run in the handlers' context, so this reporter sees

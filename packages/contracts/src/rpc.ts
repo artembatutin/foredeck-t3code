@@ -1,5 +1,6 @@
 import { AssistantOverview, AssistantOperationError, SpokenReply } from "./fd/assistant/index.ts";
 import { WORK_WS_METHODS, WorkRpcs } from "./fd/work-management/index.ts";
+import { FACTORY_WS_METHODS, FactoryRpcs } from "./fd/factory/index.ts";
 import { RepositoryTargetError } from "./project.ts";
 import {
   OrchestrationV2SearchThreadError,
@@ -597,6 +598,7 @@ export const WS_METHODS = {
   subscribeBackgroundPolicy: "subscribeBackgroundPolicy",
   subscribeResourceTelemetry: "subscribeResourceTelemetry",
   ...WORK_WS_METHODS,
+  ...FACTORY_WS_METHODS,
 } as const;
 
 const WsServerUpsertKeybindingRpc = Rpc.make(WS_METHODS.serverUpsertKeybinding, {
@@ -2161,4 +2163,5 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationV2SubscribeShellRpc,
   WsOrchestrationV2SubscribeThreadRpc,
   ...WorkRpcs,
+  ...FactoryRpcs,
 ).middleware(RpcScopeAuthorization);

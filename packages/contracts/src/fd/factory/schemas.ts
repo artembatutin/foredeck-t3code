@@ -338,3 +338,67 @@ export const FactoryDelivery = Schema.Struct({
   updatedAt: IsoDateTime,
 });
 export type FactoryDelivery = typeof FactoryDelivery.Type;
+
+export const FactorySettingsGetInput = Schema.Struct({ projectId: ProjectId });
+export type FactorySettingsGetInput = typeof FactorySettingsGetInput.Type;
+
+/** Replaces the project's settings; absent keys take the defaults. */
+export const FactorySettingsSetInput = Schema.Struct({
+  projectId: ProjectId,
+  settings: FactoryProjectSettings,
+});
+export type FactorySettingsSetInput = typeof FactorySettingsSetInput.Type;
+
+export const FactoryDeliveryStartInput = Schema.Struct({
+  itemRef: WorkItemRef,
+  /**
+   * Absent means `single`. Parents arrive with planning; until then a newer client's `parent`
+   * fails to decode here instead of being delivered as a single item.
+   */
+  kind: Schema.optionalKey(Schema.Literal("single")),
+});
+export type FactoryDeliveryStartInput = typeof FactoryDeliveryStartInput.Type;
+
+/** Names one delivery, for stop, resume, cancel and get. */
+export const FactoryDeliveryRefInput = Schema.Struct({ deliveryId: FactoryDeliveryId });
+export type FactoryDeliveryRefInput = typeof FactoryDeliveryRefInput.Type;
+
+/** Every delivery on the environment, or one project's. */
+export const FactoryDeliveryListInput = Schema.Struct({ projectId: Schema.optionalKey(ProjectId) });
+export type FactoryDeliveryListInput = typeof FactoryDeliveryListInput.Type;
+
+/** Newest first. A delivery this build cannot read is left out instead of failing the list. */
+export const FactoryDeliveryList = Schema.Struct({
+  deliveries: ForwardCompatibleArray(FactoryDelivery),
+});
+export type FactoryDeliveryList = typeof FactoryDeliveryList.Type;
+
+const FACTORY_ERROR_REASONS = [
+  "invalid_request",
+  "not_found",
+  "not_configured",
+  "conflict",
+  "refused",
+  "unavailable",
+] as const;
+
+/**
+ * `not_configured`: the project's Factory settings lack what the request needs (a verify
+ * command). `conflict`: the item already has a delivery that is not done or cancelled.
+ * `refused`: the delivery's status, or the project's checkout, does not allow the request now.
+ * `unavailable`: storage or the server failed, or a reason this build does not know (a newer
+ * server's reasons decode here rather than failing).
+ */
+export const FactoryErrorReason = literalsOr(FACTORY_ERROR_REASONS, "unavailable");
+export type FactoryErrorReason = typeof FactoryErrorReason.Type;
+
+/**
+ * How the `factory.*` methods fail. The message is Factory's fixed text, or Work's for an item
+ * Work cannot read; never a storage cause or command output.
+ */
+export class FactoryError extends Schema.TaggedError<FactoryError>()("FactoryError", {
+  reason: FactoryErrorReason,
+  message: Schema.String,
+  /** The missing or refused delivery, or for `conflict` the item's active one. */
+  deliveryId: Schema.optionalKey(FactoryDeliveryId),
+}) {}

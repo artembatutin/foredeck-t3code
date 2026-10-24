@@ -1,4 +1,4 @@
-import { AuthWorkReadScope, ThreadId } from "@t3tools/contracts";
+import { AuthWorkReadScope, type ProjectId, ThreadId } from "@t3tools/contracts";
 import {
   FactoryDeliveryId,
   FactoryDeliveryStatus,
@@ -195,6 +195,13 @@ export class FactoryService extends Context.Service<
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<
       Option.Option<FactoryDeliveryStore.StoredFactoryDelivery>,
+      FactoryStoreError
+    >;
+    /** Every delivery, or one project's, whatever its status, newest first. */
+    readonly list: (input: {
+      readonly projectId?: ProjectId;
+    }) => Effect.Effect<
+      ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>,
       FactoryStoreError
     >;
     /**
@@ -511,7 +518,15 @@ const make = Effect.gen(function* () {
     },
   );
 
-  return FactoryService.of({ start, get: deliveries.get, stop, resume, cancel, submitReview });
+  return FactoryService.of({
+    start,
+    get: deliveries.get,
+    list: deliveries.list,
+    stop,
+    resume,
+    cancel,
+    submitReview,
+  });
 });
 
 export const layer = Layer.effect(FactoryService, make);

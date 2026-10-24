@@ -296,6 +296,10 @@ export class FactoryDeliveryStore extends Context.Service<
     readonly listByItem: (
       itemRef: WorkItemRef,
     ) => Effect.Effect<ReadonlyArray<StoredFactoryDelivery>, FactoryStoreError>;
+    /** Every delivery, or one project's, whatever its status, newest first. */
+    readonly list: (input: {
+      readonly projectId?: ProjectId;
+    }) => Effect.Effect<ReadonlyArray<StoredFactoryDelivery>, FactoryStoreError>;
   }
 >()("t3/fd/factory/persistence/FactoryDeliveryStore") {}
 
@@ -307,8 +311,10 @@ const make = Effect.gen(function* () {
   const selectDeliveries = SqlSchema.findAll({
     Request: Schema.Struct({
       deliveryId: Schema.optional(FactoryDeliveryId),
+      projectId: Schema.optional(ProjectId),
       itemRef: Schema.optional(WorkItemRef),
       activeOnly: Schema.optional(Schema.Boolean),
+      newestFirst: Schema.optional(Schema.Boolean),
     }),
     Result: DeliveryDbRow,
     // The status literals match the active-item index's, so SQLite can use it.
@@ -325,12 +331,17 @@ const make = Effect.gen(function* () {
       FROM fd_factory_deliveries
       WHERE ${sql.and([
         ...(request.deliveryId === undefined ? [] : [sql`delivery_id = ${request.deliveryId}`]),
+        ...(request.projectId === undefined ? [] : [sql`project_id = ${request.projectId}`]),
         ...(request.itemRef === undefined
           ? []
           : [sql`source_id = ${request.itemRef.sourceId} AND item_id = ${request.itemRef.itemId}`]),
         ...(request.activeOnly === true ? [sql`status NOT IN ('done', 'cancelled')`] : []),
       ])}
-      ORDER BY created_at ASC, delivery_id ASC
+      ${
+        request.newestFirst === true
+          ? sql`ORDER BY created_at DESC, delivery_id DESC`
+          : sql`ORDER BY created_at ASC, delivery_id ASC`
+      }
     `,
   });
 
@@ -420,6 +431,14 @@ const make = Effect.gen(function* () {
       selectDeliveries({ itemRef }).pipe(
         Effect.map((rows) => rows.map(fromRow)),
         Effect.catchTags(FactoryStoreError.catchStorage("deliveries.listByItem")),
+      ),
+    list: ({ projectId }) =>
+      selectDeliveries({
+        ...(projectId === undefined ? {} : { projectId }),
+        newestFirst: true,
+      }).pipe(
+        Effect.map((rows) => rows.map(fromRow)),
+        Effect.catchTags(FactoryStoreError.catchStorage("deliveries.list")),
       ),
   });
 });

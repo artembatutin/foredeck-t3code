@@ -7,6 +7,7 @@ import {
   type AuthEnvironmentScope,
 } from "./auth.ts";
 import { WORK_CLIENT_GUARDED_RPC_SCOPES } from "./fd/work-management/index.ts";
+import { FACTORY_CLIENT_GUARDED_RPC_SCOPES } from "./fd/factory/index.ts";
 import { ORCHESTRATION_V2_WS_METHODS } from "./orchestrationV2.ts";
 import { WS_METHODS } from "./rpc.ts";
 
@@ -51,6 +52,7 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.scheduledTasksRotateWebhookToken]: AuthOrchestrationOperateScope,
   [ORCHESTRATION_V2_WS_METHODS.stopWorkflow]: AuthOrchestrationOperateScope,
   ...WORK_CLIENT_GUARDED_RPC_SCOPES,
+  ...FACTORY_CLIENT_GUARDED_RPC_SCOPES,
 } as const;
 export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 

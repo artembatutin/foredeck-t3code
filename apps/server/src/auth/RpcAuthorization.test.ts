@@ -21,10 +21,26 @@ import {
   WsRpcGroup,
 } from "@t3tools/contracts";
 import { AuthWorkReadScope, AuthWorkWriteScope } from "@t3tools/contracts";
-import { WORK_RPC_READ_SCOPES, WORK_WS_METHODS } from "@t3tools/contracts/fd/work-management";
+import { AuthEnvironmentScope, clientRpcRequiredScopes } from "@t3tools/contracts";
+import {
+  FACTORY_CLIENT_GUARDED_RPC_SCOPES,
+  FACTORY_RPC_READ_SCOPES,
+  FACTORY_WS_METHODS,
+  FactoryDeliveryId,
+  FactoryProjectSettings,
+} from "@t3tools/contracts/fd/factory";
+import {
+  WORK_RPC_READ_SCOPES,
+  WORK_WS_METHODS,
+  WorkItemId,
+  WorkSourceId,
+} from "@t3tools/contracts/fd/work-management";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
+import type * as RpcClient from "effect/rpc/RpcClient";
+import type * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcTest from "effect/rpc/RpcTest";
 
 import {
@@ -84,6 +100,36 @@ describe("RPC authorization scopes", () => {
     expect(requiredScopeForRpcMethod(WORK_WS_METHODS.workThreadsStart)).toBe(
       AuthOrchestrationOperateScope,
     );
+  });
+
+  it("keeps Factory reads behind orchestration:read and guards exactly its five controls", () => {
+    for (const method of Object.values(FACTORY_WS_METHODS)) {
+      expect(Object.hasOwn(RPC_REQUIRED_SCOPES, method)).toBe(true);
+    }
+    for (const method of Object.keys(FACTORY_RPC_READ_SCOPES)) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
+      expect(clientRpcRequiredScopes(method, undefined)).toEqual([]);
+    }
+    expect(Object.keys(FACTORY_CLIENT_GUARDED_RPC_SCOPES).sort()).toEqual(
+      [
+        FACTORY_WS_METHODS.factorySettingsSet,
+        FACTORY_WS_METHODS.factoryDeliveriesStart,
+        FACTORY_WS_METHODS.factoryDeliveriesStop,
+        FACTORY_WS_METHODS.factoryDeliveriesResume,
+        FACTORY_WS_METHODS.factoryDeliveriesCancel,
+      ].sort(),
+    );
+    expect(requiredScopeForRpcMethod(FACTORY_WS_METHODS.factorySettingsSet)).toBe(
+      AuthSettingsWriteScope,
+    );
+    for (const method of [
+      FACTORY_WS_METHODS.factoryDeliveriesStart,
+      FACTORY_WS_METHODS.factoryDeliveriesStop,
+      FACTORY_WS_METHODS.factoryDeliveriesResume,
+      FACTORY_WS_METHODS.factoryDeliveriesCancel,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+    }
   });
 
   it("declares exactly one scope for every RPC in the server group", () => {
@@ -505,3 +551,118 @@ it.effect("denies manual cleanup before the handler without settings permission"
     expect(handled).toBe(false);
   }).pipe(Effect.scoped),
 );
+
+const defaultFactorySettings = Schema.decodeSync(FactoryProjectSettings)({});
+
+describe("Factory RPC authorization", () => {
+  type WsTag = RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"];
+  type FactoryTag = (typeof FACTORY_WS_METHODS)[keyof typeof FACTORY_WS_METHODS];
+  const factoryTags = new Set<string>(Object.values(FACTORY_WS_METHODS));
+  const group = WsRpcGroup.omit(
+    ...[...WsRpcGroup.requests.keys()].filter(
+      (tag): tag is Exclude<WsTag, FactoryTag> => !factoryTags.has(tag),
+    ),
+  );
+  type FactoryClient = RpcClient.RpcClient<RpcGroup.Rpcs<typeof group>>;
+
+  const deliveryId = FactoryDeliveryId.make("delivery-1");
+  const projectId = ProjectId.make("project");
+  const itemRef = {
+    sourceId: WorkSourceId.make("7e2aa85e-9347-44ce-b019-cb8dfd365b20"),
+    itemId: WorkItemId.make("fd-aaaaaa"),
+  };
+
+  /** Calls one method as a session holding every grant except `missing`. */
+  const callWithout = (
+    missing: AuthEnvironmentScope,
+    call: (client: FactoryClient) => Effect.Effect<object, { readonly _tag: string }>,
+  ) =>
+    Effect.gen(function* () {
+      const handled: Array<string> = [];
+      const reached = (tag: string) => () =>
+        Effect.sync(() => {
+          handled.push(tag);
+        }).pipe(Effect.andThen(Effect.never));
+      const client = yield* RpcTest.makeClient(group).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            group.toLayer(
+              group.of({
+                [FACTORY_WS_METHODS.factorySettingsGet]: reached("settings.get"),
+                [FACTORY_WS_METHODS.factorySettingsSet]: reached("settings.set"),
+                [FACTORY_WS_METHODS.factoryDeliveriesStart]: reached("start"),
+                [FACTORY_WS_METHODS.factoryDeliveriesStop]: reached("stop"),
+                [FACTORY_WS_METHODS.factoryDeliveriesResume]: reached("resume"),
+                [FACTORY_WS_METHODS.factoryDeliveriesCancel]: reached("cancel"),
+                [FACTORY_WS_METHODS.factoryDeliveriesGet]: reached("get"),
+                [FACTORY_WS_METHODS.factoryDeliveriesList]: reached("list"),
+              }),
+            ),
+            RpcAuthorization.layer(
+              AuthEnvironmentScope.literals.filter((scope) => scope !== missing),
+            ),
+          ),
+        ),
+      );
+      const refusal = yield* Effect.flip(call(client));
+      return { refusal, handled };
+    }).pipe(Effect.scoped);
+
+  it.effect.each([
+    {
+      name: "settings.set without settings:write",
+      missing: AuthSettingsWriteScope,
+      call: (client: FactoryClient) =>
+        client[FACTORY_WS_METHODS.factorySettingsSet]({
+          projectId,
+          settings: defaultFactorySettings,
+        }),
+    },
+    {
+      name: "start without orchestration:operate",
+      missing: AuthOrchestrationOperateScope,
+      call: (client: FactoryClient) =>
+        client[FACTORY_WS_METHODS.factoryDeliveriesStart]({ itemRef }),
+    },
+    {
+      name: "stop without orchestration:operate",
+      missing: AuthOrchestrationOperateScope,
+      call: (client: FactoryClient) =>
+        client[FACTORY_WS_METHODS.factoryDeliveriesStop]({ deliveryId }),
+    },
+    {
+      name: "resume without orchestration:operate",
+      missing: AuthOrchestrationOperateScope,
+      call: (client: FactoryClient) =>
+        client[FACTORY_WS_METHODS.factoryDeliveriesResume]({ deliveryId }),
+    },
+    {
+      name: "cancel without orchestration:operate",
+      missing: AuthOrchestrationOperateScope,
+      call: (client: FactoryClient) =>
+        client[FACTORY_WS_METHODS.factoryDeliveriesCancel]({ deliveryId }),
+    },
+    {
+      name: "settings.get without orchestration:read",
+      missing: AuthOrchestrationReadScope,
+      call: (client: FactoryClient) => client[FACTORY_WS_METHODS.factorySettingsGet]({ projectId }),
+    },
+    {
+      name: "get without orchestration:read",
+      missing: AuthOrchestrationReadScope,
+      call: (client: FactoryClient) =>
+        client[FACTORY_WS_METHODS.factoryDeliveriesGet]({ deliveryId }),
+    },
+    {
+      name: "list without orchestration:read",
+      missing: AuthOrchestrationReadScope,
+      call: (client: FactoryClient) => client[FACTORY_WS_METHODS.factoryDeliveriesList]({}),
+    },
+  ])("refuses $name before the handler runs", ({ missing, call }) =>
+    Effect.gen(function* () {
+      const { refusal, handled } = yield* callWithout(missing, call);
+      expect(refusal).toMatchObject({ requiredPermission: missing });
+      expect(handled).toEqual([]);
+    }),
+  );
+});

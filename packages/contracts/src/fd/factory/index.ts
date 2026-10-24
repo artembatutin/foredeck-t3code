@@ -19,5 +19,20 @@ export {
   FactoryVerifyReceipt,
   FactoryReviewSummary,
   FactoryDelivery,
+  FactorySettingsGetInput,
+  FactorySettingsSetInput,
+  FactoryDeliveryStartInput,
+  FactoryDeliveryRefInput,
+  FactoryDeliveryListInput,
+  FactoryDeliveryList,
+  FactoryErrorReason,
+  FactoryError,
 } from "./schemas.ts";
+export {
+  FACTORY_WS_METHODS,
+  FactoryRpcs,
+  FACTORY_RPC_READ_SCOPES,
+  FACTORY_CLIENT_GUARDED_RPC_SCOPES,
+  FACTORY_RPC_INSTRUMENTATION,
+} from "./rpc.ts";
 export { FactoryMcpFailure } from "./mcp.ts";

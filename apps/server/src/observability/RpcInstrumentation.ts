@@ -1,4 +1,5 @@
 import { ORCHESTRATION_V2_WS_METHODS, WS_METHODS, type WsRpcGroup } from "@t3tools/contracts";
+import { FACTORY_RPC_INSTRUMENTATION } from "@t3tools/contracts/fd/factory";
 import { WORK_RPC_INSTRUMENTATION } from "@t3tools/contracts/fd/work-management";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -214,6 +215,7 @@ const RPC_AGGREGATES = {
   [WS_METHODS.subscribeAuthAccess]: "auth",
   [WS_METHODS.subscribeBackgroundPolicy]: "server",
   ...WORK_RPC_INSTRUMENTATION,
+  ...FACTORY_RPC_INSTRUMENTATION,
 } as const satisfies Readonly<Record<WsRpcMethod, string>>;
 
 const RPC_SPAN_PREFIX = "ws.rpc";
