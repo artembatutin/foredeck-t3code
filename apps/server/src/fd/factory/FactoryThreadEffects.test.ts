@@ -97,7 +97,10 @@ interface World {
   projectModel: ModelSelection | null;
   launchFailure: ThreadLaunch.ThreadLaunchError | null;
   sendFailure: Orchestrator.OrchestratorCommandRejectedError | null;
-  projectionFailure: ProjectionStore.ProjectionStoreReadError | null;
+  /** Projection reads that succeed before every later one fails; null never fails. */
+  readsUntilFailure: number | null;
+  /** Runs inside each launch, standing in for its preparation. */
+  onLaunch: Effect.Effect<void> | null;
   /** The author thread's events after the launch, as the test offers them. */
   readonly events: Queue.Queue<OrchestrationV2StoredEvent>;
   /** Completed once the launch subscribes to the thread's events. */
@@ -113,14 +116,17 @@ const fakes = (world: World) =>
         Effect.suspend(() => {
           world.launches.push(input);
           if (world.launchFailure !== null) return Effect.fail(world.launchFailure);
+          const prepare = world.onLaunch ?? Effect.void;
           const runs = [
             { id: firstRun, userMessageId: input.initialMessage?.messageId, status: "preparing" },
           ];
-          return Effect.succeed({
-            threadId: author,
-            projection: { runs },
-            resumed: false,
-          } as unknown as ThreadLaunch.ThreadLaunchResult);
+          return prepare.pipe(
+            Effect.as({
+              threadId: author,
+              projection: { runs },
+              resumed: false,
+            } as unknown as ThreadLaunch.ThreadLaunchResult),
+          );
         }),
     }),
     Layer.mock(ThreadManagement.ThreadManagementService)({
@@ -144,7 +150,10 @@ const fakes = (world: World) =>
     Layer.mock(ProjectionStore.ProjectionStoreV2)({
       getThreadRecords: ((threadId: ThreadId, _fields: unknown, filter?: { runIds?: RunId[] }) =>
         Effect.suspend(() => {
-          if (world.projectionFailure !== null) return Effect.fail(world.projectionFailure);
+          if (world.readsUntilFailure === 0) {
+            return Effect.fail(new ProjectionStore.ProjectionStoreReadError({ threadId }));
+          }
+          if (world.readsUntilFailure !== null) world.readsUntilFailure -= 1;
           const runs = (filter?.runIds ?? []).flatMap((id) => {
             const status = world.runs.get(id);
             return status === undefined ? [] : [{ id, status }];
@@ -214,7 +223,8 @@ const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) =>
       projectModel: null,
       launchFailure: null,
       sendFailure: null,
-      projectionFailure: null,
+      readsUntilFailure: null,
+      onLaunch: null,
       events: yield* Queue.unbounded<OrchestrationV2StoredEvent>(),
       watching: yield* Deferred.make<void>(),
     };
@@ -270,9 +280,10 @@ const commit = (cwd: string, message: string) =>
 
 /**
  * A project checkout whose HEAD is on a scratch branch ahead of `main`, and a worktree of it on
- * the delivery branch, created from `main` the way a new delivery worktree is.
+ * the delivery branch, created from `main` the way a new delivery worktree is. With
+ * `worktree: false` only its path is chosen, for a launch to create it.
  */
-const makeProject = (world: World) =>
+const makeProject = (world: World, options: { readonly worktree?: boolean } = {}) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -286,9 +297,63 @@ const makeProject = (world: World) =>
     yield* git(root, ["switch", "-c", "scratch"]);
     yield* commit(root, "chore: scratch");
     const worktree = path.join(parent, "item-7");
-    yield* git(root, ["worktree", "add", "-b", branch, worktree, "main"]);
+    if (options.worktree !== false) {
+      yield* git(root, ["worktree", "add", "-b", branch, worktree, "main"]);
+    }
     world.workspaceRoot = root;
     return { root, worktree, main };
+  });
+
+/** Moves `main` one commit ahead without touching the checkout, as another push would. */
+const advanceMain = (root: string) =>
+  Effect.gen(function* () {
+    const next = yield* git(root, [
+      ...ada,
+      "commit-tree",
+      "main^{tree}",
+      "-p",
+      "main",
+      "-m",
+      "chore: upstream change",
+    ]);
+    yield* git(root, ["update-ref", "refs/heads/main", next]);
+    return next;
+  });
+
+/**
+ * Stands in for a launch's preparation, which runs after Factory resolved the base ref: `main`
+ * may move on first, the worktree is created from what `main` names by then (its branch reflog
+ * optionally off), and the agent may commit before the launch is reported. Returns the commit
+ * the worktree was created at once the launch has run.
+ */
+const provisionDuringLaunch = (
+  world: World,
+  project: { readonly root: string; readonly worktree: string },
+  options: {
+    readonly moveMain: boolean;
+    readonly reflog: boolean;
+    readonly agentCommits: boolean;
+  },
+) =>
+  Effect.gen(function* () {
+    const services = yield* Effect.context<GitVcsDriver.GitVcsDriver>();
+    const created = { sha: "" };
+    world.onLaunch = Effect.gen(function* () {
+      if (options.moveMain) yield* advanceMain(project.root);
+      created.sha = yield* git(project.root, ["rev-parse", "main"]);
+      yield* git(project.root, [
+        ...(options.reflog ? [] : ["-c", "core.logAllRefUpdates=false"]),
+        "worktree",
+        "add",
+        "-b",
+        branch,
+        project.worktree,
+        "main",
+      ]);
+      world.worktreePath = project.worktree;
+      if (options.agentCommits) yield* commit(project.worktree, "feat: agent work");
+    }).pipe(Effect.provideContext(services), Effect.orDie);
+    return created;
   });
 
 const threadEvent = (type: "thread.metadata-updated" | "run.updated") =>
@@ -463,6 +528,90 @@ describe("FactoryThreadEffects launches", () => {
         assert.strictEqual(state.threads.author, author);
         assert.isNull(state.worktreePath);
         assert.strictEqual(state.baseline, main);
+      }),
+    ),
+  );
+});
+
+describe("FactoryThreadEffects baselines of new worktrees", () => {
+  it.effect(
+    "records the commit the worktree started at when the base ref moves during launch",
+    () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const project = yield* makeProject(world, { worktree: false });
+          const created = yield* provisionDuringLaunch(world, project, {
+            moveMain: true,
+            reflog: true,
+            agentCommits: true,
+          });
+          yield* insert();
+
+          yield* step({ type: "start" });
+          yield* drain;
+
+          // The launch still names the base ref; the baseline follows what it named when used.
+          assert.deepStrictEqual(world.launches[0]?.workspaceStrategy, {
+            type: "worktree",
+            baseRef: "main",
+            branch,
+          });
+          const state = yield* stored;
+          assert.strictEqual(state.worktreePath, project.worktree);
+          assert.strictEqual(state.baseline, created.sha);
+          assert.notStrictEqual(state.baseline, project.main);
+          assert.notStrictEqual(
+            state.baseline,
+            yield* git(project.worktree, ["rev-parse", "HEAD"]),
+          );
+        }),
+      ),
+  );
+
+  it.effect("keeps the resolved commit without a branch reflog while HEAD has not moved", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const project = yield* makeProject(world, { worktree: false });
+        yield* provisionDuringLaunch(world, project, {
+          moveMain: false,
+          reflog: false,
+          agentCommits: false,
+        });
+        yield* insert();
+
+        yield* step({ type: "start" });
+        yield* drain;
+
+        const state = yield* stored;
+        assert.strictEqual(state.baseline, project.main);
+        assert.deepStrictEqual(state.awaiting, { type: "run", threadId: author, runId: firstRun });
+      }),
+    ),
+  );
+
+  it.effect.each([
+    { name: "the base ref moved", moveMain: true, reflog: false, agentCommits: false },
+    // The branch's reflog then starts at the agent's commit, not at its creation.
+    { name: "the agent already committed", moveMain: false, reflog: false, agentCommits: true },
+  ] as const)("blocks without a branch reflog once $name", (options) =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const project = yield* makeProject(world, { worktree: false });
+        yield* provisionDuringLaunch(world, project, options);
+        yield* insert();
+
+        yield* step({ type: "start" });
+        yield* drain;
+
+        const state = yield* stored;
+        assert.strictEqual(state.status, "blocked");
+        assert.strictEqual(
+          state.block?.reason === "effect_failed" ? state.block.detail : undefined,
+          "Factory could not launch the author thread (FactoryBranchStartError).",
+        );
+        assert.isNull(state.baseline);
+        assert.isNull(state.worktreePath);
+        assert.deepStrictEqual(state.threads, {});
       }),
     ),
   );
@@ -676,9 +825,7 @@ describe("FactoryThreadEffects failures", () => {
     withWorld((world) =>
       Effect.gen(function* () {
         yield* makeProject(world);
-        world.projectionFailure = new ProjectionStore.ProjectionStoreReadError({
-          threadId: author,
-        });
+        world.readsUntilFailure = 0;
         yield* insert();
 
         yield* step({ type: "start" });
@@ -692,6 +839,100 @@ describe("FactoryThreadEffects failures", () => {
         );
         assert.isNull(state.worktreePath);
         assert.deepStrictEqual(state.threads, {});
+      }),
+    ),
+  );
+
+  it.effect("blocks a launch whose ended run cannot be read when its result is stored", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const { worktree } = yield* makeProject(world);
+        world.worktreePath = worktree;
+        world.runs.set(firstRun, "completed");
+        // The launch's own workspace read succeeds; the worker's run read after it fails.
+        world.readsUntilFailure = 1;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        world.onLaunch = Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+        );
+        yield* insert();
+
+        yield* step({ type: "start" });
+        yield* Deferred.await(entered);
+        // The run ends while the launch is still running: its event is stale and dropped.
+        yield* step({
+          type: "run.finished",
+          threadId: author,
+          runId: firstRun,
+          status: "completed",
+        });
+        assert.strictEqual((yield* stored).awaiting?.type, "effect");
+        yield* Deferred.succeed(release, undefined);
+        yield* drain;
+
+        const state = yield* stored;
+        assert.strictEqual(state.status, "blocked");
+        assert.deepStrictEqual(state.block, {
+          reason: "effect_failed",
+          effect: {
+            id: 1,
+            type: "launch_thread",
+            role: "author",
+            workspace: { type: "worktree", branch, baseRef: "main" },
+          },
+          detail: "Factory could not launch the author thread (ProjectionStoreReadError).",
+        });
+        assert.isNull(state.awaiting);
+        assert.isNull(state.worktreePath);
+        assert.isNull(state.baseline);
+        assert.deepStrictEqual(state.threads, {});
+        assert.deepStrictEqual(
+          (yield* attempts).map(({ stage, runId, outcome }) => ({ stage, runId, outcome })),
+          [{ stage: "author", runId: null, outcome: "blocked" }],
+        );
+      }),
+    ),
+  );
+
+  it.effect("blocks a fix-commit turn whose run cannot be read when its result is stored", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const { worktree, main } = yield* makeProject(world);
+        world.readsUntilFailure = 0;
+        const before = fold(
+          queued,
+          { type: "start" },
+          {
+            type: "thread.launched",
+            effectId: 1,
+            threadId: author,
+            runId: firstRun,
+            worktreePath: worktree,
+            baseline: main,
+          },
+          { type: "run.finished", threadId: author, runId: firstRun, status: "completed" },
+        );
+        yield* insert(before);
+
+        yield* step({
+          type: "settle.checked",
+          effectId: 2,
+          result: { status: "repairable", problems: ["No commit was added since the baseline."] },
+        });
+        yield* drain;
+
+        assert.strictEqual(world.sends.length, 1);
+        const state = yield* stored;
+        assert.strictEqual(state.status, "blocked");
+        assert.strictEqual(
+          state.block?.reason === "effect_failed" ? state.block.detail : undefined,
+          "Factory could not send the fix-commit turn (ProjectionStoreReadError).",
+        );
+        assert.isNull(state.awaiting);
+        assert.strictEqual(state.worktreePath, before.worktreePath);
+        assert.strictEqual(state.baseline, before.baseline);
+        assert.deepStrictEqual(state.threads, before.threads);
       }),
     ),
   );

@@ -61,6 +61,16 @@ export class FactoryBaselineError extends Schema.TaggedError<FactoryBaselineErro
   }
 }
 
+/** Neither the branch's reflog nor an unmoved HEAD tells which commit a new worktree started at. */
+export class FactoryBranchStartError extends Schema.TaggedError<FactoryBranchStartError>()(
+  "FactoryBranchStartError",
+  { path: Schema.String, branch: Schema.String, cause: Schema.optional(Schema.Defect()) },
+) {
+  override get message(): string {
+    return `Factory could not tell which commit branch ${this.branch} started at in ${this.path}.`;
+  }
+}
+
 /** The launch reported no run for the author prompt it was given. */
 export class FactoryLaunchRunMissingError extends Schema.TaggedError<FactoryLaunchRunMissingError>()(
   "FactoryLaunchRunMissingError",
@@ -96,8 +106,9 @@ interface FactoryThreadEffectFailure {
  * Carries out the thread effects for `FactoryWorker`: launching a role's thread and sending the
  * fix-commit turn on a thread. Each receives the delivery as stored with the effect. The worker
  * feeds what they report back as `thread.launched` / `turn.started`, and a failure as
- * `effect.failed`. Every read and check runs before anything is dispatched, so a failure leaves
- * no thread or message behind.
+ * `effect.failed`. Checks run before anything is dispatched, so a refused launch leaves no thread
+ * behind; a read that fails after the launch still fails the effect, and the delivery records
+ * none of its result.
  */
 export class FactoryThreadEffects extends Context.Service<
   FactoryThreadEffects,
@@ -180,6 +191,45 @@ const make = Effect.gen(function* () {
         : yield* new FactoryBaselineError({ path: cwd, ref });
     });
 
+  /**
+   * The commit a new worktree's branch started at. Preparation creates the worktree after
+   * `launch` returns, from whatever the base ref names by then, so the commit resolved before the
+   * launch can be stale. The branch's reflog records where `worktree add -b` created it; without
+   * one (reflogs turned off), the earlier commit stands only while HEAD has not moved from it.
+   */
+  const branchStart = (worktreePath: string, branch: string, resolved: string) =>
+    Effect.gen(function* () {
+      const reflog = yield* git
+        .execute({
+          operation: "FactoryThreadEffects.branchStart",
+          cwd: worktreePath,
+          args: ["reflog", "show", "--format=%H%x00%gs", `refs/heads/${branch}`, "--"],
+          allowNonZeroExit: true,
+          timeoutMs: 30_000,
+          maxOutputBytes: 1_000_000,
+        })
+        .pipe(
+          Effect.catchTags({
+            GitCommandError: (cause) =>
+              Effect.fail(new FactoryBranchStartError({ path: worktreePath, branch, cause })),
+          }),
+        );
+      // Newest first: the oldest entry is the branch's creation.
+      const [sha = "", subject = ""] = (reflog.stdout.trim().split("\n").at(-1) ?? "").split("\0");
+      if (
+        reflog.exitCode === 0 &&
+        !reflog.stdoutTruncated &&
+        OBJECT_ID.test(sha) &&
+        subject.startsWith("branch: Created from ")
+      ) {
+        return sha;
+      }
+      const head = yield* resolveCommit(worktreePath, "HEAD");
+      return head === resolved
+        ? head
+        : yield* new FactoryBranchStartError({ path: worktreePath, branch });
+    });
+
   const readThreadRun = (threadId: ThreadId, runId: RunId) =>
     projections.getThreadRecords(threadId, ["runs"], { runIds: [runId] }).pipe(
       Effect.map(({ thread, runs }) => ({
@@ -235,8 +285,9 @@ const make = Effect.gen(function* () {
       const item = yield* work.getItem(itemReader(deliveryId), { ref: delivery.itemRef });
 
       const { workspace } = effect;
-      // HEAD before the first turn: a new worktree starts at what its base ref names now.
-      const baseline =
+      // Read before anything is dispatched, so a base ref that names no commit launches nothing.
+      // A later thread's baseline is its worktree's HEAD now, before its first turn.
+      const before =
         workspace.type === "worktree"
           ? yield* resolveCommit(project.workspaceRoot, workspace.baseRef)
           : yield* resolveCommit(workspace.worktreePath, "HEAD");
@@ -277,6 +328,11 @@ const make = Effect.gen(function* () {
         return yield* new FactoryLaunchRunMissingError({ deliveryId, threadId });
       }
       const worktreePath = yield* awaitWorkspace(threadId, run.id);
+      // A launch that recorded no new worktree ended its run before anything ran.
+      const baseline =
+        workspace.type === "worktree" && worktreePath !== null
+          ? yield* branchStart(worktreePath, workspace.branch, before)
+          : before;
       return { threadId, runId: run.id, worktreePath, baseline };
     });
 

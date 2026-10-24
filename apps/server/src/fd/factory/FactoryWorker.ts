@@ -4,6 +4,7 @@ import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import type * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -304,34 +305,50 @@ const make = Effect.gen(function* () {
   const step: FactoryWorker["Service"]["step"] = (deliveryId, event) =>
     locks.withLock(deliveryId, stepLocked(deliveryId, event));
 
+  /** The run a launch or turn result names; other results name none. */
+  const runOf = (effect: FactoryEffect, event: FactoryEvent) => {
+    if (event.type === "thread.launched") return { threadId: event.threadId, runId: event.runId };
+    if (event.type === "turn.started" && effect.type === "send_fix_commit_turn") {
+      return { threadId: effect.threadId, runId: event.runId };
+    }
+    return undefined;
+  };
+
   /**
-   * A run can end before the result naming it is stored: its terminal event then found the
-   * delivery still awaiting the effect and changed nothing. So once the delivery awaits the run,
-   * it is read here (after the store, so an end the read misses arrives as an event later) and
-   * an ended run is fed. Whichever of the two arrives second is stale.
+   * Feeds an effect's result back. A launch or turn result names a run that can end before the
+   * result is stored, and the run's terminal event then finds the delivery still awaiting the
+   * effect and changes nothing. So that run is read under the delivery's lock right before the
+   * result is stored: an end the read misses arrives as an event whose step waits for the lock,
+   * and an end it sees is fed right after the result. A read that fails fails the effect
+   * instead, so the delivery records none of the result rather than wait on a run that ended.
    */
-  const feedEndedRun = (
-    deliveryId: FactoryDeliveryId,
-    event: FactoryEvent,
-    stored: Option.Option<FactoryDeliveryStore.StoredFactoryDelivery>,
-  ) => {
-    if (event.type !== "thread.launched" && event.type !== "turn.started") return Effect.void;
-    const awaiting = Option.isSome(stored) ? stored.value.state.awaiting : null;
-    if (awaiting?.type !== "run") return Effect.void;
-    const { threadId, runId } = awaiting;
-    return threads.runEnded(threadId, runId).pipe(
-      Effect.flatMap(
-        Option.match({
-          onNone: () => Effect.void,
-          onSome: (status) => step(deliveryId, { type: "run.finished", threadId, runId, status }),
-        }),
-      ),
-      // The delivery already awaits the run; its terminal event still advances it.
-      Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause)
-          ? Effect.interrupt
-          : Effect.logWarning("factory could not read an awaited run", cause),
-      ),
+  // Annotated like `step`: it closes the cycle `stepLocked` → lane → `runJob` → `feed`.
+  const feed = (job: Job, event: FactoryEvent): ReturnType<FactoryWorker["Service"]["step"]> => {
+    const { deliveryId } = job.delivery;
+    const run = runOf(job.effect, event);
+    if (run === undefined) return step(deliveryId, event);
+    return locks.withLock(
+      deliveryId,
+      Effect.gen(function* () {
+        const ended = yield* Effect.exit(
+          Effect.suspend(() => threads.runEnded(run.threadId, run.runId)),
+        );
+        if (Exit.isFailure(ended)) {
+          if (Cause.hasInterruptsOnly(ended.cause)) return yield* Effect.interrupt;
+          return yield* stepLocked(deliveryId, {
+            type: "effect.failed",
+            effectId: job.effect.id,
+            detail: failureDetail(job.effect, ended.cause),
+          });
+        }
+        const stored = yield* stepLocked(deliveryId, event);
+        if (Option.isNone(ended.value)) return stored;
+        return yield* stepLocked(deliveryId, {
+          type: "run.finished",
+          ...run,
+          status: ended.value.value,
+        });
+      }),
     );
   };
 
@@ -351,11 +368,7 @@ const make = Effect.gen(function* () {
               detail: failureDetail(job.effect, cause),
             }),
       ),
-      Effect.flatMap((event) =>
-        step(job.delivery.deliveryId, event).pipe(
-          Effect.flatMap((stored) => feedEndedRun(job.delivery.deliveryId, event, stored)),
-        ),
-      ),
+      Effect.flatMap((event) => feed(job, event)),
       Effect.ensuring(TxRef.update(outstanding, (count) => count - 1)),
     );
 
