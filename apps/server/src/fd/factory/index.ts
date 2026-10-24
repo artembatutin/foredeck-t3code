@@ -1,10 +1,22 @@
+import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import * as FactoryReactor from "./FactoryReactor.ts";
+import * as FactoryService from "./FactoryService.ts";
+import * as FactorySettings from "./FactorySettings.ts";
+import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
+import * as FactoryWorker from "./FactoryWorker.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryMigrations from "./persistence/FactoryMigrations.ts";
 import * as FactorySettingsStore from "./persistence/FactorySettingsStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
+import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
+import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
+// Last: core's runtime layer cannot be the first module of its import cycle to load, and the
+// Factory modules above enter that cycle where native ESM can initialize it (entry.test.ts).
+import * as RuntimeLayer from "../../orchestration-v2/runtimeLayer.ts";
 
 export * as FactoryReactor from "./FactoryReactor.ts";
 export * as FactoryService from "./FactoryService.ts";
@@ -22,3 +34,41 @@ export const layerPersistence = Layer.mergeAll(
   FactoryTaskStore.layer,
   FactoryStageRunStore.layer,
 ).pipe(Layer.provide(FactoryMigrations.layer));
+
+/**
+ * The Factory service, settings and worker over Factory persistence, for transports and the
+ * reactor. Needs Work's service, the orchestration application (thread launches and
+ * management), the project store, server settings and config, the git driver and the process
+ * runner. The thread and verify effects stay private to the worker. server.ts also mounts
+ * `layerPersistence` with core and Work persistence, so the ledger migrates with theirs; one
+ * build shares the one instance.
+ */
+export const layerLive = FactoryService.layer.pipe(
+  Layer.provideMerge(FactoryWorker.layer),
+  Layer.provide(
+    Layer.mergeAll(
+      FactoryThreadEffects.layer,
+      FactoryVerifyRunner.layer.pipe(Layer.provide(FactoryEvidence.layer)),
+    ),
+  ),
+  Layer.provideMerge(FactorySettings.layer),
+  Layer.provideMerge(layerPersistence),
+  Layer.provide(ProjectionStore.layer),
+);
+
+/**
+ * Starts the reactor over `layerLive`'s worker; its boot sweep and thread event tail park until
+ * the server activates. The event sink is the orchestration runtime's own layer, which the
+ * server's build shares, so the tail receives the events the orchestrator commits. A sink from
+ * any other layer would be a second instance whose live tail never sees them.
+ */
+export const workerLayer = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const reactor = yield* FactoryReactor.FactoryReactor;
+    yield* reactor.start;
+  }),
+).pipe(
+  Layer.provideMerge(FactoryReactor.layer),
+  Layer.provide(RuntimeLayer.layerEventSink),
+  Layer.provide(ProjectionStore.layer),
+);
