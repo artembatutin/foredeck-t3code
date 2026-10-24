@@ -186,12 +186,13 @@ export class FactoryThreadEffects extends Context.Service<
       runId: RunId,
     ) => Effect.Effect<Option.Option<FactoryTerminalRunStatus>, FactoryThreadEffectFailure>;
     /**
-     * Asks the thread's run to stop, as the thread's own Stop does, for a delivery that was
-     * cancelled. A run that already ended is left as it is.
+     * Asks a run of the thread to stop, as the thread's own Stop does, for a delivery that was
+     * cancelled: `runId`, or without one the thread's latest active run. A run that already
+     * ended, a thread running nothing and a deleted thread are left as they are.
      */
     readonly interruptRun: (
       delivery: StoredFactoryDelivery,
-      run: { readonly threadId: ThreadId; readonly runId: RunId },
+      run: { readonly threadId: ThreadId; readonly runId?: RunId },
     ) => Effect.Effect<void, FactoryThreadEffectFailure>;
   }
 >()("t3/fd/factory/FactoryThreadEffects") {}
@@ -595,13 +596,16 @@ const make = Effect.gen(function* () {
       threads
         .interruptThread({
           projectId: delivery.projectId,
-          // One interrupt per run, however often a cancel is retried.
-          commandId: CommandId.make(`factory-cancel:${delivery.deliveryId}:${runId}`),
+          // One interrupt per run or thread of the delivery, however often it is asked.
+          commandId: CommandId.make(`factory-cancel:${delivery.deliveryId}:${runId ?? threadId}`),
           threadId,
-          runId,
+          ...(runId === undefined ? {} : { runId }),
           reason: "Factory delivery cancelled",
         })
-        .pipe(Effect.asVoid),
+        .pipe(
+          Effect.asVoid,
+          Effect.catchTags({ ThreadManagementThreadNotFoundError: () => Effect.void }),
+        ),
   });
 });
 

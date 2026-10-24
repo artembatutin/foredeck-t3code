@@ -22,6 +22,7 @@ import {
   type FactoryDeliveryId,
   FactoryProjectSettings,
 } from "@t3tools/contracts/fd/factory";
+import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
@@ -527,6 +528,7 @@ export interface World {
   readonly provider: FakeProvider;
   readonly root: string;
   readonly t3Home: string;
+  readonly itemRef: WorkItemRef;
   readonly itemKey: string;
   readonly itemTitle: string;
   /** `git status` of the project root once the item is committed. */
@@ -653,6 +655,7 @@ export const withProject = <A, E>(
         provider,
         root,
         t3Home,
+        itemRef: item.ref,
         itemKey: item.key,
         itemTitle: item.title,
         rootStatus,

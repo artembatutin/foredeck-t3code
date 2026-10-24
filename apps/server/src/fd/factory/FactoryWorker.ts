@@ -423,12 +423,13 @@ const make = Effect.gen(function* () {
 
   /**
    * Interrupts a run of a cancelled delivery, so no agent goes on working in its worktree; the
-   * worktree, branch and commits stay. A run that cannot be interrupted is logged and left to its
-   * owner: the delivery is cancelled either way, and no event of the run changes it.
+   * worktree, branch and commits stay. Without a run id, the thread's latest active run. A run
+   * that cannot be interrupted is logged and left to its owner: the delivery is cancelled either
+   * way, and no event of the run changes it.
    */
   const interruptCancelled = (
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,
-    run: { readonly threadId: ThreadId; readonly runId: RunId },
+    run: { readonly threadId: ThreadId; readonly runId?: RunId },
   ) =>
     Effect.suspend(() => threads.interruptRun(delivery, run)).pipe(
       Effect.catchCause((cause) =>
@@ -470,15 +471,22 @@ const make = Effect.gen(function* () {
         yield* lane.enqueue({ delivery: stored.value, effect });
       }
     }
-    // Cancelled while its agent works: the run is interrupted once the cancel is stored, so its
-    // end finds the delivery cancelled.
+    // Cancelled: once the cancel is stored, each of the delivery's threads stops what it still
+    // runs, so a run's end finds the delivery cancelled. Not only the run it awaited: a review
+    // that blocked on its submissions awaits nothing while the reviewer's turn goes on.
     if (
       Option.isSome(stored) &&
       next.delivery.status === "cancelled" &&
-      before.awaiting?.type === "run"
+      before.status !== "cancelled"
     ) {
-      const { threadId, runId } = before.awaiting;
-      yield* interruptCancelled(stored.value, { threadId, runId });
+      const awaited = before.awaiting?.type === "run" ? before.awaiting : undefined;
+      for (const threadId of new Set(Object.values(before.threads))) {
+        if (threadId === undefined) continue;
+        yield* interruptCancelled(
+          stored.value,
+          threadId === awaited?.threadId ? { threadId, runId: awaited.runId } : { threadId },
+        );
+      }
     }
     return stored;
   });

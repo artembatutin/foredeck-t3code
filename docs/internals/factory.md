@@ -102,7 +102,9 @@ matter as much as the refs: a delivery cancelled while its launch was preparing 
 after the next start has looked. A cancelled or finished delivery keeps its branch, worktree and
 commits; continuing that work is a resume of that delivery, never a new one. A repository Git
 cannot read is left to the launch to report, as `checkWorktreeBase` leaves a base it cannot
-resolve.
+resolve. Starts of one item are serialized in-process from reading its earlier deliveries to
+storing the new one, as Work's thread starts are: a delivery stored and cancelled in between would
+free the active-item index and leave both deliveries on one name.
 
 ## A review judges the verified commit
 
@@ -169,9 +171,11 @@ would hide it. Stopped where a repair round would begin, the failure's fingerpri
 no round is spent, and the stage's attempt is recorded as failed. Only a running delivery can stop;
 an approved one is already in the last stage it runs.
 
-Cancel ends a delivery whatever it awaits, and by owner decision interrupts the run its agent is
-working on, through the thread's own interrupt. A launch or turn being started when the cancel
-lands reports a run the cancelled delivery never takes, so the worker interrupts that run as well
+Cancel ends a delivery whatever it awaits, and by owner decision interrupts what its agents are
+working on, through the thread's own interrupt. Every thread the delivery recorded is asked, not
+only the one whose run it awaits: a review blocked by its submissions awaits nothing while the
+reviewer's turn goes on. A launch or turn being started when the cancel lands reports a run the
+cancelled delivery never takes, so the worker interrupts that run as well
 ([`FactoryWorker.ts`](../../apps/server/src/fd/factory/FactoryWorker.ts)). The verify command and
 the PR action belong to the server and are not stopped; their results change nothing. The worktree,
 branch and commits stay, and a new delivery of the item works on a branch of its own (see

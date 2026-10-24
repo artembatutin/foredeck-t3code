@@ -13,6 +13,7 @@ import {
   type WorkItemRef,
   WorkSourceId,
 } from "@t3tools/contracts/fd/work-management";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -52,11 +53,14 @@ import {
   git,
   runReached,
   stateOf as harnessStateOf,
+  threadProjection,
   verifyCommands,
   withProject,
 } from "./testkit/deliveryHarness.ts";
 
 const projectId = ProjectId.make("project-alpha");
+/** `workBranchName` of the item below. */
+const itemBranch = "work/fd-aaaaaa-add-the-export-button";
 const sourceId = WorkSourceId.make("7e2aa85e-9347-44ce-b019-cb8dfd365b20");
 const itemRef: WorkItemRef = { sourceId, itemId: WorkItemId.make("fd-aaaaaa") };
 // FactoryService reads only these fields of the item.
@@ -87,8 +91,12 @@ const receipt: FactoryVerifyReceipt = {
 interface World {
   /** Each author launch, by delivery. */
   readonly launches: Array<FactoryDeliveryId>;
-  /** Each run Factory asked to interrupt. */
-  readonly interrupts: Array<{ readonly threadId: ThreadId; readonly runId: RunId }>;
+  /** Each interrupt Factory asked for: of a run, or of whatever its thread still runs. */
+  readonly interrupts: Array<{ readonly threadId: ThreadId; readonly runId?: RunId }>;
+  /** The branch of each base check, in order. */
+  readonly checkedBranches: Array<string>;
+  /** Runs inside the next base check only, before its answer. */
+  onCheck: Effect.Effect<void> | null;
   /** While set, a launch waits for it before reporting. */
   launchGate: Deferred.Deferred<void> | null;
   /** While set, a verify run waits for it before reporting `verifyReceipt`. */
@@ -114,7 +122,17 @@ const fakes = (world: World) =>
       get: (id) =>
         Effect.succeed(Option.some({ projectId: id } as unknown as ProjectStore.ProjectRow)),
     }),
-    Layer.mock(ThreadLaunch.ThreadLaunchService)({ checkWorktreeBase: () => Effect.void }),
+    Layer.mock(ThreadLaunch.ThreadLaunchService)({
+      checkWorktreeBase: ({ workspaceStrategy }) =>
+        Effect.suspend(() => {
+          if (workspaceStrategy.type === "worktree") {
+            world.checkedBranches.push(workspaceStrategy.branch ?? "");
+          }
+          const gate = world.onCheck ?? Effect.void;
+          world.onCheck = null;
+          return gate;
+        }),
+    }),
     // Each delivery's author gets its own thread: one thread can hold one active stage attempt.
     Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({
       launchThread: (delivery) =>
@@ -166,6 +184,8 @@ const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
   const world: World = {
     launches: [],
     interrupts: [],
+    checkedBranches: [],
+    onCheck: null,
     launchGate: null,
     verifyGate: null,
     verifyStarted: null,
@@ -187,6 +207,8 @@ const isStopRefused = Schema.is(FactoryService.FactoryStopRefusedError);
 const isCancelRefused = Schema.is(FactoryService.FactoryCancelRefusedError);
 const isDeliveryNotFound = Schema.is(FactoryService.FactoryDeliveryNotFoundError);
 const isReviewRefused = Schema.is(FactoryService.FactoryReviewRefusedError);
+const isReviewInvalid = Schema.is(FactoryService.FactoryReviewInvalidError);
+const isDeliveryActive = Schema.is(FactoryDeliveryStore.FactoryDeliveryActive);
 
 const useVerify = Effect.flatMap(FactorySettings.FactorySettings, (settings) =>
   settings.set(
@@ -505,8 +527,9 @@ describe("FactoryService.cancel", () => {
         const { deliveryId, release } = yield* verifying(world);
 
         const cancelled = yield* cancel(deliveryId);
-        // Verify is the server's command, not an agent turn: nothing is interrupted.
-        assert.deepStrictEqual(world.interrupts, []);
+        // Verify is the server's command, not an agent turn, and is not stopped. The author's
+        // thread is asked to stop whatever it still runs, naming no run.
+        assert.deepStrictEqual(world.interrupts, [{ threadId: threadOf(deliveryId) }]);
         const before = yield* rowsOf(deliveryId);
         yield* TestClock.adjust("1 minute");
 
@@ -524,7 +547,7 @@ describe("FactoryService.cancel", () => {
   );
 
   it.effect.each(["queued", "stopped", "blocked", "pr_open"] as const)(
-    "cancels a %s delivery awaiting nothing, interrupting nothing",
+    "cancels a %s delivery awaiting nothing, asking its threads to stop what they run",
     (status) =>
       withWorld((world) =>
         Effect.gen(function* () {
@@ -536,9 +559,66 @@ describe("FactoryService.cancel", () => {
 
           assert.strictEqual(cancelled.state.status, "cancelled");
           assert.deepStrictEqual(yield* stateOf(deliveryId), cancelled.state);
-          assert.deepStrictEqual(world.interrupts, []);
+          // It awaits no run, so none is named: the thread stops whatever it still runs.
+          assert.deepStrictEqual(world.interrupts, [{ threadId: threadOf(deliveryId) }]);
         }),
       ),
+  );
+
+  it.effect("interrupts the reviewer of a review its submissions blocked mid-turn", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        // Two invalid submissions blocked the review while the reviewer's turn still runs.
+        const deliveryId = FactoryDeliveryId.make("delivery-review-blocked");
+        const author = threadOf(deliveryId);
+        const reviewer = ThreadId.make("thread-reviewer");
+        const reviewRun = RunId.make("run-reviewer");
+        const invalid = {
+          type: "review.submitted",
+          round: 1,
+          threadId: reviewer,
+          runId: reviewRun,
+          judgment: { type: "invalid", problems: ["The verdict is missing."] },
+        } as const;
+        const events: ReadonlyArray<FactoryEvent> = [
+          { type: "start" },
+          {
+            type: "thread.launched",
+            effectId: 1,
+            threadId: author,
+            runId: runOf(deliveryId),
+            worktreePath: `/worktrees/${deliveryId}`,
+            baseline: "b".repeat(40),
+          },
+          authorEnd(deliveryId, "completed"),
+          { type: "settle.checked", effectId: 2, result: { status: "settled" } },
+          { type: "command.finished", effectId: 3, outcome: { type: "receipt", receipt } },
+          {
+            type: "thread.launched",
+            effectId: 4,
+            threadId: reviewer,
+            runId: reviewRun,
+            worktreePath: `/worktrees/${deliveryId}`,
+            baseline: receipt.headSha,
+          },
+          invalid,
+          invalid,
+        ];
+        const state = events.reduce(
+          (current, event) => advance(current, event).delivery,
+          queuedDeliveryState({ branch: "work/fd-aaaaaa", baseRef: "HEAD" }),
+        );
+        assert.strictEqual(state.status, "blocked");
+        assert.isNull(state.awaiting);
+        const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+        yield* store.insert({ deliveryId, projectId, itemRef, state });
+
+        yield* cancel(deliveryId);
+        yield* drain;
+
+        assert.deepStrictEqual(world.interrupts, [{ threadId: author }, { threadId: reviewer }]);
+      }),
+    ),
   );
 
   it.effect.each(["done", "cancelled"] as const)(
@@ -563,6 +643,65 @@ describe("FactoryService.cancel", () => {
           assert.deepStrictEqual(world.interrupts, []);
         }),
       ),
+  );
+});
+
+describe("starts of one item", () => {
+  it.effect("chooses a start's branch only once an earlier start of the item is stored", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        yield* useVerify;
+        // Launches stay preparing until the test lets them report.
+        world.launchGate = yield* Deferred.make<void>();
+        const startItem = Effect.flatMap(service, (factory) => factory.start({ itemRef }));
+        // The first start has chosen its branch and is checking its base.
+        const reached = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        world.onCheck = Deferred.succeed(reached, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+        );
+        const first = yield* Effect.forkChild(startItem);
+        yield* Deferred.await(reached);
+
+        // A second start of the item waits for it instead of choosing from what is stored now.
+        let secondReturned = false;
+        const second = yield* Effect.forkChild(
+          Effect.exit(startItem).pipe(Effect.tap(() => Effect.sync(() => (secondReturned = true)))),
+        );
+        for (let turn = 0; turn < 100; turn += 1) yield* Effect.yieldNow;
+        assert.isFalse(secondReturned);
+        assert.deepStrictEqual(world.checkedBranches, [itemBranch]);
+
+        yield* Deferred.succeed(release, undefined);
+        const stored = yield* Fiber.join(first);
+        const refused = yield* Fiber.join(second);
+        // It then found the first delivery active.
+        if (!Exit.isFailure(refused)) return assert.fail("The second start was stored too.");
+        assert.isTrue(isDeliveryActive(Cause.squash(refused.cause)));
+
+        // Cancelled while its launch still prepares, the first keeps its branch, and the next
+        // start of the item takes one of its own; both launches then report.
+        yield* cancel(stored.deliveryId);
+        const next = yield* startItem;
+        assert.strictEqual(stored.state.branch, itemBranch);
+        assert.strictEqual(next.state.branch, `${itemBranch}-2`);
+        yield* Deferred.succeed(world.launchGate, undefined);
+        yield* drain;
+
+        assert.deepStrictEqual(world.launches, [stored.deliveryId, next.deliveryId]);
+        assert.deepStrictEqual((yield* stateOf(next.deliveryId)).awaiting, {
+          type: "run",
+          threadId: threadOf(next.deliveryId),
+          runId: runOf(next.deliveryId),
+        });
+        const cancelled = yield* stateOf(stored.deliveryId);
+        assert.strictEqual(cancelled.status, "cancelled");
+        assert.strictEqual(cancelled.branch, itemBranch);
+        assert.deepStrictEqual(world.interrupts, [
+          { threadId: threadOf(stored.deliveryId), runId: runOf(stored.deliveryId) },
+        ]);
+      }),
+    ),
   );
 });
 
@@ -727,6 +866,98 @@ describe("stop and cancel on the server's real stack", () => {
           authored,
         );
         assert.deepStrictEqual(yield* harnessStateOf(author.deliveryId), cancelled.state);
+      }),
+    ).pipe(Effect.orDie),
+  );
+
+  it.live("cancels a review its submissions blocked: the reviewer's turn is interrupted", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const factory = yield* Factory.FactoryService.FactoryService;
+        const author = yield* world.start;
+        yield* authorCommits(author.worktreePath, "feat: add the export button");
+        yield* world.endRun(author.runId, "completed");
+        const { awaiting } = yield* harnessStateOf(author.deliveryId);
+        if (awaiting?.type !== "run") return assert.fail("The reviewer is not running.");
+        assert.strictEqual(yield* runReached(awaiting.runId, ["starting", ...ended]), "starting");
+        yield* drainOrchestration;
+
+        // Two invalid submissions block the delivery while the reviewer's turn goes on.
+        for (const blocks of [false, true]) {
+          const invalid = yield* Effect.flip(
+            factory.submitReview({ threadId: awaiting.threadId, review: { verdict: "maybe" } }),
+          );
+          if (!isReviewInvalid(invalid)) return assert.fail(`Got ${invalid._tag}.`);
+          assert.strictEqual(invalid.blocked, blocks);
+        }
+        const blocked = yield* harnessStateOf(author.deliveryId);
+        assert.strictEqual(blocked.status, "blocked");
+        assert.strictEqual(blocked.block?.reason, "invalid_submission");
+        assert.isNull(blocked.awaiting);
+        const reviewerRun = (yield* threadProjection(awaiting.threadId)).runs.find(
+          (run) => run.id === awaiting.runId,
+        );
+        assert.strictEqual(reviewerRun?.status, "running");
+
+        yield* factory.cancel(author.deliveryId);
+        yield* drainOrchestration;
+
+        // Only the reviewer was still working; the author's thread runs nothing.
+        const reviewTurn = world.provider.started.find((turn) => turn.runId === awaiting.runId);
+        assert.deepStrictEqual(
+          world.provider.interrupted.map(({ providerTurnId }) => providerTurnId),
+          [`provider-turn:${reviewTurn?.attemptId}`],
+        );
+        yield* world.endRun(awaiting.runId, "cancelled");
+        assert.strictEqual((yield* harnessStateOf(author.deliveryId)).status, "cancelled");
+      }),
+    ).pipe(Effect.orDie),
+  );
+
+  it.live("starts over on a branch of its own after a cancel during the author's launch", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const factory = yield* Factory.FactoryService.FactoryService;
+        // The first delivery is cancelled before its author's launch has reported.
+        const first = yield* factory.start({ itemRef: world.itemRef });
+        const cancelled = yield* factory.cancel(first.deliveryId);
+        assert.strictEqual(cancelled.state.status, "cancelled");
+        yield* drainFactory;
+        yield* drainOrchestration;
+
+        // The launch made the first delivery's branch and worktree anyway; they stay its own.
+        const firstThread = ThreadId.make(`factory-thread:${first.deliveryId}:1`);
+        const firstShell = yield* threadProjection(firstThread);
+        const firstWorktree = firstShell.thread.worktreePath;
+        if (firstWorktree === null) return assert.fail("The first launch made no worktree.");
+        assert.strictEqual(
+          yield* git(firstWorktree, ["branch", "--show-current"]),
+          cancelled.state.branch,
+        );
+        // And its author's run was interrupted before the delivery could take any of it.
+        assert.strictEqual(firstShell.runs.length, 1);
+        assert.isTrue(
+          firstShell.runs.every(
+            (run) => run.status === "interrupted" || run.status === "cancelled",
+          ),
+        );
+        assert.deepStrictEqual(yield* harnessStateOf(first.deliveryId), cancelled.state);
+
+        // A new delivery launches on a branch and worktree of its own.
+        const next = yield* world.start;
+        const nextState = yield* harnessStateOf(next.deliveryId);
+        assert.strictEqual(nextState.branch, `${cancelled.state.branch}-2`);
+        assert.notStrictEqual(next.worktreePath, firstWorktree);
+        assert.strictEqual(
+          yield* git(next.worktreePath, ["branch", "--show-current"]),
+          nextState.branch,
+        );
+        assert.isTrue(yield* fileSystem.exists(firstWorktree));
+        assert.strictEqual(
+          yield* git(firstWorktree, ["branch", "--show-current"]),
+          cancelled.state.branch,
+        );
       }),
     ).pipe(Effect.orDie),
   );

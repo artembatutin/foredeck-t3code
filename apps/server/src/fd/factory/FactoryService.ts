@@ -4,7 +4,8 @@ import {
   FactoryDeliveryStatus,
   FactoryTaskId,
 } from "@t3tools/contracts/fd/factory";
-import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
+import { type WorkItemRef, workItemRefString } from "@t3tools/contracts/fd/work-management";
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -195,7 +196,7 @@ export class FactoryService extends Context.Service<
     >;
     /**
      * Cancels a delivery that is not done or cancelled. It ends at once and issues nothing more,
-     * and the run its agent works on is interrupted; the worktree, branch and commits stay. No
+     * and whatever its threads still run is interrupted; the worktree, branch and commits stay. No
      * later run end, effect result or review submission changes it, and its item can be
      * delivered again. Refused, with nothing changed, once done or cancelled.
      */
@@ -241,6 +242,9 @@ const make = Effect.gen(function* () {
   const reviews = yield* FactoryReview.FactoryReview;
   const crypto = yield* Crypto.Crypto;
   const gitContext = yield* Effect.context<GitVcsDriver.GitVcsDriver>();
+  // Starts of one item, by its canonical spelling. One server owns a T3 home, so an in-process
+  // lock is enough, as for Work's thread starts.
+  const itemLocks = yield* KeyedLock.make<string>();
 
   const start: FactoryService["Service"]["start"] = Effect.fn("FactoryService.start")(
     function* (input) {
@@ -253,48 +257,57 @@ const make = Effect.gen(function* () {
       if (project === undefined) return yield* new FactoryProjectMissingError({ projectId });
       const item = yield* work.getItem(itemReader, { ref: itemRef });
 
-      // A new delivery starts over: a cancelled or finished one keeps its branch and worktree.
-      const earlier = yield* deliveries.listByItem(itemRef);
-      const branch = yield* freshBranchName({
-        cwd: project.workspaceRoot,
-        base: workBranchName(item),
-        taken: earlier.map(({ state }) => state.branch),
-      }).pipe(Effect.provideContext(gitContext));
-      // The workspace the author's launch asks for (see `agentStage`), checked before any row
-      // exists: the launch itself would accept a base with no commit and fail inside the thread.
-      const workspace = { type: "worktree", baseRef: "HEAD", branch } as const;
-      yield* launches.checkWorktreeBase({ projectId, workspaceStrategy: workspace });
+      // From reading the item's earlier deliveries to storing this one, no other start of the
+      // item runs: a delivery stored meanwhile, then cancelled before its launch made its
+      // branch, would otherwise leave this start on the branch it chose.
+      const queued = yield* Effect.gen(function* () {
+        // A new delivery starts over: a cancelled or finished one keeps its branch and worktree.
+        const earlier = yield* deliveries.listByItem(itemRef);
+        const branch = yield* freshBranchName({
+          cwd: project.workspaceRoot,
+          base: workBranchName(item),
+          taken: earlier.map(({ state }) => state.branch),
+        }).pipe(Effect.provideContext(gitContext));
+        // The workspace the author's launch asks for (see `agentStage`), checked before any row
+        // exists: the launch itself would accept a base with no commit and fail inside the
+        // thread.
+        const workspace = { type: "worktree", baseRef: "HEAD", branch } as const;
+        yield* launches.checkWorktreeBase({ projectId, workspaceStrategy: workspace });
 
-      const deliveryId = FactoryDeliveryId.make(
-        yield* crypto
-          .randomUUIDv4()
-          .pipe(Effect.mapError((cause) => new FactoryDeliveryIdError({ cause }))),
-      );
-      // The insert refuses an item with an active delivery inside its transaction, so of two
-      // concurrent starts only one is stored. The item's task row is written in the same
-      // transaction: a refused start adds none, and no stored delivery lacks it.
-      const queued = yield* deliveries
-        .insert({
-          deliveryId,
-          projectId,
-          itemRef,
-          // The round limits stay those the delivery started with.
-          state: queuedDeliveryState({
-            branch: workspace.branch,
-            baseRef: workspace.baseRef,
-            limits: { maxFixRounds: limits.maxFixRounds, maxReviewRounds: limits.maxReviewRounds },
-          }),
-        })
-        .pipe(
-          Effect.tap(() => tasks.insert({ deliveryId, taskId: SINGLE_ITEM_TASK })),
-          sql.withTransaction,
-          Effect.catchTags({
-            SqlError: (cause) =>
-              Effect.fail(new FactoryStoreError({ operation: "service.start", cause })),
-          }),
+        const deliveryId = FactoryDeliveryId.make(
+          yield* crypto
+            .randomUUIDv4()
+            .pipe(Effect.mapError((cause) => new FactoryDeliveryIdError({ cause }))),
         );
+        // The insert refuses an item with an active delivery inside its transaction, so of two
+        // starts only one is stored, even from another spelling. The item's task row is written
+        // in the same transaction: a refused start adds none, and no stored delivery lacks it.
+        return yield* deliveries
+          .insert({
+            deliveryId,
+            projectId,
+            itemRef,
+            // The round limits stay those the delivery started with.
+            state: queuedDeliveryState({
+              branch: workspace.branch,
+              baseRef: workspace.baseRef,
+              limits: {
+                maxFixRounds: limits.maxFixRounds,
+                maxReviewRounds: limits.maxReviewRounds,
+              },
+            }),
+          })
+          .pipe(
+            Effect.tap(() => tasks.insert({ deliveryId, taskId: SINGLE_ITEM_TASK })),
+            sql.withTransaction,
+            Effect.catchTags({
+              SqlError: (cause) =>
+                Effect.fail(new FactoryStoreError({ operation: "service.start", cause })),
+            }),
+          );
+      }).pipe((locked) => itemLocks.withLock(workItemRefString(itemRef), locked));
       // A storage failure here leaves the delivery queued with nothing launched.
-      const started = yield* worker.step(deliveryId, { type: "start" });
+      const started = yield* worker.step(queued.deliveryId, { type: "start" });
       return Option.getOrElse(started, () => queued);
     },
   );

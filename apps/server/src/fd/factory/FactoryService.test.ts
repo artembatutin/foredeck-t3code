@@ -16,6 +16,7 @@ import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -448,25 +449,30 @@ describe("FactoryService.start", () => {
     withWorld((world) =>
       Effect.gen(function* () {
         yield* useVerify;
-        // Neither start answers its base check until both have reached it, so both have passed
-        // every check before either inserts. A start that ends while the gate is closed never
-        // reached it, so it arrives on its way out instead of holding the other forever.
-        const gate = yield* Deferred.make<void>();
-        let arrivals = 0;
-        const arrive = Effect.suspend(() => {
-          arrivals += 1;
-          return arrivals === 2 ? Deferred.succeed(gate, undefined) : Effect.void;
-        });
-        world.onCheck = arrive.pipe(Effect.andThen(Deferred.await(gate)));
-        const attempt = (itemRef: WorkItemRef) =>
-          Effect.exit(start(itemRef)).pipe(Effect.tap(() => arrive));
+        // The first start holds its base check open. The second, under another spelling of the
+        // item, waits for it to be stored rather than checking alongside it, then finds it
+        // active. The database refuses a second active row by itself too (FactoryStores.test.ts).
+        const reached = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        world.onCheck = Deferred.succeed(reached, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+        );
+        const first = yield* Effect.forkChild(Effect.exit(start(canonicalRef)));
+        yield* Deferred.await(reached);
+        world.onCheck = null;
+        const second = yield* Effect.forkChild(Effect.exit(start(otherSpelling)));
+        for (let turn = 0; turn < 100; turn += 1) yield* Effect.yieldNow;
+        assert.strictEqual(world.checks.length, 1);
 
-        const exits = yield* Effect.all([attempt(canonicalRef), attempt(otherSpelling)], {
-          concurrency: "unbounded",
-        });
+        yield* Deferred.succeed(release, undefined);
+        const exits = [yield* Fiber.join(first), yield* Fiber.join(second)];
         yield* drain;
 
-        assert.strictEqual(world.checks.length, 2);
+        // The second chose its branch with the first stored, so it never asked for the same one.
+        assert.deepStrictEqual(
+          world.checks.map((check) => (check.type === "worktree" ? check.branch : null)),
+          [branch, `${branch}-2`],
+        );
         const stored = exits.filter(Exit.isSuccess).map((exit) => exit.value.deliveryId);
         const errors = exits
           .filter(Exit.isFailure)
