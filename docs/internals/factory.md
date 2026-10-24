@@ -48,8 +48,13 @@ mode, like Work's thread starts (see [agent grants](./work-management.md#agent-g
 downstream checks a launch against its caller, so Factory applies the ceiling itself, at every
 launch, a resume's replay included: the narrower of it and the project's default at that moment.
 Storing the mode resolved at start instead would let a later launch outrun a default the owner has
-narrowed since. The ceiling bounds launches only; a turn on an existing thread runs in the mode the
-thread has, which its owner may change.
+narrowed since. The thread's mode alone is not enough: the server runs a mode a provider does not
+offer as one it does, and without approval-required that can be broader
+([`RuntimePolicy.ts`](../../apps/server/src/orchestration-v2/RuntimePolicy.ts)). So a capped launch
+asks only for a mode its provider advertises, read from the instance registry as that policy reads
+it, stepping down to the broadest within the bound, and fails before anything runs when none is.
+The ceiling bounds launches only; a turn on an existing thread runs in the mode the thread has,
+which its owner may change.
 
 ## Work never imports Factory
 

@@ -33,6 +33,7 @@ import * as ThreadManagement from "../../orchestration-v2/ThreadManagementServic
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProcessRunner from "../../processRunner.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
+import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerActivation from "../../serverActivation.ts";
 import * as ServerSettings from "../../serverSettings.ts";
@@ -123,6 +124,7 @@ const serverServices = Layer.mergeAll(
   Layer.mock(ServerSettings.ServerSettingsService)({}),
   Layer.mock(GitVcsDriver.GitVcsDriver)({}),
   ProviderRegistryMock.layer(),
+  Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({}),
   ProjectStore.layer,
   ProcessRunner.layer,
   ServerConfig.layerTest(process.cwd(), { prefix: "t3-fd-factory-layers-" }),

@@ -36,6 +36,7 @@ import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProcessRunner from "../../processRunner.ts";
+import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import { getAutoBootstrapThreadModelSelection } from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
@@ -214,6 +215,7 @@ const makeLayer = (world: World) =>
     ),
     Layer.provide(fakes(world)),
     Layer.provide(ProviderRegistryMock.layer()),
+    Layer.provide(Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({})),
     Layer.provide(ServerSettings.layerTest()),
     Layer.provide(
       FactoryVerifyRunner.layer.pipe(

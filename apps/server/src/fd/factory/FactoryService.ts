@@ -187,7 +187,8 @@ export class FactoryService extends Context.Service<
      * cannot read, a project without a verify command or not on this environment, a base the
      * worktree cannot start from, or an item that already has a delivery that is not done or
      * cancelled. With `runtimeModeCeiling`, which the delivery keeps, none of its threads ever
-     * launches broader than that mode (a caller's own, for an agent's start); without one they
+     * launches or runs broader than that mode (a caller's own, for an agent's start), and a launch
+     * on a provider that offers no mode within it fails before anything runs; without one they
      * launch with the project's default.
      */
     readonly start: (input: {

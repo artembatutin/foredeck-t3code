@@ -16,6 +16,7 @@ import {
   ProviderTurnId,
   type RunId,
   type RuntimeMode,
+  type ServerProvider,
   type ThreadId,
 } from "@t3tools/contracts";
 import {
@@ -24,6 +25,7 @@ import {
   FactoryProjectSettings,
 } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
+import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
@@ -52,6 +54,7 @@ import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../../orchestration-v2/ProjectStore.ts";
 import * as ProviderAdapterRegistry from "../../../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as RuntimePolicy from "../../../orchestration-v2/RuntimePolicy.ts";
 import * as ProviderReplayHarness from "../../../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
@@ -65,6 +68,7 @@ import * as ProjectService from "../../../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../../../project/ProjectSetupScriptRunner.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
 import * as WorktreeSetupTracker from "../../../project/WorktreeSetupTracker.ts";
+import * as ProviderInstanceRegistry from "../../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerActivation from "../../../serverActivation.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
@@ -75,6 +79,7 @@ import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../../../workspace/WorkspacePaths.ts";
+import { RepositorySet } from "../../multirepo/index.ts";
 import * as WorkManagement from "../../work-management/index.ts";
 import * as FactoryReactor from "../FactoryReactor.ts";
 import * as Factory from "../index.ts";
@@ -423,26 +428,57 @@ const factoryReactor = Layer.effectDiscard(
 );
 
 /**
+ * The fake provider's instance as the instance registry holds it. The runtime policy and Factory
+ * read only its advertised runtime modes; none advertised means it runs any mode it is given.
+ */
+const providerInstances = (supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined) => {
+  // A test stub: only the snapshot's runtime modes are ever read.
+  const snapshot = { instanceId, driver, supportedRuntimeModes } as ServerProvider;
+  const instance = {
+    instanceId,
+    snapshot: { getSnapshot: Effect.succeed(snapshot) },
+  } as unknown as ProviderInstance;
+  return Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+    getInstance: (id) => Effect.succeed(id === instanceId ? instance : undefined),
+  });
+};
+
+/**
  * The server's orchestration stack around the fake provider, on one in-memory database, with the
- * project root and T3 home in temp folders. Factory opens pull requests through the fake PR
- * service. Effects run only when the test drains the worker.
+ * project root and T3 home in temp folders. Turns run under the server's runtime policy, which
+ * runs a mode the provider does not advertise as one it does. Factory opens pull requests through
+ * the fake PR service. Effects run only when the test drains the worker.
  */
 const makeLayer = (input: {
   readonly provider: FakeProvider;
+  readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
   readonly pullRequestCalls: Array<PullRequestCall>;
   readonly root: string;
   readonly t3Home: string;
 }) => {
   const database = SqlitePersistence.layerMemory;
+  const serverConfig = ServerConfig.layerTest(input.root, input.t3Home);
+  const instances = providerInstances(input.supportedRuntimeModes);
+  const runtimePolicy = RuntimePolicy.layerFromProjectStore.pipe(
+    Layer.provide(RepositorySet.layerDefault),
+    Layer.provide(instances),
+    Layer.provide(ProjectStore.layer),
+    Layer.provide(database),
+    Layer.provide(serverConfig),
+    Layer.provide(NodeServices.layer),
+    // The database is the harness's own, memoized: its build fails the test before this would.
+    Layer.orDie,
+  );
   const orchestration = ProviderReplayHarness.layerWithRegistry(
     { name: "factory-delivery" },
     ProviderAdapterRegistry.layerSingle(input.provider.adapter),
-    { databaseLayer: database, runEffectWorker: false },
+    { databaseLayer: database, runEffectWorker: false, runtimePolicyLayer: runtimePolicy },
   );
   return factoryReactor.pipe(
     Layer.provideMerge(Factory.layerLive),
     Layer.provide(fakePullRequests(input.pullRequestCalls)),
     Layer.provide(ProviderRegistryMock.layer()),
+    Layer.provide(instances),
     Layer.provideMerge(work),
     Layer.provideMerge(threadLaunch),
     Layer.provideMerge(projectService),
@@ -460,7 +496,7 @@ const makeLayer = (input: {
     ),
     Layer.provideMerge(database),
     Layer.provideMerge(ServerSettings.layerTest()),
-    Layer.provideMerge(ServerConfig.layerTest(input.root, input.t3Home)),
+    Layer.provideMerge(serverConfig),
     Layer.provideMerge(VcsProcess.layer),
   );
 };
@@ -572,7 +608,11 @@ export interface World {
 export const withProject = <A, E>(
   verifyCommand: FactoryCommand,
   body: (world: World) => Effect.Effect<A, E, Services>,
-  limits: { readonly maxFixRounds?: number; readonly maxReviewRounds?: number } = {},
+  options: {
+    readonly limits?: { readonly maxFixRounds?: number; readonly maxReviewRounds?: number };
+    /** The runtime modes the provider advertises; none, so it runs any, when absent. */
+    readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
+  } = {},
 ) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
@@ -617,7 +657,11 @@ export const withProject = <A, E>(
       const settings = yield* Factory.FactorySettings.FactorySettings;
       yield* settings.set(
         projectId,
-        decodeSettings({ verifyCommand, roles: { author: modelSelection }, limits }),
+        decodeSettings({
+          verifyCommand,
+          roles: { author: modelSelection },
+          limits: options.limits ?? {},
+        }),
       );
 
       const service = yield* Factory.FactoryService.FactoryService;
@@ -674,7 +718,17 @@ export const withProject = <A, E>(
         startWith,
         endRun,
       });
-    }).pipe(Effect.provide(makeLayer({ provider, pullRequestCalls, root, t3Home })));
+    }).pipe(
+      Effect.provide(
+        makeLayer({
+          provider,
+          supportedRuntimeModes: options.supportedRuntimeModes,
+          pullRequestCalls,
+          root,
+          t3Home,
+        }),
+      ),
+    );
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 /** Commits `export.ts` with `text` in the worktree, as the author agent would during its turn. */

@@ -262,3 +262,127 @@ describe("A delivery's runtime mode ceiling", () => {
       ).pipe(Effect.orDie),
   );
 });
+
+/** The `effect.failed` detail of a launch refused for its provider's runtime modes. */
+const refusedLaunch = (role: "author" | "reviewer") =>
+  `Factory could not launch the ${role} thread (FactoryRuntimeModeUnavailableError).`;
+
+// The server runs a mode a provider does not advertise as one it does, which can be broader.
+describe("A delivery's runtime mode ceiling under the server's runtime policy", () => {
+  it.live("leaves an uncapped launch to the runtime policy, as before", () =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          yield* setProjectDefault(world, "approval-required");
+          const author = yield* world.start;
+
+          // The thread asks for the default; the provider runs the only mode it offers.
+          assert.deepStrictEqual(yield* shellModes(author.threadId), authored("approval-required"));
+          assert.deepStrictEqual(turnModes(world, author.runId), authored("full-access"));
+        }),
+      { supportedRuntimeModes: ["full-access"] },
+    ),
+  );
+
+  it.live("refuses a capped author on a full-access-only provider, also on resume", () =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const factory = yield* Factory.FactoryService.FactoryService;
+          const started = yield* factory.start({
+            itemRef: world.itemRef,
+            runtimeModeCeiling: "approval-required",
+          });
+          yield* drainFactory;
+          const refused = yield* stateOf(started.deliveryId);
+          const launch = refused.authorLaunch;
+          if (launch === null) return assert.fail("The start recorded no author launch.");
+          // The resume issues the same launch again, and it is refused again.
+          const resumed = yield* factory.resume(started.deliveryId);
+          assert.deepStrictEqual(resumed.state.awaiting, { type: "effect", effect: launch });
+          yield* drainFactory;
+          yield* drainOrchestration;
+
+          for (const state of [refused, yield* stateOf(started.deliveryId)]) {
+            assert.strictEqual(state.status, "blocked");
+            assert.strictEqual(state.stage, "author");
+            assert.deepInclude(state.block, {
+              reason: "effect_failed",
+              detail: refusedLaunch("author"),
+            });
+            assert.deepStrictEqual(state.threads, {});
+          }
+          // Nothing was launched, the first time or the resume's replay: no thread, no turn.
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const launched = FactoryThreadEffects.launchThreadId(started.deliveryId, 1);
+          assert.isNull(yield* orchestrator.getThreadShell(launched));
+          assert.deepStrictEqual(world.provider.started, []);
+        }),
+      { supportedRuntimeModes: ["full-access"] },
+    ).pipe(Effect.orDie),
+  );
+
+  it.live("refuses a reviewer the narrowed default leaves no mode for, until it widens", () =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const factory = yield* Factory.FactoryService.FactoryService;
+          yield* setProjectDefault(world, "auto");
+          const author = yield* world.startWith({ runtimeModeCeiling: "auto" });
+          assert.deepStrictEqual(turnModes(world, author.runId), authored("auto"));
+
+          // The owner narrows the default: the provider would run the reviewer in auto.
+          yield* setProjectDefault(world, "approval-required");
+          yield* authorCommits(author.worktreePath, "feat: add the export button");
+          yield* world.endRun(author.runId, "completed");
+          const refused = yield* stateOf(author.deliveryId);
+          assert.strictEqual(refused.status, "blocked");
+          assert.strictEqual(refused.stage, "review");
+          assert.deepInclude(refused.block, {
+            reason: "effect_failed",
+            detail: refusedLaunch("reviewer"),
+          });
+          assert.deepStrictEqual(refused.threads, { author: author.threadId });
+          assert.deepStrictEqual(
+            world.provider.started.map(({ runId }) => runId),
+            [author.runId],
+          );
+
+          // Widened again, the resume verifies afresh and the reviewer launches within it.
+          yield* setProjectDefault(world, "auto");
+          yield* factory.resume(author.deliveryId);
+          yield* drainFactory;
+          const reviewer = yield* runningReviewer(world, author.deliveryId);
+          assert.deepStrictEqual(yield* shellModes(reviewer.threadId), reviewing("auto"));
+          assert.deepStrictEqual(turnModes(world, reviewer.runId), reviewing("auto"));
+        }),
+      { supportedRuntimeModes: ["auto", "full-access"] },
+    ).pipe(Effect.orDie),
+  );
+
+  it.live("steps a capped launch down to the broadest mode its provider offers within", () =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const author = yield* world.startWith({ runtimeModeCeiling: "auto" });
+          assert.deepStrictEqual(yield* shellModes(author.threadId), authored("auto-accept-edits"));
+          assert.deepStrictEqual(turnModes(world, author.runId), authored("auto-accept-edits"));
+
+          yield* authorCommits(author.worktreePath, "feat: add the export button");
+          yield* world.endRun(author.runId, "completed");
+          const reviewer = yield* runningReviewer(world, author.deliveryId);
+          assert.deepStrictEqual(
+            yield* shellModes(reviewer.threadId),
+            reviewing("auto-accept-edits"),
+          );
+          assert.deepStrictEqual(turnModes(world, reviewer.runId), reviewing("auto-accept-edits"));
+        }),
+      // Listed first, full access is what the server would run an unoffered auto as.
+      { supportedRuntimeModes: ["full-access", "auto-accept-edits"] },
+    ),
+  );
+});

@@ -35,6 +35,7 @@ import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProcessRunner from "../../processRunner.ts";
+import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
@@ -220,6 +221,7 @@ const fakes = (world: World) =>
       linkLaunch: (_input, launch) => launch,
     }),
     Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed(providers) }),
+    Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({}),
   );
 
 /** Pull requests are opened in FactoryPullRequest.test.ts; here an approved delivery's opens. */

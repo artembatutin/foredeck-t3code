@@ -4,8 +4,9 @@ import {
   MessageId,
   type ModelSelection,
   ProjectId,
+  ProviderInstanceId,
   type RunId,
-  type RuntimeMode,
+  RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
 import { FactoryDeliveryId, FactoryRole } from "@t3tools/contracts/fd/factory";
@@ -24,6 +25,7 @@ import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadMessageIntake from "../../orchestration-v2/ThreadMessageIntake.ts";
+import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import { getAutoBootstrapThreadModelSelection } from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
@@ -68,6 +70,19 @@ export class FactoryRoleUnsupportedError extends Schema.TaggedError<FactoryRoleU
 ) {
   override get message(): string {
     return `Factory cannot launch a ${this.role} thread yet.`;
+  }
+}
+
+/**
+ * The provider offers no runtime mode within the broadest the delivery's launch may use (the
+ * narrower of its ceiling and the project's default); nothing was launched.
+ */
+export class FactoryRuntimeModeUnavailableError extends Schema.TaggedError<FactoryRuntimeModeUnavailableError>()(
+  "FactoryRuntimeModeUnavailableError",
+  { role: FactoryRole, instanceId: ProviderInstanceId, runtimeMode: RuntimeMode },
+) {
+  override get message(): string {
+    return `Provider ${this.instanceId} offers no runtime mode within ${this.runtimeMode}, the broadest this delivery's ${this.role} may launch with.`;
   }
 }
 
@@ -238,11 +253,19 @@ const runtimeModeRank: Record<RuntimeMode, number> = {
   "full-access": 3,
 };
 
-/** The project's default runtime mode, never broader than the delivery's ceiling. */
-const launchRuntimeMode = (projectDefault: RuntimeMode, ceiling: RuntimeMode | undefined) =>
-  ceiling !== undefined && runtimeModeRank[ceiling] < runtimeModeRank[projectDefault]
-    ? ceiling
-    : projectDefault;
+/**
+ * The runtime mode a launch under `bound` asks of a provider offering `offered`: `bound` when it
+ * offers it (or advertises nothing, and so runs what it is given), else the broadest mode it
+ * offers below it; none when it offers nothing within. A provider runs a mode it does not offer as
+ * one it does, which can be broader (see `RuntimePolicy`), so a bounded launch only asks for one
+ * it offers.
+ */
+const offeredWithin = (bound: RuntimeMode, offered: ReadonlyArray<RuntimeMode> | undefined) =>
+  offered === undefined || offered.length === 0 || offered.includes(bound)
+    ? bound
+    : offered
+        .filter((mode) => runtimeModeRank[mode] < runtimeModeRank[bound])
+        .toSorted((left, right) => runtimeModeRank[right] - runtimeModeRank[left])[0];
 
 /** Factory reads its delivery's item and writes nothing to Work under this actor. */
 const itemReader = (deliveryId: FactoryDeliveryId): WorkActor => ({
@@ -261,6 +284,7 @@ const make = Effect.gen(function* () {
   const work = yield* WorkService.WorkService;
   const git = yield* GitVcsDriver.GitVcsDriver;
   const providers = yield* ProviderRegistry.ProviderRegistry;
+  const providerInstances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
   const intakeContext = yield* Effect.context<
     ThreadManagement.ThreadManagementService | ServerConfig.ServerConfig | FileSystem.FileSystem
   >();
@@ -300,6 +324,36 @@ const make = Effect.gen(function* () {
       const { highRiskEffort } = yield* factorySettings.get(delivery.projectId);
       const selection = yield* escalated(delivery, thread.modelSelection, round, highRiskEffort);
       return selection === thread.modelSelection ? undefined : selection;
+    });
+
+  /**
+   * The runtime mode a launch of `role` on `instanceId` asks for. Without a ceiling, the project's
+   * default, as for any thread. With one, the narrower of the two, stepped down to a mode the
+   * provider offers, so the run is never broader than either; a provider offering none within
+   * fails the launch before anything is dispatched.
+   */
+  const launchRuntimeMode = (
+    delivery: StoredFactoryDelivery,
+    role: FactoryRole,
+    instanceId: ProviderInstanceId,
+    projectDefault: RuntimeMode,
+  ) =>
+    Effect.gen(function* () {
+      const ceiling = delivery.state.runtimeModeCeiling;
+      if (ceiling === undefined) return projectDefault;
+      const bound =
+        runtimeModeRank[ceiling] < runtimeModeRank[projectDefault] ? ceiling : projectDefault;
+      // Read where the run's runtime policy reads it when the provider starts the turn.
+      const instance = yield* providerInstances.getInstance(instanceId);
+      const offered =
+        instance === undefined
+          ? undefined
+          : (yield* instance.snapshot.getSnapshot).supportedRuntimeModes;
+      const mode = offeredWithin(bound, offered);
+      return (
+        mode ??
+        (yield* new FactoryRuntimeModeUnavailableError({ role, instanceId, runtimeMode: bound }))
+      );
     });
 
   /** The full object id `ref` names in `cwd`. */
@@ -440,6 +494,12 @@ const make = Effect.gen(function* () {
         1,
         highRiskEffort,
       );
+      const runtimeMode = yield* launchRuntimeMode(
+        delivery,
+        role,
+        modelSelection.instanceId,
+        resolved.defaultRuntimeMode,
+      );
       // Reviewers work in plan mode: they read and judge, and never change the worktree.
       const opening =
         basis === null
@@ -474,7 +534,7 @@ const make = Effect.gen(function* () {
         modelSelection,
         // The default as it is now, so a narrowed one narrows later launches too; a raised one
         // never takes a launch past the ceiling the delivery started with.
-        runtimeMode: launchRuntimeMode(resolved.defaultRuntimeMode, state.runtimeModeCeiling),
+        runtimeMode,
         interactionMode: opening.interactionMode,
         workspaceStrategy:
           workspace.type === "worktree"

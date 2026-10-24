@@ -194,7 +194,7 @@ describe("Factory single-item delivery", () => {
           assert.isTrue(yield* world.exists(path.join(evidence, "verify-1.json")));
         }),
       // The project allows no fix round, and the delivery keeps the limit it started with.
-      { maxFixRounds: 0 },
+      { limits: { maxFixRounds: 0 } },
     ),
   );
 

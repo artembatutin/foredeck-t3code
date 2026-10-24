@@ -40,6 +40,7 @@ import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProcessRunner from "../../processRunner.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
+import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
@@ -718,7 +719,12 @@ const threadState = (threadId: ThreadId) =>
   Effect.flatMap(FactoryThreadEffects.FactoryThreadEffects, (effects) =>
     effects.threadState(threadId),
   ).pipe(
-    Effect.provide(FactoryThreadEffects.layer.pipe(Layer.provide(ProviderRegistryMock.layer()))),
+    Effect.provide(
+      FactoryThreadEffects.layer.pipe(
+        Layer.provide(ProviderRegistryMock.layer()),
+        Layer.provide(Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({})),
+      ),
+    ),
   );
 
 /** Worktrees of the project's repository, its own checkout included. */
