@@ -5,8 +5,19 @@ import type {
 } from "@t3tools/contracts";
 import type { FactoryTaskRisk } from "@t3tools/contracts/fd/factory";
 
-/** The select options providers name a model's effort with: Claude's, Codex's (also Grok's and Muse's), Pi's. */
-const EFFORT_OPTION_IDS: ReadonlySet<string> = new Set(["effort", "reasoningEffort", "thinking"]);
+/**
+ * The select options providers name a model's effort with: `effort` (Claude, Cursor),
+ * `reasoningEffort` (Codex, Grok, Muse), `reasoning` (Cursor), `variant` (OpenCode's reasoning
+ * variants) and `thinking` (Pi's levels). ACP registry agents name theirs freely and their
+ * descriptors do not keep the `thought_level` category, so their turns are not escalated.
+ */
+const EFFORT_OPTION_IDS: ReadonlySet<string> = new Set([
+  "effort",
+  "reasoningEffort",
+  "reasoning",
+  "variant",
+  "thinking",
+]);
 
 const isEffortOption = (
   descriptor: ProviderOptionDescriptor,

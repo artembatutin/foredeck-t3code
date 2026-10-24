@@ -36,6 +36,35 @@ const thinkingLevels: ProviderOptionDescriptor = {
   type: "select",
   options: levels(["minimal", "low", "medium", "high", "xhigh"], "medium"),
 };
+/** OpenCode's reasoning variants and its agent, as `provider-opencode` advertises them. */
+const openCodeVariant: ProviderOptionDescriptor = {
+  id: "variant",
+  label: "Reasoning",
+  type: "select",
+  options: levels(["low", "medium", "high", "xhigh"], "medium"),
+  currentValue: "medium",
+};
+const openCodeAgent: ProviderOptionDescriptor = {
+  id: "agent",
+  label: "Agent",
+  type: "select",
+  options: levels(["build", "plan"], "build"),
+  currentValue: "build",
+};
+/** Cursor passes its SDK's `reasoning` parameter through under that id. */
+const cursorReasoning: ProviderOptionDescriptor = {
+  id: "reasoning",
+  label: "Reasoning",
+  type: "select",
+  options: levels(["low", "medium", "high", "xhigh"], "medium"),
+};
+/** An ACP registry agent's thought level, under an id the agent chose. */
+const acpThoughtLevel: ProviderOptionDescriptor = {
+  id: "thought_level",
+  label: "Thought level",
+  type: "select",
+  options: levels(["low", "medium", "high", "xhigh"], "medium"),
+};
 const thinkingToggle: ProviderOptionDescriptor = {
   id: "thinking",
   label: "Thinking",
@@ -91,10 +120,38 @@ describe("escalateEffort", () => {
 
   it.each([
     ["Codex's reasoning effort", reasoningEffort],
+    ["Cursor's reasoning", cursorReasoning],
     ["Pi's thinking levels", thinkingLevels],
   ] as const)("raises %s", (_, descriptor) => {
     expect(escalate({ descriptors: [descriptor], round: 2 })).toEqual(
       withOptions([{ id: descriptor.id, value: "xhigh" }]),
+    );
+  });
+
+  it.each([
+    ["round 2", { round: 2 }],
+    ["a high-risk task's first round", { round: 1, risk: "high" }],
+  ] as const)("raises OpenCode's reasoning variant on %s and keeps its agent", (_, turn) => {
+    expect(
+      escalate({
+        selection: withOptions([
+          { id: "variant", value: "medium" },
+          { id: "agent", value: "build" },
+        ]),
+        descriptors: [openCodeVariant, openCodeAgent],
+        ...turn,
+      }),
+    ).toEqual(
+      withOptions([
+        { id: "agent", value: "build" },
+        { id: "variant", value: "xhigh" },
+      ]),
+    );
+  });
+
+  it("raises OpenCode's reasoning variant from the model's default", () => {
+    expect(escalate({ descriptors: [openCodeAgent, openCodeVariant], round: 2 })).toEqual(
+      withOptions([{ id: "variant", value: "xhigh" }]),
     );
   });
 
@@ -118,6 +175,12 @@ describe("escalateEffort", () => {
 
   it.each([
     ["a descriptor without that value", [effortWithoutXhigh]],
+    [
+      "OpenCode variants without that value",
+      [{ ...openCodeVariant, options: levels(["high", "max"], "high"), currentValue: "high" }],
+    ],
+    ["only OpenCode's agent", [openCodeAgent]],
+    ["an ACP agent's own thought-level option", [acpThoughtLevel]],
     ["no effort option", [fastMode]],
     ["a boolean thinking toggle", [thinkingToggle]],
     ["another select offering the value", [serviceTier]],
@@ -137,6 +200,11 @@ describe("escalateEffort", () => {
       { ...effort, options: levels(["low", "medium", "high", "xhigh", "max"], "max") },
     ],
     ["above it by the current value", selection, { ...reasoningEffort, currentValue: "xhigh" }],
+    [
+      "chosen at that OpenCode variant",
+      withOptions([{ id: "variant", value: "xhigh" }]),
+      openCodeVariant,
+    ],
   ] as const)("never lowers an effort %s", (_, chosen, descriptor) => {
     expect(escalate({ selection: chosen, descriptors: [descriptor], round: 2 })).toBe(chosen);
   });
