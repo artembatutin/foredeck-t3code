@@ -2046,6 +2046,11 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         yield* writeTextFile(cwd, "binary.dat", "binary\0data");
         if ((yield* HostProcess.Platform) !== "win32") {
           yield* writeTextFile(cwd, "tab\tand\nnewline.txt", "unusual path\n");
+          // Executable on disk too, as `chmod +x` leaves it: where Git trusts the executable bit
+          // it reads the working tree's mode, and Changes compares the merge base with that.
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          yield* fileSystem.chmod(path.join(cwd, "mode-only.sh"), 0o755);
         }
         yield* git(cwd, ["add", "."]);
         yield* git(cwd, ["update-index", "--chmod=+x", "mode-only.sh"]);

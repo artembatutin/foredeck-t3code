@@ -170,6 +170,7 @@
     "apps/server/src/terminal/Manager.test.ts": "Verifies repository terminals cannot be retargeted or killed by open, attach, or restart, including retained history, while preserving ordinary terminal behavior.",
     "apps/server/src/terminal/Manager.ts": "Calls fd terminal location checks under existing session locks and preserves repository launch locations alongside retained terminal history.",
     "apps/server/src/vcs/GitVcsDriver.ts": "Declares the optional exact commit a branch push publishes instead of HEAD, used by the stacked Git action for the fd Factory PR stage; callers that omit it are unchanged.",
+    "apps/server/src/vcs/GitVcsDriverCore.test.ts": "Makes the review preview's mode-change fixture executable on disk as well as in the index, as a real chmod leaves it, so the existing assertions hold where Git trusts the executable bit; this neighbor of the declared exact-commit push change runs in its verification.",
     "apps/server/src/vcs/GitVcsDriverCore.ts": "Pushes an optional exact commit by its id and records the upstream as -u would, so a commit made during the push is never published for the fd Factory PR stage; pushes without it are unchanged.",
     "apps/server/src/workspace/WorkspaceFileSystem.test.ts": "Verifies repository-selected absolute paths cannot read another checkout while legacy host-file previews still work.",
     "apps/server/src/workspace/WorkspaceFileSystem.ts": "Uses the existing relative-path and realpath containment checks for explicitly targeted repository reads, including absolute file links.",
