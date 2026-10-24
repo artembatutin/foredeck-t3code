@@ -112,14 +112,14 @@ interface FactoryThreadEffectFailure {
  * fix-commit turn on a thread. Each receives the delivery as stored with the effect. The worker
  * feeds what they report back as `thread.launched` / `turn.started`, and a failure as
  * `effect.failed`. Checks run before anything is dispatched, so a refused launch leaves no thread
- * behind; a read or Work link that fails after the launch still fails the effect, and the
- * delivery records none of its result.
+ * behind; a read that fails after the launch still fails the effect, and the delivery records
+ * none of its result.
  */
 export class FactoryThreadEffects extends Context.Service<
   FactoryThreadEffects,
   {
     /**
-     * Launches the thread with its first turn, links it to the delivery's Work item, and reports
+     * Launches the thread with its first turn, linked to the delivery's Work item, and reports
      * it once the launch has recorded the worktree, or has ended the run trying (the path is null
      * then).
      */
@@ -294,11 +294,16 @@ const make = Effect.gen(function* () {
         resolved.defaultModelSelection ??
         getAutoBootstrapThreadModelSelection();
       // Derived from the effect, so a retried launch replays its receipt instead of starting a
-      // second thread.
+      // second thread, and finds its Work link already stored.
       const commandId = CommandId.make(`factory-launch:${deliveryId}:${effect.id}`);
       const messageId = MessageId.make(`factory-launch-message:${deliveryId}:${effect.id}`);
-      const launched = yield* launches.launch({
+      const threadId = ThreadId.make(`factory-thread:${deliveryId}:${effect.id}`);
+      // Work links the thread to the delivery's item before the launch runs, so a run that ends
+      // before the launch returns is recorded on the link; a launch that creates no thread leaves
+      // no link.
+      const launch = launches.launch({
         commandId,
+        threadId,
         projectId,
         title: authorThreadTitle(item),
         modelSelection,
@@ -316,10 +321,10 @@ const make = Effect.gen(function* () {
         createdBy: "system",
         creationSource: "server",
       });
-      const { threadId } = launched;
-      // Linked once the launch has created the thread, so a launch that fails first links
-      // nothing, and a replayed launch returns the same thread, whose link is already stored.
-      yield* work.linkThread({ ref: delivery.itemRef, threadId, origin: "factory" });
+      const launched = yield* work.linkLaunch(
+        { ref: delivery.itemRef, threadId, origin: "factory" },
+        launch,
+      );
       const run = launched.projection.runs.find(
         (candidate) => candidate.userMessageId === messageId,
       );

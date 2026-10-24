@@ -207,15 +207,20 @@ export class WorkService extends Context.Service<
     readonly reserveLaunch: (threadId: ThreadId) => Effect.Effect<void, never, Scope.Scope>;
     readonly isLaunching: (threadId: ThreadId) => Effect.Effect<boolean>;
     /**
-     * Links a thread another server module started for an item, marked with that module's
-     * origin, under the item's canonical ref. The thread must exist or its launch must hold a
-     * reservation; linking it again leaves the stored link as it is.
+     * Runs another server module's launch of a thread for an item, with the item's link written
+     * first under its canonical ref and marked with that module's origin. As with Work's own
+     * starts, the link is reserved while the launch runs, so the thread's runs always find it,
+     * and a launch that ends without its thread removes it. Running the launch again keeps the
+     * one link.
      */
-    readonly linkThread: (input: {
-      readonly ref: WorkItemRef;
-      readonly threadId: ThreadId;
-      readonly origin: WorkThreadLinkOrigin;
-    }) => Effect.Effect<void, WorkDomainError>;
+    readonly linkLaunch: <A, E>(
+      input: {
+        readonly ref: WorkItemRef;
+        readonly threadId: ThreadId;
+        readonly origin: WorkThreadLinkOrigin;
+      },
+      launch: Effect.Effect<A, E>,
+    ) => Effect.Effect<A, E | WorkDomainError>;
   }
 >()("t3/fd/work-management/WorkService") {}
 
@@ -1013,26 +1018,23 @@ const make = Effect.gen(function* () {
       return { linked: true };
     });
 
-  const linkThread: WorkService["Service"]["linkThread"] = (input) =>
+  /** Drops a reserved link whose launch ended without creating its thread. */
+  const releaseUnlaunched = (ref: WorkItemRef, threadId: ThreadId) =>
+    projections.getThreadShell(threadId).pipe(
+      Effect.flatMap((shell) =>
+        shell === null ? links.unlink(ref.sourceId, ref.itemId, threadId) : Effect.void,
+      ),
+      // Left for the sweep when it cannot be decided now; nothing reserves it any more.
+      Effect.catchCause((cause) => Effect.logWarning("work launch reservation left", cause)),
+    );
+
+  const linkLaunch: WorkService["Service"]["linkLaunch"] = (input, launch) =>
     Effect.gen(function* () {
       const ref = yield* canonicalRef(input.ref);
-      // A link without its thread is a live launch only while the launch holds its reservation;
-      // the sweep drops any other as a launch that died. The reservation is checked first, as
-      // it is released only once the thread exists.
-      if (!(yield* isLaunching(input.threadId))) {
-        const shell = yield* projections
-          .getThreadShell(input.threadId)
-          .pipe(Effect.mapError(unavailable("Thread state could not be read.")));
-        if (shell === null || shell.deletedAt !== null) {
-          return yield* new WorkInvalid({
-            detail: "The thread does not exist on this environment.",
-          });
-        }
-      }
-      // Usually served by the read the caller made before starting the thread.
+      // Usually served by the read the caller made before preparing its launch.
       const at = yield* currentEpoch;
       const detail = yield* Cache.get(itemCache, encodeItemKey([ref.sourceId, ref.itemId, at]));
-      const { inserted } = yield* links
+      const reserve = links
         .link({
           sourceId: ref.sourceId,
           itemId: ref.itemId,
@@ -1049,7 +1051,23 @@ const make = Effect.gen(function* () {
           },
         })
         .pipe(Effect.mapError(storeFailure));
+      // Written before the launch: the launch prepares the thread in the background, and a run
+      // that ended before a later link was written would never be recorded on it. Whatever ends
+      // the launch without its thread (a failure, a defect, the caller going away) removes it.
+      const { launched, inserted } = yield* Effect.uninterruptibleMask((restore) =>
+        reserveLaunch(input.threadId).pipe(
+          Effect.andThen(reserve),
+          Effect.flatMap(({ inserted }) =>
+            restore(launch).pipe(Effect.map((launched) => ({ launched, inserted }))),
+          ),
+          Effect.onExit((exit) =>
+            Exit.isSuccess(exit) ? Effect.void : releaseUnlaunched(ref, input.threadId),
+          ),
+          Effect.scoped,
+        ),
+      );
       if (inserted) yield* bumpEpoch;
+      return launched;
     });
 
   const refresh: WorkService["Service"]["refresh"] = (actor, _input) =>
@@ -1120,7 +1138,7 @@ const make = Effect.gen(function* () {
     canonicalRef,
     reserveLaunch,
     isLaunching,
-    linkThread,
+    linkLaunch,
   });
 });
 

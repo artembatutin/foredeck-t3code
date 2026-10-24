@@ -41,9 +41,11 @@ links that existed when the thread settled, and records each linked run's
 terminal status, which is how a client knows to offer "Mark done?" or "Back to
 todo?". Factory-origin links (`origin: "factory"`) offer no reverse prompts,
 because Factory moves the item's status itself; Work stores the origin but never
-imports Factory. Factory links through `WorkService.linkThread` once its launch has
-created the thread, so a Work start of the item during that launch does not see it
-yet. Settling is the owner saying the thread is finished, so
+imports Factory. Factory launches through `WorkService.linkLaunch`, which writes and
+reserves the link before the launch like Work's own starts. A link written after
+the launch would miss a run that ended first (preparation runs in the background):
+the run tail finds no row, and the sweep ignores outcomes older than the link.
+Settling is the owner saying the thread is finished, so
 unsettling does not bring the link back. The thread event tail is live only: a
 sweep at boot and every five minutes recovers outcomes committed while the
 reactor was not listening, drops links the tail missed and refreshes the

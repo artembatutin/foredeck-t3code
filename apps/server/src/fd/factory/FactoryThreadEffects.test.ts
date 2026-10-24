@@ -60,7 +60,8 @@ const itemRef = {
   sourceId: WorkSourceId.make("7e2aa85e-9347-44ce-b019-cb8dfd365b20"),
   itemId: WorkItemId.make("fd-aaaaaa"),
 };
-const author = ThreadId.make("thread-author");
+// The id Factory derives for the delivery's first launch effect.
+const author = ThreadId.make(`factory-thread:${deliveryId}:1`);
 const firstRun = RunId.make("run-1");
 const fixRun = RunId.make("run-2");
 const branch = "feature/item-7";
@@ -122,7 +123,7 @@ const fakes = (world: World) =>
           ];
           return prepare.pipe(
             Effect.as({
-              threadId: author,
+              threadId: input.threadId ?? author,
               projection: { runs },
               resumed: false,
             } as unknown as ThreadLaunch.ThreadLaunchResult),
@@ -186,7 +187,7 @@ const fakes = (world: World) =>
     Layer.mock(WorkService.WorkService)({
       getItem: () => Effect.succeed(item as unknown as WorkItemDetail),
       // FactoryWorkLink.test.ts covers the link on the real Work service.
-      linkThread: () => Effect.void,
+      linkLaunch: (_input, launch) => launch,
     }),
   );
 
@@ -384,6 +385,7 @@ describe("FactoryThreadEffects launches", () => {
 
         assert.strictEqual(world.launches.length, 1);
         const [launch] = world.launches;
+        assert.strictEqual(launch?.threadId, author);
         assert.deepStrictEqual(launch?.workspaceStrategy, {
           type: "worktree",
           baseRef: "main",

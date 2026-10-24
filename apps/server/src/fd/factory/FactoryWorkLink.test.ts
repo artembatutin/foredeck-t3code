@@ -5,6 +5,7 @@ import {
   AuthWorkReadScope,
   AuthWorkWriteScope,
   CommandId,
+  type OrchestrationV2RunStatus,
   type OrchestrationV2ThreadShell,
   ProjectId,
   RunId,
@@ -14,19 +15,23 @@ import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import { FetchHttpClient } from "effect/http";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../../config.ts";
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
+import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
@@ -60,16 +65,29 @@ const authorLaunch = {
 /** What the fakes stand in for, as the test sets it up and as they record it. */
 interface World {
   readonly launches: Array<ThreadLaunch.ThreadLaunchInput>;
-  /** The thread each launch command created; a replay gets it back, as its receipt gives it. */
-  readonly created: Map<CommandId, ThreadId>;
   readonly threads: Map<ThreadId, OrchestrationV2ThreadShell>;
+  /** The author run as the projection reports it. */
+  run: { status: OrchestrationV2RunStatus; completedAt: DateTime.Utc | null };
   launchFailure: ThreadLaunch.ThreadLaunchError | null;
+  /** Runs inside each launch once it has created the thread, standing in for its preparation. */
+  onLaunch: Effect.Effect<void> | null;
   root: string;
   worktree: string;
 }
 
-// The launch creates the thread and reports its first run; the projection reads give Work the
-// thread shell and the effects a prepared worktree with the run still going.
+const shellOf = (threadId: ThreadId, activeRunId: RunId | null) =>
+  ({
+    id: threadId,
+    projectId,
+    activeRunId,
+    latestRunId: runId,
+    deletedAt: null,
+    settledAt: null,
+    archivedAt: null,
+  }) as unknown as OrchestrationV2ThreadShell;
+
+// The launch creates the thread Factory names and reports its first run; the projection reads
+// give Work the thread and its run, and the effects a prepared worktree.
 const fakes = (world: World) =>
   Layer.mergeAll(
     Layer.mock(ThreadLaunch.ThreadLaunchService)({
@@ -77,24 +95,21 @@ const fakes = (world: World) =>
         Effect.suspend(() => {
           world.launches.push(input);
           if (world.launchFailure !== null) return Effect.fail(world.launchFailure);
-          const replayed = world.created.get(input.commandId);
-          const threadId = replayed ?? ThreadId.make(`thread-${world.created.size + 1}`);
-          world.created.set(input.commandId, threadId);
-          world.threads.set(threadId, {
-            id: threadId,
-            projectId,
-            deletedAt: null,
-            settledAt: null,
-            archivedAt: null,
-          } as unknown as OrchestrationV2ThreadShell);
+          const { threadId } = input;
+          if (threadId === undefined) return Effect.die("Factory names the thread it launches.");
+          // A replay of the command finds its thread, as the launch receipt does.
+          const resumed = world.threads.has(threadId);
+          if (!resumed) world.threads.set(threadId, shellOf(threadId, runId));
           const runs = [
-            { id: runId, userMessageId: input.initialMessage?.messageId, status: "running" },
+            { id: runId, userMessageId: input.initialMessage?.messageId, status: "preparing" },
           ];
-          return Effect.succeed({
-            threadId,
-            projection: { runs },
-            resumed: replayed !== undefined,
-          } as unknown as ThreadLaunch.ThreadLaunchResult);
+          return (world.onLaunch ?? Effect.void).pipe(
+            Effect.as({
+              threadId,
+              projection: { runs },
+              resumed,
+            } as unknown as ThreadLaunch.ThreadLaunchResult),
+          );
         }),
     }),
     Layer.mock(ThreadManagement.ThreadManagementService)({
@@ -105,7 +120,7 @@ const fakes = (world: World) =>
       getThreadRecords: ((threadId: ThreadId) =>
         Effect.sync(() => ({
           thread: { id: threadId, worktreePath: world.worktree, deletedAt: null },
-          runs: [{ id: runId, status: "running" }],
+          runs: [{ id: runId, ...world.run }],
         }))) as unknown as ProjectionStore.ProjectionStoreV2["Service"]["getThreadRecords"],
     }),
     Layer.mock(ProjectStore.ProjectStoreV2)({
@@ -140,8 +155,14 @@ const workLayer = WorkManagement.WorkService.layer.pipe(
   Layer.provide(FetchHttpClient.layer),
 );
 
+/** Work's link sweep; its event tails are never started. */
+const reactorLayer = WorkManagement.WorkSyncReactor.layer.pipe(
+  Layer.provide(Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({})),
+  Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({})),
+);
+
 const makeLayer = (world: World) =>
-  FactoryThreadEffects.layer.pipe(
+  Layer.mergeAll(FactoryThreadEffects.layer, reactorLayer).pipe(
     Layer.provideMerge(workLayer),
     Layer.provide(ServerSettings.layerTest()),
     Layer.provide(FactorySettings.layer),
@@ -158,9 +179,10 @@ const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) =>
   Effect.suspend(() => {
     const world: World = {
       launches: [],
-      created: new Map(),
       threads: new Map(),
+      run: { status: "running", completedAt: null },
       launchFailure: null,
+      onLaunch: null,
       root: "/nowhere",
       worktree: "/nowhere",
     };
@@ -269,15 +291,53 @@ describe("FactoryThreadEffects Work links", () => {
         const first = yield* launchAuthor(delivery);
         const second = yield* launchAuthor(delivery);
 
-        // One command id, so the launch replays its thread.
+        // One command id and thread id, so the launch replays its thread.
+        const once = [`factory-launch:${deliveryId}:1`, `factory-thread:${deliveryId}:1`];
         assert.deepStrictEqual(
-          world.launches.map((launch) => launch.commandId),
-          [`factory-launch:${deliveryId}:1`, `factory-launch:${deliveryId}:1`],
+          world.launches.map((launch): ReadonlyArray<string | undefined> => [
+            launch.commandId,
+            launch.threadId,
+          ]),
+          [once, once],
         );
         assert.strictEqual(second.threadId, first.threadId);
         assert.deepStrictEqual(
           (yield* listLinks({ ref: item.ref })).map((link) => [link.threadId, link.origin]),
           [[first.threadId, "factory"]],
+        );
+      }),
+    ),
+  );
+
+  it.effect("records the author run's end when the run ends before the launch returns", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const item = yield* makeProject(world);
+        const services = yield* Effect.context<WorkManagement.WorkService.WorkService>();
+        const linkedDuringLaunch: Array<ReadonlyArray<ThreadId>> = [];
+        // Preparation runs in the background and fails the run before the launch returns, and
+        // time moves on before Factory gets the result.
+        world.onLaunch = Effect.gen(function* () {
+          const links = yield* listLinks({ ref: item.ref });
+          linkedDuringLaunch.push(links.map((link) => link.threadId));
+          world.run = { status: "failed", completedAt: yield* DateTime.now };
+          for (const threadId of world.threads.keys()) {
+            world.threads.set(threadId, shellOf(threadId, null));
+          }
+          yield* TestClock.adjust("1 minute");
+        }).pipe(Effect.provideContext(services), Effect.orDie);
+
+        const launched = yield* launchAuthor(deliveryOf(item.ref));
+
+        // The link already existed, so the run's end event finds it too.
+        assert.deepStrictEqual(linkedDuringLaunch, [[launched.threadId]]);
+        const reactor = yield* WorkManagement.WorkSyncReactor.WorkSyncReactor;
+        yield* reactor.sweepLinks;
+        yield* reactor.drain;
+        const links = yield* listLinks({ ref: item.ref });
+        assert.deepStrictEqual(
+          links.map((link) => [link.threadId, link.origin, link.run]),
+          [[launched.threadId, "factory", { status: "failed", at: "1970-01-01T00:00:00.000Z" }]],
         );
       }),
     ),
