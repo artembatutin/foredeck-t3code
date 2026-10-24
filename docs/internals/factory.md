@@ -87,12 +87,22 @@ refused without running.
 ## At most one active delivery per item
 
 An item may have only one delivery that is not done or cancelled; a new one is allowed once the
-previous delivery is terminal (operator decision). Two deliveries of one item would ask for the
-same branch, which is named after the item, and race each other on the item's status. A partial unique index enforces it in the
-insert's transaction, so of two concurrent starts only one is stored (see
+previous delivery is terminal (operator decision). Two active deliveries of one item would race
+each other on the item's status. A partial unique index enforces it in the insert's transaction,
+so of two concurrent starts only one is stored (see
 [`FactoryDeliveryStore.ts`](../../apps/server/src/fd/factory/persistence/FactoryDeliveryStore.ts)).
 Item ids must be in Work's canonical spelling, or one item could hold two active deliveries. A new
 terminal status needs a new index migration.
+
+A new delivery starts over on a branch and worktree of its own (owner decision): the branch Work's
+thread starts would name, or the first of `-2`, `-3`, … after it that no earlier delivery of the
+item recorded and no ref in the repository holds
+([`freshBranch.ts`](../../apps/server/src/fd/factory/git/freshBranch.ts)). The recorded names
+matter as much as the refs: a delivery cancelled while its launch was preparing creates its branch
+after the next start has looked. A cancelled or finished delivery keeps its branch, worktree and
+commits; continuing that work is a resume of that delivery, never a new one. A repository Git
+cannot read is left to the launch to report, as `checkWorktreeBase` leaves a base it cannot
+resolve.
 
 ## A review judges the verified commit
 
@@ -164,10 +174,8 @@ working on, through the thread's own interrupt. A launch or turn being started w
 lands reports a run the cancelled delivery never takes, so the worker interrupts that run as well
 ([`FactoryWorker.ts`](../../apps/server/src/fd/factory/FactoryWorker.ts)). The verify command and
 the PR action belong to the server and are not stopped; their results change nothing. The worktree,
-branch and commits stay. A new delivery of the item may start, but its author asks for a new
-worktree on the item's branch, which the cancelled delivery's worktree still has checked out, so
-the launch fails and the new delivery blocks. What a re-delivery should do with the kept worktree
-is not decided yet.
+branch and commits stay, and a new delivery of the item works on a branch of its own (see
+[one active delivery per item](#at-most-one-active-delivery-per-item)).
 
 Both actions check the status and step under the delivery's lock, like a review submission. The
 boot sweep keys on what a delivery awaits, not on its status: a stopping delivery whose run ended

@@ -15,6 +15,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
+import type * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import {
   type WorkActor,
   type WorkDomainError,
@@ -25,6 +26,7 @@ import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import { FactoryProjectMissingError } from "./FactoryThreadEffects.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
+import { type FactoryBranchUnavailableError, freshBranchName } from "./git/freshBranch.ts";
 import { FactoryStoreError } from "./persistence/errors.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
@@ -149,6 +151,7 @@ type FactoryStartError =
   | ProjectStore.ProjectStoreV2Error
   | FactoryProjectMissingError
   | ThreadLaunch.ThreadLaunchBaseRefError
+  | FactoryBranchUnavailableError
   | FactoryDeliveryIdError
   | FactoryDeliveryStore.FactoryDeliveryActive
   | FactoryStoreError;
@@ -159,7 +162,9 @@ export class FactoryService extends Context.Service<
   {
     /**
      * Starts a delivery of a single Work item. The author works on a new worktree of the branch
-     * Work's thread starts would name, created from the canonical checkout's HEAD. The delivery
+     * Work's thread starts would name, created from the canonical checkout's HEAD; when an earlier
+     * delivery of the item or any ref already holds that name, the first free one of `-2`, `-3`,
+     * … after it (see `freshBranchName`), so an earlier delivery keeps its work. The delivery
      * is stored queued with the item as its one task, then started, so its author launch is
      * queued once the running state is stored. Refused, with nothing written: an item Work
      * cannot read, a project without a verify command or not on this environment, a base the
@@ -235,6 +240,7 @@ const make = Effect.gen(function* () {
   const worker = yield* FactoryWorker.FactoryWorker;
   const reviews = yield* FactoryReview.FactoryReview;
   const crypto = yield* Crypto.Crypto;
+  const gitContext = yield* Effect.context<GitVcsDriver.GitVcsDriver>();
 
   const start: FactoryService["Service"]["start"] = Effect.fn("FactoryService.start")(
     function* (input) {
@@ -243,18 +249,20 @@ const make = Effect.gen(function* () {
       const itemRef = yield* work.canonicalRef(input.itemRef);
       const { projectId } = (yield* work.resolveSource(itemRef.sourceId)).stored;
       const { limits } = yield* settings.requireDeliverySettings(projectId);
-      if (Option.isNone(yield* projects.get(projectId))) {
-        return yield* new FactoryProjectMissingError({ projectId });
-      }
+      const project = Option.getOrUndefined(yield* projects.get(projectId));
+      if (project === undefined) return yield* new FactoryProjectMissingError({ projectId });
       const item = yield* work.getItem(itemReader, { ref: itemRef });
 
+      // A new delivery starts over: a cancelled or finished one keeps its branch and worktree.
+      const earlier = yield* deliveries.listByItem(itemRef);
+      const branch = yield* freshBranchName({
+        cwd: project.workspaceRoot,
+        base: workBranchName(item),
+        taken: earlier.map(({ state }) => state.branch),
+      }).pipe(Effect.provideContext(gitContext));
       // The workspace the author's launch asks for (see `agentStage`), checked before any row
       // exists: the launch itself would accept a base with no commit and fail inside the thread.
-      const workspace = {
-        type: "worktree",
-        baseRef: "HEAD",
-        branch: workBranchName(item),
-      } as const;
+      const workspace = { type: "worktree", baseRef: "HEAD", branch } as const;
       yield* launches.checkWorktreeBase({ projectId, workspaceStrategy: workspace });
 
       const deliveryId = FactoryDeliveryId.make(

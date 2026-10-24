@@ -282,6 +282,10 @@ export class FactoryDeliveryStore extends Context.Service<
       ReadonlyArray<StoredFactoryDelivery>,
       FactoryStoreError
     >;
+    /** Every delivery of the item, whatever its status, oldest first. */
+    readonly listByItem: (
+      itemRef: WorkItemRef,
+    ) => Effect.Effect<ReadonlyArray<StoredFactoryDelivery>, FactoryStoreError>;
   }
 >()("t3/fd/factory/persistence/FactoryDeliveryStore") {}
 
@@ -401,6 +405,11 @@ const make = Effect.gen(function* () {
       selectDeliveries({ activeOnly: true }).pipe(
         Effect.map((rows) => rows.map(fromRow)),
         Effect.catchTags(FactoryStoreError.catchStorage("deliveries.listActive")),
+      ),
+    listByItem: (itemRef) =>
+      selectDeliveries({ itemRef }).pipe(
+        Effect.map((rows) => rows.map(fromRow)),
+        Effect.catchTags(FactoryStoreError.catchStorage("deliveries.listByItem")),
       ),
   });
 });

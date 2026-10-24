@@ -18,6 +18,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
@@ -45,6 +46,7 @@ const canonicalRef: WorkItemRef = { sourceId, itemId: WorkItemId.make("fd-aaaaaa
 const otherSpelling: WorkItemRef = { sourceId, itemId: WorkItemId.make("FD-AAAAAA") };
 /** `workBranchName` of the item below. */
 const branch = "work/fd-aaaaaa-add-the-export-button";
+const workspaceRoot = "/projects/alpha";
 
 // FactoryService reads only these fields of the item and the project.
 const item = {
@@ -70,6 +72,10 @@ interface World {
     readonly deliveryId: FactoryDeliveryId;
     readonly effect: Extract<FactoryEffect, { readonly type: "launch_thread" }>;
   }>;
+  /** Refs in the project's repository, as full names. */
+  readonly refs: Set<string>;
+  /** The directory and pattern of each ref lookup. */
+  readonly refReads: Array<{ readonly cwd: string; readonly pattern: string }>;
   projectExists: boolean;
   itemReadable: boolean;
   baseRefused: boolean;
@@ -104,7 +110,7 @@ const fakes = (world: World) =>
       get: (id) =>
         Effect.sync(() =>
           world.projectExists
-            ? Option.some({ projectId: id } as unknown as ProjectStore.ProjectRow)
+            ? Option.some({ projectId: id, workspaceRoot } as unknown as ProjectStore.ProjectRow)
             : Option.none(),
         ),
     }),
@@ -148,7 +154,23 @@ const fakes = (world: World) =>
     Layer.mock(FactoryReview.FactoryReview)({}),
     Layer.mock(FactoryRecord.FactoryRecord)({}),
     Layer.mock(FactoryPullRequest.FactoryPullRequest)({}),
-    Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+    // Answers the ref lookups a start makes for a free branch name, from `world.refs`.
+    Layer.mock(GitVcsDriver.GitVcsDriver)({
+      execute: ({ cwd, args }) =>
+        Effect.sync(() => {
+          const pattern = args.at(-1) ?? "";
+          world.refReads.push({ cwd, pattern });
+          const name = pattern.replace(/^refs\/\*\*\//, "");
+          const found = [...world.refs].find((ref) => ref.endsWith(`/${name}`));
+          return {
+            exitCode: ChildProcessSpawner.ExitCode(0),
+            stdout: found === undefined ? "" : `${found}\n`,
+            stderr: "",
+            stdoutTruncated: false,
+            stderrTruncated: false,
+          };
+        }),
+    }),
   );
 
 /** The service and the real worker on in-memory SQLite, with everything outside Factory faked. */
@@ -167,6 +189,8 @@ const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
     reads: [],
     checks: [],
     launches: [],
+    refs: new Set(),
+    refReads: [],
     projectExists: true,
     itemReadable: true,
     baseRefused: false,
@@ -282,6 +306,31 @@ describe("FactoryService.start", () => {
     ),
   );
 
+  it.effect("names the delivery after the first branch no ref in the repository holds", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        yield* useVerify;
+        // A thread started from the item outside Factory left its branch, and a remote has the
+        // next name.
+        world.refs.add(`refs/heads/${branch}`);
+        world.refs.add(`refs/remotes/origin/${branch}-2`);
+        const started = yield* start(canonicalRef);
+        yield* drain;
+        assert.strictEqual(started.state.branch, `${branch}-3`);
+        assert.deepStrictEqual(world.refReads, [
+          { cwd: workspaceRoot, pattern: `refs/**/${branch}` },
+          { cwd: workspaceRoot, pattern: `refs/**/${branch}-2` },
+          { cwd: workspaceRoot, pattern: `refs/**/${branch}-3` },
+        ]);
+        assert.deepStrictEqual(world.launches.at(-1)?.effect.workspace, {
+          type: "worktree",
+          branch: `${branch}-3`,
+          baseRef: "HEAD",
+        });
+      }),
+    ),
+  );
+
   it.effect("refuses a project without a verify command", () =>
     withWorld((world) =>
       Effect.gen(function* () {
@@ -377,6 +426,14 @@ describe("FactoryService.start", () => {
           assert.notStrictEqual(second.deliveryId, first.deliveryId);
           assert.deepStrictEqual(second.itemRef, canonicalRef);
           assert.strictEqual(second.state.status, "running");
+          // The first keeps its branch: the second starts over on one of its own.
+          assert.strictEqual(second.state.branch, `${branch}-2`);
+          assert.deepStrictEqual(world.checks.at(-1), {
+            type: "worktree",
+            baseRef: "HEAD",
+            branch: `${branch}-2`,
+          });
+          assert.strictEqual(Option.getOrThrow(yield* get(first.deliveryId)).state.branch, branch);
           assert.deepStrictEqual(
             world.launches.map(({ deliveryId }) => deliveryId),
             [first.deliveryId, second.deliveryId],

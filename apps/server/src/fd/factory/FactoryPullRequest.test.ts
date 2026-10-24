@@ -146,8 +146,13 @@ const fakes = (world: World) =>
         } as unknown as WorkService.ResolvedSource),
       getItem: () => world.onItemRead.pipe(Effect.as(world.item)),
     }),
+    // No repository at the root: a start keeps the item's branch name (freshBranch.test.ts).
     Layer.mock(ProjectStore.ProjectStoreV2)({
-      get: (id) => Effect.succeedSome({ projectId: id } as unknown as ProjectStore.ProjectRow),
+      get: (id) =>
+        Effect.succeedSome({
+          projectId: id,
+          workspaceRoot: "/nowhere",
+        } as unknown as ProjectStore.ProjectRow),
     }),
     Layer.mock(ThreadLaunch.ThreadLaunchService)({ checkWorktreeBase: () => Effect.void }),
     Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({

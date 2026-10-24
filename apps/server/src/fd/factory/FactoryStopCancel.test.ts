@@ -21,6 +21,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
@@ -147,7 +148,17 @@ const fakes = (world: World) =>
     Layer.mock(FactoryReview.FactoryReview)({}),
     Layer.mock(FactoryRecord.FactoryRecord)({}),
     Layer.mock(FactoryPullRequest.FactoryPullRequest)({}),
-    Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+    // No ref holds the item's branch name, so a start keeps it.
+    Layer.mock(GitVcsDriver.GitVcsDriver)({
+      execute: () =>
+        Effect.succeed({
+          exitCode: ChildProcessSpawner.ExitCode(0),
+          stdout: "",
+          stderr: "",
+          stdoutTruncated: false,
+          stderrTruncated: false,
+        }),
+    }),
   );
 
 /** The service and the real worker on in-memory SQLite, with everything outside Factory faked. */
@@ -680,14 +691,42 @@ describe("stop and cancel on the server's real stack", () => {
           authored,
         );
 
-        // Cancelled once, the delivery refuses another cancel, and the item can be delivered again.
+        // Cancelled once, the delivery refuses another cancel.
         const again = yield* Effect.flip(factory.cancel(author.deliveryId));
         assert.isTrue(isCancelRefused(again));
-        const { itemRef: cancelledItem } = Option.getOrThrow(yield* factory.get(author.deliveryId));
-        const redelivery = yield* factory.start({ itemRef: cancelledItem });
-        assert.notStrictEqual(redelivery.deliveryId, author.deliveryId);
-        assert.strictEqual(redelivery.state.status, "running");
-        yield* drainFactory;
+
+        // A new delivery of the item starts over: its author launches on a branch and worktree
+        // of its own, from the project's HEAD, and the cancelled delivery's work stays as it was.
+        const restart = yield* world.start;
+        assert.notStrictEqual(restart.deliveryId, author.deliveryId);
+        const restarted = yield* harnessStateOf(restart.deliveryId);
+        assert.strictEqual(restarted.status, "running");
+        assert.strictEqual(restarted.stage, "author");
+        assert.strictEqual(restarted.branch, `${cancelled.state.branch}-2`);
+        assert.notStrictEqual(restart.worktreePath, author.worktreePath);
+        assert.strictEqual(
+          yield* git(restart.worktreePath, ["branch", "--show-current"]),
+          restarted.branch,
+        );
+        assert.strictEqual(
+          yield* git(restart.worktreePath, ["rev-parse", "HEAD"]),
+          yield* git(world.root, ["rev-parse", "main"]),
+        );
+        assert.notStrictEqual(restarted.baseline, authored);
+        assert.strictEqual(
+          world.provider.started.filter((turn) => turn.threadId === restart.threadId).length,
+          1,
+        );
+        assert.strictEqual(yield* git(author.worktreePath, ["rev-parse", "HEAD"]), authored);
+        assert.strictEqual(
+          yield* git(author.worktreePath, ["branch", "--show-current"]),
+          cancelled.state.branch,
+        );
+        assert.strictEqual(
+          yield* git(world.root, ["rev-parse", `refs/heads/${cancelled.state.branch}`]),
+          authored,
+        );
+        assert.deepStrictEqual(yield* harnessStateOf(author.deliveryId), cancelled.state);
       }),
     ).pipe(Effect.orDie),
   );
