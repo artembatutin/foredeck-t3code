@@ -18,7 +18,7 @@ import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts"
 import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
 import * as ServerRuntimeStartup from "../../../serverRuntimeStartup.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
-import { WorkService } from "../../work-management/index.ts";
+import { type WorkDomainError, WorkService } from "../../work-management/index.ts";
 import * as FactoryReview from "../FactoryReview.ts";
 import * as FactoryService from "../FactoryService.ts";
 import * as FactorySettings from "../FactorySettings.ts";
@@ -231,6 +231,73 @@ describe("Factory RPC errors", () => {
       // Fixed text only: nothing of the storage failure's cause reaches the client.
       expect(JSON.stringify(onTheWire(error))).not.toMatch(/SQLITE|\/home\/owner/);
     }),
+  );
+
+  // A tracker's own words reach Work's errors: Jira's 4xx answers become a WorkForbidden or
+  // WorkInvalid detail, and a moved item's not-found names where it went.
+  const trackerText = "Tracker-provided diagnostic text about /secret/project";
+  /** Stands in for a Work error, which only Work's own modules may construct. */
+  const workError = (tag: WorkDomainError["_tag"]) =>
+    Object.assign(new Error(trackerText), {
+      _tag: tag,
+      detail: trackerText,
+    }) as unknown as WorkDomainError;
+  const unreadable = "Work could not read this item right now. Try again.";
+  const workCases: ReadonlyArray<{
+    readonly tag: WorkDomainError["_tag"];
+    readonly reason: FactoryError["reason"];
+    readonly message: string;
+  }> = [
+    {
+      tag: "WorkSourceNotFound",
+      reason: "not_found",
+      message: "The item's Work source does not exist on this environment.",
+    },
+    { tag: "WorkItemNotFound", reason: "not_found", message: "Work could not find this item." },
+    {
+      tag: "WorkInvalid",
+      reason: "invalid_request",
+      message: "The item's Work source refused the request for this item.",
+    },
+    {
+      tag: "WorkUnauthenticated",
+      reason: "unavailable",
+      message: "The item's Work source refused its credential. Reconnect the source in Work.",
+    },
+    {
+      tag: "WorkForbidden",
+      reason: "unavailable",
+      message: "The item's Work source does not allow reading this item.",
+    },
+    {
+      tag: "WorkPermissionDenied",
+      reason: "unavailable",
+      message: "The item's Work source does not allow reading this item.",
+    },
+    {
+      tag: "WorkRateLimited",
+      reason: "unavailable",
+      message: "The item's Work source is limiting requests. Try again later.",
+    },
+    { tag: "WorkStale", reason: "unavailable", message: unreadable },
+    { tag: "WorkSourceStale", reason: "unavailable", message: unreadable },
+    { tag: "WorkConflict", reason: "unavailable", message: unreadable },
+    { tag: "WorkUnsupported", reason: "unavailable", message: unreadable },
+    { tag: "WorkUnavailable", reason: "unavailable", message: unreadable },
+  ];
+
+  it.effect.each(workCases)(
+    "gives $tag fixed text, not the tracker's",
+    ({ tag, reason, message }) =>
+      Effect.gen(function* () {
+        const handlers = handlersOver({ start: () => Effect.fail(workError(tag)) });
+        const error = yield* Effect.flip(
+          handlers[FACTORY_WS_METHODS.factoryDeliveriesStart]({ itemRef: itemRef("fd-aaaaaa") }),
+        );
+        const wire = onTheWire(error);
+        expect(wire).toStrictEqual({ _tag: "FactoryError", reason, message });
+        expect(JSON.stringify(wire)).not.toContain("Tracker-provided");
+      }),
   );
 });
 

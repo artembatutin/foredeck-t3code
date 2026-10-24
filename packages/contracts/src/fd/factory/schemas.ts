@@ -393,8 +393,8 @@ export const FactoryErrorReason = literalsOr(FACTORY_ERROR_REASONS, "unavailable
 export type FactoryErrorReason = typeof FactoryErrorReason.Type;
 
 /**
- * How the `factory.*` methods fail. The message is Factory's fixed text, or Work's for an item
- * Work cannot read; never a storage cause or command output.
+ * How the `factory.*` methods fail. The message is Factory's fixed text, never a storage cause,
+ * command output or what a Work source answered.
  */
 export class FactoryError extends Schema.TaggedError<FactoryError>()("FactoryError", {
   reason: FactoryErrorReason,

@@ -61,7 +61,7 @@ const STORAGE_FAILED = "Factory could not read or save its records. Try again.";
 
 /**
  * The wire error for one service error: Factory's fixed text and bounded attributes, never a
- * cause. Work's errors keep their messages, which Work's own RPC sends as they are.
+ * cause. Work's errors get fixed text too: their messages can carry what a tracker answered.
  */
 const toFactoryError = (error: FactoryServiceError): FactoryError => {
   switch (error._tag) {
@@ -140,20 +140,42 @@ const toFactoryError = (error: FactoryServiceError): FactoryError => {
     case "ProjectionStoreReadError":
       return new FactoryError({ reason: "unavailable", message: STORAGE_FAILED });
     case "WorkSourceNotFound":
+      return new FactoryError({
+        reason: "not_found",
+        message: "The item's Work source does not exist on this environment.",
+      });
     case "WorkItemNotFound":
-      return new FactoryError({ reason: "not_found", message: error.message });
+      return new FactoryError({ reason: "not_found", message: "Work could not find this item." });
     case "WorkInvalid":
-      return new FactoryError({ reason: "invalid_request", message: error.message });
+      return new FactoryError({
+        reason: "invalid_request",
+        message: "The item's Work source refused the request for this item.",
+      });
+    case "WorkUnauthenticated":
+      return new FactoryError({
+        reason: "unavailable",
+        message: "The item's Work source refused its credential. Reconnect the source in Work.",
+      });
     case "WorkPermissionDenied":
+    case "WorkForbidden":
+      return new FactoryError({
+        reason: "unavailable",
+        message: "The item's Work source does not allow reading this item.",
+      });
+    case "WorkRateLimited":
+      return new FactoryError({
+        reason: "unavailable",
+        message: "The item's Work source is limiting requests. Try again later.",
+      });
     case "WorkStale":
     case "WorkSourceStale":
     case "WorkConflict":
     case "WorkUnsupported":
     case "WorkUnavailable":
-    case "WorkUnauthenticated":
-    case "WorkForbidden":
-    case "WorkRateLimited":
-      return new FactoryError({ reason: "unavailable", message: error.message });
+      return new FactoryError({
+        reason: "unavailable",
+        message: "Work could not read this item right now. Try again.",
+      });
   }
 };
 
