@@ -40,8 +40,9 @@ The sync reactor drops links when their thread is deleted, and on settlement the
 links that existed when the thread settled, and records each linked run's
 terminal status, which is how a client knows to offer "Mark done?" or "Back to
 todo?". Factory-origin links (`origin: "factory"`) offer no reverse prompts,
-because Factory moves the item's status itself; Work stores the origin but never
-imports Factory. Factory launches through `WorkService.linkLaunch`, which writes and
+because a Factory thread's run is one stage of a delivery, and the delivery, not
+the thread, decides the item's status; Work stores the origin but never imports
+Factory. Factory launches through `WorkService.linkLaunch`, which writes and
 reserves the link before the launch like Work's own starts. A link written after
 the launch would miss a run that ended first (preparation runs in the background):
 the run tail finds no row, and the sweep ignores outcomes older than the link.

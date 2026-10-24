@@ -61,6 +61,17 @@ Terms whose meaning matters across T3 Code. Architecture and lifecycle constrain
 | Work link   | A Work-owned association between a Work item and a thread, with a snapshot of the item at link time and the last run outcome. |
 | Revision    | An item's opaque version token. Title and body writes carry the revision they were based on and fail as stale otherwise.      |
 
+## Factory
+
+| Term       | Meaning                                                                                                                                                              |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Delivery   | One Factory run of one Work item through a pipeline. A parent delivery owns one child delivery per approved planned task.                                            |
+| Pipeline   | Ordered stages with their gates and limits, defined as data.                                                                                                         |
+| Stage kind | What a stage does: run a role's thread (`agent`), run a server command (`command`), wait at a `gate`, review the whole branch (`integrate`) or handle the PR (`pr`). |
+| Role       | The part a Factory thread plays: `planner`, `author` or `reviewer`. Each role has its own model selection.                                                           |
+| Receipt    | The server's record of one verification command run against one commit and tree.                                                                                     |
+| Approval   | The record that one commit and tree passed verification and review.                                                                                                  |
+
 ## Composer context
 
 | Term                 | Meaning                                                                                                                             |
