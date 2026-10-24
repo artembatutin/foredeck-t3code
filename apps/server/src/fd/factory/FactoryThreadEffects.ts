@@ -28,7 +28,12 @@ import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkActor, WorkService } from "../work-management/index.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import type { StoredFactoryDelivery } from "./persistence/FactoryDeliveryStore.ts";
-import type { FactoryEffect, FactoryEvent, FactoryTerminalRunStatus } from "./pipeline/state.ts";
+import {
+  type FactoryEffect,
+  type FactoryEvent,
+  type FactoryTerminalRunStatus,
+  isTerminalRunStatus,
+} from "./pipeline/state.ts";
 import { authorThreadTitle, renderAuthorPrompt } from "./prompts/author.ts";
 import { renderFixCommitPrompt } from "./prompts/fixCommit.ts";
 
@@ -135,16 +140,6 @@ export class FactoryThreadEffects extends Context.Service<
 >()("t3/fd/factory/FactoryThreadEffects") {}
 
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-
-const TERMINAL_STATUSES: ReadonlySet<string> = new Set<FactoryTerminalRunStatus>([
-  "completed",
-  "failed",
-  "cancelled",
-  "interrupted",
-  "rolled_back",
-]);
-const isTerminal = (status: string | undefined): status is FactoryTerminalRunStatus =>
-  status !== undefined && TERMINAL_STATUSES.has(status);
 
 /** Factory reads its delivery's item and writes nothing to Work under this actor. */
 const itemReader = (deliveryId: FactoryDeliveryId): WorkActor => ({
@@ -367,7 +362,9 @@ const make = Effect.gen(function* () {
     sendFixCommitTurn,
     runEnded: (threadId, runId) =>
       readThreadRun(threadId, runId).pipe(
-        Effect.map(({ status }) => (isTerminal(status) ? Option.some(status) : Option.none())),
+        Effect.map(({ status }) =>
+          isTerminalRunStatus(status) ? Option.some(status) : Option.none(),
+        ),
       ),
   });
 });

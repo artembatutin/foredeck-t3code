@@ -17,6 +17,24 @@ export type FactoryTerminalRunStatus = Extract<
   "completed" | "failed" | "cancelled" | "interrupted" | "rolled_back"
 >;
 
+const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set<FactoryTerminalRunStatus>([
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+  "rolled_back",
+]);
+
+/**
+ * Whether a run has ended. Not imported from `ThreadManagementService`: that module sits on an
+ * import cycle and throws while initializing when it is the first of the cycle to load, which a
+ * Factory module loaded first makes it. `entry.test.ts` loads each Factory module in a fresh Node
+ * process, because Vitest's module runner does not raise that error.
+ */
+export const isTerminalRunStatus = (
+  status: string | undefined,
+): status is FactoryTerminalRunStatus => status !== undefined && TERMINAL_RUN_STATUSES.has(status);
+
 /** Where a launched thread works. */
 export type FactoryWorkspace =
   /** A new worktree that creates the delivery branch from `baseRef`. */

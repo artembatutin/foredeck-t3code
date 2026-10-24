@@ -10,11 +10,10 @@ import * as TxRef from "effect/TxRef";
 
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
-import { isTerminalRunStatus } from "../../orchestration-v2/ThreadManagementService.ts";
 import { forkParked } from "../../serverActivation.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
-import type { FactoryThreadEvent } from "./pipeline/state.ts";
+import { type FactoryThreadEvent, isTerminalRunStatus } from "./pipeline/state.ts";
 
 /**
  * Feeds what happens to Factory's threads into their deliveries: a terminal run becomes
@@ -57,7 +56,7 @@ const make = Effect.gen(function* () {
       Effect.map(({ thread, runs }): FactoryThreadEvent | null => {
         if (thread.deletedAt !== null) return { type: "thread.deleted", threadId };
         const status = runs.find((run) => run.id === runId)?.status;
-        return status !== undefined && isTerminalRunStatus(status)
+        return isTerminalRunStatus(status)
           ? { type: "run.finished", threadId, runId, status }
           : null;
       }),
