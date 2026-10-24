@@ -247,7 +247,9 @@ const make = Effect.gen(function* () {
       const refusals: Array<FactoryReceiptRefusal> = [];
       if (after.headSha !== before.headSha) refusals.push("head_changed");
       if (!after.clean) refusals.push("tree_dirty");
-      if (refusals.length > 0) return { type: "refused", refusals } satisfies FactoryCommandOutcome;
+      if (refusals.length > 0) {
+        return { type: "refused", refusals, evidencePath: logPath } satisfies FactoryCommandOutcome;
+      }
 
       const { executable, args } = input.settings.verifyCommand;
       const receipt: FactoryVerifyReceipt = {
@@ -280,7 +282,11 @@ const make = Effect.gen(function* () {
             }),
         ),
       );
-      return { type: "receipt", receipt } satisfies FactoryCommandOutcome;
+      return {
+        type: "receipt",
+        receipt,
+        evidencePath: receiptPath,
+      } satisfies FactoryCommandOutcome;
     }),
   });
 });

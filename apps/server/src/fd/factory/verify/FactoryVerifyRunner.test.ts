@@ -147,7 +147,11 @@ it.layer(makeLayer(ProcessRunner.layer), { excludeTestServices: true })(
         const worktree = yield* makeWorktree;
         const directory = yield* evidenceDirectory("passing");
 
-        const receipt = yield* receiptOf("passing", worktree, passing);
+        const outcome = yield* run("passing", worktree, passing);
+        assert.strictEqual(outcome.type, "receipt");
+        if (outcome.type !== "receipt") return;
+        const { receipt } = outcome;
+        assert.strictEqual(outcome.evidencePath, `${directory}/verify-1.json`);
 
         assert.strictEqual(receipt.version, 1);
         assert.strictEqual(receipt.headSha, yield* git(worktree, ["rev-parse", "HEAD"]));
@@ -244,7 +248,11 @@ it.layer(makeLayer(ProcessRunner.layer), { excludeTestServices: true })(
 
         const outcome = yield* run("commits", worktree, nodeVerify(commitScript));
 
-        assert.deepStrictEqual(outcome, { type: "refused", refusals: ["head_changed"] });
+        assert.deepStrictEqual(outcome, {
+          type: "refused",
+          refusals: ["head_changed"],
+          evidencePath: `${directory}/verify-1.log`,
+        });
         assert.isTrue(yield* exists(`${directory}/verify-1.log`));
         assert.isFalse(yield* exists(`${directory}/verify-1.json`));
       }),
@@ -263,6 +271,7 @@ it.layer(makeLayer(ProcessRunner.layer), { excludeTestServices: true })(
         assert.deepStrictEqual(outcome, {
           type: "refused",
           refusals: ["head_changed", "tree_dirty"],
+          evidencePath: `${directory}/verify-1.log`,
         });
         assert.isTrue(yield* exists(`${directory}/verify-1.log`));
         assert.isFalse(yield* exists(`${directory}/verify-1.json`));
@@ -277,7 +286,11 @@ it.layer(makeLayer(ProcessRunner.layer), { excludeTestServices: true })(
 
         const outcome = yield* run("untracked", worktree, settings);
 
-        assert.deepStrictEqual(outcome, { type: "refused", refusals: ["tree_dirty"] });
+        assert.deepStrictEqual(outcome, {
+          type: "refused",
+          refusals: ["tree_dirty"],
+          evidencePath: `${directory}/verify-1.log`,
+        });
         assert.isTrue(yield* exists(`${directory}/verify-1.log`));
         assert.isFalse(yield* exists(`${directory}/verify-1.json`));
       }),

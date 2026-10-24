@@ -7,6 +7,8 @@ import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 
 export * as FactorySettings from "./FactorySettings.ts";
+export * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
+export * as FactoryWorker from "./FactoryWorker.ts";
 
 /**
  * Factory persistence on the core-migrated SQL client. The `fd_factory_migrations` ledger

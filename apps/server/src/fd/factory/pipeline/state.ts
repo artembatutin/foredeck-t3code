@@ -71,9 +71,22 @@ export type FactorySettleResult =
 /** Why the server refused to accept a command run as a receipt. */
 export type FactoryReceiptRefusal = "head_changed" | "tree_dirty";
 
+/**
+ * A command run's result. `evidencePath` is the receipt's JSON, or the log a refused run left
+ * (none when it was refused before running); the worker records it on the stage attempt and the
+ * engine ignores it.
+ */
 export type FactoryCommandOutcome =
-  | { readonly type: "receipt"; readonly receipt: FactoryVerifyReceipt }
-  | { readonly type: "refused"; readonly refusals: ReadonlyArray<FactoryReceiptRefusal> };
+  | {
+      readonly type: "receipt";
+      readonly receipt: FactoryVerifyReceipt;
+      readonly evidencePath?: string;
+    }
+  | {
+      readonly type: "refused";
+      readonly refusals: ReadonlyArray<FactoryReceiptRefusal>;
+      readonly evidencePath?: string;
+    };
 
 /**
  * What the engine folds in. The worker's results name the effect they answer by `effectId`;

@@ -48,6 +48,17 @@ export class FactoryStageRunStore extends Context.Service<
       readonly threadId?: ThreadId;
       readonly runId?: RunId;
     }) => Effect.Effect<StoredFactoryStageRun, FactoryStoreError>;
+    /**
+     * Records the thread and run now doing an active attempt's work (an attempt starts before
+     * its thread exists); none when no such attempt is active.
+     */
+    readonly assignRun: (input: {
+      readonly deliveryId: FactoryDeliveryId;
+      readonly stage: FactoryStageName;
+      readonly attempt: number;
+      readonly threadId: ThreadId;
+      readonly runId: RunId;
+    }) => Effect.Effect<Option.Option<StoredFactoryStageRun>, FactoryStoreError>;
     /** Records the outcome of an active attempt; none when no such attempt is active. */
     readonly finish: (input: {
       readonly deliveryId: FactoryDeliveryId;
@@ -131,7 +142,17 @@ const make = Effect.gen(function* () {
     `,
   });
 
-  // Finishes the attempt read in the same transaction.
+  // Both write the attempt read in the same transaction.
+  const writeRun = SqlSchema.void({
+    Request: StoredFactoryStageRun,
+    execute: (row) => sql`
+      UPDATE fd_factory_stage_runs SET
+        thread_id = ${row.threadId},
+        run_id = ${row.runId}
+      WHERE delivery_id = ${row.deliveryId} AND stage = ${row.stage} AND attempt = ${row.attempt}
+    `,
+  });
+
   const writeOutcome = SqlSchema.void({
     Request: StoredFactoryStageRun,
     execute: (row) => sql`
@@ -166,17 +187,40 @@ const make = Effect.gen(function* () {
       Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.append")),
     );
 
+  const selectActive = (input: {
+    readonly deliveryId: FactoryDeliveryId;
+    readonly stage: FactoryStageName;
+    readonly attempt: number;
+  }) =>
+    selectRuns({
+      deliveryId: input.deliveryId,
+      stage: input.stage,
+      attempt: input.attempt,
+      activeOnly: true,
+    }).pipe(Effect.map((rows) => Option.fromUndefinedOr(rows[0])));
+
+  const assignRun: FactoryStageRunStore["Service"]["assignRun"] = (input) =>
+    Effect.gen(function* () {
+      const active = yield* selectActive(input);
+      if (Option.isNone(active)) return active;
+      const assigned: StoredFactoryStageRun = {
+        ...active.value,
+        threadId: input.threadId,
+        runId: input.runId,
+      };
+      yield* writeRun(assigned);
+      return Option.some(assigned);
+    }).pipe(
+      sql.withTransaction,
+      Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.assignRun")),
+    );
+
   const finish: FactoryStageRunStore["Service"]["finish"] = (input) =>
     Effect.gen(function* () {
-      const [active] = yield* selectRuns({
-        deliveryId: input.deliveryId,
-        stage: input.stage,
-        attempt: input.attempt,
-        activeOnly: true,
-      });
-      if (active === undefined) return Option.none();
+      const active = yield* selectActive(input);
+      if (Option.isNone(active)) return active;
       const finished: StoredFactoryStageRun = {
-        ...active,
+        ...active.value,
         outcome: input.outcome,
         evidencePath: input.evidencePath ?? null,
         fingerprint: input.fingerprint ?? null,
@@ -191,6 +235,7 @@ const make = Effect.gen(function* () {
 
   return FactoryStageRunStore.of({
     append,
+    assignRun,
     finish,
     findActiveByThread: (threadId) =>
       selectRuns({ threadId, activeOnly: true }).pipe(

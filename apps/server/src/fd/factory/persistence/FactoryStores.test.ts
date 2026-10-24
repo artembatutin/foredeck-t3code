@@ -381,6 +381,31 @@ describe("FactoryStageRunStore", () => {
     }).pipe(Effect.provide(persistence)),
   );
 
+  it.effect("records the thread and run of an active attempt only", () =>
+    Effect.gen(function* () {
+      yield* seedDeliveries;
+      const runs = yield* FactoryStageRunStore.FactoryStageRunStore;
+      const started = yield* runs.append({ deliveryId: delivery1, stage: "author" });
+      const attempt = { deliveryId: delivery1, stage: "author", attempt: 1 } as const;
+
+      const assigned = yield* runs.assignRun({ ...attempt, threadId: author, runId: firstRun });
+      assert.deepStrictEqual(
+        assigned,
+        Option.some({ ...started, threadId: author, runId: firstRun }),
+      );
+      assert.deepStrictEqual(yield* runs.findActiveByThread(author), assigned);
+      const reassigned = yield* runs.assignRun({ ...attempt, threadId: author, runId: fixRun });
+      assert.strictEqual(Option.getOrThrow(reassigned).runId, fixRun);
+
+      const finished = Option.getOrThrow(yield* runs.finish({ ...attempt, outcome: "passed" }));
+      assert.deepStrictEqual(
+        yield* runs.assignRun({ ...attempt, threadId: reviewer, runId: firstRun }),
+        Option.none(),
+      );
+      assert.deepStrictEqual(yield* runs.listByDelivery(delivery1), [finished]);
+    }).pipe(Effect.provide(persistence)),
+  );
+
   it.effect("refuses a second active attempt on one thread", () =>
     Effect.gen(function* () {
       yield* seedDeliveries;
