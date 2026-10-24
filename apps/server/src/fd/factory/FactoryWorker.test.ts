@@ -61,6 +61,8 @@ const scriptedThreads = (script: ThreadScript) =>
           script.launch?.(store, delivery, effect) ?? Effect.die("launch not scripted"),
         sendFixCommitTurn: (delivery, effect) =>
           script.turn?.(store, delivery, effect) ?? Effect.die("turn not scripted"),
+        // Every run is still going; its end arrives as a step.
+        runEnded: () => Effect.succeedNone,
       });
     }),
   );

@@ -305,6 +305,37 @@ const make = Effect.gen(function* () {
     locks.withLock(deliveryId, stepLocked(deliveryId, event));
 
   /**
+   * A run can end before the result naming it is stored: its terminal event then found the
+   * delivery still awaiting the effect and changed nothing. So once the delivery awaits the run,
+   * it is read here (after the store, so an end the read misses arrives as an event later) and
+   * an ended run is fed. Whichever of the two arrives second is stale.
+   */
+  const feedEndedRun = (
+    deliveryId: FactoryDeliveryId,
+    event: FactoryEvent,
+    stored: Option.Option<FactoryDeliveryStore.StoredFactoryDelivery>,
+  ) => {
+    if (event.type !== "thread.launched" && event.type !== "turn.started") return Effect.void;
+    const awaiting = Option.isSome(stored) ? stored.value.state.awaiting : null;
+    if (awaiting?.type !== "run") return Effect.void;
+    const { threadId, runId } = awaiting;
+    return threads.runEnded(threadId, runId).pipe(
+      Effect.flatMap(
+        Option.match({
+          onNone: () => Effect.void,
+          onSome: (status) => step(deliveryId, { type: "run.finished", threadId, runId, status }),
+        }),
+      ),
+      // The delivery already awaits the run; its terminal event still advances it.
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("factory could not read an awaited run", cause),
+      ),
+    );
+  };
+
+  /**
    * Runs an effect and feeds its result back. Suspended, so an executor that throws while
    * building its effect fails the effect like any other failure. Interruption (shutdown) feeds
    * nothing.
@@ -320,7 +351,11 @@ const make = Effect.gen(function* () {
               detail: failureDetail(job.effect, cause),
             }),
       ),
-      Effect.flatMap((event) => step(job.delivery.deliveryId, event)),
+      Effect.flatMap((event) =>
+        step(job.delivery.deliveryId, event).pipe(
+          Effect.flatMap((stored) => feedEndedRun(job.delivery.deliveryId, event, stored)),
+        ),
+      ),
       Effect.ensuring(TxRef.update(outstanding, (count) => count - 1)),
     );
 

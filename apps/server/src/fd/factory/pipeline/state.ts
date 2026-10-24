@@ -94,13 +94,16 @@ export type FactoryCommandOutcome =
  */
 export type FactoryEvent =
   | { readonly type: "start" }
-  /** A `launch_thread` result; `baseline` is HEAD before the thread's first turn. */
+  /**
+   * A `launch_thread` result; `baseline` is HEAD before the thread's first turn. `worktreePath`
+   * is null when the launch ended the run before a new worktree was recorded.
+   */
   | {
       readonly type: "thread.launched";
       readonly effectId: number;
       readonly threadId: ThreadId;
       readonly runId: RunId;
-      readonly worktreePath: string;
+      readonly worktreePath: string | null;
       readonly baseline: string;
     }
   /** A `send_fix_commit_turn` result: the run that turn started on the effect's thread. */
