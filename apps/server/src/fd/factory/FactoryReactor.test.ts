@@ -31,6 +31,7 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as FactoryReactor from "./FactoryReactor.ts";
+import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
@@ -147,12 +148,13 @@ const settled: FactoryEvent = {
 const awaitingRun = (f: Fixture) => fold({ type: "start" }, launched(f));
 const awaitingVerify = (f: Fixture) =>
   fold({ type: "start" }, launched(f), finished(f, "completed"), settled);
-const stoppedVerified = (f: Fixture) =>
-  fold({ type: "start" }, launched(f), finished(f, "completed"), settled, {
-    type: "command.finished",
-    effectId: 3,
-    outcome: { type: "receipt", receipt },
-  });
+/** Where a delivery stopped before review existed: verified, with its passing receipt last. */
+const stoppedVerified = (f: Fixture): FactoryDeliveryState => ({
+  ...awaitingVerify(f),
+  status: "stopped",
+  awaiting: null,
+  receipts: [receipt],
+});
 
 /** The settle check the engine issues once the author's first run completed. */
 const awaitingSettle = (f: Fixture) =>
@@ -192,6 +194,7 @@ const fakeThreads = (world: World) =>
         return { ...launch, worktreePath, baseline };
       }),
     sendFixCommitTurn: () => Effect.die("fix-commit turn not scripted"),
+    sendReviewRetryTurn: () => Effect.die("review retry turn not scripted"),
     runEnded: (threadId, runId) =>
       (world.onRunRead?.(threadId, runId) ?? Effect.void).pipe(Effect.as(Option.none())),
   });
@@ -310,6 +313,8 @@ const setup = Effect.gen(function* () {
     Layer.provide(failingStore(world)),
     Layer.provide(fakeThreads(world)),
     Layer.provide(fakeVerify(world)),
+    // No delivery here reaches a review.
+    Layer.provide(Layer.mock(FactoryReview.FactoryReview)({})),
     Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({ execute: () => Effect.never })),
   );
   const layer = FactoryReactor.layer.pipe(

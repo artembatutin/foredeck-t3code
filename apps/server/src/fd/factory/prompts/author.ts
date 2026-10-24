@@ -34,13 +34,10 @@ const RULES = [
   "Stop and say so when you need credentials you do not have or a decision only the owner can make.",
 ];
 
-export const renderAuthorPrompt = (input: {
-  readonly item: FactoryAuthorItem;
-  readonly branch: string;
-}): string => {
-  const { item } = input;
+/** The item's heading line, then its link, file and Work reference, then its description. */
+export const itemSections = (item: FactoryAuthorItem, heading: string): Array<string> => {
   const header = [
-    `Factory author task for Work item ${item.key}: ${item.title}`,
+    heading,
     ...(item.url === null ? [] : [`Link: ${item.url}`]),
     ...(item.locator === undefined ? [] : [`File: ${item.locator}`]),
     `work-item: ${workItemRefString(item.ref)}`,
@@ -52,6 +49,18 @@ export const renderAuthorPrompt = (input: {
       `Description:\n${body.text}${body.truncated || item.bodyTruncated ? "\n[description truncated; read the rest with work_read]" : ""}`,
     );
   }
+  return sections;
+};
+
+export const renderAuthorPrompt = (input: {
+  readonly item: FactoryAuthorItem;
+  readonly branch: string;
+}): string => {
+  const { item } = input;
+  const sections = itemSections(
+    item,
+    `Factory author task for Work item ${item.key}: ${item.title}`,
+  );
   sections.push(
     `Your task: implement this Work item on branch \`${input.branch}\` in this worktree.`,
   );

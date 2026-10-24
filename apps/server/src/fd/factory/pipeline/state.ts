@@ -1,6 +1,7 @@
 import type { OrchestrationV2RunStatus, RunId, ThreadId } from "@t3tools/contracts";
 import type {
   FactoryDeliveryStatus,
+  FactoryReviewSummary,
   FactoryRole,
   FactoryStageName,
   FactoryVerifyReceipt,
@@ -61,7 +62,18 @@ export type FactoryEffectRequest =
   /** Read the branch after this run and evaluate the settle rules. */
   | { readonly type: "check_settle"; readonly threadId: ThreadId; readonly runId: RunId }
   /** Run the stage's project command in the worktree. */
-  | { readonly type: "run_command"; readonly stage: FactoryStageName };
+  | { readonly type: "run_command"; readonly stage: FactoryStageName }
+  /**
+   * Judge the review in the last assistant message of this reviewer run, for a run that ended
+   * without an accepted submission (providers without t3 MCP tools answer in a fenced block).
+   */
+  | { readonly type: "read_fallback_review"; readonly threadId: ThreadId; readonly runId: RunId }
+  /** The one follow-up turn asking the reviewer to correct these problems and submit again. */
+  | {
+      readonly type: "send_review_retry_turn";
+      readonly threadId: ThreadId;
+      readonly problems: ReadonlyArray<string>;
+    };
 
 /**
  * An issued effect. Its id is unique within the delivery, and the worker's result names it, so
@@ -106,6 +118,28 @@ export type FactoryCommandOutcome =
       readonly evidencePath?: string;
     };
 
+/** Which path a review came by: the `factory_submit_review` tool, or the fenced-JSON fallback. */
+export type FactoryReviewSource = "mcp" | "fallback";
+
+/** A valid review the delivery recorded; `evidencePath` is its `review-<n>.json`. */
+export interface FactoryAcceptedReview {
+  /** The review round it answers. */
+  readonly round: number;
+  readonly source: FactoryReviewSource;
+  readonly summary: FactoryReviewSummary;
+  readonly evidencePath: string;
+}
+
+/**
+ * The server's judgment of one review submission. A valid review, blocking or not, is accepted;
+ * an invalid one goes back to the reviewer with its problems; a worktree that no longer holds the
+ * verified commit, clean, refuses any review.
+ */
+export type FactoryReviewJudgment =
+  | { readonly type: "accepted"; readonly review: Omit<FactoryAcceptedReview, "round"> }
+  | { readonly type: "invalid"; readonly problems: ReadonlyArray<string> }
+  | { readonly type: "code_changed"; readonly changes: ReadonlyArray<FactoryReceiptRefusal> };
+
 /**
  * What the engine folds in. The worker's results name the effect they answer by `effectId`;
  * the reactor's run and thread events name the thread and run they observed.
@@ -124,7 +158,10 @@ export type FactoryEvent =
       readonly worktreePath: string | null;
       readonly baseline: string;
     }
-  /** A `send_fix_commit_turn` result: the run that turn started on the effect's thread. */
+  /**
+   * A `send_fix_commit_turn` or `send_review_retry_turn` result: the run that turn started on
+   * the effect's thread.
+   */
   | { readonly type: "turn.started"; readonly effectId: number; readonly runId: RunId }
   | {
       readonly type: "run.finished";
@@ -144,6 +181,23 @@ export type FactoryEvent =
       readonly type: "command.finished";
       readonly effectId: number;
       readonly outcome: FactoryCommandOutcome;
+    }
+  /**
+   * A reviewer's `factory_submit_review` call, judged while its run is going. It names the round
+   * and the reviewer run it was made in.
+   */
+  | {
+      readonly type: "review.submitted";
+      readonly round: number;
+      readonly threadId: ThreadId;
+      readonly runId: RunId;
+      readonly judgment: FactoryReviewJudgment;
+    }
+  /** A `read_fallback_review` result. */
+  | {
+      readonly type: "review.read";
+      readonly effectId: number;
+      readonly judgment: FactoryReviewJudgment;
     }
   /** The worker could not carry out the effect; `detail` is bounded and safe to show. */
   | { readonly type: "effect.failed"; readonly effectId: number; readonly detail: string };
@@ -169,7 +223,13 @@ export type FactoryBlock =
   | { readonly reason: "verify_failed" }
   | { readonly reason: "receipt_refused"; readonly refusals: ReadonlyArray<FactoryReceiptRefusal> }
   /** The pipeline reached a stage kind this server cannot run. */
-  | { readonly reason: "unsupported_stage"; readonly stage: FactoryStageName };
+  | { readonly reason: "unsupported_stage"; readonly stage: FactoryStageName }
+  /** The round's accepted review blocks the commit; its full text is in its evidence. */
+  | { readonly reason: "review_changes_required"; readonly summary: FactoryReviewSummary }
+  /** A review was submitted after HEAD moved from the verified receipt or the tree got dirty. */
+  | { readonly reason: "code_changed"; readonly changes: ReadonlyArray<FactoryReceiptRefusal> }
+  /** The submission after the one corrected retry was invalid too; these are its problems. */
+  | { readonly reason: "invalid_submission"; readonly problems: ReadonlyArray<string> };
 
 export interface FactoryDeliveryState {
   readonly status: FactoryDeliveryStatus;
@@ -189,6 +249,12 @@ export interface FactoryDeliveryState {
   /** Effects issued so far; the next effect's id is one more. */
   readonly effectsIssued: number;
   readonly receipts: ReadonlyArray<FactoryVerifyReceipt>;
+  /** The current (or last) review round, from 1; 0 before the first review. */
+  readonly reviewRound: number;
+  /** Invalid submissions in the current round; the first earns one corrected retry. */
+  readonly invalidSubmissions: number;
+  /** Accepted reviews, oldest first; at most one per round. */
+  readonly reviews: ReadonlyArray<FactoryAcceptedReview>;
   /** Set while the delivery is blocked. */
   readonly block: FactoryBlock | null;
 }
@@ -227,5 +293,14 @@ export const queuedDeliveryState = (input: {
   fixCommitTurns: 0,
   effectsIssued: 0,
   receipts: [],
+  reviewRound: 0,
+  invalidSubmissions: 0,
+  reviews: [],
   block: null,
 });
+
+/** The accepted review of the current round, once there is one. */
+export const acceptedReview = (delivery: FactoryDeliveryState) => {
+  const last = delivery.reviews.at(-1);
+  return last !== undefined && last.round === delivery.reviewRound ? last : undefined;
+};

@@ -15,6 +15,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as TxRef from "effect/TxRef";
 
 import type * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
+import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 import { readBranchFacts } from "./git/branchFacts.ts";
@@ -23,6 +24,7 @@ import { FactoryStoreError } from "./persistence/errors.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import { advance } from "./pipeline/engine.ts";
+import { acceptedReview } from "./pipeline/state.ts";
 import type {
   FactoryDeliveryState,
   FactoryEffect,
@@ -63,6 +65,24 @@ export class FactoryWorker extends Context.Service<
       FactoryStoreError
     >;
     /**
+     * Decides an event from the stored delivery, then steps it, both under the delivery's lock:
+     * no other step of the delivery runs between what `decide` read and the step. A decision
+     * that fails steps nothing. Returns the stored result with the decision's value; none for
+     * an unknown delivery, where `decide` does not run.
+     */
+    readonly stepWith: <A, E>(
+      deliveryId: FactoryDeliveryId,
+      decide: (
+        delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+      ) => Effect.Effect<{ readonly event: FactoryEvent; readonly value: A }, E>,
+    ) => Effect.Effect<
+      Option.Option<{
+        readonly delivery: FactoryDeliveryStore.StoredFactoryDelivery;
+        readonly value: A;
+      }>,
+      E | FactoryStoreError
+    >;
+    /**
      * Steps the deliveries the event's thread belongs to. A run's end goes to the delivery whose
      * active stage attempt names the thread; a deletion goes to every active delivery that records
      * the thread, since a delivery keeps its threads after their attempts finish. A delivery whose
@@ -101,6 +121,10 @@ const describeEffect = (effect: FactoryEffect) => {
       return "check the branch";
     case "run_command":
       return `run the ${effect.stage} command`;
+    case "read_fallback_review":
+      return "read the review in the reviewer's last message";
+    case "send_review_retry_turn":
+      return "send the review retry turn";
   }
 };
 
@@ -126,9 +150,26 @@ const unreadable = (problem: string): FactorySettleResult => ({
 /** How an attempt ends when its delivery stops running in `state`. */
 const outcomeOf = (state: FactoryDeliveryState): FactoryStageRunStore.FactoryStageOutcome => {
   if (state.status === "blocked") {
-    return state.block?.reason === "verify_failed" ? "failed" : "blocked";
+    // The stage did its work and judged the commit wanting; any other block is not a verdict.
+    const reason = state.block?.reason;
+    return reason === "verify_failed" || reason === "review_changes_required"
+      ? "failed"
+      : "blocked";
   }
   return state.status === "cancelled" ? "cancelled" : "passed";
+};
+
+/**
+ * The evidence of the attempt a step finishes: the command's receipt (or log), or the review
+ * accepted in the review round being left.
+ */
+const evidenceOf = (event: FactoryEvent, before: FactoryDeliveryState) => {
+  if (event.type === "command.finished") return event.outcome.evidencePath;
+  if (before.stage !== "review") return undefined;
+  if (event.type === "review.read" && event.judgment.type === "accepted") {
+    return event.judgment.review.evidencePath;
+  }
+  return acceptedReview(before)?.evidencePath;
 };
 
 const make = Effect.gen(function* () {
@@ -138,6 +179,7 @@ const make = Effect.gen(function* () {
   const settings = yield* FactorySettings.FactorySettings;
   const verifyRunner = yield* FactoryVerifyRunner.FactoryVerifyRunner;
   const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
+  const reviews = yield* FactoryReview.FactoryReview;
   const gitContext = yield* Effect.context<FileSystem.FileSystem | GitVcsDriver.GitVcsDriver>();
   const scope = yield* Effect.scope;
   const locks = yield* KeyedLock.make<FactoryDeliveryId>();
@@ -237,6 +279,22 @@ const make = Effect.gen(function* () {
             outcome,
           })),
         );
+      case "read_fallback_review":
+        return reviews.judgeFallback(delivery, effect).pipe(
+          Effect.map((judgment): FactoryEvent => ({
+            type: "review.read",
+            effectId: effect.id,
+            judgment,
+          })),
+        );
+      case "send_review_retry_turn":
+        return threads.sendReviewRetryTurn(delivery, effect).pipe(
+          Effect.map(({ runId }): FactoryEvent => ({
+            type: "turn.started",
+            effectId: effect.id,
+            runId,
+          })),
+        );
     }
   };
 
@@ -302,7 +360,7 @@ const make = Effect.gen(function* () {
     // The engine hands back the very same state for an event the delivery does not await.
     if (next.delivery === before && next.effects.length === 0) return current;
 
-    const evidencePath = event.type === "command.finished" ? event.outcome.evidencePath : undefined;
+    const evidencePath = evidenceOf(event, before);
     const stored = yield* deliveries.update(deliveryId, next.delivery).pipe(
       Effect.tap((updated) =>
         Option.isSome(updated)
@@ -329,10 +387,25 @@ const make = Effect.gen(function* () {
   const step: FactoryWorker["Service"]["step"] = (deliveryId, event) =>
     locks.withLock(deliveryId, stepLocked(deliveryId, event));
 
+  const stepWith: FactoryWorker["Service"]["stepWith"] = (deliveryId, decide) =>
+    locks.withLock(
+      deliveryId,
+      Effect.gen(function* () {
+        const current = yield* deliveries.get(deliveryId);
+        if (Option.isNone(current)) return Option.none();
+        const { event, value } = yield* decide(current.value);
+        const stored = yield* stepLocked(deliveryId, event);
+        return Option.map(stored, (delivery) => ({ delivery, value }));
+      }),
+    );
+
   /** The run a launch or turn result names; other results name none. */
   const runOf = (effect: FactoryEffect, event: FactoryEvent) => {
     if (event.type === "thread.launched") return { threadId: event.threadId, runId: event.runId };
-    if (event.type === "turn.started" && effect.type === "send_fix_commit_turn") {
+    if (
+      event.type === "turn.started" &&
+      (effect.type === "send_fix_commit_turn" || effect.type === "send_review_retry_turn")
+    ) {
       return { threadId: effect.threadId, runId: event.runId };
     }
     return undefined;
@@ -457,6 +530,7 @@ const make = Effect.gen(function* () {
 
   return FactoryWorker.of({
     step,
+    stepWith,
     stepThread,
     failInterruptedEffect,
     drain: TxRef.get(outstanding).pipe(

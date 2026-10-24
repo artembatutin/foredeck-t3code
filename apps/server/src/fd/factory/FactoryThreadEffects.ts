@@ -26,6 +26,7 @@ import { getAutoBootstrapThreadModelSelection } from "../../serverRuntimeStartup
 import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkActor, WorkService } from "../work-management/index.ts";
+import { reviewBasis } from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import type { StoredFactoryDelivery } from "./persistence/FactoryDeliveryStore.ts";
 import {
@@ -36,6 +37,11 @@ import {
 } from "./pipeline/state.ts";
 import { authorThreadTitle, renderAuthorPrompt } from "./prompts/author.ts";
 import { renderFixCommitPrompt } from "./prompts/fixCommit.ts";
+import {
+  renderReviewPrompt,
+  renderReviewRetryPrompt,
+  reviewThreadTitle,
+} from "./prompts/review.ts";
 
 export class FactoryProjectMissingError extends Schema.TaggedError<FactoryProjectMissingError>()(
   "FactoryProjectMissingError",
@@ -46,7 +52,7 @@ export class FactoryProjectMissingError extends Schema.TaggedError<FactoryProjec
   }
 }
 
-/** Only the author role has a prompt in this phase. */
+/** Only the author and reviewer roles have prompts in this phase. */
 export class FactoryRoleUnsupportedError extends Schema.TaggedError<FactoryRoleUnsupportedError>()(
   "FactoryRoleUnsupportedError",
   { role: FactoryRole },
@@ -108,8 +114,8 @@ interface FactoryThreadEffectFailure {
 }
 
 /**
- * Carries out the thread effects for `FactoryWorker`: launching a role's thread and sending the
- * fix-commit turn on a thread. Each receives the delivery as stored with the effect. The worker
+ * Carries out the thread effects for `FactoryWorker`: launching a role's thread and sending a
+ * follow-up turn on a thread. Each receives the delivery as stored with the effect. The worker
  * feeds what they report back as `thread.launched` / `turn.started`, and a failure as
  * `effect.failed`. Checks run before anything is dispatched, so a refused launch leaves no thread
  * behind; a read that fails after the launch still fails the effect, and the delivery records
@@ -131,6 +137,11 @@ export class FactoryThreadEffects extends Context.Service<
     readonly sendFixCommitTurn: (
       delivery: StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "send_fix_commit_turn" }>,
+    ) => Effect.Effect<{ readonly runId: RunId }, FactoryThreadEffectFailure>;
+    /** Sends the reviewer's retry turn and reports the run it started on the effect's thread. */
+    readonly sendReviewRetryTurn: (
+      delivery: StoredFactoryDelivery,
+      effect: Extract<FactoryEffect, { readonly type: "send_review_retry_turn" }>,
     ) => Effect.Effect<{ readonly runId: RunId }, FactoryThreadEffectFailure>;
     /** The run's status once it has ended; none while it has not. */
     readonly runEnded: (
@@ -266,10 +277,11 @@ const make = Effect.gen(function* () {
 
   const launchThread: FactoryThreadEffects["Service"]["launchThread"] = (delivery, effect) =>
     Effect.gen(function* () {
-      if (effect.role !== "author") {
-        return yield* new FactoryRoleUnsupportedError({ role: effect.role });
-      }
+      const { role } = effect;
+      if (role === "planner") return yield* new FactoryRoleUnsupportedError({ role });
       const { deliveryId, projectId, state } = delivery;
+      // A review starts from the verified commit; without one, nothing is launched.
+      const basis = role === "reviewer" ? yield* reviewBasis(delivery) : null;
       const project = Option.getOrUndefined(yield* projects.get(projectId));
       if (project === undefined) return yield* new FactoryProjectMissingError({ projectId });
       const resolved = resolveProjectSettings(
@@ -288,11 +300,30 @@ const make = Effect.gen(function* () {
           ? yield* resolveCommit(project.workspaceRoot, workspace.baseRef)
           : yield* resolveCommit(workspace.worktreePath, "HEAD");
 
-      // The order Work's thread starts use, with the role's profile as the explicit choice.
+      // The order Work's thread starts use, with the role's profile as the explicit choice. A
+      // reviewer without a profile of its own uses the author's.
       const modelSelection =
-        roles[effect.role] ??
+        (role === "reviewer" ? (roles.reviewer ?? roles.author) : roles.author) ??
         resolved.defaultModelSelection ??
         getAutoBootstrapThreadModelSelection();
+      // Reviewers work in plan mode: they read and judge, and never change the worktree.
+      const opening =
+        basis === null
+          ? {
+              title: authorThreadTitle(item),
+              text: renderAuthorPrompt({ item, branch: state.branch }),
+              interactionMode: "default" as const,
+            }
+          : {
+              title: reviewThreadTitle(item),
+              text: renderReviewPrompt({
+                item,
+                branch: state.branch,
+                baseline: basis.baseline,
+                receipt: basis.receipt,
+              }),
+              interactionMode: "plan" as const,
+            };
       // Derived from the effect, so a retried launch replays its receipt instead of starting a
       // second thread, and finds its Work link already stored.
       const commandId = CommandId.make(`factory-launch:${deliveryId}:${effect.id}`);
@@ -305,19 +336,15 @@ const make = Effect.gen(function* () {
         commandId,
         threadId,
         projectId,
-        title: authorThreadTitle(item),
+        title: opening.title,
         modelSelection,
         runtimeMode: resolved.defaultRuntimeMode,
-        interactionMode: "default",
+        interactionMode: opening.interactionMode,
         workspaceStrategy:
           workspace.type === "worktree"
             ? { type: "worktree", baseRef: workspace.baseRef, branch: workspace.branch }
             : { type: "existing_worktree", worktreePath: workspace.worktreePath },
-        initialMessage: {
-          messageId,
-          text: renderAuthorPrompt({ item, branch: state.branch }),
-          attachments: [],
-        },
+        initialMessage: { messageId, text: opening.text, attachments: [] },
         createdBy: "system",
         creationSource: "server",
       });
@@ -340,21 +367,22 @@ const make = Effect.gen(function* () {
       return { threadId, runId: run.id, worktreePath, baseline };
     });
 
-  const sendFixCommitTurn: FactoryThreadEffects["Service"]["sendFixCommitTurn"] = (
-    delivery,
-    effect,
-  ) => {
-    const { deliveryId, state } = delivery;
-    return ThreadMessageIntake.sendToThread({
+  /**
+   * Sends a follow-up turn on the effect's thread. Its ids derive from the effect, so a retried
+   * send replays its receipt instead of sending twice.
+   */
+  const sendTurn = (
+    delivery: StoredFactoryDelivery,
+    effect: { readonly id: number; readonly threadId: ThreadId },
+    kind: "fix-commit" | "review-retry",
+    text: string,
+  ) =>
+    ThreadMessageIntake.sendToThread({
       projectId: delivery.projectId,
-      commandId: CommandId.make(`factory-fix-commit:${deliveryId}:${effect.id}`),
+      commandId: CommandId.make(`factory-${kind}:${delivery.deliveryId}:${effect.id}`),
       threadId: effect.threadId,
-      messageId: MessageId.make(`factory-fix-commit-message:${deliveryId}:${effect.id}`),
-      text: renderFixCommitPrompt({
-        problems: effect.problems,
-        branch: state.branch,
-        baseline: state.baseline,
-      }),
+      messageId: MessageId.make(`factory-${kind}-message:${delivery.deliveryId}:${effect.id}`),
+      text,
       attachments: [],
       // After whatever the thread is still doing; never steering or interrupting it.
       mode: "queue",
@@ -364,11 +392,27 @@ const make = Effect.gen(function* () {
       Effect.map((sent) => ({ runId: sent.run.id })),
       Effect.provideContext(intakeContext),
     );
-  };
 
   return FactoryThreadEffects.of({
     launchThread,
-    sendFixCommitTurn,
+    sendFixCommitTurn: (delivery, effect) =>
+      sendTurn(
+        delivery,
+        effect,
+        "fix-commit",
+        renderFixCommitPrompt({
+          problems: effect.problems,
+          branch: delivery.state.branch,
+          baseline: delivery.state.baseline,
+        }),
+      ),
+    sendReviewRetryTurn: (delivery, effect) =>
+      sendTurn(
+        delivery,
+        effect,
+        "review-retry",
+        renderReviewRetryPrompt({ problems: effect.problems }),
+      ),
     runEnded: (threadId, runId) =>
       readThreadRun(threadId, runId).pipe(
         Effect.map(({ status }) =>

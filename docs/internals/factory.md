@@ -94,10 +94,26 @@ insert's transaction, so of two concurrent starts only one is stored (see
 Item ids must be in Work's canonical spelling, or one item could hold two active deliveries. A new
 terminal status needs a new index migration.
 
-## Phase 1 stops a verified commit
+## A review judges the verified commit
 
-Review does not exist yet, and no owner decision gives a status to a verified commit that review
-has not seen. The delivery therefore becomes `stopped` at stage `verify` with its passing receipt
-last, keeping the checkpoint for review to resume from (operator decision). This is neither review
-approval nor completion. `stopped` is not terminal, so the item keeps its active delivery and a new
-start for it is refused.
+A passing receipt starts the review stage, and every review is judged against the commit and tree
+that receipt recorded. A submission made after HEAD moved, or with a dirty worktree, is refused and
+the delivery blocks rather than retrying: the reviewer works read-only in plan mode, so a changed
+commit means the review describes code no receipt covers. The reviewer's launch leaves the task
+baseline alone; settle checks keep judging the author's commits after it. See
+[`FactoryReview.ts`](../../apps/server/src/fd/factory/FactoryReview.ts).
+
+Deliveries a Phase 1 server stopped at their verified checkpoint load without review fields and stay
+`stopped` at `verify`; nothing moves them on its own.
+
+## One accepted review per round, acted on when the run ends
+
+A `factory_submit_review` call arrives while the reviewer's turn is still running. It is judged and
+recorded under the delivery's step lock
+([`FactoryWorker.stepWith`](../../apps/server/src/fd/factory/FactoryWorker.ts)), so the run's end
+cannot land between the checks that admit it and the record. The accepted review waits for the run
+to complete: a run that fails after submitting still blocks as a failed run, and the reviewer's turn
+is never cut short. A run that completes without one has the fenced JSON of its last assistant
+message judged the same way, for providers without t3 tools. The first invalid submission in a
+round, on either path, is answered once (by the tool's failure in the same turn, or a retry turn on
+the reviewer thread); the second blocks.

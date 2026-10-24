@@ -41,6 +41,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService } from "../work-management/index.ts";
+import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
@@ -118,8 +119,13 @@ const fakes = (world: World) =>
           world.launches.push(input);
           if (world.launchFailure !== null) return Effect.fail(world.launchFailure);
           const prepare = world.onLaunch ?? Effect.void;
+          // The author's launch starts run-1; a later launch (the reviewer's) a run of its own.
+          const id =
+            world.launches.length === 1
+              ? firstRun
+              : RunId.make(`run-launch-${world.launches.length}`);
           const runs = [
-            { id: firstRun, userMessageId: input.initialMessage?.messageId, status: "preparing" },
+            { id, userMessageId: input.initialMessage?.messageId, status: "preparing" },
           ];
           return prepare.pipe(
             Effect.as({
@@ -194,7 +200,12 @@ const fakes = (world: World) =>
 /** The worker with the real thread effects over the fakes, in-memory SQLite and real git. */
 const makeLayer = (world: World) =>
   FactoryWorker.layer.pipe(
-    Layer.provide(FactoryThreadEffects.layer),
+    Layer.provide(
+      Layer.mergeAll(
+        FactoryThreadEffects.layer,
+        FactoryReview.layer.pipe(Layer.provide(FactoryEvidence.layer)),
+      ),
+    ),
     Layer.provide(fakes(world)),
     Layer.provide(ServerSettings.layerTest()),
     Layer.provide(
@@ -685,15 +696,24 @@ describe("FactoryThreadEffects runs that ended before their result was stored", 
         yield* step({ type: "start" });
         yield* drain;
 
+        // Verified, then on to review: the reviewer's run is still going.
         const state = yield* stored;
-        assert.strictEqual(state.status, "stopped");
-        assert.strictEqual(state.stage, "verify");
+        assert.strictEqual(state.status, "running");
+        assert.strictEqual(state.stage, "review");
         assert.strictEqual(state.receipts.length, 1);
+        const reviewer = ThreadId.make(`factory-thread:${deliveryId}:4`);
+        const reviewRun = RunId.make("run-launch-2");
+        assert.deepStrictEqual(state.awaiting, {
+          type: "run",
+          threadId: reviewer,
+          runId: reviewRun,
+        });
         assert.deepStrictEqual(
           (yield* attempts).map(({ stage, runId, outcome }) => ({ stage, runId, outcome })),
           [
             { stage: "author", runId: firstRun, outcome: "passed" },
             { stage: "verify", runId: null, outcome: "passed" },
+            { stage: "review", runId: reviewRun, outcome: null },
           ],
         );
 

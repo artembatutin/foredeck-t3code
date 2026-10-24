@@ -1,4 +1,4 @@
-import { AuthWorkReadScope } from "@t3tools/contracts";
+import { AuthWorkReadScope, ThreadId } from "@t3tools/contracts";
 import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as Context from "effect/Context";
@@ -16,12 +16,82 @@ import {
   WorkService,
   workBranchName,
 } from "../work-management/index.ts";
+import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import { FactoryProjectMissingError } from "./FactoryThreadEffects.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import type { FactoryStoreError } from "./persistence/errors.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
-import { queuedDeliveryState } from "./pipeline/state.ts";
+import {
+  acceptedReview,
+  type FactoryAcceptedReview,
+  type FactoryEvent,
+  queuedDeliveryState,
+} from "./pipeline/state.ts";
+
+const FactoryReceiptRefusal = Schema.Literals(["head_changed", "tree_dirty"]);
+
+/** A review submission refused before it was judged: nothing was recorded. */
+export class FactoryReviewRefusedError extends Schema.TaggedError<FactoryReviewRefusedError>()(
+  "FactoryReviewRefusedError",
+  {
+    threadId: ThreadId,
+    /**
+     * `not_reviewer`: no active delivery has this thread as its reviewer. `review_not_active`:
+     * its delivery is not running the review stage, or not this thread's run. `already_accepted`:
+     * this round's review is already accepted.
+     */
+    reason: Schema.Literals(["not_reviewer", "review_not_active", "already_accepted"]),
+  },
+) {
+  override get message(): string {
+    switch (this.reason) {
+      case "not_reviewer":
+        return `Thread ${this.threadId} is not the reviewer of an active Factory delivery.`;
+      case "review_not_active":
+        return `The Factory review of thread ${this.threadId} is not waiting for a submission.`;
+      case "already_accepted":
+        return `Factory already accepted this round's review from thread ${this.threadId}.`;
+    }
+  }
+}
+
+/** The submitted review is invalid. The first is the reviewer's to correct; a second blocks. */
+export class FactoryReviewInvalidError extends Schema.TaggedError<FactoryReviewInvalidError>()(
+  "FactoryReviewInvalidError",
+  {
+    deliveryId: FactoryDeliveryId,
+    /** Bounded descriptions of what to correct. */
+    problems: Schema.Array(Schema.String),
+    /** The delivery blocked on this submission: no further one is taken. */
+    blocked: Schema.Boolean,
+  },
+) {
+  override get message(): string {
+    const problems = this.problems.join(" ");
+    return this.blocked
+      ? `The review is invalid again, so Factory blocked the delivery: ${problems}`
+      : `The review is invalid. Correct these problems and submit the whole review again: ${problems}`;
+  }
+}
+
+/** The worktree no longer holds the verified commit, clean; the delivery blocked. */
+export class FactoryReviewCodeChangedError extends Schema.TaggedError<FactoryReviewCodeChangedError>()(
+  "FactoryReviewCodeChangedError",
+  { deliveryId: FactoryDeliveryId, changes: Schema.Array(FactoryReceiptRefusal) },
+) {
+  override get message(): string {
+    return `The code changed during review (${this.changes.join(", ")}), so Factory blocked the delivery.`;
+  }
+}
+
+/** Why a review submission was not accepted. Refusals and judging failures record nothing. */
+type FactorySubmitReviewError =
+  | FactoryReviewRefusedError
+  | FactoryReviewInvalidError
+  | FactoryReviewCodeChangedError
+  | FactoryReview.FactoryReviewJudgeError
+  | FactoryStoreError;
 
 /** No delivery id could be minted; nothing was written. */
 export class FactoryDeliveryIdError extends Schema.TaggedError<FactoryDeliveryIdError>()(
@@ -66,6 +136,21 @@ export class FactoryService extends Context.Service<
       Option.Option<FactoryDeliveryStore.StoredFactoryDelivery>,
       FactoryStoreError
     >;
+    /**
+     * A reviewer's `factory_submit_review`. Taken only from the thread an active delivery
+     * registered as its reviewer, while the review stage awaits that thread's run and before
+     * the round has an accepted review; any other call is refused with nothing changed. The
+     * review is judged (see `FactoryReview`) and the judgment recorded on the delivery: an
+     * accepted review is acted on once the reviewer's run completes, an invalid one fails with
+     * its problems (the second in a round blocks the delivery), and changed code blocks it.
+     */
+    readonly submitReview: (input: {
+      readonly threadId: ThreadId;
+      readonly review: unknown;
+    }) => Effect.Effect<
+      { readonly deliveryId: FactoryDeliveryId; readonly review: FactoryAcceptedReview },
+      FactorySubmitReviewError
+    >;
   }
 >()("t3/fd/factory/FactoryService") {}
 
@@ -79,6 +164,7 @@ const make = Effect.gen(function* () {
   const settings = yield* FactorySettings.FactorySettings;
   const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
   const worker = yield* FactoryWorker.FactoryWorker;
+  const reviews = yield* FactoryReview.FactoryReview;
   const crypto = yield* Crypto.Crypto;
 
   const start: FactoryService["Service"]["start"] = Effect.fn("FactoryService.start")(
@@ -121,7 +207,64 @@ const make = Effect.gen(function* () {
     },
   );
 
-  return FactoryService.of({ start, get: deliveries.get });
+  const submitReview: FactoryService["Service"]["submitReview"] = Effect.fn(
+    "FactoryService.submitReview",
+  )(function* ({ threadId, review }) {
+    const refuse = (reason: FactoryReviewRefusedError["reason"]) =>
+      Effect.fail(new FactoryReviewRefusedError({ threadId, reason }));
+    // A reviewer thread belongs to the one delivery that launched it.
+    const owner = (yield* deliveries.listActive()).find(
+      ({ state }) => state.threads.reviewer === threadId,
+    );
+    if (owner === undefined) return yield* refuse("not_reviewer");
+    const { deliveryId } = owner;
+
+    // Judged and recorded under the delivery's lock, so the run cannot end in between: the
+    // engine then takes the judgment exactly when these checks pass.
+    const stepped = yield* worker.stepWith(deliveryId, (current) =>
+      Effect.gen(function* () {
+        const { state } = current;
+        const { awaiting } = state;
+        if (state.threads.reviewer !== threadId) return yield* refuse("not_reviewer");
+        if (
+          state.status !== "running" ||
+          state.stage !== "review" ||
+          awaiting?.type !== "run" ||
+          awaiting.threadId !== threadId
+        ) {
+          return yield* refuse("review_not_active");
+        }
+        if (acceptedReview(state) !== undefined) return yield* refuse("already_accepted");
+        const judgment = yield* reviews.judge(current, { source: "mcp", threadId, review });
+        const event: FactoryEvent = {
+          type: "review.submitted",
+          round: state.reviewRound,
+          threadId,
+          runId: awaiting.runId,
+          judgment,
+        };
+        return { event, value: { judgment, round: state.reviewRound } };
+      }),
+    );
+    // Deliveries are never deleted, so this one is still stored.
+    if (Option.isNone(stepped)) return yield* refuse("not_reviewer");
+    const { delivery, value } = stepped.value;
+    const { judgment } = value;
+    switch (judgment.type) {
+      case "accepted":
+        return { deliveryId, review: { ...judgment.review, round: value.round } };
+      case "invalid":
+        return yield* new FactoryReviewInvalidError({
+          deliveryId,
+          problems: judgment.problems,
+          blocked: delivery.state.status === "blocked",
+        });
+      case "code_changed":
+        return yield* new FactoryReviewCodeChangedError({ deliveryId, changes: judgment.changes });
+    }
+  });
+
+  return FactoryService.of({ start, get: deliveries.get, submitReview });
 });
 
 export const layer = Layer.effect(FactoryService, make);

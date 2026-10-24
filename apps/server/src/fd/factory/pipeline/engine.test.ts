@@ -448,14 +448,21 @@ describe("settling the branch", () => {
 });
 
 describe("the verify command finishing", () => {
-  it("records a passing receipt and stops at the verified checkpoint", () => {
+  it("records a passing receipt and launches the first review round's reviewer", () => {
     const pass = receipt();
     expect(
       advance(awaitingVerify, commandFinished(VERIFY, { type: "receipt", receipt: pass })),
-    ).toEqual({
-      delivery: { ...awaitingVerify, status: "stopped", awaiting: null, receipts: [pass] },
-      effects: [],
-    });
+    ).toEqual(
+      issued(
+        { ...awaitingVerify, stage: "review", reviewRound: 1, receipts: [pass] },
+        {
+          id: VERIFY + 1,
+          type: "launch_thread",
+          role: "reviewer",
+          workspace: { type: "existing_worktree", worktreePath },
+        },
+      ),
+    );
   });
 
   it.each([
@@ -515,13 +522,16 @@ describe("stale events", () => {
     "author, awaiting the fix-commit run": awaitingFixRun,
     "author, awaiting the second settle check": awaitingSecondSettle,
     "verify, awaiting the command": awaitingVerify,
-    "verify, stopped at the checkpoint": verified,
+    "review, awaiting the reviewer launch": verified,
     blocked: blockedOnRun,
     done: { ...awaitingRun, status: "done" },
     cancelled: { ...awaitingRun, status: "cancelled" },
   } satisfies Record<string, FactoryDeliveryState>;
 
-  /** The event types each gate-1 state answers to; every other type is stale there. */
+  /**
+   * The event types each state answers to; every other type is stale there. Review events are
+   * covered in `engine.review.test.ts`.
+   */
   const ANSWERED: Readonly<Record<keyof typeof STATES, ReadonlyArray<FactoryEvent["type"]>>> = {
     queued: ["start"],
     "author, awaiting the launch": ["thread.launched", "effect.failed"],
@@ -535,7 +545,7 @@ describe("stale events", () => {
       "effect.failed",
     ],
     "verify, awaiting the command": ["command.finished", "thread.deleted", "effect.failed"],
-    "verify, stopped at the checkpoint": [],
+    "review, awaiting the reviewer launch": ["thread.launched", "thread.deleted", "effect.failed"],
     blocked: [],
     done: [],
     cancelled: [],
@@ -545,7 +555,10 @@ describe("stale events", () => {
    * An event of `type` naming what the delivery awaits: the awaited effect's id, or the awaited
    * run. A worker result of another type than the awaited effect still names its id.
    */
-  const eventFor = (type: FactoryEvent["type"], delivery: FactoryDeliveryState): FactoryEvent => {
+  const eventFor = (
+    type: (typeof EVENT_TYPES)[number],
+    delivery: FactoryDeliveryState,
+  ): FactoryEvent => {
     const { awaiting } = delivery;
     const effectId = awaiting?.type === "effect" ? awaiting.effect.id : LAUNCH;
     const threadId = awaiting?.type === "run" ? awaiting.threadId : author;
@@ -579,7 +592,7 @@ describe("stale events", () => {
     })),
   );
 
-  it("cover every gate-1 state and event type", () => {
+  it("cover every listed state and event type", () => {
     expect(pairs).toHaveLength(Object.keys(STATES).length * EVENT_TYPES.length);
   });
 

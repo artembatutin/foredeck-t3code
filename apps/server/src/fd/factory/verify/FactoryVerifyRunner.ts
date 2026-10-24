@@ -17,9 +17,10 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as ProcessRunner from "../../../processRunner.ts";
-import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
+import type * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import type { FactoryDeliverySettings } from "../FactorySettings.ts";
-import { FactoryBranchReadError, FactoryWorktreeMissingError } from "../git/branchFacts.ts";
+import type { FactoryBranchReadError, FactoryWorktreeMissingError } from "../git/branchFacts.ts";
+import { readWorktreeState } from "../git/worktreeState.ts";
 import type { FactoryCommandOutcome, FactoryReceiptRefusal } from "../pipeline/state.ts";
 import * as FactoryEvidence from "./FactoryEvidence.ts";
 
@@ -55,7 +56,6 @@ export type FactoryVerifyRunError =
 
 const RECEIPT_VERSION = 1;
 const encodeReceipt = Schema.encodeEffect(Schema.fromJsonString(FactoryVerifyReceipt));
-const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 /** The process runner's own buffers; the log receives every chunk through its callbacks. */
 const BUFFERED_OUTPUT_BYTES = 64 * 1024;
 
@@ -96,52 +96,12 @@ export class FactoryVerifyRunner extends Context.Service<
 
 const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
-  const git = yield* GitVcsDriver.GitVcsDriver;
   const processRunner = yield* ProcessRunner.ProcessRunner;
   const evidence = yield* FactoryEvidence.FactoryEvidence;
   const platform = `${yield* HostProcess.Platform}-${yield* HostProcess.Architecture}`;
-
-  const readWorktree = Effect.fn("FactoryVerifyRunner.readWorktree")(function* (path: string) {
-    const exists = yield* fileSystem.exists(path).pipe(
-      Effect.catchTags({
-        PlatformError: (cause) =>
-          Effect.fail(new FactoryBranchReadError({ operation: "worktree", path, cause })),
-      }),
-    );
-    if (!exists) return yield* new FactoryWorktreeMissingError({ path });
-
-    const read = (operation: string, args: ReadonlyArray<string>) =>
-      git
-        .execute({
-          operation: `FactoryVerifyRunner.${operation}`,
-          cwd: path,
-          args,
-          timeoutMs: 30_000,
-          maxOutputBytes: 1_000_000,
-        })
-        .pipe(
-          Effect.map((result) => result.stdout.trim()),
-          Effect.catchTags({
-            GitCommandError: (cause) =>
-              Effect.fail(new FactoryBranchReadError({ operation, path, cause })),
-          }),
-        );
-
-    const [headSha = "", tree = ""] = (yield* read("head", ["rev-parse", "HEAD", "HEAD^{tree}"]))
-      .split("\n")
-      .map((line) => line.trim());
-    if (!OBJECT_ID.test(headSha) || !OBJECT_ID.test(tree)) {
-      return yield* new FactoryBranchReadError({ operation: "head", path });
-    }
-    // No optional locks: reading status must not rewrite the worktree's index.
-    const status = yield* read("status", [
-      "--no-optional-locks",
-      "status",
-      "--porcelain=v1",
-      "--untracked-files=all",
-    ]);
-    return { headSha, tree, clean: status === "" };
-  });
+  const gitContext = yield* Effect.context<FileSystem.FileSystem | GitVcsDriver.GitVcsDriver>();
+  const readWorktree = (path: string) =>
+    readWorktreeState(path).pipe(Effect.provideContext(gitContext));
 
   /**
    * Runs the command, appending its stdout and stderr chunks to a new log in arrival order and

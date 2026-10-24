@@ -9,6 +9,7 @@ import {
 import {
   FactoryDeliveryId,
   FactoryDeliveryStatus,
+  FactoryReviewSummary,
   FactoryRole,
   FactoryStageName,
   FactoryVerifyReceipt,
@@ -38,8 +39,10 @@ export class FactoryDeliveryActive extends Schema.TaggedError<FactoryDeliveryAct
 
 // The engine's state as stored. `fromRow` and `toRow` type it as `FactoryDeliveryState` both ways,
 // so a field or variant changed on one side alone stops compiling. An optional field added to the
-// engine's state still has to be added here by hand.
+// engine's state still has to be added here by hand. A field added after rows were stored decodes
+// with a default, so those rows keep loading.
 const Problems = Schema.Array(Schema.String);
+const ReceiptRefusals = Schema.Array(Schema.Literals(["head_changed", "tree_dirty"]));
 
 const StoredWorkspace = Schema.Union([
   Schema.Struct({
@@ -70,6 +73,18 @@ const StoredEffect = Schema.Union([
     runId: RunId,
   }),
   Schema.Struct({ id: PositiveInt, type: Schema.Literal("run_command"), stage: FactoryStageName }),
+  Schema.Struct({
+    id: PositiveInt,
+    type: Schema.Literal("read_fallback_review"),
+    threadId: ThreadId,
+    runId: RunId,
+  }),
+  Schema.Struct({
+    id: PositiveInt,
+    type: Schema.Literal("send_review_retry_turn"),
+    threadId: ThreadId,
+    problems: Problems,
+  }),
 ]);
 
 const StoredAwaiting = Schema.Union([
@@ -92,12 +107,22 @@ const StoredBlock = Schema.Union([
   }),
   Schema.Struct({ reason: Schema.Literal("unsettled"), problems: Problems }),
   Schema.Struct({ reason: Schema.Literal("verify_failed") }),
-  Schema.Struct({
-    reason: Schema.Literal("receipt_refused"),
-    refusals: Schema.Array(Schema.Literals(["head_changed", "tree_dirty"])),
-  }),
+  Schema.Struct({ reason: Schema.Literal("receipt_refused"), refusals: ReceiptRefusals }),
   Schema.Struct({ reason: Schema.Literal("unsupported_stage"), stage: FactoryStageName }),
+  Schema.Struct({
+    reason: Schema.Literal("review_changes_required"),
+    summary: FactoryReviewSummary,
+  }),
+  Schema.Struct({ reason: Schema.Literal("code_changed"), changes: ReceiptRefusals }),
+  Schema.Struct({ reason: Schema.Literal("invalid_submission"), problems: Problems }),
 ]);
+
+const StoredAcceptedReview = Schema.Struct({
+  round: PositiveInt,
+  source: Schema.Literals(["mcp", "fallback"]),
+  summary: FactoryReviewSummary,
+  evidencePath: Schema.String,
+});
 
 const StoredDeliveryState = Schema.Struct({
   status: FactoryDeliveryStatus,
@@ -115,6 +140,10 @@ const StoredDeliveryState = Schema.Struct({
   fixCommitTurns: NonNegativeInt,
   effectsIssued: NonNegativeInt,
   receipts: Schema.Array(FactoryVerifyReceipt),
+  // Added with review: rows stored before it have none.
+  reviewRound: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
+  invalidSubmissions: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
+  reviews: Schema.Array(StoredAcceptedReview).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   block: Schema.NullOr(StoredBlock),
 });
 

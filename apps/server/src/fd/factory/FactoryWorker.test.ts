@@ -19,6 +19,7 @@ import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProcessRunner from "../../processRunner.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
+import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
@@ -61,6 +62,7 @@ const scriptedThreads = (script: ThreadScript) =>
           script.launch?.(store, delivery, effect) ?? Effect.die("launch not scripted"),
         sendFixCommitTurn: (delivery, effect) =>
           script.turn?.(store, delivery, effect) ?? Effect.die("turn not scripted"),
+        sendReviewRetryTurn: () => Effect.die("review retry turn not scripted"),
         // Every run is still going; its end arrives as a step.
         runEnded: () => Effect.succeedNone,
       });
@@ -94,6 +96,8 @@ const makeLayer = (script: ThreadScript) =>
   FactoryWorker.layer.pipe(
     Layer.provide(observedStore(script)),
     Layer.provide(scriptedThreads(script)),
+    // Reviews are judged in FactoryReview.test.ts; here no review is submitted.
+    Layer.provide(Layer.mock(FactoryReview.FactoryReview)({})),
     Layer.provide(
       FactoryVerifyRunner.layer.pipe(
         Layer.provide(FactoryEvidence.layer),
@@ -120,8 +124,11 @@ const missingId = FactoryDeliveryId.make("delivery-missing");
 const otherId = FactoryDeliveryId.make("delivery-2");
 const otherItem = { ...itemRef, itemId: WorkItemId.make("fd-bbbbbb") };
 const author = ThreadId.make("thread-author");
+const reviewer = ThreadId.make("thread-reviewer");
 const firstRun = RunId.make("run-1");
 const fixRun = RunId.make("run-2");
+const reviewRun = RunId.make("run-review");
+const reviewedSha = "e".repeat(40);
 const branch = "feature/item-7";
 const baseline = "b".repeat(40);
 
@@ -225,7 +232,18 @@ const makeRepository = Effect.gen(function* () {
 const startOnRepository = (script: ThreadScript) =>
   Effect.gen(function* () {
     const repository = yield* makeRepository;
-    script.launch = () => Effect.succeed(launchedAt(repository.cwd, repository.baselineSha));
+    script.launch = (_store, _delivery, effect) =>
+      Effect.succeed(
+        effect.role === "reviewer"
+          ? // A reviewer's launch reports its worktree's HEAD, the commit it reviews.
+            {
+              threadId: reviewer,
+              runId: reviewRun,
+              worktreePath: repository.cwd,
+              baseline: reviewedSha,
+            }
+          : launchedAt(repository.cwd, repository.baselineSha),
+      );
     yield* insert();
     yield* step({ type: "start" });
     yield* drain;
@@ -451,8 +469,10 @@ describe("FactoryWorker settle checks", () => {
         yield* step(authorFinished(firstRun));
         yield* drain;
 
+        // Verify ran on the settled branch and passed, so review began.
         const { state } = yield* stored;
-        assert.strictEqual(state.stage, "verify");
+        assert.strictEqual(state.receipts.length, 1);
+        assert.strictEqual(state.stage, "review");
         assert.isNull(state.block);
       }),
     ),
@@ -546,11 +566,17 @@ describe("FactoryWorker settle checks", () => {
 });
 
 describe("FactoryWorker verify", () => {
-  it.effect("stops at verify with one receipt and records both attempts as passed", () =>
+  it.effect("passes verify with one receipt and starts the review in the delivery worktree", () =>
     withWorker((script) =>
       Effect.gen(function* () {
         yield* useVerify(passingVerify);
-        const { cwd } = yield* startOnRepository(script);
+        const { cwd, baselineSha } = yield* startOnRepository(script);
+        const launches: Array<Parameters<Threads["launchThread"]>[1]> = [];
+        const launch = script.launch;
+        script.launch = (store, delivery, effect) => {
+          launches.push(effect);
+          return launch?.(store, delivery, effect) ?? Effect.die("launch not scripted");
+        };
         yield* commit(cwd, "feat(server): add the thing");
         const head = yield* git(cwd, ["rev-parse", "HEAD"]);
 
@@ -558,12 +584,28 @@ describe("FactoryWorker verify", () => {
         yield* drain;
 
         const { state } = yield* stored;
-        assert.strictEqual(state.status, "stopped");
-        assert.strictEqual(state.stage, "verify");
-        assert.isNull(state.awaiting);
+        assert.strictEqual(state.status, "running");
+        assert.strictEqual(state.stage, "review");
+        assert.strictEqual(state.reviewRound, 1);
         assert.strictEqual(state.receipts.length, 1);
         assert.strictEqual(state.receipts[0]?.code, 0);
         assert.strictEqual(state.receipts[0]?.headSha, head);
+        assert.deepStrictEqual(launches, [
+          {
+            id: 4,
+            type: "launch_thread",
+            role: "reviewer",
+            workspace: { type: "existing_worktree", worktreePath: cwd },
+          },
+        ]);
+        assert.deepStrictEqual(state.threads, { author, reviewer });
+        assert.deepStrictEqual(state.awaiting, {
+          type: "run",
+          threadId: reviewer,
+          runId: reviewRun,
+        });
+        // The task baseline stays the author's: review covers baseline..HEAD.
+        assert.strictEqual(state.baseline, baselineSha);
 
         const directory = yield* evidenceDirectory;
         const runs = yield* attempts;
@@ -593,9 +635,20 @@ describe("FactoryWorker verify", () => {
               outcome: "passed",
               evidencePath: `${directory}/verify-1.json`,
             },
+            {
+              stage: "review",
+              attempt: 1,
+              threadId: reviewer,
+              runId: reviewRun,
+              outcome: null,
+              evidencePath: null,
+            },
           ],
         );
-        assert.isTrue(runs.every((run) => run.finishedAt !== null));
+        assert.deepStrictEqual(
+          runs.map((run) => run.finishedAt !== null),
+          [true, true, false],
+        );
       }),
     ),
   );

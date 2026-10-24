@@ -5,6 +5,7 @@ import {
   AuthWorkReadScope,
   AuthWorkWriteScope,
   CommandId,
+  MessageId,
   type OrchestrationV2RunStatus,
   ProjectId,
   ProviderDriverKind,
@@ -237,7 +238,31 @@ const makeFakeProvider = Effect.gen(function* () {
       );
     });
 
-  return { adapter, started, endTurn };
+  /** Posts the turn's final assistant message, as a provider does before the turn ends. */
+  const say = (turn: ProviderAdapter.ProviderAdapterV2TurnInput, text: string) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      yield* Queue.offer(events, {
+        type: "message.updated",
+        driver,
+        message: {
+          id: MessageId.make(`assistant:${turn.attemptId}`),
+          threadId: turn.threadId,
+          runId: turn.runId,
+          nodeId: turn.rootNodeId,
+          role: "assistant",
+          text,
+          attachments: [],
+          streaming: false,
+          createdBy: "agent",
+          creationSource: "provider",
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+    });
+
+  return { adapter, started, endTurn, say };
 });
 
 type FakeProvider = Effect.Success<typeof makeFakeProvider>;
@@ -572,7 +597,7 @@ const stateOf = (deliveryId: FactoryDeliveryId) =>
   delivery(deliveryId).pipe(Effect.map((stored: StoredFactoryDelivery) => stored.state));
 
 describe("Factory single-item delivery", () => {
-  it.live("launches the author on a new worktree and stops verified after a passing check", () =>
+  it.live("launches the author on a new worktree, verifies it, then reviews it in plan mode", () =>
     withProject(verifyCommands.passes, (world) =>
       Effect.gen(function* () {
         const author = yield* world.start;
@@ -598,9 +623,10 @@ describe("Factory single-item delivery", () => {
         yield* authorCommits(author.worktreePath, "feat: add the export button");
         assert.strictEqual(yield* world.endRun(author.runId, "completed"), "completed");
 
+        // Verified, so the review began: a reviewer thread works on the same worktree.
         const state = yield* stateOf(author.deliveryId);
-        assert.strictEqual(state.status, "stopped");
-        assert.strictEqual(state.stage, "verify");
+        assert.strictEqual(state.status, "running");
+        assert.strictEqual(state.stage, "review");
         assert.isNull(state.block);
         const receipt = state.receipts.at(-1);
         assert.strictEqual(state.receipts.length, 1);
@@ -636,7 +662,70 @@ describe("Factory single-item delivery", () => {
           yield* git(author.worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]),
           "",
         );
-        assert.strictEqual(world.provider.started.length, 1);
+
+        // The reviewer is a separate thread in plan mode, prompted with the verified commit.
+        const { awaiting } = state;
+        if (awaiting?.type !== "run") return assert.fail("The reviewer launch recorded no run.");
+        assert.strictEqual(state.threads.reviewer, awaiting.threadId);
+        assert.notStrictEqual(awaiting.threadId, author.threadId);
+        assert.strictEqual(yield* runReached(awaiting.runId, ["starting", ...ended]), "starting");
+        yield* drainOrchestration;
+        assert.strictEqual(world.provider.started.length, 2);
+        const review = world.provider.started[1];
+        assert.strictEqual(review?.threadId, awaiting.threadId);
+        assert.strictEqual(review?.runtimePolicy.cwd, author.worktreePath);
+        assert.strictEqual(review?.runtimePolicy.interactionMode, "plan");
+        assert.include(review?.message.text ?? "", `${state.baseline}..${receipt?.headSha}`);
+        assert.include(review?.message.text ?? "", "factory_submit_review");
+
+        // This provider has no t3 tools: its review arrives in the run's last message.
+        if (review === undefined) return;
+        yield* world.provider.say(
+          review,
+          `Reviewed.\n\n\`\`\`json\n${JSON.stringify({
+            verdict: "pass",
+            findings: [],
+            acceptance: [
+              {
+                criterion: 1,
+                status: "verified",
+                evidence: "The export module is committed.",
+                paths: ["export.ts"],
+              },
+            ],
+            missing_evidence: [],
+          })}\n\`\`\``,
+        );
+        assert.strictEqual(yield* world.endRun(awaiting.runId, "completed"), "completed");
+
+        // Accepted from the fallback; record is not built yet, so the delivery stops there.
+        const reviewed = yield* stateOf(author.deliveryId);
+        assert.strictEqual(reviewed.stage, "record");
+        assert.deepStrictEqual(reviewed.block, { reason: "unsupported_stage", stage: "record" });
+        assert.deepStrictEqual(
+          reviewed.reviews.map(({ round, source, summary, evidencePath }) => ({
+            round,
+            source,
+            headSha: summary.headSha,
+            blocking: summary.blocking,
+            evidencePath,
+          })),
+          [
+            {
+              round: 1,
+              source: "fallback",
+              headSha: receipt?.headSha,
+              blocking: false,
+              evidencePath: path.join(evidence, "review-1.json"),
+            },
+          ],
+        );
+        assert.isTrue(yield* world.exists(path.join(evidence, "review-1.json")));
+        assert.strictEqual(
+          yield* git(author.worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]),
+          "",
+        );
+        assert.strictEqual(world.provider.started.length, 2);
       }),
     ),
   );

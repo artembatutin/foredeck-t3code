@@ -26,6 +26,7 @@ import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkDomainError, WorkService } from "../work-management/index.ts";
+import * as FactoryReview from "./FactoryReview.ts";
 import * as FactoryService from "./FactoryService.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
@@ -139,8 +140,9 @@ const fakes = (world: World) =>
         }),
       runEnded: () => Effect.succeedNone,
     }),
-    // Nothing here reaches verify or a settle check.
+    // Nothing here reaches verify, a settle check or a review; FactoryReview.test.ts covers those.
     Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({}),
+    Layer.mock(FactoryReview.FactoryReview)({}),
     Layer.mock(GitVcsDriver.GitVcsDriver)({}),
   );
 
