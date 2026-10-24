@@ -8,6 +8,7 @@ import { assert, it } from "@effect/vitest";
 it.each([
   "index.ts",
   "FactoryReactor.ts",
+  "FactoryService.ts",
   "FactorySettings.ts",
   "FactoryThreadEffects.ts",
   "FactoryWorker.ts",
