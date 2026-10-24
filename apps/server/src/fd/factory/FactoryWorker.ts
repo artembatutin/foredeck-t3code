@@ -10,6 +10,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as TxRef from "effect/TxRef";
 
 import type * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as FactorySettings from "./FactorySettings.ts";
@@ -123,6 +124,13 @@ const make = Effect.gen(function* () {
   // long verify command never holds up another's. Lanes are tiny and bounded by the deliveries
   // stepped since the server started.
   const lanes = new Map<FactoryDeliveryId, DrainableWorker<Job>>();
+  // Effects queued or running on any lane, each counted until the step its result fed back has
+  // finished. That step queues its follow-ups first, so a chain never reads as idle midway, and
+  // a delivery stepped while a drain waits is counted too.
+  const outstanding = yield* TxRef.make(0);
+  // Runs after every lane's finalizer: effects dropped at shutdown never finish, and a drain
+  // must not wait for them.
+  yield* Effect.addFinalizer(() => TxRef.set(outstanding, 0));
 
   const checkSettle = (state: FactoryDeliveryState): Effect.Effect<FactorySettleResult> => {
     const { worktreePath, baseline } = state;
@@ -285,7 +293,10 @@ const make = Effect.gen(function* () {
     // Queued only now: an effect never starts before the state that issued it is stored.
     if (Option.isSome(stored) && next.effects.length > 0) {
       const lane = yield* laneFor(deliveryId);
-      for (const effect of next.effects) yield* lane.enqueue({ delivery: stored.value, effect });
+      for (const effect of next.effects) {
+        yield* TxRef.update(outstanding, (count) => count + 1);
+        yield* lane.enqueue({ delivery: stored.value, effect });
+      }
     }
     return stored;
   });
@@ -293,9 +304,13 @@ const make = Effect.gen(function* () {
   const step: FactoryWorker["Service"]["step"] = (deliveryId, event) =>
     locks.withLock(deliveryId, stepLocked(deliveryId, event));
 
-  /** Runs an effect and feeds its result back. Interruption (shutdown) feeds nothing. */
+  /**
+   * Runs an effect and feeds its result back. Suspended, so an executor that throws while
+   * building its effect fails the effect like any other failure. Interruption (shutdown) feeds
+   * nothing.
+   */
   const runJob = (job: Job) =>
-    execute(job).pipe(
+    Effect.suspend(() => execute(job)).pipe(
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause)
           ? Effect.interrupt
@@ -306,6 +321,7 @@ const make = Effect.gen(function* () {
             }),
       ),
       Effect.flatMap((event) => step(job.delivery.deliveryId, event)),
+      Effect.ensuring(TxRef.update(outstanding, (count) => count - 1)),
     );
 
   // Called only under the delivery's lock, so a delivery never gets two lanes.
@@ -321,10 +337,9 @@ const make = Effect.gen(function* () {
 
   return FactoryWorker.of({
     step,
-    // A delivery's effects feed only that delivery's steps, so each lane's drain already covers
-    // the chains it started; one pass over the lanes covers every queued effect.
-    drain: Effect.suspend(() =>
-      Effect.forEach([...lanes.values()], (lane) => lane.drain, { discard: true }),
+    drain: TxRef.get(outstanding).pipe(
+      Effect.flatMap((count) => (count > 0 ? Effect.txRetry : Effect.void)),
+      Effect.tx,
     ),
   });
 });

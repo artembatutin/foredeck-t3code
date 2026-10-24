@@ -114,6 +114,9 @@ const itemRef = {
 };
 const deliveryId = FactoryDeliveryId.make("delivery-1");
 const missingId = FactoryDeliveryId.make("delivery-missing");
+/** A second delivery, of another item, for steps across deliveries. */
+const otherId = FactoryDeliveryId.make("delivery-2");
+const otherItem = { ...itemRef, itemId: WorkItemId.make("fd-bbbbbb") };
 const author = ThreadId.make("thread-author");
 const firstRun = RunId.make("run-1");
 const fixRun = RunId.make("run-2");
@@ -138,13 +141,15 @@ const authorFinished = (runId: RunId): FactoryEvent => ({
 
 const decodeSettings = Schema.decodeUnknownSync(FactoryProjectSettings);
 
-const insert = (state: FactoryDeliveryState = queued) =>
+const insert = (state: FactoryDeliveryState = queued, id = deliveryId, item = itemRef) =>
   Effect.flatMap(FactoryDeliveryStore.FactoryDeliveryStore, (store) =>
-    store.insert({ deliveryId, projectId, itemRef, state }),
+    store.insert({ deliveryId: id, projectId, itemRef: item, state }),
   );
-const stored = Effect.flatMap(FactoryDeliveryStore.FactoryDeliveryStore, (store) =>
-  store.get(deliveryId),
-).pipe(Effect.map(Option.getOrThrow));
+const storedOf = (id: FactoryDeliveryId) =>
+  Effect.flatMap(FactoryDeliveryStore.FactoryDeliveryStore, (store) => store.get(id)).pipe(
+    Effect.map(Option.getOrThrow),
+  );
+const stored = storedOf(deliveryId);
 const step = (event: FactoryEvent, id = deliveryId) =>
   Effect.flatMap(FactoryWorker.FactoryWorker, (worker) => worker.step(id, event));
 const drain = Effect.flatMap(FactoryWorker.FactoryWorker, (worker) => worker.drain);
@@ -364,6 +369,68 @@ describe("FactoryWorker steps", () => {
         assert.deepStrictEqual((yield* stored).state.awaiting, {
           type: "run",
           threadId: author,
+          runId: firstRun,
+        });
+      }),
+    ),
+  );
+  it.effect("drains a delivery started while a drain already waits", () =>
+    withWorker((script) =>
+      Effect.gen(function* () {
+        const gate = Effect.all({
+          called: Deferred.make<void>(),
+          release: Deferred.make<void>(),
+          returned: Deferred.make<void>(),
+        });
+        const gates = new Map([
+          [deliveryId, yield* gate],
+          [otherId, yield* gate],
+        ]);
+        const gateOf = (id: FactoryDeliveryId) => {
+          const found = gates.get(id);
+          if (found === undefined) throw new Error(`no gate for ${id}`);
+          return found;
+        };
+        // Each delivery's thread is its own: one thread holds one active attempt.
+        const threadOf = (id: FactoryDeliveryId) => ThreadId.make(`thread-${id}`);
+        script.launch = (_store, delivery) => {
+          const { called, release, returned } = gateOf(delivery.deliveryId);
+          return Deferred.succeed(called, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.andThen(Deferred.succeed(returned, undefined)),
+            Effect.as({
+              ...launchedAt(`/worktrees/${delivery.deliveryId}`, baseline),
+              threadId: threadOf(delivery.deliveryId),
+            }),
+          );
+        };
+        yield* insert();
+        yield* insert(queued, otherId, otherItem);
+        yield* step({ type: "start" });
+        const draining = yield* Effect.forkChild(drain);
+        yield* Deferred.await(gateOf(deliveryId).called);
+
+        // The second delivery starts only after the drain began waiting.
+        yield* step({ type: "start" }, otherId);
+        yield* Deferred.await(gateOf(otherId).called);
+        // Let the first delivery's chain finish: its fed-back step holds its lock, so this stale
+        // step returns only after that step has stored the launch.
+        yield* Deferred.succeed(gateOf(deliveryId).release, undefined);
+        yield* Deferred.await(gateOf(deliveryId).returned);
+        yield* step({
+          type: "command.finished",
+          effectId: 1,
+          outcome: { type: "refused", refusals: ["tree_dirty"] },
+        });
+        yield* Effect.yieldNow;
+        assert.strictEqual((yield* stored).state.awaiting?.type, "run");
+        assert.isUndefined(draining.pollUnsafe());
+
+        yield* Deferred.succeed(gateOf(otherId).release, undefined);
+        yield* Fiber.join(draining);
+        assert.deepStrictEqual((yield* storedOf(otherId)).state.awaiting, {
+          type: "run",
+          threadId: threadOf(otherId),
           runId: firstRun,
         });
       }),
@@ -624,6 +691,29 @@ describe("FactoryWorker failures and stale results", () => {
           runs.map(({ stage, threadId, outcome }) => ({ stage, threadId, outcome })),
           [{ stage: "author", threadId: null, outcome: "blocked" }],
         );
+      }),
+    ),
+  );
+
+  it.effect("blocks a launch whose executor throws before returning an effect", () =>
+    withWorker((script) =>
+      Effect.gen(function* () {
+        script.launch = () => {
+          throw new Error("npm ERR! token=hunter2 could not reach the registry");
+        };
+        yield* insert();
+
+        yield* step({ type: "start" });
+        yield* drain;
+
+        const { state } = yield* stored;
+        assert.strictEqual(state.status, "blocked");
+        assert.strictEqual(state.block?.reason, "effect_failed");
+        assert.strictEqual(
+          state.block?.reason === "effect_failed" ? state.block.detail : undefined,
+          "Factory could not launch the author thread (unexpected error).",
+        );
+        assert.notInclude(JSON.stringify(state), "hunter2");
       }),
     ),
   );
