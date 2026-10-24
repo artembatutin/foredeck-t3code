@@ -3,11 +3,16 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   type OrchestrationV2DomainEvent,
   type OrchestrationV2RunStatus,
+  type OrchestrationV2StoredEvent,
   ProjectId,
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
-import { FactoryDeliveryId, type FactoryVerifyReceipt } from "@t3tools/contracts/fd/factory";
+import {
+  FactoryDeliveryId,
+  FactoryProjectSettings,
+  type FactoryVerifyReceipt,
+} from "@t3tools/contracts/fd/factory";
 import { WorkItemId, type WorkItemRef, WorkSourceId } from "@t3tools/contracts/fd/work-management";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -16,11 +21,12 @@ import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
-import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
@@ -50,12 +56,21 @@ interface ProjectedThread {
 /** What the fakes report, and what they saw. */
 interface World {
   readonly projections: Map<ThreadId, ProjectedThread>;
+  projectionReads: number;
   /** The thread and run each delivery's author launch reports. */
   readonly launches: Map<FactoryDeliveryId, { readonly threadId: ThreadId; readonly runId: RunId }>;
   /** While set, a launch waits for it before reporting. */
   launchGate: Deferred.Deferred<void> | null;
   launchCalls: number;
   verifyCalls: number;
+  /** While set, a verify run waits for it, then fails. */
+  verifyGate: Deferred.Deferred<void> | null;
+  /** Resolves once a verify run has started. */
+  readonly verifyStarted: Deferred.Deferred<void>;
+  /** The event log the tail reads, in sequence order. */
+  readonly events: Array<OrchestrationV2StoredEvent>;
+  /** While set, the tail waits for it before it subscribes. */
+  subscribeGate: Deferred.Deferred<void> | null;
   /** Deliveries the worker cannot read. */
   readonly unreadable: Set<FactoryDeliveryId>;
   /** Runs when the worker reads a launched run, before it stores the launch. */
@@ -101,6 +116,11 @@ const receipt: FactoryVerifyReceipt = {
   logPath: "/t3/userdata/fd-factory/delivery-1/verify-1.log",
   outputHash: "output-1",
 };
+
+/** Settings a delivery can verify with; the fake runner never runs the command. */
+const withVerify = Schema.decodeSync(FactoryProjectSettings)({
+  verifyCommand: { executable: "vp", args: ["test", "run"] },
+});
 
 const fold = (...events: ReadonlyArray<FactoryEvent>) =>
   events.reduce((state, event) => advance(state, event).delivery, queued);
@@ -179,10 +199,43 @@ const fakeThreads = (world: World) =>
 const fakeVerify = (world: World) =>
   Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({
     run: () =>
-      Effect.suspend(() => {
+      Effect.gen(function* () {
         world.verifyCalls += 1;
-        return Effect.die("verify must not run");
+        yield* Deferred.succeed(world.verifyStarted, undefined);
+        if (world.verifyGate !== null) yield* Deferred.await(world.verifyGate);
+        return yield* Effect.die("verify not scripted");
       }),
+  });
+
+/**
+ * The event log like EventSink's: `stream` subscribes to live events, then replays the log after
+ * `afterSequence` up to that moment, then delivers live events past it.
+ */
+const fakeEventSink = (
+  world: World,
+  live: PubSub.PubSub<OrchestrationV2StoredEvent>,
+  tailSubscribed: Deferred.Deferred<void>,
+) =>
+  Layer.mock(EventSink.EventSinkV2)({
+    latestSequence: () => Effect.sync(() => world.events.length),
+    stream: (input) =>
+      Stream.unwrap(
+        Effect.gen(function* () {
+          if (world.subscribeGate !== null) yield* Deferred.await(world.subscribeGate);
+          const subscription = yield* PubSub.subscribe(live);
+          const highWater = world.events.length;
+          const after = input?.afterSequence ?? 0;
+          yield* Deferred.succeed(tailSubscribed, undefined);
+          return Stream.concat(
+            Stream.fromIterable(
+              world.events.filter(({ sequence }) => sequence > after && sequence <= highWater),
+            ),
+            Stream.fromSubscription(subscription).pipe(
+              Stream.filter(({ sequence }) => sequence > Math.max(highWater, after)),
+            ),
+          );
+        }),
+      ),
   });
 
 /** The worker's delivery store, which fails every read of an unreadable delivery. */
@@ -214,6 +267,7 @@ const fakeProjections = (world: World) =>
       filter?: { readonly runIds?: ReadonlyArray<RunId> },
     ) =>
       Effect.suspend(() => {
+        world.projectionReads += 1;
         const projected = world.projections.get(threadId);
         if (projected === undefined) {
           return Effect.fail(new ProjectionStore.ProjectionStoreThreadNotFoundError({ threadId }));
@@ -226,20 +280,24 @@ const fakeProjections = (world: World) =>
   });
 
 /**
- * The reactor over the real worker, engine and stores on in-memory SQLite. Thread events come
- * from a live tail like the orchestrator's: an event published before the reactor subscribes is
- * never delivered. `tailSubscribed` resolves once it has subscribed. The settle check's git reads
- * never return, so a delivery the reactor moved on stays awaiting that check.
+ * The reactor over the real worker, engine and stores on in-memory SQLite, reading thread events
+ * from a fake event log. `tailSubscribed` resolves once the tail has subscribed. The settle
+ * check's git reads never return, so a delivery the reactor moved on stays awaiting that check.
  */
 const setup = Effect.gen(function* () {
-  const domainEvents = yield* PubSub.unbounded<OrchestrationV2DomainEvent>();
+  const live = yield* PubSub.unbounded<OrchestrationV2StoredEvent>();
   const tailSubscribed = yield* Deferred.make<void>();
   const world: World = {
     projections: new Map(),
+    projectionReads: 0,
     launches: new Map(),
     launchGate: null,
     launchCalls: 0,
     verifyCalls: 0,
+    verifyGate: null,
+    verifyStarted: yield* Deferred.make<void>(),
+    events: [],
+    subscribeGate: null,
     unreadable: new Set(),
     onRunRead: null,
     warnings: [],
@@ -247,14 +305,6 @@ const setup = Effect.gen(function* () {
   const logger = Logger.make(({ logLevel, message }) => {
     const [first] = Array.isArray(message) ? message : [message];
     if (logLevel === "Warn" && typeof first === "string") world.warnings.push(first);
-  });
-  const orchestrator = Layer.mock(Orchestrator.OrchestratorV2)({
-    streamDomainEvents: Stream.unwrap(
-      PubSub.subscribe(domainEvents).pipe(
-        Effect.tap(() => Deferred.succeed(tailSubscribed, undefined)),
-        Effect.map((subscription) => Stream.fromSubscription(subscription)),
-      ),
-    ),
   });
   const worker = FactoryWorker.layer.pipe(
     Layer.provide(failingStore(world)),
@@ -264,7 +314,7 @@ const setup = Effect.gen(function* () {
   );
   const layer = FactoryReactor.layer.pipe(
     Layer.provideMerge(worker),
-    Layer.provide(orchestrator),
+    Layer.provide(fakeEventSink(world, live, tailSubscribed)),
     Layer.provide(fakeProjections(world)),
     Layer.provideMerge(FactorySettings.layer),
     Layer.provideMerge(Factory.layerPersistence),
@@ -272,9 +322,14 @@ const setup = Effect.gen(function* () {
     Layer.provideMerge(NodeServices.layer),
     Layer.provide(Logger.layer([logger], { mergeWithExisting: false })),
   );
-  const publish = (event: OrchestrationV2DomainEvent) =>
-    PubSub.publish(domainEvents, event).pipe(Effect.asVoid);
-  return { world, layer, publish, tailSubscribed };
+  /** Appends the event to the log and publishes it, as EventSink does after a commit. */
+  const commit = (event: OrchestrationV2DomainEvent) =>
+    Effect.suspend(() => {
+      const stored = { sequence: world.events.length + 1, commandId: null, event };
+      world.events.push(stored);
+      return PubSub.publish(live, stored);
+    }).pipe(Effect.asVoid);
+  return { world, layer, commit, tailSubscribed };
 });
 
 type Harness = Effect.Success<typeof setup>;
@@ -335,7 +390,7 @@ describe("FactoryReactor run ends", () => {
         yield* launch(harness.world, f);
         yield* listen(harness);
 
-        yield* harness.publish(runUpdated(f.thread, f.run, "completed"));
+        yield* harness.commit(runUpdated(f.thread, f.run, "completed"));
         yield* drain;
 
         const state = yield* stateOf(f);
@@ -355,7 +410,7 @@ describe("FactoryReactor run ends", () => {
 
         for (const [index, status] of statuses.entries()) {
           const f = fixtures[index]!;
-          yield* harness.publish(runUpdated(f.thread, f.run, status));
+          yield* harness.commit(runUpdated(f.thread, f.run, status));
         }
         yield* drain;
 
@@ -387,7 +442,7 @@ describe("FactoryReactor run ends", () => {
         yield* TestClock.adjust("1 minute");
 
         for (const status of ["preparing", "queued", "starting", "running", "waiting"] as const) {
-          yield* harness.publish(runUpdated(f.thread, f.run, status));
+          yield* harness.commit(runUpdated(f.thread, f.run, status));
         }
         yield* drain;
 
@@ -406,7 +461,7 @@ describe("FactoryReactor run ends", () => {
         yield* TestClock.adjust("1 minute");
 
         // Even one naming the very run the delivery awaits.
-        yield* harness.publish(runUpdated(ThreadId.make("thread-unowned"), f.run, "failed"));
+        yield* harness.commit(runUpdated(ThreadId.make("thread-unowned"), f.run, "failed"));
         yield* drain;
 
         assert.deepStrictEqual(yield* rawRow(f), before);
@@ -424,7 +479,7 @@ describe("FactoryReactor run ends", () => {
         // no attempt names the thread. The yields let the reactor look the thread up before the
         // launch is stored; its step then waits for this delivery's lock.
         world.onRunRead = (threadId, runId) =>
-          harness.publish(runUpdated(threadId, runId, "failed")).pipe(
+          harness.commit(runUpdated(threadId, runId, "failed")).pipe(
             Effect.andThen(
               Effect.gen(function* () {
                 for (let turn = 0; turn < 20; turn += 1) yield* Effect.yieldNow;
@@ -458,7 +513,7 @@ describe("FactoryReactor thread deletion", () => {
         yield* launch(harness.world, f);
         yield* listen(harness);
 
-        yield* harness.publish(threadDeleted(f.thread));
+        yield* harness.commit(threadDeleted(f.thread));
         yield* drain;
 
         const state = yield* stateOf(f);
@@ -466,6 +521,55 @@ describe("FactoryReactor thread deletion", () => {
         assert.deepStrictEqual(state.block, { reason: "thread_deleted", threadId: f.thread });
         const [authorAttempt] = yield* attemptsOf(f);
         assert.strictEqual(authorAttempt?.outcome, "blocked");
+      }),
+    ),
+  );
+
+  it.effect("blocks a delivery whose author thread is deleted while it verifies", () =>
+    withReactor((harness) =>
+      Effect.gen(function* () {
+        const { world } = harness;
+        const f = fixture("a");
+        yield* listen(harness);
+        // The author's run completed and its attempt is active until the branch settles.
+        yield* insert(f, fold({ type: "start" }, launched(f), finished(f, "completed")));
+        const runs = yield* FactoryStageRunStore.FactoryStageRunStore;
+        yield* runs.append({ deliveryId: f.id, stage: "author", threadId: f.thread, runId: f.run });
+        const settings = yield* FactorySettings.FactorySettings;
+        yield* settings.set(projectId, withVerify);
+        world.verifyGate = yield* Deferred.make<void>();
+        const worker = yield* FactoryWorker.FactoryWorker;
+        yield* worker.step(f.id, settled);
+        yield* Deferred.await(world.verifyStarted);
+        // Verify runs: the author attempt is finished, and the verify attempt names no thread.
+        assert.deepStrictEqual(
+          (yield* attemptsOf(f)).map(({ stage, threadId, outcome }) => ({
+            stage,
+            threadId,
+            outcome,
+          })),
+          [
+            { stage: "author", threadId: f.thread, outcome: "passed" },
+            { stage: "verify", threadId: null, outcome: null },
+          ],
+        );
+
+        yield* harness.commit(threadDeleted(f.thread));
+        yield* drain;
+
+        const state = yield* stateOf(f);
+        assert.strictEqual(state.status, "blocked");
+        assert.strictEqual(state.stage, "verify");
+        assert.deepStrictEqual(state.block, { reason: "thread_deleted", threadId: f.thread });
+        assert.strictEqual((yield* attemptsOf(f))[1]?.outcome, "blocked");
+
+        // The verify run that was still going fails afterwards and changes nothing.
+        yield* Deferred.succeed(world.verifyGate, undefined);
+        yield* worker.drain;
+        assert.deepStrictEqual((yield* stateOf(f)).block, {
+          reason: "thread_deleted",
+          threadId: f.thread,
+        });
       }),
     ),
   );
@@ -480,7 +584,7 @@ describe("FactoryReactor thread deletion", () => {
         const attemptsBefore = yield* attemptsOf(f);
         yield* TestClock.adjust("1 minute");
 
-        yield* harness.publish(threadDeleted(ThreadId.make("thread-unrelated")));
+        yield* harness.commit(threadDeleted(ThreadId.make("thread-unrelated")));
         yield* drain;
 
         assert.deepStrictEqual(yield* rawRow(f), before);
@@ -543,6 +647,37 @@ describe("FactoryReactor boot sweep", () => {
           runStatus: "interrupted",
         });
         assert.deepStrictEqual(yield* rawRow(running), runningBefore);
+      }),
+    ),
+  );
+
+  it.effect("hands on a run that ended between the sweep's read and the tail's start", () =>
+    withReactor((harness) =>
+      Effect.gen(function* () {
+        const { world } = harness;
+        const f = fixture("a");
+        yield* launch(world, f);
+        world.subscribeGate = yield* Deferred.make<void>();
+        yield* start;
+        yield* drain;
+        // The sweep read the run as running, and the tail has not subscribed yet.
+        assert.strictEqual(world.projectionReads, 1);
+        assert.isFalse(yield* Deferred.isDone(harness.tailSubscribed));
+        assert.deepStrictEqual((yield* stateOf(f)).awaiting, {
+          type: "run",
+          threadId: f.thread,
+          runId: f.run,
+        });
+
+        world.projections.set(f.thread, {
+          deleted: false,
+          runs: [{ id: f.run, status: "completed" }],
+        });
+        yield* harness.commit(runUpdated(f.thread, f.run, "completed"));
+        yield* Deferred.succeed(world.subscribeGate, undefined);
+        yield* drain;
+
+        assert.deepStrictEqual((yield* stateOf(f)).awaiting, awaitingSettle(f));
       }),
     ),
   );
@@ -642,8 +777,8 @@ describe("FactoryReactor failures", () => {
         yield* listen(harness);
         world.unreadable.add(first.id);
 
-        yield* harness.publish(runUpdated(first.thread, first.run, "completed"));
-        yield* harness.publish(runUpdated(second.thread, second.run, "completed"));
+        yield* harness.commit(runUpdated(first.thread, first.run, "completed"));
+        yield* harness.commit(runUpdated(second.thread, second.run, "completed"));
         yield* drain;
         world.unreadable.delete(first.id);
 

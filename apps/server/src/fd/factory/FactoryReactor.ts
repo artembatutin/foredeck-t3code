@@ -6,8 +6,9 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as TxRef from "effect/TxRef";
 
-import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { isTerminalRunStatus } from "../../orchestration-v2/ThreadManagementService.ts";
 import { forkParked } from "../../serverActivation.ts";
@@ -18,17 +19,19 @@ import type { FactoryThreadEvent } from "./pipeline/state.ts";
 /**
  * Feeds what happens to Factory's threads into their deliveries: a terminal run becomes
  * `run.finished` and a deleted thread `thread.deleted` for the delivery whose active stage
- * attempt owns the thread; other threads pass by. The thread tail is live only, so a boot sweep
- * catches up the deliveries that were running when the previous server stopped.
+ * attempt owns the thread (any delivery recording it, for a deletion); other threads pass by.
+ * A boot sweep catches up the deliveries that were running when the previous server stopped, and
+ * the tail starts at the event log position read before it, so no event falls between the two.
  */
 export class FactoryReactor extends Context.Service<
   FactoryReactor,
   {
     readonly start: Effect.Effect<void, never, Scope.Scope>;
     /**
-     * Resolves once the boot sweep and every event received so far have been handled, including
-     * the steps they fed; the effects those steps queued are `FactoryWorker.drain`'s. Waits for
-     * `start`'s tail to subscribe. Tests await this instead of sleeping.
+     * Resolves once the boot sweep and every thread event committed before the call have been
+     * handled, including the steps they fed; the effects those steps queued are
+     * `FactoryWorker.drain`'s. Waits for `start` to read its log position. Tests await this
+     * instead of sleeping.
      */
     readonly drain: Effect.Effect<void>;
   }
@@ -37,11 +40,13 @@ export class FactoryReactor extends Context.Service<
 type Job = "boot" | FactoryThreadEvent;
 
 const make = Effect.gen(function* () {
-  const engine = yield* Orchestrator.OrchestratorV2;
+  const eventSink = yield* EventSink.EventSinkV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
   const worker = yield* FactoryWorker.FactoryWorker;
-  const subscribed = yield* Deferred.make<void>();
+  const ready = yield* Deferred.make<void>();
+  // The sequence of the last event the tail has read; jobs for events up to it are queued.
+  const handled = yield* TxRef.make(0);
 
   const logSkipped = (message: string) => (cause: unknown) =>
     Effect.logWarning(message, cause).pipe(Effect.asVoid);
@@ -88,9 +93,7 @@ const make = Effect.gen(function* () {
   const jobs = yield* makeDrainableWorker((job: Job) =>
     job === "boot"
       ? bootSweep
-      : worker
-          .stepThread(job)
-          .pipe(Effect.asVoid, Effect.catchCause(logSkipped("factory thread event skipped"))),
+      : worker.stepThread(job).pipe(Effect.catchCause(logSkipped("factory thread event skipped"))),
   );
 
   /** Run ends and thread deletions; everything else passes by. */
@@ -109,28 +112,43 @@ const make = Effect.gen(function* () {
     }
   };
 
-  // The sweep is queued as the parked tail subscribes, ahead of every event it delivers, rather
-  // than while the layer builds: restart recovery ends the runs that were active at shutdown
-  // before the server activates, and those events precede the tail. Swept then, a run reads as
-  // recovery left it, and whatever happens after the subscription arrives through the tail.
+  // The log position is read before the sweep, so the sweep reads every event up to it in the
+  // projections and the tail replays every later one from the log, however long the sweep takes.
+  // Their jobs queue behind the sweep. All of it waits for activation, so no Factory work runs
+  // in a server that never takes over.
   const start: FactoryReactor["Service"]["start"] = forkParked(
-    Stream.runForEach(
-      engine.streamDomainEvents.pipe(
-        Stream.onStart(
-          jobs.enqueue("boot").pipe(Effect.andThen(Deferred.succeed(subscribed, undefined))),
+    Effect.gen(function* () {
+      const position = yield* eventSink.latestSequence();
+      yield* TxRef.set(handled, position);
+      yield* jobs.enqueue("boot");
+      yield* Deferred.succeed(ready, undefined);
+      yield* Stream.runForEach(eventSink.stream({ afterSequence: position }), (stored) =>
+        onDomainEvent(stored.event).pipe(Effect.andThen(TxRef.set(handled, stored.sequence))),
+      );
+    }).pipe(
+      Effect.catchCause(logSkipped("factory thread event stream failed")),
+      // A tail that stopped hands on nothing more; drain must not wait for it.
+      Effect.ensuring(
+        TxRef.set(handled, Number.POSITIVE_INFINITY).pipe(
+          Effect.andThen(Deferred.succeed(ready, undefined)),
         ),
       ),
-      onDomainEvent,
-    ).pipe(
-      Effect.catchCause(logSkipped("factory thread event stream failed")),
-      Effect.ensuring(Deferred.succeed(subscribed, undefined)),
     ),
   );
 
-  return FactoryReactor.of({
-    start,
-    drain: Deferred.await(subscribed).pipe(Effect.andThen(jobs.drain)),
+  const drain = Effect.gen(function* () {
+    yield* Deferred.await(ready);
+    const target = yield* eventSink
+      .latestSequence()
+      .pipe(Effect.catchCause(() => Effect.succeed(0)));
+    yield* TxRef.get(handled).pipe(
+      Effect.flatMap((sequence) => (sequence >= target ? Effect.void : Effect.txRetry)),
+      Effect.tx,
+    );
+    yield* jobs.drain;
   });
+
+  return FactoryReactor.of({ start, drain });
 });
 
 export const layer = Layer.effect(FactoryReactor, make);

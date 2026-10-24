@@ -63,15 +63,12 @@ export class FactoryWorker extends Context.Service<
       FactoryStoreError
     >;
     /**
-     * Steps the delivery that owns the event's thread: the one whose active stage attempt names
-     * it, or whose launch or turn result naming it is being stored. None when no delivery does.
+     * Steps the deliveries the event's thread belongs to. A run's end goes to the delivery whose
+     * active stage attempt names the thread; a deletion goes to every active delivery that records
+     * the thread, since a delivery keeps its threads after their attempts finish. A delivery whose
+     * launch or turn result naming the thread is being stored gets either.
      */
-    readonly stepThread: (
-      event: FactoryThreadEvent,
-    ) => Effect.Effect<
-      Option.Option<FactoryDeliveryStore.StoredFactoryDelivery>,
-      FactoryStoreError
-    >;
+    readonly stepThread: (event: FactoryThreadEvent) => Effect.Effect<void, FactoryStoreError>;
     /**
      * Blocks a running delivery that awaits an effect this process never queued: the queue that
      * held it ended with an earlier server process. Nothing is re-run. Any other delivery is left
@@ -350,8 +347,9 @@ const make = Effect.gen(function* () {
    * instead, so the delivery records none of the result rather than wait on a run that ended.
    *
    * The thread is entered in `storing` before the read, so `stepThread` loses no end: one looked
-   * up before the entry exists was committed before the read, which sees it; one looked up while
-   * the entry stands is routed by it; one looked up after finds the attempt the store recorded.
+   * up before the entry exists was committed before the read, which sees it (a deletion cancels
+   * the thread's active runs in the same commit); one looked up while the entry stands is routed
+   * by it; one looked up after finds what the store recorded.
    */
   // Annotated like `step`: it closes the cycle `stepLocked` → lane → `runJob` → `feed`.
   const feed = (job: Job, event: FactoryEvent): ReturnType<FactoryWorker["Service"]["step"]> => {
@@ -384,15 +382,27 @@ const make = Effect.gen(function* () {
     );
   };
 
-  const stepThread: FactoryWorker["Service"]["stepThread"] = (event) =>
+  /** The deliveries `stepThread` steps; see there. */
+  const ownersOf = (event: FactoryThreadEvent) =>
     Effect.gen(function* () {
-      // The entry first: once it is gone, the store that held it has recorded the attempt.
-      const deliveryId =
-        storing.get(event.threadId) ??
-        Option.getOrUndefined(yield* stageRuns.findActiveByThread(event.threadId))?.deliveryId;
-      if (deliveryId === undefined) return Option.none();
-      return yield* step(deliveryId, event);
+      // The entry first: once it is gone, the store that held it has recorded the thread.
+      const storingFor = storing.get(event.threadId);
+      if (storingFor !== undefined) return [storingFor];
+      if (event.type === "run.finished") {
+        const attempt = yield* stageRuns.findActiveByThread(event.threadId);
+        return Option.toArray(Option.map(attempt, (run) => run.deliveryId));
+      }
+      return (yield* deliveries.listActive())
+        .filter(({ state }) => Object.values(state.threads).includes(event.threadId))
+        .map((delivery) => delivery.deliveryId);
     });
+
+  const stepThread: FactoryWorker["Service"]["stepThread"] = (event) =>
+    ownersOf(event).pipe(
+      Effect.flatMap((owners) =>
+        Effect.forEach(owners, (deliveryId) => step(deliveryId, event), { discard: true }),
+      ),
+    );
 
   const failInterruptedEffect: FactoryWorker["Service"]["failInterruptedEffect"] = (deliveryId) =>
     locks.withLock(
