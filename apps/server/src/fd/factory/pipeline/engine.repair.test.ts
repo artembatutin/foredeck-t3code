@@ -421,9 +421,11 @@ describe("fix-review rounds", () => {
       finished(reviewer, followUpRun),
     ).delivery;
     expect(accepted.reviews.map(({ round }) => round)).toEqual([1, 2]);
-    // Record is not built yet: the delivery blocks there, past the review.
     expect(accepted.stage).toBe("record");
-    expect(accepted.block).toEqual({ reason: "unsupported_stage", stage: "record" });
+    expect(accepted.awaiting).toEqual({
+      type: "effect",
+      effect: { id: accepted.effectsIssued, type: "record_approval" },
+    });
   });
 
   it("gives a follow-up round a fresh retry budget", () => {

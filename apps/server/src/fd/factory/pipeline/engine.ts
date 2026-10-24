@@ -1,6 +1,6 @@
 import { standardStages } from "./definitions.ts";
 import type { FactoryStageDefinition } from "./definitions.ts";
-import { acceptedReview, isTurnEffect, issue, receiptFailed } from "./state.ts";
+import { acceptedReview, blocked, isTurnEffect, issue, receiptFailed } from "./state.ts";
 import type {
   FactoryAcceptedReview,
   FactoryAdvance,
@@ -24,9 +24,6 @@ const step = (delivery: FactoryDeliveryState): FactoryAdvance => ({ delivery, ef
 
 /** A stale event's result: the very same state and no effects. */
 const unchanged = (delivery: FactoryDeliveryState) => step(delivery);
-
-const blocked = (delivery: FactoryDeliveryState, block: FactoryBlock) =>
-  step({ ...delivery, status: "blocked", awaiting: null, block });
 
 const begin = (delivery: FactoryDeliveryState, stage: FactoryStageDefinition): FactoryAdvance => {
   const lookup = stageHandler(stage.kind);
@@ -171,12 +168,13 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * effect, a run of another thread or an earlier run, a submission for another round, a stage it
  * is not in, a delivery that is not running) changes nothing.
  *
- * This covers a single item from start to a passing review: the author thread, the branch
- * settle check with at most one fix-commit turn, the verify command, then a reviewer thread
- * whose one accepted review per round is acted on once its run completes. A failed verify or a
- * blocking review gets a repair turn on the author thread while the task has rounds of that kind
- * left and the failure is new; the repaired branch is settled and verified again, and a review
- * round after a fix-review continues the same reviewer thread.
+ * This covers a single item from start to its approval: the author thread, the branch settle
+ * check with at most one fix-commit turn, the verify command, then a reviewer thread whose one
+ * accepted review per round is acted on once its run completes. A failed verify or a blocking
+ * review gets a repair turn on the author thread while the task has rounds of that kind left and
+ * the failure is new; the repaired branch is settled and verified again, and a review round after
+ * a fix-review continues the same reviewer thread. A passing review enters `record`, which
+ * approves the reviewed commit and leaves the delivery `approved`, awaiting nothing.
  */
 export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
   if (event.type === "start") {
@@ -318,6 +316,18 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
         retry: (counted, problems) =>
           issue(counted, { type: "send_review_retry_turn", threadId: read.threadId, problems }),
       });
+    }
+
+    case "approval.recorded": {
+      if (awaitedEffect(delivery, event.effectId, "record_approval") === undefined) {
+        return unchanged(delivery);
+      }
+      const { outcome } = event;
+      if (outcome.type === "approved") {
+        return step({ ...delivery, status: "approved", awaiting: null });
+      }
+      const { expected, actual, differences } = outcome;
+      return blocked(delivery, { reason: "record_mismatch", expected, actual, differences });
     }
 
     case "effect.failed":

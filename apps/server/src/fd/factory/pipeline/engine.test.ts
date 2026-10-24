@@ -260,6 +260,7 @@ describe("the engine's imports", () => {
         "engine.ts",
         "stages/agent.ts",
         "stages/command.ts",
+        "stages/gate.ts",
         "stages/registry.ts",
         "state.ts",
       ],

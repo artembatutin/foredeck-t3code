@@ -1,5 +1,5 @@
 import { AuthWorkReadScope, ThreadId } from "@t3tools/contracts";
-import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
+import { FactoryDeliveryId, FactoryTaskId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -7,6 +7,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
@@ -20,8 +21,9 @@ import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import { FactoryProjectMissingError } from "./FactoryThreadEffects.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
-import type { FactoryStoreError } from "./persistence/errors.ts";
+import { FactoryStoreError } from "./persistence/errors.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
+import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 import {
   acceptedReview,
   type FactoryAcceptedReview,
@@ -122,10 +124,11 @@ export class FactoryService extends Context.Service<
     /**
      * Starts a delivery of a single Work item. The author works on a new worktree of the branch
      * Work's thread starts would name, created from the canonical checkout's HEAD. The delivery
-     * is stored queued, then started, so its author launch is queued once the running state is
-     * stored. Refused, with nothing written: an item Work cannot read, a project without a
-     * verify command or not on this environment, a base the worktree cannot start from, or an
-     * item that already has a delivery that is not done or cancelled.
+     * is stored queued with the item as its one task, then started, so its author launch is
+     * queued once the running state is stored. Refused, with nothing written: an item Work
+     * cannot read, a project without a verify command or not on this environment, a base the
+     * worktree cannot start from, or an item that already has a delivery that is not done or
+     * cancelled.
      */
     readonly start: (input: {
       readonly itemRef: WorkItemRef;
@@ -157,12 +160,17 @@ export class FactoryService extends Context.Service<
 /** Factory reads the item to start and writes nothing to Work under this actor. */
 const itemReader: WorkActor = { id: "factory", grants: [AuthWorkReadScope], label: "Factory" };
 
+/** A single item is its delivery's one task; its approval is `approval-item.json`. */
+const SINGLE_ITEM_TASK = FactoryTaskId.make("item");
+
 const make = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
   const work = yield* WorkService.WorkService;
   const projects = yield* ProjectStore.ProjectStoreV2;
   const launches = yield* ThreadLaunch.ThreadLaunchService;
   const settings = yield* FactorySettings.FactorySettings;
   const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+  const tasks = yield* FactoryTaskStore.FactoryTaskStore;
   const worker = yield* FactoryWorker.FactoryWorker;
   const reviews = yield* FactoryReview.FactoryReview;
   const crypto = yield* Crypto.Crypto;
@@ -194,18 +202,28 @@ const make = Effect.gen(function* () {
           .pipe(Effect.mapError((cause) => new FactoryDeliveryIdError({ cause }))),
       );
       // The insert refuses an item with an active delivery inside its transaction, so of two
-      // concurrent starts only one is stored.
-      const queued = yield* deliveries.insert({
-        deliveryId,
-        projectId,
-        itemRef,
-        // The round limits stay those the delivery started with.
-        state: queuedDeliveryState({
-          branch: workspace.branch,
-          baseRef: workspace.baseRef,
-          limits: { maxFixRounds: limits.maxFixRounds, maxReviewRounds: limits.maxReviewRounds },
-        }),
-      });
+      // concurrent starts only one is stored. The item's task row is written in the same
+      // transaction: a refused start adds none, and no stored delivery lacks it.
+      const queued = yield* deliveries
+        .insert({
+          deliveryId,
+          projectId,
+          itemRef,
+          // The round limits stay those the delivery started with.
+          state: queuedDeliveryState({
+            branch: workspace.branch,
+            baseRef: workspace.baseRef,
+            limits: { maxFixRounds: limits.maxFixRounds, maxReviewRounds: limits.maxReviewRounds },
+          }),
+        })
+        .pipe(
+          Effect.tap(() => tasks.insert({ deliveryId, taskId: SINGLE_ITEM_TASK })),
+          sql.withTransaction,
+          Effect.catchTags({
+            SqlError: (cause) =>
+              Effect.fail(new FactoryStoreError({ operation: "service.start", cause })),
+          }),
+        );
       // A storage failure here leaves the delivery queued with nothing launched.
       const started = yield* worker.step(deliveryId, { type: "start" });
       return Option.getOrElse(started, () => queued);

@@ -15,6 +15,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as TxRef from "effect/TxRef";
 
 import type * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
+import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
@@ -132,6 +133,8 @@ const describeEffect = (effect: FactoryEffect) => {
       return `send the ${effect.kind} turn`;
     case "send_review_follow_up_turn":
       return "send the review follow-up turn";
+    case "record_approval":
+      return "record the approval";
   }
 };
 
@@ -170,7 +173,7 @@ const outcomeOf = (state: FactoryDeliveryState): FactoryStageRunStore.FactorySta
 
 /**
  * The evidence of the attempt a step finishes, with a failure's fingerprint: the command's
- * receipt (or log), or the review accepted in the review round being left.
+ * receipt (or log), the review accepted in the review round being left, or the approval.
  */
 const evidenceOf = (
   event: FactoryEvent,
@@ -181,6 +184,13 @@ const evidenceOf = (
     return {
       path: outcome.evidencePath,
       fingerprint: outcome.type === "receipt" ? outcome.fingerprint : undefined,
+    };
+  }
+  if (event.type === "approval.recorded") {
+    const { outcome } = event;
+    return {
+      path: outcome.type === "approved" ? outcome.evidencePath : undefined,
+      fingerprint: undefined,
     };
   }
   const review =
@@ -200,6 +210,7 @@ const make = Effect.gen(function* () {
   const verifyRunner = yield* FactoryVerifyRunner.FactoryVerifyRunner;
   const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
   const reviews = yield* FactoryReview.FactoryReview;
+  const records = yield* FactoryRecord.FactoryRecord;
   const gitContext = yield* Effect.context<FileSystem.FileSystem | GitVcsDriver.GitVcsDriver>();
   const scope = yield* Effect.scope;
   const locks = yield* KeyedLock.make<FactoryDeliveryId>();
@@ -329,6 +340,14 @@ const make = Effect.gen(function* () {
         return threads.sendRepairTurn(delivery, effect).pipe(Effect.map(turnStarted));
       case "send_review_follow_up_turn":
         return threads.sendReviewFollowUpTurn(delivery, effect).pipe(Effect.map(turnStarted));
+      case "record_approval":
+        return records.record(delivery).pipe(
+          Effect.map((outcome): FactoryEvent => ({
+            type: "approval.recorded",
+            effectId: effect.id,
+            outcome,
+          })),
+        );
     }
   };
 

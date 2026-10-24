@@ -599,7 +599,7 @@ const stateOf = (deliveryId: FactoryDeliveryId) =>
   delivery(deliveryId).pipe(Effect.map((stored: StoredFactoryDelivery) => stored.state));
 
 describe("Factory single-item delivery", () => {
-  it.live("launches the author on a new worktree, verifies it, then reviews it in plan mode", () =>
+  it.live("launches the author on a new worktree, verifies, reviews and approves it", () =>
     withProject(verifyCommands.passes, (world) =>
       Effect.gen(function* () {
         const author = yield* world.start;
@@ -700,10 +700,20 @@ describe("Factory single-item delivery", () => {
         );
         assert.strictEqual(yield* world.endRun(awaiting.runId, "completed"), "completed");
 
-        // Accepted from the fallback; record is not built yet, so the delivery stops there.
+        // Accepted from the fallback, then approved: the approval names the task the start stored.
         const reviewed = yield* stateOf(author.deliveryId);
         assert.strictEqual(reviewed.stage, "record");
-        assert.deepStrictEqual(reviewed.block, { reason: "unsupported_stage", stage: "record" });
+        assert.strictEqual(reviewed.status, "approved");
+        assert.isNull(reviewed.block);
+        const approval = JSON.parse(
+          yield* fileSystem.readFileString(path.join(evidence, "approval-item.json")),
+        );
+        assert.strictEqual(approval.deliveryId, author.deliveryId);
+        assert.strictEqual(approval.taskId, "item");
+        assert.strictEqual(approval.headSha, receipt?.headSha);
+        assert.strictEqual(approval.tree, receipt?.tree);
+        assert.strictEqual(approval.receiptPath, path.join(evidence, "verify-1.json"));
+        assert.strictEqual(approval.reviewPath, path.join(evidence, "review-1.json"));
         assert.deepStrictEqual(
           reviewed.reviews.map(({ round, source, summary, evidencePath }) => ({
             round,

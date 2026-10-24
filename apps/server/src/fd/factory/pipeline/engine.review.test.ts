@@ -40,10 +40,12 @@ const receipt: FactoryVerifyReceipt = {
 };
 
 // Effect ids, issued in order: the author launch (1), its settle check (2) and verify (3), then
-// the reviewer launch (4). A run that ends without an accepted review gets the fallback read (5);
-// an invalid one the retry turn (6), whose run gets the second fallback read (7).
+// the reviewer launch (4). The run's end issues the record effect (5) after an accepted passing
+// review, or else the fallback read (5); an invalid one gets the retry turn (6), whose run gets
+// the second fallback read (7).
 const VERIFY = 3;
 const REVIEW_LAUNCH = 4;
+const RECORD = 5;
 const FALLBACK = 5;
 const RETRY_TURN = 6;
 const SECOND_FALLBACK = 7;
@@ -205,12 +207,9 @@ describe("a submission while the reviewer runs", () => {
   });
 
   it("moves a passing review to record once the run completes", () => {
-    // Record is not built yet: the delivery blocks there, past the review.
+    // engine.record.test.ts covers what the record effect's result does.
     expect(advance(acceptedPassing, finished(reviewer, reviewRun))).toEqual(
-      blockedState(
-        { ...acceptedPassing, stage: "record" },
-        { reason: "unsupported_stage", stage: "record" },
-      ),
+      issued({ ...acceptedPassing, stage: "record" }, { id: RECORD, type: "record_approval" }),
     );
   });
 
@@ -291,22 +290,22 @@ describe("the fenced-JSON fallback", () => {
     );
   });
 
-  it.each([
-    [false, "record"],
-    [true, "review"],
-  ] as const)("acts at once on an accepted review (blocking: %s)", (blocking, stage) => {
+  it.each([false, true])("acts at once on an accepted review (blocking: %s)", (blocking) => {
     const delivery = withoutRounds(awaitingFallback);
     const step = advance(delivery, read(FALLBACK, accepted("fallback", blocking)));
     const reviews: FactoryDeliveryState["reviews"] = [
       { round: 1, source: "fallback", summary: summary(blocking), evidencePath },
     ];
     expect(step).toEqual(
-      blockedState(
-        { ...delivery, stage, reviews },
-        blocking
-          ? { reason: "review_changes_required", summary: summary(true) }
-          : { reason: "unsupported_stage", stage: "record" },
-      ),
+      blocking
+        ? blockedState(
+            { ...delivery, reviews },
+            { reason: "review_changes_required", summary: summary(true) },
+          )
+        : issued(
+            { ...delivery, stage: "record", reviews },
+            { id: FALLBACK + 1, type: "record_approval" },
+          ),
     );
   });
 

@@ -134,3 +134,15 @@ author's reply, labelled as claims to check against the code. Turns of later rou
 high-risk tasks raise the effort of the model the thread runs with, only to a value its options
 offer and never below what was chosen
 ([`effort.ts`](../../apps/server/src/fd/factory/pipeline/effort.ts)).
+
+## Record checks the worktree again
+
+Record is the gate the server passes on its own. It reads the worktree again instead of trusting
+the review's check: a review is accepted while the reviewer's run is still going, and nothing
+stops a commit or an edit in the shared worktree before that run ends. HEAD and its tree must be
+the ones the last receipt recorded, HEAD must be the commit the accepted review judged, and the
+worktree must be clean. Otherwise nothing is written and the delivery blocks, naming both commits.
+Numbered verify and review evidence is never overwritten, but a task has one current approval: a
+later approval of the task replaces its `approval-<taskId>.json` and `lastReviewedSha`. A single
+item is its delivery's one task, written in the transaction that inserts the delivery. See
+[`FactoryRecord.ts`](../../apps/server/src/fd/factory/FactoryRecord.ts).

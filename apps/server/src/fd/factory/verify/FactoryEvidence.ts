@@ -1,4 +1,4 @@
-import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
+import type { FactoryDeliveryId, FactoryTaskId } from "@t3tools/contracts/fd/factory";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -43,6 +43,11 @@ export class FactoryEvidence extends Context.Service<
       deliveryId: FactoryDeliveryId,
       prefix: "verify" | "review",
     ) => Effect.Effect<FactoryEvidenceRun, FactoryEvidenceError>;
+    /** The task's `approval-<taskId>.json` path in the delivery's folder, created on demand. */
+    readonly approvalFile: (
+      deliveryId: FactoryDeliveryId,
+      taskId: FactoryTaskId,
+    ) => Effect.Effect<string, FactoryEvidenceError>;
   }
 >()("t3/fd/factory/verify/FactoryEvidence") {}
 
@@ -52,15 +57,20 @@ const make = Effect.gen(function* () {
   const path = yield* Path.Path;
   const root = path.join(config.stateDir, "fd-factory");
 
+  const directoryOf = (deliveryId: FactoryDeliveryId) => {
+    const directory = path.join(root, deliveryId);
+    return fileSystem.makeDirectory(directory, { recursive: true }).pipe(
+      Effect.as(directory),
+      Effect.catchTags({
+        PlatformError: (cause) =>
+          Effect.fail(new FactoryEvidenceError({ operation: "create", path: directory, cause })),
+      }),
+    );
+  };
+
   return FactoryEvidence.of({
     nextRun: Effect.fn("FactoryEvidence.nextRun")(function* (deliveryId, prefix) {
-      const directory = path.join(root, deliveryId);
-      yield* fileSystem.makeDirectory(directory, { recursive: true }).pipe(
-        Effect.catchTags({
-          PlatformError: (cause) =>
-            Effect.fail(new FactoryEvidenceError({ operation: "create", path: directory, cause })),
-        }),
-      );
+      const directory = yield* directoryOf(deliveryId);
       const names = yield* fileSystem.readDirectory(directory).pipe(
         Effect.catchTags({
           PlatformError: (cause) =>
@@ -73,6 +83,9 @@ const make = Effect.gen(function* () {
         number,
         file: (extension) => path.join(directory, `${prefix}-${number}.${extension}`),
       };
+    }),
+    approvalFile: Effect.fn("FactoryEvidence.approvalFile")(function* (deliveryId, taskId) {
+      return path.join(yield* directoryOf(deliveryId), `approval-${taskId}.json`);
     }),
   });
 });

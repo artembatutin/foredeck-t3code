@@ -4,11 +4,15 @@ import type { FactoryStageDefinition } from "../definitions.ts";
 import type { FactoryAdvance, FactoryDeliveryState } from "../state.ts";
 import { agentStage } from "./agent.ts";
 import { commandStage } from "./command.ts";
+import { gateStage } from "./gate.ts";
 
 /** One handler per stage kind. Handlers are pure, like the engine that calls them. */
 export interface FactoryStageHandler<K extends FactoryStageKind> {
   readonly kind: K;
-  /** Enters the stage: records it, what the delivery now awaits, and the effect doing its work. */
+  /**
+   * Enters the stage: records it, what the delivery now awaits, and the effect doing its work. A
+   * stage of the kind that the handler cannot run yet blocks there as `unsupported_stage`.
+   */
   readonly begin: (
     delivery: FactoryDeliveryState,
     stage: Extract<FactoryStageDefinition, { readonly kind: K }>,
@@ -22,7 +26,7 @@ export type FactoryStageLookup<K extends FactoryStageKind> =
 const registry: { readonly [K in FactoryStageKind]: FactoryStageLookup<K> } = {
   agent: { type: "supported", handler: agentStage },
   command: { type: "supported", handler: commandStage },
-  gate: { type: "unsupported", kind: "gate" },
+  gate: { type: "supported", handler: gateStage },
   integrate: { type: "unsupported", kind: "integrate" },
   pr: { type: "unsupported", kind: "pr" },
 };

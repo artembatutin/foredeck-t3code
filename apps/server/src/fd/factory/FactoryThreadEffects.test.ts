@@ -42,6 +42,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService } from "../work-management/index.ts";
+import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
@@ -205,6 +206,8 @@ const makeLayer = (world: World) =>
       Layer.mergeAll(
         FactoryThreadEffects.layer,
         FactoryReview.layer.pipe(Layer.provide(FactoryEvidence.layer)),
+        // No delivery here reaches record; FactoryRecord.test.ts covers it.
+        Layer.mock(FactoryRecord.FactoryRecord)({}),
       ),
     ),
     Layer.provide(fakes(world)),

@@ -19,6 +19,7 @@ import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProcessRunner from "../../processRunner.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
+import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
@@ -99,8 +100,10 @@ const makeLayer = (script: ThreadScript) =>
   FactoryWorker.layer.pipe(
     Layer.provide(observedStore(script)),
     Layer.provide(scriptedThreads(script)),
-    // Reviews are judged in FactoryReview.test.ts; here no review is submitted.
+    // Reviews are judged in FactoryReview.test.ts and approvals recorded in FactoryRecord.test.ts;
+    // here no review is submitted.
     Layer.provide(Layer.mock(FactoryReview.FactoryReview)({})),
+    Layer.provide(Layer.mock(FactoryRecord.FactoryRecord)({})),
     Layer.provide(
       FactoryVerifyRunner.layer.pipe(
         Layer.provide(FactoryEvidence.layer),

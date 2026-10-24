@@ -10,7 +10,11 @@ import {
   type ServerProvider,
   ThreadId,
 } from "@t3tools/contracts";
-import { FactoryDeliveryId, FactoryProjectSettings } from "@t3tools/contracts/fd/factory";
+import {
+  FactoryDeliveryId,
+  FactoryProjectSettings,
+  FactoryTaskId,
+} from "@t3tools/contracts/fd/factory";
 import {
   type WorkItemDetail,
   WorkItemId,
@@ -36,6 +40,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService } from "../work-management/index.ts";
+import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactoryService from "./FactoryService.ts";
 import * as FactorySettings from "./FactorySettings.ts";
@@ -44,6 +49,7 @@ import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
+import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 import { advance } from "./pipeline/engine.ts";
 import { failureFingerprint } from "./pipeline/fingerprint.ts";
 import { queuedDeliveryState } from "./pipeline/state.ts";
@@ -216,14 +222,16 @@ const fakes = (world: World) =>
   );
 
 /**
- * The service, worker, thread effects, review judging and verify runner as the server builds
- * them, on in-memory SQLite, real git, real processes and an evidence folder under a temp T3 home.
+ * The service, worker, thread effects, review judging, record and verify runner as the server
+ * builds them, on in-memory SQLite, real git, real processes and an evidence folder under a temp
+ * T3 home.
  */
 const makeLayer = (world: World) =>
   FactoryService.layer.pipe(
     Layer.provideMerge(FactoryWorker.layer),
     Layer.provideMerge(FactoryThreadEffects.layer),
     Layer.provide(FactoryReview.layer),
+    Layer.provide(FactoryRecord.layer),
     Layer.provide(FactoryVerifyRunner.layer.pipe(Layer.provide(ProcessRunner.layer))),
     Layer.provide(FactoryEvidence.layer),
     Layer.provide(fakes(world)),
@@ -359,6 +367,10 @@ const authorFinishes = (
     );
     yield* Effect.flatMap(FactoryDeliveryStore.FactoryDeliveryStore, (deliveries) =>
       deliveries.insert({ deliveryId, projectId, itemRef, state: initial }),
+    );
+    // The item's one task, as FactoryService.start stores it.
+    yield* Effect.flatMap(FactoryTaskStore.FactoryTaskStore, (tasks) =>
+      tasks.insert({ deliveryId, taskId: FactoryTaskId.make("item") }),
     );
     // The attempt the worker would have recorded for the author's launch.
     yield* Effect.flatMap(FactoryStageRunStore.FactoryStageRunStore, (runs) =>
@@ -692,11 +704,13 @@ describe("fix-review rounds", () => {
           assert.strictEqual(retry?.threadId, reviewer);
           assert.strictEqual(retry?.commandId, `factory-review-retry:${deliveryId}:10`);
 
-          // The retry answers in a fenced block, judged against the repaired commit.
+          // The retry answers in a fenced block, judged against the repaired commit, which
+          // record then approves.
           world.messages.set(runOf(retry), [fenced(passingReview)]);
           yield* runEnds(reviewer, runOf(retry));
           const passed = yield* state;
           assert.strictEqual(passed.stage, "record");
+          assert.strictEqual(passed.status, "approved");
           assert.deepStrictEqual(
             passed.reviews.map(({ round, source, summary }) => ({
               round,
@@ -724,9 +738,13 @@ describe("fix-review rounds", () => {
               { stage: "repair", threadId: author, outcome: "passed" },
               { stage: "verify", threadId: null, outcome: "passed" },
               { stage: "review", threadId: reviewer, outcome: "passed" },
-              { stage: "record", threadId: null, outcome: "blocked" },
+              { stage: "record", threadId: null, outcome: "passed" },
             ],
           );
+          const [task] = yield* Effect.flatMap(FactoryTaskStore.FactoryTaskStore, (tasks) =>
+            tasks.listByDelivery(deliveryId),
+          );
+          assert.strictEqual(task?.lastReviewedSha, yield* git(cwd, ["rev-parse", "HEAD"]));
         }),
       ),
   );

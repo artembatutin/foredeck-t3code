@@ -94,7 +94,12 @@ export type FactoryEffectRequest =
       readonly type: "send_review_follow_up_turn";
       readonly threadId: ThreadId;
       readonly round: number;
-    };
+    }
+  /**
+   * The record gate: approve the delivery's task for the worktree's commit, which must be the one
+   * its last receipt verified and its last accepted review judged, on a clean tree.
+   */
+  | { readonly type: "record_approval" };
 
 export type FactoryRepairKind = "fix-verify" | "fix-review";
 
@@ -191,6 +196,38 @@ export type FactoryReviewJudgment =
   | { readonly type: "invalid"; readonly problems: ReadonlyArray<string> }
   | { readonly type: "code_changed"; readonly changes: ReadonlyArray<FactoryReceiptRefusal> };
 
+/** A commit and its tree. */
+export interface FactoryCommit {
+  readonly headSha: string;
+  readonly tree: string;
+}
+
+/** How the worktree at record differs from the verified, reviewed commit on a clean tree. */
+export type FactoryRecordDifference =
+  /** HEAD is not the commit the receipt verified. */
+  | "head_changed"
+  /** HEAD's tree is not the tree the receipt verified. */
+  | "tree_changed"
+  /** HEAD is not the commit the accepted review judged. */
+  | "not_reviewed"
+  /** The worktree has staged, unstaged or untracked changes. */
+  | "tree_dirty";
+
+/**
+ * A `record_approval` result. `approved` wrote the task's `approval-<taskId>.json`
+ * (`evidencePath`, which the worker records on the stage attempt) and set its `lastReviewedSha`;
+ * `mismatch` wrote nothing.
+ */
+export type FactoryRecordOutcome =
+  | { readonly type: "approved"; readonly evidencePath: string }
+  | {
+      readonly type: "mismatch";
+      /** The commit the receipt verified. */
+      readonly expected: FactoryCommit;
+      readonly actual: FactoryCommit & { readonly clean: boolean };
+      readonly differences: ReadonlyArray<FactoryRecordDifference>;
+    };
+
 /**
  * What the engine folds in. The worker's results name the effect they answer by `effectId`;
  * the reactor's run and thread events name the thread and run they observed.
@@ -250,6 +287,12 @@ export type FactoryEvent =
       readonly effectId: number;
       readonly judgment: FactoryReviewJudgment;
     }
+  /** A `record_approval` result. */
+  | {
+      readonly type: "approval.recorded";
+      readonly effectId: number;
+      readonly outcome: FactoryRecordOutcome;
+    }
   /** The worker could not carry out the effect; `detail` is bounded and safe to show. */
   | { readonly type: "effect.failed"; readonly effectId: number; readonly detail: string };
 
@@ -288,7 +331,14 @@ export type FactoryBlock =
   /** A review was submitted after HEAD moved from the verified receipt or the tree got dirty. */
   | { readonly reason: "code_changed"; readonly changes: ReadonlyArray<FactoryReceiptRefusal> }
   /** The submission after the one corrected retry was invalid too; these are its problems. */
-  | { readonly reason: "invalid_submission"; readonly problems: ReadonlyArray<string> };
+  | { readonly reason: "invalid_submission"; readonly problems: ReadonlyArray<string> }
+  /** At record, the worktree no longer held the verified, reviewed commit on a clean tree. */
+  | {
+      readonly reason: "record_mismatch";
+      readonly expected: FactoryCommit;
+      readonly actual: FactoryCommit & { readonly clean: boolean };
+      readonly differences: ReadonlyArray<FactoryRecordDifference>;
+    };
 
 /** How many repair rounds of each kind a task may spend. */
 export interface FactoryRoundLimits {
@@ -357,6 +407,12 @@ export const issue = (
     effects: [effect],
   };
 };
+
+/** Blocks the delivery for `block`: it awaits nothing until its owner acts. */
+export const blocked = (delivery: FactoryDeliveryState, block: FactoryBlock): FactoryAdvance => ({
+  delivery: { ...delivery, status: "blocked", awaiting: null, block },
+  effects: [],
+});
 
 export const queuedDeliveryState = (input: {
   readonly branch: string;

@@ -26,6 +26,7 @@ import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkDomainError, WorkService } from "../work-management/index.ts";
+import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactoryService from "./FactoryService.ts";
 import * as FactorySettings from "./FactorySettings.ts";
@@ -140,9 +141,11 @@ const fakes = (world: World) =>
         }),
       runEnded: () => Effect.succeedNone,
     }),
-    // Nothing here reaches verify, a settle check or a review; FactoryReview.test.ts covers those.
+    // Nothing here reaches verify, a settle check, a review or record; FactoryReview.test.ts and
+    // FactoryRecord.test.ts cover those.
     Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({}),
     Layer.mock(FactoryReview.FactoryReview)({}),
+    Layer.mock(FactoryRecord.FactoryRecord)({}),
     Layer.mock(GitVcsDriver.GitVcsDriver)({}),
   );
 
@@ -193,14 +196,17 @@ const rowCounts = Effect.gen(function* () {
   const [stageRuns] = yield* sql<{ readonly count: number }>`
     SELECT COUNT(*) AS count FROM fd_factory_stage_runs
   `;
-  return { deliveries: deliveries?.count, stageRuns: stageRuns?.count };
+  const [tasks] = yield* sql<{ readonly count: number }>`
+    SELECT COUNT(*) AS count FROM fd_factory_tasks
+  `;
+  return { deliveries: deliveries?.count, stageRuns: stageRuns?.count, tasks: tasks?.count };
 });
 
 /** Asserts the refused start wrote nothing and launched nothing, once queued work has run. */
 const assertNothingStarted = (world: World) =>
   Effect.gen(function* () {
     yield* drain;
-    assert.deepStrictEqual(yield* rowCounts, { deliveries: 0, stageRuns: 0 });
+    assert.deepStrictEqual(yield* rowCounts, { deliveries: 0, stageRuns: 0, tasks: 0 });
     const active = yield* Effect.flatMap(FactoryDeliveryStore.FactoryDeliveryStore, (store) =>
       store.listActive(),
     );
@@ -269,7 +275,7 @@ describe("FactoryService.start", () => {
           threadId: ThreadId.make(`thread-${started.deliveryId}`),
           runId: RunId.make(`run-${started.deliveryId}`),
         });
-        assert.deepStrictEqual(yield* rowCounts, { deliveries: 1, stageRuns: 1 });
+        assert.deepStrictEqual(yield* rowCounts, { deliveries: 1, stageRuns: 1, tasks: 1 });
       }),
     ),
   );
@@ -334,7 +340,7 @@ describe("FactoryService.start", () => {
         assert.strictEqual(error.deliveryId, first.deliveryId);
         yield* drain;
         assert.strictEqual(world.launches.length, 1);
-        assert.deepStrictEqual(yield* rowCounts, { deliveries: 1, stageRuns: 1 });
+        assert.deepStrictEqual(yield* rowCounts, { deliveries: 1, stageRuns: 1, tasks: 1 });
       }),
     ),
   );
@@ -374,7 +380,7 @@ describe("FactoryService.start", () => {
             [first.deliveryId, second.deliveryId],
           );
           assert.strictEqual(Option.getOrThrow(yield* get(first.deliveryId)).state.status, status);
-          assert.strictEqual((yield* rowCounts).deliveries, 2);
+          assert.deepStrictEqual(yield* rowCounts, { deliveries: 2, stageRuns: 2, tasks: 2 });
         }),
       ),
   );
@@ -414,7 +420,7 @@ describe("FactoryService.start", () => {
           world.launches.map(({ deliveryId }) => deliveryId),
           stored,
         );
-        assert.deepStrictEqual(yield* rowCounts, { deliveries: 1, stageRuns: 1 });
+        assert.deepStrictEqual(yield* rowCounts, { deliveries: 1, stageRuns: 1, tasks: 1 });
       }),
     ),
   );

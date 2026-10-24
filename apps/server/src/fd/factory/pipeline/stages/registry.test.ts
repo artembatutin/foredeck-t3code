@@ -11,7 +11,7 @@ const delivery = {
 };
 
 describe("stageHandler", () => {
-  it("registers the agent and command handlers and nothing else yet", () => {
+  it("registers the agent, command and gate handlers and nothing else yet", () => {
     const lookups = FactoryStageKind.literals.map((kind) => [kind, stageHandler(kind)] as const);
     expect(
       lookups.map(([kind, lookup]) => [
@@ -21,10 +21,38 @@ describe("stageHandler", () => {
     ).toEqual([
       ["agent", "agent"],
       ["command", "command"],
-      ["gate", { type: "unsupported", kind: "gate" }],
+      ["gate", "gate"],
       ["integrate", { type: "unsupported", kind: "integrate" }],
       ["pr", { type: "unsupported", kind: "pr" }],
     ]);
+  });
+
+  it("begins record by recording the approval, and blocks plan approval as unsupported", () => {
+    const lookup = stageHandler("gate");
+    if (lookup.type !== "supported") throw new Error("gate stages are supported");
+
+    const record = { id: 1, type: "record_approval" } as const;
+    expect(lookup.handler.begin(delivery, standardStages.record)).toEqual({
+      delivery: {
+        ...delivery,
+        stage: "record",
+        effectsIssued: 1,
+        awaiting: { type: "effect", effect: record },
+      },
+      effects: [record],
+    });
+
+    // The owner's gate is not built yet: the delivery stops there and issues nothing.
+    expect(lookup.handler.begin(delivery, standardStages.approve_plan)).toEqual({
+      delivery: {
+        ...delivery,
+        stage: "approve_plan",
+        status: "blocked",
+        awaiting: null,
+        block: { reason: "unsupported_stage", stage: "approve_plan" },
+      },
+      effects: [],
+    });
   });
 
   it("begins an agent stage by launching the stage role's thread", () => {

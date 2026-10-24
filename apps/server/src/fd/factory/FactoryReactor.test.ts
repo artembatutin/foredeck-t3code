@@ -31,6 +31,7 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as FactoryReactor from "./FactoryReactor.ts";
+import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
@@ -313,8 +314,9 @@ const setup = Effect.gen(function* () {
     Layer.provide(failingStore(world)),
     Layer.provide(fakeThreads(world)),
     Layer.provide(fakeVerify(world)),
-    // No delivery here reaches a review.
+    // No delivery here reaches a review or record.
     Layer.provide(Layer.mock(FactoryReview.FactoryReview)({})),
+    Layer.provide(Layer.mock(FactoryRecord.FactoryRecord)({})),
     Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({ execute: () => Effect.never })),
   );
   const layer = FactoryReactor.layer.pipe(

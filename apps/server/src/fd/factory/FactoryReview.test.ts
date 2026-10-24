@@ -11,6 +11,7 @@ import {
 import {
   FactoryDeliveryId,
   FactoryProjectSettings,
+  FactoryTaskId,
   type FactoryVerifyReceipt,
 } from "@t3tools/contracts/fd/factory";
 import {
@@ -39,6 +40,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService } from "../work-management/index.ts";
+import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactoryService from "./FactoryService.ts";
 import * as FactorySettings from "./FactorySettings.ts";
@@ -47,6 +49,7 @@ import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
+import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 import { advance } from "./pipeline/engine.ts";
 import { queuedDeliveryState } from "./pipeline/state.ts";
 import type { FactoryDeliveryState, FactoryEvent, FactoryRoundLimits } from "./pipeline/state.ts";
@@ -187,14 +190,15 @@ const fakes = (world: World) =>
   );
 
 /**
- * FactoryService, the worker, the thread effects and review judging as the server builds them,
- * on in-memory SQLite, real git and an evidence folder under a temp T3 home.
+ * FactoryService, the worker, the thread effects, review judging and record as the server builds
+ * them, on in-memory SQLite, real git and an evidence folder under a temp T3 home.
  */
 const makeLayer = (world: World) =>
   FactoryService.layer.pipe(
     Layer.provideMerge(FactoryWorker.layer),
     Layer.provide(FactoryThreadEffects.layer),
     Layer.provide(FactoryReview.layer),
+    Layer.provide(FactoryRecord.layer),
     Layer.provide(FactoryEvidence.layer),
     Layer.provide(fakes(world)),
     Layer.provide(ProviderRegistryMock.layer()),
@@ -296,6 +300,9 @@ const makeWorktree = (world: World) =>
     return { cwd, baseline };
   });
 
+/** Where the verify runner would have written the receipt below. */
+const receiptPath = "/t3/userdata/fd-factory/delivery-1/verify-1.json";
+
 /**
  * Stores the delivery as verify left it, feeds the passing receipt of the worktree's commit, and
  * returns once the reviewer's launch is stored and the delivery awaits its run.
@@ -341,6 +348,10 @@ const startReview = (world: World, limits?: FactoryRoundLimits) =>
     yield* Effect.flatMap(store, (deliveries) =>
       deliveries.insert({ deliveryId, projectId, itemRef, state }),
     );
+    // The item's one task, as FactoryService.start stores it.
+    yield* Effect.flatMap(FactoryTaskStore.FactoryTaskStore, (tasks) =>
+      tasks.insert({ deliveryId, taskId: FactoryTaskId.make("item") }),
+    );
     // The attempts the worker would have recorded: the author's passed, verify's is running.
     const runs = yield* FactoryStageRunStore.FactoryStageRunStore;
     const authored = yield* runs.append({
@@ -358,7 +369,11 @@ const startReview = (world: World, limits?: FactoryRoundLimits) =>
     yield* runs.append({ deliveryId, stage: "verify" });
     // The author's own account of its work, which a first-round reviewer must never see.
     world.messages.set(authorRun, ["Done. AUTHOR-CLAIM: every criterion is verified."]);
-    yield* step({ type: "command.finished", effectId: 3, outcome: { type: "receipt", receipt } });
+    yield* step({
+      type: "command.finished",
+      effectId: 3,
+      outcome: { type: "receipt", receipt, evidencePath: receiptPath },
+    });
     yield* drain;
     return { cwd, baseline, receipt };
   });
@@ -644,9 +659,10 @@ describe("FactoryService.submitReview accepted reviews", () => {
           yield* step(reviewerFinished(reviewRun));
           yield* drain;
 
+          // FactoryRecord.test.ts covers the approval itself.
           const state = yield* stored;
           assert.strictEqual(state.stage, "record");
-          assert.deepStrictEqual(state.block, { reason: "unsupported_stage", stage: "record" });
+          assert.strictEqual(state.status, "approved");
           assert.deepStrictEqual(
             (yield* attempts).map(({ stage, outcome, evidencePath }) => ({
               stage,
@@ -655,9 +671,13 @@ describe("FactoryService.submitReview accepted reviews", () => {
             })),
             [
               { stage: "author", outcome: "passed", evidencePath: null },
-              { stage: "verify", outcome: "passed", evidencePath: null },
+              { stage: "verify", outcome: "passed", evidencePath: receiptPath },
               { stage: "review", outcome: "passed", evidencePath },
-              { stage: "record", outcome: "blocked", evidencePath: null },
+              {
+                stage: "record",
+                outcome: "passed",
+                evidencePath: `${directory}/approval-item.json`,
+              },
             ],
           );
         }),

@@ -99,7 +99,10 @@ const StoredEffect = Schema.Union([
     threadId: ThreadId,
     round: PositiveInt,
   }),
+  Schema.Struct({ id: PositiveInt, type: Schema.Literal("record_approval") }),
 ]);
+
+const StoredCommit = { headSha: Schema.String, tree: Schema.String };
 
 const StoredAwaiting = Schema.Union([
   Schema.Struct({ type: Schema.Literal("effect"), effect: StoredEffect }),
@@ -133,6 +136,14 @@ const StoredBlock = Schema.Union([
   }),
   Schema.Struct({ reason: Schema.Literal("code_changed"), changes: ReceiptRefusals }),
   Schema.Struct({ reason: Schema.Literal("invalid_submission"), problems: Problems }),
+  Schema.Struct({
+    reason: Schema.Literal("record_mismatch"),
+    expected: Schema.Struct(StoredCommit),
+    actual: Schema.Struct({ ...StoredCommit, clean: Schema.Boolean }),
+    differences: Schema.Array(
+      Schema.Literals(["head_changed", "tree_changed", "not_reviewed", "tree_dirty"]),
+    ),
+  }),
 ]);
 
 const StoredAcceptedReview = Schema.Struct({
