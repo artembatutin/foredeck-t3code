@@ -1,4 +1,5 @@
 import { ProjectAssistant } from "../../../fd/assistant/index.ts";
+import { FactoryService } from "../../../fd/factory/index.ts";
 import { WorkService, WorkThreads } from "../../../fd/work-management/index.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../../orchestration-v2/ProjectionStore.ts";
@@ -41,6 +42,7 @@ const layerStubServices = Layer.mergeAll(
   Layer.mock(ProjectAssistant.ProjectAssistant)({}),
   Layer.mock(WorkService.WorkService)({}),
   Layer.mock(WorkThreads.WorkThreads)({}),
+  Layer.mock(FactoryService.FactoryService)({}),
   Layer.mock(Orchestrator.OrchestratorV2)({}),
   Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
   Layer.mock(DeviceService.DeviceService)({}),
@@ -163,6 +165,7 @@ it.effect("production mcp layer lists worktree tools over http", () =>
         "work_comment",
         "work_link_thread",
         "work_start_thread",
+        "factory_submit_review",
       ])
         expect(toolNames).toContain(name);
 

@@ -1200,8 +1200,17 @@ export function makeClaudeQueryOptions(input: {
 
 export const CLAUDE_T3_MCP_TOOL_WILDCARD = "mcp__t3-code__*";
 
-// Must stay in sync with the Tool.Readonly annotations on OrchestratorToolkit;
-// ClaudeAdapterV2.test.ts cross-checks this list against the toolkit.
+// The one declared exception to the read-only allowlist below: Factory's planner and reviewer
+// work in plan mode and must reach their submit tools. A submission records only the calling
+// thread's own plan or review, never files or threads, and Factory refuses any thread that is
+// not the registered planner or reviewer of an active stage.
+export const CLAUDE_READ_ONLY_T3_MCP_SUBMIT_TOOLS: ReadonlyArray<string> = [
+  "mcp__t3-code__factory_submit_plan",
+  "mcp__t3-code__factory_submit_review",
+];
+
+// Apart from the submit tools above, must stay in sync with the Tool.Readonly annotations on
+// OrchestratorToolkit; ClaudeAdapterV2.test.ts cross-checks this list against the toolkit.
 export const CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS: ReadonlyArray<string> = [
   "mcp__t3-code__orchestrator_capabilities",
   "mcp__t3-code__list_scheduled_tasks",
@@ -1224,6 +1233,7 @@ export const CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS: ReadonlyArray<string> = [
   "mcp__t3-code__html_render",
   "mcp__t3-code__work_list",
   "mcp__t3-code__work_read",
+  ...CLAUDE_READ_ONLY_T3_MCP_SUBMIT_TOOLS,
 ];
 
 // Claude Code aborts an HTTP MCP call after 60 s ("The operation timed out.")
@@ -1237,8 +1247,8 @@ export const CLAUDE_T3_MCP_TOOL_TIMEOUT_MS = 65 * 60 * 1_000;
 // separate `tools` option. Attaching the t3-code MCP server therefore always
 // pre-approves its tools (headless modes like `dontAsk` deny anything that is
 // not pre-approved), but read-only sandboxes pre-approve only the annotated
-// read-only orchestrator tools so a read-only session cannot silently spawn
-// threads or scheduled tasks.
+// read-only orchestrator tools (and the declared submit-tool exception) so a
+// read-only session cannot silently spawn threads or scheduled tasks.
 //
 // The header carries the credential itself: the query runner sends
 // `mcpServers` over the CLI's stdin, never its argv or environment.

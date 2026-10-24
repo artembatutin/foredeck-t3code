@@ -25,6 +25,8 @@ export * as FactoryService from "./FactoryService.ts";
 export * as FactorySettings from "./FactorySettings.ts";
 export * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 export * as FactoryWorker from "./FactoryWorker.ts";
+export { toolLayer as factoryToolLayer } from "./mcp/handlers.ts";
+export { FactoryToolkit } from "./mcp/tools.ts";
 
 /**
  * Factory persistence on the core-migrated SQL client. The `fd_factory_migrations` ledger

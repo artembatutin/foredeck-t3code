@@ -4,6 +4,7 @@ import {
   assistantToolRefusal,
 } from "../fd/assistant/index.ts";
 import { WorkToolkit, workToolLayer } from "../fd/work-management/index.ts";
+import { FactoryToolkit, factoryToolLayer } from "../fd/factory/index.ts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -887,6 +888,7 @@ export const layer = Layer.mergeAll(
   layerProjectRegistration,
   toolkitRegistration(AssistantToolkit, assistantToolLayer),
   toolkitRegistration(WorkToolkit, workToolLayer),
+  toolkitRegistration(FactoryToolkit, factoryToolLayer),
   layerEnvironmentToolkit,
   layerPreviewControlsRegistration,
   layerWorktreeToolkitRegistration,

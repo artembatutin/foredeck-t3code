@@ -20,3 +20,4 @@ export {
   FactoryReviewSummary,
   FactoryDelivery,
 } from "./schemas.ts";
+export { FactoryMcpFailure } from "./mcp.ts";

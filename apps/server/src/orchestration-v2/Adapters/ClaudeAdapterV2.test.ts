@@ -1,4 +1,5 @@
 import { WorkToolkit } from "../../fd/work-management/index.ts";
+import { FactoryToolkit } from "../../fd/factory/index.ts";
 // @effect-diagnostics nodeBuiltinImport:off -- workflow fixtures use files and the fake Claude CLI uses Node streams
 import * as NodeEvents from "node:events";
 import * as NodeFS from "node:fs";
@@ -701,13 +702,25 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
       ...Object.values(PreviewControlsToolkit.tools),
       ...Object.values(HtmlToolkit.tools),
       ...Object.values(WorkToolkit.tools),
+      ...Object.values(FactoryToolkit.tools),
     ]
       .filter((tool) => Context.get(tool.annotations, Tool.Readonly))
       .map((tool) => `mcp__t3-code__${tool.name}`)
       .sort();
 
+    // The declared exception: plan-mode planners and reviewers submit their own plan or review.
+    const submitTools = [
+      "mcp__t3-code__factory_submit_plan",
+      "mcp__t3-code__factory_submit_review",
+    ];
+    assert.deepEqual([...ClaudeAdapterV2.CLAUDE_READ_ONLY_T3_MCP_SUBMIT_TOOLS], submitTools);
+    for (const name of submitTools) {
+      assert.include(ClaudeAdapterV2.CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS, name);
+    }
     assert.deepEqual(
-      [...ClaudeAdapterV2.CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS].sort(),
+      ClaudeAdapterV2.CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS.filter(
+        (name) => !submitTools.includes(name),
+      ).sort(),
       readOnlyToolNames,
     );
   });

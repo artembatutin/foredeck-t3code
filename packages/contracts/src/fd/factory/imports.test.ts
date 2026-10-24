@@ -121,7 +121,7 @@ const forbiddenImports = (srcRoot: URL): ReadonlyArray<string> => {
 describe("factory contracts imports", () => {
   it("scans every Factory source but no test file", () => {
     const sources = featureSources(contractsSource);
-    expect(sources).toEqual(expect.arrayContaining(["index.ts", "schemas.ts"]));
+    expect(sources).toEqual(expect.arrayContaining(["index.ts", "mcp.ts", "schemas.ts"]));
     expect(sources.filter((path) => path.includes(".test."))).toEqual([]);
   });
 
