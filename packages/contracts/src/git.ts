@@ -138,6 +138,13 @@ export const GitRunStackedActionInput = Schema.Struct({
   /** The thread the action runs beside; a pull request it creates is linked to it. */
   threadId: Schema.optional(ThreadId),
   projectId: Schema.optional(ProjectId),
+  /**
+   * Replace the generated title or body of a pull request the action creates. Each one absent is
+   * still generated; an existing open pull request is returned unchanged. The bounds are GitHub's
+   * title and body limits.
+   */
+  prTitle: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(256))),
+  prBody: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(65_536))),
 });
 export type GitRunStackedActionInput = typeof GitRunStackedActionInput.Type;
 

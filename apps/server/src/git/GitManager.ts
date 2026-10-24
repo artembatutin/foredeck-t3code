@@ -2232,6 +2232,7 @@ export const make = Effect.gen(function* () {
     cwd: string,
     fallbackBranch: string | null,
     emit: GitActionProgressEmitter,
+    overrides: Pick<GitRunStackedActionInput, "prTitle" | "prBody">,
   ) {
     const provider = yield* sourceControlProvider(cwd);
     const terms = getChangeRequestTerminologyForKind(provider.kind);
@@ -2270,38 +2271,46 @@ export const make = Effect.gen(function* () {
     }
 
     const baseBranch = yield* resolveBaseBranch(cwd, branch, details.upstreamRef, headContext);
-    yield* emit({
-      kind: "phase_started",
-      phase: "pr",
-      label: `Generating ${terms.shortLabel} content...`,
-    });
-    const baseRangeRef = yield* resolveBaseRangeRef(cwd, baseBranch);
-    const rangeContext = yield* gitCore.readRangeContext(cwd, baseRangeRef);
-    const policy = yield* resolveStylePolicy(cwd, settings);
-    const changeRequestTemplate =
-      settings.style.followChangeRequestTemplates && provider.readChangeRequestTemplate
-        ? Option.getOrUndefined(
-            yield* provider.readChangeRequestTemplate({ cwd, treeish: baseRangeRef }),
-          )
-        : undefined;
+    // A given title or body replaces its generated counterpart; with both, nothing is generated.
+    const generated =
+      overrides.prTitle !== undefined && overrides.prBody !== undefined
+        ? { title: overrides.prTitle, body: overrides.prBody }
+        : yield* Effect.gen(function* () {
+            yield* emit({
+              kind: "phase_started",
+              phase: "pr",
+              label: `Generating ${terms.shortLabel} content...`,
+            });
+            const baseRangeRef = yield* resolveBaseRangeRef(cwd, baseBranch);
+            const rangeContext = yield* gitCore.readRangeContext(cwd, baseRangeRef);
+            const policy = yield* resolveStylePolicy(cwd, settings);
+            const changeRequestTemplate =
+              settings.style.followChangeRequestTemplates && provider.readChangeRequestTemplate
+                ? Option.getOrUndefined(
+                    yield* provider.readChangeRequestTemplate({ cwd, treeish: baseRangeRef }),
+                  )
+                : undefined;
 
-    const generated = yield* textGeneration.generatePrContent({
-      cwd,
-      baseBranch,
-      headBranch: headContext.headBranch,
-      commitSummary: limitContext(rangeContext.commitSummary, 20_000),
-      diffSummary: limitContext(rangeContext.diffSummary, 20_000),
-      diffPatch: limitContext(rangeContext.diffPatch, 60_000),
-      ...(changeRequestTemplate ? { changeRequestTemplate } : {}),
-      ...(policy ? { policy } : {}),
-      modelSelection: settings.modelSelection,
-    });
+            return yield* textGeneration.generatePrContent({
+              cwd,
+              baseBranch,
+              headBranch: headContext.headBranch,
+              commitSummary: limitContext(rangeContext.commitSummary, 20_000),
+              diffSummary: limitContext(rangeContext.diffSummary, 20_000),
+              diffPatch: limitContext(rangeContext.diffPatch, 60_000),
+              ...(changeRequestTemplate ? { changeRequestTemplate } : {}),
+              ...(policy ? { policy } : {}),
+              modelSelection: settings.modelSelection,
+            });
+          });
+    const title = overrides.prTitle ?? generated.title;
+    const body = overrides.prBody ?? generated.body;
 
     const bodyFile = path.join(
       tempDir,
       `t3code-pr-body-${process.pid}-${yield* randomUUIDv4(cwd)}.md`,
     );
-    yield* fileSystem.writeFileString(bodyFile, generated.body).pipe(
+    yield* fileSystem.writeFileString(bodyFile, body).pipe(
       Effect.mapError(
         (cause) =>
           new GitManagerError({
@@ -2322,7 +2331,7 @@ export const make = Effect.gen(function* () {
         cwd,
         baseRefName: baseBranch,
         headSelector: headContext.preferredHeadSelector,
-        title: generated.title,
+        title,
         bodyFile,
       })
       .pipe(Effect.ensuring(fileSystem.remove(bodyFile).pipe(Effect.ignore)));
@@ -2333,7 +2342,7 @@ export const make = Effect.gen(function* () {
         status: "created" as const,
         baseBranch,
         headBranch: headContext.headBranch,
-        title: generated.title,
+        title,
       };
     }
 
@@ -3172,7 +3181,7 @@ export const make = Effect.gen(function* () {
               .pipe(
                 Effect.tap(() => Ref.set(currentPhase, Option.some("pr"))),
                 Effect.flatMap(() =>
-                  runPrStep(textGenerationSettings, input.cwd, currentBranch, progress.emit),
+                  runPrStep(textGenerationSettings, input.cwd, currentBranch, progress.emit, input),
                 ),
               )
           : { status: "skipped_not_requested" as const };
