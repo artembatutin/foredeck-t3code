@@ -41,6 +41,16 @@ rather than guessing. A later thread's baseline is the worktree's HEAD before it
 [`FactoryThreadEffects.ts`](../../apps/server/src/fd/factory/FactoryThreadEffects.ts) and
 [`settle.ts`](../../apps/server/src/fd/factory/git/settle.ts).
 
+## A delivery's launches stay under its starter's mode
+
+A start can carry a runtime-mode ceiling, which the delivery keeps; an agent's start passes its own
+mode, like Work's thread starts (see [agent grants](./work-management.md#agent-grants)). Nothing
+downstream checks a launch against its caller, so Factory applies the ceiling itself, at every
+launch, a resume's replay included: the narrower of it and the project's default at that moment.
+Storing the mode resolved at start instead would let a later launch outrun a default the owner has
+narrowed since. The ceiling bounds launches only; a turn on an existing thread runs in the mode the
+thread has, which its owner may change.
+
 ## Work never imports Factory
 
 Work decides what to build and Factory decides how, so Work stays complete without Factory: the

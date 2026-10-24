@@ -1,4 +1,4 @@
-import { AuthWorkReadScope, type ProjectId, ThreadId } from "@t3tools/contracts";
+import { AuthWorkReadScope, type ProjectId, type RuntimeMode, ThreadId } from "@t3tools/contracts";
 import {
   FactoryDeliveryId,
   FactoryDeliveryStatus,
@@ -186,10 +186,13 @@ export class FactoryService extends Context.Service<
      * queued once the running state is stored. Refused, with nothing written: an item Work
      * cannot read, a project without a verify command or not on this environment, a base the
      * worktree cannot start from, or an item that already has a delivery that is not done or
-     * cancelled.
+     * cancelled. With `runtimeModeCeiling`, which the delivery keeps, none of its threads ever
+     * launches broader than that mode (a caller's own, for an agent's start); without one they
+     * launch with the project's default.
      */
     readonly start: (input: {
       readonly itemRef: WorkItemRef;
+      readonly runtimeModeCeiling?: RuntimeMode;
     }) => Effect.Effect<FactoryDeliveryStore.StoredFactoryDelivery, FactoryStartError>;
     readonly get: (
       deliveryId: FactoryDeliveryId,
@@ -357,6 +360,9 @@ const make = Effect.gen(function* () {
                 maxFixRounds: limits.maxFixRounds,
                 maxReviewRounds: limits.maxReviewRounds,
               },
+              ...(input.runtimeModeCeiling === undefined
+                ? {}
+                : { runtimeModeCeiling: input.runtimeModeCeiling }),
             }),
           })
           .pipe(

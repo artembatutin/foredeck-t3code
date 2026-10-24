@@ -1,4 +1,4 @@
-import type { OrchestrationV2RunStatus, RunId, ThreadId } from "@t3tools/contracts";
+import type { OrchestrationV2RunStatus, RunId, RuntimeMode, ThreadId } from "@t3tools/contracts";
 import type {
   FactoryDeliveryStatus,
   FactoryReviewSummary,
@@ -458,6 +458,12 @@ export interface FactoryDeliveryState {
   /** The task's risk; a single item's is normal. Turns of a high-risk task escalate effort. */
   readonly risk: FactoryTaskRisk;
   /**
+   * The broadest runtime mode the delivery's threads launch with, set by whoever started it: each
+   * launch takes the narrower of this and the project's default at that moment. Absent when the
+   * start set none; its threads then launch with the project's default.
+   */
+  readonly runtimeModeCeiling?: RuntimeMode;
+  /**
    * Repair rounds spent on the current task since it started or resumed: fix-verify turns
    * (`fix`), fix-review turns (`review`).
    */
@@ -532,6 +538,7 @@ export const queuedDeliveryState = (input: {
   /** The project's limits; the settings defaults when absent. */
   readonly limits?: FactoryRoundLimits;
   readonly risk?: FactoryTaskRisk;
+  readonly runtimeModeCeiling?: RuntimeMode;
 }): FactoryDeliveryState => ({
   status: "queued",
   stage: null,
@@ -550,6 +557,9 @@ export const queuedDeliveryState = (input: {
   reviews: [],
   limits: input.limits ?? defaultRoundLimits,
   risk: input.risk ?? "normal",
+  ...(input.runtimeModeCeiling === undefined
+    ? {}
+    : { runtimeModeCeiling: input.runtimeModeCeiling }),
   rounds: { fix: 0, review: 0 },
   fingerprints: [],
   reviewResponse: null,

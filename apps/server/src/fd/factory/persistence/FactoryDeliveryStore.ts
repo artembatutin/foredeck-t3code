@@ -4,6 +4,7 @@ import {
   PositiveInt,
   ProjectId,
   RunId,
+  RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
 import {
@@ -192,6 +193,9 @@ const StoredDeliveryState = Schema.Struct({
     maxReviewRounds: StoredRoundLimit,
   }).pipe(Schema.withDecodingDefault(Effect.succeed(defaultRoundLimits))),
   risk: FactoryTaskRisk.pipe(Schema.withDecodingDefault(Effect.succeed("normal" as const))),
+  // Added with runtime ceilings: absent from rows stored before them and from deliveries started
+  // without one, which launch with the project's default as before.
+  runtimeModeCeiling: Schema.optionalKey(RuntimeMode),
   rounds: Schema.Struct({ fix: NonNegativeInt, review: NonNegativeInt }).pipe(
     Schema.withDecodingDefault(Effect.succeed({ fix: 0, review: 0 })),
   ),

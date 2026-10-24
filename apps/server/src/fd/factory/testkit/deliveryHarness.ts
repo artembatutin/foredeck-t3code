@@ -15,6 +15,7 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   type RunId,
+  type RuntimeMode,
   type ThreadId,
 } from "@t3tools/contracts";
 import {
@@ -87,7 +88,8 @@ import type { StoredFactoryDelivery } from "../persistence/FactoryDeliveryStore.
 
 const projectId = ProjectId.make("project-factory-delivery");
 const driver = ProviderDriverKind.make("codex");
-const instanceId = ProviderInstanceId.make("codex");
+/** The fake provider's instance, which every Factory thread here runs on. */
+export const instanceId = ProviderInstanceId.make("codex");
 const modelSelection = { instanceId, model: "test-model" };
 const identity = ["-c", "user.name=Ada Lovelace", "-c", "user.email=ada@example.com"];
 
@@ -524,8 +526,17 @@ export const threadProjection = (threadId: ThreadId) =>
 /** What a test body runs with: the server layers and the platform. */
 type Services = Layer.Success<ReturnType<typeof makeLayer>> | NodeServices.NodeServices;
 
+/** A started delivery whose author's first turn is running. */
+interface StartedAuthor {
+  readonly deliveryId: FactoryDeliveryId;
+  readonly threadId: ThreadId;
+  readonly runId: RunId;
+  readonly worktreePath: string;
+}
+
 export interface World {
   readonly provider: FakeProvider;
+  readonly projectId: ProjectId;
   readonly root: string;
   readonly t3Home: string;
   readonly itemRef: WorkItemRef;
@@ -538,16 +549,11 @@ export interface World {
   readonly evidenceDir: (deliveryId: FactoryDeliveryId) => string;
   readonly exists: (path: string) => Effect.Effect<boolean>;
   /** Starts the delivery and returns it once its author's first turn is running. */
-  readonly start: Effect.Effect<
-    {
-      readonly deliveryId: FactoryDeliveryId;
-      readonly threadId: ThreadId;
-      readonly runId: RunId;
-      readonly worktreePath: string;
-    },
-    never,
-    Services
-  >;
+  readonly start: Effect.Effect<StartedAuthor, never, Services>;
+  /** `start`, with the start's options. */
+  readonly startWith: (options: {
+    readonly runtimeModeCeiling?: RuntimeMode;
+  }) => Effect.Effect<StartedAuthor, never, Services>;
   /**
    * Ends the provider turn of `runId` and waits until orchestration has finished the run and
    * Factory has handled its end, including every effect that followed. Returns the run's status.
@@ -615,25 +621,26 @@ export const withProject = <A, E>(
       );
 
       const service = yield* Factory.FactoryService.FactoryService;
-      const start = Effect.gen(function* () {
-        const started = yield* service.start({ itemRef: item.ref });
-        yield* drainFactory;
-        const { awaiting, worktreePath } = (yield* delivery(started.deliveryId)).state;
-        assert.strictEqual(awaiting?.type, "run");
-        if (awaiting?.type !== "run" || worktreePath === null) {
-          return assert.fail("The author launch did not record its run and worktree.");
-        }
-        // The launch returns once the worktree is recorded; the run starts once preparation
-        // releases it.
-        assert.strictEqual(yield* runReached(awaiting.runId, ["starting", ...ended]), "starting");
-        yield* drainOrchestration;
-        return {
-          deliveryId: started.deliveryId,
-          threadId: awaiting.threadId,
-          runId: awaiting.runId,
-          worktreePath,
-        };
-      }).pipe(Effect.orDie);
+      const startWith: World["startWith"] = (options) =>
+        Effect.gen(function* () {
+          const started = yield* service.start({ ...options, itemRef: item.ref });
+          yield* drainFactory;
+          const { awaiting, worktreePath } = (yield* delivery(started.deliveryId)).state;
+          assert.strictEqual(awaiting?.type, "run");
+          if (awaiting?.type !== "run" || worktreePath === null) {
+            return assert.fail("The author launch did not record its run and worktree.");
+          }
+          // The launch returns once the worktree is recorded; the run starts once preparation
+          // releases it.
+          assert.strictEqual(yield* runReached(awaiting.runId, ["starting", ...ended]), "starting");
+          yield* drainOrchestration;
+          return {
+            deliveryId: started.deliveryId,
+            threadId: awaiting.threadId,
+            runId: awaiting.runId,
+            worktreePath,
+          };
+        }).pipe(Effect.orDie);
 
       const endRun: World["endRun"] = (runId, status) =>
         Effect.gen(function* () {
@@ -653,6 +660,7 @@ export const withProject = <A, E>(
       const rootStatus = yield* git(root, ["status", "--porcelain=v1", "--untracked-files=all"]);
       return yield* body({
         provider,
+        projectId,
         root,
         t3Home,
         itemRef: item.ref,
@@ -662,7 +670,8 @@ export const withProject = <A, E>(
         pullRequestCalls,
         evidenceDir: (deliveryId) => path.join(t3Home, "userdata", "fd-factory", deliveryId),
         exists: (target) => fileSystem.exists(target).pipe(Effect.orElseSucceed(() => false)),
-        start,
+        start: startWith({}),
+        startWith,
         endRun,
       });
     }).pipe(Effect.provide(makeLayer({ provider, pullRequestCalls, root, t3Home })));

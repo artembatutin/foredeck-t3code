@@ -5,6 +5,7 @@ import {
   type ModelSelection,
   ProjectId,
   type RunId,
+  type RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
 import { FactoryDeliveryId, FactoryRole } from "@t3tools/contracts/fd/factory";
@@ -228,6 +229,20 @@ export class FactoryThreadEffects extends Context.Service<
 >()("t3/fd/factory/FactoryThreadEffects") {}
 
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/** Runtime modes from the narrowest to the broadest. */
+const runtimeModeRank: Record<RuntimeMode, number> = {
+  "approval-required": 0,
+  "auto-accept-edits": 1,
+  auto: 2,
+  "full-access": 3,
+};
+
+/** The project's default runtime mode, never broader than the delivery's ceiling. */
+const launchRuntimeMode = (projectDefault: RuntimeMode, ceiling: RuntimeMode | undefined) =>
+  ceiling !== undefined && runtimeModeRank[ceiling] < runtimeModeRank[projectDefault]
+    ? ceiling
+    : projectDefault;
 
 /** Factory reads its delivery's item and writes nothing to Work under this actor. */
 const itemReader = (deliveryId: FactoryDeliveryId): WorkActor => ({
@@ -457,7 +472,9 @@ const make = Effect.gen(function* () {
         projectId,
         title: opening.title,
         modelSelection,
-        runtimeMode: resolved.defaultRuntimeMode,
+        // The default as it is now, so a narrowed one narrows later launches too; a raised one
+        // never takes a launch past the ceiling the delivery started with.
+        runtimeMode: launchRuntimeMode(resolved.defaultRuntimeMode, state.runtimeModeCeiling),
         interactionMode: opening.interactionMode,
         workspaceStrategy:
           workspace.type === "worktree"
