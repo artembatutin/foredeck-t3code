@@ -17,6 +17,12 @@ describe("namesAiTool", () => {
     "runs cursor-agent",
     "Use the Cursor IDE",
     "Anysphere's editor",
+    "Export support. Co-authored-by: Cursor <cursor@cursor.com>",
+    "Co-Authored-By: cursor",
+    "Co-authored-by: Ada <cursoragent@cursor.com>",
+    "Made with Cursor",
+    "Drafted using Cursor.",
+    "see https://cursor.sh/docs",
     "Fixed with ChatGPT",
     "GPT-4 output",
   ])("finds a name in %j", (text) => {
@@ -27,6 +33,10 @@ describe("namesAiTool", () => {
     "Paginate with a database cursor",
     "Move the cursor to the end of the line",
     "Cursor-based pagination for the API",
+    "Paginate with Cursor-based tokens",
+    "Select text with the cursor",
+    "Pass the cursor in the request",
+    "Co-authored-by: Ada Lovelace <ada@example.com>\nMoves the cursor.",
     "support gptq weights",
     "thank Claudette",
     "handle codexes",
@@ -83,6 +93,7 @@ describe("the settle check reads the same rules", () => {
       "ai_attribution",
     ]);
     expect(settled("Co-authored-by: Ada Lovelace <ada@example.com>")).toEqual([]);
+    expect(settled("Co-authored-by: Cursor <cursoragent@cursor.com>")).toEqual(["ai_name_in_body"]);
     expect(settled("Moves the cursor to the end of the line.")).toEqual([]);
   });
 });

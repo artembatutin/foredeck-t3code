@@ -39,10 +39,14 @@ const NAMES = [
 const aiNames = new RegExp(`\\b(${NAMES.join("|")})\\b`, "i");
 
 /**
- * A name that is also an everyday programming word counts only in its product forms: a database,
- * text or pagination cursor is not the Cursor editor.
+ * A name that is also an everyday programming word counts only where it can only mean the
+ * product: its product forms, its domains (which its commit emails use), a co-author line, and
+ * the capitalized name after a word of tool use ("made with Cursor"). A database, text or
+ * pagination cursor is not the Cursor editor, and neither is "Cursor-based pagination".
  */
-const aiProductForms = /\bcursor[ -](agent|ai|ide|cli|editor|adapter|provider)s?\b|\banysphere\b/i;
+const aiProductForms =
+  /\bcursor[ -](agent|ai|ide|cli|editor|adapter|provider)s?\b|\banysphere\b|\bcursor\.(com|sh)\b|co-authored-by:[^\n]*\bcursor\b/i;
+const aiProductUse = /\b(with|using|via|by|in|from|through)\s+Cursor\b(?!-)/;
 
 /**
  * Generated or assisted attribution anywhere, not only as a line-start trailer, so an inline or
@@ -53,7 +57,8 @@ const aiAttribution =
   /\b(generated|assisted)-by\b|generated\s+with|\bai[- ]generated\b|\b(generated|written|created|made)\s+(by|with|using)\s+(an?\s+)?ai\b|co-authored-by:[^\n]*\b(ai|assistant|llm)\b/i;
 
 /** Whether the text names an AI agent, model or provider. */
-export const namesAiTool = (text: string) => aiNames.test(text) || aiProductForms.test(text);
+export const namesAiTool = (text: string) =>
+  aiNames.test(text) || aiProductForms.test(text) || aiProductUse.test(text);
 
 /** Whether the text carries generated or assisted attribution, or AI co-authorship. */
 export const carriesAiAttribution = (text: string) => aiAttribution.test(text);

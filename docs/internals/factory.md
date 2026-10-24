@@ -169,7 +169,9 @@ to commits ([`publishedText.ts`](../../apps/server/src/fd/factory/git/publishedT
 published: the effect fails before anything is pushed, and the owner changes the item or the
 command. The rules are Looper's, widened to every provider T3 runs, the well-known assistants and
 model families, and co-authorship credited to an assistant. A name that is also an everyday
-programming word counts only in its product forms, so a database cursor is not the Cursor editor.
+programming word counts only where it can only mean the product: its product forms, its domains,
+a co-author line, or the capitalized name after a word of tool use. So a database cursor is not
+the Cursor editor, and "Co-authored-by: Cursor" is refused.
 No list names every tool; both checks read that one file, so extend it there.
 
 Passing `threadId` to `GitWorkflowService.runStackedAction` does not link the pull request to the

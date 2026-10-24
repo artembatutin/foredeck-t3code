@@ -655,6 +655,15 @@ describe("the PR stage", () => {
       ],
     },
     {
+      name: "an item title crediting the Cursor editor",
+      verifyArgs: [],
+      item: { ...item, title: "Export support. Co-authored-by: Cursor <cursor@cursor.com>" },
+      problems: [
+        { field: "title", rule: "ai_name" },
+        { field: "body", rule: "ai_name" },
+      ],
+    },
+    {
       name: "an item title crediting an unnamed assistant",
       verifyArgs: [],
       item: { ...item, title: "Export support. Co-authored-by: AI Assistant" },
