@@ -40,10 +40,10 @@ import {
   type FactoryAcceptedReview,
   type FactoryEvent,
   type FactoryResumeCheck,
-  failedAuthorLaunch,
   isTerminal,
   queuedDeliveryState,
   runsStages,
+  unrecordedAuthorLaunch,
 } from "./pipeline/state.ts";
 
 const FactoryReceiptRefusal = Schema.Literals(["head_changed", "tree_dirty"]);
@@ -218,11 +218,12 @@ export class FactoryService extends Context.Service<
      * commit its task was approved for, a delivery stopped at or blocked in the PR stage opens its
      * pull request at once. A branch that does not settle gets one fix-commit turn naming the
      * checkpoint, or blocks when it cannot be repaired; a deleted thread of the delivery blocks it
-     * again. A delivery that blocked on its author's launch issues that launch again, which picks
-     * up the thread, run and worktree it made if it went through, and never starts a second
-     * author. A resume grants a fresh retry allowance (owner decision): repair rounds and failure
-     * fingerprints start over, its limits do not. Refused, with nothing changed, in any other
-     * status.
+     * again, every time. A delivery that issued an author launch but never recorded its result
+     * issues that launch again, which picks up the thread, run and worktree it made if it went
+     * through, and never starts a second author; if that run had ended, however it ended, the
+     * branch it left is settled and verified at once. A resume grants a fresh retry allowance
+     * (owner decision): repair rounds and failure fingerprints start over, its limits do not.
+     * Refused, with nothing changed, in any other status.
      */
     readonly resume: (
       deliveryId: FactoryDeliveryId,
@@ -440,19 +441,19 @@ const make = Effect.gen(function* () {
         threads.threadState(threadId).pipe(Effect.map((found) => found !== "present")),
       );
       if (state.threads.author === undefined) {
-        // The author launch the delivery blocked on is issued again and replays its thread, if it
-        // made one; a thread it made and the owner deleted since blocks instead. One it never made
-        // has no record, and the launch makes it.
-        const launch = failedAuthorLaunch(state);
-        const launched =
-          launch === undefined
-            ? undefined
-            : FactoryThreadEffects.launchThreadId(deliveryId, launch.id);
-        const deletedThreads =
-          launched !== undefined && (yield* threads.threadState(launched)) === "deleted"
-            ? [...gone, launched]
-            : gone;
-        return { deletedThreads, worktree: null } satisfies FactoryResumeCheck;
+        // An author launch whose result was never recorded is issued again and replays the
+        // thread it made, if any; a thread it made and the owner deleted since blocks instead.
+        const launch = unrecordedAuthorLaunch(state);
+        const found =
+          launch === undefined ? "missing" : yield* threads.launchState(delivery, launch);
+        return {
+          deletedThreads:
+            launch !== undefined && found === "deleted"
+              ? [...gone, FactoryThreadEffects.launchThreadId(deliveryId, launch.id)]
+              : gone,
+          unrecordedAuthorRunEnded: found === "ended",
+          worktree: null,
+        } satisfies FactoryResumeCheck;
       }
       const settle = yield* readSettle(state).pipe(Effect.provideContext(gitContext));
       // A worktree that cannot be read does not settle, and is never the approved commit.
@@ -471,6 +472,7 @@ const make = Effect.gen(function* () {
       const approvedSha = stored.length === 1 ? (stored[0]?.lastReviewedSha ?? null) : null;
       return {
         deletedThreads: gone,
+        unrecordedAuthorRunEnded: false,
         worktree: { settle, commit, approvedSha },
       } satisfies FactoryResumeCheck;
     });

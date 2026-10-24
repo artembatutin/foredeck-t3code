@@ -48,11 +48,16 @@ export type FactoryWorkspace =
  * branch or baseline read them from the delivery they came with.
  */
 export type FactoryEffectRequest =
-  /** Launch a new thread for the role, starting its first turn with the role's prompt. */
+  /**
+   * Launch a new thread for the role, starting its first turn with the role's prompt. Set when a
+   * resume replays an author launch whose run had already ended: `resumeCheckpoint`, the
+   * checkpoint the delivery resumes from, whose branch is settled once the launch is recorded.
+   */
   | {
       readonly type: "launch_thread";
       readonly role: FactoryRole;
       readonly workspace: FactoryWorkspace;
+      readonly resumeCheckpoint?: FactoryStageName;
     }
   /**
    * One mechanical `fix-commit` follow-up turn asking the thread to repair these problems. A
@@ -64,8 +69,16 @@ export type FactoryEffectRequest =
       readonly problems: ReadonlyArray<string>;
       readonly checkpoint?: FactoryStageName;
     }
-  /** Read the branch after this run and evaluate the settle rules. */
-  | { readonly type: "check_settle"; readonly threadId: ThreadId; readonly runId: RunId }
+  /**
+   * Read the branch after this run and evaluate the settle rules. A resume's check names the
+   * checkpoint, and so does the fix-commit turn it may lead to.
+   */
+  | {
+      readonly type: "check_settle";
+      readonly threadId: ThreadId;
+      readonly runId: RunId;
+      readonly checkpoint?: FactoryStageName;
+    }
   /** Run the stage's project command in the worktree. */
   | { readonly type: "run_command"; readonly stage: FactoryStageName }
   /**
@@ -120,6 +133,8 @@ export type FactoryRepairedStage = Extract<FactoryStageName, "verify" | "review"
  * a late or repeated result of an earlier effect of the same type is never taken for this one.
  */
 export type FactoryEffect = FactoryEffectRequest & { readonly id: number };
+
+export type FactoryLaunchEffect = Extract<FactoryEffect, { readonly type: "launch_thread" }>;
 
 /** The effects that send a turn on an existing thread; each is answered by `turn.started`. */
 export type FactoryTurnEffect = Extract<
@@ -250,8 +265,13 @@ export interface FactoryOpenedPullRequest {
  * before the engine decides where it picks up.
  */
 export interface FactoryResumeCheck {
-  /** Threads the delivery recorded that have been deleted since. */
+  /**
+   * Threads the delivery recorded that have been deleted since, and the thread of an author
+   * launch it never recorded (see `unrecordedAuthorLaunch`) when that was deleted.
+   */
   readonly deletedThreads: ReadonlyArray<ThreadId>;
+  /** Whether the run of an author launch the delivery never recorded has already ended. */
+  readonly unrecordedAuthorRunEnded: boolean;
   /** The worktree once the author has launched; null before. */
   readonly worktree: {
     readonly settle: FactorySettleResult;
@@ -416,6 +436,11 @@ export interface FactoryDeliveryState {
   readonly baseline: string | null;
   /** The latest thread of each role. */
   readonly threads: Partial<Readonly<Record<FactoryRole, ThreadId>>>;
+  /**
+   * The current task's author launch, recorded when it is issued. Its thread and checkout derive
+   * from its id, so a launch whose result was lost can be found again, whatever happened after.
+   */
+  readonly authorLaunch: FactoryLaunchEffect | null;
   readonly awaiting: FactoryAwaiting | null;
   /** Fix-commit turns spent on the current task's settle problems since it started or resumed. */
   readonly fixCommitTurns: number;
@@ -515,6 +540,7 @@ export const queuedDeliveryState = (input: {
   worktreePath: input.worktreePath ?? null,
   baseline: null,
   threads: {},
+  authorLaunch: null,
   awaiting: null,
   fixCommitTurns: 0,
   effectsIssued: 0,
@@ -533,16 +559,23 @@ export const queuedDeliveryState = (input: {
 });
 
 /**
- * The author launch a delivery blocked on before it recorded its author. A launch derives its
- * thread, command and message ids from its effect's id, so issuing this effect again replays a
- * launch that went through but whose result was lost (a failed read, a restart): its thread, run
- * and worktree, rather than a second author on the branch that launch created.
+ * The author launch of a delivery that has issued one but never recorded its result. A launch can
+ * go through and its result still be lost (a failed read, a restart), so this is no proof that
+ * nothing ran: launches derive their thread, command and message ids from the effect's id, and
+ * issuing it again replays a launch that went through rather than starting a second author on
+ * the branch it created. Rows stored before launches were recorded name it only in their block.
  */
-export const failedAuthorLaunch = (delivery: FactoryDeliveryState) => {
+export const unrecordedAuthorLaunch = (
+  delivery: FactoryDeliveryState,
+): FactoryLaunchEffect | undefined => {
+  if (delivery.threads.author !== undefined) return undefined;
+  if (delivery.authorLaunch !== null) return delivery.authorLaunch;
   const { block } = delivery;
-  if (delivery.threads.author !== undefined || block?.reason !== "effect_failed") return undefined;
-  const { effect } = block;
-  return effect.type === "launch_thread" && effect.role === "author" ? effect : undefined;
+  return block?.reason === "effect_failed" &&
+    block.effect.type === "launch_thread" &&
+    block.effect.role === "author"
+    ? block.effect
+    : undefined;
 };
 
 /** The accepted review of the current round, once there is one. */

@@ -202,11 +202,18 @@ A resume that blocks keeps the checkpoint, so the next one still knows it stoppe
 
 A delivery with no author recorded is not proof that no author ran. A launch can go through and its
 result still be lost, to a failed run read or a restart, leaving a thread at work on the branch the
-launch created. So a resume issues the author launch the delivery blocked on again, under its own
-id: the launch derives its command, thread and message ids from the effect, and replaying them
-returns that thread, run and worktree instead of starting a second author whose `worktree add -b`
-would collide with the branch. A thread that launch made and the owner deleted since blocks the
-resume like any deleted thread of the delivery.
+launch created. So the engine records the author launch when it issues it (`authorLaunch`), not
+when its result arrives, and a resume issues that same launch again: the launch derives its
+command, thread and message ids from the effect, and replaying them returns that thread, run and
+worktree instead of starting a second author whose `worktree add -b` would collide with the branch.
+The record cannot live in the block, which the next block replaces: a resume that blocked on the
+deleted thread of that launch would otherwise forget it, and the one after would launch anew.
+
+What the resume found decides what the replay does. If the launch's run had already ended, however
+it ended, no end is coming to await, so once the thread is recorded its branch is settled and
+verified as a resume settles a recorded author's. A run still going is awaited like any other, and
+its failure after the resume blocks. A thread that launch made and the owner deleted since blocks
+every resume, like any deleted thread of the delivery.
 
 By owner decision an explicit resume grants a fresh retry allowance: repair rounds, the fix-commit
 turn and failure fingerprints start over, while the limits the delivery started with stay, and so

@@ -176,6 +176,8 @@ describe("FactoryDeliveryStore with review state", () => {
         pullRequest: null,
         // Nor a checkpoint, added with stop after step: stopped before it, it names none.
         checkpoint: null,
+        // Nor the author launch, recorded since resume: the row predates it.
+        authorLaunch: null,
       });
       assert.deepStrictEqual(
         (yield* store.listActive()).map((delivery) => delivery.deliveryId),

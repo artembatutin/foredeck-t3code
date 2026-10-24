@@ -54,13 +54,17 @@ const StoredWorkspace = Schema.Union([
   Schema.Struct({ type: Schema.Literal("existing_worktree"), worktreePath: Schema.String }),
 ]);
 
+const StoredLaunch = Schema.Struct({
+  id: PositiveInt,
+  type: Schema.Literal("launch_thread"),
+  role: FactoryRole,
+  workspace: StoredWorkspace,
+  // Added with resume: only a resume's replay of a launch names a checkpoint.
+  resumeCheckpoint: Schema.optionalKey(FactoryStageName),
+});
+
 const StoredEffect = Schema.Union([
-  Schema.Struct({
-    id: PositiveInt,
-    type: Schema.Literal("launch_thread"),
-    role: FactoryRole,
-    workspace: StoredWorkspace,
-  }),
+  StoredLaunch,
   Schema.Struct({
     id: PositiveInt,
     type: Schema.Literal("send_fix_commit_turn"),
@@ -74,6 +78,7 @@ const StoredEffect = Schema.Union([
     type: Schema.Literal("check_settle"),
     threadId: ThreadId,
     runId: RunId,
+    checkpoint: Schema.optionalKey(FactoryStageName),
   }),
   Schema.Struct({ id: PositiveInt, type: Schema.Literal("run_command"), stage: FactoryStageName }),
   Schema.Struct({
@@ -171,6 +176,8 @@ const StoredDeliveryState = Schema.Struct({
     author: Schema.optionalKey(ThreadId),
     reviewer: Schema.optionalKey(ThreadId),
   }),
+  // Added with resume: rows stored before it recorded no launch.
+  authorLaunch: Schema.NullOr(StoredLaunch).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   awaiting: Schema.NullOr(StoredAwaiting),
   fixCommitTurns: NonNegativeInt,
   effectsIssued: NonNegativeInt,

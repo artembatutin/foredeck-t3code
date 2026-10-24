@@ -7,7 +7,7 @@ import type {
 import { describe, expect, it } from "vite-plus/test";
 
 import { advance } from "./engine.ts";
-import { queuedDeliveryState } from "./state.ts";
+import { queuedDeliveryState, unrecordedAuthorLaunch } from "./state.ts";
 import type {
   FactoryAdvance,
   FactoryDeliveryState,
@@ -114,6 +114,7 @@ const check = (
   deletedThreads: ReadonlyArray<ThreadId> = [],
 ): FactoryResumeCheck => ({
   deletedThreads,
+  unrecordedAuthorRunEnded: false,
   worktree: {
     settle: { status: "settled" },
     commit: { headSha: head, tree },
@@ -439,9 +440,29 @@ describe("resume without an author or with a deleted thread", () => {
     role: "author",
     workspace: { type: "worktree", branch: "fd/item-7", baseRef: "main" },
   } as const;
-  const nothingRecorded: FactoryResumeCheck = { deletedThreads: [], worktree: null };
+  const nothingRecorded: FactoryResumeCheck = {
+    deletedThreads: [],
+    unrecordedAuthorRunEnded: false,
+    worktree: null,
+  };
+  const runEnded: FactoryResumeCheck = { ...nothingRecorded, unrecordedAuthorRunEnded: true };
+  const relaunched: FactoryEvent = {
+    type: "thread.launched",
+    effectId: 1,
+    threadId: author,
+    runId: authorRun,
+    worktreePath,
+    baseline,
+  };
 
-  it("issues the author launch it blocked on again, under its own id", () => {
+  it("records the author launch as it issues it", () => {
+    expect(authoring.authorLaunch).toEqual(firstLaunch);
+    expect(blockedAtLaunch.authorLaunch).toEqual(firstLaunch);
+    // A reviewer launch is not the author's.
+    expect(reviewing.authorLaunch).toEqual(firstLaunch);
+  });
+
+  it("issues the author launch it never recorded again, under its own id", () => {
     // The launch may have gone through before its result was lost: under the same id it replays
     // that thread, run and worktree instead of starting a second author on the branch.
     expect(advance(blockedAtLaunch, resumeWith(nothingRecorded))).toEqual({
@@ -456,47 +477,105 @@ describe("resume without an author or with a deleted thread", () => {
     });
   });
 
-  it("takes the replayed launch's thread and settles the branch its run left", () => {
-    const relaunched = run(
-      blockedAtLaunch,
-      resumeWith(nothingRecorded),
-      {
-        type: "thread.launched",
-        effectId: 1,
-        threadId: author,
-        runId: authorRun,
-        worktreePath,
-        baseline,
-      },
-      finished(author, authorRun),
-    );
-    expect(relaunched.delivery.threads).toEqual({ author });
-    expect(relaunched.delivery.worktreePath).toBe(worktreePath);
-    expect(relaunched.effects).toEqual([
+  it("awaits a replayed run still going, and blocks if it then fails", () => {
+    const awaiting = fold(blockedAtLaunch, resumeWith(nothingRecorded), relaunched);
+    expect(awaiting.threads).toEqual({ author });
+    expect(awaiting.worktreePath).toBe(worktreePath);
+    expect(awaiting.awaiting).toEqual({ type: "run", threadId: author, runId: authorRun });
+    // Completed, its branch is settled as after any author turn.
+    expect(advance(awaiting, finished(author, authorRun)).effects).toEqual([
       { id: 2, type: "check_settle", threadId: author, runId: authorRun },
     ]);
-    expect(advance(relaunched.delivery, settled(2)).effects).toEqual([
-      { id: 3, type: "run_command", stage: "verify" },
-    ]);
+    // A failure after the resume is a failure like any other.
+    expect(advance(awaiting, finished(author, authorRun, "failed")).delivery.block).toEqual({
+      reason: "run_ended",
+      threadId: author,
+      runId: authorRun,
+      runStatus: "failed",
+    });
   });
 
-  it("launches the author as start does when it blocked on nothing it launched", () => {
-    const delivery = { ...blockedAtLaunch, block: { reason: "unsettled", problems: [] } } as const;
+  it.each(["completed", "failed", "interrupted", "cancelled"] as const)(
+    "settles the branch a replayed run left once it had ended %s",
+    (status) => {
+      const replay = { ...firstLaunch, resumeCheckpoint: "author" };
+      const resumed = advance(blockedAtLaunch, resumeWith(runEnded));
+      expect(resumed.effects).toEqual([replay]);
+      expect(resumed.delivery.authorLaunch).toEqual(firstLaunch);
+
+      // Recorded, the author's branch is settled at once; the run's end that the worker read
+      // with the launch's result is no news.
+      const settling = fold(resumed.delivery, relaunched);
+      const settle = {
+        id: 2,
+        type: "check_settle",
+        threadId: author,
+        runId: authorRun,
+        checkpoint: "author",
+      };
+      expect(settling).toEqual({
+        ...resumed.delivery,
+        threads: { author },
+        worktreePath,
+        baseline,
+        effectsIssued: 2,
+        awaiting: { type: "effect", effect: settle },
+      });
+      expect(advance(settling, finished(author, authorRun, status)).delivery).toBe(settling);
+      // Settled, it is verified afresh; with repairable problems, one turn names the checkpoint.
+      expect(advance(settling, settled(2)).effects).toEqual([
+        { id: 3, type: "run_command", stage: "verify" },
+      ]);
+      const problems = ["Worktree has uncommitted or untracked changes."];
+      expect(
+        advance(settling, {
+          type: "settle.checked",
+          effectId: 2,
+          result: { status: "repairable", problems },
+        }).effects,
+      ).toEqual([
+        { id: 3, type: "send_fix_commit_turn", threadId: author, problems, checkpoint: "author" },
+      ]);
+    },
+  );
+
+  it("launches the author as start does only when it never issued an author launch", () => {
+    const delivery = {
+      ...blockedAtLaunch,
+      authorLaunch: null,
+      block: { reason: "unsettled", problems: [] },
+    } as const;
     const launch = { ...firstLaunch, id: 2 };
-    expect(advance(delivery, resumeWith(nothingRecorded)).effects).toEqual([launch]);
+    const step = advance(delivery, resumeWith(nothingRecorded));
+    expect(step.effects).toEqual([launch]);
+    expect(step.delivery.authorLaunch).toEqual(launch);
   });
 
-  it("blocks again when the thread of the launch it blocked on was deleted", () => {
+  it("stays blocked on every resume once the thread of its unrecorded launch is deleted", () => {
     const thread = ThreadId.make("factory-thread:delivery:1");
-    expect(
-      advance(blockedAtLaunch, resumeWith({ ...nothingRecorded, deletedThreads: [thread] })),
-    ).toEqual({
-      delivery: {
-        ...blockedAtLaunch,
-        block: { reason: "thread_deleted", threadId: thread },
-      },
+    const deleted = { ...nothingRecorded, deletedThreads: [thread] };
+    const first = advance(blockedAtLaunch, resumeWith(deleted));
+    expect(first).toEqual({
+      delivery: { ...blockedAtLaunch, block: { reason: "thread_deleted", threadId: thread } },
       effects: [],
     });
+    // The new block does not hide the launch, so the next resume still asks after its thread...
+    expect(unrecordedAuthorLaunch(first.delivery)).toEqual(firstLaunch);
+    const second = advance(first.delivery, resumeWith(deleted));
+    expect(second.delivery).toEqual(first.delivery);
+    expect(second.effects).toEqual([]);
+    // ...and nothing it could find would launch another author: only the same launch, again.
+    expect(advance(first.delivery, resumeWith(nothingRecorded)).effects).toEqual([firstLaunch]);
+  });
+
+  it("finds the launch in the block of a row stored before launches were recorded", () => {
+    const thread = ThreadId.make("factory-thread:delivery:1");
+    const stored = { ...blockedAtLaunch, authorLaunch: null };
+    expect(advance(stored, resumeWith(nothingRecorded)).effects).toEqual([firstLaunch]);
+    // A resume that blocks again records it, since the new block no longer names it.
+    const blocked = advance(stored, resumeWith({ ...nothingRecorded, deletedThreads: [thread] }));
+    expect(blocked.delivery.authorLaunch).toEqual(firstLaunch);
+    expect(advance(blocked.delivery, resumeWith(nothingRecorded)).effects).toEqual([firstLaunch]);
   });
 
   it.each([

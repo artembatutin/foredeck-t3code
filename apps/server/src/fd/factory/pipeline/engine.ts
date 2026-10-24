@@ -5,12 +5,12 @@ import type { FactoryStageDefinition } from "./definitions.ts";
 import {
   acceptedReview,
   blocked,
-  failedAuthorLaunch,
   isTerminal,
   isTurnEffect,
   issue,
   receiptFailed,
   runsStages,
+  unrecordedAuthorLaunch,
 } from "./state.ts";
 import type {
   FactoryAcceptedReview,
@@ -171,33 +171,40 @@ const holdsApprovedCommit = (
  * and so does a branch that cannot be repaired. A settled branch is verified again, never trusting
  * an earlier receipt, then reviewed; only a delivery resuming the PR stage on the very commit its
  * task was approved for opens its pull request at once. A branch with repairable problems gets one
- * fix-commit turn naming the checkpoint, and is settled after it as after any author turn. Without
- * an author recorded, the author launch it blocked on is issued again under its own id (see
- * `failedAuthorLaunch`), or else the author launches as `start` launches it.
+ * fix-commit turn naming the checkpoint, and is settled after it as after any author turn.
+ *
+ * An author launch the delivery issued but never recorded is issued again under its own id (see
+ * `unrecordedAuthorLaunch`), so it replays the thread and checkout it made, if any. When that
+ * thread's run had already ended, the replay settles the branch at once, as a resume settles a
+ * recorded author's, whatever way the run ended; a run still going is awaited like any other.
+ * Only a delivery that issued no author launch launches one, as `start` does.
  */
 const resume = (delivery: FactoryDeliveryState, check: FactoryResumeCheck): FactoryAdvance => {
-  const { author } = delivery.threads;
+  const lost = unrecordedAuthorLaunch(delivery);
+  // Kept as the author launch whatever happens next, so every later resume finds it again.
+  const known = lost === undefined ? delivery : { ...delivery, authorLaunch: lost };
+  const { author } = known.threads;
   const deleted =
     author !== undefined && check.deletedThreads.includes(author)
       ? author
       : check.deletedThreads[0];
   if (deleted !== undefined) {
-    return blocked(delivery, { reason: "thread_deleted", threadId: deleted });
+    return blocked(known, { reason: "thread_deleted", threadId: deleted });
   }
+  const checkpoint = known.checkpoint ?? known.stage;
   if (author === undefined) {
-    // The launch it blocked on goes again under its own id, so a launch that went through is
-    // picked up rather than started twice.
-    const launch = failedAuthorLaunch(delivery);
-    return launch === undefined
-      ? begin(resumed(delivery), standardStages.author)
-      : {
-          delivery: {
-            ...resumed(delivery),
-            stage: "author",
-            awaiting: { type: "effect", effect: launch },
-          },
-          effects: [launch],
-        };
+    if (lost === undefined) return begin(resumed(known), standardStages.author);
+    const launch = check.unrecordedAuthorRunEnded
+      ? { ...lost, resumeCheckpoint: checkpoint ?? "author" }
+      : lost;
+    return {
+      delivery: {
+        ...resumed(known),
+        stage: "author",
+        awaiting: { type: "effect", effect: launch },
+      },
+      effects: [launch],
+    };
   }
   const { worktree } = check;
   // The worktree is read whenever the author has launched; without it there is nothing to judge.
@@ -206,7 +213,6 @@ const resume = (delivery: FactoryDeliveryState, check: FactoryResumeCheck): Fact
   if (settle.status === "unrepairable") {
     return blocked(delivery, { reason: "unsettled", problems: settle.problems });
   }
-  const checkpoint = delivery.checkpoint ?? delivery.stage;
   if (settle.status === "repairable") {
     // The turn counts as the one fix-commit turn: a branch it leaves unsettled blocks.
     return issue(
@@ -347,14 +353,19 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
     case "thread.launched": {
       const launch = awaitedEffect(delivery, event.effectId, "launch_thread");
       if (launch === undefined) return unchanged(delivery);
-      return step({
+      const recorded = {
         ...delivery,
         worktreePath: delivery.worktreePath ?? event.worktreePath,
         // The task baseline is the author's; a reviewer starts at the commit it reviews.
         baseline: launch.role === "author" ? event.baseline : delivery.baseline,
         threads: { ...delivery.threads, [launch.role]: event.threadId },
-        awaiting: { type: "run", threadId: event.threadId, runId: event.runId },
-      });
+      };
+      const run = { threadId: event.threadId, runId: event.runId };
+      // A resume replayed this launch after its run had ended: no end is coming to await, and
+      // the branch it left is settled now, however the run ended.
+      return launch.resumeCheckpoint === undefined
+        ? step({ ...recorded, awaiting: { type: "run", ...run } })
+        : issue(recorded, { type: "check_settle", ...run, checkpoint: launch.resumeCheckpoint });
     }
 
     case "turn.started": {
@@ -425,7 +436,12 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       if (result.status === "repairable" && delivery.fixCommitTurns < FIX_COMMIT_TURNS) {
         return issue(
           { ...delivery, fixCommitTurns: delivery.fixCommitTurns + 1 },
-          { type: "send_fix_commit_turn", threadId: check.threadId, problems: result.problems },
+          {
+            type: "send_fix_commit_turn",
+            threadId: check.threadId,
+            problems: result.problems,
+            ...(check.checkpoint === undefined ? {} : { checkpoint: check.checkpoint }),
+          },
         );
       }
       return blocked(delivery, { reason: "unsettled", problems: result.problems });

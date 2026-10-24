@@ -308,16 +308,15 @@ describe("the engine's imports", () => {
 
 describe("starting a delivery", () => {
   it("runs the author stage on a new worktree for the delivery branch", () => {
+    const launch = {
+      id: LAUNCH,
+      type: "launch_thread",
+      role: "author",
+      workspace: { type: "worktree", branch: "fd/item-7", baseRef: "main" },
+    } as const;
+    // The author launch is recorded as it is issued; see engine.resume.test.ts.
     expect(advance(queued, start)).toEqual(
-      issued(
-        { ...queued, status: "running", stage: "author" },
-        {
-          id: LAUNCH,
-          type: "launch_thread",
-          role: "author",
-          workspace: { type: "worktree", branch: "fd/item-7", baseRef: "main" },
-        },
-      ),
+      issued({ ...queued, status: "running", stage: "author", authorLaunch: launch }, launch),
     );
   });
 

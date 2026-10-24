@@ -54,7 +54,11 @@ import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
-import type { FactoryDeliveryState, FactoryEffect } from "./pipeline/state.ts";
+import type {
+  FactoryDeliveryState,
+  FactoryEffect,
+  FactoryTerminalRunStatus,
+} from "./pipeline/state.ts";
 import {
   authorCommits,
   drainFactory,
@@ -64,6 +68,7 @@ import {
   runReached,
   stateOf as harnessStateOf,
   verifyCommands,
+  type World as DeliveryWorld,
   withProject,
 } from "./testkit/deliveryHarness.ts";
 import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
@@ -101,7 +106,7 @@ interface World {
   /** How many of the worker's next run reads fail, as a projection read can. */
   runReadFailures: number;
   /** Runs that have ended, with how. */
-  readonly ended: Map<RunId, "completed">;
+  readonly ended: Map<RunId, FactoryTerminalRunStatus>;
   readonly fixCommitTurns: Array<Extract<FactoryEffect, { readonly type: "send_fix_commit_turn" }>>;
   readonly deleted: Set<ThreadId>;
   /** Every stacked action the fake PR service ran. */
@@ -186,6 +191,15 @@ const fakes = (world: World) =>
         Effect.sync(() => {
           world.fixCommitTurns.push(effect);
           return { runId: runOf(effect.id) };
+        }),
+      // A launch's thread is the real one's id; its run is the one this fake named for the effect.
+      launchState: ({ deliveryId }, effect) =>
+        Effect.sync(() => {
+          if (world.deleted.has(FactoryThreadEffects.launchThreadId(deliveryId, effect.id))) {
+            return "deleted";
+          }
+          if (!world.launchIds.includes(effect.id)) return "missing";
+          return world.ended.has(runOf(effect.id)) ? "ended" : "unfinished";
         }),
       threadState: (threadId) =>
         Effect.succeed(world.deleted.has(threadId) ? "deleted" : "present"),
@@ -565,61 +579,65 @@ describe("FactoryService.resume, with faked threads over a real worktree", () =>
     ),
   );
 
-  it.effect("picks up an author launch whose result was lost, verifying its work", () =>
-    withWorld((world) =>
-      Effect.gen(function* () {
-        // The launch went through, but the worker's read of its run failed: the delivery blocked
-        // recording no author, while the author's thread went on and committed its work.
-        world.runReadFailures = 1;
-        const { cwd, deliveryId } = yield* started(world);
-        const failed = yield* stateOf(deliveryId);
-        assert.deepStrictEqual(failed.block, {
-          reason: "effect_failed",
-          effect: {
-            id: 1,
-            type: "launch_thread",
-            role: "author",
-            workspace: { type: "worktree", branch, baseRef: "HEAD" },
-          },
-          detail: "Factory could not launch the author thread (ProjectionStoreReadError).",
-        });
-        assert.deepStrictEqual(failed.threads, {});
-        assert.isNull(failed.worktreePath);
-        world.ended.set(runOf(1), "completed");
+  it.effect.each(["completed", "failed", "interrupted", "cancelled"] as const)(
+    "verifies the work of a lost author launch whose run had ended %s, launching nothing new",
+    (status) =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          // The launch went through, but the worker's read of its run failed: the delivery blocked
+          // recording no author, while the author's thread went on and committed its work.
+          world.runReadFailures = 1;
+          const { cwd, deliveryId } = yield* started(world);
+          const failed = yield* stateOf(deliveryId);
+          assert.deepStrictEqual(failed.block, {
+            reason: "effect_failed",
+            effect: {
+              id: 1,
+              type: "launch_thread",
+              role: "author",
+              workspace: { type: "worktree", branch, baseRef: "HEAD" },
+            },
+            detail: "Factory could not launch the author thread (ProjectionStoreReadError).",
+          });
+          assert.deepStrictEqual(failed.threads, {});
+          assert.isNull(failed.worktreePath);
+          world.ended.set(runOf(1), status);
 
-        yield* resume(deliveryId);
-        yield* drain;
+          yield* resume(deliveryId);
+          yield* drain;
 
-        // The same launch again, so the same thread: no second author on the branch.
-        assert.deepStrictEqual(world.launchIds, [1, 1, 4]);
-        assert.deepStrictEqual(world.launches, ["author", "author", "reviewer"]);
-        const state = yield* stateOf(deliveryId);
-        assert.deepStrictEqual(state.threads, { author, reviewer });
-        assert.strictEqual(state.worktreePath, cwd);
-        assert.strictEqual(state.baseline, world.worktree?.baseline);
-        // Its work is settled and verified afresh, then reviewed.
-        assert.deepStrictEqual(
-          state.receipts.map(({ headSha }) => headSha),
-          [yield* git(cwd, ["rev-parse", "HEAD"])],
-        );
-        assert.strictEqual(state.status, "running");
-        assert.strictEqual(state.stage, "review");
-        assert.deepStrictEqual(state.awaiting, {
-          type: "run",
-          threadId: reviewer,
-          runId: runOf(4),
-        });
-        assert.deepStrictEqual(yield* attemptsOf(deliveryId), [
-          ["author", "blocked"],
-          ["author", "passed"],
-          ["verify", "passed"],
-          ["review", null],
-        ]);
-      }),
-    ),
+          // The same launch again, so the same thread: no second author on the branch.
+          assert.deepStrictEqual(world.launchIds, [1, 1, 4]);
+          assert.deepStrictEqual(world.launches, ["author", "author", "reviewer"]);
+          const state = yield* stateOf(deliveryId);
+          assert.deepStrictEqual(state.threads, { author, reviewer });
+          assert.strictEqual(state.worktreePath, cwd);
+          assert.strictEqual(state.baseline, world.worktree?.baseline);
+          // Its work is settled and verified afresh, then reviewed.
+          assert.deepStrictEqual(
+            state.receipts.map(({ headSha }) => headSha),
+            [yield* git(cwd, ["rev-parse", "HEAD"])],
+          );
+          assert.strictEqual(state.status, "running");
+          assert.strictEqual(state.stage, "review");
+          assert.deepStrictEqual(state.awaiting, {
+            type: "run",
+            threadId: reviewer,
+            runId: runOf(4),
+          });
+          // However its run ended, the author got no turn of any kind.
+          assert.deepStrictEqual(world.fixCommitTurns, []);
+          assert.deepStrictEqual(yield* attemptsOf(deliveryId), [
+            ["author", "blocked"],
+            ["author", "passed"],
+            ["verify", "passed"],
+            ["review", null],
+          ]);
+        }),
+      ),
   );
 
-  it.effect("blocks again when the thread of the launch it blocked on was deleted", () =>
+  it.effect("stays blocked on every resume once a lost author launch's thread is deleted", () =>
     withWorld((world) =>
       Effect.gen(function* () {
         world.runReadFailures = 1;
@@ -627,15 +645,24 @@ describe("FactoryService.resume, with faked threads over a real worktree", () =>
         const launched = FactoryThreadEffects.launchThreadId(deliveryId, 1);
         world.deleted.add(launched);
 
-        const resumed = yield* resume(deliveryId);
+        const first = yield* resume(deliveryId);
+        yield* drain;
+        const second = yield* resume(deliveryId);
         yield* drain;
 
-        assert.deepStrictEqual(resumed.state.block, {
-          reason: "thread_deleted",
-          threadId: launched,
-        });
+        for (const resumed of [first, second]) {
+          assert.strictEqual(resumed.state.status, "blocked");
+          assert.deepStrictEqual(resumed.state.block, {
+            reason: "thread_deleted",
+            threadId: launched,
+          });
+          assert.deepStrictEqual(resumed.state.threads, {});
+        }
+        assert.deepStrictEqual(second.state, first.state);
+        assert.deepStrictEqual(yield* stateOf(deliveryId), second.state);
+        // No launch of any kind after the first.
         assert.deepStrictEqual(world.launchIds, [1]);
-        assert.deepStrictEqual(yield* stateOf(deliveryId), resumed.state);
+        assert.deepStrictEqual(world.launches, ["author"]);
       }),
     ),
   );
@@ -694,81 +721,139 @@ const threadState = (threadId: ThreadId) =>
     Effect.provide(FactoryThreadEffects.layer.pipe(Layer.provide(ProviderRegistryMock.layer()))),
   );
 
+/** Worktrees of the project's repository, its own checkout included. */
+const worktreeCount = (root: string) =>
+  harnessGit(root, ["worktree", "list", "--porcelain"]).pipe(
+    Effect.map((list) => list.split("\n").filter((line) => line.startsWith("worktree ")).length),
+  );
+
+/**
+ * A delivery whose author launch went through while the server lost its result: started, its
+ * launch recorded, then stored back as it was before the result and failed as the next boot's
+ * sweep fails an effect it finds awaited (`failInterruptedEffect`). The author's run is starting.
+ */
+const lostLaunch = (world: DeliveryWorld) =>
+  Effect.gen(function* () {
+    const factory = yield* Factory.FactoryService.FactoryService;
+    const worker = yield* Factory.FactoryWorker.FactoryWorker;
+    const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+    // Stored as start left it: running, awaiting its author's launch.
+    const queued = yield* factory.start({ itemRef: world.itemRef });
+    const { deliveryId } = queued;
+    assert.strictEqual(queued.state.awaiting?.type, "effect");
+    yield* drainFactory;
+    const launched = yield* harnessStateOf(deliveryId);
+    const { awaiting, worktreePath } = launched;
+    if (awaiting?.type !== "run" || worktreePath === null) {
+      return assert.fail("The author launch recorded no run and worktree.");
+    }
+    assert.strictEqual(yield* runReached(awaiting.runId, ["starting", ...ended]), "starting");
+    yield* drainOrchestration;
+
+    yield* store.update(deliveryId, queued.state);
+    yield* worker.step(deliveryId, {
+      type: "effect.failed",
+      effectId: 1,
+      detail: "Factory could not launch the author thread: a server restart interrupted it.",
+    });
+    const lost = yield* harnessStateOf(deliveryId);
+    assert.strictEqual(lost.status, "blocked");
+    assert.deepStrictEqual(lost.threads, {});
+    assert.isNull(lost.worktreePath);
+    return { deliveryId, awaiting, worktreePath, launched, lost };
+  });
+
 describe("FactoryService.resume on the server's real stack", () => {
-  it.live("picks up an author launch a restart lost, on its own thread and worktree", () =>
-    withProject(verifyCommands.passes, (world) =>
-      Effect.gen(function* () {
-        const factory = yield* Factory.FactoryService.FactoryService;
-        const worker = yield* Factory.FactoryWorker.FactoryWorker;
-        const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
-        // Stored as start left it: running, awaiting its author's launch.
-        const queued = yield* factory.start({ itemRef: world.itemRef });
-        const { deliveryId } = queued;
-        assert.strictEqual(queued.state.awaiting?.type, "effect");
-        yield* drainFactory;
-        const launched = yield* harnessStateOf(deliveryId);
-        const { awaiting, worktreePath } = launched;
-        if (awaiting?.type !== "run" || worktreePath === null) {
-          return assert.fail("The author launch recorded no run and worktree.");
-        }
-        assert.strictEqual(yield* runReached(awaiting.runId, ["starting", ...ended]), "starting");
-        yield* drainOrchestration;
+  it.live.each(["completed", "failed", "cancelled"] as const)(
+    "picks up an author launch a restart lost after its run ended %s, and verifies its work",
+    (status) =>
+      withProject(verifyCommands.passes, (world) =>
+        Effect.gen(function* () {
+          const factory = yield* Factory.FactoryService.FactoryService;
+          const { deliveryId, awaiting, worktreePath, launched, lost } = yield* lostLaunch(world);
+          // The author's turn went on regardless, committed its work, and then ended.
+          yield* authorCommits(worktreePath, "feat: add the export button");
+          yield* world.endRun(awaiting.runId, status);
+          assert.deepStrictEqual(yield* harnessStateOf(deliveryId), lost);
 
-        // The server stopped before it stored the launch's result, and the next boot failed the
-        // launch it found still awaited, as `failInterruptedEffect` does.
-        yield* store.update(deliveryId, queued.state);
-        yield* worker.step(deliveryId, {
-          type: "effect.failed",
-          effectId: 1,
-          detail: "Factory could not launch the author thread: a server restart interrupted it.",
-        });
-        const lost = yield* harnessStateOf(deliveryId);
-        assert.strictEqual(lost.status, "blocked");
-        assert.deepStrictEqual(lost.threads, {});
-        assert.isNull(lost.worktreePath);
-        // The author's turn went on regardless and committed its work.
-        yield* authorCommits(worktreePath, "feat: add the export button");
-        yield* world.endRun(awaiting.runId, "completed");
-        assert.deepStrictEqual(yield* harnessStateOf(deliveryId), lost);
+          yield* factory.resume(deliveryId);
+          yield* drainFactory;
 
-        yield* factory.resume(deliveryId);
-        yield* drainFactory;
+          // The launch replayed: its own thread, worktree and baseline, and no second author.
+          const state = yield* harnessStateOf(deliveryId);
+          assert.strictEqual(state.threads.author, awaiting.threadId);
+          assert.strictEqual(state.worktreePath, worktreePath);
+          assert.strictEqual(state.baseline, launched.baseline);
+          // However its run ended, its work was settled and verified afresh, and is under review.
+          assert.deepStrictEqual(
+            state.receipts.map(({ headSha }) => headSha),
+            [yield* harnessGit(worktreePath, ["rev-parse", "HEAD"])],
+          );
+          assert.strictEqual(state.status, "running");
+          assert.strictEqual(state.stage, "review");
+          if (state.awaiting?.type !== "run") return assert.fail("The reviewer is not running.");
+          assert.strictEqual(
+            yield* runReached(state.awaiting.runId, ["starting", ...ended]),
+            "starting",
+          );
+          yield* drainOrchestration;
+          // One author turn, the one the lost launch started, then the reviewer's.
+          assert.deepStrictEqual(
+            world.provider.started.map((turn) => [turn.threadId, turn.runId]),
+            [
+              [awaiting.threadId, awaiting.runId],
+              [state.awaiting.threadId, state.awaiting.runId],
+            ],
+          );
+          assert.strictEqual(yield* worktreeCount(world.root), 2);
+          assert.strictEqual(
+            yield* harnessGit(worktreePath, ["branch", "--show-current"]),
+            state.branch,
+          );
+        }),
+      ).pipe(Effect.orDie),
+  );
 
-        // The launch replayed: its own thread, worktree and baseline, and no second author.
-        const state = yield* harnessStateOf(deliveryId);
-        assert.strictEqual(state.threads.author, awaiting.threadId);
-        assert.strictEqual(state.worktreePath, worktreePath);
-        assert.strictEqual(state.baseline, launched.baseline);
-        // Its work was settled and verified afresh, and is under review.
-        assert.deepStrictEqual(
-          state.receipts.map(({ headSha }) => headSha),
-          [yield* harnessGit(worktreePath, ["rev-parse", "HEAD"])],
-        );
-        assert.strictEqual(state.status, "running");
-        assert.strictEqual(state.stage, "review");
-        if (state.awaiting?.type !== "run") return assert.fail("The reviewer is not running.");
-        assert.strictEqual(
-          yield* runReached(state.awaiting.runId, ["starting", ...ended]),
-          "starting",
-        );
-        yield* drainOrchestration;
-        assert.deepStrictEqual(
-          world.provider.started.map((turn) => [turn.threadId, turn.runId]),
-          [
-            [awaiting.threadId, awaiting.runId],
-            [state.awaiting.threadId, state.awaiting.runId],
-          ],
-        );
-        const worktrees = (yield* harnessGit(world.root, ["worktree", "list", "--porcelain"]))
-          .split("\n")
-          .filter((line) => line.startsWith("worktree "));
-        assert.strictEqual(worktrees.length, 2);
-        assert.strictEqual(
-          yield* harnessGit(worktreePath, ["branch", "--show-current"]),
-          state.branch,
-        );
-      }),
-    ).pipe(Effect.orDie),
+  it.live(
+    "stays blocked, launching nothing, on resumes after a lost author's thread is deleted",
+    () =>
+      withProject(verifyCommands.passes, (world) =>
+        Effect.gen(function* () {
+          const factory = yield* Factory.FactoryService.FactoryService;
+          const { deliveryId, awaiting } = yield* lostLaunch(world);
+          yield* world.endRun(awaiting.runId, "completed");
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* orchestrator.dispatch({
+            type: "thread.delete",
+            commandId: CommandId.make("delete-the-lost-author"),
+            threadId: awaiting.threadId,
+          });
+          yield* drainOrchestration;
+          yield* drainFactory;
+
+          const first = yield* factory.resume(deliveryId);
+          yield* drainFactory;
+          yield* drainOrchestration;
+          const second = yield* factory.resume(deliveryId);
+          yield* drainFactory;
+          yield* drainOrchestration;
+
+          for (const resumed of [first, second]) {
+            assert.strictEqual(resumed.state.status, "blocked");
+            assert.deepStrictEqual(resumed.state.block, {
+              reason: "thread_deleted",
+              threadId: awaiting.threadId,
+            });
+          }
+          assert.deepStrictEqual(yield* harnessStateOf(deliveryId), second.state);
+          // No thread, turn or worktree beyond the lost launch's.
+          assert.deepStrictEqual(
+            world.provider.started.map((turn) => turn.runId),
+            [awaiting.runId],
+          );
+          assert.strictEqual(yield* worktreeCount(world.root), 2);
+        }),
+      ).pipe(Effect.orDie),
   );
 
   it.live("verifies a delivery stopped at verify and reviews it, with no new author turn", () =>

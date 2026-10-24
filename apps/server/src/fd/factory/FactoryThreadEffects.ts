@@ -133,6 +133,16 @@ type FactoryThreadState = "present" | "deleted" | "missing";
 export const launchThreadId = (deliveryId: FactoryDeliveryId, effectId: number) =>
   ThreadId.make(`factory-thread:${deliveryId}:${effectId}`);
 
+/** The first message of a launch's thread, which starts the launch's run. */
+const launchMessageId = (deliveryId: FactoryDeliveryId, effectId: number) =>
+  MessageId.make(`factory-launch-message:${deliveryId}:${effectId}`);
+
+/**
+ * What became of a launch: it made no thread, made one that was deleted since, or made one whose
+ * run is unfinished (or not created yet) or has ended.
+ */
+type FactoryLaunchState = "missing" | "deleted" | "unfinished" | "ended";
+
 /** A launched thread, as `thread.launched` records it. */
 type FactoryThreadLaunch = Omit<
   Extract<FactoryEvent, { readonly type: "thread.launched" }>,
@@ -191,6 +201,11 @@ export class FactoryThreadEffects extends Context.Service<
       delivery: StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "send_review_follow_up_turn" }>,
     ) => Effect.Effect<{ readonly runId: RunId }, FactoryThreadEffectFailure>;
+    /** What became of the launch effect's thread and its first run. */
+    readonly launchState: (
+      delivery: StoredFactoryDelivery,
+      effect: Extract<FactoryEffect, { readonly type: "launch_thread" }>,
+    ) => Effect.Effect<FactoryLaunchState, ProjectionStore.ProjectionStoreV2Error>;
     /** Whether the thread exists, was deleted, or has no record at all. */
     readonly threadState: (
       threadId: ThreadId,
@@ -431,7 +446,7 @@ const make = Effect.gen(function* () {
       // Derived from the effect, so a retried launch replays its receipt instead of starting a
       // second thread, and finds its Work link already stored.
       const commandId = CommandId.make(`factory-launch:${deliveryId}:${effect.id}`);
-      const messageId = MessageId.make(`factory-launch-message:${deliveryId}:${effect.id}`);
+      const messageId = launchMessageId(deliveryId, effect.id);
       const threadId = launchThreadId(deliveryId, effect.id);
       // Work links the thread to the delivery's item before the launch runs, so a run that ends
       // before the launch returns is recorded on the link; a launch that creates no thread leaves
@@ -602,6 +617,19 @@ const make = Effect.gen(function* () {
         const selection = yield* turnSelection(delivery, effect.threadId, effect.round);
         return yield* sendTurn(delivery, effect, "review-follow-up", text, selection);
       }),
+    launchState: ({ deliveryId }, effect) => {
+      const messageId = launchMessageId(deliveryId, effect.id);
+      return projections.getThreadRecords(launchThreadId(deliveryId, effect.id), ["runs"]).pipe(
+        Effect.map(({ thread, runs }): FactoryLaunchState => {
+          if (thread.deletedAt !== null) return "deleted";
+          const run = runs.find((candidate) => candidate.userMessageId === messageId);
+          return run !== undefined && isTerminalRunStatus(run.status) ? "ended" : "unfinished";
+        }),
+        Effect.catchTags({
+          ProjectionStoreThreadNotFoundError: () => Effect.succeed<FactoryLaunchState>("missing"),
+        }),
+      );
+    },
     threadState: (threadId) =>
       projections.getThreadRecords(threadId, []).pipe(
         Effect.map(({ thread }): FactoryThreadState =>
