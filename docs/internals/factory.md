@@ -163,9 +163,13 @@ linked but never recorded as the delivery's, which blocks. Preventing that push 
 action itself to push an expected commit, a core change the owner has not decided.
 
 The template names no AI agent, model or provider, but the item's title, link and the verify
-command appear as written. Rendered text that breaks the commit policy's name or attribution rule
-([`publishedText.ts`](../../apps/server/src/fd/factory/git/publishedText.ts)) is never published:
-the effect fails before anything is pushed, and the owner changes the item or the command.
+command appear as written. Rendered text that breaks the name or attribution rules settle applies
+to commits ([`publishedText.ts`](../../apps/server/src/fd/factory/git/publishedText.ts)) is never
+published: the effect fails before anything is pushed, and the owner changes the item or the
+command. The rules are Looper's, widened to every provider T3 runs, the well-known assistants and
+model families, and co-authorship credited to an assistant. A name that is also an everyday
+programming word counts only in its product forms, so a database cursor is not the Cursor editor.
+No list names every tool; both checks read that one file, so extend it there.
 
 Passing `threadId` to `GitWorkflowService.runStackedAction` does not link the pull request to the
 thread; the stacked action's RPC handler in `ws.ts` does that afterwards. Factory calls the same

@@ -1,5 +1,5 @@
 import type { FactoryBranchCommit, FactoryBranchFacts } from "./branchFacts.ts";
-import { aiAttribution, aiNames } from "./publishedText.ts";
+import { carriesAiAttribution, namesAiTool } from "./publishedText.ts";
 
 /**
  * Commit policy ported from Looper. Its name and attribution rules are the ones pull request
@@ -7,8 +7,8 @@ import { aiAttribution, aiNames } from "./publishedText.ts";
  */
 const commitPolicy = {
   subject: /^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)(\([^)]+\))?!?: \S/,
-  names: aiNames,
-  attribution: aiAttribution,
+  names: namesAiTool,
+  attribution: carriesAiAttribution,
 };
 
 export type FactorySettleRule =
@@ -53,19 +53,19 @@ const commitProblems = (commit: FactoryBranchCommit): FactorySettleProblem[] => 
       description: `${label} subject is not a Conventional Commit: ${quote(commit.subject)}.`,
     });
   }
-  if (commitPolicy.names.test(commit.subject)) {
+  if (commitPolicy.names(commit.subject)) {
     problems.push({
       rule: "ai_name_in_subject",
       description: `${label} subject names an AI agent, model or provider.`,
     });
   }
-  if (commitPolicy.names.test(commit.body)) {
+  if (commitPolicy.names(commit.body)) {
     problems.push({
       rule: "ai_name_in_body",
       description: `${label} body names an AI agent, model or provider.`,
     });
   }
-  if (commitPolicy.attribution.test(`${commit.subject}\n${commit.body}`)) {
+  if (commitPolicy.attribution(`${commit.subject}\n${commit.body}`)) {
     problems.push({
       rule: "ai_attribution",
       description: `${label} message carries generated or assisted attribution.`,
@@ -76,7 +76,7 @@ const commitProblems = (commit: FactoryBranchCommit): FactorySettleProblem[] => 
     ["committer", `${commit.committerName}\n${commit.committerEmail}`],
   ] as const;
   for (const [role, identity] of identities) {
-    if (commitPolicy.names.test(identity)) {
+    if (commitPolicy.names(identity)) {
       problems.push({
         rule: "ai_identity",
         description: `${label} ${role} identity names an AI agent, model or provider.`,

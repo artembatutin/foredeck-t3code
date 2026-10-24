@@ -623,6 +623,39 @@ describe("the PR stage", () => {
         { field: "body", rule: "ai_attribution" },
       ],
     },
+    {
+      name: "a verify command naming another provider",
+      verifyArgs: ["tests/grok/verify.mjs"],
+      item,
+      problems: [{ field: "body", rule: "ai_name" }],
+    },
+    {
+      name: "an item title naming another provider",
+      verifyArgs: [],
+      item: { ...item, title: "Fix the OpenCode adapter" },
+      problems: [
+        { field: "title", rule: "ai_name" },
+        { field: "body", rule: "ai_name" },
+      ],
+    },
+    {
+      name: "an item title crediting a named assistant",
+      verifyArgs: [],
+      item: { ...item, title: "Export support. Co-authored-by: GitHub Copilot" },
+      problems: [
+        { field: "title", rule: "ai_name" },
+        { field: "body", rule: "ai_name" },
+      ],
+    },
+    {
+      name: "an item title crediting an unnamed assistant",
+      verifyArgs: [],
+      item: { ...item, title: "Export support. Co-authored-by: AI Assistant" },
+      problems: [
+        { field: "title", rule: "ai_attribution" },
+        { field: "body", rule: "ai_attribution" },
+      ],
+    },
   ] as const)("publishes nothing for $name", (testCase) =>
     withWorld((world) =>
       Effect.gen(function* () {

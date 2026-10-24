@@ -1,7 +1,7 @@
 import type { FactoryReviewSummary, FactoryVerifyReceipt } from "@t3tools/contracts/fd/factory";
 import type { WorkItemDetail } from "@t3tools/contracts/fd/work-management";
 
-import { aiAttribution, aiNames } from "../git/publishedText.ts";
+import { carriesAiAttribution, namesAiTool } from "../git/publishedText.ts";
 import { commandLine, describeResult } from "./review.ts";
 
 /**
@@ -77,6 +77,6 @@ export const pullRequestTextProblems = (text: {
   readonly body: string;
 }): ReadonlyArray<FactoryPullRequestTextProblem> =>
   (["title", "body"] as const).flatMap((field) => [
-    ...(aiNames.test(text[field]) ? [{ field, rule: "ai_name" as const }] : []),
-    ...(aiAttribution.test(text[field]) ? [{ field, rule: "ai_attribution" as const }] : []),
+    ...(namesAiTool(text[field]) ? [{ field, rule: "ai_name" as const }] : []),
+    ...(carriesAiAttribution(text[field]) ? [{ field, rule: "ai_attribution" as const }] : []),
   ]);
