@@ -79,6 +79,31 @@ describe("checkEvidencePaths", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("makes the review invalid for names too long to exist, naming each path", () =>
+    Effect.gen(function* () {
+      const { worktree } = yield* makeDirectories;
+      // One name past the 255-byte limit, and a path past macOS's 1024-byte limit once joined
+      // to the worktree (Linux allows it and reports it missing). Both decode as a review.
+      const longName = "a".repeat(256);
+      const longPath = Array.from({ length: 4 }, () => "b".repeat(250)).join("/");
+      const review = reviewWith([{ paths: [longName, longPath] }]);
+
+      assert.deepStrictEqual(yield* validateReviewInWorktree(worktree, review, context), {
+        status: "invalid",
+        problems: [
+          {
+            rule: "evidence_path_missing",
+            description: `Evidence path "${longName}" does not exist in the worktree.`,
+          },
+          {
+            rule: "evidence_path_missing",
+            description: `Evidence path "${longPath}" does not exist in the worktree.`,
+          },
+        ],
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("makes the review invalid for a symlink resolving outside the worktree", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

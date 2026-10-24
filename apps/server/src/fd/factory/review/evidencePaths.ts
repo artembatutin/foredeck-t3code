@@ -28,9 +28,18 @@ export class FactoryEvidencePathError extends Schema.TaggedError<FactoryEvidence
   }
 }
 
-/** Missing, through a file used as a directory, or a symlink loop: nothing to read there. */
-const isUnresolvable = (cause: PlatformError.PlatformError) =>
-  cause.reason._tag === "NotFound" || cause.reason._tag === "BadResource";
+/**
+ * Missing, through a file used as a directory, a symlink loop, or a name longer than the file
+ * system allows (Node reports that one as `Unknown`): nothing to read there.
+ */
+const isUnresolvable = ({ reason }: PlatformError.PlatformError) =>
+  reason._tag === "NotFound" ||
+  reason._tag === "BadResource" ||
+  (reason._tag === "Unknown" &&
+    typeof reason.cause === "object" &&
+    reason.cause !== null &&
+    "code" in reason.cause &&
+    reason.cause.code === "ENAMETOOLONG");
 
 /**
  * Problems with the evidence paths of verified criteria: each must exist and its realpath must
