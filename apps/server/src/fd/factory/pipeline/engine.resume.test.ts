@@ -433,23 +433,69 @@ describe("resume with an unsettled branch", () => {
 });
 
 describe("resume without an author or with a deleted thread", () => {
-  it("launches the author of a delivery that blocked before its launch, as start does", () => {
-    const launch = {
-      id: 2,
-      type: "launch_thread",
-      role: "author",
-      workspace: { type: "worktree", branch: "fd/item-7", baseRef: "main" },
-    };
-    expect(advance(blockedAtLaunch, resumeWith({ deletedThreads: [], worktree: null }))).toEqual({
+  const firstLaunch = {
+    id: 1,
+    type: "launch_thread",
+    role: "author",
+    workspace: { type: "worktree", branch: "fd/item-7", baseRef: "main" },
+  } as const;
+  const nothingRecorded: FactoryResumeCheck = { deletedThreads: [], worktree: null };
+
+  it("issues the author launch it blocked on again, under its own id", () => {
+    // The launch may have gone through before its result was lost: under the same id it replays
+    // that thread, run and worktree instead of starting a second author on the branch.
+    expect(advance(blockedAtLaunch, resumeWith(nothingRecorded))).toEqual({
       delivery: {
         ...blockedAtLaunch,
         status: "running",
         stage: "author",
         block: null,
-        effectsIssued: 2,
-        awaiting: { type: "effect", effect: launch },
+        awaiting: { type: "effect", effect: firstLaunch },
       },
-      effects: [launch],
+      effects: [firstLaunch],
+    });
+  });
+
+  it("takes the replayed launch's thread and settles the branch its run left", () => {
+    const relaunched = run(
+      blockedAtLaunch,
+      resumeWith(nothingRecorded),
+      {
+        type: "thread.launched",
+        effectId: 1,
+        threadId: author,
+        runId: authorRun,
+        worktreePath,
+        baseline,
+      },
+      finished(author, authorRun),
+    );
+    expect(relaunched.delivery.threads).toEqual({ author });
+    expect(relaunched.delivery.worktreePath).toBe(worktreePath);
+    expect(relaunched.effects).toEqual([
+      { id: 2, type: "check_settle", threadId: author, runId: authorRun },
+    ]);
+    expect(advance(relaunched.delivery, settled(2)).effects).toEqual([
+      { id: 3, type: "run_command", stage: "verify" },
+    ]);
+  });
+
+  it("launches the author as start does when it blocked on nothing it launched", () => {
+    const delivery = { ...blockedAtLaunch, block: { reason: "unsettled", problems: [] } } as const;
+    const launch = { ...firstLaunch, id: 2 };
+    expect(advance(delivery, resumeWith(nothingRecorded)).effects).toEqual([launch]);
+  });
+
+  it("blocks again when the thread of the launch it blocked on was deleted", () => {
+    const thread = ThreadId.make("factory-thread:delivery:1");
+    expect(
+      advance(blockedAtLaunch, resumeWith({ ...nothingRecorded, deletedThreads: [thread] })),
+    ).toEqual({
+      delivery: {
+        ...blockedAtLaunch,
+        block: { reason: "thread_deleted", threadId: thread },
+      },
+      effects: [],
     });
   });
 

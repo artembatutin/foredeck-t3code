@@ -532,6 +532,19 @@ export const queuedDeliveryState = (input: {
   checkpoint: null,
 });
 
+/**
+ * The author launch a delivery blocked on before it recorded its author. A launch derives its
+ * thread, command and message ids from its effect's id, so issuing this effect again replays a
+ * launch that went through but whose result was lost (a failed read, a restart): its thread, run
+ * and worktree, rather than a second author on the branch that launch created.
+ */
+export const failedAuthorLaunch = (delivery: FactoryDeliveryState) => {
+  const { block } = delivery;
+  if (delivery.threads.author !== undefined || block?.reason !== "effect_failed") return undefined;
+  const { effect } = block;
+  return effect.type === "launch_thread" && effect.role === "author" ? effect : undefined;
+};
+
 /** The accepted review of the current round, once there is one. */
 export const acceptedReview = (delivery: FactoryDeliveryState) => {
   const last = delivery.reviews.at(-1);

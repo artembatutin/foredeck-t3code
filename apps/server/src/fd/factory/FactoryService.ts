@@ -40,6 +40,7 @@ import {
   type FactoryAcceptedReview,
   type FactoryEvent,
   type FactoryResumeCheck,
+  failedAuthorLaunch,
   isTerminal,
   queuedDeliveryState,
   runsStages,
@@ -217,9 +218,11 @@ export class FactoryService extends Context.Service<
      * commit its task was approved for, a delivery stopped at or blocked in the PR stage opens its
      * pull request at once. A branch that does not settle gets one fix-commit turn naming the
      * checkpoint, or blocks when it cannot be repaired; a deleted thread of the delivery blocks it
-     * again; a delivery whose author never launched launches it. A resume grants a fresh retry
-     * allowance (owner decision): repair rounds and failure fingerprints start over, its limits
-     * do not. Refused, with nothing changed, in any other status.
+     * again. A delivery that blocked on its author's launch issues that launch again, which picks
+     * up the thread, run and worktree it made if it went through, and never starts a second
+     * author. A resume grants a fresh retry allowance (owner decision): repair rounds and failure
+     * fingerprints start over, its limits do not. Refused, with nothing changed, in any other
+     * status.
      */
     readonly resume: (
       deliveryId: FactoryDeliveryId,
@@ -433,8 +436,22 @@ const make = Effect.gen(function* () {
       const recorded = [...new Set(Object.values(state.threads))].filter(
         (threadId): threadId is ThreadId => threadId !== undefined,
       );
-      const deletedThreads = yield* Effect.filter(recorded, threads.threadDeleted);
+      const gone = yield* Effect.filter(recorded, (threadId) =>
+        threads.threadState(threadId).pipe(Effect.map((found) => found !== "present")),
+      );
       if (state.threads.author === undefined) {
+        // The author launch the delivery blocked on is issued again and replays its thread, if it
+        // made one; a thread it made and the owner deleted since blocks instead. One it never made
+        // has no record, and the launch makes it.
+        const launch = failedAuthorLaunch(state);
+        const launched =
+          launch === undefined
+            ? undefined
+            : FactoryThreadEffects.launchThreadId(deliveryId, launch.id);
+        const deletedThreads =
+          launched !== undefined && (yield* threads.threadState(launched)) === "deleted"
+            ? [...gone, launched]
+            : gone;
         return { deletedThreads, worktree: null } satisfies FactoryResumeCheck;
       }
       const settle = yield* readSettle(state).pipe(Effect.provideContext(gitContext));
@@ -453,7 +470,7 @@ const make = Effect.gen(function* () {
       const stored = yield* tasks.listByDelivery(deliveryId);
       const approvedSha = stored.length === 1 ? (stored[0]?.lastReviewedSha ?? null) : null;
       return {
-        deletedThreads,
+        deletedThreads: gone,
         worktree: { settle, commit, approvedSha },
       } satisfies FactoryResumeCheck;
     });

@@ -5,6 +5,7 @@ import type { FactoryStageDefinition } from "./definitions.ts";
 import {
   acceptedReview,
   blocked,
+  failedAuthorLaunch,
   isTerminal,
   isTurnEffect,
   issue,
@@ -171,7 +172,8 @@ const holdsApprovedCommit = (
  * an earlier receipt, then reviewed; only a delivery resuming the PR stage on the very commit its
  * task was approved for opens its pull request at once. A branch with repairable problems gets one
  * fix-commit turn naming the checkpoint, and is settled after it as after any author turn. Without
- * an author yet, the author launches as `start` launches it.
+ * an author recorded, the author launch it blocked on is issued again under its own id (see
+ * `failedAuthorLaunch`), or else the author launches as `start` launches it.
  */
 const resume = (delivery: FactoryDeliveryState, check: FactoryResumeCheck): FactoryAdvance => {
   const { author } = delivery.threads;
@@ -182,7 +184,21 @@ const resume = (delivery: FactoryDeliveryState, check: FactoryResumeCheck): Fact
   if (deleted !== undefined) {
     return blocked(delivery, { reason: "thread_deleted", threadId: deleted });
   }
-  if (author === undefined) return begin(resumed(delivery), standardStages.author);
+  if (author === undefined) {
+    // The launch it blocked on goes again under its own id, so a launch that went through is
+    // picked up rather than started twice.
+    const launch = failedAuthorLaunch(delivery);
+    return launch === undefined
+      ? begin(resumed(delivery), standardStages.author)
+      : {
+          delivery: {
+            ...resumed(delivery),
+            stage: "author",
+            awaiting: { type: "effect", effect: launch },
+          },
+          effects: [launch],
+        };
+  }
   const { worktree } = check;
   // The worktree is read whenever the author has launched; without it there is nothing to judge.
   if (worktree === null) return unchanged(delivery);

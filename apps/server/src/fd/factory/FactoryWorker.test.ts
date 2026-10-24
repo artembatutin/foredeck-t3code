@@ -69,7 +69,7 @@ const scriptedThreads = (script: ThreadScript) =>
         sendRepairTurn: () => Effect.die("repair turn not scripted"),
         sendReviewFollowUpTurn: () => Effect.die("review follow-up turn not scripted"),
         // Resumes are covered in FactoryResume.test.ts.
-        threadDeleted: () => Effect.die("thread read not scripted"),
+        threadState: () => Effect.die("thread read not scripted"),
         // Every run is still going; its end arrives as a step.
         runEnded: () => Effect.succeedNone,
         // Cancels are covered in FactoryStopCancel.test.ts.

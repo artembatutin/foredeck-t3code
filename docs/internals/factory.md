@@ -200,6 +200,14 @@ fix-commit turn naming the checkpoint, an unrepairable one blocks, and a deleted
 delivery blocks it again: a resume never launches a replacement for a thread the delivery recorded.
 A resume that blocks keeps the checkpoint, so the next one still knows it stopped before `pr`.
 
+A delivery with no author recorded is not proof that no author ran. A launch can go through and its
+result still be lost, to a failed run read or a restart, leaving a thread at work on the branch the
+launch created. So a resume issues the author launch the delivery blocked on again, under its own
+id: the launch derives its command, thread and message ids from the effect, and replaying them
+returns that thread, run and worktree instead of starting a second author whose `worktree add -b`
+would collide with the branch. A thread that launch made and the owner deleted since blocks the
+resume like any deleted thread of the delivery.
+
 By owner decision an explicit resume grants a fresh retry allowance: repair rounds, the fix-commit
 turn and failure fingerprints start over, while the limits the delivery started with stay, and so
 do its receipts, reviews, stage attempts and approval. The resumed stage gets a new attempt even
