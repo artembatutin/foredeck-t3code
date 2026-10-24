@@ -136,11 +136,11 @@ interface FactoryThreadEffectFailure {
 
 /**
  * Carries out the thread effects for `FactoryWorker`: launching a role's thread and sending a
- * follow-up turn on a thread. Each receives the delivery as stored with the effect. The worker
- * feeds what they report back as `thread.launched` / `turn.started`, and a failure as
- * `effect.failed`. Checks run before anything is dispatched, so a refused launch leaves no thread
- * behind; a read that fails after the launch still fails the effect, and the delivery records
- * none of its result.
+ * follow-up turn on a thread, and interrupting the runs of a cancelled delivery. Each receives
+ * the delivery as stored with the effect. The worker feeds what they report back as
+ * `thread.launched` / `turn.started`, and a failure as `effect.failed`. Checks run before
+ * anything is dispatched, so a refused launch leaves no thread behind; a read that fails after the
+ * launch still fails the effect, and the delivery records none of its result.
  */
 export class FactoryThreadEffects extends Context.Service<
   FactoryThreadEffects,
@@ -185,6 +185,14 @@ export class FactoryThreadEffects extends Context.Service<
       threadId: ThreadId,
       runId: RunId,
     ) => Effect.Effect<Option.Option<FactoryTerminalRunStatus>, FactoryThreadEffectFailure>;
+    /**
+     * Asks the thread's run to stop, as the thread's own Stop does, for a delivery that was
+     * cancelled. A run that already ended is left as it is.
+     */
+    readonly interruptRun: (
+      delivery: StoredFactoryDelivery,
+      run: { readonly threadId: ThreadId; readonly runId: RunId },
+    ) => Effect.Effect<void, FactoryThreadEffectFailure>;
   }
 >()("t3/fd/factory/FactoryThreadEffects") {}
 
@@ -583,6 +591,17 @@ const make = Effect.gen(function* () {
           isTerminalRunStatus(status) ? Option.some(status) : Option.none(),
         ),
       ),
+    interruptRun: (delivery, { threadId, runId }) =>
+      threads
+        .interruptThread({
+          projectId: delivery.projectId,
+          // One interrupt per run, however often a cancel is retried.
+          commandId: CommandId.make(`factory-cancel:${delivery.deliveryId}:${runId}`),
+          threadId,
+          runId,
+          reason: "Factory delivery cancelled",
+        })
+        .pipe(Effect.asVoid),
   });
 });
 

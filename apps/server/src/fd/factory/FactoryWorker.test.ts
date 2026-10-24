@@ -70,6 +70,8 @@ const scriptedThreads = (script: ThreadScript) =>
         sendReviewFollowUpTurn: () => Effect.die("review follow-up turn not scripted"),
         // Every run is still going; its end arrives as a step.
         runEnded: () => Effect.succeedNone,
+        // Cancels are covered in FactoryStopCancel.test.ts.
+        interruptRun: () => Effect.die("interrupt not scripted"),
       });
     }),
   );

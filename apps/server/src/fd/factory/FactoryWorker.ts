@@ -95,7 +95,7 @@ export class FactoryWorker extends Context.Service<
      */
     readonly stepThread: (event: FactoryThreadEvent) => Effect.Effect<void, FactoryStoreError>;
     /**
-     * Blocks a running or approved delivery that awaits an effect this process never queued: the
+     * Blocks a delivery that awaits an effect this process never queued, whatever its status: the
      * queue that held it ended with an earlier server process. Nothing is re-run. Any other
      * delivery is left as it is; an unknown one returns none.
      */
@@ -171,6 +171,8 @@ const outcomeOf = (state: FactoryDeliveryState): FactoryStageRunStore.FactorySta
       ? "failed"
       : "blocked";
   }
+  // Stopped where a repair round would begin: the stage judged the commit wanting.
+  if (state.status === "stopped" && state.checkpoint === "repair") return "failed";
   return state.status === "cancelled" ? "cancelled" : "passed";
 };
 
@@ -419,6 +421,23 @@ const make = Effect.gen(function* () {
     }
   });
 
+  /**
+   * Interrupts a run of a cancelled delivery, so no agent goes on working in its worktree; the
+   * worktree, branch and commits stay. A run that cannot be interrupted is logged and left to its
+   * owner: the delivery is cancelled either way, and no event of the run changes it.
+   */
+  const interruptCancelled = (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+    run: { readonly threadId: ThreadId; readonly runId: RunId },
+  ) =>
+    Effect.suspend(() => threads.interruptRun(delivery, run)).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("factory could not interrupt a cancelled delivery's run", cause),
+      ),
+    );
+
   const stepLocked = Effect.fn("FactoryWorker.step")(function* (
     deliveryId: FactoryDeliveryId,
     event: FactoryEvent,
@@ -450,6 +469,16 @@ const make = Effect.gen(function* () {
         yield* TxRef.update(outstanding, (count) => count + 1);
         yield* lane.enqueue({ delivery: stored.value, effect });
       }
+    }
+    // Cancelled while its agent works: the run is interrupted once the cancel is stored, so its
+    // end finds the delivery cancelled.
+    if (
+      Option.isSome(stored) &&
+      next.delivery.status === "cancelled" &&
+      before.awaiting?.type === "run"
+    ) {
+      const { threadId, runId } = before.awaiting;
+      yield* interruptCancelled(stored.value, { threadId, runId });
     }
     return stored;
   });
@@ -512,7 +541,14 @@ const make = Effect.gen(function* () {
           });
         }
         const stored = yield* stepLocked(deliveryId, event);
-        if (Option.isNone(ended.value)) return stored;
+        if (Option.isNone(ended.value)) {
+          // A launch or turn that started after its delivery was cancelled: the delivery took
+          // none of it, and its agent must not go on working.
+          if (Option.isSome(stored) && stored.value.state.status === "cancelled") {
+            yield* interruptCancelled(stored.value, run);
+          }
+          return stored;
+        }
         return yield* stepLocked(deliveryId, {
           type: "run.finished",
           ...run,
@@ -553,13 +589,7 @@ const make = Effect.gen(function* () {
         const { awaiting } = current.value.state;
         // A delivery gets a lane when this process queues its first effect, so with one the
         // awaited effect is still queued or running here, or has already fed its result back.
-        if (
-          !isProceeding(current.value.state) ||
-          awaiting?.type !== "effect" ||
-          lanes.has(deliveryId)
-        ) {
-          return current;
-        }
+        if (awaiting?.type !== "effect" || lanes.has(deliveryId)) return current;
         return yield* stepLocked(deliveryId, {
           type: "effect.failed",
           effectId: awaiting.effect.id,

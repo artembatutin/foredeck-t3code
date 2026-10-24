@@ -248,6 +248,13 @@ export interface FactoryOpenedPullRequest {
 export type FactoryEvent =
   | { readonly type: "start" }
   /**
+   * The owner's stop after the current step: a running delivery becomes `stopping`, finishes the
+   * work of its stage and stops where it would begin the next one.
+   */
+  | { readonly type: "stop" }
+  /** The owner's cancel: the delivery ends, whatever it awaits. */
+  | { readonly type: "cancel" }
+  /**
    * A `launch_thread` result; `baseline` is HEAD before the thread's first turn. `worktreePath`
    * is null when the launch ended the run before a new worktree was recorded.
    */
@@ -409,7 +416,20 @@ export interface FactoryDeliveryState {
   readonly pullRequest: FactoryOpenedPullRequest | null;
   /** Set while the delivery is blocked. */
   readonly block: FactoryBlock | null;
+  /**
+   * Set while the delivery is stopped: the stage it would have begun when it stopped, where a
+   * resume picks up. Null for deliveries a server stopped before checkpoints were recorded.
+   */
+  readonly checkpoint: FactoryStageName | null;
 }
+
+/**
+ * Whether the delivery runs its stages: `running`, or `stopping`, which the owner asked to stop
+ * after its step. A stopping delivery takes every event a running one does and stops only where it
+ * would begin its next stage.
+ */
+export const runsStages = (delivery: FactoryDeliveryState) =>
+  delivery.status === "running" || delivery.status === "stopping";
 
 /**
  * Whether the server moves the delivery on by itself: while it runs its stages, and once
@@ -417,7 +437,11 @@ export interface FactoryDeliveryState {
  * so no worker result is coming for an effect it still names.
  */
 export const isProceeding = (delivery: FactoryDeliveryState) =>
-  delivery.status === "running" || delivery.status === "approved";
+  runsStages(delivery) || delivery.status === "approved";
+
+/** Done and cancelled deliveries never change again. */
+export const isTerminal = (delivery: FactoryDeliveryState) =>
+  delivery.status === "done" || delivery.status === "cancelled";
 
 /** The result of one engine step: the new state and the effects to carry out, in order. */
 export interface FactoryAdvance {
@@ -472,6 +496,7 @@ export const queuedDeliveryState = (input: {
   reviewResponse: null,
   pullRequest: null,
   block: null,
+  checkpoint: null,
 });
 
 /** The accepted review of the current round, once there is one. */

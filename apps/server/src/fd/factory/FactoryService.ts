@@ -1,5 +1,9 @@
 import { AuthWorkReadScope, ThreadId } from "@t3tools/contracts";
-import { FactoryDeliveryId, FactoryTaskId } from "@t3tools/contracts/fd/factory";
+import {
+  FactoryDeliveryId,
+  FactoryDeliveryStatus,
+  FactoryTaskId,
+} from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -28,7 +32,9 @@ import {
   acceptedReview,
   type FactoryAcceptedReview,
   type FactoryEvent,
+  isTerminal,
   queuedDeliveryState,
+  runsStages,
 } from "./pipeline/state.ts";
 
 const FactoryReceiptRefusal = Schema.Literals(["head_changed", "tree_dirty"]);
@@ -105,6 +111,36 @@ export class FactoryDeliveryIdError extends Schema.TaggedError<FactoryDeliveryId
   }
 }
 
+/** No delivery has this id. */
+export class FactoryDeliveryNotFoundError extends Schema.TaggedError<FactoryDeliveryNotFoundError>()(
+  "FactoryDeliveryNotFoundError",
+  { deliveryId: FactoryDeliveryId },
+) {
+  override get message(): string {
+    return `Factory delivery ${this.deliveryId} does not exist.`;
+  }
+}
+
+/** Only a running delivery can stop after its step; nothing changed. */
+export class FactoryStopRefusedError extends Schema.TaggedError<FactoryStopRefusedError>()(
+  "FactoryStopRefusedError",
+  { deliveryId: FactoryDeliveryId, status: FactoryDeliveryStatus },
+) {
+  override get message(): string {
+    return `Factory delivery ${this.deliveryId} is ${this.status}; only a running delivery can stop after its step.`;
+  }
+}
+
+/** A done or cancelled delivery cannot be cancelled; nothing changed. */
+export class FactoryCancelRefusedError extends Schema.TaggedError<FactoryCancelRefusedError>()(
+  "FactoryCancelRefusedError",
+  { deliveryId: FactoryDeliveryId, status: FactoryDeliveryStatus },
+) {
+  override get message(): string {
+    return `Factory delivery ${this.deliveryId} is already ${this.status}, so it cannot be cancelled.`;
+  }
+}
+
 /** Why a start was refused. Every refusal comes before the delivery's row is written. */
 type FactoryStartError =
   | WorkDomainError
@@ -138,6 +174,31 @@ export class FactoryService extends Context.Service<
     ) => Effect.Effect<
       Option.Option<FactoryDeliveryStore.StoredFactoryDelivery>,
       FactoryStoreError
+    >;
+    /**
+     * Stops a running delivery after its current step. It is stored `stopping`, and the turn or
+     * effect under way is not interrupted: it finishes the work of its stage and becomes
+     * `stopped` where it would begin the next one, with that stage as its checkpoint (see
+     * `advance`). Stopping already, nothing changes. Refused, with nothing changed, in any other
+     * status.
+     */
+    readonly stop: (
+      deliveryId: FactoryDeliveryId,
+    ) => Effect.Effect<
+      FactoryDeliveryStore.StoredFactoryDelivery,
+      FactoryStopRefusedError | FactoryDeliveryNotFoundError | FactoryStoreError
+    >;
+    /**
+     * Cancels a delivery that is not done or cancelled. It ends at once and issues nothing more,
+     * and the run its agent works on is interrupted; the worktree, branch and commits stay. No
+     * later run end, effect result or review submission changes it, and its item can be
+     * delivered again. Refused, with nothing changed, once done or cancelled.
+     */
+    readonly cancel: (
+      deliveryId: FactoryDeliveryId,
+    ) => Effect.Effect<
+      FactoryDeliveryStore.StoredFactoryDelivery,
+      FactoryCancelRefusedError | FactoryDeliveryNotFoundError | FactoryStoreError
     >;
     /**
      * A reviewer's `factory_submit_review`. Taken only from the thread an active delivery
@@ -249,8 +310,9 @@ const make = Effect.gen(function* () {
         const { state } = current;
         const { awaiting } = state;
         if (state.threads.reviewer !== threadId) return yield* refuse("not_reviewer");
+        // A stopping delivery still finishes its review round.
         if (
-          state.status !== "running" ||
+          !runsStages(state) ||
           state.stage !== "review" ||
           awaiting?.type !== "run" ||
           awaiting.threadId !== threadId
@@ -287,7 +349,33 @@ const make = Effect.gen(function* () {
     }
   });
 
-  return FactoryService.of({ start, get: deliveries.get, submitReview });
+  // Both decide and step under the delivery's lock, so no run end or effect result lands between
+  // the status they check and the step.
+  const stop: FactoryService["Service"]["stop"] = Effect.fn("FactoryService.stop")(
+    function* (deliveryId) {
+      const stepped = yield* worker.stepWith(deliveryId, ({ state }) =>
+        runsStages(state)
+          ? Effect.succeed({ event: { type: "stop" } as const, value: undefined })
+          : Effect.fail(new FactoryStopRefusedError({ deliveryId, status: state.status })),
+      );
+      if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
+      return stepped.value.delivery;
+    },
+  );
+
+  const cancel: FactoryService["Service"]["cancel"] = Effect.fn("FactoryService.cancel")(
+    function* (deliveryId) {
+      const stepped = yield* worker.stepWith(deliveryId, ({ state }) =>
+        isTerminal(state)
+          ? Effect.fail(new FactoryCancelRefusedError({ deliveryId, status: state.status }))
+          : Effect.succeed({ event: { type: "cancel" } as const, value: undefined }),
+      );
+      if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
+      return stepped.value.delivery;
+    },
+  );
+
+  return FactoryService.of({ start, get: deliveries.get, stop, cancel, submitReview });
 });
 
 export const layer = Layer.effect(FactoryService, make);

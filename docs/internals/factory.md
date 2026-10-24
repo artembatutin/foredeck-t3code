@@ -103,8 +103,8 @@ commit means the review describes code no receipt covers. The reviewer's launch 
 baseline alone; settle checks keep judging the author's commits after it. See
 [`FactoryReview.ts`](../../apps/server/src/fd/factory/FactoryReview.ts).
 
-Deliveries a Phase 1 server stopped at their verified checkpoint load without review fields and stay
-`stopped` at `verify`; nothing moves them on its own.
+Deliveries a Phase 1 server stopped at their verified checkpoint load without review fields or a
+recorded checkpoint and stay `stopped` at `verify`; nothing moves them on its own.
 
 ## One accepted review per round, acted on when the run ends
 
@@ -146,6 +146,32 @@ Numbered verify and review evidence is never overwritten, but a task has one cur
 later approval of the task replaces its `approval-<taskId>.json` and `lastReviewedSha`. A single
 item is its delivery's one task, written in the transaction that inserts the delivery. See
 [`FactoryRecord.ts`](../../apps/server/src/fd/factory/FactoryRecord.ts).
+
+## Stop waits for a stage boundary; cancel does not
+
+Stop after step is a status, not an interruption. A `stopping` delivery takes every event a running
+one does, so the turn or effect under way finishes, and it becomes `stopped` only where the engine
+would begin verify, a review round, a repair round, record or the PR stage, with that stage as its
+checkpoint ([`engine.ts`](../../apps/server/src/fd/factory/pipeline/engine.ts)). Work inside a
+stage is not a boundary: the settle check and its fix-commit turn, the fallback review read, a
+review submission and its retry. A failure found first still blocks, because a stopped delivery
+would hide it. Stopped where a repair round would begin, the failure's fingerprint is recorded but
+no round is spent, and the stage's attempt is recorded as failed. Only a running delivery can stop;
+an approved one is already in the last stage it runs.
+
+Cancel ends a delivery whatever it awaits, and by owner decision interrupts the run its agent is
+working on, through the thread's own interrupt. A launch or turn being started when the cancel
+lands reports a run the cancelled delivery never takes, so the worker interrupts that run as well
+([`FactoryWorker.ts`](../../apps/server/src/fd/factory/FactoryWorker.ts)). The verify command and
+the PR action belong to the server and are not stopped; their results change nothing. The worktree,
+branch and commits stay. A new delivery of the item may start, but its author asks for a new
+worktree on the item's branch, which the cancelled delivery's worktree still has checked out, so
+the launch fails and the new delivery blocks. What a re-delivery should do with the kept worktree
+is not decided yet.
+
+Both actions check the status and step under the delivery's lock, like a review submission. The
+boot sweep keys on what a delivery awaits, not on its status: a stopping delivery whose run ended
+while no server ran stops where the run's end leads it, as the live tail would have taken it there.
 
 ## The PR stage opens only the approved commit
 

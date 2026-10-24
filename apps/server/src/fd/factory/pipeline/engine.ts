@@ -1,6 +1,16 @@
+import type { FactoryStageName } from "@t3tools/contracts/fd/factory";
+
 import { standardStages } from "./definitions.ts";
 import type { FactoryStageDefinition } from "./definitions.ts";
-import { acceptedReview, blocked, isTurnEffect, issue, receiptFailed } from "./state.ts";
+import {
+  acceptedReview,
+  blocked,
+  isTerminal,
+  isTurnEffect,
+  issue,
+  receiptFailed,
+  runsStages,
+} from "./state.ts";
 import type {
   FactoryAcceptedReview,
   FactoryAdvance,
@@ -34,6 +44,21 @@ const begin = (delivery: FactoryDeliveryState, stage: FactoryStageDefinition): F
         { reason: "unsupported_stage", stage: stage.name },
       );
 };
+
+/**
+ * Begins the next stage with `proceed`, unless the owner asked the delivery to stop after its
+ * step: a stopping delivery is `stopped` here instead, awaiting nothing, with the stage it would
+ * have begun as its checkpoint. A failure found first still blocks it, so call this only once the
+ * delivery would go on.
+ */
+const enter = (
+  delivery: FactoryDeliveryState,
+  checkpoint: FactoryStageName,
+  proceed: (delivery: FactoryDeliveryState) => FactoryAdvance,
+): FactoryAdvance =>
+  delivery.status === "stopping"
+    ? step({ ...delivery, status: "stopped", awaiting: null, checkpoint })
+    : proceed(delivery);
 
 /**
  * A new review round: a fresh retry budget, and no review accepted for it yet. The first round
@@ -82,18 +107,20 @@ const repair = (
     return blocked(recorded, failure.exhausted);
   }
   const round = spent + 1;
-  return issue(
-    {
-      ...recorded,
-      stage: "repair",
-      rounds: fixing ? { ...rounds, fix: round } : { ...rounds, review: round },
-    },
-    {
-      type: "send_repair_turn",
-      kind: fixing ? "fix-verify" : "fix-review",
-      threadId: author,
-      round,
-    },
+  return enter(recorded, "repair", (current) =>
+    issue(
+      {
+        ...current,
+        stage: "repair",
+        rounds: fixing ? { ...rounds, fix: round } : { ...rounds, review: round },
+      },
+      {
+        type: "send_repair_turn",
+        kind: fixing ? "fix-verify" : "fix-review",
+        threadId: author,
+        round,
+      },
+    ),
   );
 };
 
@@ -105,7 +132,7 @@ const concludeReview = (delivery: FactoryDeliveryState, review: FactoryAcceptedR
         fingerprint: review.fingerprint,
         exhausted: { reason: "review_changes_required", summary: review.summary },
       })
-    : begin(delivery, standardStages.record);
+    : enter(delivery, "record", (current) => begin(current, standardStages.record));
 
 /**
  * Folds a judged submission into the round. `accepted` continues with the recorded review and
@@ -166,7 +193,7 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * services, I/O or clock, and the input is never mutated, so a delivery's events replay to the
  * same state. An event that does not answer what the delivery awaits (a result for another
  * effect, a run of another thread or an earlier run, a submission for another round, a stage it
- * is not in, a delivery that is not running) changes nothing.
+ * is not in, a delivery that does not run its stages) changes nothing.
  *
  * This covers a single item from start to its pull request: the author thread, the branch settle
  * check with at most one fix-commit turn, the verify command, then a reviewer thread whose one
@@ -176,19 +203,36 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * a fix-review continues the same reviewer thread. A passing review enters `record`, which
  * approves the reviewed commit. The approved delivery enters `pr` and opens its pull request,
  * then is `pr_open` with the pull request recorded, awaiting nothing.
+ *
+ * The owner can stop a running delivery after its step, or cancel any delivery that is not done
+ * or cancelled. A stopping delivery still completes the work of its stage (the settle check and
+ * its fix-commit turn, the fallback review read, review submissions and their retry) and blocks on
+ * a failure as a running one would; where it would begin verify, a review round, a repair round,
+ * record or the PR stage, it is `stopped` instead. A cancelled delivery awaits nothing, so no later
+ * event moves it.
  */
 export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
-  if (event.type === "start") {
-    return delivery.status === "queued"
-      ? begin({ ...delivery, status: "running" }, standardStages.author)
-      : unchanged(delivery);
+  switch (event.type) {
+    case "start":
+      return delivery.status === "queued"
+        ? begin({ ...delivery, status: "running" }, standardStages.author)
+        : unchanged(delivery);
+    case "stop":
+      // Stopping already, the stop changes nothing; only a running delivery stops after its step.
+      return delivery.status === "running"
+        ? step({ ...delivery, status: "stopping" })
+        : unchanged(delivery);
+    case "cancel":
+      return isTerminal(delivery)
+        ? unchanged(delivery)
+        : step({ ...delivery, status: "cancelled", awaiting: null, block: null, checkpoint: null });
   }
   // Approved, the delivery only opens its pull request: its threads' runs and deletions no
   // longer change it.
   const opensPullRequest =
     delivery.status === "approved" &&
     (event.type === "pr.opened" || event.type === "effect.failed");
-  if (delivery.status !== "running" && !opensPullRequest) return unchanged(delivery);
+  if (!runsStages(delivery) && !opensPullRequest) return unchanged(delivery);
   const { awaiting } = delivery;
 
   switch (event.type) {
@@ -267,7 +311,9 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       const check = awaitedEffect(delivery, event.effectId, "check_settle");
       if (check === undefined) return unchanged(delivery);
       const { result } = event;
-      if (result.status === "settled") return begin(delivery, standardStages.verify);
+      if (result.status === "settled") {
+        return enter(delivery, "verify", (current) => begin(current, standardStages.verify));
+      }
       if (result.status === "repairable" && delivery.fixCommitTurns < FIX_COMMIT_TURNS) {
         return issue(
           { ...delivery, fixCommitTurns: delivery.fixCommitTurns + 1 },
@@ -293,7 +339,7 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
           exhausted: { reason: "verify_failed" },
         });
       }
-      return beginReview(recorded);
+      return enter(recorded, "review", beginReview);
     }
 
     case "review.submitted": {
@@ -330,7 +376,9 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       }
       const { outcome } = event;
       if (outcome.type === "approved") {
-        return begin({ ...delivery, status: "approved" }, standardStages.pr);
+        return enter(delivery, "pr", (current) =>
+          begin({ ...current, status: "approved" }, standardStages.pr),
+        );
       }
       const { expected, actual, differences } = outcome;
       return blocked(delivery, { reason: "record_mismatch", expected, actual, differences });

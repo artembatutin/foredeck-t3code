@@ -119,12 +119,14 @@ export const verifyCommands = {
 } satisfies Record<string, FactoryCommand>;
 
 /**
- * A provider whose turns run until the test ends them. Every turn it is asked to start is
- * recorded, and the test ends one by sending its terminal events, as a provider process would.
+ * A provider whose turns run until the test ends them. Every turn it is asked to start or
+ * interrupt is recorded, and the test ends one by sending its terminal events, as a provider
+ * process would.
  */
 const makeFakeProvider = Effect.gen(function* () {
   const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
   const started: Array<ProviderAdapter.ProviderAdapterV2TurnInput> = [];
+  const interrupted: Array<ProviderAdapter.ProviderAdapterV2InterruptInput> = [];
   const providerTurnId = (turn: ProviderAdapter.ProviderAdapterV2TurnInput) =>
     ProviderTurnId.make(`provider-turn:${turn.attemptId}`);
   const providerTurn = (
@@ -199,7 +201,8 @@ const makeFakeProvider = Effect.gen(function* () {
               });
             }),
           steerTurn: () => Effect.die("Factory never steers a turn."),
-          interruptTurn: () => Effect.void,
+          // The turn goes on until the test ends it, as a provider still finishing it would.
+          interruptTurn: (input) => Effect.sync(() => void interrupted.push(input)),
           respondToRuntimeRequest: () => Effect.void,
           readThreadSnapshot: () => Effect.die("unused"),
           rollbackThread: () => Effect.die("unused"),
@@ -270,7 +273,7 @@ const makeFakeProvider = Effect.gen(function* () {
       });
     });
 
-  return { adapter, started, endTurn, say };
+  return { adapter, started, interrupted, endTurn, say };
 });
 
 type FakeProvider = Effect.Success<typeof makeFakeProvider>;

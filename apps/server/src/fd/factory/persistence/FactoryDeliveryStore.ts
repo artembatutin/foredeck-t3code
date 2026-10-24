@@ -195,6 +195,11 @@ const StoredDeliveryState = Schema.Struct({
     Schema.Struct({ number: PositiveInt, url: Schema.String, headBranch: Schema.String }),
   ).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   block: Schema.NullOr(StoredBlock),
+  // Added with stop after step: rows stored before it name no checkpoint, even when stopped. The
+  // stop request is the `stopping` status, which every stored row could already hold.
+  checkpoint: Schema.NullOr(FactoryStageName).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
 });
 
 /** A delivery: its identity beside the engine's state. */

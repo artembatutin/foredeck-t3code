@@ -13,14 +13,14 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { forkParked } from "../../serverActivation.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
-import { type FactoryThreadEvent, isProceeding, isTerminalRunStatus } from "./pipeline/state.ts";
+import { type FactoryThreadEvent, isTerminalRunStatus } from "./pipeline/state.ts";
 
 /**
  * Feeds what happens to Factory's threads into their deliveries: a terminal run becomes
  * `run.finished` and a deleted thread `thread.deleted` for the delivery whose active stage
  * attempt owns the thread (any delivery recording it, for a deletion); other threads pass by.
- * A boot sweep catches up the deliveries that were running when the previous server stopped, and
- * the tail starts at the event log position read before it, so no event falls between the two.
+ * A boot sweep catches up the deliveries that awaited something when the previous server stopped,
+ * and the tail starts at the event log position read before it, so no event falls between the two.
  */
 export class FactoryReactor extends Context.Service<
   FactoryReactor,
@@ -67,16 +67,17 @@ const make = Effect.gen(function* () {
     );
 
   /**
-   * Catches one delivery up with what happened while no server ran it. A delivery awaiting a run
-   * gets the run's end or its thread's deletion; one awaiting an effect lost it with the previous
-   * process and blocks, an approved one opening its pull request too. Deliveries that are neither
-   * running nor approved wait for their owner.
+   * Catches one delivery up with what happened while no server ran it, whatever its status. A
+   * delivery awaiting a run gets the run's end or its thread's deletion, as the tail would have
+   * handed them on, so a stopping one stops where the run's end leads it. One awaiting an effect
+   * lost it with the previous process and blocks. A delivery awaiting nothing (queued, stopped,
+   * blocked, its pull request open) waits for its owner.
    */
   const reconcile = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
     Effect.gen(function* () {
       const { deliveryId, state } = delivery;
       const { awaiting } = state;
-      if (!isProceeding(state) || awaiting === null) return;
+      if (awaiting === null) return;
       if (awaiting.type === "effect") {
         yield* worker.failInterruptedEffect(deliveryId);
         return;
