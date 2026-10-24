@@ -62,6 +62,7 @@ describe("Factory RPC errors", () => {
       start: () => unexpected,
       get: () => unexpected,
       list: () => unexpected,
+      listByItem: () => unexpected,
       stop: () => unexpected,
       resume: () => unexpected,
       cancel: () => unexpected,

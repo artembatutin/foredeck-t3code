@@ -296,9 +296,10 @@ export class FactoryDeliveryStore extends Context.Service<
     readonly listByItem: (
       itemRef: WorkItemRef,
     ) => Effect.Effect<ReadonlyArray<StoredFactoryDelivery>, FactoryStoreError>;
-    /** Every delivery, or one project's, whatever its status, newest first. */
+    /** Every delivery, or one project's or item's, whatever its status, newest first. */
     readonly list: (input: {
       readonly projectId?: ProjectId;
+      readonly itemRef?: WorkItemRef;
     }) => Effect.Effect<ReadonlyArray<StoredFactoryDelivery>, FactoryStoreError>;
   }
 >()("t3/fd/factory/persistence/FactoryDeliveryStore") {}
@@ -432,9 +433,10 @@ const make = Effect.gen(function* () {
         Effect.map((rows) => rows.map(fromRow)),
         Effect.catchTags(FactoryStoreError.catchStorage("deliveries.listByItem")),
       ),
-    list: ({ projectId }) =>
+    list: ({ projectId, itemRef }) =>
       selectDeliveries({
         ...(projectId === undefined ? {} : { projectId }),
+        ...(itemRef === undefined ? {} : { itemRef }),
         newestFirst: true,
       }).pipe(
         Effect.map((rows) => rows.map(fromRow)),

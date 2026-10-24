@@ -21,6 +21,7 @@ export * as WorkService from "./WorkService.ts";
 export * as WorkSyncReactor from "./sync/WorkSyncReactor.ts";
 export * as WorkThreads from "./WorkThreads.ts";
 export { toolLayer as workToolLayer } from "./mcp/handlers.ts";
+export { parseWorkItemReference, resolveWorkTarget } from "./mcp/target.ts";
 export { WorkToolkit } from "./mcp/tools.ts";
 
 /**

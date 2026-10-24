@@ -12,7 +12,8 @@ export class FactoryMcpFailure extends Schema.TaggedError<FactoryMcpFailure>()(
     /**
      * `invalid_review` is the reviewer's to correct and submit again. `delivery_blocked`: the
      * delivery blocked on this submission (a second invalid review in the round, or code that
-     * changed during review) and takes no further one.
+     * changed during review) and takes no further one. `invalid_request` and `not_found` answer
+     * a status read that names nothing, or names a delivery or item Factory cannot find.
      */
     code: Schema.Literals([
       "not_reviewer",
@@ -20,6 +21,8 @@ export class FactoryMcpFailure extends Schema.TaggedError<FactoryMcpFailure>()(
       "already_accepted",
       "invalid_review",
       "delivery_blocked",
+      "invalid_request",
+      "not_found",
       "unavailable",
     ]),
     message: Schema.String,

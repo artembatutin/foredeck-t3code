@@ -166,6 +166,7 @@ it.effect("production mcp layer lists worktree tools over http", () =>
         "work_link_thread",
         "work_start_thread",
         "factory_submit_review",
+        "factory_status",
       ])
         expect(toolNames).toContain(name);
 
@@ -179,6 +180,8 @@ it.effect("production mcp layer lists worktree tools over http", () =>
       const status = tools.find((tool) => tool.name === "t3_worktree_status");
       expect(status?.annotations?.readOnlyHint).toBe(true);
       expect(status?.annotations?.destructiveHint).toBe(false);
+      const factoryStatus = tools.find((tool) => tool.name === "factory_status");
+      expect(factoryStatus?.annotations?.readOnlyHint).toBe(true);
 
       // MCP requires every tool input schema to be a top-level object schema.
       // A non-object schema (e.g. the anyOf produced by an empty

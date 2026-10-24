@@ -205,6 +205,18 @@ export class FactoryService extends Context.Service<
       FactoryStoreError
     >;
     /**
+     * The item in Work's canonical spelling, which deliveries are stored under, and every
+     * delivery of it, whatever its status, newest first. An item without deliveries has none,
+     * and an item of an unknown source keeps the spelling given.
+     */
+    readonly listByItem: (itemRef: WorkItemRef) => Effect.Effect<
+      {
+        readonly itemRef: WorkItemRef;
+        readonly deliveries: ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>;
+      },
+      WorkDomainError | FactoryStoreError
+    >;
+    /**
      * Stops a running delivery after its current step. It is stored `stopping`, and the turn or
      * effect under way is not interrupted: it finishes the work of its stage and becomes
      * `stopped` where it would begin the next one, with that stage as its checkpoint (see
@@ -522,6 +534,11 @@ const make = Effect.gen(function* () {
     start,
     get: deliveries.get,
     list: deliveries.list,
+    listByItem: (input) =>
+      Effect.gen(function* () {
+        const itemRef = yield* work.canonicalRef(input);
+        return { itemRef, deliveries: yield* deliveries.list({ itemRef }) };
+      }),
     stop,
     resume,
     cancel,

@@ -1233,6 +1233,7 @@ export const CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS: ReadonlyArray<string> = [
   "mcp__t3-code__html_render",
   "mcp__t3-code__work_list",
   "mcp__t3-code__work_read",
+  "mcp__t3-code__factory_status",
   ...CLAUDE_READ_ONLY_T3_MCP_SUBMIT_TOOLS,
 ];
 

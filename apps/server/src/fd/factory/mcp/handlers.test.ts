@@ -266,7 +266,7 @@ describe("factory MCP tools", () => {
   it("publishes factory_submit_review with a reference-free object-root input", () => {
     assert.deepStrictEqual(
       Object.values(FactoryToolkit.tools).map((tool) => tool.name),
-      ["factory_submit_review"],
+      ["factory_submit_review", "factory_status"],
     );
     const schema = Tool.getJsonSchema(FactoryToolkit.tools.factory_submit_review);
     assert.strictEqual((schema as { type?: string }).type, "object");
