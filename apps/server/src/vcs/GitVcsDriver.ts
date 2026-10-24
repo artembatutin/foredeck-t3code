@@ -330,7 +330,14 @@ export class GitVcsDriver extends Context.Service<
     readonly pushCurrentBranch: (
       cwd: string,
       fallbackBranch: string | null,
-      options?: { readonly remoteName?: string | null },
+      options?: {
+        readonly remoteName?: string | null;
+        /**
+         * Push this commit (a full object id) as the branch instead of HEAD, so a commit made
+         * while the push runs is never published. A remote branch it would rewind is refused.
+         */
+        readonly commitSha?: string;
+      },
     ) => Effect.Effect<GitPushResult, GitCommandError>;
     readonly readRangeContext: (
       cwd: string,

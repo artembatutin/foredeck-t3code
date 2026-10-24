@@ -154,13 +154,14 @@ the pull request is recorded. The engine takes only that result or the effect's 
 approved, and the boot sweep blocks an approved delivery whose PR effect a restart lost, as it does
 a running one; the action is never re-run on its own.
 
-`create_pr` pushes whatever the branch holds when it pushes, and the stacked action takes no
-commit to expect. So [`FactoryPullRequest`](../../apps/server/src/fd/factory/FactoryPullRequest.ts)
-reads the worktree again as its last step before the action, after the item read, and runs it only
-on the approved commit with a clean tree. Afterwards it reads the commit the branch's upstream
-holds: a commit that landed inside the action was published with it, and that pull request is
-linked but never recorded as the delivery's, which blocks. Preventing that push needs the stacked
-action itself to push an expected commit, a core change the owner has not decided.
+Factory passes the approved commit to `create_pr` as its expected commit. The stacked action then
+refuses to start unless HEAD is that commit, and the push publishes that commit by its id rather
+than HEAD: a commit made while the action runs stays local, and a remote branch the push would
+rewind is refused. Without one, as for every other caller, the push publishes HEAD as it is when it
+runs. [`FactoryPullRequest`](../../apps/server/src/fd/factory/FactoryPullRequest.ts) reads the
+worktree again as its last step before the action, after the item read, and runs it only on the
+approved commit with a clean tree. Afterwards it reads back the commit the branch's upstream holds,
+so a pull request on any other commit is linked but never recorded as the delivery's.
 
 The template names no AI agent, model or provider, but the item's title, link and the verify
 command appear as written. Rendered text that breaks the name or attribution rules settle applies

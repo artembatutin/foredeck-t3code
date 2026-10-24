@@ -325,8 +325,9 @@ const gitWorkflow = GitWorkflow.layer.pipe(
 
 /**
  * The fake PR service: the Git workflow Factory's PR stage calls. Its stacked action records the
- * call with the worktree's HEAD and branch at that moment, pushes the branch to the project's
- * bare `origin` the way `create_pr` does, and reports the pull request open.
+ * call with the worktree's HEAD and branch at that moment, pushes to the project's bare `origin`
+ * the way `create_pr` does (the expected commit by its id, tracked as the branch's upstream, or
+ * HEAD when given none), and reports the pull request open.
  */
 const fakePullRequests = (calls: Array<PullRequestCall>) =>
   Layer.unwrap(
@@ -341,7 +342,16 @@ const fakePullRequests = (calls: Array<PullRequestCall>) =>
             const head = yield* read(input.cwd, ["rev-parse", "HEAD"]);
             const branch = yield* read(input.cwd, ["branch", "--show-current"]);
             calls.push({ input, head, branch });
-            yield* read(input.cwd, ["push", "-u", "origin", `HEAD:refs/heads/${branch}`]);
+            if (input.expectedHeadSha === undefined) {
+              yield* read(input.cwd, ["push", "-u", "origin", `HEAD:refs/heads/${branch}`]);
+            } else {
+              yield* read(input.cwd, [
+                "push",
+                "origin",
+                `${input.expectedHeadSha}:refs/heads/${branch}`,
+              ]);
+              yield* read(input.cwd, ["branch", "--set-upstream-to", `origin/${branch}`]);
+            }
             return {
               action: input.action,
               branch: { status: "skipped_not_requested" },

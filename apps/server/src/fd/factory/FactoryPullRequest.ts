@@ -128,12 +128,11 @@ export type FactoryPullRequestError =
 
 /**
  * The PR stage's work. Opens the delivery's pull request from its worktree through the stacked
- * Git action (`create_pr`, which pushes the branch first when needed) with the item's title and a
- * body listing the accepted task and its evidence, then links it to the author thread. Text that
- * names an AI agent, model or provider or carries attribution is never published, and the action
- * runs only while the worktree holds the approved commit on a clean tree. An open pull request
- * for the branch is reported as it is, unchanged. A pull request whose published branch does not
- * hold the approved commit is linked but fails the effect, so it is never the delivery's.
+ * Git action (`create_pr`) with the item's title and a body listing the accepted task and its
+ * evidence, then links it to the author thread. Text that names an AI agent, model or provider or
+ * carries attribution is never published. The action runs only while the worktree holds the
+ * approved commit on a clean tree, and pushes that exact commit, so a commit made meanwhile never
+ * reaches the remote. An open pull request for the branch is reported as it is, unchanged.
  */
 export class FactoryPullRequest extends Context.Service<
   FactoryPullRequest,
@@ -251,7 +250,7 @@ const make = Effect.gen(function* () {
       }
 
       // Record checked the worktree, but a commit or edit could land since; read last, right
-      // before the action, so the push carries only what was approved.
+      // before the action, so an action that would fail on a moved HEAD never starts.
       const current = yield* readWorktreeState(basis.worktreePath).pipe(
         Effect.provideContext(context),
       );
@@ -275,6 +274,8 @@ const make = Effect.gen(function* () {
           projectId,
           prTitle,
           prBody,
+          // Pushed by its id, whatever HEAD becomes while the action runs.
+          expectedHeadSha: basis.approvedSha,
         },
         { actionId },
       );
@@ -286,15 +287,15 @@ const make = Effect.gen(function* () {
         });
       }
       // As the stacked action's RPC does for its caller's thread; a link that cannot be made is
-      // logged and dropped. The pull request is open either way, and linked even when it holds
-      // the wrong commit, so the owner finds it.
+      // logged and dropped. The pull request is open either way, and linked even if it were to
+      // hold another commit, so the owner finds it.
       yield* linkCreatedPullRequest({
         threadId: basis.author,
         result,
         commandId: Effect.succeed(CommandId.make(`factory-pr-link:${deliveryId}:${effect.id}`)),
       }).pipe(Effect.provideContext(context));
-      // The action pushes the branch as it is when it pushes, which a commit landing during the
-      // action would change; only a published approved commit makes this the delivery's PR.
+      // The action published the approved commit; read back, so a pull request on any other
+      // commit is never recorded as the delivery's.
       const publishedSha = yield* publishedCommit(basis.worktreePath);
       if (publishedSha !== basis.approvedSha) {
         return yield* new FactoryPullRequestPublishedUnapprovedError({

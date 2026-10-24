@@ -145,6 +145,14 @@ export const GitRunStackedActionInput = Schema.Struct({
    */
   prTitle: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(256))),
   prBody: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(65_536))),
+  /**
+   * The commit (a full object id) a push or pull request action publishes: the action fails
+   * unless HEAD is this commit when it starts, and pushes this commit rather than HEAD, so one
+   * made while it runs is never published. Commit actions refuse it.
+   */
+  expectedHeadSha: Schema.optional(
+    Schema.String.check(Schema.isPattern(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)),
+  ),
 });
 export type GitRunStackedActionInput = typeof GitRunStackedActionInput.Type;
 

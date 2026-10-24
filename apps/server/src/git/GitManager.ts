@@ -3033,12 +3033,18 @@ export const make = Effect.gen(function* () {
       > {
         const initialStatus = yield* gitCore.statusDetails(input.cwd);
         const wantsCommit = isCommitAction(input.action);
+        const { expectedHeadSha } = input;
+        // With an expected commit the branch is always pushed, by that commit's id: the push is a
+        // no-op when the remote already holds it and is refused when it would rewind the remote,
+        // so the pull request never holds anything else.
         const wantsPush =
           input.action === "push" ||
           input.action === "commit_push" ||
           input.action === "commit_push_pr" ||
           (input.action === "create_pr" &&
-            (!initialStatus.hasUpstream || initialStatus.aheadCount > 0));
+            (expectedHeadSha !== undefined ||
+              !initialStatus.hasUpstream ||
+              initialStatus.aheadCount > 0));
         const wantsPr = input.action === "create_pr" || input.action === "commit_push_pr";
 
         if (input.featureBranch && !wantsCommit) {
@@ -3047,6 +3053,23 @@ export const make = Effect.gen(function* () {
             cwd: input.cwd,
             detail: "Feature-branch checkout is only supported for commit actions.",
           });
+        }
+        if (expectedHeadSha !== undefined) {
+          if (wantsCommit || input.featureBranch) {
+            return yield* new GitManagerError({
+              operation: "runStackedAction",
+              cwd: input.cwd,
+              detail: "An expected commit applies only to push and pull request actions.",
+            });
+          }
+          const head = yield* gitCore.resolveCommit({ cwd: input.cwd, revision: "HEAD" });
+          if (head.commitSha !== expectedHeadSha) {
+            return yield* new GitManagerError({
+              operation: "runStackedAction",
+              cwd: input.cwd,
+              detail: "HEAD is not the expected commit.",
+            });
+          }
         }
         const phases: GitActionProgressPhase[] = [
           ...(input.featureBranch ? (["branch"] as const) : []),
@@ -3167,7 +3190,13 @@ export const make = Effect.gen(function* () {
               })
               .pipe(
                 Effect.tap(() => Ref.set(currentPhase, Option.some("push"))),
-                Effect.flatMap(() => gitCore.pushCurrentBranch(input.cwd, currentBranch)),
+                Effect.flatMap(() =>
+                  gitCore.pushCurrentBranch(
+                    input.cwd,
+                    currentBranch,
+                    expectedHeadSha === undefined ? undefined : { commitSha: expectedHeadSha },
+                  ),
+                ),
               )
           : { status: "skipped_not_requested" as const };
 

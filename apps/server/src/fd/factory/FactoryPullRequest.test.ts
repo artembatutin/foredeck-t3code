@@ -95,6 +95,8 @@ interface World {
   onItemRead: Effect.Effect<void>;
   /** Runs inside the stacked action, before it pushes the branch. */
   beforePush: Effect.Effect<void>;
+  /** The action pushes HEAD whatever commit it is given, as one that predates the field would. */
+  ignoresExpectedCommit: boolean;
   /** How the stacked action answers; a test sets it before the delivery reaches the PR stage. */
   respond: (
     input: GitRunStackedActionInput,
@@ -104,29 +106,32 @@ interface World {
 }
 
 /**
- * The fake PR service: the Git workflow, whose stacked action records the call, pushes the branch
- * as it then is to the worktree's `origin` the way `create_pr` does, and answers as the test says.
+ * The fake PR service: the Git workflow, whose stacked action records the call and pushes to the
+ * worktree's `origin` the way `create_pr` does: the expected commit by its id, tracked as the
+ * branch's upstream, or HEAD as it then is when given none. It answers as the test says.
+ * `exactCommitPush.test.ts` holds the real action to this.
  */
 const fakeGitWorkflow = (world: World) =>
   Layer.unwrap(
-    Effect.map(GitVcsDriver.GitVcsDriver, (driver) =>
-      Layer.mock(GitWorkflow.GitWorkflowService)({
+    Effect.map(GitVcsDriver.GitVcsDriver, (driver) => {
+      const run = (cwd: string, args: ReadonlyArray<string>) =>
+        driver.execute({ operation: "test.push", cwd, args, timeoutMs: 30_000 }).pipe(Effect.orDie);
+      return Layer.mock(GitWorkflow.GitWorkflowService)({
         runStackedAction: (input) =>
           Effect.gen(function* () {
             world.calls.push(input);
             yield* world.beforePush;
-            yield* driver
-              .execute({
-                operation: "test.push",
-                cwd: input.cwd,
-                args: ["push", "-u", "origin", `HEAD:refs/heads/${branch}`],
-                timeoutMs: 30_000,
-              })
-              .pipe(Effect.orDie);
+            const exact = world.ignoresExpectedCommit ? undefined : input.expectedHeadSha;
+            if (exact === undefined) {
+              yield* run(input.cwd, ["push", "-u", "origin", `HEAD:refs/heads/${branch}`]);
+            } else {
+              yield* run(input.cwd, ["push", "origin", `${exact}:refs/heads/${branch}`]);
+              yield* run(input.cwd, ["branch", "--set-upstream-to", `origin/${branch}`]);
+            }
             return yield* world.respond(input);
           }),
-      }),
-    ),
+      });
+    }),
   );
 
 // Threads are faked as in FactoryRecord.test.ts; every run is still going when its launch
@@ -204,6 +209,7 @@ const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
     item,
     onItemRead: Effect.void,
     beforePush: Effect.void,
+    ignoresExpectedCommit: false,
     respond: () => Effect.succeed(created),
     calls: [],
     dispatched: [],
@@ -382,6 +388,7 @@ describe("the PR stage", () => {
         assert.strictEqual(input?.threadId, author);
         assert.strictEqual(input?.projectId, projectId);
         assert.strictEqual(input?.actionId, `factory-pr:${deliveryId}:6`);
+        assert.strictEqual(input?.expectedHeadSha, reviewed);
         assert.strictEqual(input?.prTitle, "fd-aaaaaa: Add the export button");
         assert.strictEqual(
           input?.prBody,
@@ -718,7 +725,7 @@ describe("the PR stage", () => {
     ),
   );
 
-  it.effect("never takes a pull request published from a commit that landed in the action", () =>
+  it.effect("publishes only the approved commit when another lands inside the action", () =>
     withWorld((world) =>
       Effect.gen(function* () {
         const { cwd, deliveryId, reviewed } = yield* reviewAccepted(world);
@@ -727,8 +734,30 @@ describe("the PR stage", () => {
 
         yield* runEnds(deliveryId, reviewer, reviewRun);
 
-        // The action pushed the moved branch; the pull request is linked so the owner finds it,
-        // but it is not the delivery's, which blocks instead of opening.
+        // The action pushed the approved commit by its id: the unreviewed one stays local.
+        const moved = yield* git(cwd, ["rev-parse", "HEAD"]);
+        assert.notStrictEqual(moved, reviewed);
+        assert.strictEqual(world.calls[0]?.expectedHeadSha, reviewed);
+        assert.strictEqual(yield* publishedOf(cwd), reviewed);
+        const state = yield* stateOf(deliveryId);
+        assert.strictEqual(state.status, "pr_open");
+        assert.isNull(state.block);
+        assert.deepStrictEqual(state.pullRequest, { number: 7, url: prUrl, headBranch: branch });
+      }),
+    ),
+  );
+
+  it.effect("never takes a pull request published from a commit other than the approved", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const { cwd, deliveryId, reviewed } = yield* reviewAccepted(world);
+        // An action that pushes HEAD whatever it is given: the read-back is the last guard.
+        world.ignoresExpectedCommit = true;
+        world.beforePush = yield* captured(commitChange(cwd));
+
+        yield* runEnds(deliveryId, reviewer, reviewRun);
+
+        // The pull request is linked so the owner finds it, but it is not the delivery's.
         const moved = yield* git(cwd, ["rev-parse", "HEAD"]);
         assert.notStrictEqual(moved, reviewed);
         assert.strictEqual(yield* publishedOf(cwd), moved);
@@ -741,7 +770,6 @@ describe("the PR stage", () => {
             "Factory could not open the pull request (FactoryPullRequestPublishedUnapprovedError).",
         });
         assert.isNull(state.pullRequest);
-        assert.strictEqual(world.calls.length, 1);
         assert.deepStrictEqual(
           world.dispatched.map((command) => command.type),
           ["thread.pull-request.link"],

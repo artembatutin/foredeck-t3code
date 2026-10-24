@@ -168,6 +168,8 @@ describe("Factory single-item delivery to its pull request", () => {
         assert.strictEqual(call?.input.action, "create_pr");
         assert.strictEqual(call?.input.cwd, worktreePath);
         assert.strictEqual(call?.input.threadId, author.threadId);
+        // Published by its id, whatever the branch holds while the action runs.
+        assert.strictEqual(call?.input.expectedHeadSha, verified?.headSha);
         assert.strictEqual(call?.input.prTitle, `${world.itemKey}: ${world.itemTitle}`);
         const body = call?.input.prBody ?? "";
         assert.include(body, `Work item ${world.itemKey}: ${world.itemTitle}`);

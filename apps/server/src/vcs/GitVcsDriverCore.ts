@@ -2356,14 +2356,53 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       });
     }
 
+    // An exact commit is pushed by its id, so whatever HEAD becomes meanwhile, the remote gets
+    // that commit. Git records no upstream for such a push, so `pushTracked` writes what `-u`
+    // would. HEAD-based shortcuts are skipped: git itself reports an exact push already there,
+    // and refuses one that would rewind the remote.
+    const commitSha = options?.commitSha ?? null;
+    if (commitSha !== null && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commitSha)) {
+      return yield* new GitCommandError({
+        ...gitCommandContext({
+          operation: "GitVcsDriver.pushCurrentBranch",
+          cwd,
+          args: ["push"],
+        }),
+        detail: "The commit to push must be a full object id.",
+      });
+    }
+    const source = commitSha ?? "HEAD";
+    const pushTracked = (operation: string, remoteName: string, publishBranch: string) =>
+      commitSha === null
+        ? runGit(operation, cwd, ["push", "-u", remoteName, `HEAD:refs/heads/${publishBranch}`], {
+            timeoutMs: null,
+          })
+        : runGit(operation, cwd, ["push", remoteName, `${commitSha}:refs/heads/${publishBranch}`], {
+            timeoutMs: null,
+          }).pipe(
+            Effect.andThen(
+              runGit(`${operation}.recordRemote`, cwd, [
+                "config",
+                `branch.${branch}.remote`,
+                remoteName,
+              ]),
+            ),
+            Effect.andThen(
+              runGit(`${operation}.recordMerge`, cwd, [
+                "config",
+                `branch.${branch}.merge`,
+                `refs/heads/${publishBranch}`,
+              ]),
+            ),
+          );
+
     const requestedRemoteName = options?.remoteName?.trim() || null;
     if (requestedRemoteName) {
       const publishBranch = yield* resolvePublishBranchName(cwd, branch);
-      yield* runGit(
+      yield* pushTracked(
         "GitVcsDriver.pushCurrentBranch.pushWithRequestedRemote",
-        cwd,
-        ["push", "-u", requestedRemoteName, `HEAD:refs/heads/${publishBranch}`],
-        { timeoutMs: null },
+        requestedRemoteName,
+        publishBranch,
       );
       return {
         status: "pushed" as const,
@@ -2374,7 +2413,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     }
 
     const hasNoLocalDelta = details.aheadCount === 0 && details.behindCount === 0;
-    if (hasNoLocalDelta) {
+    if (hasNoLocalDelta && commitSha === null) {
       if (details.hasUpstream) {
         return {
           status: "skipped_up_to_date" as const,
@@ -2424,11 +2463,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         });
       }
       const publishBranch = yield* resolvePublishBranchName(cwd, branch);
-      yield* runGit(
+      yield* pushTracked(
         "GitVcsDriver.pushCurrentBranch.pushWithUpstream",
-        cwd,
-        ["push", "-u", publishRemoteName, `HEAD:refs/heads/${publishBranch}`],
-        { timeoutMs: null },
+        publishRemoteName,
+        publishBranch,
       );
       return {
         status: "pushed" as const,
@@ -2477,11 +2515,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             currentUpstream.branchName,
           ]);
         }
-        yield* runGit(
+        yield* pushTracked(
           "GitVcsDriver.pushCurrentBranch.pushOwnBranch",
-          cwd,
-          ["push", "-u", remoteName, `HEAD:refs/heads/${publishBranch}`],
-          { timeoutMs: null },
+          remoteName,
+          publishBranch,
         );
         return {
           status: "pushed" as const,
@@ -2494,7 +2531,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       yield* runGit(
         "GitVcsDriver.pushCurrentBranch.pushUpstream",
         cwd,
-        ["push", currentUpstream.remoteName, `HEAD:refs/heads/${currentUpstream.branchName}`],
+        ["push", currentUpstream.remoteName, `${source}:refs/heads/${currentUpstream.branchName}`],
         { timeoutMs: null },
       );
       return {
@@ -2505,6 +2542,17 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       };
     }
 
+    if (commitSha !== null) {
+      // A bare `git push` pushes HEAD to targets this cannot name, so no exact commit goes out.
+      return yield* new GitCommandError({
+        ...gitCommandContext({
+          operation: "GitVcsDriver.pushCurrentBranch",
+          cwd,
+          args: ["push"],
+        }),
+        detail: "Cannot push an exact commit without a resolvable upstream.",
+      });
+    }
     yield* runGit("GitVcsDriver.pushCurrentBranch.push", cwd, ["push"], { timeoutMs: null });
     return {
       status: "pushed" as const,
