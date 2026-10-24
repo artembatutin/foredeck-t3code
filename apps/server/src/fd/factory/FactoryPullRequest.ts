@@ -15,16 +15,20 @@ import * as GitWorkflow from "../../git/GitWorkflowService.ts";
 import { linkCreatedPullRequest } from "../../git/linkCreatedPullRequest.ts";
 import type * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import type * as ProjectService from "../../project/ProjectService.ts";
-import type * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
+import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkActor, type WorkDomainError, WorkService } from "../work-management/index.ts";
-import type { FactoryBranchReadError, FactoryWorktreeMissingError } from "./git/branchFacts.ts";
+import { FactoryBranchReadError, type FactoryWorktreeMissingError } from "./git/branchFacts.ts";
 import { readWorktreeState } from "./git/worktreeState.ts";
 import type { FactoryStoreError } from "./persistence/errors.ts";
 import type { StoredFactoryDelivery } from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 import { acceptedReview, receiptFailed } from "./pipeline/state.ts";
 import type { FactoryEffect, FactoryOpenedPullRequest } from "./pipeline/state.ts";
-import { renderPullRequestBody, renderPullRequestTitle } from "./prompts/prBody.ts";
+import {
+  pullRequestTextProblems,
+  renderPullRequestBody,
+  renderPullRequestTitle,
+} from "./prompts/prBody.ts";
 
 /**
  * The delivery records nothing to open a pull request for: no worktree or author thread, no
@@ -54,6 +58,49 @@ export class FactoryPullRequestUnapprovedError extends Schema.TaggedError<Factor
   }
 }
 
+/**
+ * The rendered title or body names an AI agent, model or provider, or carries attribution: the
+ * item's text or the verify command brought it in. Nothing was pushed or published.
+ */
+export class FactoryPullRequestTextRefusedError extends Schema.TaggedError<FactoryPullRequestTextRefusedError>()(
+  "FactoryPullRequestTextRefusedError",
+  {
+    deliveryId: FactoryDeliveryId,
+    problems: Schema.Array(
+      Schema.Struct({
+        field: Schema.Literals(["title", "body"]),
+        rule: Schema.Literals(["ai_name", "ai_attribution"]),
+      }),
+    ),
+  },
+) {
+  override get message(): string {
+    const problems = this.problems.map(({ field, rule }) =>
+      rule === "ai_name"
+        ? `its ${field} names an AI agent, model or provider`
+        : `its ${field} carries generated or assisted attribution`,
+    );
+    return `Factory will not publish the pull request for delivery ${this.deliveryId}: ${problems.join("; ")}.`;
+  }
+}
+
+/**
+ * The branch the stacked action published does not hold the approved commit (or Factory could
+ * not read it), so the pull request it opened carries code no approval covers.
+ */
+export class FactoryPullRequestPublishedUnapprovedError extends Schema.TaggedError<FactoryPullRequestPublishedUnapprovedError>()(
+  "FactoryPullRequestPublishedUnapprovedError",
+  {
+    deliveryId: FactoryDeliveryId,
+    approvedSha: Schema.String,
+    publishedSha: Schema.NullOr(Schema.String),
+  },
+) {
+  override get message(): string {
+    return `The pull request for Factory delivery ${this.deliveryId} was published from ${this.publishedSha ?? "an unreadable commit"}, not the approved ${this.approvedSha}.`;
+  }
+}
+
 /** The stacked action ended without reporting a pull request Factory can record. */
 export class FactoryPullRequestNotOpenedError extends Schema.TaggedError<FactoryPullRequestNotOpenedError>()(
   "FactoryPullRequestNotOpenedError",
@@ -71,6 +118,8 @@ export type FactoryPullRequestError =
   | FactoryPullRequestBasisMissingError
   | FactoryPullRequestUnapprovedError
   | FactoryPullRequestNotOpenedError
+  | FactoryPullRequestTextRefusedError
+  | FactoryPullRequestPublishedUnapprovedError
   | FactoryWorktreeMissingError
   | FactoryBranchReadError
   | FactoryStoreError
@@ -80,9 +129,11 @@ export type FactoryPullRequestError =
 /**
  * The PR stage's work. Opens the delivery's pull request from its worktree through the stacked
  * Git action (`create_pr`, which pushes the branch first when needed) with the item's title and a
- * body listing the accepted task and its evidence, then links it to the author thread. Only the
- * approved commit, on a clean tree, is pushed; anything else fails before the action runs. An
- * open pull request for the branch is reported as it is, unchanged.
+ * body listing the accepted task and its evidence, then links it to the author thread. Text that
+ * names an AI agent, model or provider or carries attribution is never published, and the action
+ * runs only while the worktree holds the approved commit on a clean tree. An open pull request
+ * for the branch is reported as it is, unchanged. A pull request whose published branch does not
+ * hold the approved commit is linked but fails the effect, so it is never the delivery's.
  */
 export class FactoryPullRequest extends Context.Service<
   FactoryPullRequest,
@@ -113,6 +164,7 @@ const openedPullRequest = ({ pr }: GitRunStackedActionResult) =>
 
 const make = Effect.gen(function* () {
   const gitWorkflow = yield* GitWorkflow.GitWorkflowService;
+  const git = yield* GitVcsDriver.GitVcsDriver;
   const work = yield* WorkService.WorkService;
   const tasks = yield* FactoryTaskStore.FactoryTaskStore;
   const context = yield* Effect.context<
@@ -152,12 +204,54 @@ const make = Effect.gen(function* () {
     };
   });
 
+  /**
+   * The commit the branch's upstream holds: every stacked action that opens a pull request leaves
+   * the branch tracking the ref it published, and pushing updates that tracking ref. Null when the
+   * branch tracks nothing.
+   */
+  const publishedCommit = (worktreePath: string) =>
+    git
+      .execute({
+        operation: "FactoryPullRequest.published",
+        cwd: worktreePath,
+        args: ["rev-parse", "--verify", "--quiet", "@{upstream}^{commit}"],
+        allowNonZeroExit: true,
+        timeoutMs: 30_000,
+      })
+      .pipe(
+        Effect.map((result) => (result.exitCode === 0 ? result.stdout.trim() : null)),
+        Effect.catchTags({
+          GitCommandError: (cause) =>
+            Effect.fail(
+              new FactoryBranchReadError({ operation: "upstream", path: worktreePath, cause }),
+            ),
+        }),
+      );
+
   const open: FactoryPullRequest["Service"]["open"] = Effect.fn("FactoryPullRequest.open")(
     function* (delivery, effect) {
       const { deliveryId, projectId } = delivery;
       const basis = yield* basisOf(delivery);
-      // Record checked the worktree, but a commit or edit could land before this runs; the push
-      // must carry only what was approved.
+      const item = yield* work.getItem(itemReader(deliveryId), { ref: delivery.itemRef });
+      const { task } = basis;
+      const prTitle = renderPullRequestTitle(item);
+      const prBody = renderPullRequestBody({
+        item,
+        tasks: [
+          {
+            title: task.title ?? item.title,
+            receipt: task.receipt,
+            review: { round: task.review.round, summary: task.review.summary },
+          },
+        ],
+      });
+      const problems = pullRequestTextProblems({ title: prTitle, body: prBody });
+      if (problems.length > 0) {
+        return yield* new FactoryPullRequestTextRefusedError({ deliveryId, problems });
+      }
+
+      // Record checked the worktree, but a commit or edit could land since; read last, right
+      // before the action, so the push carries only what was approved.
       const current = yield* readWorktreeState(basis.worktreePath).pipe(
         Effect.provideContext(context),
       );
@@ -170,8 +264,6 @@ const make = Effect.gen(function* () {
         });
       }
 
-      const item = yield* work.getItem(itemReader(deliveryId), { ref: delivery.itemRef });
-      const { task } = basis;
       // Derived from the effect, so progress and the thread link name this attempt.
       const actionId = `factory-pr:${deliveryId}:${effect.id}`;
       const result = yield* gitWorkflow.runStackedAction(
@@ -181,17 +273,8 @@ const make = Effect.gen(function* () {
           action: "create_pr",
           threadId: basis.author,
           projectId,
-          prTitle: renderPullRequestTitle(item),
-          prBody: renderPullRequestBody({
-            item,
-            tasks: [
-              {
-                title: task.title ?? item.title,
-                receipt: task.receipt,
-                review: { round: task.review.round, summary: task.review.summary },
-              },
-            ],
-          }),
+          prTitle,
+          prBody,
         },
         { actionId },
       );
@@ -203,12 +286,23 @@ const make = Effect.gen(function* () {
         });
       }
       // As the stacked action's RPC does for its caller's thread; a link that cannot be made is
-      // logged and dropped, since the pull request is open either way.
+      // logged and dropped. The pull request is open either way, and linked even when it holds
+      // the wrong commit, so the owner finds it.
       yield* linkCreatedPullRequest({
         threadId: basis.author,
         result,
         commandId: Effect.succeed(CommandId.make(`factory-pr-link:${deliveryId}:${effect.id}`)),
       }).pipe(Effect.provideContext(context));
+      // The action pushes the branch as it is when it pushes, which a commit landing during the
+      // action would change; only a published approved commit makes this the delivery's PR.
+      const publishedSha = yield* publishedCommit(basis.worktreePath);
+      if (publishedSha !== basis.approvedSha) {
+        return yield* new FactoryPullRequestPublishedUnapprovedError({
+          deliveryId,
+          approvedSha: basis.approvedSha,
+          publishedSha,
+        });
+      }
       return opened;
     },
   );

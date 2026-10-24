@@ -325,8 +325,8 @@ const gitWorkflow = GitWorkflow.layer.pipe(
 
 /**
  * The fake PR service: the Git workflow Factory's PR stage calls. Its stacked action records the
- * call with the worktree's HEAD and branch at that moment, and reports the pull request open
- * without pushing anywhere.
+ * call with the worktree's HEAD and branch at that moment, pushes the branch to the project's
+ * bare `origin` the way `create_pr` does, and reports the pull request open.
  */
 const fakePullRequests = (calls: Array<PullRequestCall>) =>
   Layer.unwrap(
@@ -341,6 +341,7 @@ const fakePullRequests = (calls: Array<PullRequestCall>) =>
             const head = yield* read(input.cwd, ["rev-parse", "HEAD"]);
             const branch = yield* read(input.cwd, ["branch", "--show-current"]);
             calls.push({ input, head, branch });
+            yield* read(input.cwd, ["push", "-u", "origin", `HEAD:refs/heads/${branch}`]);
             return {
               action: input.action,
               branch: { status: "skipped_not_requested" },
@@ -563,7 +564,11 @@ export const withProject = <A, E>(
     const pullRequestCalls: Array<PullRequestCall> = [];
 
     return yield* Effect.gen(function* () {
+      // The project's remote: a bare repository the fake PR service pushes to.
+      const origin = path.join(parent, "origin.git");
+      yield* git(parent, ["init", "--bare", origin]);
       yield* git(root, ["init", "-b", "main"]);
+      yield* git(root, ["remote", "add", "origin", origin]);
       yield* fileSystem.writeFileString(path.join(root, "README.md"), "# Alpha\n");
       yield* git(root, ["add", "-A"]);
       yield* git(root, [...identity, "commit", "--no-verify", "-m", "chore: initial commit"]);

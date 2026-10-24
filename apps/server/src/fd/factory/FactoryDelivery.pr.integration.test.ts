@@ -184,6 +184,13 @@ describe("Factory single-item delivery to its pull request", () => {
         assert.strictEqual(approval.tree, verified?.tree);
         assert.strictEqual(approval.receiptPath, path.join(evidence, "verify-2.json"));
         assert.strictEqual(approval.reviewPath, path.join(evidence, "review-2.json"));
+        // And the branch the pull request merges from holds that commit.
+        const published = yield* git(worktreePath, [
+          "ls-remote",
+          "origin",
+          `refs/heads/${state.branch}`,
+        ]);
+        assert.strictEqual(published.split("\t")[0], approval.headSha);
 
         // The author thread shows the pull request as one it created.
         const shell = yield* Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>

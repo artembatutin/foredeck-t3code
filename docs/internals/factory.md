@@ -152,10 +152,20 @@ item is its delivery's one task, written in the transaction that inserts the del
 An approved delivery is not at rest: it enters `pr` still `approved` and becomes `pr_open` once
 the pull request is recorded. The engine takes only that result or the effect's failure while
 approved, and the boot sweep blocks an approved delivery whose PR effect a restart lost, as it does
-a running one; the action is never re-run on its own. Before the stacked action runs,
-[`FactoryPullRequest`](../../apps/server/src/fd/factory/FactoryPullRequest.ts) reads the worktree
-again, like record: `create_pr` pushes whatever the branch holds, so anything but the approved
-commit on a clean tree fails the effect with nothing pushed.
+a running one; the action is never re-run on its own.
+
+`create_pr` pushes whatever the branch holds when it pushes, and the stacked action takes no
+commit to expect. So [`FactoryPullRequest`](../../apps/server/src/fd/factory/FactoryPullRequest.ts)
+reads the worktree again as its last step before the action, after the item read, and runs it only
+on the approved commit with a clean tree. Afterwards it reads the commit the branch's upstream
+holds: a commit that landed inside the action was published with it, and that pull request is
+linked but never recorded as the delivery's, which blocks. Preventing that push needs the stacked
+action itself to push an expected commit, a core change the owner has not decided.
+
+The template names no AI agent, model or provider, but the item's title, link and the verify
+command appear as written. Rendered text that breaks the commit policy's name or attribution rule
+([`publishedText.ts`](../../apps/server/src/fd/factory/git/publishedText.ts)) is never published:
+the effect fails before anything is pushed, and the owner changes the item or the command.
 
 Passing `threadId` to `GitWorkflowService.runStackedAction` does not link the pull request to the
 thread; the stacked action's RPC handler in `ws.ts` does that afterwards. Factory calls the same

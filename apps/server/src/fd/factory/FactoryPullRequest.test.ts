@@ -89,6 +89,12 @@ const created = stackedResult({
 
 interface World {
   worktree: { readonly cwd: string; readonly baseline: string } | null;
+  /** The item Work returns; a test may change it once the delivery has started. */
+  item: WorkItemDetail;
+  /** Runs while Work reads the item, before the read returns. */
+  onItemRead: Effect.Effect<void>;
+  /** Runs inside the stacked action, before it pushes the branch. */
+  beforePush: Effect.Effect<void>;
   /** How the stacked action answers; a test sets it before the delivery reaches the PR stage. */
   respond: (
     input: GitRunStackedActionInput,
@@ -97,9 +103,34 @@ interface World {
   readonly dispatched: Array<OrchestrationV2ServerCommand>;
 }
 
+/**
+ * The fake PR service: the Git workflow, whose stacked action records the call, pushes the branch
+ * as it then is to the worktree's `origin` the way `create_pr` does, and answers as the test says.
+ */
+const fakeGitWorkflow = (world: World) =>
+  Layer.unwrap(
+    Effect.map(GitVcsDriver.GitVcsDriver, (driver) =>
+      Layer.mock(GitWorkflow.GitWorkflowService)({
+        runStackedAction: (input) =>
+          Effect.gen(function* () {
+            world.calls.push(input);
+            yield* world.beforePush;
+            yield* driver
+              .execute({
+                operation: "test.push",
+                cwd: input.cwd,
+                args: ["push", "-u", "origin", `HEAD:refs/heads/${branch}`],
+                timeoutMs: 30_000,
+              })
+              .pipe(Effect.orDie);
+            return yield* world.respond(input);
+          }),
+      }),
+    ),
+  );
+
 // Threads are faked as in FactoryRecord.test.ts; every run is still going when its launch
-// returns, and the test steps its end. The Git workflow is the fake PR service: it records each
-// stacked action and answers as the test says.
+// returns, and the test steps its end.
 const fakes = (world: World) =>
   Layer.mergeAll(
     Layer.mock(WorkService.WorkService)({
@@ -108,7 +139,7 @@ const fakes = (world: World) =>
         Effect.succeed({
           stored: { sourceId, projectId },
         } as unknown as WorkService.ResolvedSource),
-      getItem: () => Effect.succeed(item),
+      getItem: () => world.onItemRead.pipe(Effect.as(world.item)),
     }),
     Layer.mock(ProjectStore.ProjectStoreV2)({
       get: (id) => Effect.succeedSome({ projectId: id } as unknown as ProjectStore.ProjectRow),
@@ -126,13 +157,7 @@ const fakes = (world: World) =>
       runEnded: () => Effect.succeedNone,
     }),
     Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
-    Layer.mock(GitWorkflow.GitWorkflowService)({
-      runStackedAction: (input) =>
-        Effect.suspend(() => {
-          world.calls.push(input);
-          return world.respond(input);
-        }),
-    }),
+    fakeGitWorkflow(world),
     // The created pull request is linked to the thread the action ran beside.
     Layer.mock(Orchestrator.OrchestratorV2)({
       getThreadShell: (threadId) =>
@@ -176,6 +201,9 @@ const makeLayer = (world: World) =>
 const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
   const world: World = {
     worktree: null,
+    item,
+    onItemRead: Effect.void,
+    beforePush: Effect.void,
     respond: () => Effect.succeed(created),
     calls: [],
     dispatched: [],
@@ -202,12 +230,16 @@ const commit = (cwd: string, args: ReadonlyArray<string>) =>
 
 const decodeSettings = Schema.decodeUnknownSync(FactoryProjectSettings);
 const verifyScript = 'console.log("checks pass")';
-const useVerify = Effect.flatMap(FactorySettings.FactorySettings, (settings) =>
-  settings.set(
-    projectId,
-    decodeSettings({ verifyCommand: { executable: process.execPath, args: ["-e", verifyScript] } }),
-  ),
-);
+/** The project's verify command: the script, then any arguments, which the script ignores. */
+const useVerify = (extraArgs: ReadonlyArray<string> = []) =>
+  Effect.flatMap(FactorySettings.FactorySettings, (settings) =>
+    settings.set(
+      projectId,
+      decodeSettings({
+        verifyCommand: { executable: process.execPath, args: ["-e", verifyScript, ...extraArgs] },
+      }),
+    ),
+  );
 
 const start = Effect.flatMap(FactoryService.FactoryService, (service) =>
   service.start({ itemRef }),
@@ -253,15 +285,19 @@ const passingReview = {
 };
 
 /**
- * A repository standing in for the delivery worktree, and a started delivery whose author's
- * commit passed verify and whose reviewer submitted a passing review, still awaiting the
- * reviewer run's end. Returns the delivery and the reviewed commit.
+ * A repository standing in for the delivery worktree, with a bare `origin` the fake action pushes
+ * to, and a started delivery whose author's commit passed verify and whose reviewer submitted a
+ * passing review, still awaiting the reviewer run's end. Returns the delivery and the reviewed
+ * commit. `verifyArgs` follow the verify script in the project's command.
  */
-const reviewAccepted = (world: World) =>
+const reviewAccepted = (world: World, verifyArgs: ReadonlyArray<string> = []) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "fd-factory-pr-wt-" });
+    const remote = yield* fileSystem.makeTempDirectoryScoped({ prefix: "fd-factory-pr-origin-" });
+    yield* git(remote, ["init", "--bare"]);
     yield* git(cwd, ["init", "-b", "main"]);
+    yield* git(cwd, ["remote", "add", "origin", remote]);
     yield* writeFile(cwd, "README.md", "root\n");
     yield* git(cwd, ["add", "-A"]);
     yield* commit(cwd, ["-m", "chore: root"]);
@@ -273,7 +309,7 @@ const reviewAccepted = (world: World) =>
     yield* commit(cwd, ["-m", "feat: export the table as CSV"]);
     world.worktree = { cwd, baseline };
 
-    yield* useVerify;
+    yield* useVerify(verifyArgs);
     const { deliveryId } = yield* start;
     yield* drain;
     yield* runEnds(deliveryId, author, authorRun);
@@ -281,6 +317,28 @@ const reviewAccepted = (world: World) =>
     yield* service.submitReview({ threadId: reviewer, review: passingReview });
     return { cwd, deliveryId, reviewed: yield* git(cwd, ["rev-parse", "HEAD"]) };
   });
+
+/** The commit `origin` holds for the delivery branch; empty when it holds none. */
+const publishedOf = (cwd: string) =>
+  git(cwd, ["ls-remote", "origin", `refs/heads/${branch}`]).pipe(
+    Effect.map((line) => line.split("\t")[0] ?? ""),
+  );
+
+/** Services a hook needs, so it runs inside the fakes with nothing left to provide. */
+const captured = <A, E>(
+  effect: Effect.Effect<A, E, GitVcsDriver.GitVcsDriver | FileSystem.FileSystem | Path.Path>,
+) =>
+  Effect.map(
+    Effect.context<GitVcsDriver.GitVcsDriver | FileSystem.FileSystem | Path.Path>(),
+    (context) => effect.pipe(Effect.provideContext(context), Effect.orDie, Effect.asVoid),
+  );
+
+/** Commits a change in the worktree, as an agent or the owner could at any time. */
+const commitChange = (cwd: string) =>
+  writeFile(cwd, "src/export.ts", "export const csv = 2;\n").pipe(
+    Effect.andThen(git(cwd, ["add", "-A"])),
+    Effect.andThen(commit(cwd, ["-m", "fix: write the header row"])),
+  );
 
 /** AI agent, model and provider names, and attribution lines, none of which a body may hold. */
 const FORBIDDEN =
@@ -367,7 +425,8 @@ describe("the PR stage", () => {
             source: "created",
           },
         ]);
-        // Pushed from the approved commit, which the worktree still holds, clean.
+        // Published the approved commit, which the worktree still holds, clean.
+        assert.strictEqual(yield* publishedOf(cwd), reviewed);
         assert.strictEqual(yield* git(cwd, ["rev-parse", "HEAD"]), reviewed);
         assert.strictEqual(
           yield* git(cwd, ["status", "--porcelain=v1", "--untracked-files=all"]),
@@ -529,6 +588,134 @@ describe("the PR stage", () => {
           }),
         );
         assert.strictEqual(world.calls.length, 1);
+      }),
+    ),
+  );
+
+  it.effect.each([
+    {
+      name: "a verify command naming an AI tool",
+      verifyArgs: ["tests/codex/verify.mjs"],
+      item,
+      problems: [{ field: "body", rule: "ai_name" }],
+    },
+    {
+      name: "an item title naming an AI provider",
+      verifyArgs: [],
+      item: { ...item, title: "Port the export to the Claude adapter" },
+      problems: [
+        { field: "title", rule: "ai_name" },
+        { field: "body", rule: "ai_name" },
+      ],
+    },
+    {
+      name: "an item link naming an AI provider",
+      verifyArgs: [],
+      item: { ...item, url: "https://github.com/openai/alpha/issues/3" },
+      problems: [{ field: "body", rule: "ai_name" }],
+    },
+    {
+      name: "an item title carrying attribution",
+      verifyArgs: [],
+      item: { ...item, title: "Add the export button, generated with a tool" },
+      problems: [
+        { field: "title", rule: "ai_attribution" },
+        { field: "body", rule: "ai_attribution" },
+      ],
+    },
+  ] as const)("publishes nothing for $name", (testCase) =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const { cwd, deliveryId } = yield* reviewAccepted(world, testCase.verifyArgs);
+        // The item reads this way by the time its pull request is written.
+        world.item = testCase.item as unknown as WorkItemDetail;
+
+        yield* runEnds(deliveryId, reviewer, reviewRun);
+
+        const state = yield* stateOf(deliveryId);
+        assert.strictEqual(state.status, "blocked");
+        assert.strictEqual(state.stage, "pr");
+        assert.deepStrictEqual(state.block, {
+          reason: "effect_failed",
+          effect: { id: 6, type: "open_pr" },
+          detail: "Factory could not open the pull request (FactoryPullRequestTextRefusedError).",
+        });
+        assert.deepStrictEqual(world.calls, []);
+        assert.strictEqual(yield* publishedOf(cwd), "");
+
+        // The refusal names each field and rule, never the text that broke it.
+        const pullRequests = yield* FactoryPullRequest.FactoryPullRequest;
+        const error = yield* Effect.flip(
+          pullRequests.open(yield* storedOf(deliveryId), { id: 6, type: "open_pr" }),
+        );
+        assert.deepStrictEqual(
+          error,
+          new FactoryPullRequest.FactoryPullRequestTextRefusedError({
+            deliveryId,
+            problems: testCase.problems,
+          }),
+        );
+        assert.deepStrictEqual(world.calls, []);
+      }),
+    ),
+  );
+
+  it.effect("refuses the action when the approved commit moves while the item is read", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const { cwd, deliveryId, reviewed } = yield* reviewAccepted(world);
+        // A commit lands while Work reads the item, after record checked the worktree.
+        world.onItemRead = yield* captured(commitChange(cwd));
+
+        yield* runEnds(deliveryId, reviewer, reviewRun);
+
+        const state = yield* stateOf(deliveryId);
+        assert.strictEqual(state.status, "blocked");
+        assert.deepStrictEqual(state.block, {
+          reason: "effect_failed",
+          effect: { id: 6, type: "open_pr" },
+          detail: "Factory could not open the pull request (FactoryPullRequestUnapprovedError).",
+        });
+        assert.isNull(state.pullRequest);
+        // Nothing ran, so nothing was published.
+        assert.deepStrictEqual(world.calls, []);
+        assert.strictEqual(yield* publishedOf(cwd), "");
+        assert.notStrictEqual(yield* git(cwd, ["rev-parse", "HEAD"]), reviewed);
+      }),
+    ),
+  );
+
+  it.effect("never takes a pull request published from a commit that landed in the action", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const { cwd, deliveryId, reviewed } = yield* reviewAccepted(world);
+        // A commit lands inside the stacked action, after Factory's check and before its push.
+        world.beforePush = yield* captured(commitChange(cwd));
+
+        yield* runEnds(deliveryId, reviewer, reviewRun);
+
+        // The action pushed the moved branch; the pull request is linked so the owner finds it,
+        // but it is not the delivery's, which blocks instead of opening.
+        const moved = yield* git(cwd, ["rev-parse", "HEAD"]);
+        assert.notStrictEqual(moved, reviewed);
+        assert.strictEqual(yield* publishedOf(cwd), moved);
+        const state = yield* stateOf(deliveryId);
+        assert.strictEqual(state.status, "blocked");
+        assert.deepStrictEqual(state.block, {
+          reason: "effect_failed",
+          effect: { id: 6, type: "open_pr" },
+          detail:
+            "Factory could not open the pull request (FactoryPullRequestPublishedUnapprovedError).",
+        });
+        assert.isNull(state.pullRequest);
+        assert.strictEqual(world.calls.length, 1);
+        assert.deepStrictEqual(
+          world.dispatched.map((command) => command.type),
+          ["thread.pull-request.link"],
+        );
+        assert.deepStrictEqual((yield* attemptsOf(deliveryId)).slice(-1), [
+          { stage: "pr", outcome: "blocked" },
+        ]);
       }),
     ),
   );

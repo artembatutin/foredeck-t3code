@@ -1,14 +1,14 @@
 import type { FactoryBranchCommit, FactoryBranchFacts } from "./branchFacts.ts";
+import { aiAttribution, aiNames } from "./publishedText.ts";
 
 /**
- * Commit policy ported from Looper. Names match whole words only, so "gptq" passes. Attribution
- * matches anywhere in the message, not only as a line-start trailer, so an inline or indented
- * "Generated-by:" is caught too.
+ * Commit policy ported from Looper. Its name and attribution rules are the ones pull request
+ * text follows too (see `publishedText.ts`).
  */
 const commitPolicy = {
   subject: /^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)(\([^)]+\))?!?: \S/,
-  names: /\b(claude|codex|chatgpt|gpt|openai|anthropic|devin|cognition)\b/i,
-  attribution: /\b(generated|assisted)-by\b|generated\s+with/i,
+  names: aiNames,
+  attribution: aiAttribution,
 };
 
 export type FactorySettleRule =

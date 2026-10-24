@@ -1,12 +1,15 @@
 import type { FactoryReviewSummary, FactoryVerifyReceipt } from "@t3tools/contracts/fd/factory";
 import type { WorkItemDetail } from "@t3tools/contracts/fd/work-management";
 
+import { aiAttribution, aiNames } from "../git/publishedText.ts";
 import { commandLine, describeResult } from "./review.ts";
 
 /**
  * A delivery's pull request text: plain language naming the Work item and the evidence behind
- * each accepted task. It names no agent, model or provider and carries no attribution. Pure, so
- * the exact text is tested rather than inferred.
+ * each accepted task. The template names no agent, model or provider and carries no attribution,
+ * but the item's text and the verify command appear as written, so the rendered text is checked
+ * with `pullRequestTextProblems` before anything is published. Pure, so the exact text is tested
+ * rather than inferred.
  */
 
 /** What the pull request says about its item. */
@@ -61,3 +64,19 @@ export const renderPullRequestBody = (input: {
     BODY_MAX_CHARS,
   );
 };
+
+/** A rule the rendered title or body breaks; Factory publishes neither while one does. */
+export interface FactoryPullRequestTextProblem {
+  readonly field: "title" | "body";
+  readonly rule: "ai_name" | "ai_attribution";
+}
+
+/** What keeps the rendered text from being published, in field order; empty when nothing does. */
+export const pullRequestTextProblems = (text: {
+  readonly title: string;
+  readonly body: string;
+}): ReadonlyArray<FactoryPullRequestTextProblem> =>
+  (["title", "body"] as const).flatMap((field) => [
+    ...(aiNames.test(text[field]) ? [{ field, rule: "ai_name" as const }] : []),
+    ...(aiAttribution.test(text[field]) ? [{ field, rule: "ai_attribution" as const }] : []),
+  ]);
