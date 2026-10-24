@@ -367,6 +367,7 @@ const makeLayer = (input: {
   );
   return factoryReactor.pipe(
     Layer.provideMerge(Factory.layerLive),
+    Layer.provide(ProviderRegistryMock.layer()),
     Layer.provideMerge(work),
     Layer.provideMerge(threadLaunch),
     Layer.provideMerge(projectService),
@@ -487,6 +488,7 @@ interface World {
 const withProject = <A, E>(
   verifyCommand: FactoryCommand,
   body: (world: World) => Effect.Effect<A, E, Services>,
+  limits: { readonly maxFixRounds?: number; readonly maxReviewRounds?: number } = {},
 ) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
@@ -526,7 +528,7 @@ const withProject = <A, E>(
       const settings = yield* Factory.FactorySettings.FactorySettings;
       yield* settings.set(
         projectId,
-        decodeSettings({ verifyCommand, roles: { author: modelSelection } }),
+        decodeSettings({ verifyCommand, roles: { author: modelSelection }, limits }),
       );
 
       const service = yield* Factory.FactoryService.FactoryService;
@@ -730,35 +732,39 @@ describe("Factory single-item delivery", () => {
     ),
   );
 
-  it.live("blocks with the failing receipt and its log when the verify command fails", () =>
-    withProject(verifyCommands.fails, (world) =>
-      Effect.gen(function* () {
-        const author = yield* world.start;
-        yield* authorCommits(author.worktreePath, "feat: add the export button");
-        yield* world.endRun(author.runId, "completed");
+  it.live("blocks with the failing receipt and its log when verify fails without fix rounds", () =>
+    withProject(
+      verifyCommands.fails,
+      (world) =>
+        Effect.gen(function* () {
+          const author = yield* world.start;
+          yield* authorCommits(author.worktreePath, "feat: add the export button");
+          yield* world.endRun(author.runId, "completed");
 
-        const state = yield* stateOf(author.deliveryId);
-        assert.strictEqual(state.status, "blocked");
-        assert.strictEqual(state.stage, "verify");
-        assert.deepStrictEqual(state.block, { reason: "verify_failed" });
-        const receipt = state.receipts.at(-1);
-        assert.strictEqual(state.receipts.length, 1);
-        assert.strictEqual(receipt?.code, 3);
-        assert.strictEqual(
-          receipt?.headSha,
-          yield* git(author.worktreePath, ["rev-parse", "HEAD"]),
-        );
+          const state = yield* stateOf(author.deliveryId);
+          assert.strictEqual(state.status, "blocked");
+          assert.strictEqual(state.stage, "verify");
+          assert.deepStrictEqual(state.block, { reason: "verify_failed" });
+          const receipt = state.receipts.at(-1);
+          assert.strictEqual(state.receipts.length, 1);
+          assert.strictEqual(receipt?.code, 3);
+          assert.strictEqual(
+            receipt?.headSha,
+            yield* git(author.worktreePath, ["rev-parse", "HEAD"]),
+          );
 
-        const path = yield* Path.Path;
-        const fileSystem = yield* FileSystem.FileSystem;
-        const evidence = world.evidenceDir(author.deliveryId);
-        assert.strictEqual(receipt?.logPath, path.join(evidence, "verify-1.log"));
-        assert.include(
-          yield* fileSystem.readFileString(path.join(evidence, "verify-1.log")),
-          "one check failed",
-        );
-        assert.isTrue(yield* world.exists(path.join(evidence, "verify-1.json")));
-      }),
+          const path = yield* Path.Path;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const evidence = world.evidenceDir(author.deliveryId);
+          assert.strictEqual(receipt?.logPath, path.join(evidence, "verify-1.log"));
+          assert.include(
+            yield* fileSystem.readFileString(path.join(evidence, "verify-1.log")),
+            "one check failed",
+          );
+          assert.isTrue(yield* world.exists(path.join(evidence, "verify-1.json")));
+        }),
+      // The project allows no fix round, and the delivery keeps the limit it started with.
+      { maxFixRounds: 0 },
     ),
   );
 

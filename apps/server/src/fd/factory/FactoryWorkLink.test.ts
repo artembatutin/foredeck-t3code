@@ -33,6 +33,7 @@ import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
+import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
@@ -167,6 +168,7 @@ const makeLayer = (world: World) =>
     Layer.provide(ServerSettings.layerTest()),
     Layer.provide(FactorySettings.layer),
     Layer.provide(Factory.layerPersistence),
+    Layer.provide(ProviderRegistryMock.layer()),
     Layer.provideMerge(fakes(world)),
     Layer.provideMerge(SqlitePersistence.layerMemory),
     Layer.provideMerge(GitVcsDriver.layer),

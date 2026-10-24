@@ -20,6 +20,7 @@ import * as FactorySettings from "./FactorySettings.ts";
 import type { FactoryBranchReadError, FactoryWorktreeMissingError } from "./git/branchFacts.ts";
 import { readWorktreeState } from "./git/worktreeState.ts";
 import type { StoredFactoryDelivery } from "./persistence/FactoryDeliveryStore.ts";
+import { failureFingerprint } from "./pipeline/fingerprint.ts";
 import type {
   FactoryEffect,
   FactoryReceiptRefusal,
@@ -28,6 +29,7 @@ import type {
 } from "./pipeline/state.ts";
 import { type FactoryEvidencePathError, validateReviewInWorktree } from "./review/evidencePaths.ts";
 import { parseFencedReview } from "./review/fencedJson.ts";
+import { findingsToFix } from "./review/validate.ts";
 import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
 
 /** The delivery records no verified commit to review: no worktree, task baseline or receipt. */
@@ -86,6 +88,21 @@ const FactoryReviewEvidence = Schema.Struct({
 });
 const REVIEW_EVIDENCE_VERSION = 1;
 const encodeEvidence = Schema.encodeEffect(Schema.fromJsonString(FactoryReviewEvidence));
+const decodeEvidence = Schema.decodeUnknownEffect(Schema.fromJsonString(FactoryReviewEvidence));
+
+/** Reads the `review-<n>.json` an accepted review wrote, for the turns that act on it. */
+export const readReviewEvidence = Effect.fn("FactoryReview.readEvidence")(function* (
+  evidencePath: string,
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  return yield* fileSystem.readFileString(evidencePath).pipe(
+    Effect.flatMap(decodeEvidence),
+    Effect.mapError(
+      (cause) =>
+        new FactoryEvidence.FactoryEvidenceError({ operation: "read", path: evidencePath, cause }),
+    ),
+  );
+});
 // Every issue at once, like the fenced fallback: the reviewer gets one corrected retry.
 const decodeReview = Schema.decodeUnknownResult(FactoryReviewSchema, { errors: "all" });
 
@@ -107,8 +124,9 @@ type FactoryReviewCandidate =
  * last assistant message. A worktree whose HEAD or tree moved from the verified receipt, or that
  * is not clean, refuses any review. Otherwise the review must decode and pass the validation
  * port, evidence paths included; a valid one, blocking or not, is written to the delivery's
- * evidence as `review-<n>.json` and accepted. Judging records nothing on the delivery; the
- * engine does, from the judgment.
+ * evidence as `review-<n>.json` and accepted, a blocking one with its failure fingerprint (its
+ * findings to fix and the reviewed tree). Judging records nothing on the delivery; the engine
+ * does, from the judgment.
  */
 export class FactoryReview extends Context.Service<
   FactoryReview,
@@ -194,10 +212,11 @@ const make = Effect.gen(function* () {
         problems: validation.problems.map((problem) => problem.description),
       } satisfies FactoryReviewJudgment;
     }
+    const blocking = validation.status === "blocking";
     const summary: FactoryReviewSummary = {
       headSha: basis.receipt.headSha,
       verdict: review.verdict,
-      blocking: validation.status === "blocking",
+      blocking,
       findings: validation.findings,
       reviewedAt: DateTime.formatIso(yield* DateTime.now),
     };
@@ -212,9 +231,20 @@ const make = Effect.gen(function* () {
       blockingReasons: validation.status === "blocking" ? validation.reasons : [],
       review,
     });
+    if (!blocking) {
+      return {
+        type: "accepted",
+        review: { source, summary, evidencePath },
+      } satisfies FactoryReviewJudgment;
+    }
+    const fingerprint = failureFingerprint({
+      stage: "review",
+      findings: findingsToFix(review, blockingSeverities),
+      tree: basis.receipt.tree,
+    });
     return {
       type: "accepted",
-      review: { source, summary, evidencePath },
+      review: { source, summary, evidencePath, fingerprint },
     } satisfies FactoryReviewJudgment;
   });
 

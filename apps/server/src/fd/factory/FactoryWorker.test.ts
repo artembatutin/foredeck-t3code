@@ -63,6 +63,9 @@ const scriptedThreads = (script: ThreadScript) =>
         sendFixCommitTurn: (delivery, effect) =>
           script.turn?.(store, delivery, effect) ?? Effect.die("turn not scripted"),
         sendReviewRetryTurn: () => Effect.die("review retry turn not scripted"),
+        // Repair rounds are driven in FactoryRepair.test.ts.
+        sendRepairTurn: () => Effect.die("repair turn not scripted"),
+        sendReviewFollowUpTurn: () => Effect.die("review follow-up turn not scripted"),
         // Every run is still going; its end arrives as a step.
         runEnded: () => Effect.succeedNone,
       });
@@ -229,7 +232,7 @@ const makeRepository = Effect.gen(function* () {
  * Starts the delivery with its author thread launched into a fresh repository, standing in for
  * the delivery worktree, and leaves it waiting for the author's first run.
  */
-const startOnRepository = (script: ThreadScript) =>
+const startOnRepository = (script: ThreadScript, state: FactoryDeliveryState = queued) =>
   Effect.gen(function* () {
     const repository = yield* makeRepository;
     script.launch = (_store, _delivery, effect) =>
@@ -244,7 +247,7 @@ const startOnRepository = (script: ThreadScript) =>
             }
           : launchedAt(repository.cwd, repository.baselineSha),
       );
-    yield* insert();
+    yield* insert(state);
     yield* step({ type: "start" });
     yield* drain;
     return repository;
@@ -653,11 +656,18 @@ describe("FactoryWorker verify", () => {
     ),
   );
 
-  it.effect("blocks a failing verify command and records the attempt as failed", () =>
+  it.effect("blocks a failing verify command without fix rounds and records it as failed", () =>
     withWorker((script) =>
       Effect.gen(function* () {
         yield* useVerify(`console.error("1 test failed"); process.exitCode = 1;`);
-        const { cwd } = yield* startOnRepository(script);
+        const { cwd } = yield* startOnRepository(
+          script,
+          queuedDeliveryState({
+            branch,
+            baseRef: "main",
+            limits: { maxFixRounds: 0, maxReviewRounds: 0 },
+          }),
+        );
         yield* commit(cwd, "fix: repair the thing");
 
         yield* step(authorFinished(firstRun));

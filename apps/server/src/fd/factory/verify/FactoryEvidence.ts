@@ -8,11 +8,11 @@ import * as Schema from "effect/Schema";
 
 import * as ServerConfig from "../../../config.ts";
 
-/** Creating, listing or writing a delivery's evidence failed; the failure stays in `cause`. */
+/** Creating, listing, reading or writing a delivery's evidence failed; the failure stays in `cause`. */
 export class FactoryEvidenceError extends Schema.TaggedError<FactoryEvidenceError>()(
   "FactoryEvidenceError",
   {
-    operation: Schema.Literals(["create", "list", "write"]),
+    operation: Schema.Literals(["create", "list", "read", "write"]),
     path: Schema.String,
     cause: Schema.Defect(),
   },

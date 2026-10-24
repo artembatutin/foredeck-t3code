@@ -1,4 +1,4 @@
-import type { ThreadId } from "@t3tools/contracts";
+import type { RunId, ThreadId } from "@t3tools/contracts";
 import { type FactoryDeliveryId, FactoryStageName } from "@t3tools/contracts/fd/factory";
 import { type DrainableWorker, makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
@@ -24,8 +24,10 @@ import { FactoryStoreError } from "./persistence/errors.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import { advance } from "./pipeline/engine.ts";
-import { acceptedReview } from "./pipeline/state.ts";
+import { failureFingerprint } from "./pipeline/fingerprint.ts";
+import { acceptedReview, isTurnEffect, receiptFailed } from "./pipeline/state.ts";
 import type {
+  FactoryCommandOutcome,
   FactoryDeliveryState,
   FactoryEffect,
   FactoryEvent,
@@ -33,6 +35,7 @@ import type {
   FactoryThreadEvent,
 } from "./pipeline/state.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
+import { readLogTail } from "./verify/logTail.ts";
 
 /** The delivery has nothing to run for the stage: only verify has a command, run in the worktree. */
 class FactoryStageCommandError extends Schema.TaggedError<FactoryStageCommandError>()(
@@ -125,6 +128,10 @@ const describeEffect = (effect: FactoryEffect) => {
       return "read the review in the reviewer's last message";
     case "send_review_retry_turn":
       return "send the review retry turn";
+    case "send_repair_turn":
+      return `send the ${effect.kind} turn`;
+    case "send_review_follow_up_turn":
+      return "send the review follow-up turn";
   }
 };
 
@@ -152,7 +159,9 @@ const outcomeOf = (state: FactoryDeliveryState): FactoryStageRunStore.FactorySta
   if (state.status === "blocked") {
     // The stage did its work and judged the commit wanting; any other block is not a verdict.
     const reason = state.block?.reason;
-    return reason === "verify_failed" || reason === "review_changes_required"
+    return reason === "verify_failed" ||
+      reason === "review_changes_required" ||
+      reason === "repeated_failure"
       ? "failed"
       : "blocked";
   }
@@ -160,16 +169,27 @@ const outcomeOf = (state: FactoryDeliveryState): FactoryStageRunStore.FactorySta
 };
 
 /**
- * The evidence of the attempt a step finishes: the command's receipt (or log), or the review
- * accepted in the review round being left.
+ * The evidence of the attempt a step finishes, with a failure's fingerprint: the command's
+ * receipt (or log), or the review accepted in the review round being left.
  */
-const evidenceOf = (event: FactoryEvent, before: FactoryDeliveryState) => {
-  if (event.type === "command.finished") return event.outcome.evidencePath;
-  if (before.stage !== "review") return undefined;
-  if (event.type === "review.read" && event.judgment.type === "accepted") {
-    return event.judgment.review.evidencePath;
+const evidenceOf = (
+  event: FactoryEvent,
+  before: FactoryDeliveryState,
+): { readonly path: string | undefined; readonly fingerprint: string | undefined } => {
+  if (event.type === "command.finished") {
+    const { outcome } = event;
+    return {
+      path: outcome.evidencePath,
+      fingerprint: outcome.type === "receipt" ? outcome.fingerprint : undefined,
+    };
   }
-  return acceptedReview(before)?.evidencePath;
+  const review =
+    before.stage !== "review"
+      ? undefined
+      : event.type === "review.read" && event.judgment.type === "accepted"
+        ? event.judgment.review
+        : acceptedReview(before);
+  return { path: review?.evidencePath, fingerprint: review?.fingerprint };
 };
 
 const make = Effect.gen(function* () {
@@ -241,11 +261,32 @@ const make = Effect.gen(function* () {
       });
     });
 
+  /** A failed run's outcome with its failure fingerprint: the end of its log, and its tree. */
+  const withFingerprint = (outcome: FactoryCommandOutcome) =>
+    outcome.type === "receipt" && receiptFailed(outcome.receipt)
+      ? readLogTail(outcome.receipt.logPath).pipe(
+          Effect.map((tail): FactoryCommandOutcome => ({
+            ...outcome,
+            fingerprint: failureFingerprint({
+              stage: "verify",
+              tail,
+              tree: outcome.receipt.tree,
+            }),
+          })),
+          Effect.provideContext(gitContext),
+        )
+      : Effect.succeed(outcome);
+
   /** Carries out one effect and returns the event that answers it. Every failure is tagged. */
   const execute = ({
     delivery,
     effect,
   }: Job): Effect.Effect<FactoryEvent, { readonly _tag: string }> => {
+    const turnStarted = ({ runId }: { readonly runId: RunId }): FactoryEvent => ({
+      type: "turn.started",
+      effectId: effect.id,
+      runId,
+    });
     switch (effect.type) {
       case "launch_thread":
         return threads.launchThread(delivery, effect).pipe(
@@ -256,13 +297,7 @@ const make = Effect.gen(function* () {
           })),
         );
       case "send_fix_commit_turn":
-        return threads.sendFixCommitTurn(delivery, effect).pipe(
-          Effect.map(({ runId }): FactoryEvent => ({
-            type: "turn.started",
-            effectId: effect.id,
-            runId,
-          })),
-        );
+        return threads.sendFixCommitTurn(delivery, effect).pipe(Effect.map(turnStarted));
       case "check_settle":
         return checkSettle(delivery.state).pipe(
           Effect.map((result): FactoryEvent => ({
@@ -273,6 +308,7 @@ const make = Effect.gen(function* () {
         );
       case "run_command":
         return runCommand(delivery, effect.stage).pipe(
+          Effect.flatMap(withFingerprint),
           Effect.map((outcome): FactoryEvent => ({
             type: "command.finished",
             effectId: effect.id,
@@ -288,26 +324,25 @@ const make = Effect.gen(function* () {
           })),
         );
       case "send_review_retry_turn":
-        return threads.sendReviewRetryTurn(delivery, effect).pipe(
-          Effect.map(({ runId }): FactoryEvent => ({
-            type: "turn.started",
-            effectId: effect.id,
-            runId,
-          })),
-        );
+        return threads.sendReviewRetryTurn(delivery, effect).pipe(Effect.map(turnStarted));
+      case "send_repair_turn":
+        return threads.sendRepairTurn(delivery, effect).pipe(Effect.map(turnStarted));
+      case "send_review_follow_up_turn":
+        return threads.sendReviewFollowUpTurn(delivery, effect).pipe(Effect.map(turnStarted));
     }
   };
 
   /**
    * Records the stage attempts a step implies. Leaving a stage finishes its active attempt:
-   * passed when the delivery advanced, otherwise by how it stopped running. Entering one
-   * appends the next attempt, and the attempt carries the run the delivery now awaits.
+   * failed when the delivery left it for a repair round, passed when it advanced otherwise, and
+   * by how it stopped running when it did. Entering one appends the next attempt, and the
+   * attempt carries the run the delivery now awaits.
    */
   const recordAttempts = Effect.fn("FactoryWorker.recordAttempts")(function* (
     deliveryId: FactoryDeliveryId,
     before: FactoryDeliveryState,
     after: FactoryDeliveryState,
-    evidencePath: string | undefined,
+    evidence: ReturnType<typeof evidenceOf>,
   ) {
     const stopped = after.status !== "running";
     const advanced = after.stage !== before.stage;
@@ -321,10 +356,13 @@ const make = Effect.gen(function* () {
     });
 
     if (active !== undefined && before.status === "running" && (advanced || stopped)) {
+      const { path, fingerprint } = evidence;
       yield* stageRuns.finish({
         ...attemptOf(active),
-        outcome: advanced ? "passed" : outcomeOf(after),
-        ...(evidencePath === undefined ? {} : { evidencePath }),
+        // A repair round is the stage's verdict that the commit is wanting.
+        outcome: advanced ? (after.stage === "repair" ? "failed" : "passed") : outcomeOf(after),
+        ...(path === undefined ? {} : { evidencePath: path }),
+        ...(fingerprint === undefined ? {} : { fingerprint }),
       });
       active = undefined;
     }
@@ -360,11 +398,11 @@ const make = Effect.gen(function* () {
     // The engine hands back the very same state for an event the delivery does not await.
     if (next.delivery === before && next.effects.length === 0) return current;
 
-    const evidencePath = evidenceOf(event, before);
+    const evidence = evidenceOf(event, before);
     const stored = yield* deliveries.update(deliveryId, next.delivery).pipe(
       Effect.tap((updated) =>
         Option.isSome(updated)
-          ? recordAttempts(deliveryId, before, next.delivery, evidencePath)
+          ? recordAttempts(deliveryId, before, next.delivery, evidence)
           : Effect.void,
       ),
       sql.withTransaction,
@@ -402,10 +440,7 @@ const make = Effect.gen(function* () {
   /** The run a launch or turn result names; other results name none. */
   const runOf = (effect: FactoryEffect, event: FactoryEvent) => {
     if (event.type === "thread.launched") return { threadId: event.threadId, runId: event.runId };
-    if (
-      event.type === "turn.started" &&
-      (effect.type === "send_fix_commit_turn" || effect.type === "send_review_retry_turn")
-    ) {
+    if (event.type === "turn.started" && isTurnEffect(effect)) {
       return { threadId: effect.threadId, runId: event.runId };
     }
     return undefined;

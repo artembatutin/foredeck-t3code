@@ -469,10 +469,12 @@ describe("the verify command finishing", () => {
     ["failing", receipt({ code: 1 })],
     ["timed-out", receipt({ code: null, timedOut: true })],
     ["signal-killed", receipt({ code: null })],
-  ] as const)("records a %s receipt and blocks", (_, failed) => {
+  ] as const)("records a %s receipt and blocks when no fix round is allowed", (_, failed) => {
+    // engine.repair.test.ts covers the fix rounds a failed receipt gets otherwise.
+    const noRounds = { ...awaitingVerify, limits: { maxFixRounds: 0, maxReviewRounds: 0 } };
     expect(
-      advance(awaitingVerify, commandFinished(VERIFY, { type: "receipt", receipt: failed })),
-    ).toEqual(blockedState({ ...awaitingVerify, receipts: [failed] }, { reason: "verify_failed" }));
+      advance(noRounds, commandFinished(VERIFY, { type: "receipt", receipt: failed })),
+    ).toEqual(blockedState({ ...noRounds, receipts: [failed] }, { reason: "verify_failed" }));
   });
 
   it.each([[["head_changed"]], [["tree_dirty"]], [["head_changed", "tree_dirty"]]] as const)(

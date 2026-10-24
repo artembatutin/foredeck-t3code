@@ -173,7 +173,7 @@ const make = Effect.gen(function* () {
       // hold a second delivery.
       const itemRef = yield* work.canonicalRef(input.itemRef);
       const { projectId } = (yield* work.resolveSource(itemRef.sourceId)).stored;
-      yield* settings.requireDeliverySettings(projectId);
+      const { limits } = yield* settings.requireDeliverySettings(projectId);
       if (Option.isNone(yield* projects.get(projectId))) {
         return yield* new FactoryProjectMissingError({ projectId });
       }
@@ -199,7 +199,12 @@ const make = Effect.gen(function* () {
         deliveryId,
         projectId,
         itemRef,
-        state: queuedDeliveryState({ branch: workspace.branch, baseRef: workspace.baseRef }),
+        // The round limits stay those the delivery started with.
+        state: queuedDeliveryState({
+          branch: workspace.branch,
+          baseRef: workspace.baseRef,
+          limits: { maxFixRounds: limits.maxFixRounds, maxReviewRounds: limits.maxReviewRounds },
+        }),
       });
       // A storage failure here leaves the delivery queued with nothing launched.
       const started = yield* worker.step(deliveryId, { type: "start" });

@@ -117,3 +117,20 @@ is never cut short. A run that completes without one has the fenced JSON of its 
 message judged the same way, for providers without t3 tools. The first invalid submission in a
 round, on either path, is answered once (by the tool's failure in the same turn, or a retry turn on
 the reviewer thread); the second blocks.
+
+## Repair rounds stop on limits and repeated failures
+
+A failed verify or a blocking review becomes a repair turn on the author thread, then the branch is
+settled and verified again. Each kind counts against its own limit, and a delivery keeps the limits
+it started with, so changing the settings never moves a loop already running. A failure's
+fingerprint hashes the stage, the log tail or the findings to fix, and the tree: a repair that left
+the tree as it was, or changed it without changing the failure, stops the loop as a repeated
+failure even with rounds left, because another round would face the same thing (see
+[`fingerprint.ts`](../../apps/server/src/fd/factory/pipeline/fingerprint.ts)).
+
+Only the first review round runs on a fresh thread that never sees the author's account. After a
+fix-review, the next round is a turn on the same reviewer thread with its previous findings and the
+author's reply, labelled as claims to check against the code. Turns of later rounds and of
+high-risk tasks raise the effort of the model the thread runs with, only to a value its options
+offer and never below what was chosen
+([`effort.ts`](../../apps/server/src/fd/factory/pipeline/effort.ts)).

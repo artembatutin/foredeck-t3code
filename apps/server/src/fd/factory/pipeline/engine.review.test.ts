@@ -136,6 +136,12 @@ const retrying = run(awaitingRetryTurn, {
 const awaitingSecondFallback = run(retrying, finished(reviewer, retryRun)).delivery;
 const acceptedPassing = run(reviewing, submitted(accepted("mcp", false))).delivery;
 
+/** The delivery under limits that allow no repair round. */
+const withoutRounds = (delivery: FactoryDeliveryState): FactoryDeliveryState => ({
+  ...delivery,
+  limits: { maxFixRounds: 0, maxReviewRounds: 0 },
+});
+
 const issued = (delivery: FactoryDeliveryState, effect: FactoryEffect): FactoryAdvance => ({
   delivery: { ...delivery, effectsIssued: effect.id, awaiting: { type: "effect", effect } },
   effects: [effect],
@@ -208,8 +214,9 @@ describe("a submission while the reviewer runs", () => {
     );
   });
 
-  it("blocks a blocking review with its summary once the run completes", () => {
-    const accepting = run(reviewing, submitted(accepted("mcp", true))).delivery;
+  it("blocks a blocking review with its summary once the run completes, without rounds", () => {
+    // engine.repair.test.ts covers the fix-review rounds a blocking review gets otherwise.
+    const accepting = run(withoutRounds(reviewing), submitted(accepted("mcp", true))).delivery;
     expect(advance(accepting, finished(reviewer, reviewRun))).toEqual(
       blockedState(accepting, { reason: "review_changes_required", summary: summary(true) }),
     );
@@ -288,13 +295,14 @@ describe("the fenced-JSON fallback", () => {
     [false, "record"],
     [true, "review"],
   ] as const)("acts at once on an accepted review (blocking: %s)", (blocking, stage) => {
-    const step = advance(awaitingFallback, read(FALLBACK, accepted("fallback", blocking)));
+    const delivery = withoutRounds(awaitingFallback);
+    const step = advance(delivery, read(FALLBACK, accepted("fallback", blocking)));
     const reviews: FactoryDeliveryState["reviews"] = [
       { round: 1, source: "fallback", summary: summary(blocking), evidencePath },
     ];
     expect(step).toEqual(
       blockedState(
-        { ...awaitingFallback, stage, reviews },
+        { ...delivery, stage, reviews },
         blocking
           ? { reason: "review_changes_required", summary: summary(true) }
           : { reason: "unsupported_stage", stage: "record" },

@@ -4,6 +4,7 @@ import type {
   FactoryReviewSummary,
   FactoryRole,
   FactoryStageName,
+  FactoryTaskRisk,
   FactoryVerifyReceipt,
 } from "@t3tools/contracts/fd/factory";
 
@@ -73,13 +74,56 @@ export type FactoryEffectRequest =
       readonly type: "send_review_retry_turn";
       readonly threadId: ThreadId;
       readonly problems: ReadonlyArray<string>;
+    }
+  /**
+   * A repair turn on the author thread: `fix-verify` for the delivery's last receipt, which
+   * failed, or `fix-review` for its last accepted review, which blocks. `round` counts that kind
+   * of repair for the task, from 1.
+   */
+  | {
+      readonly type: "send_repair_turn";
+      readonly kind: FactoryRepairKind;
+      readonly threadId: ThreadId;
+      readonly round: number;
+    }
+  /**
+   * A later review round as a turn on the existing reviewer thread: the delivery's last receipt
+   * against its last accepted review, with the author's fix-review reply as claims to check.
+   */
+  | {
+      readonly type: "send_review_follow_up_turn";
+      readonly threadId: ThreadId;
+      readonly round: number;
     };
+
+export type FactoryRepairKind = "fix-verify" | "fix-review";
+
+/** The stages whose failures repair rounds answer, and whose fingerprints stop a loop. */
+export type FactoryRepairedStage = Extract<FactoryStageName, "verify" | "review">;
 
 /**
  * An issued effect. Its id is unique within the delivery, and the worker's result names it, so
  * a late or repeated result of an earlier effect of the same type is never taken for this one.
  */
 export type FactoryEffect = FactoryEffectRequest & { readonly id: number };
+
+/** The effects that send a turn on an existing thread; each is answered by `turn.started`. */
+export type FactoryTurnEffect = Extract<
+  FactoryEffect,
+  {
+    readonly type:
+      | "send_fix_commit_turn"
+      | "send_review_retry_turn"
+      | "send_repair_turn"
+      | "send_review_follow_up_turn";
+  }
+>;
+
+export const isTurnEffect = (effect: FactoryEffect): effect is FactoryTurnEffect =>
+  effect.type === "send_fix_commit_turn" ||
+  effect.type === "send_review_retry_turn" ||
+  effect.type === "send_repair_turn" ||
+  effect.type === "send_review_follow_up_turn";
 
 /**
  * What the delivery waits for: the worker's result for one issued effect, or the end of one run.
@@ -98,19 +142,24 @@ export type FactorySettleResult =
   | { readonly status: "repairable"; readonly problems: ReadonlyArray<string> }
   | { readonly status: "unrepairable"; readonly problems: ReadonlyArray<string> };
 
+/** Whether a receipt records a run that failed or timed out. */
+export const receiptFailed = (receipt: FactoryVerifyReceipt) =>
+  receipt.timedOut || receipt.code !== 0;
+
 /** Why the server refused to accept a command run as a receipt. */
 export type FactoryReceiptRefusal = "head_changed" | "tree_dirty";
 
 /**
  * A command run's result. `evidencePath` is the receipt's JSON, or the log a refused run left
  * (none when it was refused before running); the worker records it on the stage attempt and the
- * engine ignores it.
+ * engine ignores it. A failed or timed-out receipt carries its failure fingerprint.
  */
 export type FactoryCommandOutcome =
   | {
       readonly type: "receipt";
       readonly receipt: FactoryVerifyReceipt;
       readonly evidencePath?: string;
+      readonly fingerprint?: string;
     }
   | {
       readonly type: "refused";
@@ -128,6 +177,8 @@ export interface FactoryAcceptedReview {
   readonly source: FactoryReviewSource;
   readonly summary: FactoryReviewSummary;
   readonly evidencePath: string;
+  /** Set on a blocking review: its failure fingerprint. */
+  readonly fingerprint?: string;
 }
 
 /**
@@ -159,8 +210,8 @@ export type FactoryEvent =
       readonly baseline: string;
     }
   /**
-   * A `send_fix_commit_turn` or `send_review_retry_turn` result: the run that turn started on
-   * the effect's thread.
+   * A `send_fix_commit_turn`, `send_review_retry_turn`, `send_repair_turn` or
+   * `send_review_follow_up_turn` result: the run that turn started on the effect's thread.
    */
   | { readonly type: "turn.started"; readonly effectId: number; readonly runId: RunId }
   | {
@@ -219,17 +270,37 @@ export type FactoryBlock =
   | { readonly reason: "thread_deleted"; readonly threadId: ThreadId }
   | { readonly reason: "effect_failed"; readonly effect: FactoryEffect; readonly detail: string }
   | { readonly reason: "unsettled"; readonly problems: ReadonlyArray<string> }
-  /** The command ran and failed or timed out; its receipt is the last in `receipts`. */
+  /**
+   * The command ran and failed or timed out with no fix round left; its receipt is the last in
+   * `receipts`.
+   */
   | { readonly reason: "verify_failed" }
+  /** The stage failed exactly as it failed before on this task: same failure, same tree. */
+  | { readonly reason: "repeated_failure"; readonly stage: FactoryRepairedStage }
   | { readonly reason: "receipt_refused"; readonly refusals: ReadonlyArray<FactoryReceiptRefusal> }
   /** The pipeline reached a stage kind this server cannot run. */
   | { readonly reason: "unsupported_stage"; readonly stage: FactoryStageName }
-  /** The round's accepted review blocks the commit; its full text is in its evidence. */
+  /**
+   * The round's accepted review blocks the commit with no review round left; its full text is in
+   * its evidence.
+   */
   | { readonly reason: "review_changes_required"; readonly summary: FactoryReviewSummary }
   /** A review was submitted after HEAD moved from the verified receipt or the tree got dirty. */
   | { readonly reason: "code_changed"; readonly changes: ReadonlyArray<FactoryReceiptRefusal> }
   /** The submission after the one corrected retry was invalid too; these are its problems. */
   | { readonly reason: "invalid_submission"; readonly problems: ReadonlyArray<string> };
+
+/** How many repair rounds of each kind a task may spend. */
+export interface FactoryRoundLimits {
+  readonly maxFixRounds: number;
+  readonly maxReviewRounds: number;
+}
+
+/**
+ * The project settings' default limits, for a delivery stored without its own. A literal, since
+ * the engine imports only types; `engine.repair.test.ts` holds it to the settings schema's.
+ */
+export const defaultRoundLimits: FactoryRoundLimits = { maxFixRounds: 2, maxReviewRounds: 2 };
 
 export interface FactoryDeliveryState {
   readonly status: FactoryDeliveryStatus;
@@ -255,6 +326,16 @@ export interface FactoryDeliveryState {
   readonly invalidSubmissions: number;
   /** Accepted reviews, oldest first; at most one per round. */
   readonly reviews: ReadonlyArray<FactoryAcceptedReview>;
+  /** The project's limits when the delivery started, so a settings change never moves a loop. */
+  readonly limits: FactoryRoundLimits;
+  /** The task's risk; a single item's is normal. Turns of a high-risk task escalate effort. */
+  readonly risk: FactoryTaskRisk;
+  /** Repair rounds spent on the current task: fix-verify turns (`fix`), fix-review turns (`review`). */
+  readonly rounds: { readonly fix: number; readonly review: number };
+  /** Failure fingerprints of the current task's failed verifies and blocking reviews, oldest first. */
+  readonly fingerprints: ReadonlyArray<string>;
+  /** The author's latest fix-review run; the next review round reads its reply as claims. */
+  readonly reviewResponse: { readonly threadId: ThreadId; readonly runId: RunId } | null;
   /** Set while the delivery is blocked. */
   readonly block: FactoryBlock | null;
 }
@@ -281,6 +362,9 @@ export const queuedDeliveryState = (input: {
   readonly branch: string;
   readonly baseRef: string;
   readonly worktreePath?: string;
+  /** The project's limits; the settings defaults when absent. */
+  readonly limits?: FactoryRoundLimits;
+  readonly risk?: FactoryTaskRisk;
 }): FactoryDeliveryState => ({
   status: "queued",
   stage: null,
@@ -296,6 +380,11 @@ export const queuedDeliveryState = (input: {
   reviewRound: 0,
   invalidSubmissions: 0,
   reviews: [],
+  limits: input.limits ?? defaultRoundLimits,
+  risk: input.risk ?? "normal",
+  rounds: { fix: 0, review: 0 },
+  fingerprints: [],
+  reviewResponse: null,
   block: null,
 });
 

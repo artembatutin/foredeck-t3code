@@ -12,6 +12,7 @@ import {
   FactoryReviewSummary,
   FactoryRole,
   FactoryStageName,
+  FactoryTaskRisk,
   FactoryVerifyReceipt,
 } from "@t3tools/contracts/fd/factory";
 import { WorkItemId, WorkItemRef, WorkSourceId } from "@t3tools/contracts/fd/work-management";
@@ -24,7 +25,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlSchema from "effect/sql/SqlSchema";
 
-import type { FactoryDeliveryState } from "../pipeline/state.ts";
+import { defaultRoundLimits, type FactoryDeliveryState } from "../pipeline/state.ts";
 import { FactoryStoreError } from "./errors.ts";
 
 /** The Work item already has a delivery that is not done or cancelled. */
@@ -85,6 +86,19 @@ const StoredEffect = Schema.Union([
     threadId: ThreadId,
     problems: Problems,
   }),
+  Schema.Struct({
+    id: PositiveInt,
+    type: Schema.Literal("send_repair_turn"),
+    kind: Schema.Literals(["fix-verify", "fix-review"]),
+    threadId: ThreadId,
+    round: PositiveInt,
+  }),
+  Schema.Struct({
+    id: PositiveInt,
+    type: Schema.Literal("send_review_follow_up_turn"),
+    threadId: ThreadId,
+    round: PositiveInt,
+  }),
 ]);
 
 const StoredAwaiting = Schema.Union([
@@ -107,6 +121,10 @@ const StoredBlock = Schema.Union([
   }),
   Schema.Struct({ reason: Schema.Literal("unsettled"), problems: Problems }),
   Schema.Struct({ reason: Schema.Literal("verify_failed") }),
+  Schema.Struct({
+    reason: Schema.Literal("repeated_failure"),
+    stage: Schema.Literals(["verify", "review"]),
+  }),
   Schema.Struct({ reason: Schema.Literal("receipt_refused"), refusals: ReceiptRefusals }),
   Schema.Struct({ reason: Schema.Literal("unsupported_stage"), stage: FactoryStageName }),
   Schema.Struct({
@@ -122,7 +140,10 @@ const StoredAcceptedReview = Schema.Struct({
   source: Schema.Literals(["mcp", "fallback"]),
   summary: FactoryReviewSummary,
   evidencePath: Schema.String,
+  fingerprint: Schema.optionalKey(Schema.String),
 });
+
+const StoredRoundLimit = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 10 }));
 
 const StoredDeliveryState = Schema.Struct({
   status: FactoryDeliveryStatus,
@@ -144,6 +165,19 @@ const StoredDeliveryState = Schema.Struct({
   reviewRound: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
   invalidSubmissions: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
   reviews: Schema.Array(StoredAcceptedReview).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+  // Added with repair rounds: rows stored before them have spent none, under the default limits.
+  limits: Schema.Struct({
+    maxFixRounds: StoredRoundLimit,
+    maxReviewRounds: StoredRoundLimit,
+  }).pipe(Schema.withDecodingDefault(Effect.succeed(defaultRoundLimits))),
+  risk: FactoryTaskRisk.pipe(Schema.withDecodingDefault(Effect.succeed("normal" as const))),
+  rounds: Schema.Struct({ fix: NonNegativeInt, review: NonNegativeInt }).pipe(
+    Schema.withDecodingDefault(Effect.succeed({ fix: 0, review: 0 })),
+  ),
+  fingerprints: Schema.Array(Schema.String).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+  reviewResponse: Schema.NullOr(Schema.Struct({ threadId: ThreadId, runId: RunId })).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
   block: Schema.NullOr(StoredBlock),
 });
 

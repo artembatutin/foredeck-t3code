@@ -34,6 +34,7 @@ import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
+import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
@@ -48,7 +49,7 @@ import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import { advance } from "./pipeline/engine.ts";
 import { queuedDeliveryState } from "./pipeline/state.ts";
-import type { FactoryDeliveryState, FactoryEvent } from "./pipeline/state.ts";
+import type { FactoryDeliveryState, FactoryEvent, FactoryRoundLimits } from "./pipeline/state.ts";
 import type { FactoryAuthorItem } from "./prompts/author.ts";
 import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
@@ -196,6 +197,7 @@ const makeLayer = (world: World) =>
     Layer.provide(FactoryReview.layer),
     Layer.provide(FactoryEvidence.layer),
     Layer.provide(fakes(world)),
+    Layer.provide(ProviderRegistryMock.layer()),
     Layer.provide(ServerSettings.layerTest()),
     Layer.provideMerge(FactorySettings.layer),
     Layer.provideMerge(Factory.layerPersistence),
@@ -298,7 +300,7 @@ const makeWorktree = (world: World) =>
  * Stores the delivery as verify left it, feeds the passing receipt of the worktree's commit, and
  * returns once the reviewer's launch is stored and the delivery awaits its run.
  */
-const startReview = (world: World) =>
+const startReview = (world: World, limits?: FactoryRoundLimits) =>
   Effect.gen(function* () {
     const { cwd, baseline } = yield* makeWorktree(world);
     const [headSha = "", tree = ""] = (yield* git(cwd, ["rev-parse", "HEAD", "HEAD^{tree}"])).split(
@@ -334,7 +336,7 @@ const startReview = (world: World) =>
     ] satisfies ReadonlyArray<FactoryEvent>;
     const state = verifying.reduce<FactoryDeliveryState>(
       (current, event) => advance(current, event).delivery,
-      queuedDeliveryState({ branch, baseRef: "main" }),
+      queuedDeliveryState({ branch, baseRef: "main", ...(limits === undefined ? {} : { limits }) }),
     );
     yield* Effect.flatMap(store, (deliveries) =>
       deliveries.insert({ deliveryId, projectId, itemRef, state }),
@@ -360,6 +362,9 @@ const startReview = (world: World) =>
     yield* drain;
     return { cwd, baseline, receipt };
   });
+
+/** Limits under which a blocking review blocks at once, with no repair round. */
+const noRounds: FactoryRoundLimits = { maxFixRounds: 0, maxReviewRounds: 0 };
 
 /** A review that passes: a low finding, and criterion 1 verified by the export's test. */
 const passingReview = {
@@ -659,10 +664,10 @@ describe("FactoryService.submitReview accepted reviews", () => {
       ),
   );
 
-  it.effect("blocks with the summary of a blocking review once the run ends", () =>
+  it.effect("blocks with the summary of a blocking review once the run ends, without rounds", () =>
     withWorld((world) =>
       Effect.gen(function* () {
-        yield* startReview(world);
+        yield* startReview(world, noRounds);
 
         const accepted = yield* submit(reviewer, blockingReview);
         assert.isTrue(accepted.review.summary.blocking);
@@ -882,7 +887,7 @@ describe("the fenced-JSON fallback", () => {
   it.effect("accepts a corrected fenced review from the retry turn", () =>
     withWorld((world) =>
       Effect.gen(function* () {
-        yield* startReview(world);
+        yield* startReview(world, noRounds);
         world.messages.set(reviewRun, ["No review here."]);
         yield* step(reviewerFinished(reviewRun));
         yield* drain;

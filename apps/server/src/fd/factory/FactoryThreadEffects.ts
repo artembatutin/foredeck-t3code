@@ -2,6 +2,7 @@ import {
   AuthWorkReadScope,
   CommandId,
   MessageId,
+  type ModelSelection,
   ProjectId,
   type RunId,
   ThreadId,
@@ -22,13 +23,15 @@ import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadMessageIntake from "../../orchestration-v2/ThreadMessageIntake.ts";
+import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import { getAutoBootstrapThreadModelSelection } from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkActor, WorkService } from "../work-management/index.ts";
-import { reviewBasis } from "./FactoryReview.ts";
+import { readReviewEvidence, reviewBasis } from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import type { StoredFactoryDelivery } from "./persistence/FactoryDeliveryStore.ts";
+import { escalateEffort } from "./pipeline/effort.ts";
 import {
   type FactoryEffect,
   type FactoryEvent,
@@ -37,11 +40,16 @@ import {
 } from "./pipeline/state.ts";
 import { authorThreadTitle, renderAuthorPrompt } from "./prompts/author.ts";
 import { renderFixCommitPrompt } from "./prompts/fixCommit.ts";
+import { renderFixReviewPrompt } from "./prompts/fixReview.ts";
+import { renderFixVerifyPrompt } from "./prompts/fixVerify.ts";
 import {
   renderReviewPrompt,
   renderReviewRetryPrompt,
   reviewThreadTitle,
 } from "./prompts/review.ts";
+import { renderReviewFollowUpPrompt } from "./prompts/reviewFollowUp.ts";
+import { findingsToFix } from "./review/validate.ts";
+import { readLogTail } from "./verify/logTail.ts";
 
 export class FactoryProjectMissingError extends Schema.TaggedError<FactoryProjectMissingError>()(
   "FactoryProjectMissingError",
@@ -102,6 +110,19 @@ export class FactoryLaunchWatchEndedError extends Schema.TaggedError<FactoryLaun
   }
 }
 
+/** The delivery records nothing for the turn to act on: no failed receipt, accepted review or baseline. */
+export class FactoryTurnBasisMissingError extends Schema.TaggedError<FactoryTurnBasisMissingError>()(
+  "FactoryTurnBasisMissingError",
+  {
+    deliveryId: FactoryDeliveryId,
+    turn: Schema.Literals(["fix-verify", "fix-review", "review-follow-up"]),
+  },
+) {
+  override get message(): string {
+    return `Factory delivery ${this.deliveryId} records nothing for its ${this.turn} turn to act on.`;
+  }
+}
+
 /** A launched thread, as `thread.launched` records it. */
 type FactoryThreadLaunch = Omit<
   Extract<FactoryEvent, { readonly type: "thread.launched" }>,
@@ -143,6 +164,22 @@ export class FactoryThreadEffects extends Context.Service<
       delivery: StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "send_review_retry_turn" }>,
     ) => Effect.Effect<{ readonly runId: RunId }, FactoryThreadEffectFailure>;
+    /**
+     * Sends a repair turn on the author thread and reports its run: fix-verify names the end of
+     * the delivery's last receipt's log, fix-review the findings of its last accepted review.
+     */
+    readonly sendRepairTurn: (
+      delivery: StoredFactoryDelivery,
+      effect: Extract<FactoryEffect, { readonly type: "send_repair_turn" }>,
+    ) => Effect.Effect<{ readonly runId: RunId }, FactoryThreadEffectFailure>;
+    /**
+     * Sends a later review round on the reviewer thread and reports its run: the delivery's last
+     * receipt, the previous round's findings and the author's fix-review reply as claims.
+     */
+    readonly sendReviewFollowUpTurn: (
+      delivery: StoredFactoryDelivery,
+      effect: Extract<FactoryEffect, { readonly type: "send_review_follow_up_turn" }>,
+    ) => Effect.Effect<{ readonly runId: RunId }, FactoryThreadEffectFailure>;
     /** The run's status once it has ended; none while it has not. */
     readonly runEnded: (
       threadId: ThreadId,
@@ -169,9 +206,47 @@ const make = Effect.gen(function* () {
   const factorySettings = yield* FactorySettings.FactorySettings;
   const work = yield* WorkService.WorkService;
   const git = yield* GitVcsDriver.GitVcsDriver;
+  const providers = yield* ProviderRegistry.ProviderRegistry;
   const intakeContext = yield* Effect.context<
     ThreadManagement.ThreadManagementService | ServerConfig.ServerConfig | FileSystem.FileSystem
   >();
+
+  /**
+   * `selection` for a turn of `round`, with its effort raised when the task's risk or the round
+   * calls for it and the selected model's options offer the project's `highRiskEffort`.
+   */
+  const escalated = (
+    delivery: StoredFactoryDelivery,
+    selection: ModelSelection,
+    round: number,
+    highRiskEffort: string,
+  ) =>
+    providers.getProviders.pipe(
+      Effect.map((available) =>
+        escalateEffort({
+          selection,
+          descriptors: available
+            .find((provider) => provider.instanceId === selection.instanceId)
+            ?.models.find((model) => model.slug === selection.model)?.capabilities
+            ?.optionDescriptors,
+          round,
+          risk: delivery.state.risk,
+          highRiskEffort,
+        }),
+      ),
+    );
+
+  /**
+   * The model selection for a turn of `round` on a thread: the one the thread runs with, so a
+   * model the owner switched it to stays, escalated. None when that leaves it as it is.
+   */
+  const turnSelection = (delivery: StoredFactoryDelivery, threadId: ThreadId, round: number) =>
+    Effect.gen(function* () {
+      const { thread } = yield* projections.getThreadRecords(threadId, []);
+      const { highRiskEffort } = yield* factorySettings.get(delivery.projectId);
+      const selection = yield* escalated(delivery, thread.modelSelection, round, highRiskEffort);
+      return selection === thread.modelSelection ? undefined : selection;
+    });
 
   /** The full object id `ref` names in `cwd`. */
   const resolveCommit = (cwd: string, ref: string) =>
@@ -289,7 +364,7 @@ const make = Effect.gen(function* () {
         project.projectId,
         project,
       ).settings;
-      const { roles } = yield* factorySettings.get(projectId);
+      const { roles, highRiskEffort } = yield* factorySettings.get(projectId);
       const item = yield* work.getItem(itemReader(deliveryId), { ref: delivery.itemRef });
 
       const { workspace } = effect;
@@ -301,11 +376,16 @@ const make = Effect.gen(function* () {
           : yield* resolveCommit(workspace.worktreePath, "HEAD");
 
       // The order Work's thread starts use, with the role's profile as the explicit choice. A
-      // reviewer without a profile of its own uses the author's.
-      const modelSelection =
+      // reviewer without a profile of its own uses the author's. A launch starts a first round,
+      // so only a high-risk task escalates it.
+      const modelSelection = yield* escalated(
+        delivery,
         (role === "reviewer" ? (roles.reviewer ?? roles.author) : roles.author) ??
-        resolved.defaultModelSelection ??
-        getAutoBootstrapThreadModelSelection();
+          resolved.defaultModelSelection ??
+          getAutoBootstrapThreadModelSelection(),
+        1,
+        highRiskEffort,
+      );
       // Reviewers work in plan mode: they read and judge, and never change the worktree.
       const opening =
         basis === null
@@ -368,14 +448,16 @@ const make = Effect.gen(function* () {
     });
 
   /**
-   * Sends a follow-up turn on the effect's thread. Its ids derive from the effect, so a retried
-   * send replays its receipt instead of sending twice.
+   * Sends a follow-up turn on the effect's thread, with the thread's own model unless
+   * `modelSelection` is given. Its ids derive from the effect, so a retried send replays its
+   * receipt instead of sending twice.
    */
   const sendTurn = (
     delivery: StoredFactoryDelivery,
     effect: { readonly id: number; readonly threadId: ThreadId },
-    kind: "fix-commit" | "review-retry",
+    kind: "fix-commit" | "review-retry" | "fix-verify" | "fix-review" | "review-follow-up",
     text: string,
+    modelSelection?: ModelSelection,
   ) =>
     ThreadMessageIntake.sendToThread({
       projectId: delivery.projectId,
@@ -384,6 +466,7 @@ const make = Effect.gen(function* () {
       messageId: MessageId.make(`factory-${kind}-message:${delivery.deliveryId}:${effect.id}`),
       text,
       attachments: [],
+      ...(modelSelection === undefined ? {} : { modelSelection }),
       // After whatever the thread is still doing; never steering or interrupting it.
       mode: "queue",
       createdBy: "system",
@@ -392,6 +475,75 @@ const make = Effect.gen(function* () {
       Effect.map((sent) => ({ runId: sent.run.id })),
       Effect.provideContext(intakeContext),
     );
+
+  /** The text of the run's last assistant message that has any; null when it has none. */
+  const lastAssistantText = (threadId: ThreadId, runId: RunId) =>
+    projections
+      .getThreadRecords(threadId, ["messages"], {
+        messageRunIds: [runId],
+        messageRoles: ["assistant"],
+      })
+      .pipe(
+        Effect.map(
+          ({ messages }) =>
+            messages.findLast((message) => message.text.trim().length > 0)?.text ?? null,
+        ),
+      );
+
+  const repairText = (
+    delivery: StoredFactoryDelivery,
+    effect: Extract<FactoryEffect, { readonly type: "send_repair_turn" }>,
+  ) =>
+    Effect.gen(function* () {
+      const { deliveryId, state } = delivery;
+      const missing = new FactoryTurnBasisMissingError({ deliveryId, turn: effect.kind });
+      if (effect.kind === "fix-verify") {
+        const receipt = state.receipts.at(-1);
+        if (receipt === undefined) return yield* missing;
+        const tail = yield* readLogTail(receipt.logPath);
+        return renderFixVerifyPrompt({
+          receipt,
+          tail,
+          branch: state.branch,
+          round: effect.round,
+        });
+      }
+      const accepted = state.reviews.at(-1);
+      if (accepted === undefined) return yield* missing;
+      const evidence = yield* readReviewEvidence(accepted.evidencePath);
+      const { blockingSeverities } = yield* factorySettings.get(delivery.projectId);
+      return renderFixReviewPrompt({
+        headSha: accepted.summary.headSha,
+        findings: findingsToFix(evidence.review, blockingSeverities),
+        // The findings are listed in full above.
+        otherReasons: evidence.blockingReasons
+          .filter(({ rule }) => rule !== "changes_required" && rule !== "blocking_finding")
+          .map(({ description }) => description),
+        branch: state.branch,
+        round: effect.round,
+      });
+    }).pipe(Effect.provideContext(intakeContext));
+
+  const followUpText = (delivery: StoredFactoryDelivery) =>
+    Effect.gen(function* () {
+      const { deliveryId, state } = delivery;
+      const basis = yield* reviewBasis(delivery);
+      const previous = state.reviews.at(-1);
+      if (previous === undefined) {
+        return yield* new FactoryTurnBasisMissingError({ deliveryId, turn: "review-follow-up" });
+      }
+      const evidence = yield* readReviewEvidence(previous.evidencePath);
+      const response = state.reviewResponse;
+      return renderReviewFollowUpPrompt({
+        round: basis.round,
+        branch: state.branch,
+        baseline: basis.baseline,
+        receipt: basis.receipt,
+        previous: { headSha: previous.summary.headSha, findings: evidence.review.findings },
+        authorResponse:
+          response === null ? null : yield* lastAssistantText(response.threadId, response.runId),
+      });
+    }).pipe(Effect.provideContext(intakeContext));
 
   return FactoryThreadEffects.of({
     launchThread,
@@ -413,6 +565,18 @@ const make = Effect.gen(function* () {
         "review-retry",
         renderReviewRetryPrompt({ problems: effect.problems }),
       ),
+    sendRepairTurn: (delivery, effect) =>
+      Effect.gen(function* () {
+        const text = yield* repairText(delivery, effect);
+        const selection = yield* turnSelection(delivery, effect.threadId, effect.round);
+        return yield* sendTurn(delivery, effect, effect.kind, text, selection);
+      }),
+    sendReviewFollowUpTurn: (delivery, effect) =>
+      Effect.gen(function* () {
+        const text = yield* followUpText(delivery);
+        const selection = yield* turnSelection(delivery, effect.threadId, effect.round);
+        return yield* sendTurn(delivery, effect, "review-follow-up", text, selection);
+      }),
     runEnded: (threadId, runId) =>
       readThreadRun(threadId, runId).pipe(
         Effect.map(({ status }) =>

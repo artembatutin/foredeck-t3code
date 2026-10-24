@@ -131,7 +131,7 @@ const reviewStates: ReadonlyArray<readonly [string, FactoryDeliveryState]> = [
   [
     "blocked on a review that requires changes",
     fold(
-      reviewing,
+      { ...reviewing, limits: { maxFixRounds: 0, maxReviewRounds: 0 } },
       submitted({
         type: "accepted",
         review: { source: "mcp", summary, evidencePath: "/t3/review-1.json" },
@@ -166,6 +166,12 @@ describe("FactoryDeliveryStore with review state", () => {
         reviewRound: 0,
         invalidSubmissions: 0,
         reviews: [],
+        // Nor the repair fields, added after review.
+        limits: { maxFixRounds: 2, maxReviewRounds: 2 },
+        risk: "normal",
+        rounds: { fix: 0, review: 0 },
+        fingerprints: [],
+        reviewResponse: null,
       });
       assert.deepStrictEqual(
         (yield* store.listActive()).map((delivery) => delivery.deliveryId),

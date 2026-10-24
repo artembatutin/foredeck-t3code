@@ -75,10 +75,31 @@ const SUBMIT = [
   "2. End your final message with the same review as JSON in one fenced ```json block, shaped like this:",
 ].join("\n");
 
-const describeResult = (receipt: FactoryVerifyReceipt) => {
+/** How a verify run ended, as the prompts name it. */
+export const describeResult = (receipt: FactoryVerifyReceipt) => {
   if (receipt.timedOut) return "timed out";
   return receipt.code === null ? "ended by a signal" : `exit code ${receipt.code}`;
 };
+
+/** The verify command a receipt ran, as one line. */
+export const commandLine = (receipt: FactoryVerifyReceipt) =>
+  [receipt.command.executable, ...receipt.command.args].join(" ");
+
+/** The commit a review judges and how the server verified it. */
+export const verifiedCommitSection = (receipt: FactoryVerifyReceipt) =>
+  [
+    "The server verified this commit:",
+    `- Command: \`${commandLine(receipt)}\``,
+    `- Commit: ${receipt.headSha} (tree ${receipt.tree})`,
+    `- Result: ${describeResult(receipt)} after ${Math.round(receipt.durationMs / 1000)} s, from ${receipt.startedAt} to ${receipt.finishedAt}`,
+  ].join("\n");
+
+/** Every review round's rules, review fields and way to submit. */
+export const reviewInstructionSections = (): ReadonlyArray<string> => [
+  `Rules:\n${RULES.map((rule) => `- ${rule}`).join("\n")}`,
+  SHAPE,
+  `${SUBMIT}\n\n${EXAMPLE}`,
+];
 
 export const renderReviewPrompt = (input: FactoryReviewPromptInput): string => {
   const { item, receipt } = input;
@@ -86,15 +107,8 @@ export const renderReviewPrompt = (input: FactoryReviewPromptInput): string => {
   const sections = itemSections(item, `Factory review of Work item ${item.key}: ${item.title}`);
   sections.push(
     `Your task: review the work for this item on branch \`${input.branch}\` in this worktree, the commits in \`${range}\` (for example \`git log ${range}\` and \`git diff ${range}\`).`,
-    [
-      "The server verified this commit:",
-      `- Command: \`${[receipt.command.executable, ...receipt.command.args].join(" ")}\``,
-      `- Commit: ${receipt.headSha} (tree ${receipt.tree})`,
-      `- Result: ${describeResult(receipt)} after ${Math.round(receipt.durationMs / 1000)} s, from ${receipt.startedAt} to ${receipt.finishedAt}`,
-    ].join("\n"),
-    `Rules:\n${RULES.map((rule) => `- ${rule}`).join("\n")}`,
-    SHAPE,
-    `${SUBMIT}\n\n${EXAMPLE}`,
+    verifiedCommitSection(receipt),
+    ...reviewInstructionSections(),
   );
   return sections.join("\n\n");
 };

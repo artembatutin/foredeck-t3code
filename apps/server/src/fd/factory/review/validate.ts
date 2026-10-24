@@ -146,6 +146,21 @@ const countFindings = (findings: FactoryReview["findings"]): FindingCounts => {
 };
 
 /**
+ * The findings a blocking review asks the author to fix: the required ones and those at a
+ * blocking severity, or every finding when none is either. They name the review's failure in its
+ * fingerprint and are what a fix-review turn lists.
+ */
+export const findingsToFix = (
+  review: FactoryReview,
+  blockingSeverities: ReadonlyArray<FactoryFindingSeverity>,
+): FactoryReview["findings"] => {
+  const blocking = review.findings.filter(
+    (finding) => finding.required || blockingSeverities.includes(finding.severity),
+  );
+  return blocking.length > 0 ? blocking : review.findings;
+};
+
+/**
  * Judges a decoded review. Every structural problem is reported together, so one corrected
  * retry can fix them all; evidence paths need the worktree, see `evidencePaths.ts`.
  */

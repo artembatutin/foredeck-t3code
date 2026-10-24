@@ -1,6 +1,6 @@
 import { standardStages } from "./definitions.ts";
 import type { FactoryStageDefinition } from "./definitions.ts";
-import { acceptedReview, issue } from "./state.ts";
+import { acceptedReview, isTurnEffect, issue, receiptFailed } from "./state.ts";
 import type {
   FactoryAcceptedReview,
   FactoryAdvance,
@@ -8,6 +8,7 @@ import type {
   FactoryDeliveryState,
   FactoryEffect,
   FactoryEvent,
+  FactoryRepairedStage,
   FactoryReviewJudgment,
 } from "./state.ts";
 import { stageHandler } from "./stages/registry.ts";
@@ -37,17 +38,76 @@ const begin = (delivery: FactoryDeliveryState, stage: FactoryStageDefinition): F
       );
 };
 
-/** A new review round: a fresh retry budget, and no review accepted for it yet. */
-const beginReview = (delivery: FactoryDeliveryState) =>
-  begin(
-    { ...delivery, reviewRound: delivery.reviewRound + 1, invalidSubmissions: 0 },
-    standardStages.review,
+/**
+ * A new review round: a fresh retry budget, and no review accepted for it yet. The first round
+ * launches a fresh reviewer that never sees the author's account; after a fix-review round the
+ * reviewer thread goes on with a follow-up turn that carries the author's reply.
+ */
+const beginReview = (delivery: FactoryDeliveryState): FactoryAdvance => {
+  const next = { ...delivery, reviewRound: delivery.reviewRound + 1, invalidSubmissions: 0 };
+  const { reviewer } = delivery.threads;
+  return reviewer !== undefined && delivery.reviewResponse !== null
+    ? issue(
+        { ...next, stage: "review" },
+        { type: "send_review_follow_up_turn", threadId: reviewer, round: next.reviewRound },
+      )
+    : begin(next, standardStages.review);
+};
+
+/**
+ * Answers a failed verify or a blocking review with the next repair round on the author thread.
+ * The failure's fingerprint is recorded; one the task already recorded blocks instead, since the
+ * round before saw the same failure on the same tree. With the stage's rounds spent, the delivery
+ * blocks with `exhausted`.
+ */
+const repair = (
+  delivery: FactoryDeliveryState,
+  failure: {
+    readonly stage: FactoryRepairedStage;
+    readonly fingerprint: string | undefined;
+    readonly exhausted: FactoryBlock;
+  },
+): FactoryAdvance => {
+  const { fingerprint } = failure;
+  if (fingerprint !== undefined && delivery.fingerprints.includes(fingerprint)) {
+    return blocked(delivery, { reason: "repeated_failure", stage: failure.stage });
+  }
+  const recorded =
+    fingerprint === undefined
+      ? delivery
+      : { ...delivery, fingerprints: [...delivery.fingerprints, fingerprint] };
+  const { rounds, limits } = delivery;
+  const fixing = failure.stage === "verify";
+  const spent = fixing ? rounds.fix : rounds.review;
+  // The author thread exists from the author stage on; verify and review come after it.
+  const { author } = delivery.threads;
+  if (spent >= (fixing ? limits.maxFixRounds : limits.maxReviewRounds) || author === undefined) {
+    return blocked(recorded, failure.exhausted);
+  }
+  const round = spent + 1;
+  return issue(
+    {
+      ...recorded,
+      stage: "repair",
+      rounds: fixing ? { ...rounds, fix: round } : { ...rounds, review: round },
+    },
+    {
+      type: "send_repair_turn",
+      kind: fixing ? "fix-verify" : "fix-review",
+      threadId: author,
+      round,
+    },
   );
+};
 
 /** Acts on the round's accepted review once its run has completed. */
 const concludeReview = (delivery: FactoryDeliveryState, review: FactoryAcceptedReview) =>
   review.summary.blocking
-    ? blocked(delivery, { reason: "review_changes_required", summary: review.summary })
+    ? repair(delivery, {
+        stage: "review",
+        fingerprint: review.fingerprint,
+        exhausted: { reason: "review_changes_required", summary: review.summary },
+      })
     : begin(delivery, standardStages.record);
 
 /**
@@ -111,9 +171,12 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * effect, a run of another thread or an earlier run, a submission for another round, a stage it
  * is not in, a delivery that is not running) changes nothing.
  *
- * This covers a single item from start to the first review's verdict: the author thread, the
- * branch settle check with at most one fix-commit turn, the verify command, then a reviewer
- * thread whose one accepted review per round is acted on once its run completes.
+ * This covers a single item from start to a passing review: the author thread, the branch
+ * settle check with at most one fix-commit turn, the verify command, then a reviewer thread
+ * whose one accepted review per round is acted on once its run completes. A failed verify or a
+ * blocking review gets a repair turn on the author thread while the task has rounds of that kind
+ * left and the failure is new; the repaired branch is settled and verified again, and a review
+ * round after a fix-review continues the same reviewer thread.
  */
 export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
   if (event.type === "start") {
@@ -140,12 +203,19 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
 
     case "turn.started": {
       const turn =
-        awaitedEffect(delivery, event.effectId, "send_fix_commit_turn") ??
-        awaitedEffect(delivery, event.effectId, "send_review_retry_turn");
-      if (turn === undefined) return unchanged(delivery);
+        awaiting?.type === "effect" && awaiting.effect.id === event.effectId
+          ? awaiting.effect
+          : undefined;
+      if (turn === undefined || !isTurnEffect(turn)) return unchanged(delivery);
+      const run = { threadId: turn.threadId, runId: event.runId };
       return step({
         ...delivery,
-        awaiting: { type: "run", threadId: turn.threadId, runId: event.runId },
+        // The reply to the findings is what the next review round checks.
+        reviewResponse:
+          turn.type === "send_repair_turn" && turn.kind === "fix-review"
+            ? run
+            : delivery.reviewResponse,
+        awaiting: { type: "run", ...run },
       });
     }
 
@@ -212,8 +282,12 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
         return blocked(delivery, { reason: "receipt_refused", refusals: outcome.refusals });
       }
       const recorded = { ...delivery, receipts: [...delivery.receipts, outcome.receipt] };
-      if (outcome.receipt.timedOut || outcome.receipt.code !== 0) {
-        return blocked(recorded, { reason: "verify_failed" });
+      if (receiptFailed(outcome.receipt)) {
+        return repair(recorded, {
+          stage: "verify",
+          fingerprint: outcome.fingerprint,
+          exhausted: { reason: "verify_failed" },
+        });
       }
       return beginReview(recorded);
     }

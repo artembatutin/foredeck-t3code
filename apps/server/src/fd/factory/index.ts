@@ -39,8 +39,9 @@ export const layerPersistence = Layer.mergeAll(
 /**
  * The Factory service, settings and worker over Factory persistence, for transports and the
  * reactor. Needs Work's service, the orchestration application (thread launches and
- * management), the project store, server settings and config, the git driver and the process
- * runner. The thread, verify and review effects stay private to the service and worker.
+ * management), the project store, server settings and config, the provider registry (for model
+ * options), the git driver and the process runner. The thread, verify and review effects stay
+ * private to the service and worker.
  * server.ts also mounts `layerPersistence` with core and Work persistence, so the ledger migrates
  * with theirs; one build shares the one instance.
  */
