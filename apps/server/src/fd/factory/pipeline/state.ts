@@ -130,6 +130,12 @@ export type FactoryEvent =
   /** The worker could not carry out the effect; `detail` is bounded and safe to show. */
   | { readonly type: "effect.failed"; readonly effectId: number; readonly detail: string };
 
+/** The events the reactor observes on a thread; they name the thread, not the delivery. */
+export type FactoryThreadEvent = Extract<
+  FactoryEvent,
+  { readonly type: "run.finished" | "thread.deleted" }
+>;
+
 export type FactoryBlock =
   /** The awaited run ended without completing. */
   | {

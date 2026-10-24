@@ -1,3 +1,4 @@
+import type { ThreadId } from "@t3tools/contracts";
 import { type FactoryDeliveryId, FactoryStageName } from "@t3tools/contracts/fd/factory";
 import { type DrainableWorker, makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
@@ -27,6 +28,7 @@ import type {
   FactoryEffect,
   FactoryEvent,
   FactorySettleResult,
+  FactoryThreadEvent,
 } from "./pipeline/state.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 
@@ -56,6 +58,27 @@ export class FactoryWorker extends Context.Service<
     readonly step: (
       deliveryId: FactoryDeliveryId,
       event: FactoryEvent,
+    ) => Effect.Effect<
+      Option.Option<FactoryDeliveryStore.StoredFactoryDelivery>,
+      FactoryStoreError
+    >;
+    /**
+     * Steps the delivery that owns the event's thread: the one whose active stage attempt names
+     * it, or whose launch or turn result naming it is being stored. None when no delivery does.
+     */
+    readonly stepThread: (
+      event: FactoryThreadEvent,
+    ) => Effect.Effect<
+      Option.Option<FactoryDeliveryStore.StoredFactoryDelivery>,
+      FactoryStoreError
+    >;
+    /**
+     * Blocks a running delivery that awaits an effect this process never queued: the queue that
+     * held it ended with an earlier server process. Nothing is re-run. Any other delivery is left
+     * as it is; an unknown one returns none.
+     */
+    readonly failInterruptedEffect: (
+      deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<
       Option.Option<FactoryDeliveryStore.StoredFactoryDelivery>,
       FactoryStoreError
@@ -125,6 +148,10 @@ const make = Effect.gen(function* () {
   // long verify command never holds up another's. Lanes are tiny and bounded by the deliveries
   // stepped since the server started.
   const lanes = new Map<FactoryDeliveryId, DrainableWorker<Job>>();
+  // Threads whose launch or turn result is being stored, with their delivery. No attempt names a
+  // newly launched thread until that store commits, so a thread event looked up meanwhile is
+  // routed by this entry instead, and its step waits for the lock the store holds.
+  const storing = new Map<ThreadId, FactoryDeliveryId>();
   // Effects queued or running on any lane, each counted until the step its result fed back has
   // finished. That step queues its follow-ups first, so a chain never reads as idle midway, and
   // a delivery stepped while a drain waits is counted too.
@@ -321,6 +348,10 @@ const make = Effect.gen(function* () {
    * result is stored: an end the read misses arrives as an event whose step waits for the lock,
    * and an end it sees is fed right after the result. A read that fails fails the effect
    * instead, so the delivery records none of the result rather than wait on a run that ended.
+   *
+   * The thread is entered in `storing` before the read, so `stepThread` loses no end: one looked
+   * up before the entry exists was committed before the read, which sees it; one looked up while
+   * the entry stands is routed by it; one looked up after finds the attempt the store recorded.
    */
   // Annotated like `step`: it closes the cycle `stepLocked` → lane → `runJob` → `feed`.
   const feed = (job: Job, event: FactoryEvent): ReturnType<FactoryWorker["Service"]["step"]> => {
@@ -330,6 +361,7 @@ const make = Effect.gen(function* () {
     return locks.withLock(
       deliveryId,
       Effect.gen(function* () {
+        storing.set(run.threadId, deliveryId);
         const ended = yield* Effect.exit(
           Effect.suspend(() => threads.runEnded(run.threadId, run.runId)),
         );
@@ -348,9 +380,39 @@ const make = Effect.gen(function* () {
           ...run,
           status: ended.value.value,
         });
-      }),
+      }).pipe(Effect.ensuring(Effect.sync(() => storing.delete(run.threadId)))),
     );
   };
+
+  const stepThread: FactoryWorker["Service"]["stepThread"] = (event) =>
+    Effect.gen(function* () {
+      // The entry first: once it is gone, the store that held it has recorded the attempt.
+      const deliveryId =
+        storing.get(event.threadId) ??
+        Option.getOrUndefined(yield* stageRuns.findActiveByThread(event.threadId))?.deliveryId;
+      if (deliveryId === undefined) return Option.none();
+      return yield* step(deliveryId, event);
+    });
+
+  const failInterruptedEffect: FactoryWorker["Service"]["failInterruptedEffect"] = (deliveryId) =>
+    locks.withLock(
+      deliveryId,
+      Effect.gen(function* () {
+        const current = yield* deliveries.get(deliveryId);
+        if (Option.isNone(current)) return current;
+        const { status, awaiting } = current.value.state;
+        // A delivery gets a lane when this process queues its first effect, so with one the
+        // awaited effect is still queued or running here, or has already fed its result back.
+        if (status !== "running" || awaiting?.type !== "effect" || lanes.has(deliveryId)) {
+          return current;
+        }
+        return yield* stepLocked(deliveryId, {
+          type: "effect.failed",
+          effectId: awaiting.effect.id,
+          detail: `Factory could not ${describeEffect(awaiting.effect)}: a server restart interrupted it.`,
+        });
+      }),
+    );
 
   /**
    * Runs an effect and feeds its result back. Suspended, so an executor that throws while
@@ -385,6 +447,8 @@ const make = Effect.gen(function* () {
 
   return FactoryWorker.of({
     step,
+    stepThread,
+    failInterruptedEffect,
     drain: TxRef.get(outstanding).pipe(
       Effect.flatMap((count) => (count > 0 ? Effect.txRetry : Effect.void)),
       Effect.tx,
