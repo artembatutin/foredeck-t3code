@@ -146,3 +146,22 @@ Numbered verify and review evidence is never overwritten, but a task has one cur
 later approval of the task replaces its `approval-<taskId>.json` and `lastReviewedSha`. A single
 item is its delivery's one task, written in the transaction that inserts the delivery. See
 [`FactoryRecord.ts`](../../apps/server/src/fd/factory/FactoryRecord.ts).
+
+## The PR stage opens only the approved commit
+
+An approved delivery is not at rest: it enters `pr` still `approved` and becomes `pr_open` once
+the pull request is recorded. The engine takes only that result or the effect's failure while
+approved, and the boot sweep blocks an approved delivery whose PR effect a restart lost, as it does
+a running one; the action is never re-run on its own. Before the stacked action runs,
+[`FactoryPullRequest`](../../apps/server/src/fd/factory/FactoryPullRequest.ts) reads the worktree
+again, like record: `create_pr` pushes whatever the branch holds, so anything but the approved
+commit on a clean tree fails the effect with nothing pushed.
+
+Passing `threadId` to `GitWorkflowService.runStackedAction` does not link the pull request to the
+thread; the stacked action's RPC handler in `ws.ts` does that afterwards. Factory calls the same
+`linkCreatedPullRequest` itself, so the author thread shows the pull request as one it created.
+A pull request step that reports no number and URL blocks rather than recording a pull request
+Factory cannot name.
+
+Deliveries approved before the PR stage existed load without a pull request and stay `approved` at
+`record`, awaiting nothing; nothing opens their pull request on its own.

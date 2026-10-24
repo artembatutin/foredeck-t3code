@@ -40,6 +40,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService } from "../work-management/index.ts";
+import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactoryService from "./FactoryService.ts";
@@ -221,6 +222,12 @@ const fakes = (world: World) =>
     Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed(providers) }),
   );
 
+/** Pull requests are opened in FactoryPullRequest.test.ts; here an approved delivery's opens. */
+const openedPullRequest = Layer.mock(FactoryPullRequest.FactoryPullRequest)({
+  open: () =>
+    Effect.succeed({ number: 7, url: "https://github.com/acme/alpha/pull/7", headBranch: branch }),
+});
+
 /**
  * The service, worker, thread effects, review judging, record and verify runner as the server
  * builds them, on in-memory SQLite, real git, real processes and an evidence folder under a temp
@@ -232,6 +239,7 @@ const makeLayer = (world: World) =>
     Layer.provideMerge(FactoryThreadEffects.layer),
     Layer.provide(FactoryReview.layer),
     Layer.provide(FactoryRecord.layer),
+    Layer.provide(openedPullRequest),
     Layer.provide(FactoryVerifyRunner.layer.pipe(Layer.provide(ProcessRunner.layer))),
     Layer.provide(FactoryEvidence.layer),
     Layer.provide(fakes(world)),
@@ -705,12 +713,12 @@ describe("fix-review rounds", () => {
           assert.strictEqual(retry?.commandId, `factory-review-retry:${deliveryId}:10`);
 
           // The retry answers in a fenced block, judged against the repaired commit, which
-          // record then approves.
+          // record then approves, and its pull request opens.
           world.messages.set(runOf(retry), [fenced(passingReview)]);
           yield* runEnds(reviewer, runOf(retry));
           const passed = yield* state;
-          assert.strictEqual(passed.stage, "record");
-          assert.strictEqual(passed.status, "approved");
+          assert.strictEqual(passed.stage, "pr");
+          assert.strictEqual(passed.status, "pr_open");
           assert.deepStrictEqual(
             passed.reviews.map(({ round, source, summary }) => ({
               round,
@@ -739,6 +747,7 @@ describe("fix-review rounds", () => {
               { stage: "verify", threadId: null, outcome: "passed" },
               { stage: "review", threadId: reviewer, outcome: "passed" },
               { stage: "record", threadId: null, outcome: "passed" },
+              { stage: "pr", threadId: null, outcome: "passed" },
             ],
           );
           const [task] = yield* Effect.flatMap(FactoryTaskStore.FactoryTaskStore, (tasks) =>

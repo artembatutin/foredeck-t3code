@@ -33,6 +33,7 @@ import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import { WorkService } from "../../work-management/index.ts";
+import * as FactoryPullRequest from "../FactoryPullRequest.ts";
 import * as FactoryRecord from "../FactoryRecord.ts";
 import * as FactoryReview from "../FactoryReview.ts";
 import * as FactoryService from "../FactoryService.ts";
@@ -86,6 +87,7 @@ const layer = FactoryService.layer.pipe(
       Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({}),
       Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({}),
       Layer.mock(FactoryRecord.FactoryRecord)({}),
+      Layer.mock(FactoryPullRequest.FactoryPullRequest)({}),
       Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
       Layer.mock(ProjectStore.ProjectStoreV2)({}),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({}),

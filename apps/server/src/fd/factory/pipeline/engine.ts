@@ -168,13 +168,14 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * effect, a run of another thread or an earlier run, a submission for another round, a stage it
  * is not in, a delivery that is not running) changes nothing.
  *
- * This covers a single item from start to its approval: the author thread, the branch settle
+ * This covers a single item from start to its pull request: the author thread, the branch settle
  * check with at most one fix-commit turn, the verify command, then a reviewer thread whose one
  * accepted review per round is acted on once its run completes. A failed verify or a blocking
  * review gets a repair turn on the author thread while the task has rounds of that kind left and
  * the failure is new; the repaired branch is settled and verified again, and a review round after
  * a fix-review continues the same reviewer thread. A passing review enters `record`, which
- * approves the reviewed commit and leaves the delivery `approved`, awaiting nothing.
+ * approves the reviewed commit. The approved delivery enters `pr` and opens its pull request,
+ * then is `pr_open` with the pull request recorded, awaiting nothing.
  */
 export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
   if (event.type === "start") {
@@ -182,7 +183,12 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       ? begin({ ...delivery, status: "running" }, standardStages.author)
       : unchanged(delivery);
   }
-  if (delivery.status !== "running") return unchanged(delivery);
+  // Approved, the delivery only opens its pull request: its threads' runs and deletions no
+  // longer change it.
+  const opensPullRequest =
+    delivery.status === "approved" &&
+    (event.type === "pr.opened" || event.type === "effect.failed");
+  if (delivery.status !== "running" && !opensPullRequest) return unchanged(delivery);
   const { awaiting } = delivery;
 
   switch (event.type) {
@@ -324,11 +330,21 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       }
       const { outcome } = event;
       if (outcome.type === "approved") {
-        return step({ ...delivery, status: "approved", awaiting: null });
+        return begin({ ...delivery, status: "approved" }, standardStages.pr);
       }
       const { expected, actual, differences } = outcome;
       return blocked(delivery, { reason: "record_mismatch", expected, actual, differences });
     }
+
+    case "pr.opened":
+      return awaitedEffect(delivery, event.effectId, "open_pr") === undefined
+        ? unchanged(delivery)
+        : step({
+            ...delivery,
+            status: "pr_open",
+            awaiting: null,
+            pullRequest: event.pullRequest,
+          });
 
     case "effect.failed":
       return awaiting?.type === "effect" && awaiting.effect.id === event.effectId

@@ -29,6 +29,7 @@ import * as ProcessRunner from "../../processRunner.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService, workBranchName } from "../work-management/index.ts";
+import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactoryService from "./FactoryService.ts";
@@ -92,6 +93,15 @@ const fakes = (world: World) =>
     }),
     // Every review here arrives through the tool, never the fenced fallback.
     Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+    // FactoryPullRequest.test.ts opens pull requests; here an approved delivery's opens.
+    Layer.mock(FactoryPullRequest.FactoryPullRequest)({
+      open: () =>
+        Effect.succeed({
+          number: 7,
+          url: "https://github.com/acme/alpha/pull/7",
+          headBranch: branch,
+        }),
+    }),
   );
 
 /**
@@ -251,9 +261,10 @@ describe("the record gate", () => {
 
         yield* runEnds(deliveryId, reviewer, reviewRun);
 
+        // Approved, so the PR stage ran and its pull request is open.
         const state = yield* stateOf(deliveryId);
-        assert.strictEqual(state.status, "approved");
-        assert.strictEqual(state.stage, "record");
+        assert.strictEqual(state.status, "pr_open");
+        assert.strictEqual(state.stage, "pr");
         assert.isNull(state.awaiting);
         assert.isNull(state.block);
 

@@ -100,6 +100,7 @@ const StoredEffect = Schema.Union([
     round: PositiveInt,
   }),
   Schema.Struct({ id: PositiveInt, type: Schema.Literal("record_approval") }),
+  Schema.Struct({ id: PositiveInt, type: Schema.Literal("open_pr") }),
 ]);
 
 const StoredCommit = { headSha: Schema.String, tree: Schema.String };
@@ -189,6 +190,10 @@ const StoredDeliveryState = Schema.Struct({
   reviewResponse: Schema.NullOr(Schema.Struct({ threadId: ThreadId, runId: RunId })).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
+  // Added with the PR stage: rows stored before it opened none.
+  pullRequest: Schema.NullOr(
+    Schema.Struct({ number: PositiveInt, url: Schema.String, headBranch: Schema.String }),
+  ).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   block: Schema.NullOr(StoredBlock),
 });
 

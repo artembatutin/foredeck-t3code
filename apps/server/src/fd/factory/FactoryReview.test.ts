@@ -40,6 +40,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService } from "../work-management/index.ts";
+import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactoryService from "./FactoryService.ts";
@@ -189,6 +190,12 @@ const fakes = (world: World) =>
     Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({}),
   );
 
+/** Pull requests are opened in FactoryPullRequest.test.ts; here an approved delivery's opens. */
+const openedPullRequest = Layer.mock(FactoryPullRequest.FactoryPullRequest)({
+  open: () =>
+    Effect.succeed({ number: 7, url: "https://github.com/acme/alpha/pull/7", headBranch: branch }),
+});
+
 /**
  * FactoryService, the worker, the thread effects, review judging and record as the server builds
  * them, on in-memory SQLite, real git and an evidence folder under a temp T3 home.
@@ -199,6 +206,7 @@ const makeLayer = (world: World) =>
     Layer.provide(FactoryThreadEffects.layer),
     Layer.provide(FactoryReview.layer),
     Layer.provide(FactoryRecord.layer),
+    Layer.provide(openedPullRequest),
     Layer.provide(FactoryEvidence.layer),
     Layer.provide(fakes(world)),
     Layer.provide(ProviderRegistryMock.layer()),
@@ -661,8 +669,8 @@ describe("FactoryService.submitReview accepted reviews", () => {
 
           // FactoryRecord.test.ts covers the approval itself.
           const state = yield* stored;
-          assert.strictEqual(state.stage, "record");
-          assert.strictEqual(state.status, "approved");
+          assert.strictEqual(state.stage, "pr");
+          assert.strictEqual(state.status, "pr_open");
           assert.deepStrictEqual(
             (yield* attempts).map(({ stage, outcome, evidencePath }) => ({
               stage,
@@ -678,6 +686,7 @@ describe("FactoryService.submitReview accepted reviews", () => {
                 outcome: "passed",
                 evidencePath: `${directory}/approval-item.json`,
               },
+              { stage: "pr", outcome: "passed", evidencePath: null },
             ],
           );
         }),
@@ -815,7 +824,7 @@ describe("the fenced-JSON fallback", () => {
         yield* drain;
 
         const state = yield* stored;
-        assert.strictEqual(state.stage, "record");
+        assert.strictEqual(state.stage, "pr");
         assert.deepStrictEqual(
           state.reviews.map(({ round, source, summary }) => ({
             round,

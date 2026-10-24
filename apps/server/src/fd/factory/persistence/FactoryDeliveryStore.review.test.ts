@@ -172,6 +172,8 @@ describe("FactoryDeliveryStore with review state", () => {
         rounds: { fix: 0, review: 0 },
         fingerprints: [],
         reviewResponse: null,
+        // Nor the pull request, added after record.
+        pullRequest: null,
       });
       assert.deepStrictEqual(
         (yield* store.listActive()).map((delivery) => delivery.deliveryId),

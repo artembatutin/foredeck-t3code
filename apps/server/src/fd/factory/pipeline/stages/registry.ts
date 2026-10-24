@@ -5,6 +5,7 @@ import type { FactoryAdvance, FactoryDeliveryState } from "../state.ts";
 import { agentStage } from "./agent.ts";
 import { commandStage } from "./command.ts";
 import { gateStage } from "./gate.ts";
+import { prStage } from "./pr.ts";
 
 /** One handler per stage kind. Handlers are pure, like the engine that calls them. */
 export interface FactoryStageHandler<K extends FactoryStageKind> {
@@ -28,7 +29,7 @@ const registry: { readonly [K in FactoryStageKind]: FactoryStageLookup<K> } = {
   command: { type: "supported", handler: commandStage },
   gate: { type: "supported", handler: gateStage },
   integrate: { type: "unsupported", kind: "integrate" },
-  pr: { type: "unsupported", kind: "pr" },
+  pr: { type: "supported", handler: prStage },
 };
 
 /** The handler for a stage kind, or `unsupported` for kinds this server cannot run yet. */

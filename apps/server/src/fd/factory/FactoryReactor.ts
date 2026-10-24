@@ -13,7 +13,7 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { forkParked } from "../../serverActivation.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
-import { type FactoryThreadEvent, isTerminalRunStatus } from "./pipeline/state.ts";
+import { type FactoryThreadEvent, isProceeding, isTerminalRunStatus } from "./pipeline/state.ts";
 
 /**
  * Feeds what happens to Factory's threads into their deliveries: a terminal run becomes
@@ -69,13 +69,14 @@ const make = Effect.gen(function* () {
   /**
    * Catches one delivery up with what happened while no server ran it. A delivery awaiting a run
    * gets the run's end or its thread's deletion; one awaiting an effect lost it with the previous
-   * process and blocks. Deliveries that are not running wait for their owner.
+   * process and blocks, an approved one opening its pull request too. Deliveries that are neither
+   * running nor approved wait for their owner.
    */
   const reconcile = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
     Effect.gen(function* () {
       const { deliveryId, state } = delivery;
       const { awaiting } = state;
-      if (state.status !== "running" || awaiting === null) return;
+      if (!isProceeding(state) || awaiting === null) return;
       if (awaiting.type === "effect") {
         yield* worker.failInterruptedEffect(deliveryId);
         return;

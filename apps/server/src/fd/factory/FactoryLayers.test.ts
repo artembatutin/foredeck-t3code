@@ -3,6 +3,7 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
   EventId,
+  type GitRunStackedActionInput,
   MessageId,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
@@ -23,12 +24,15 @@ import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ServerConfig from "../../config.ts";
+import * as GitWorkflow from "../../git/GitWorkflowService.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProcessRunner from "../../processRunner.ts";
+import * as ProjectService from "../../project/ProjectService.ts";
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerActivation from "../../serverActivation.ts";
 import * as ServerSettings from "../../serverSettings.ts";
@@ -86,15 +90,36 @@ const awaitingRun = fold(
   },
 );
 
+/** Approved by an earlier process, which ended before its PR effect fed a result back. */
+const awaitingPullRequest: FactoryDeliveryState = {
+  ...awaitingRun,
+  status: "approved",
+  stage: "pr",
+  effectsIssued: 6,
+  awaiting: { type: "effect", effect: { id: 6, type: "open_pr" } },
+};
+
+/** Every stacked action Factory asked the Git workflow for. */
+const pullRequestCalls: Array<GitRunStackedActionInput> = [];
+
 /**
  * What server.ts provides Factory's layers besides SQLite and the platform. The project store,
- * process runner and config are real; the services that reach Work's sources, providers or Git
- * are fakes that fail if called, since nothing here launches a thread or runs a command.
+ * process runner and config are real; the services that reach Work's sources, providers, Git or
+ * the orchestrator are fakes that fail if called, since nothing here launches a thread, runs a
+ * command or opens a pull request. The Git workflow also records a call before it fails.
  */
 const serverServices = Layer.mergeAll(
   Layer.mock(Work.WorkService.WorkService)({}),
   Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
   Layer.mock(ThreadManagement.ThreadManagementService)({}),
+  Layer.mock(Orchestrator.OrchestratorV2)({}),
+  Layer.mock(ProjectService.ProjectService)({}),
+  Layer.mock(GitWorkflow.GitWorkflowService)({
+    runStackedAction: (input) =>
+      Effect.sync(() => pullRequestCalls.push(input)).pipe(
+        Effect.andThen(Effect.die("Factory must not open a pull request here.")),
+      ),
+  }),
   Layer.mock(ServerSettings.ServerSettingsService)({}),
   Layer.mock(GitVcsDriver.GitVcsDriver)({}),
   ProviderRegistryMock.layer(),
@@ -119,7 +144,7 @@ const factoryLayers = (activation: Deferred.Deferred<void>) =>
 const corePersistence = <E, R>(sqlite: Layer.Layer<SqlClient.SqlClient, E, R>) =>
   Work.layerPersistence.pipe(Layer.provideMerge(sqlite));
 
-/** Stores a delivery with its author attempt, as an earlier process left them. */
+/** Stores a delivery with its current stage's attempt, as an earlier process left them. */
 const seed = (
   state: FactoryDeliveryState,
   run?: { readonly threadId: ThreadId; readonly runId: RunId },
@@ -128,7 +153,7 @@ const seed = (
     const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
     const stageRuns = yield* FactoryStageRunStore.FactoryStageRunStore;
     yield* deliveries.insert({ deliveryId, projectId, itemRef, state });
-    yield* stageRuns.append({ deliveryId, stage: "author", ...run });
+    yield* stageRuns.append({ deliveryId, stage: state.stage ?? "author", ...run });
   });
 
 /** Every Factory delivery and stage attempt row exactly as SQLite holds it. */
@@ -143,7 +168,8 @@ const factoryRows = Effect.gen(function* () {
 const stateOf = Effect.flatMap(FactoryDeliveryStore.FactoryDeliveryStore, (store) =>
   store.get(deliveryId),
 ).pipe(Effect.map((delivery) => Option.getOrThrow(delivery).state));
-const authorAttempt = Effect.flatMap(FactoryStageRunStore.FactoryStageRunStore, (store) =>
+/** The attempt `seed` stored. */
+const seededAttempt = Effect.flatMap(FactoryStageRunStore.FactoryStageRunStore, (store) =>
   store.listByDelivery(deliveryId),
 ).pipe(Effect.map(([attempt]) => attempt));
 const drainReactor = Effect.flatMap(Factory.FactoryReactor.FactoryReactor, (r) => r.drain);
@@ -204,7 +230,32 @@ describe("Factory server layers", () => {
         assert.strictEqual(state.status, "blocked");
         assert.strictEqual(state.block?.reason, "effect_failed");
         assert.deepStrictEqual(state, interrupted);
-        assert.strictEqual((yield* authorAttempt)?.outcome, "blocked");
+        assert.strictEqual((yield* seededAttempt)?.outcome, "blocked");
+      }),
+    ),
+  );
+
+  it.effect("block an approved delivery left opening its pull request, without opening it", () =>
+    afterRestart(seed(awaitingPullRequest), (activate) =>
+      Effect.gen(function* () {
+        yield* activate;
+        yield* drainReactor;
+        yield* drainWorker;
+
+        assert.deepStrictEqual(yield* stateOf, {
+          ...awaitingPullRequest,
+          status: "blocked",
+          awaiting: null,
+          block: {
+            reason: "effect_failed",
+            effect: { id: 6, type: "open_pr" },
+            detail: "Factory could not open the pull request: a server restart interrupted it.",
+          },
+        });
+        const attempt = yield* seededAttempt;
+        assert.strictEqual(attempt?.stage, "pr");
+        assert.strictEqual(attempt?.outcome, "blocked");
+        assert.deepStrictEqual(pullRequestCalls, []);
       }),
     ),
   );
@@ -304,7 +355,7 @@ describe("Factory server layers", () => {
           runId,
           runStatus: "failed",
         });
-        assert.strictEqual((yield* authorAttempt)?.outcome, "blocked");
+        assert.strictEqual((yield* seededAttempt)?.outcome, "blocked");
       }),
     ),
   );

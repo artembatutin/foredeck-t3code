@@ -15,6 +15,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as TxRef from "effect/TxRef";
 
 import type * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
+import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
@@ -26,7 +27,7 @@ import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import { advance } from "./pipeline/engine.ts";
 import { failureFingerprint } from "./pipeline/fingerprint.ts";
-import { acceptedReview, isTurnEffect, receiptFailed } from "./pipeline/state.ts";
+import { acceptedReview, isProceeding, isTurnEffect, receiptFailed } from "./pipeline/state.ts";
 import type {
   FactoryCommandOutcome,
   FactoryDeliveryState,
@@ -94,9 +95,9 @@ export class FactoryWorker extends Context.Service<
      */
     readonly stepThread: (event: FactoryThreadEvent) => Effect.Effect<void, FactoryStoreError>;
     /**
-     * Blocks a running delivery that awaits an effect this process never queued: the queue that
-     * held it ended with an earlier server process. Nothing is re-run. Any other delivery is left
-     * as it is; an unknown one returns none.
+     * Blocks a running or approved delivery that awaits an effect this process never queued: the
+     * queue that held it ended with an earlier server process. Nothing is re-run. Any other
+     * delivery is left as it is; an unknown one returns none.
      */
     readonly failInterruptedEffect: (
       deliveryId: FactoryDeliveryId,
@@ -135,6 +136,8 @@ const describeEffect = (effect: FactoryEffect) => {
       return "send the review follow-up turn";
     case "record_approval":
       return "record the approval";
+    case "open_pr":
+      return "open the pull request";
   }
 };
 
@@ -211,6 +214,7 @@ const make = Effect.gen(function* () {
   const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
   const reviews = yield* FactoryReview.FactoryReview;
   const records = yield* FactoryRecord.FactoryRecord;
+  const pullRequests = yield* FactoryPullRequest.FactoryPullRequest;
   const gitContext = yield* Effect.context<FileSystem.FileSystem | GitVcsDriver.GitVcsDriver>();
   const scope = yield* Effect.scope;
   const locks = yield* KeyedLock.make<FactoryDeliveryId>();
@@ -348,14 +352,23 @@ const make = Effect.gen(function* () {
             outcome,
           })),
         );
+      case "open_pr":
+        return pullRequests.open(delivery, effect).pipe(
+          Effect.map((pullRequest): FactoryEvent => ({
+            type: "pr.opened",
+            effectId: effect.id,
+            pullRequest,
+          })),
+        );
     }
   };
 
   /**
    * Records the stage attempts a step implies. Leaving a stage finishes its active attempt:
    * failed when the delivery left it for a repair round, passed when it advanced otherwise, and
-   * by how it stopped running when it did. Entering one appends the next attempt, and the
-   * attempt carries the run the delivery now awaits.
+   * by how it stopped proceeding when it did. Entering one appends the next attempt, and the
+   * attempt carries the run the delivery now awaits. An approved delivery still proceeds: its PR
+   * attempt ends when the pull request is open or the delivery blocks.
    */
   const recordAttempts = Effect.fn("FactoryWorker.recordAttempts")(function* (
     deliveryId: FactoryDeliveryId,
@@ -363,7 +376,7 @@ const make = Effect.gen(function* () {
     after: FactoryDeliveryState,
     evidence: ReturnType<typeof evidenceOf>,
   ) {
-    const stopped = after.status !== "running";
+    const stopped = !isProceeding(after);
     const advanced = after.stage !== before.stage;
     let active = (yield* stageRuns.listByDelivery(deliveryId)).findLast(
       (run) => run.outcome === null && run.stage === before.stage,
@@ -374,7 +387,7 @@ const make = Effect.gen(function* () {
       attempt: run.attempt,
     });
 
-    if (active !== undefined && before.status === "running" && (advanced || stopped)) {
+    if (active !== undefined && isProceeding(before) && (advanced || stopped)) {
       const { path, fingerprint } = evidence;
       yield* stageRuns.finish({
         ...attemptOf(active),
@@ -537,10 +550,14 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const current = yield* deliveries.get(deliveryId);
         if (Option.isNone(current)) return current;
-        const { status, awaiting } = current.value.state;
+        const { awaiting } = current.value.state;
         // A delivery gets a lane when this process queues its first effect, so with one the
         // awaited effect is still queued or running here, or has already fed its result back.
-        if (status !== "running" || awaiting?.type !== "effect" || lanes.has(deliveryId)) {
+        if (
+          !isProceeding(current.value.state) ||
+          awaiting?.type !== "effect" ||
+          lanes.has(deliveryId)
+        ) {
           return current;
         }
         return yield* stepLocked(deliveryId, {

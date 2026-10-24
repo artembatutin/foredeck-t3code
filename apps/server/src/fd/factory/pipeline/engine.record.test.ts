@@ -131,12 +131,19 @@ describe("entering record", () => {
 });
 
 describe("the record result", () => {
-  it("leaves an approved delivery at record, awaiting nothing", () => {
+  it("approves the delivery, which enters pr to open its pull request", () => {
+    // engine.pr.test.ts covers the PR stage.
+    const effect = { id: RECORD + 1, type: "open_pr" } as const;
     expect(advance(recording, recorded(approved))).toEqual({
-      delivery: { ...recording, status: "approved", awaiting: null },
-      effects: [],
+      delivery: {
+        ...recording,
+        status: "approved",
+        stage: "pr",
+        effectsIssued: RECORD + 1,
+        awaiting: { type: "effect", effect },
+      },
+      effects: [effect],
     });
-    expect(approvedState.stage).toBe("record");
     expect(approvedState.block).toBeNull();
   });
 

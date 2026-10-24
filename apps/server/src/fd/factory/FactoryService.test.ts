@@ -26,6 +26,7 @@ import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkDomainError, WorkService } from "../work-management/index.ts";
+import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactoryService from "./FactoryService.ts";
@@ -141,11 +142,12 @@ const fakes = (world: World) =>
         }),
       runEnded: () => Effect.succeedNone,
     }),
-    // Nothing here reaches verify, a settle check, a review or record; FactoryReview.test.ts and
-    // FactoryRecord.test.ts cover those.
+    // Nothing here reaches verify, a settle check, a review, record or a pull request;
+    // FactoryReview.test.ts, FactoryRecord.test.ts and FactoryPullRequest.test.ts cover those.
     Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({}),
     Layer.mock(FactoryReview.FactoryReview)({}),
     Layer.mock(FactoryRecord.FactoryRecord)({}),
+    Layer.mock(FactoryPullRequest.FactoryPullRequest)({}),
     Layer.mock(GitVcsDriver.GitVcsDriver)({}),
   );
 

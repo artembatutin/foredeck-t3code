@@ -99,7 +99,12 @@ export type FactoryEffectRequest =
    * The record gate: approve the delivery's task for the worktree's commit, which must be the one
    * its last receipt verified and its last accepted review judged, on a clean tree.
    */
-  | { readonly type: "record_approval" };
+  | { readonly type: "record_approval" }
+  /**
+   * The PR stage: push the delivery branch and open its pull request, linked to the author
+   * thread, for the commit its task was approved for.
+   */
+  | { readonly type: "open_pr" };
 
 export type FactoryRepairKind = "fix-verify" | "fix-review";
 
@@ -228,6 +233,14 @@ export type FactoryRecordOutcome =
       readonly differences: ReadonlyArray<FactoryRecordDifference>;
     };
 
+/** The delivery's pull request: the one the PR stage opened, or found already open. */
+export interface FactoryOpenedPullRequest {
+  readonly number: number;
+  readonly url: string;
+  /** The branch the pull request merges from, the delivery branch as the host names it. */
+  readonly headBranch: string;
+}
+
 /**
  * What the engine folds in. The worker's results name the effect they answer by `effectId`;
  * the reactor's run and thread events name the thread and run they observed.
@@ -292,6 +305,12 @@ export type FactoryEvent =
       readonly type: "approval.recorded";
       readonly effectId: number;
       readonly outcome: FactoryRecordOutcome;
+    }
+  /** An `open_pr` result. */
+  | {
+      readonly type: "pr.opened";
+      readonly effectId: number;
+      readonly pullRequest: FactoryOpenedPullRequest;
     }
   /** The worker could not carry out the effect; `detail` is bounded and safe to show. */
   | { readonly type: "effect.failed"; readonly effectId: number; readonly detail: string };
@@ -386,9 +405,19 @@ export interface FactoryDeliveryState {
   readonly fingerprints: ReadonlyArray<string>;
   /** The author's latest fix-review run; the next review round reads its reply as claims. */
   readonly reviewResponse: { readonly threadId: ThreadId; readonly runId: RunId } | null;
+  /** Set once the PR stage has opened the delivery's pull request. */
+  readonly pullRequest: FactoryOpenedPullRequest | null;
   /** Set while the delivery is blocked. */
   readonly block: FactoryBlock | null;
 }
+
+/**
+ * Whether the server moves the delivery on by itself: while it runs its stages, and once
+ * approved, while it opens its pull request. A delivery in any other status waits for its owner,
+ * so no worker result is coming for an effect it still names.
+ */
+export const isProceeding = (delivery: FactoryDeliveryState) =>
+  delivery.status === "running" || delivery.status === "approved";
 
 /** The result of one engine step: the new state and the effects to carry out, in order. */
 export interface FactoryAdvance {
@@ -441,6 +470,7 @@ export const queuedDeliveryState = (input: {
   rounds: { fix: 0, review: 0 },
   fingerprints: [],
   reviewResponse: null,
+  pullRequest: null,
   block: null,
 });
 
