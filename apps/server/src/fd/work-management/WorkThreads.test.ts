@@ -224,6 +224,9 @@ describe("WorkThreads.start", () => {
         assert.strictEqual(link?.source, "started");
         assert.strictEqual(link?.snapshot.autoStarted, true);
         assert.strictEqual(link?.snapshot.mode, "scope");
+        // Work's own starts carry no origin, so clients keep offering the reverse prompts.
+        assert.isNull(link?.origin);
+        assert.notProperty(detail.links[0], "origin");
       }).pipe(Effect.provide(layer));
     }),
   );

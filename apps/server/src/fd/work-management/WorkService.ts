@@ -39,6 +39,7 @@ import {
   type WorkSourceTestInput,
   type WorkSourceTestResult,
   type WorkThreadLink,
+  type WorkThreadLinkOrigin,
 } from "@t3tools/contracts/fd/work-management";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
@@ -205,6 +206,16 @@ export class WorkService extends Context.Service<
      */
     readonly reserveLaunch: (threadId: ThreadId) => Effect.Effect<void, never, Scope.Scope>;
     readonly isLaunching: (threadId: ThreadId) => Effect.Effect<boolean>;
+    /**
+     * Links a thread another server module started for an item, marked with that module's
+     * origin, under the item's canonical ref. The thread must exist or its launch must hold a
+     * reservation; linking it again leaves the stored link as it is.
+     */
+    readonly linkThread: (input: {
+      readonly ref: WorkItemRef;
+      readonly threadId: ThreadId;
+      readonly origin: WorkThreadLinkOrigin;
+    }) => Effect.Effect<void, WorkDomainError>;
   }
 >()("t3/fd/work-management/WorkService") {}
 
@@ -1002,6 +1013,45 @@ const make = Effect.gen(function* () {
       return { linked: true };
     });
 
+  const linkThread: WorkService["Service"]["linkThread"] = (input) =>
+    Effect.gen(function* () {
+      const ref = yield* canonicalRef(input.ref);
+      // A link without its thread is a live launch only while the launch holds its reservation;
+      // the sweep drops any other as a launch that died. The reservation is checked first, as
+      // it is released only once the thread exists.
+      if (!(yield* isLaunching(input.threadId))) {
+        const shell = yield* projections
+          .getThreadShell(input.threadId)
+          .pipe(Effect.mapError(unavailable("Thread state could not be read.")));
+        if (shell === null || shell.deletedAt !== null) {
+          return yield* new WorkInvalid({
+            detail: "The thread does not exist on this environment.",
+          });
+        }
+      }
+      // Usually served by the read the caller made before starting the thread.
+      const at = yield* currentEpoch;
+      const detail = yield* Cache.get(itemCache, encodeItemKey([ref.sourceId, ref.itemId, at]));
+      const { inserted } = yield* links
+        .link({
+          sourceId: ref.sourceId,
+          itemId: ref.itemId,
+          threadId: input.threadId,
+          source: "started",
+          origin: input.origin,
+          snapshot: {
+            key: detail.key,
+            title: detail.title,
+            status: detail.status,
+            url: detail.url,
+            revision: detail.revision,
+            autoStarted: false,
+          },
+        })
+        .pipe(Effect.mapError(storeFailure));
+      if (inserted) yield* bumpEpoch;
+    });
+
   const refresh: WorkService["Service"]["refresh"] = (actor, _input) =>
     requireGrants(actor, [AuthWorkReadScope]).pipe(Effect.andThen(bumpEpoch));
 
@@ -1070,6 +1120,7 @@ const make = Effect.gen(function* () {
     canonicalRef,
     reserveLaunch,
     isLaunching,
+    linkThread,
   });
 });
 

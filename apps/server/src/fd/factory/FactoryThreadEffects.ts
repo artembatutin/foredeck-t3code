@@ -112,15 +112,16 @@ interface FactoryThreadEffectFailure {
  * fix-commit turn on a thread. Each receives the delivery as stored with the effect. The worker
  * feeds what they report back as `thread.launched` / `turn.started`, and a failure as
  * `effect.failed`. Checks run before anything is dispatched, so a refused launch leaves no thread
- * behind; a read that fails after the launch still fails the effect, and the delivery records
- * none of its result.
+ * behind; a read or Work link that fails after the launch still fails the effect, and the
+ * delivery records none of its result.
  */
 export class FactoryThreadEffects extends Context.Service<
   FactoryThreadEffects,
   {
     /**
-     * Launches the thread with its first turn and reports it once the launch has recorded the
-     * worktree, or has ended the run trying (the path is null then).
+     * Launches the thread with its first turn, links it to the delivery's Work item, and reports
+     * it once the launch has recorded the worktree, or has ended the run trying (the path is null
+     * then).
      */
     readonly launchThread: (
       delivery: StoredFactoryDelivery,
@@ -316,6 +317,9 @@ const make = Effect.gen(function* () {
         creationSource: "server",
       });
       const { threadId } = launched;
+      // Linked once the launch has created the thread, so a launch that fails first links
+      // nothing, and a replayed launch returns the same thread, whose link is already stored.
+      yield* work.linkThread({ ref: delivery.itemRef, threadId, origin: "factory" });
       const run = launched.projection.runs.find(
         (candidate) => candidate.userMessageId === messageId,
       );

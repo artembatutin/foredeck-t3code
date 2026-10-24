@@ -4,6 +4,7 @@ import {
   AuthWorkReadScope,
   AuthWorkWriteScope,
   ProjectId,
+  RunId,
   ThreadId,
 } from "@t3tools/contracts";
 import {
@@ -14,9 +15,14 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import type { WorkActor } from "./authority.ts";
 import { WorkRateLimited, WorkUnauthenticated, type WorkDomainError } from "./errors.ts";
 import * as WorkLinkStore from "./persistence/WorkLinkStore.ts";
@@ -35,6 +41,7 @@ import {
   threadShell,
 } from "./testkit/fakes.ts";
 import * as WorkService from "./WorkService.ts";
+import * as WorkSyncReactor from "./sync/WorkSyncReactor.ts";
 
 const alpha = ProjectId.make("project-alpha");
 const beta = ProjectId.make("project-beta");
@@ -1053,5 +1060,147 @@ describe("WorkService links", () => {
       // A project without sources is nothing to retire.
       yield* work.retireProject(ProjectId.make("project-empty"));
     }).pipe(Effect.provide(harness.layer));
+  });
+});
+
+describe("WorkService links for other modules", () => {
+  it.effect("links a thread with its origin under the item's canonical ref, once", () => {
+    const jira = fakeAdapter("jira", { mintId: (n) => `ONE-${n}` });
+    const harness = seeded(jira.adapter);
+    const thread = ThreadId.make("thread-factory");
+    harness.threads.set(thread, threadShell(thread, alpha));
+    return Effect.gen(function* () {
+      const work = yield* WorkService.WorkService;
+      const source = yield* work.saveSource(owner, {
+        projectId: alpha,
+        label: "ONE",
+        config: jiraConfig("ONE"),
+        apiToken: "token",
+      });
+      const item = yield* work.createItem(owner, { sourceId: source.sourceId, title: "Ship it" });
+      assert.strictEqual(item.ref.itemId, "ONE-1");
+      // The caller reads the item before it starts the thread, as Factory does.
+      yield* work.getItem(reader, { ref: item.ref });
+
+      // Another spelling of the item, then a retry: one link, keyed on Work's spelling.
+      const spelled = { sourceId: item.ref.sourceId, itemId: WorkItemId.make("one-1") };
+      yield* work.linkThread({ ref: spelled, threadId: thread, origin: "factory" });
+      // The snapshot came from the read the caller had just made.
+      assert.strictEqual(jira.count("get:ONE-1"), 1);
+      yield* work.linkThread({ ref: item.ref, threadId: thread, origin: "factory" });
+
+      const { links } = yield* work.listLinks(owner, { threadId: thread });
+      assert.deepStrictEqual(
+        links.map((link) => [link.ref, link.source, link.origin, link.snapshot, link.run]),
+        [
+          [
+            item.ref,
+            "started",
+            "factory",
+            {
+              key: item.key,
+              title: "Ship it",
+              status: "todo",
+              url: null,
+              revision: item.revision,
+              autoStarted: false,
+            },
+            null,
+          ],
+        ],
+      );
+      assert.deepStrictEqual((yield* work.listLinks(owner, { ref: spelled })).links, links);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("links a thread only once it exists or while its launch holds a reservation", () => {
+    const markdown = fakeAdapter("markdown");
+    const harness = seeded(markdown.adapter);
+    const launching = ThreadId.make("thread-launching");
+    const deleted = ThreadId.make("thread-deleted");
+    harness.threads.set(
+      deleted,
+      threadShell(deleted, alpha, { deletedAt: DateTime.makeUnsafe(at) }),
+    );
+    return Effect.gen(function* () {
+      const work = yield* WorkService.WorkService;
+      const source = yield* work.saveSource(owner, {
+        projectId: alpha,
+        label: "Tasks",
+        config: markdownConfig("tasks"),
+      });
+      const { ref } = yield* work.createItem(owner, { sourceId: source.sourceId, title: "Ship" });
+      const link = (threadId: ThreadId) => work.linkThread({ ref, threadId, origin: "factory" });
+
+      // Nothing holds either: the sweep would drop such a link as a launch that died.
+      assert.strictEqual(yield* failureOf(link(launching)), "WorkInvalid");
+      assert.strictEqual(yield* failureOf(link(deleted)), "WorkInvalid");
+      assert.deepStrictEqual((yield* work.listLinks(owner, { ref })).links, []);
+
+      const launch = yield* Scope.make();
+      yield* work.reserveLaunch(launching).pipe(Scope.provide(launch));
+      yield* link(launching);
+      yield* Scope.close(launch, Exit.void);
+      assert.deepStrictEqual(
+        (yield* work.listLinks(owner, { ref })).links.map((row) => [row.threadId, row.origin]),
+        [[launching, "factory"]],
+      );
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("keeps a Factory link through the sweep and records its run's end", () => {
+    const markdown = fakeAdapter("markdown");
+    const harness = seeded(markdown.adapter);
+    const factory = ThreadId.make("thread-factory");
+    const manual = ThreadId.make("thread-manual");
+    harness.threads.set(factory, threadShell(factory, alpha));
+    harness.threads.set(manual, threadShell(manual, alpha));
+    // The sweep alone; its event tails are never started.
+    const layer = WorkSyncReactor.layer.pipe(
+      Layer.provide(Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({})),
+      Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({})),
+      Layer.provideMerge(harness.layer),
+    );
+    return Effect.gen(function* () {
+      const work = yield* WorkService.WorkService;
+      const reactor = yield* WorkSyncReactor.WorkSyncReactor;
+      const source = yield* work.saveSource(owner, {
+        projectId: alpha,
+        label: "Tasks",
+        config: markdownConfig("tasks"),
+      });
+      const { ref } = yield* work.createItem(owner, { sourceId: source.sourceId, title: "Ship" });
+      yield* work.linkThread({ ref, threadId: factory, origin: "factory" });
+      yield* work.setLink(owner, { ref, threadId: manual, action: "link" });
+      const links = work
+        .listLinks(owner, { ref })
+        .pipe(
+          Effect.map(({ links }) =>
+            links.map((link) => [link.threadId, link.origin ?? null, link.run]).sort(),
+          ),
+        );
+
+      // The same sweep drops the link whose thread went away.
+      harness.threads.set(
+        manual,
+        threadShell(manual, alpha, { deletedAt: DateTime.makeUnsafe(at) }),
+      );
+      yield* reactor.sweepLinks;
+      yield* reactor.drain;
+      assert.deepStrictEqual(yield* links, [[factory, "factory", null]]);
+
+      // The Factory thread's run ended while nothing was listening.
+      const runId = RunId.make("run-1");
+      harness.threads.set(
+        factory,
+        threadShell(factory, alpha, { activeRunId: null, latestRunId: runId }),
+      );
+      harness.runs.set(factory, [
+        { id: runId, status: "completed", completedAt: DateTime.makeUnsafe(at) },
+      ]);
+      yield* reactor.sweepLinks;
+      yield* reactor.drain;
+      assert.deepStrictEqual(yield* links, [[factory, "factory", { status: "completed", at }]]);
+    }).pipe(Effect.provide(layer));
   });
 });

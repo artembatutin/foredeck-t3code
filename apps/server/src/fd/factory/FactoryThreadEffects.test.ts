@@ -185,6 +185,8 @@ const fakes = (world: World) =>
     }),
     Layer.mock(WorkService.WorkService)({
       getItem: () => Effect.succeed(item as unknown as WorkItemDetail),
+      // FactoryWorkLink.test.ts covers the link on the real Work service.
+      linkThread: () => Effect.void,
     }),
   );
 
