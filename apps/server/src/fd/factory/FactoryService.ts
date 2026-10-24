@@ -9,11 +9,13 @@ import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import type * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import type * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import type * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
@@ -25,9 +27,11 @@ import {
 } from "../work-management/index.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
-import { FactoryProjectMissingError } from "./FactoryThreadEffects.ts";
+import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import { type FactoryBranchUnavailableError, freshBranchName } from "./git/freshBranch.ts";
+import { readSettle } from "./git/settleCheck.ts";
+import { readWorktreeState } from "./git/worktreeState.ts";
 import { FactoryStoreError } from "./persistence/errors.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
@@ -35,6 +39,7 @@ import {
   acceptedReview,
   type FactoryAcceptedReview,
   type FactoryEvent,
+  type FactoryResumeCheck,
   isTerminal,
   queuedDeliveryState,
   runsStages,
@@ -134,6 +139,16 @@ export class FactoryStopRefusedError extends Schema.TaggedError<FactoryStopRefus
   }
 }
 
+/** Only a stopping, stopped or blocked delivery can resume; nothing changed. */
+export class FactoryResumeRefusedError extends Schema.TaggedError<FactoryResumeRefusedError>()(
+  "FactoryResumeRefusedError",
+  { deliveryId: FactoryDeliveryId, status: FactoryDeliveryStatus },
+) {
+  override get message(): string {
+    return `Factory delivery ${this.deliveryId} is ${this.status}; only a stopping, stopped or blocked delivery can resume.`;
+  }
+}
+
 /** A done or cancelled delivery cannot be cancelled; nothing changed. */
 export class FactoryCancelRefusedError extends Schema.TaggedError<FactoryCancelRefusedError>()(
   "FactoryCancelRefusedError",
@@ -150,7 +165,7 @@ type FactoryStartError =
   | FactorySettings.FactorySettingsStorageError
   | FactorySettings.FactoryVerifyCommandMissingError
   | ProjectStore.ProjectStoreV2Error
-  | FactoryProjectMissingError
+  | FactoryThreadEffects.FactoryProjectMissingError
   | ThreadLaunch.ThreadLaunchBaseRefError
   | FactoryBranchUnavailableError
   | FactoryDeliveryIdError
@@ -193,6 +208,27 @@ export class FactoryService extends Context.Service<
     ) => Effect.Effect<
       FactoryDeliveryStore.StoredFactoryDelivery,
       FactoryStopRefusedError | FactoryDeliveryNotFoundError | FactoryStoreError
+    >;
+    /**
+     * Resumes a delivery, like Looper's `--finish`. A stopping one runs on as if never stopped,
+     * awaiting what it awaited. A stopped or blocked one has its branch and threads read again
+     * under its lock and picks up from its checkpoint (see `advance`): a settled branch is
+     * verified again for a fresh receipt and then reviewed, without a new author turn; on the
+     * commit its task was approved for, a delivery stopped at or blocked in the PR stage opens its
+     * pull request at once. A branch that does not settle gets one fix-commit turn naming the
+     * checkpoint, or blocks when it cannot be repaired; a deleted thread of the delivery blocks it
+     * again; a delivery whose author never launched launches it. A resume grants a fresh retry
+     * allowance (owner decision): repair rounds and failure fingerprints start over, its limits
+     * do not. Refused, with nothing changed, in any other status.
+     */
+    readonly resume: (
+      deliveryId: FactoryDeliveryId,
+    ) => Effect.Effect<
+      FactoryDeliveryStore.StoredFactoryDelivery,
+      | FactoryResumeRefusedError
+      | FactoryDeliveryNotFoundError
+      | FactoryStoreError
+      | ProjectionStore.ProjectionStoreV2Error
     >;
     /**
      * Cancels a delivery that is not done or cancelled. It ends at once and issues nothing more,
@@ -240,8 +276,9 @@ const make = Effect.gen(function* () {
   const tasks = yield* FactoryTaskStore.FactoryTaskStore;
   const worker = yield* FactoryWorker.FactoryWorker;
   const reviews = yield* FactoryReview.FactoryReview;
+  const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
   const crypto = yield* Crypto.Crypto;
-  const gitContext = yield* Effect.context<GitVcsDriver.GitVcsDriver>();
+  const gitContext = yield* Effect.context<FileSystem.FileSystem | GitVcsDriver.GitVcsDriver>();
   // Starts of one item, by its canonical spelling. One server owns a T3 home, so an in-process
   // lock is enough, as for Work's thread starts.
   const itemLocks = yield* KeyedLock.make<string>();
@@ -254,7 +291,9 @@ const make = Effect.gen(function* () {
       const { projectId } = (yield* work.resolveSource(itemRef.sourceId)).stored;
       const { limits } = yield* settings.requireDeliverySettings(projectId);
       const project = Option.getOrUndefined(yield* projects.get(projectId));
-      if (project === undefined) return yield* new FactoryProjectMissingError({ projectId });
+      if (project === undefined) {
+        return yield* new FactoryThreadEffects.FactoryProjectMissingError({ projectId });
+      }
       const item = yield* work.getItem(itemReader, { ref: itemRef });
 
       // From reading the item's earlier deliveries to storing this one, no other start of the
@@ -384,6 +423,63 @@ const make = Effect.gen(function* () {
     },
   );
 
+  /**
+   * What a resume of a stopped or blocked delivery finds: which of its threads are gone and, once
+   * its author has launched, its branch, HEAD and the commit its task was approved for.
+   */
+  const resumeCheck = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
+    Effect.gen(function* () {
+      const { deliveryId, state } = delivery;
+      const recorded = [...new Set(Object.values(state.threads))].filter(
+        (threadId): threadId is ThreadId => threadId !== undefined,
+      );
+      const deletedThreads = yield* Effect.filter(recorded, threads.threadDeleted);
+      if (state.threads.author === undefined) {
+        return { deletedThreads, worktree: null } satisfies FactoryResumeCheck;
+      }
+      const settle = yield* readSettle(state).pipe(Effect.provideContext(gitContext));
+      // A worktree that cannot be read does not settle, and is never the approved commit.
+      const commit =
+        state.worktreePath === null
+          ? null
+          : yield* readWorktreeState(state.worktreePath).pipe(
+              Effect.map(({ headSha, tree }) => ({ headSha, tree })),
+              Effect.catchTags({
+                FactoryWorktreeMissingError: () => Effect.succeed(null),
+                FactoryBranchReadError: () => Effect.succeed(null),
+              }),
+              Effect.provideContext(gitContext),
+            );
+      const stored = yield* tasks.listByDelivery(deliveryId);
+      const approvedSha = stored.length === 1 ? (stored[0]?.lastReviewedSha ?? null) : null;
+      return {
+        deletedThreads,
+        worktree: { settle, commit, approvedSha },
+      } satisfies FactoryResumeCheck;
+    });
+
+  // Decided under the delivery's lock, like stop and cancel: the worktree is read and judged with
+  // no run end or effect result landing in between.
+  const resume: FactoryService["Service"]["resume"] = Effect.fn("FactoryService.resume")(
+    function* (deliveryId) {
+      const stepped = yield* worker.stepWith(deliveryId, (current) =>
+        Effect.gen(function* () {
+          const { status } = current.state;
+          if (status === "stopping") {
+            return { event: { type: "resume", check: null } as const, value: undefined };
+          }
+          if (status !== "stopped" && status !== "blocked") {
+            return yield* new FactoryResumeRefusedError({ deliveryId, status });
+          }
+          const check = yield* resumeCheck(current);
+          return { event: { type: "resume", check } as const, value: undefined };
+        }),
+      );
+      if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
+      return stepped.value.delivery;
+    },
+  );
+
   const cancel: FactoryService["Service"]["cancel"] = Effect.fn("FactoryService.cancel")(
     function* (deliveryId) {
       const stepped = yield* worker.stepWith(deliveryId, ({ state }) =>
@@ -396,7 +492,7 @@ const make = Effect.gen(function* () {
     },
   );
 
-  return FactoryService.of({ start, get: deliveries.get, stop, cancel, submitReview });
+  return FactoryService.of({ start, get: deliveries.get, stop, resume, cancel, submitReview });
 });
 
 export const layer = Layer.effect(FactoryService, make);

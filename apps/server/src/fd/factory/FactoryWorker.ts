@@ -20,8 +20,7 @@ import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
-import { readBranchFacts } from "./git/branchFacts.ts";
-import { evaluateSettle } from "./git/settle.ts";
+import { readSettle } from "./git/settleCheck.ts";
 import { FactoryStoreError } from "./persistence/errors.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
@@ -154,12 +153,6 @@ const failureDetail = (effect: FactoryEffect, cause: Cause.Cause<unknown>) => {
   return `Factory could not ${describeEffect(effect)} (${kind}).`;
 };
 
-/** A branch that cannot be read never settles; the problem names only the path and operation. */
-const unreadable = (problem: string): FactorySettleResult => ({
-  status: "unrepairable",
-  problems: [problem],
-});
-
 /** How an attempt ends when its delivery stops running in `state`. */
 const outcomeOf = (state: FactoryDeliveryState): FactoryStageRunStore.FactoryStageOutcome => {
   if (state.status === "blocked") {
@@ -236,28 +229,8 @@ const make = Effect.gen(function* () {
   // must not wait for them.
   yield* Effect.addFinalizer(() => TxRef.set(outstanding, 0));
 
-  const checkSettle = (state: FactoryDeliveryState): Effect.Effect<FactorySettleResult> => {
-    const { worktreePath, baseline } = state;
-    if (worktreePath === null || baseline === null) {
-      return Effect.succeed(unreadable("The delivery has no recorded worktree and baseline."));
-    }
-    return readBranchFacts({ worktreePath, baselineSha: baseline }).pipe(
-      Effect.map((facts): FactorySettleResult => {
-        const evaluation = evaluateSettle(facts, state.branch);
-        return evaluation.status === "settled"
-          ? evaluation
-          : {
-              status: evaluation.status,
-              problems: evaluation.problems.map((problem) => problem.description),
-            };
-      }),
-      Effect.catchTags({
-        FactoryWorktreeMissingError: (error) => Effect.succeed(unreadable(error.message)),
-        FactoryBranchReadError: (error) => Effect.succeed(unreadable(error.message)),
-      }),
-      Effect.provideContext(gitContext),
-    );
-  };
+  const checkSettle = (state: FactoryDeliveryState): Effect.Effect<FactorySettleResult> =>
+    readSettle(state).pipe(Effect.provideContext(gitContext));
 
   const runCommand = (
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,
@@ -369,8 +342,9 @@ const make = Effect.gen(function* () {
    * Records the stage attempts a step implies. Leaving a stage finishes its active attempt:
    * failed when the delivery left it for a repair round, passed when it advanced otherwise, and
    * by how it stopped proceeding when it did. Entering one appends the next attempt, and the
-   * attempt carries the run the delivery now awaits. An approved delivery still proceeds: its PR
-   * attempt ends when the pull request is open or the delivery blocks.
+   * attempt carries the run the delivery now awaits; a resumed delivery enters its stage again,
+   * since the attempt it stopped or blocked in has ended. An approved delivery still proceeds:
+   * its PR attempt ends when the pull request is open or the delivery blocks.
    */
   const recordAttempts = Effect.fn("FactoryWorker.recordAttempts")(function* (
     deliveryId: FactoryDeliveryId,
@@ -380,6 +354,7 @@ const make = Effect.gen(function* () {
   ) {
     const stopped = !isProceeding(after);
     const advanced = after.stage !== before.stage;
+    const entered = advanced || (!isProceeding(before) && !stopped);
     let active = (yield* stageRuns.listByDelivery(deliveryId)).findLast(
       (run) => run.outcome === null && run.stage === before.stage,
     );
@@ -400,7 +375,7 @@ const make = Effect.gen(function* () {
       });
       active = undefined;
     }
-    if (after.stage !== null && advanced) {
+    if (after.stage !== null && entered) {
       active = yield* stageRuns.append({ deliveryId, stage: after.stage });
       if (stopped) {
         yield* stageRuns.finish({ ...attemptOf(active), outcome: outcomeOf(after) });

@@ -54,11 +54,15 @@ export type FactoryEffectRequest =
       readonly role: FactoryRole;
       readonly workspace: FactoryWorkspace;
     }
-  /** One mechanical `fix-commit` follow-up turn asking the thread to repair these problems. */
+  /**
+   * One mechanical `fix-commit` follow-up turn asking the thread to repair these problems. A
+   * resume's turn names the checkpoint the delivery resumes from.
+   */
   | {
       readonly type: "send_fix_commit_turn";
       readonly threadId: ThreadId;
       readonly problems: ReadonlyArray<string>;
+      readonly checkpoint?: FactoryStageName;
     }
   /** Read the branch after this run and evaluate the settle rules. */
   | { readonly type: "check_settle"; readonly threadId: ThreadId; readonly runId: RunId }
@@ -242,6 +246,23 @@ export interface FactoryOpenedPullRequest {
 }
 
 /**
+ * What a resume of a stopped or blocked delivery found, read under the delivery's lock right
+ * before the engine decides where it picks up.
+ */
+export interface FactoryResumeCheck {
+  /** Threads the delivery recorded that have been deleted since. */
+  readonly deletedThreads: ReadonlyArray<ThreadId>;
+  /** The worktree once the author has launched; null before. */
+  readonly worktree: {
+    readonly settle: FactorySettleResult;
+    /** HEAD and its tree; null when they could not be read. */
+    readonly commit: FactoryCommit | null;
+    /** The commit the delivery's task was last approved for (its `lastReviewedSha`). */
+    readonly approvedSha: string | null;
+  } | null;
+}
+
+/**
  * What the engine folds in. The worker's results name the effect they answer by `effectId`;
  * the reactor's run and thread events name the thread and run they observed.
  */
@@ -252,6 +273,11 @@ export type FactoryEvent =
    * work of its stage and stops where it would begin the next one.
    */
   | { readonly type: "stop" }
+  /**
+   * The owner's resume: a stopping delivery runs on (`check` is null, nothing was read); a stopped
+   * or blocked one picks up from its checkpoint with what `check` found.
+   */
+  | { readonly type: "resume"; readonly check: FactoryResumeCheck | null }
   /** The owner's cancel: the delivery ends, whatever it awaits. */
   | { readonly type: "cancel" }
   /**
@@ -391,7 +417,7 @@ export interface FactoryDeliveryState {
   /** The latest thread of each role. */
   readonly threads: Partial<Readonly<Record<FactoryRole, ThreadId>>>;
   readonly awaiting: FactoryAwaiting | null;
-  /** Fix-commit turns spent on the current task's settle problems. */
+  /** Fix-commit turns spent on the current task's settle problems since it started or resumed. */
   readonly fixCommitTurns: number;
   /** Effects issued so far; the next effect's id is one more. */
   readonly effectsIssued: number;
@@ -406,9 +432,15 @@ export interface FactoryDeliveryState {
   readonly limits: FactoryRoundLimits;
   /** The task's risk; a single item's is normal. Turns of a high-risk task escalate effort. */
   readonly risk: FactoryTaskRisk;
-  /** Repair rounds spent on the current task: fix-verify turns (`fix`), fix-review turns (`review`). */
+  /**
+   * Repair rounds spent on the current task since it started or resumed: fix-verify turns
+   * (`fix`), fix-review turns (`review`).
+   */
   readonly rounds: { readonly fix: number; readonly review: number };
-  /** Failure fingerprints of the current task's failed verifies and blocking reviews, oldest first. */
+  /**
+   * Failure fingerprints of the current task's failed verifies and blocking reviews since it
+   * started or resumed, oldest first.
+   */
   readonly fingerprints: ReadonlyArray<string>;
   /** The author's latest fix-review run; the next review round reads its reply as claims. */
   readonly reviewResponse: { readonly threadId: ThreadId; readonly runId: RunId } | null;
@@ -417,8 +449,9 @@ export interface FactoryDeliveryState {
   /** Set while the delivery is blocked. */
   readonly block: FactoryBlock | null;
   /**
-   * Set while the delivery is stopped: the stage it would have begun when it stopped, where a
-   * resume picks up. Null for deliveries a server stopped before checkpoints were recorded.
+   * Set while the delivery is stopped, and kept when a resume blocks it before it moved on: the
+   * stage it would have begun when it stopped, where a resume picks up. Null for deliveries a
+   * server stopped before checkpoints were recorded.
    */
   readonly checkpoint: FactoryStageName | null;
 }

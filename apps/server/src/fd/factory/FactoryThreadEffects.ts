@@ -136,9 +136,10 @@ interface FactoryThreadEffectFailure {
 
 /**
  * Carries out the thread effects for `FactoryWorker`: launching a role's thread and sending a
- * follow-up turn on a thread, and interrupting the runs of a cancelled delivery. Each receives
- * the delivery as stored with the effect. The worker feeds what they report back as
- * `thread.launched` / `turn.started`, and a failure as `effect.failed`. Checks run before
+ * follow-up turn on a thread, and interrupting the runs of a cancelled delivery; a resume reads
+ * here whether the delivery's threads still exist. Each effect receives the delivery as stored
+ * with it. The worker feeds what they report back as `thread.launched` / `turn.started`, and a
+ * failure as `effect.failed`. Checks run before
  * anything is dispatched, so a refused launch leaves no thread behind; a read that fails after the
  * launch still fails the effect, and the delivery records none of its result.
  */
@@ -180,6 +181,10 @@ export class FactoryThreadEffects extends Context.Service<
       delivery: StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "send_review_follow_up_turn" }>,
     ) => Effect.Effect<{ readonly runId: RunId }, FactoryThreadEffectFailure>;
+    /** Whether the thread has been deleted, or has no record at all. */
+    readonly threadDeleted: (
+      threadId: ThreadId,
+    ) => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
     /** The run's status once it has ended; none while it has not. */
     readonly runEnded: (
       threadId: ThreadId,
@@ -565,6 +570,7 @@ const make = Effect.gen(function* () {
           problems: effect.problems,
           branch: delivery.state.branch,
           baseline: delivery.state.baseline,
+          checkpoint: effect.checkpoint ?? null,
         }),
       ),
     sendReviewRetryTurn: (delivery, effect) =>
@@ -586,6 +592,11 @@ const make = Effect.gen(function* () {
         const selection = yield* turnSelection(delivery, effect.threadId, effect.round);
         return yield* sendTurn(delivery, effect, "review-follow-up", text, selection);
       }),
+    threadDeleted: (threadId) =>
+      projections.getThreadRecords(threadId, []).pipe(
+        Effect.map(({ thread }) => thread.deletedAt !== null),
+        Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed(true) }),
+      ),
     runEnded: (threadId, runId) =>
       readThreadRun(threadId, runId).pipe(
         Effect.map(({ status }) =>

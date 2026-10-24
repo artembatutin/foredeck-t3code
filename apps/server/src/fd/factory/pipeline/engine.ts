@@ -19,6 +19,7 @@ import type {
   FactoryEffect,
   FactoryEvent,
   FactoryRepairedStage,
+  FactoryResumeCheck,
   FactoryReviewJudgment,
 } from "./state.ts";
 import { stageHandler } from "./stages/registry.ts";
@@ -124,6 +125,89 @@ const repair = (
   );
 };
 
+/**
+ * A resumed delivery's fresh retry allowance (owner decision): repair rounds, fix-commit turns
+ * and failure fingerprints start over, and its limits stay. Receipts, reviews and approvals stay
+ * as its history; none is taken for the commit the resume finds.
+ */
+const resumed = (delivery: FactoryDeliveryState): FactoryDeliveryState => ({
+  ...delivery,
+  status: "running",
+  block: null,
+  checkpoint: null,
+  fixCommitTurns: 0,
+  rounds: { fix: 0, review: 0 },
+  fingerprints: [],
+});
+
+type FactoryResumedWorktree = NonNullable<FactoryResumeCheck["worktree"]>;
+
+/**
+ * Whether the worktree holds the commit the delivery's task was approved for: HEAD and its tree
+ * are the last receipt's, which passed, and the round's accepted review passed it.
+ */
+const holdsApprovedCommit = (
+  delivery: FactoryDeliveryState,
+  { commit, approvedSha }: FactoryResumedWorktree,
+) => {
+  const receipt = delivery.receipts.at(-1);
+  const review = acceptedReview(delivery);
+  return (
+    commit !== null &&
+    receipt !== undefined &&
+    !receiptFailed(receipt) &&
+    review !== undefined &&
+    !review.summary.blocking &&
+    approvedSha === commit.headSha &&
+    receipt.headSha === commit.headSha &&
+    receipt.tree === commit.tree
+  );
+};
+
+/**
+ * Picks a stopped or blocked delivery up from its checkpoint, the stage it stopped before or the
+ * one it blocked in, like Looper's `--finish`. A deleted thread of the delivery blocks it again,
+ * and so does a branch that cannot be repaired. A settled branch is verified again, never trusting
+ * an earlier receipt, then reviewed; only a delivery resuming the PR stage on the very commit its
+ * task was approved for opens its pull request at once. A branch with repairable problems gets one
+ * fix-commit turn naming the checkpoint, and is settled after it as after any author turn. Without
+ * an author yet, the author launches as `start` launches it.
+ */
+const resume = (delivery: FactoryDeliveryState, check: FactoryResumeCheck): FactoryAdvance => {
+  const { author } = delivery.threads;
+  const deleted =
+    author !== undefined && check.deletedThreads.includes(author)
+      ? author
+      : check.deletedThreads[0];
+  if (deleted !== undefined) {
+    return blocked(delivery, { reason: "thread_deleted", threadId: deleted });
+  }
+  if (author === undefined) return begin(resumed(delivery), standardStages.author);
+  const { worktree } = check;
+  // The worktree is read whenever the author has launched; without it there is nothing to judge.
+  if (worktree === null) return unchanged(delivery);
+  const { settle } = worktree;
+  if (settle.status === "unrepairable") {
+    return blocked(delivery, { reason: "unsettled", problems: settle.problems });
+  }
+  const checkpoint = delivery.checkpoint ?? delivery.stage;
+  if (settle.status === "repairable") {
+    // The turn counts as the one fix-commit turn: a branch it leaves unsettled blocks.
+    return issue(
+      { ...resumed(delivery), stage: "repair", fixCommitTurns: FIX_COMMIT_TURNS },
+      {
+        type: "send_fix_commit_turn",
+        threadId: author,
+        problems: settle.problems,
+        ...(checkpoint === null ? {} : { checkpoint }),
+      },
+    );
+  }
+  return checkpoint === "pr" && holdsApprovedCommit(delivery, worktree)
+    ? begin({ ...resumed(delivery), status: "approved" }, standardStages.pr)
+    : begin(resumed(delivery), standardStages.verify);
+};
+
 /** Acts on the round's accepted review once its run has completed. */
 const concludeReview = (delivery: FactoryDeliveryState, review: FactoryAcceptedReview) =>
   review.summary.blocking
@@ -209,7 +293,8 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * its fix-commit turn, the fallback review read, review submissions and their retry) and blocks on
  * a failure as a running one would; where it would begin verify, a review round, a repair round,
  * record or the PR stage, it is `stopped` instead. A cancelled delivery awaits nothing, so no later
- * event moves it.
+ * event moves it. Resume undoes a stop that has not yet taken effect, and picks a stopped or
+ * blocked delivery up from its checkpoint (see `resume`).
  */
 export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
   switch (event.type) {
@@ -221,6 +306,13 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       // Stopping already, the stop changes nothing; only a running delivery stops after its step.
       return delivery.status === "running"
         ? step({ ...delivery, status: "stopping" })
+        : unchanged(delivery);
+    case "resume":
+      // Stopping, the delivery runs on: what it awaits is still coming, so nothing is issued.
+      if (delivery.status === "stopping") return step({ ...delivery, status: "running" });
+      return (delivery.status === "stopped" || delivery.status === "blocked") &&
+        event.check !== null
+        ? resume(delivery, event.check)
         : unchanged(delivery);
     case "cancel":
       return isTerminal(delivery)

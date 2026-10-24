@@ -116,7 +116,8 @@ baseline alone; settle checks keep judging the author's commits after it. See
 [`FactoryReview.ts`](../../apps/server/src/fd/factory/FactoryReview.ts).
 
 Deliveries a Phase 1 server stopped at their verified checkpoint load without review fields or a
-recorded checkpoint and stay `stopped` at `verify`; nothing moves them on its own.
+recorded checkpoint and stay `stopped` at `verify`; nothing moves them on its own, and a resume
+verifies them again.
 
 ## One accepted review per round, acted on when the run ends
 
@@ -184,6 +185,27 @@ branch and commits stay, and a new delivery of the item works on a branch of its
 Both actions check the status and step under the delivery's lock, like a review submission. The
 boot sweep keys on what a delivery awaits, not on its status: a stopping delivery whose run ended
 while no server ran stops where the run's end leads it, as the live tail would have taken it there.
+
+## Resume trusts only what it reads again
+
+Resume is Looper's `--finish`. A `stopping` delivery just runs on. A stopped or blocked one is
+judged under its step lock from what the resume reads at that moment: whether its threads still
+exist, the settle check of its branch, HEAD and its tree, and its task's approval. A settled branch
+is verified again even when the last receipt names the same commit, because a stop or block can
+last any time and the command, settings or machine may have changed since; review follows by the
+usual round rules, and the author gets no new turn. Only a delivery resuming the PR stage on
+exactly its approved commit (the task's `lastReviewedSha`, with the last receipt's tree, on a
+settled branch) opens its pull request without that. Any other unsettled branch gets one
+fix-commit turn naming the checkpoint, an unrepairable one blocks, and a deleted thread of the
+delivery blocks it again: a resume never launches a replacement for a thread the delivery recorded.
+A resume that blocks keeps the checkpoint, so the next one still knows it stopped before `pr`.
+
+By owner decision an explicit resume grants a fresh retry allowance: repair rounds, the fix-commit
+turn and failure fingerprints start over, while the limits the delivery started with stay, and so
+do its receipts, reviews, stage attempts and approval. The resumed stage gets a new attempt even
+when its name has not changed: the reactor routes a run's end only to a thread's active attempt,
+and the attempt the delivery stopped or blocked in has ended (see `recordAttempts` in
+[`FactoryWorker.ts`](../../apps/server/src/fd/factory/FactoryWorker.ts)).
 
 ## The PR stage opens only the approved commit
 

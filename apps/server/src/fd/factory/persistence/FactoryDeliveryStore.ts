@@ -66,6 +66,8 @@ const StoredEffect = Schema.Union([
     type: Schema.Literal("send_fix_commit_turn"),
     threadId: ThreadId,
     problems: Problems,
+    // Added with resume: only a resume's turn names a checkpoint.
+    checkpoint: Schema.optionalKey(FactoryStageName),
   }),
   Schema.Struct({
     id: PositiveInt,
@@ -196,7 +198,8 @@ const StoredDeliveryState = Schema.Struct({
   ).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   block: Schema.NullOr(StoredBlock),
   // Added with stop after step: rows stored before it name no checkpoint, even when stopped. The
-  // stop request is the `stopping` status, which every stored row could already hold.
+  // stop request is the `stopping` status, which every stored row could already hold. A blocked
+  // row may name one too, when a resume blocked it before it moved on.
   checkpoint: Schema.NullOr(FactoryStageName).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
