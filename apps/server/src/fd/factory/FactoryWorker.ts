@@ -15,6 +15,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as TxRef from "effect/TxRef";
 
 import type * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
+import * as FactoryChanges from "./FactoryChanges.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
@@ -56,7 +57,8 @@ class FactoryStageCommandError extends Schema.TaggedError<FactoryStageCommandErr
  * stores the new state with its stage attempts, then queues the effects the engine returned;
  * each effect's result (or failure) is fed back as the delivery's next step. A step that moves
  * the delivery into a status its item announces records that Work comment with the new state and
- * then queues it.
+ * then queues it. Each step that stores something moves the deliveries' change epoch once it has
+ * committed.
  */
 export class FactoryWorker extends Context.Service<
   FactoryWorker,
@@ -227,6 +229,7 @@ const make = Effect.gen(function* () {
   const pullRequests = yield* FactoryPullRequest.FactoryPullRequest;
   const commentStore = yield* FactoryWorkCommentStore.FactoryWorkCommentStore;
   const poster = yield* FactoryWorkComments.FactoryWorkComments;
+  const changes = yield* FactoryChanges.FactoryChanges;
   const gitContext = yield* Effect.context<FileSystem.FileSystem | GitVcsDriver.GitVcsDriver>();
   const scope = yield* Effect.scope;
   const locks = yield* KeyedLock.make<FactoryDeliveryId>();
@@ -469,6 +472,7 @@ const make = Effect.gen(function* () {
             ),
       ),
       sql.withTransaction,
+      (transaction) => changes.afterCommit(transaction, Option.isSome),
       Effect.catchTags({
         SqlError: (cause) =>
           Effect.fail(new FactoryStoreError({ operation: "worker.step", cause })),
@@ -674,4 +678,7 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(FactoryWorker, make);
+/** The worker, with the change epoch its steps move; the service shares that one epoch. */
+export const layer = Layer.effect(FactoryWorker, make).pipe(
+  Layer.provideMerge(FactoryChanges.layer),
+);

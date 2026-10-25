@@ -39,6 +39,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import type * as RpcClient from "effect/rpc/RpcClient";
 import type * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcTest from "effect/rpc/RpcTest";
@@ -596,6 +597,8 @@ describe("Factory RPC authorization", () => {
                 [FACTORY_WS_METHODS.factoryDeliveriesCancel]: reached("cancel"),
                 [FACTORY_WS_METHODS.factoryDeliveriesGet]: reached("get"),
                 [FACTORY_WS_METHODS.factoryDeliveriesList]: reached("list"),
+                [FACTORY_WS_METHODS.factoryDeliveriesSubscribe]: () =>
+                  Stream.fromEffect(reached("subscribe")()),
               }),
             ),
             RpcAuthorization.layer(
@@ -657,6 +660,12 @@ describe("Factory RPC authorization", () => {
       name: "list without orchestration:read",
       missing: AuthOrchestrationReadScope,
       call: (client: FactoryClient) => client[FACTORY_WS_METHODS.factoryDeliveriesList]({}),
+    },
+    {
+      name: "subscribe without orchestration:read",
+      missing: AuthOrchestrationReadScope,
+      call: (client: FactoryClient) =>
+        client[FACTORY_WS_METHODS.factoryDeliveriesSubscribe]({}).pipe(Stream.runHead),
     },
   ])("refuses $name before the handler runs", ({ missing, call }) =>
     Effect.gen(function* () {

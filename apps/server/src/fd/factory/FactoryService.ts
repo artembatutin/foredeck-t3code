@@ -14,6 +14,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import type * as Stream from "effect/Stream";
 
 import type * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
@@ -25,6 +26,7 @@ import {
   WorkService,
   workBranchName,
 } from "../work-management/index.ts";
+import * as FactoryChanges from "./FactoryChanges.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
@@ -285,6 +287,12 @@ export class FactoryService extends Context.Service<
       { readonly deliveryId: FactoryDeliveryId; readonly review: FactoryAcceptedReview },
       FactorySubmitReviewError
     >;
+    /**
+     * The deliveries' change epoch: its value on subscribe, then each move. It moves after each
+     * delivery write commits (a start, each engine step, a stop, resume or cancel, a review
+     * submission) and never for a refusal, so a subscriber refetches what it shows on each value.
+     */
+    readonly subscribe: Stream.Stream<number>;
   }
 >()("t3/fd/factory/FactoryService") {}
 
@@ -305,6 +313,7 @@ const make = Effect.gen(function* () {
   const worker = yield* FactoryWorker.FactoryWorker;
   const reviews = yield* FactoryReview.FactoryReview;
   const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
+  const changes = yield* FactoryChanges.FactoryChanges;
   const crypto = yield* Crypto.Crypto;
   const gitContext = yield* Effect.context<FileSystem.FileSystem | GitVcsDriver.GitVcsDriver>();
   // Starts of one item, by its canonical spelling. One server owns a T3 home, so an in-process
@@ -379,6 +388,7 @@ const make = Effect.gen(function* () {
           .pipe(
             Effect.tap(() => tasks.insert({ deliveryId, taskId: SINGLE_ITEM_TASK })),
             sql.withTransaction,
+            (transaction) => changes.afterCommit(transaction),
             Effect.catchTags({
               SqlError: (cause) =>
                 Effect.fail(new FactoryStoreError({ operation: "service.start", cause })),
@@ -560,6 +570,7 @@ const make = Effect.gen(function* () {
     resume,
     cancel,
     submitReview,
+    subscribe: changes.changes,
   });
 });
 

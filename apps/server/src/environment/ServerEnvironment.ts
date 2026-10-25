@@ -21,6 +21,7 @@ import { readAgentActivityPublishingActive } from "../cloud/config.ts";
 import { resolveServerSelfUpdateCapability } from "../cloud/selfUpdate.ts";
 import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
+import { FACTORY_CAPABILITY } from "@t3tools/contracts/fd/factory";
 import { WORK_MANAGEMENT_CAPABILITY } from "@t3tools/contracts/fd/work-management";
 import * as ProcessRunner from "../processRunner.ts";
 import { resolveServerEnvironmentLabel } from "./ServerEnvironmentLabel.ts";
@@ -267,6 +268,7 @@ export const make = Effect.gen(function* () {
       ...(desktopAppUpdate ? { desktopAppUpdate: true } : {}),
       serverBrowser: true,
       workManagement: WORK_MANAGEMENT_CAPABILITY,
+      factory: FACTORY_CAPABILITY,
     },
   };
 

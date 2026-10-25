@@ -91,6 +91,7 @@ export const wsHandlers = (input: {
         Effect.map((deliveries) => ({ deliveries: deliveries.map(toFactoryDelivery) })),
         Effect.mapError(toFactoryError),
       ),
+    [FACTORY_WS_METHODS.factoryDeliveriesSubscribe]: () => factory.subscribe,
   } satisfies FactoryHandlers;
 };
 

@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 // Loaded at run time with local types: importing Node or Vite statically would put Node's
 // globals into the whole contracts typecheck, which has none on purpose.
-const [NodeFS, NodeOS, NodeURL, { parseSync }] = await Promise.all([
+const [NodeFS, NodeOS, NodeURL, { parseSync }, NodeChildProcess, NodeProcess] = await Promise.all([
   vi.importActual<{
     readonly readdirSync: (dir: URL, options: { recursive: true; encoding: "utf8" }) => string[];
     readonly readFileSync: (file: URL, encoding: "utf8") => string;
@@ -28,6 +28,18 @@ const [NodeFS, NodeOS, NodeURL, { parseSync }] = await Promise.all([
       source: string,
     ) => { readonly program: unknown; readonly errors: ReadonlyArray<unknown> };
   }>("vite-plus"),
+  vi.importActual<{
+    readonly spawnSync: (
+      command: string,
+      args: ReadonlyArray<string>,
+      options: { encoding: "utf8" },
+    ) => {
+      readonly error?: unknown;
+      readonly status: number | null;
+      readonly stderr: string;
+    };
+  }>("node:child_process"),
+  vi.importActual<{ readonly execPath: string }>("node:process"),
 ]);
 
 const contractsSource = new URL("../../", import.meta.url);
@@ -285,4 +297,30 @@ describe("factory contracts load order", () => {
     const factory = await import("./index.ts");
     expect(Object.keys(factory).filter((name) => name in root)).toEqual([]);
   });
+});
+
+/**
+ * Vitest's module runner tolerates import cycles that native ESM rejects while initializing a
+ * module, so each module is also loaded first, alone, in a fresh Node process: the root barrel,
+ * `environment.ts`, which imports the Factory entry for its capability, and the entry itself.
+ */
+describe("factory contracts native load", () => {
+  it.each(["../../index.ts", "../../environment.ts", "./index.ts"])(
+    "loads %s first in a fresh Node process",
+    (path) => {
+      const child = NodeChildProcess.spawnSync(
+        NodeProcess.execPath,
+        [
+          "--input-type=module",
+          "--eval",
+          `await import(${JSON.stringify(new URL(path, import.meta.url).href)});`,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(child.error).toBeUndefined();
+      expect(child.stderr).toBe("");
+      expect(child.status).toBe(0);
+    },
+    60_000,
+  );
 });

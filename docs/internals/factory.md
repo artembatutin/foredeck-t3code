@@ -78,12 +78,13 @@ rejects imports of Work's private files. How Work treats Factory-origin links is
 
 ## Contracts never import orchestration
 
-Factory contracts import Work's contracts entry, which core's `environment.ts` also imports. A
-Factory contract that imported `orchestrationV2.ts`, `project.ts`, `environment.ts` or the root
-barrel would close the module-load cycle described in
+Core's `environment.ts` imports the Factory contracts entry for its capability, as it imports
+Work's, which Factory contracts import too. A Factory contract that imported `orchestrationV2.ts`,
+`project.ts`, `environment.ts` or the root barrel would close the module-load cycle described in
 [Work's contracts](./work-management.md#contracts-never-import-orchestration). Factory declares its
 own literals and the server maps them;
-[`imports.test.ts`](../../packages/contracts/src/fd/factory/imports.test.ts) locks this.
+[`imports.test.ts`](../../packages/contracts/src/fd/factory/imports.test.ts) locks this, and loads
+the root barrel, `environment.ts` and the entry first in fresh Node processes for the reason below.
 
 ## Vitest hides native ESM cycles
 
@@ -94,6 +95,17 @@ another entry might import first, alone, in a fresh Node process. Core's runtime
 the first module of its cycle to load, which is why
 [`index.ts`](../../apps/server/src/fd/factory/index.ts) imports it last. Add a module to that test
 when another entry starts importing it.
+
+## Clients refetch on a change epoch
+
+Clients follow `factory.deliveries.subscribe`, an epoch like Work's refresh epoch, and refetch the
+deliveries they show on each value; the stream itself carries no delivery data. Every delivery
+write therefore runs its outermost transaction through `FactoryChanges.afterCommit`
+([`FactoryChanges.ts`](../../apps/server/src/fd/factory/FactoryChanges.ts)), which moves the epoch
+only once the write has committed, so a refetch on the new value reads it. Today the start's
+insert and the worker's step are the only writers (stop, resume, cancel and review submissions are
+steps); a new writer that bypasses `afterCommit` leaves every client stale until something else
+moves the epoch.
 
 ## The reactor tail starts at the sweep's position
 

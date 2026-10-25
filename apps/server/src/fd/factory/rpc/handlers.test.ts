@@ -11,6 +11,7 @@ import { WorkItemId, type WorkItemRef, WorkSourceId } from "@t3tools/contracts/f
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ProjectStore from "../../../orchestration-v2/ProjectStore.ts";
@@ -19,6 +20,7 @@ import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
 import * as ServerRuntimeStartup from "../../../serverRuntimeStartup.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import { type WorkDomainError, WorkService } from "../../work-management/index.ts";
+import * as FactoryChanges from "../FactoryChanges.ts";
 import * as FactoryReview from "../FactoryReview.ts";
 import * as FactoryService from "../FactoryService.ts";
 import * as FactorySettings from "../FactorySettings.ts";
@@ -67,6 +69,7 @@ describe("Factory RPC errors", () => {
       resume: () => unexpected,
       cancel: () => unexpected,
       submitReview: () => unexpected,
+      subscribe: Stream.die("not called in this test"),
       ...overrides,
     });
   const stubSettings = FactorySettings.FactorySettings.of({
@@ -308,6 +311,7 @@ describe("Factory RPC handlers over real stores", () => {
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(FactoryWorker.FactoryWorker)({}),
+        FactoryChanges.layer,
         Layer.mock(FactoryReview.FactoryReview)({}),
         Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({}),
         Layer.mock(ThreadLaunch.ThreadLaunchService)({}),

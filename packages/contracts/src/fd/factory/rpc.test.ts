@@ -47,6 +47,7 @@ describe("Factory RPC methods", () => {
       "factory.settings.get": AuthOrchestrationReadScope,
       "factory.deliveries.get": AuthOrchestrationReadScope,
       "factory.deliveries.list": AuthOrchestrationReadScope,
+      "factory.deliveries.subscribe": AuthOrchestrationReadScope,
     });
   });
 

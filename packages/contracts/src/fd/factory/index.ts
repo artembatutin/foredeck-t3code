@@ -35,4 +35,10 @@ export {
   FACTORY_CLIENT_GUARDED_RPC_SCOPES,
   FACTORY_RPC_INSTRUMENTATION,
 } from "./rpc.ts";
+export {
+  FactoryCapability,
+  FACTORY_CAPABILITY,
+  factorySupport,
+  type FactorySupport,
+} from "./capability.ts";
 export { FactoryMcpFailure } from "./mcp.ts";

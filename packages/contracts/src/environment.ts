@@ -8,6 +8,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
+import { FactoryCapability } from "./fd/factory/index.ts";
 import { WorkManagementCapability } from "./fd/work-management/index.ts";
 
 /** Wire version for orchestration snapshots, streams, commands, and RPC payloads. */
@@ -230,6 +231,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   /** Foredeck Work. Absent on servers without it; a shape this build cannot read decodes as
       absent. Read it through `workManagementSupport`, which also rejects other versions. */
   workManagement: ForwardCompatibleOptional(WorkManagementCapability),
+  /** Foredeck Factory, likewise; read it through `factorySupport`. */
+  factory: ForwardCompatibleOptional(FactoryCapability),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

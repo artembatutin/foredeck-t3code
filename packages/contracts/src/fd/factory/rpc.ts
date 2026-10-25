@@ -7,6 +7,7 @@ import {
   AuthSettingsWriteScope,
   EnvironmentAuthorizationError,
 } from "../../auth.ts";
+import { NonNegativeInt } from "../../baseSchemas.ts";
 import {
   FactoryDelivery,
   FactoryDeliveryList,
@@ -33,6 +34,7 @@ export const FACTORY_WS_METHODS = {
   factoryDeliveriesCancel: "factory.deliveries.cancel",
   factoryDeliveriesGet: "factory.deliveries.get",
   factoryDeliveriesList: "factory.deliveries.list",
+  factoryDeliveriesSubscribe: "factory.deliveries.subscribe",
 } as const;
 
 const FactoryRpcError = Schema.Union([FactoryError, EnvironmentAuthorizationError]);
@@ -79,6 +81,17 @@ const WsFactoryDeliveriesListRpc = Rpc.make(FACTORY_WS_METHODS.factoryDeliveries
   error: FactoryRpcError,
 });
 
+/**
+ * An epoch that moves after every committed delivery write, Work's refresh epoch for Factory:
+ * clients refetch the deliveries they show on each value. It carries no delivery data.
+ */
+const WsFactoryDeliveriesSubscribeRpc = Rpc.make(FACTORY_WS_METHODS.factoryDeliveriesSubscribe, {
+  payload: Schema.Struct({}),
+  success: NonNegativeInt,
+  error: EnvironmentAuthorizationError,
+  stream: true,
+});
+
 export const FactoryRpcs = [
   WsFactorySettingsGetRpc,
   WsFactorySettingsSetRpc,
@@ -88,6 +101,7 @@ export const FactoryRpcs = [
   WsFactoryDeliveriesCancelRpc,
   WsFactoryDeliveriesGetRpc,
   WsFactoryDeliveriesListRpc,
+  WsFactoryDeliveriesSubscribeRpc,
 ] as const;
 
 /** Reads, authorized server-side only; the client never guards them. */
@@ -95,6 +109,7 @@ export const FACTORY_RPC_READ_SCOPES = {
   [FACTORY_WS_METHODS.factorySettingsGet]: AuthOrchestrationReadScope,
   [FACTORY_WS_METHODS.factoryDeliveriesGet]: AuthOrchestrationReadScope,
   [FACTORY_WS_METHODS.factoryDeliveriesList]: AuthOrchestrationReadScope,
+  [FACTORY_WS_METHODS.factoryDeliveriesSubscribe]: AuthOrchestrationReadScope,
 } as const;
 
 /**
