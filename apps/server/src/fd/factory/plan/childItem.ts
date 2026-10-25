@@ -6,6 +6,8 @@ import type {
 import { WorkItemCreateInput, type WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as Schema from "effect/Schema";
 
+import { canWriteMarkdownItem } from "../../work-management/index.ts";
+
 /**
  * The line that opens an approved task's child item: the parent delivery and the task the item
  * was created for. A run that stopped after creating a child but before recording it finds the
@@ -19,7 +21,8 @@ export const childReference = (deliveryId: FactoryDeliveryId, taskId: FactoryTas
 /**
  * A line Work's Markdown source reads as a merge conflict marker, which makes it refuse the whole
  * file: a run of `<` or `=`, or of seven or more `>`, alone or before a space or tab. A shorter run
- * of `>` counts only after such `<` and `=` lines, so a Markdown quote is left as it is.
+ * of `>` counts only after such `<` and `=` lines, so a Markdown quote is left as it is. Escaping
+ * them only spares such a task a refusal: the source's own check (see `uncreatableTasks`) decides.
  */
 const CONFLICT_MARKER_LINE = /^(?:<+|=+|>{7,})(?:[ \t\r]|$)/;
 
@@ -32,12 +35,6 @@ const escapeConflictMarkers = (text: string) =>
     .split("\n")
     .map((line) => (CONFLICT_MARKER_LINE.test(line) ? `\\${line}` : line))
     .join("\n");
-
-/**
- * A line or paragraph separator, or half a surrogate pair: Markdown keeps a title on one line as
- * written, and refuses these where a Work title allows them.
- */
-const MARKDOWN_TITLE_REFUSED = /[\u0085\p{Zl}\p{Zp}\p{Cs}]/u;
 
 /** The child item's body: its reference, then the task's summary, criteria and test plan. */
 const childItemBody = (deliveryId: FactoryDeliveryId, task: FactoryPlanTask) =>
@@ -78,8 +75,9 @@ const isCreatable = Schema.is(WorkItemCreateInput);
 
 /**
  * The tasks whose child item the parent's Markdown source would refuse: a body past what a Work
- * item holds, or a title it cannot keep on one line. Nothing of a task is cut or changed to fit,
- * so approval refuses such a plan and the owner edits it.
+ * item holds, or a title or body its files cannot store as written, judged by the source's own
+ * render. Nothing of a task is cut or changed to fit, so approval refuses such a plan and the
+ * owner edits it.
  */
 export const uncreatableTasks = (
   parent: WorkItemRef,
@@ -87,9 +85,10 @@ export const uncreatableTasks = (
   tasks: ReadonlyArray<FactoryPlanTask>,
 ): ReadonlyArray<FactoryTaskId> =>
   tasks
-    .filter(
-      (task) =>
-        MARKDOWN_TITLE_REFUSED.test(task.title) ||
-        !isCreatable(childItemInput({ parent, deliveryId, task })),
-    )
+    .filter((task) => {
+      const input = childItemInput({ parent, deliveryId, task });
+      return (
+        !isCreatable(input) || !canWriteMarkdownItem({ title: input.title, body: input.body ?? "" })
+      );
+    })
     .map(({ id }) => id);

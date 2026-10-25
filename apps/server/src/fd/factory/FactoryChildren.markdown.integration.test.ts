@@ -12,6 +12,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
 import { type WorkActor, type WorkDomainError, WorkService } from "../work-management/index.ts";
 import * as Factory from "./index.ts";
@@ -255,6 +256,27 @@ const nearLimitTask = nearLimitWith(
 );
 const nearLimitPlan = decodePlan({ tasks: [tasks[0], nearLimitTask, tasks[2]] });
 
+/**
+ * `plan` with half a surrogate pair, which UTF-8 cannot carry, in the first task's summary, the
+ * second's criterion and the third's check: valid as a plan, and refused by Markdown.
+ */
+const halfPair = "\ud800";
+const halfPairedPlan = decodePlan({
+  tasks: [
+    { ...tasks[0], summary: `${tasks[0].summary} ${halfPair}` },
+    { ...tasks[1], acceptance: [tasks[1].acceptance[0]!, `Empty ${halfPair} tables export.`] },
+    {
+      ...tasks[2],
+      testPlan: [{ ...tasks[2].testPlan[0]!, check: `Sum ${halfPair} two rows.` }],
+    },
+  ],
+});
+
+/** Factory's change epoch now: a new subscription's first value. */
+const currentEpoch = Effect.flatMap(service, (factory) =>
+  factory.subscribe.pipe(Stream.runHead, Effect.map(Option.getOrThrow)),
+);
+
 describe("approving a parent's plan in a Markdown source", () => {
   it.live("writes one child task file per task, chained in plan order", () =>
     withProject(verifyCommands.passes, (world) =>
@@ -425,4 +447,48 @@ describe("approving a parent's plan in a Markdown source", () => {
       options,
     );
   });
+  it.live(
+    "refuses at the gate text its Markdown files cannot store, and creates it once edited",
+    () =>
+      withProject(verifyCommands.passes, (world) =>
+        Effect.gen(function* () {
+          const planner = yield* world.startWith({ kind: "parent" });
+          const { deliveryId } = planner;
+          const factory = yield* service;
+          // Valid as a plan, and stored as submitted.
+          yield* factory
+            .submitPlan({ threadId: planner.threadId, plan: halfPairedPlan })
+            .pipe(Effect.orDie);
+          yield* world.endRun(planner.runId, "completed");
+          const before = yield* stateOf(deliveryId);
+          assert.strictEqual(before.status, "waiting");
+          assert.deepStrictEqual(before.plan?.tasks, halfPairedPlan.tasks);
+
+          const epoch = yield* currentEpoch;
+          const refused = yield* Effect.flip(factory.approvePlan(deliveryId));
+          assert.strictEqual(refused._tag, "FactoryChildItemUncreatableError");
+          if (refused._tag !== "FactoryChildItemUncreatableError") return;
+          assert.deepStrictEqual(
+            refused.taskIds,
+            tasks.map(({ id }) => id),
+          );
+          // Nothing changed: the plan still waits, editable, and nothing was written to Work.
+          yield* drainFactory;
+          assert.deepStrictEqual(yield* stateOf(deliveryId), before);
+          assert.deepStrictEqual(yield* childItemIds(deliveryId), []);
+          assert.strictEqual(yield* currentEpoch, epoch);
+          assert.strictEqual(yield* taskFileCount(world), 1);
+
+          // The owner's edit takes the characters out, and the approved children are written.
+          yield* factory.updatePlan({ deliveryId, plan }).pipe(Effect.orDie);
+          yield* factory.approvePlan(deliveryId).pipe(Effect.orDie);
+          yield* drainFactory;
+          const itemIds = (yield* childItemIds(deliveryId)).map(
+            (itemId) => itemId ?? assert.fail("A task has no child."),
+          );
+          yield* assertTaskFiles(world, deliveryId, itemIds);
+          assert.strictEqual(yield* taskFileCount(world), 4);
+        }),
+      ),
+  );
 });

@@ -15,6 +15,7 @@ import * as WorkThreads from "./WorkThreads.ts";
 
 export type { WorkActor } from "./authority.ts";
 export type { WorkDomainError } from "./errors.ts";
+export { canWriteMarkdownItem } from "./documents/taskDocument.ts";
 export { workBranchName } from "./model/prompt.ts";
 export { actorFromSession, layerWsRpc, WS_METHOD_TAGS, wsHandlers } from "./rpc/handlers.ts";
 export * as WorkService from "./WorkService.ts";

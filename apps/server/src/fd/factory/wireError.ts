@@ -91,7 +91,7 @@ export const toFactoryError = (error: FactoryServiceError): FactoryError => {
       return new FactoryError({
         reason: "invalid_request",
         message:
-          "Factory cannot approve this plan: the parent's Work source cannot hold a task's child item as written, because it is longer than a Work item holds or its title has a line break. Factory does not cut or change a task's text. Edit the plan, then approve it.",
+          "Factory cannot approve this plan: the parent's Work source cannot hold a task's child item as written, because it is longer than a Work item holds or its title or text holds characters the source's files cannot store. Factory does not cut or change a task's text. Edit the plan, then approve it.",
         deliveryId: error.deliveryId,
       });
     case "FactoryPlanEditInvalidError":

@@ -5,6 +5,7 @@ import {
   FactoryDeliveryId,
   FactoryPlan,
   type FactoryPlanTask,
+  FactoryTaskId,
 } from "@t3tools/contracts/fd/factory";
 import {
   type WorkItemDetail,
@@ -601,7 +602,29 @@ describe("approving a parent's plan", () => {
         };
         // A Work title, but Markdown cannot keep a line separator on the title's one line.
         const separated = { ...tasks[2], title: "Sum the numeric\u2028columns" };
-        yield* seedAtGate(decodePlan({ tasks: [tasks[0], oversized, separated] }));
+        // Text UTF-8 cannot carry, half a surrogate pair, in a summary, a criterion and a check:
+        // it passes the plan's validation and survives storage, and Markdown refuses it.
+        const halfPair = "\ud800";
+        const textTask = (id: string): FactoryPlanTask => ({
+          ...tasks[0],
+          id: FactoryTaskId.make(id),
+          title: `Export ${id}`,
+        });
+        const textTasks = [
+          textTask("export-summary"),
+          textTask("export-criterion"),
+          textTask("export-check"),
+        ] as const;
+        const [summaryTask, criterionTask, checkTask] = textTasks;
+        const halfPaired = [
+          { ...summaryTask, summary: `Export the rows ${halfPair} as CSV.` },
+          { ...criterionTask, acceptance: [`The CSV ${halfPair} downloads.`] },
+          {
+            ...checkTask,
+            testPlan: [{ criterion: 1, check: `Read ${halfPair} back.`, paths: [] }],
+          },
+        ];
+        yield* seedAtGate(decodePlan({ tasks: [tasks[0], oversized, separated, ...halfPaired] }));
         yield* boot(
           Effect.gen(function* () {
             const factory = yield* service;
@@ -610,13 +633,18 @@ describe("approving a parent's plan", () => {
             const error = yield* Effect.flip(factory.approvePlan(parentId));
             assert.strictEqual(error._tag, "FactoryChildItemUncreatableError");
             if (error._tag !== "FactoryChildItemUncreatableError") return;
-            assert.deepStrictEqual(error.taskIds, [tasks[1].id, tasks[2].id]);
+            assert.deepStrictEqual(error.taskIds, [
+              tasks[1].id,
+              tasks[2].id,
+              ...textTasks.map(({ id }) => id),
+            ]);
             assert.strictEqual(toFactoryError(error).reason, "invalid_request");
             assert.deepStrictEqual(yield* parent, before);
             assert.deepStrictEqual(yield* taskRows, []);
             assert.strictEqual(yield* currentEpoch, epoch);
 
-            // The owner shortens one task and retitles the other at the gate; the plan is approved.
+            // The owner shortens one task, retitles another and rewrites the rest at the gate;
+            // the plan is approved.
             const shortened = {
               ...oversized,
               acceptance: [criteria[0]!],
@@ -624,14 +652,14 @@ describe("approving a parent's plan", () => {
             };
             yield* factory.updatePlan({
               deliveryId: parentId,
-              plan: { tasks: [tasks[0], shortened, tasks[2]] },
+              plan: { tasks: [tasks[0], shortened, tasks[2], ...textTasks] },
             });
             assert.strictEqual((yield* factory.approvePlan(parentId)).state.planApproved, true);
           }),
         );
         assert.deepStrictEqual(
           world.items.map(({ title }) => title),
-          tasks.map(({ title }) => title),
+          [...tasks, ...textTasks].map(({ title }) => title),
         );
       }),
     ),

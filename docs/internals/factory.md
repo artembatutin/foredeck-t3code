@@ -223,12 +223,16 @@ dependency. An unclaimed task never looks, so a broken file elsewhere holds back
 
 Nothing of a task is cut or changed to fit its source. Markdown refuses a file with a line that
 reads as a merge conflict marker, so such a line of the task's text gets a backslash first, which
-Markdown renders as the same text. What has no such rendering is refused at the gate, where the
-owner can still edit the plan: a body past Work's bound, or a title with a line break a Work title
-allows and Markdown does not. The children's deliveries are stored only once every child exists,
-under ids derived from the parent and task, in one transaction that first checks the parent still
-awaits the effect, so a parent cancelled meanwhile queues none. The Work items an effect wrote
-after a cancel stay, as the server's other effects do.
+Markdown renders as the same text. Whether the source can store a child as written is judged at
+the gate, while the owner can still edit the plan, by the source's own render through Work's
+`canWriteMarkdownItem`, not by a copy of its rules in Factory: a copy misses cases, such as half a
+surrogate pair, which plan validation accepts and JSON storage keeps, and a plan frozen with one
+blocks every resume. A body past Work's bound is refused there too.
+
+The children's deliveries are stored only once every child exists, under ids derived from the
+parent and task, in one transaction that first checks the parent still awaits the effect, so a
+parent cancelled meanwhile queues none. The Work items an effect wrote after a cancel stay, as the
+server's other effects do.
 
 ## Clients see a review's details as it was accepted
 

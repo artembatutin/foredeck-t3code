@@ -3,7 +3,7 @@ import * as NodeCrypto from "node:crypto";
 
 import {
   isWorkNativeStatus,
-  type WorkItemId,
+  WorkItemId,
   WorkItemTitle,
   type WorkNativeStatus,
   type WorkStatus,
@@ -940,3 +940,25 @@ export const renderTaskDocument = (input: {
 
   return Result.succeed({ filename: taskFilename(input.id, input.title), bytes });
 };
+
+/** Stands in for the id a create mints: every valid id renders a title and body alike. */
+const CONTENT_CHECK_ID = WorkItemId.make("fd-000000");
+
+/**
+ * Whether a Markdown source can create an item with this title and body exactly as given: the
+ * render its create performs succeeds for them. The title must stay on one line and the body read
+ * back unchanged, so a merge conflict marker line, half a surrogate pair or an oversized file is
+ * refused. For a module that must know before it commits to creating the item.
+ */
+export const canWriteMarkdownItem = (input: {
+  readonly title: string;
+  readonly body: string;
+}): boolean =>
+  Result.isSuccess(
+    renderTaskDocument({
+      id: CONTENT_CHECK_ID,
+      title: input.title,
+      status: "todo",
+      body: input.body,
+    }),
+  );

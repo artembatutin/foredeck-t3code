@@ -262,8 +262,8 @@ export class FactoryPlanGateRefusedError extends Schema.TaggedError<FactoryPlanG
 
 /**
  * The parent's Markdown source would refuse these tasks' child items: longer than a Work item
- * holds, or titled with a line break it cannot store. Nothing of a task is cut or changed to fit;
- * nothing changed.
+ * holds, or with a title or body its files cannot store as written. Nothing of a task is cut or
+ * changed to fit; nothing changed.
  */
 export class FactoryChildItemUncreatableError extends Schema.TaggedError<FactoryChildItemUncreatableError>()(
   "FactoryChildItemUncreatableError",
