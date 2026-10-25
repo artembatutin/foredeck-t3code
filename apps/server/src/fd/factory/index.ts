@@ -16,6 +16,7 @@ import * as FactoryMigrations from "./persistence/FactoryMigrations.ts";
 import * as FactorySettingsStore from "./persistence/FactorySettingsStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
+import * as FactoryWorkCommentStore from "./persistence/FactoryWorkCommentStore.ts";
 import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 // Last: core's runtime layer cannot be the first module of its import cycle to load, and the
@@ -40,6 +41,7 @@ export const layerPersistence = Layer.mergeAll(
   FactoryDeliveryStore.layer,
   FactoryTaskStore.layer,
   FactoryStageRunStore.layer,
+  FactoryWorkCommentStore.layer,
 ).pipe(Layer.provide(FactoryMigrations.layer));
 
 /**

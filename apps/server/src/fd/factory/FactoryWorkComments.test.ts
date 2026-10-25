@@ -7,6 +7,7 @@ import {
   WorkItemId,
   WorkSourceId,
 } from "@t3tools/contracts/fd/work-management";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -53,6 +54,11 @@ interface World {
   readonly posts: Array<{ readonly actor: WorkActor; readonly input: WorkCommentInput }>;
   /** Work posts each comment, cannot reach the source, or the source refuses the comment. */
   work: "posts" | "unavailable" | "refuses";
+  /** While set, every post waits for `release`; `posting` resolves once one is waiting. */
+  held: {
+    readonly posting: Deferred.Deferred<void>;
+    readonly release: Deferred.Deferred<void>;
+  } | null;
   readonly warnings: Array<string>;
 }
 
@@ -77,19 +83,24 @@ const authorRun = RunId.make("run-author");
 const fakeWork = (world: World) =>
   Layer.mock(WorkService.WorkService)({
     addComment: (actor, input) =>
-      Effect.suspend(() => {
+      Effect.gen(function* () {
         world.posts.push({ actor, input });
+        const { held } = world;
+        if (held !== null) {
+          yield* Deferred.succeed(held.posting, undefined);
+          yield* Deferred.await(held.release);
+        }
         switch (world.work) {
           case "posts":
-            return Effect.succeed({ commentId: String(world.posts.length) });
+            return { commentId: String(world.posts.length) };
           case "unavailable":
-            return Effect.fail(
+            return yield* Effect.fail(
               new FakeWorkUnavailable({
                 detail: "The source could not be reached.",
               }) as unknown as WorkDomainError,
             );
           case "refuses":
-            return Effect.fail(
+            return yield* Effect.fail(
               new FakeWorkInvalid({
                 detail: "The source refused the comment.",
               }) as unknown as WorkDomainError,
@@ -169,7 +180,7 @@ const serverLayer = (world: World) =>
   );
 
 const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
-  const world: World = { posts: [], work: "posts", warnings: [] };
+  const world: World = { posts: [], work: "posts", held: null, warnings: [] };
   return body(world).pipe(Effect.provide(baseLayer(world)), Effect.scoped);
 };
 
@@ -299,6 +310,45 @@ const resumeOn = (cwd: string) =>
       },
     } satisfies FactoryEvent;
   });
+
+/**
+ * Runs `body` in a server process that stops as soon as `body` returns: whatever it queued and
+ * has not finished is dropped or interrupted, as when the server shuts down.
+ */
+const stopsAfter = <A, E, R>(world: World, body: Effect.Effect<A, E, R>) =>
+  body.pipe(Effect.scoped, Effect.provide(serverLayer(world)));
+
+/** A delivery of its own item, stored with its author's run going. */
+const authoringOf = (name: string) => {
+  const id = FactoryDeliveryId.make(`delivery-${name}`);
+  const thread = ThreadId.make(`thread-author-${name}`);
+  return {
+    id,
+    deleted: { type: "thread.deleted", threadId: thread } satisfies FactoryEvent,
+    insert: Effect.flatMap(FactoryDeliveryStore.FactoryDeliveryStore, (deliveries) =>
+      deliveries.insert({
+        deliveryId: id,
+        projectId,
+        itemRef: { ...itemRef, itemId: WorkItemId.make(`fd-${name}`) },
+        state: fold(
+          queuedDeliveryState({ branch: `feature/${name}`, baseRef: "main" }),
+          { type: "start" },
+          {
+            type: "thread.launched",
+            effectId: 1,
+            threadId: thread,
+            runId: RunId.make(`run-author-${name}`),
+            worktreePath: `/worktrees/${name}`,
+            baseline: "b".repeat(40),
+          },
+        ),
+      }),
+    ),
+  };
+};
+
+const stepOf = (id: FactoryDeliveryId, event: FactoryEvent) =>
+  Effect.flatMap(FactoryWorker.FactoryWorker, (worker) => worker.step(id, event));
 
 const bodies = (world: World) => world.posts.map(({ input }) => input.body);
 const requestIds = (world: World) => world.posts.map(({ input }) => input.clientRequestId);
@@ -453,6 +503,90 @@ describe("Work comments on a delivery's transitions", () => {
         yield* boot(world, Effect.void);
         assert.strictEqual(world.posts.length, 1);
       }),
+    ),
+  );
+
+  it.effect(
+    "posts after a restart a comment the stopped process recorded and never began, and never again one it began",
+    () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const first = authoringOf("first");
+          const second = authoringOf("second");
+          yield* first.insert;
+          yield* second.insert;
+          const held = {
+            posting: yield* Deferred.make<void>(),
+            release: yield* Deferred.make<void>(),
+          };
+          world.held = held;
+
+          yield* stopsAfter(
+            world,
+            Effect.gen(function* () {
+              // The first block's comment is being posted when the second delivery blocks.
+              yield* stepOf(first.id, first.deleted);
+              yield* Deferred.await(held.posting);
+              yield* stepOf(second.id, second.deleted);
+            }),
+          );
+          // The process stopped with the second comment still queued.
+          const blocked = yield* Effect.flatMap(FactoryDeliveryStore.FactoryDeliveryStore, (d) =>
+            d.get(second.id),
+          ).pipe(Effect.map(Option.getOrThrow));
+          assert.strictEqual(blocked.state.status, "blocked");
+          assert.deepStrictEqual(
+            world.posts.map(({ actor }) => actor.id),
+            [`factory:${first.id}`],
+          );
+
+          // The next boot posts the comment nobody began; the one interrupted mid-post may have
+          // reached the source, so it is not posted again.
+          world.held = null;
+          yield* boot(world, Effect.void);
+          assert.deepStrictEqual(
+            world.posts.map(({ actor, input }) => [actor.id, input.body]),
+            [
+              [`factory:${first.id}`, blockedText("The author thread was deleted.")],
+              [`factory:${second.id}`, blockedText("The author thread was deleted.")],
+            ],
+          );
+          yield* boot(world, Effect.void);
+          assert.strictEqual(world.posts.length, 2);
+        }),
+      ),
+  );
+
+  it.effect("posts a comment queued twice once", () =>
+    withWorld((world) =>
+      boot(
+        world,
+        Effect.gen(function* () {
+          const first = authoringOf("first");
+          const second = authoringOf("second");
+          yield* first.insert;
+          yield* second.insert;
+          const held = {
+            posting: yield* Deferred.make<void>(),
+            release: yield* Deferred.make<void>(),
+          };
+          world.held = held;
+          yield* stepOf(first.id, first.deleted);
+          yield* Deferred.await(held.posting);
+          yield* stepOf(second.id, second.deleted);
+          // A sweep that finds the queued, unclaimed comment queues it a second time.
+          yield* Effect.flatMap(
+            FactoryWorker.FactoryWorker,
+            (worker) => worker.postUnattemptedComments,
+          );
+          yield* Deferred.succeed(held.release, undefined);
+          yield* drain;
+          assert.deepStrictEqual(
+            world.posts.map(({ actor }) => actor.id),
+            [`factory:${first.id}`, `factory:${second.id}`],
+          );
+        }),
+      ),
     ),
   );
 

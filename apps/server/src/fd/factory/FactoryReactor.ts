@@ -20,7 +20,8 @@ import { type FactoryThreadEvent, isTerminalRunStatus } from "./pipeline/state.t
  * `run.finished` and a deleted thread `thread.deleted` for the delivery whose active stage
  * attempt owns the thread (any delivery recording it, for a deletion); other threads pass by.
  * A boot sweep catches up the deliveries that awaited something when the previous server stopped,
- * and the tail starts at the event log position read before it, so no event falls between the two.
+ * and posts the Work comments it recorded and never attempted. The tail starts at the event log
+ * position read before the sweep, so no event falls between the two.
  */
 export class FactoryReactor extends Context.Service<
   FactoryReactor,
@@ -86,7 +87,10 @@ const make = Effect.gen(function* () {
       if (ended !== null) yield* worker.step(deliveryId, ended);
     }).pipe(Effect.catchCause(logSkipped("factory delivery reconcile skipped")));
 
-  const bootSweep = deliveries.listActive().pipe(
+  // Comments a previous process recorded and never began posting go first, in their order.
+  const bootSweep = worker.postUnattemptedComments.pipe(
+    Effect.catchCause(logSkipped("factory comment recovery failed")),
+    Effect.andThen(deliveries.listActive()),
     Effect.flatMap((active) => Effect.forEach(active, reconcile, { discard: true })),
     Effect.catchCause(logSkipped("factory boot reconcile failed")),
   );

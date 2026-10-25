@@ -85,11 +85,26 @@ const FactoryStageRuns = Effect.gen(function* () {
     WHERE finished_at IS NULL`;
 });
 
+const FactoryWorkComments = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  // A comment is attempted at most once: posted only after `attempted_at` is set.
+  yield* sql`CREATE TABLE fd_factory_work_comments (
+    delivery_id TEXT NOT NULL REFERENCES fd_factory_deliveries (delivery_id),
+    transition INTEGER NOT NULL CHECK (transition >= 1),
+    status TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    attempted_at TEXT,
+    PRIMARY KEY (delivery_id, transition)
+  )`;
+});
+
 export const factoryMigrationEntries = [
   [1, "FactorySettings", FactorySettings],
   [2, "FactoryDeliveries", FactoryDeliveries],
   [3, "FactoryTasks", FactoryTasks],
   [4, "FactoryStageRuns", FactoryStageRuns],
+  [5, "FactoryWorkComments", FactoryWorkComments],
 ] as const;
 
 const run = Migrator.make({});

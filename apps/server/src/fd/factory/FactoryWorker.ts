@@ -25,6 +25,7 @@ import { readSettle } from "./git/settleCheck.ts";
 import { FactoryStoreError } from "./persistence/errors.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
+import * as FactoryWorkCommentStore from "./persistence/FactoryWorkCommentStore.ts";
 import { transitionComment } from "./pipeline/comments.ts";
 import { advance } from "./pipeline/engine.ts";
 import { failureFingerprint } from "./pipeline/fingerprint.ts";
@@ -54,7 +55,8 @@ class FactoryStageCommandError extends Schema.TaggedError<FactoryStageCommandErr
  * Drives deliveries through the pure engine. A step folds one event into the stored delivery,
  * stores the new state with its stage attempts, then queues the effects the engine returned;
  * each effect's result (or failure) is fed back as the delivery's next step. A step that moves
- * the delivery into a status its item announces also queues that Work comment.
+ * the delivery into a status its item announces records that Work comment with the new state and
+ * then queues it.
  */
 export class FactoryWorker extends Context.Service<
   FactoryWorker,
@@ -108,8 +110,13 @@ export class FactoryWorker extends Context.Service<
       FactoryStoreError
     >;
     /**
+     * Queues every recorded Work comment no process has begun posting: its transition was stored
+     * by a process that stopped before posting it. The boot sweep calls this.
+     */
+    readonly postUnattemptedComments: Effect.Effect<void, FactoryStoreError>;
+    /**
      * Resolves once every queued effect and every step its result fed back have finished, and
-     * every Work comment those steps queued has been posted or has failed.
+     * every Work comment queued has been posted, has failed or was found attempted already.
      */
     readonly drain: Effect.Effect<void>;
   }
@@ -218,7 +225,8 @@ const make = Effect.gen(function* () {
   const reviews = yield* FactoryReview.FactoryReview;
   const records = yield* FactoryRecord.FactoryRecord;
   const pullRequests = yield* FactoryPullRequest.FactoryPullRequest;
-  const comments = yield* FactoryWorkComments.FactoryWorkComments;
+  const commentStore = yield* FactoryWorkCommentStore.FactoryWorkCommentStore;
+  const poster = yield* FactoryWorkComments.FactoryWorkComments;
   const gitContext = yield* Effect.context<FileSystem.FileSystem | GitVcsDriver.GitVcsDriver>();
   const scope = yield* Effect.scope;
   const locks = yield* KeyedLock.make<FactoryDeliveryId>();
@@ -237,11 +245,23 @@ const make = Effect.gen(function* () {
   // Runs after every lane's finalizer: effects dropped at shutdown never finish, and a drain
   // must not wait for them.
   yield* Effect.addFinalizer(() => TxRef.set(outstanding, 0));
-  // Work comments post on one lane of their own, in the order their transitions were stored: a
-  // slow or failing Work source never holds up a delivery. Each is counted until it is done.
+  // Work comments post on one lane of their own, in the order they were recorded: a slow or
+  // failing Work source never holds up a delivery. Each is counted until it is done. A comment is
+  // claimed before it is posted, so one queued twice (live, and by a boot sweep) posts once, and
+  // one a stopped process began posting is never posted again. One this process could not claim
+  // stays unattempted, for the next boot.
   const commentLane = yield* makeDrainableWorker((job: CommentJob) =>
-    comments.post(job).pipe(Effect.ensuring(TxRef.update(outstanding, (count) => count - 1))),
+    commentStore.claim(job.comment).pipe(
+      Effect.flatMap((claimed) => (claimed ? poster.post(job) : Effect.void)),
+      Effect.catchTags({
+        FactoryStoreError: (error) =>
+          Effect.logWarning("factory could not claim a Work comment", error),
+      }),
+      Effect.ensuring(TxRef.update(outstanding, (count) => count - 1)),
+    ),
   );
+  const queueComment = (job: CommentJob) =>
+    TxRef.update(outstanding, (count) => count + 1).pipe(Effect.andThen(commentLane.enqueue(job)));
 
   const checkSettle = (state: FactoryDeliveryState): Effect.Effect<FactorySettleResult> =>
     readSettle(state).pipe(Effect.provideContext(gitContext));
@@ -358,8 +378,7 @@ const make = Effect.gen(function* () {
    * by how it stopped proceeding when it did. Entering one appends the next attempt, and the
    * attempt carries the run the delivery now awaits; a resumed delivery enters its stage again,
    * since the attempt it stopped or blocked in has ended. An approved delivery still proceeds:
-   * its PR attempt ends when the pull request is open or the delivery blocks. Returns how many
-   * attempts the delivery has once these are recorded.
+   * its PR attempt ends when the pull request is open or the delivery blocks.
    */
   const recordAttempts = Effect.fn("FactoryWorker.recordAttempts")(function* (
     deliveryId: FactoryDeliveryId,
@@ -370,9 +389,9 @@ const make = Effect.gen(function* () {
     const stopped = !isProceeding(after);
     const advanced = after.stage !== before.stage;
     const entered = advanced || (!isProceeding(before) && !stopped);
-    const runs = yield* stageRuns.listByDelivery(deliveryId);
-    let attempts = runs.length;
-    let active = runs.findLast((run) => run.outcome === null && run.stage === before.stage);
+    let active = (yield* stageRuns.listByDelivery(deliveryId)).findLast(
+      (run) => run.outcome === null && run.stage === before.stage,
+    );
     const attemptOf = (run: FactoryStageRunStore.StoredFactoryStageRun) => ({
       deliveryId,
       stage: run.stage,
@@ -392,7 +411,6 @@ const make = Effect.gen(function* () {
     }
     if (after.stage !== null && entered) {
       active = yield* stageRuns.append({ deliveryId, stage: after.stage });
-      attempts += 1;
       if (stopped) {
         yield* stageRuns.finish({ ...attemptOf(active), outcome: outcomeOf(after) });
         active = undefined;
@@ -410,7 +428,6 @@ const make = Effect.gen(function* () {
         runId: awaiting.runId,
       });
     }
-    return attempts;
   });
 
   /**
@@ -443,12 +460,20 @@ const make = Effect.gen(function* () {
     if (next.delivery === before && next.effects.length === 0) return current;
 
     const evidence = evidenceOf(event, before);
+    // Only the step that stores a transition announces it, and records its comment with it: a
+    // repeated event changes nothing, and a restart posts only what no process has attempted.
+    const comment = transitionComment(before, next.delivery);
     const recorded = yield* deliveries.update(deliveryId, next.delivery).pipe(
       Effect.flatMap((updated) =>
         Option.isNone(updated)
           ? Effect.succeedNone
           : recordAttempts(deliveryId, before, next.delivery, evidence).pipe(
-              Effect.map((attempts) => Option.some({ delivery: updated.value, attempts })),
+              Effect.andThen(
+                comment === undefined
+                  ? Effect.succeedNone
+                  : Effect.asSome(commentStore.record({ deliveryId, comment })),
+              ),
+              Effect.map((announced) => Option.some({ delivery: updated.value, announced })),
             ),
       ),
       sql.withTransaction,
@@ -458,7 +483,7 @@ const make = Effect.gen(function* () {
       }),
     );
     if (Option.isNone(recorded)) return Option.none();
-    const { delivery: stored, attempts } = recorded.value;
+    const { delivery: stored, announced } = recorded.value;
     // Queued only now: an effect never starts before the state that issued it is stored.
     if (next.effects.length > 0) {
       const lane = yield* laneFor(deliveryId);
@@ -467,14 +492,8 @@ const make = Effect.gen(function* () {
         yield* lane.enqueue({ delivery: stored, effect });
       }
     }
-    // Only the step that stores a transition announces it: a repeated event changes nothing and
-    // a restart only reads statuses back, so neither posts again. The attempt count tells apart
-    // transitions into one status: a delivery gets back to a status it left only by proceeding
-    // again from one that awaits its owner, and that step starts a stage attempt.
-    const comment = transitionComment(before, next.delivery);
-    if (comment !== undefined) {
-      yield* TxRef.update(outstanding, (count) => count + 1);
-      yield* commentLane.enqueue({ delivery: stored, comment, transition: attempts });
+    if (Option.isSome(announced)) {
+      yield* queueComment({ itemRef: stored.itemRef, comment: announced.value });
     }
     // Cancelled: once the cancel is stored, each of the delivery's threads stops what it still
     // runs, so a run's end finds the delivery cancelled. Not only the run it awaited: a review
@@ -638,11 +657,24 @@ const make = Effect.gen(function* () {
       );
     });
 
+  const postUnattemptedComments: FactoryWorker["Service"]["postUnattemptedComments"] = Effect.gen(
+    function* () {
+      for (const comment of yield* commentStore.listUnattempted()) {
+        // Deliveries are never deleted, so every comment's delivery is stored.
+        const delivery = yield* deliveries.get(comment.deliveryId);
+        if (Option.isSome(delivery)) {
+          yield* queueComment({ itemRef: delivery.value.itemRef, comment });
+        }
+      }
+    },
+  );
+
   return FactoryWorker.of({
     step,
     stepWith,
     stepThread,
     failInterruptedEffect,
+    postUnattemptedComments,
     drain: TxRef.get(outstanding).pipe(
       Effect.flatMap((count) => (count > 0 ? Effect.txRetry : Effect.void)),
       Effect.tx,

@@ -72,6 +72,7 @@ describe("runFactoryMigrations", () => {
         ["table", "fd_factory_settings"],
         ["table", "fd_factory_stage_runs"],
         ["table", "fd_factory_tasks"],
+        ["table", "fd_factory_work_comments"],
       ]);
       // The same numeric id names a different migration in each ledger.
       assert.deepStrictEqual(
