@@ -65,7 +65,8 @@ const blockedBody = (reason: string | undefined) =>
  * pr_open from any other status, none for staying in a status or entering any other. A blocked
  * comment gives the block's message, as the delivery's `needsYou` does, and keeps the reason's
  * fixed text when it drops the facts; an approved one the approved commit, the one the last
- * receipt verified; a pr_open one the pull request's number and URL.
+ * receipt verified, and that its pull request is being opened unless it is a child, whose parent's
+ * pull request carries it; a pr_open one the pull request's number and URL.
  */
 export const transitionComment = (
   before: FactoryDeliveryState,
@@ -95,17 +96,15 @@ export const transitionComment = (
       };
     case "approved": {
       const commit = after.receipts.at(-1)?.headSha;
-      const fixed =
-        "Factory approved this item after verify and review, and is opening its pull request.";
+      const next = after.kind === "child" ? "" : ", and is opening its pull request";
+      const fixed = `Factory approved this item after verify and review${next}.`;
       return {
         status: "approved",
         body:
           commit === undefined
             ? fixed
             : firstPublishable(
-                [
-                  `Factory approved commit ${commit} for this item after verify and review, and is opening its pull request.`,
-                ],
+                [`Factory approved commit ${commit} for this item after verify and review${next}.`],
                 fixed,
               ),
       };

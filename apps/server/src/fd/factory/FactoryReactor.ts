@@ -72,13 +72,14 @@ const make = Effect.gen(function* () {
    * delivery awaiting a run gets the run's end or its thread's deletion, as the tail would have
    * handed them on, so a stopping one stops where the run's end leads it. One awaiting an effect
    * lost it with the previous process and blocks. A delivery awaiting nothing (queued, stopped,
-   * blocked, its pull request open) waits for its owner.
+   * blocked, its pull request open) waits for its owner, and a parent awaiting its child waits for
+   * that child.
    */
   const reconcile = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
     Effect.gen(function* () {
       const { deliveryId, state } = delivery;
       const { awaiting } = state;
-      if (awaiting === null) return;
+      if (awaiting === null || awaiting.type === "child") return;
       if (awaiting.type === "effect") {
         yield* worker.failInterruptedEffect(deliveryId);
         return;

@@ -234,6 +234,17 @@ parent and task, in one transaction that first checks the parent still awaits th
 parent cancelled meanwhile queues none. The Work items an effect wrote after a cancel stay, as the
 server's other effects do.
 
+## A parent runs one child at a time
+
+Children of one parent share its branch and worktree, so they run in plan order, one at a time
+(owner decision). The parent waits on one child and starts the next only once that child reports
+its approval. It records each child that reported one (`approvedChildren`), so a resume starts
+the next child rather than one that is done. A child runs a single item's stages with its
+own limits and fingerprints but ends `approved` at record: the parent's one pull request carries
+its work. Plan approval stored children as single items before the `child` kind existed, and a
+single item opens its own pull request, so the store reads any delivery with a parent as a child
+([`FactoryDeliveryStore.ts`](../../apps/server/src/fd/factory/persistence/FactoryDeliveryStore.ts)).
+
 ## Clients see a review's details as it was accepted
 
 Snapshots are built on every read and never read evidence, so what clients see of a review's
@@ -277,14 +288,15 @@ item is its delivery's one task, written in the transaction that inserts the del
 
 Stop after step is a status, not an interruption. A `stopping` delivery takes every event a running
 one does, so the turn or effect under way finishes, and it becomes `stopped` only where the engine
-would begin verify, a review round, a repair round, record, the PR stage or the plan gate, with
-that stage as its checkpoint ([`engine.ts`](../../apps/server/src/fd/factory/pipeline/engine.ts)).
+would begin verify, a review round, a repair round, record, the PR stage, the plan gate, a parent's
+next child or the stage after its children, with that stage as its checkpoint
+([`engine.ts`](../../apps/server/src/fd/factory/pipeline/engine.ts)).
 Work inside a stage is not a boundary: the settle check and its fix-commit turn, the fallback plan
 and review reads, a plan or review submission and its retry. A failure found first still blocks,
 because a stopped delivery would hide it, and so does an empty plan. Stopped where a repair round
 would begin, the failure's fingerprint is recorded but no round is spent, and the stage's attempt
 is recorded as failed. Only a running delivery can stop; an approved one is already in the last
-stage it runs.
+stage it runs, and a stopping child approved at record has no stage left to stop before.
 
 Cancel ends a delivery whatever it awaits, and by owner decision interrupts what its agents are
 working on, through the thread's own interrupt. Every thread the delivery recorded is asked, not
@@ -335,7 +347,8 @@ and replayed like an author's (`plannerLaunch`). A recorded planner gets one ret
 plan round, because a plan accepted before the block, from a run that failed after submitting,
 must not stand in for what the resumed planner submits.
 Once its plan is approved, a parent launches no thread until its children run, so its planner's
-deletion does not hold it: a resume creates the children it lacks, keeping those recorded.
+deletion does not hold it: a resume creates the children it lacks, keeping those recorded, or once
+they exist starts the first that has not reported its approval, never creating one again.
 
 By owner decision an explicit resume grants a fresh retry allowance: repair rounds, the fix-commit
 turn and failure fingerprints start over, while the limits the delivery started with stay, and so
@@ -346,10 +359,10 @@ and the attempt the delivery stopped or blocked in has ended (see `recordAttempt
 
 ## The PR stage opens only the approved commit
 
-An approved delivery is not at rest: it enters `pr` still `approved` and becomes `pr_open` once
-the pull request is recorded. The engine takes only that result or the effect's failure while
-approved, and the boot sweep blocks an approved delivery whose PR effect a restart lost, as it does
-a running one; the action is never re-run on its own.
+An approved delivery other than a child is not at rest: it enters `pr` still `approved` and
+becomes `pr_open` once the pull request is recorded. The engine takes only that result or the
+effect's failure while approved, and the boot sweep blocks an approved delivery whose PR effect a
+restart lost, as it does a running one; the action is never re-run on its own.
 
 Factory passes the approved commit to `create_pr` as its expected commit. The stacked action then
 refuses to start unless HEAD is that commit, and the push publishes that commit by its id rather

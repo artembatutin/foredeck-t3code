@@ -9,6 +9,7 @@ import {
   isTerminal,
   isTurnEffect,
   issue,
+  nextChild,
   planAtGate,
   receiptFailed,
   runsStages,
@@ -308,19 +309,29 @@ const resumePlanning = (
 };
 
 /**
- * Begins a parent's per-child phase once its children exist. Running them is not built yet, so
- * the parent blocks there as an unsupported stage and starts none of them.
+ * Goes on with a parent's per-child phase, one child at a time: it starts the first child that has
+ * not reported its approval and waits for it, at the stage each child begins with, or begins the
+ * stage after its children once every one has. A stopping parent is `stopped` where it would start
+ * the child or begin that stage instead, with it as its checkpoint.
  */
-const beginChildren = (delivery: FactoryDeliveryState): FactoryAdvance =>
-  blocked(
-    { ...delivery, stage: standardStages.author.name },
-    { reason: "unsupported_stage", stage: standardStages.author.name },
+const continueChildren = (delivery: FactoryDeliveryState): FactoryAdvance => {
+  const child = nextChild(delivery);
+  if (child === undefined) {
+    return enter(delivery, standardStages.integrate.name, (current) =>
+      begin(current, standardStages.integrate),
+    );
+  }
+  return enter(delivery, standardStages.author.name, (current) =>
+    issue({ ...current, stage: standardStages.author.name }, { type: "start_child", child }),
   );
+};
 
 /**
  * Picks up a parent whose plan its owner approved. It launches no thread, so a deleted thread does
  * not hold it: its planner's work ended with the approval. Without its children it creates them
- * again, keeping every child it recorded before; with them it begins its per-child phase again.
+ * again, keeping every child it recorded before. With them it never creates one again: it starts
+ * the first child that has not reported its approval, or begins the stage after its children once
+ * every one has.
  */
 const resumeApproved = (delivery: FactoryDeliveryState): FactoryAdvance =>
   delivery.children.length === 0
@@ -328,7 +339,7 @@ const resumeApproved = (delivery: FactoryDeliveryState): FactoryAdvance =>
         { ...resumed(delivery), stage: standardStages.approve_plan.name },
         { type: "create_children" },
       )
-    : beginChildren(resumed(delivery));
+    : continueChildren(resumed(delivery));
 
 /**
  * Acts on the round's accepted plan once its run has completed. A plan with tasks enters the plan
@@ -454,7 +465,9 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * which cancels the delivery, or replan: the planner thread gets the owner's note as a follow-up
  * turn in a new plan round, and the plan it then submits waits at the gate in place of the old.
  * Or the owner approves it: the plan is frozen, and the running parent creates its children, then
- * blocks where its per-child phase would begin, which this server cannot run yet.
+ * runs them one at a time: it starts the first child that has not reported its approval and waits
+ * on that child alone, and starts the next only once that one reports its approval. After the last
+ * it begins the stage after its children.
  *
  * A single item runs from start to its pull request: the author thread, the branch settle
  * check with at most one fix-commit turn, the verify command, then a reviewer thread whose one
@@ -463,17 +476,19 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * the failure is new; the repaired branch is settled and verified again, and a review round after
  * a fix-review continues the same reviewer thread. A passing review enters `record`, which
  * approves the reviewed commit. The approved delivery enters `pr` and opens its pull request,
- * then is `pr_open` with the pull request recorded, awaiting nothing.
+ * then is `pr_open` with the pull request recorded, awaiting nothing. A child runs as a single
+ * item does, with its own rounds and fingerprints, but ends approved at record: its parent's pull
+ * request carries its work.
  *
  * The owner can stop a running delivery after its step, or cancel any delivery that is not done
  * or cancelled. A stopping delivery still completes the work of its stage (the settle check and
  * its fix-commit turn, the fallback plan and review reads, plan and review submissions and their
  * retry, a parent's child creation) and blocks on a failure as a running one would; where it
- * would begin verify, a review round, a repair round, record, the PR stage, the plan gate or a
- * parent's per-child phase, it is `stopped` instead. A cancelled delivery awaits nothing, so no
- * later event moves it. Resume undoes a stop that has not yet taken effect, and picks a stopped or
- * blocked delivery up from its checkpoint (see `resume` and, for a parent, `resumePlanning` and
- * `resumeApproved`).
+ * would begin verify, a review round, a repair round, record, the PR stage, the plan gate, a
+ * parent's next child or the stage after its children, it is `stopped` instead. A cancelled
+ * delivery awaits nothing, so no later event moves it. Resume undoes a stop that has not yet taken
+ * effect, and picks a stopped or blocked delivery up from its checkpoint (see `resume` and, for a
+ * parent, `resumePlanning` and `resumeApproved`).
  */
 export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
   switch (event.type) {
@@ -496,7 +511,7 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       ) {
         return unchanged(delivery);
       }
-      if (delivery.kind === "single") return resume(delivery, event.check);
+      if (delivery.kind !== "parent") return resume(delivery, event.check);
       return delivery.planApproved
         ? resumeApproved(delivery)
         : resumePlanning(delivery, event.check);
@@ -747,9 +762,13 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       }
       const { outcome } = event;
       if (outcome.type === "approved") {
-        return enter(delivery, "pr", (current) =>
-          begin({ ...current, status: "approved" }, standardStages.pr),
-        );
+        // A child ends here, stopping or not: no stage of its own is left, and its parent goes
+        // on once it hears of the approval.
+        return delivery.kind === "child"
+          ? step({ ...delivery, status: "approved", awaiting: null })
+          : enter(delivery, "pr", (current) =>
+              begin({ ...current, status: "approved" }, standardStages.pr),
+            );
       }
       const { expected, actual, differences } = outcome;
       return blocked(delivery, { reason: "record_mismatch", expected, actual, differences });
@@ -768,11 +787,25 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
     case "children.created":
       return awaitedEffect(delivery, event.effectId, "create_children") === undefined
         ? unchanged(delivery)
-        : enter(
-            { ...delivery, children: event.children },
-            standardStages.author.name,
-            beginChildren,
-          );
+        : continueChildren({ ...delivery, children: event.children });
+
+    case "child.started": {
+      const start = awaitedEffect(delivery, event.effectId, "start_child");
+      return start === undefined
+        ? unchanged(delivery)
+        : step({ ...delivery, awaiting: { type: "child", deliveryId: start.child } });
+    }
+
+    case "child.approved":
+      // Only the child the parent waits on: one it took before, or one it has not started, is
+      // not.
+      return awaiting?.type === "child" && awaiting.deliveryId === event.deliveryId
+        ? continueChildren({
+            ...delivery,
+            awaiting: null,
+            approvedChildren: [...delivery.approvedChildren, event.deliveryId],
+          })
+        : unchanged(delivery);
 
     case "effect.failed":
       return awaiting?.type === "effect" && awaiting.effect.id === event.effectId

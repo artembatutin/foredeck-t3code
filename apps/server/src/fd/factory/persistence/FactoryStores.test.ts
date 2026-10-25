@@ -169,7 +169,7 @@ describe("FactoryDeliveryStore", () => {
         projectId: alpha,
         itemRef: itemB,
         parentId: delivery1,
-        state: queued,
+        state: { ...queued, kind: "child" },
       });
       assert.strictEqual(child.parentId, delivery1);
       assert.deepStrictEqual(yield* store.get(delivery2), Option.some(child));

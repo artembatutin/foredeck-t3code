@@ -1,7 +1,7 @@
 import type { RunId, ThreadId } from "@t3tools/contracts";
 import {
   FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
-  type FactoryDeliveryId,
+  FactoryDeliveryId,
   FactoryStageName,
   type FactoryStageOutcome,
 } from "@t3tools/contracts/fd/factory";
@@ -62,6 +62,16 @@ class FactoryStageCommandError extends Schema.TaggedError<FactoryStageCommandErr
 ) {
   override get message(): string {
     return `Factory has no command to run for stage ${this.stage} of this delivery.`;
+  }
+}
+
+/** This server does not run child deliveries yet: a parent blocks on its first child's start. */
+class FactoryChildStartUnsupportedError extends Schema.TaggedError<FactoryChildStartUnsupportedError>()(
+  "FactoryChildStartUnsupportedError",
+  { child: FactoryDeliveryId },
+) {
+  override get message(): string {
+    return `This server cannot start child delivery ${this.child} yet.`;
   }
 }
 
@@ -179,6 +189,8 @@ const describeEffect = (effect: FactoryEffect) => {
       return "open the pull request";
     case "create_children":
       return "create the child items";
+    case "start_child":
+      return "start the child delivery";
   }
 };
 
@@ -426,6 +438,8 @@ const make = Effect.gen(function* () {
             children: created,
           })),
         );
+      case "start_child":
+        return Effect.fail(new FactoryChildStartUnsupportedError({ child: effect.child }));
     }
   };
 

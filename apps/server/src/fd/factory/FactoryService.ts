@@ -351,8 +351,8 @@ export class FactoryService extends Context.Service<
      */
     readonly start: (input: {
       readonly itemRef: WorkItemRef;
-      /** Single when absent. */
-      readonly kind?: FactoryDeliveryKind;
+      /** Single when absent. A child is started by its parent, never on its own. */
+      readonly kind?: Exclude<FactoryDeliveryKind, "child">;
       readonly runtimeModeCeiling?: RuntimeMode;
     }) => Effect.Effect<FactoryDeliveryWithRuns, FactoryStartError>;
     readonly get: (

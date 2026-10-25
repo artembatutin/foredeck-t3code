@@ -134,6 +134,8 @@ const StoredEffect = Schema.Union([
   Schema.Struct({ id: PositiveInt, type: Schema.Literal("open_pr") }),
   // Added with plan approval.
   Schema.Struct({ id: PositiveInt, type: Schema.Literal("create_children") }),
+  // Added with the per-child phase.
+  Schema.Struct({ id: PositiveInt, type: Schema.Literal("start_child"), child: FactoryDeliveryId }),
 ]);
 
 const StoredCommit = { headSha: Schema.String, tree: Schema.String };
@@ -141,6 +143,8 @@ const StoredCommit = { headSha: Schema.String, tree: Schema.String };
 const StoredAwaiting = Schema.Union([
   Schema.Struct({ type: Schema.Literal("effect"), effect: StoredEffect }),
   Schema.Struct({ type: Schema.Literal("run"), threadId: ThreadId, runId: RunId }),
+  // Added with the per-child phase.
+  Schema.Struct({ type: Schema.Literal("child"), deliveryId: FactoryDeliveryId }),
 ]);
 
 const StoredBlock = Schema.Union([
@@ -202,8 +206,9 @@ const StoredRoundLimit = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum
 
 const StoredDeliveryState = Schema.Struct({
   // Added with planning, as were the planner launch, plan round and plan: rows stored before it
-  // are single items that never planned.
-  kind: Schema.Literals(["single", "parent"]).pipe(
+  // are single items that never planned. `child` was added with the per-child phase; see
+  // `fromRow` for children stored before it.
+  kind: Schema.Literals(["single", "parent", "child"]).pipe(
     Schema.withDecodingDefault(Effect.succeed("single" as const)),
   ),
   status: FactoryDeliveryStatus,
@@ -249,6 +254,10 @@ const StoredDeliveryState = Schema.Struct({
   // Added with plan approval: rows stored before it never had a plan approved.
   planApproved: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   children: Schema.Array(FactoryDeliveryId).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+  // Added with the per-child phase: no child reported an approval before it.
+  approvedChildren: Schema.Array(FactoryDeliveryId).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   // Added with the PR stage: rows stored before it opened none.
   pullRequest: Schema.NullOr(
     Schema.Struct({ number: PositiveInt, url: Schema.String, headBranch: Schema.String }),
@@ -289,12 +298,17 @@ const DeliveryDbRow = Schema.Struct({
 /** Written beside the state, so the active-item index can see it. */
 const DeliveryWriteRow = Schema.Struct({ ...DeliveryDbRow.fields, status: FactoryDeliveryStatus });
 
+// Plan approval stored its children as single items before the child kind existed, and a single
+// item ends in its own pull request. A delivery with a parent is always a child.
 const fromRow = (row: typeof DeliveryDbRow.Type): StoredFactoryDelivery => ({
   deliveryId: row.deliveryId,
   projectId: row.projectId,
   itemRef: { sourceId: row.sourceId, itemId: row.itemId },
   parentId: row.parentId,
-  state: row.state,
+  state:
+    row.parentId !== null && row.state.kind === "single"
+      ? { ...row.state, kind: "child" }
+      : row.state,
   createdAt: row.createdAt,
   updatedAt: row.updatedAt,
 });

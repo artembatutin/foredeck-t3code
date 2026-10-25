@@ -186,6 +186,8 @@ describe("FactoryDeliveryStore with review state", () => {
         // Nor plan approval: no plan was approved, and no child was created.
         planApproved: false,
         children: [],
+        // Nor child approvals, added with the per-child phase.
+        approvedChildren: [],
       });
       assert.deepStrictEqual(
         (yield* store.listActive()).map((delivery) => delivery.deliveryId),

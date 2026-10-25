@@ -151,7 +151,13 @@ export type FactoryEffectRequest =
    * A parent's approved plan: create the child Work item of each of its tasks that has none yet,
    * in plan order, then store the children's queued deliveries.
    */
-  | { readonly type: "create_children" };
+  | { readonly type: "create_children" }
+  /**
+   * Start the parent's child delivery, which is queued, or leave it as it is when it has started
+   * before, as when a resume starts again the child a parent waited on. Answered by
+   * `child.started`, after which the parent waits for that child's approval.
+   */
+  | { readonly type: "start_child"; readonly child: FactoryDeliveryId };
 
 export type FactoryRepairKind = "fix-verify" | "fix-review";
 
@@ -189,12 +195,13 @@ export const isTurnEffect = (effect: FactoryEffect): effect is FactoryTurnEffect
   effect.type === "send_review_follow_up_turn";
 
 /**
- * What the delivery waits for: the worker's result for one issued effect, or the end of one run.
- * Only an event that answers it advances the delivery.
+ * What the delivery waits for: the worker's result for one issued effect, the end of one run, or,
+ * for a parent, the approval of one child. Only an event that answers it advances the delivery.
  */
 export type FactoryAwaiting =
   | { readonly type: "effect"; readonly effect: FactoryEffect }
-  | { readonly type: "run"; readonly threadId: ThreadId; readonly runId: RunId };
+  | { readonly type: "run"; readonly threadId: ThreadId; readonly runId: RunId }
+  | { readonly type: "child"; readonly deliveryId: FactoryDeliveryId };
 
 /**
  * A settle evaluation. Repairable problems get one fix-commit turn; unrepairable ones (an AI
@@ -472,6 +479,10 @@ export type FactoryEvent =
       readonly effectId: number;
       readonly children: ReadonlyArray<FactoryDeliveryId>;
     }
+  /** A `start_child` result: the child runs, or ran before. */
+  | { readonly type: "child.started"; readonly effectId: number }
+  /** A parent's child reports that it ended approved at record. */
+  | { readonly type: "child.approved"; readonly deliveryId: FactoryDeliveryId }
   /** The worker could not carry out the effect; `detail` is bounded and safe to show. */
   | { readonly type: "effect.failed"; readonly effectId: number; readonly detail: string };
 
@@ -538,9 +549,11 @@ export const defaultRoundLimits: FactoryRoundLimits = { maxFixRounds: 2, maxRevi
 
 /**
  * A single item is its delivery's one task. A parent first plans its tasks, which wait at the
- * plan gate for the owner's approval.
+ * plan gate for the owner's approval; each approved task becomes a child, which runs like a single
+ * item on the parent's branch and worktree but ends approved at record, since the parent's one
+ * pull request carries its work.
  */
-export type FactoryDeliveryKind = "single" | "parent";
+export type FactoryDeliveryKind = "single" | "parent" | "child";
 
 export interface FactoryDeliveryState {
   readonly kind: FactoryDeliveryKind;
@@ -609,6 +622,11 @@ export interface FactoryDeliveryState {
   readonly planApproved: boolean;
   /** A parent's child deliveries in plan order, once they are created; none before. */
   readonly children: ReadonlyArray<FactoryDeliveryId>;
+  /**
+   * The children that reported their approval, in the order they did. A parent starts the first
+   * of its children not among them, one at a time.
+   */
+  readonly approvedChildren: ReadonlyArray<FactoryDeliveryId>;
   /** Set once the PR stage has opened the delivery's pull request. */
   readonly pullRequest: FactoryOpenedPullRequest | null;
   /** Set while the delivery is blocked. */
@@ -632,10 +650,11 @@ export const runsStages = (delivery: FactoryDeliveryState) =>
 /**
  * Whether the server moves the delivery on by itself: while it runs its stages, and once
  * approved, while it opens its pull request. A delivery in any other status waits for its owner,
- * so no worker result is coming for an effect it still names.
+ * so no worker result is coming for an effect it still names. An approved child has nothing left
+ * to run: its parent's pull request carries its work.
  */
 export const isProceeding = (delivery: FactoryDeliveryState) =>
-  runsStages(delivery) || delivery.status === "approved";
+  runsStages(delivery) || (delivery.status === "approved" && delivery.kind !== "child");
 
 /** Done and cancelled deliveries never change again. */
 export const isTerminal = (delivery: FactoryDeliveryState) =>
@@ -705,6 +724,7 @@ export const queuedDeliveryState = (input: {
   plan: null,
   planApproved: false,
   children: [],
+  approvedChildren: [],
   pullRequest: null,
   block: null,
   checkpoint: null,
@@ -757,6 +777,10 @@ export const planAtGate = (delivery: FactoryDeliveryState) => {
     ? plan
     : undefined;
 };
+
+/** The first of a parent's children that has not reported its approval; none once every one has. */
+export const nextChild = (delivery: FactoryDeliveryState) =>
+  delivery.children.find((child) => !delivery.approvedChildren.includes(child));
 
 /** The accepted review of the current round, once there is one. */
 export const acceptedReview = (delivery: FactoryDeliveryState) => {

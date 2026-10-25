@@ -226,6 +226,7 @@ const make = Effect.gen(function* () {
               itemRef: { sourceId: parent.itemRef.sourceId, itemId },
               parentId: parent.deliveryId,
               state: queuedDeliveryState({
+                kind: "child",
                 branch: state.branch,
                 baseRef: state.baseRef,
                 ...(state.worktreePath === null ? {} : { worktreePath: state.worktreePath }),

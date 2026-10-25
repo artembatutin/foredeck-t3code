@@ -80,12 +80,18 @@ const check = (deletedThreads: ReadonlyArray<ThreadId> = []): FactoryResumeCheck
   unrecordedAuthorRunEnded: false,
   worktree: null,
 });
-const unsupported = {
-  status: "blocked",
-  stage: "author",
-  awaiting: null,
-  block: { reason: "unsupported_stage", stage: "author" },
-} as const;
+/** The first child's start, as the effect after `effectsIssued`. */
+const startFirst = (effectsIssued: number) =>
+  ({ id: effectsIssued + 1, type: "start_child", child: children[0]! }) as const;
+/** A parent with its children that waits on the start of the first. */
+const startingFirst = (effectsIssued: number) =>
+  ({
+    status: "running",
+    stage: "author",
+    children,
+    effectsIssued: effectsIssued + 1,
+    awaiting: { type: "effect", effect: startFirst(effectsIssued) },
+  }) as const;
 
 describe("a plan approval", () => {
   it("freezes the plan at the gate and asks for the children, running", () => {
@@ -135,10 +141,10 @@ describe("a plan approval", () => {
 });
 
 describe("a parent's created children", () => {
-  it("are recorded in plan order, and the parent blocks at its per-child phase", () => {
+  it("are recorded in plan order, and the parent starts the first", () => {
     expect(advance(creating, created(2))).toEqual({
-      delivery: { ...creating, ...unsupported, children },
-      effects: [],
+      delivery: { ...creating, ...startingFirst(2) },
+      effects: [startFirst(2)],
     } satisfies FactoryAdvance);
   });
 
@@ -186,7 +192,7 @@ describe("resuming an approved parent", () => {
     // The new effect's children are taken; the failed one's never are.
     const resumed = fold(blocked, { type: "resume", check: check() });
     expect(advance(resumed, created(2)).delivery).toBe(resumed);
-    expect(advance(resumed, created(3)).delivery).toMatchObject({ ...unsupported, children });
+    expect(advance(resumed, created(3)).delivery).toMatchObject(startingFirst(3));
   });
 
   it("is not held by its planner thread's deletion, which it no longer needs", () => {
@@ -198,11 +204,22 @@ describe("resuming an approved parent", () => {
   });
 
   it.each([
-    ["blocked at its per-child phase", fold(creating, created(2))],
+    [
+      "blocked at its per-child phase by an earlier server",
+      {
+        ...fold(creating, created(2)),
+        effectsIssued: 2,
+        awaiting: null,
+        status: "blocked",
+        block: { reason: "unsupported_stage", stage: "author" },
+      } satisfies FactoryDeliveryState,
+    ],
     ["stopped where that phase would begin", fold(creating, { type: "stop" }, created(2))],
-  ])("with its children, blocks again where it was when %s", (_name, delivery) => {
+  ])("with its children, starts the first without creating any when %s", (_name, delivery) => {
     const step = advance(delivery, { type: "resume", check: check() });
-    expect(step.delivery).toEqual({ ...delivery, ...unsupported, checkpoint: null, children });
-    expect(step.effects).toEqual([]);
+    expect(step).toEqual({
+      delivery: { ...delivery, ...startingFirst(2), block: null, checkpoint: null },
+      effects: [startFirst(2)],
+    } satisfies FactoryAdvance);
   });
 });

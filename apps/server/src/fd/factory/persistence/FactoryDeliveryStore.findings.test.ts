@@ -131,6 +131,7 @@ describe("FactoryDeliveryStore with reviews accepted before details", () => {
         plan: null,
         planApproved: false,
         children: [],
+        approvedChildren: [],
       });
       for (const review of loaded.state.reviews) expect(review).not.toHaveProperty("details");
     }).pipe(Effect.provide(persistence)),

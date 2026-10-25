@@ -427,8 +427,8 @@ const itemsOf = (items: ReadonlyArray<FakeItem>) =>
 
 /**
  * The parent once each task's child (`children`, the source's items when not given) exists under
- * it, blocked by the one before: its queued child deliveries are stored, and it blocks where its
- * per-child phase would begin.
+ * it, blocked by the one before: its queued child deliveries are stored, and it blocks on the start
+ * of the first, which this server's worker does not carry out yet.
  */
 const assertChildrenCreated = (world: World, children: ReadonlyArray<FakeItem> = world.items) =>
   Effect.gen(function* () {
@@ -440,12 +440,21 @@ const assertChildrenCreated = (world: World, children: ReadonlyArray<FakeItem> =
     ]);
     assert.deepStrictEqual(yield* childItemIds, itemIds);
 
-    const snapshot = toFactoryDelivery(yield* parent);
+    const blocked = yield* parent;
+    const snapshot = toFactoryDelivery(blocked);
     const childIds = tasks.map(({ id }) => FactoryChildren.childDeliveryId(parentId, id));
     assert.deepStrictEqual(snapshot.childIds, childIds);
     assert.strictEqual(snapshot.status, "blocked");
     assert.deepStrictEqual(snapshot.stage, { name: "author", kind: "agent" });
-    assert.strictEqual(snapshot.needsYou, "This server cannot run the author stage.");
+    const { block } = blocked.state;
+    assert.strictEqual(block?.reason, "effect_failed");
+    if (block?.reason === "effect_failed") {
+      assert.deepInclude(block.effect, { type: "start_child", child: childIds[0]! });
+    }
+    assert.strictEqual(
+      snapshot.needsYou,
+      "Factory could not start the child delivery (FactoryChildStartUnsupportedError).",
+    );
 
     const stored = yield* childrenOf;
     assert.deepStrictEqual(
@@ -459,6 +468,7 @@ const assertChildrenCreated = (world: World, children: ReadonlyArray<FakeItem> =
       assert.deepStrictEqual(
         child?.state,
         queuedDeliveryState({
+          kind: "child",
           branch: "work/fd-parent",
           baseRef: "HEAD",
           worktreePath,
