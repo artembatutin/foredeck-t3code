@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
-import type { ThreadId } from "@t3tools/contracts";
+import { ThreadId } from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -55,6 +56,23 @@ const twoTaskPlan = {
   ],
 };
 
+/** `twoTaskPlan` with a third task after them. */
+const threeTaskPlan = {
+  tasks: [
+    ...twoTaskPlan.tasks,
+    {
+      id: "export-totals",
+      title: "Sum the numeric columns",
+      kind: "feature",
+      summary: "Add a totals row under the exported rows.",
+      acceptance: ["The last row sums each numeric column."],
+      testPlan: [{ criterion: 1, check: "Sum two rows.", paths: ["export.test.ts"] }],
+      likelyPaths: ["export.ts"],
+      risk: "normal",
+    },
+  ],
+};
+
 /** A passing review whose one criterion cites the file each child's author commits. */
 const passingReview = {
   verdict: "pass",
@@ -94,21 +112,24 @@ const checkouts = (world: World) =>
   }).pipe(Effect.orDie);
 
 /**
- * A parent whose planner's two-task plan its owner approved, once its first child has started;
- * `atGate` runs while it waits at the plan gate. Returns the parent, its children in plan order,
- * and the repository's checkouts and the main branch's commit from before the approval: the
- * parent's branch started there.
+ * A parent whose planner's plan (two tasks unless given) its owner approved, once its first child
+ * has started; `atGate` runs while it waits at the plan gate. Returns the parent, its first two
+ * children in plan order and all of them, and the repository's checkouts and the main branch's
+ * commit from before the approval: the parent's branch started there.
  */
 const approvedParent = <E = never, R = never>(
   world: World,
-  atGate: (worktreePath: string) => Effect.Effect<unknown, E, R> = () => Effect.void,
+  options: {
+    readonly plan?: unknown;
+    readonly atGate?: (worktreePath: string) => Effect.Effect<unknown, E, R>;
+  } = {},
 ) =>
   Effect.gen(function* () {
     const factory = yield* service;
     const planner = yield* world.startWith({ kind: "parent" });
-    yield* factory.submitPlan({ threadId: planner.threadId, plan: twoTaskPlan });
+    yield* factory.submitPlan({ threadId: planner.threadId, plan: options.plan ?? twoTaskPlan });
     yield* world.endRun(planner.runId, "completed");
-    yield* atGate(planner.worktreePath);
+    if (options.atGate !== undefined) yield* options.atGate(planner.worktreePath);
     const before = yield* checkouts(world);
     const branchStart = yield* git(world.root, ["rev-parse", "main"]);
     yield* factory.approvePlan(planner.deliveryId);
@@ -122,6 +143,7 @@ const approvedParent = <E = never, R = never>(
       worktreePath: planner.worktreePath,
       branch: parent.branch,
       children: [first, second] as const,
+      all: parent.children,
       before,
       branchStart,
     };
@@ -268,9 +290,10 @@ describe("an approved parent's children", () => {
     withProject(verifyCommands.passes, (world) =>
       Effect.gen(function* () {
         // A commit lands on the parent's branch while its plan waits at the gate.
-        const parent = yield* approvedParent(world, (worktreePath) =>
-          authorCommits(worktreePath, "docs: note the CSV format", "format\n"),
-        );
+        const parent = yield* approvedParent(world, {
+          atGate: (worktreePath) =>
+            authorCommits(worktreePath, "docs: note the CSV format", "format\n"),
+        });
         const [first, second] = parent.children;
 
         // The first child starts where the parent's branch started, not at the HEAD it found,
@@ -415,6 +438,140 @@ describe("an approved parent's children", () => {
         assert.strictEqual(turnsOf(world, author.threadId).length, 1);
 
         // The worktree, its branch and the child's commit stay.
+        assert.isTrue(yield* fileSystem.exists(parent.worktreePath));
+        assert.strictEqual(yield* head(parent.worktreePath), committed);
+        assert.strictEqual(
+          yield* git(world.root, ["rev-parse", `refs/heads/${parent.branch}`]),
+          committed,
+        );
+      }),
+    ),
+  );
+
+  it.live("are cancelled with a parent cancelled while the first's launch is pending", () =>
+    Effect.gen(function* () {
+      // The first child's author launch waits here, before anything is dispatched for it.
+      const launching = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const hold = { armed: true };
+      return yield* withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const fileSystem = yield* FileSystem.FileSystem;
+            const factory = yield* service;
+            const planner = yield* world.startWith({ kind: "parent" });
+            yield* factory.submitPlan({ threadId: planner.threadId, plan: twoTaskPlan });
+            yield* world.endRun(planner.runId, "completed");
+            yield* factory.approvePlan(planner.deliveryId);
+            yield* Deferred.await(launching);
+            const [first, second] = (yield* stateOf(planner.deliveryId)).children;
+            if (first === undefined || second === undefined) return assert.fail("No children.");
+            assert.strictEqual((yield* stateOf(first)).status, "running");
+            const committed = yield* head(planner.worktreePath);
+
+            const cancelled = yield* factory.cancel(planner.deliveryId);
+            assert.strictEqual(cancelled.state.status, "cancelled");
+            const firstCancelled = yield* stateOf(first);
+            assert.strictEqual(firstCancelled.status, "cancelled");
+            assert.strictEqual((yield* stateOf(second)).status, "cancelled");
+
+            // The launch goes through after the cancel: neither delivery takes it, and its run is
+            // interrupted, so no agent works on in the shared worktree.
+            yield* Deferred.succeed(release, undefined);
+            yield* drainFactory;
+            yield* drainOrchestration;
+            const { runs } = yield* threadProjection(ThreadId.make(`factory-thread:${first}:1`));
+            assert.deepStrictEqual(
+              runs.map(({ status }) => status),
+              ["interrupted"],
+            );
+            assert.deepStrictEqual(yield* stateOf(first), firstCancelled);
+            assert.deepStrictEqual(yield* stateOf(planner.deliveryId), cancelled.state);
+            assert.strictEqual((yield* stateOf(second)).status, "cancelled");
+            // The provider never started a turn for it.
+            assert.deepStrictEqual(turnsOf(world, ThreadId.make(`factory-thread:${first}:1`)), []);
+
+            // The worktree and its branch stay.
+            assert.isTrue(yield* fileSystem.exists(planner.worktreePath));
+            assert.strictEqual(yield* head(planner.worktreePath), committed);
+          }).pipe(Effect.orDie),
+        {
+          work: (work) => ({
+            ...work,
+            linkLaunch: (input, launch) =>
+              hold.armed && input.threadId.startsWith("factory-thread:child-")
+                ? Effect.gen(function* () {
+                    hold.armed = false;
+                    yield* Deferred.succeed(launching, undefined);
+                    yield* Deferred.await(release);
+                    return yield* work.linkLaunch(input, launch);
+                  })
+                : work.linkLaunch(input, launch),
+          }),
+        },
+      );
+    }),
+  );
+
+  it.live("are cancelled with their parent when the owner cancels one, keeping approvals", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const factory = yield* service;
+        const parent = yield* approvedParent(world, { plan: threeTaskPlan });
+        const [first, second] = parent.children;
+        const third = parent.all[2] ?? assert.fail("Three children exist.");
+        yield* authorDone(world, first, "feat: export the table as CSV", "csv\n");
+        yield* passReview(world, first);
+        const approved = yield* head(parent.worktreePath);
+        const author = yield* world.launched(second);
+        yield* authorCommits(parent.worktreePath, "fix: write a header row first", "h\ncsv\n");
+        const committed = yield* head(parent.worktreePath);
+
+        // Owner decision: cancelling a child cancels its parent and its unfinished siblings.
+        const cancelled = yield* factory.cancel(second).pipe(Effect.orDie);
+        assert.strictEqual(cancelled.state.status, "cancelled");
+        yield* drainFactory;
+        yield* drainOrchestration;
+        const ended = {
+          parent: yield* stateOf(parent.parentId),
+          first: yield* stateOf(first),
+          second: yield* stateOf(second),
+          third: yield* stateOf(third),
+        };
+        assert.strictEqual(ended.parent.status, "cancelled");
+        assert.isNull(ended.parent.awaiting);
+        assert.strictEqual(ended.second.status, "cancelled");
+        assert.strictEqual(ended.third.status, "cancelled");
+        // The approved child keeps its approval, as the parent's task does.
+        assert.strictEqual(ended.first.status, "approved");
+        assert.strictEqual((yield* taskRows(parent.parentId))[0]?.lastReviewedSha, approved);
+        const { evidence } = yield* approvalEvidence(world, first, "export-csv");
+        assert.strictEqual(evidence.headSha, approved);
+        // The cancelled child's author was asked to stop its run, through the thread's interrupt.
+        const turn = world.provider.started.find(({ runId }) => runId === author.runId);
+        assert.deepStrictEqual(
+          world.provider.interrupted.map(({ providerTurnId }) => providerTurnId),
+          [`provider-turn:${turn?.attemptId}`],
+        );
+
+        // It cannot resume, and its run's late end changes no delivery.
+        const refused = yield* Effect.flip(factory.resume(second));
+        assert.strictEqual(refused._tag, "FactoryResumeRefusedError");
+        yield* world.endRun(author.runId, "completed");
+        assert.deepStrictEqual(
+          {
+            parent: yield* stateOf(parent.parentId),
+            first: yield* stateOf(first),
+            second: yield* stateOf(second),
+            third: yield* stateOf(third),
+          },
+          ended,
+        );
+        assert.strictEqual(turnsOf(world, author.threadId).length, 1);
+
+        // The worktree, its branch and every commit stay.
         assert.isTrue(yield* fileSystem.exists(parent.worktreePath));
         assert.strictEqual(yield* head(parent.worktreePath), committed);
         assert.strictEqual(

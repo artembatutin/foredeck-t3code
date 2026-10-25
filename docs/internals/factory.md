@@ -46,8 +46,9 @@ parent starts it: where the parent's branch started for the first child, and the
 before it was approved for (its `lastReviewedSha`) after that. Not the HEAD its author finds: a
 commit made while the plan waits at the gate, or between two children, is then judged by the next
 child's settle check and review instead of passing into the branch unreviewed. A parent stored
-before planners recorded where its branch started has none, and its first child starts from that
-HEAD.
+before planner launches recorded where its branch started has it read from its branch's reflog
+when its first child starts, and keeps it; a reflog that no longer holds the creation refuses the
+start, and the parent blocks rather than take HEAD for it.
 
 ## A delivery's launches stay under its starter's mode
 
@@ -257,10 +258,18 @@ request read the approved commit. A child that blocks blocks alone: the parent k
 it, and the owner resumes the child.
 
 The worker starts a child under the parent's lock, and only while the parent still awaits that
-start, so a cancelled parent starts none; a parent's cancel cancels its children that are not
-approved, interrupting what their threads run. It takes a parent's lock before a child's, never
-the other way: a child's approval reaches its parent only once the child's step has released its
-lock ([`FactoryWorker.ts`](../../apps/server/src/fd/factory/FactoryWorker.ts)). An approval stored
+start, so a cancelled parent starts none. The child's start commits before the parent stores the
+result, so the child can run, even to its approval, before its parent waits for it: the parent
+takes an approval stored by then as it takes the start, and the boot sweep takes a start a
+restart kept from the parent, with that approval, rather than block on the lost effect.
+
+A parent's cancel cancels its children that are not approved, and by owner decision a child's own
+cancel cancels its parent, so its unfinished siblings too; each stops what its threads run, and
+approved children keep their approvals. Each delivery's cancel is its own commit, so the boot
+sweep completes a cancellation a restart cut short between a parent and its children before
+anything else moves them. The worker takes a parent's lock before a child's, never the other way:
+a child's approval or cancel reaches its parent only once the child's step has released its lock
+([`FactoryWorker.ts`](../../apps/server/src/fd/factory/FactoryWorker.ts)). An approval stored
 while no server handed it on is handed on by the boot sweep, once, since the parent then waits for
 its next child.
 

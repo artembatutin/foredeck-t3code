@@ -68,16 +68,20 @@ const make = Effect.gen(function* () {
     );
 
   /**
-   * Catches one delivery up with what happened while no server ran it, whatever its status. A
+   * Catches one delivery up with what happened while no server ran it, whatever its status. First
+   * a cancellation the restart cut short between a parent and its children is completed. A
    * delivery awaiting a run gets the run's end or its thread's deletion, as the tail would have
    * handed them on, so a stopping one stops where the run's end leads it. One awaiting an effect
-   * lost it with the previous process and blocks. A parent awaiting its child takes the child's
-   * approval stored before the restart, and otherwise waits for that child. A delivery awaiting
-   * nothing (queued, stopped, blocked, its pull request open) waits for its owner.
+   * lost it with the previous process and blocks, unless what it did is stored (see
+   * `failInterruptedEffect`). A parent awaiting its child takes the child's approval stored
+   * before the restart, and otherwise waits for that child. A delivery awaiting nothing (queued,
+   * stopped, blocked, its pull request open) waits for its owner. Each step reads the delivery
+   * again, so one cancelled here takes nothing more.
    */
   const reconcile = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
     Effect.gen(function* () {
       const { deliveryId, state } = delivery;
+      yield* worker.finishCancellation(deliveryId);
       const { awaiting } = state;
       if (awaiting === null) return;
       if (awaiting.type === "child") {

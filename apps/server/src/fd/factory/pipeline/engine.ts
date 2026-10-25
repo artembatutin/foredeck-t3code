@@ -801,7 +801,13 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       const start = awaitedEffect(delivery, event.effectId, "start_child");
       return start === undefined
         ? unchanged(delivery)
-        : step({ ...delivery, awaiting: { type: "child", deliveryId: start.child } });
+        : step({
+            ...delivery,
+            // A parent stored before planner launches recorded where its branch started keeps
+            // its first child's baseline, which is that commit.
+            baseline: delivery.baseline ?? event.baseline ?? null,
+            awaiting: { type: "child", deliveryId: start.child },
+          });
     }
 
     case "child.approved":

@@ -484,8 +484,11 @@ export type FactoryEvent =
       readonly effectId: number;
       readonly children: ReadonlyArray<FactoryDeliveryId>;
     }
-  /** A `start_child` result: the child runs, or ran before. */
-  | { readonly type: "child.started"; readonly effectId: number }
+  /**
+   * A `start_child` result: the child runs, or ran before. For the parent's first child, its
+   * baseline, which is where the parent's branch started.
+   */
+  | { readonly type: "child.started"; readonly effectId: number; readonly baseline?: string }
   /** A parent's child reports that it ended approved at record. */
   | { readonly type: "child.approved"; readonly deliveryId: FactoryDeliveryId }
   /** The worker could not carry out the effect; `detail` is bounded and safe to show. */
@@ -572,7 +575,8 @@ export interface FactoryDeliveryState {
   /**
    * The task baseline; settle checks require it to be an ancestor of HEAD and judge only the
    * commits after it. Set once: HEAD before a single item's author's first turn, where a parent's
-   * planner launch created its branch, or a child's, assigned by its parent at its start.
+   * planner launch created its branch (or, for a parent stored before planner launches recorded
+   * it, its first child's start), or a child's, assigned by its parent at its start.
    */
   readonly baseline: string | null;
   /** The latest thread of each role. */

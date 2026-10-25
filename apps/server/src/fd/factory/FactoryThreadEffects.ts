@@ -32,6 +32,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkActor, WorkService } from "../work-management/index.ts";
 import { readReviewEvidence, reviewBasis } from "./FactoryReview.ts";
+import { FactoryBranchStartError, readBranchCreation } from "./git/branchStart.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import type { StoredFactoryDelivery } from "./persistence/FactoryDeliveryStore.ts";
 import { escalateEffort } from "./pipeline/effort.ts";
@@ -89,16 +90,6 @@ export class FactoryBaselineError extends Schema.TaggedError<FactoryBaselineErro
 ) {
   override get message(): string {
     return `Factory could not resolve ${this.ref} to a commit in ${this.path}.`;
-  }
-}
-
-/** Neither the branch's reflog nor an unmoved HEAD tells which commit a new worktree started at. */
-export class FactoryBranchStartError extends Schema.TaggedError<FactoryBranchStartError>()(
-  "FactoryBranchStartError",
-  { path: Schema.String, branch: Schema.String, cause: Schema.optional(Schema.Defect()) },
-) {
-  override get message(): string {
-    return `Factory could not tell which commit branch ${this.branch} started at in ${this.path}.`;
   }
 }
 
@@ -408,31 +399,10 @@ const make = Effect.gen(function* () {
    */
   const branchStart = (worktreePath: string, branch: string, resolved: string) =>
     Effect.gen(function* () {
-      const reflog = yield* git
-        .execute({
-          operation: "FactoryThreadEffects.branchStart",
-          cwd: worktreePath,
-          args: ["reflog", "show", "--format=%H%x00%gs", `refs/heads/${branch}`, "--"],
-          allowNonZeroExit: true,
-          timeoutMs: 30_000,
-          maxOutputBytes: 1_000_000,
-        })
-        .pipe(
-          Effect.catchTags({
-            GitCommandError: (cause) =>
-              Effect.fail(new FactoryBranchStartError({ path: worktreePath, branch, cause })),
-          }),
-        );
-      // Newest first: the oldest entry is the branch's creation.
-      const [sha = "", subject = ""] = (reflog.stdout.trim().split("\n").at(-1) ?? "").split("\0");
-      if (
-        reflog.exitCode === 0 &&
-        !reflog.stdoutTruncated &&
-        OBJECT_ID.test(sha) &&
-        subject.startsWith("branch: Created from ")
-      ) {
-        return sha;
-      }
+      const created = yield* readBranchCreation(worktreePath, branch).pipe(
+        Effect.provideService(GitVcsDriver.GitVcsDriver, git),
+      );
+      if (Option.isSome(created)) return created.value;
       const head = yield* resolveCommit(worktreePath, "HEAD");
       return head === resolved
         ? head

@@ -419,7 +419,8 @@ export class FactoryService extends Context.Service<
     /**
      * Cancels a delivery that is not done or cancelled. It ends at once and issues nothing more,
      * and whatever its threads still run is interrupted; the worktree, branch and commits stay. A
-     * parent's children that are not approved are cancelled with it, alike. No later run end,
+     * parent's children that are not approved are cancelled with it, alike, and a child cancels
+     * its parent so (owner decision); approved children keep their approvals. No later run end,
      * effect result or review submission changes it, and its item can be delivered again.
      * Refused, with nothing changed, once done or cancelled.
      */
