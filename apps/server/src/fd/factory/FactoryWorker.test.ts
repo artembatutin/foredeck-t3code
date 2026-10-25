@@ -24,6 +24,7 @@ import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
+import * as FactoryWorkComments from "./FactoryWorkComments.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
@@ -104,6 +105,8 @@ const observedStore = (script: ThreadScript) =>
 /** The worker on in-memory SQLite, real git and real processes, with scripted thread effects. */
 const makeLayer = (script: ThreadScript) =>
   FactoryWorker.layer.pipe(
+    // Transition comments are posted in FactoryWorkComments.test.ts; none is posted here.
+    Layer.provide(Layer.mock(FactoryWorkComments.FactoryWorkComments)({ post: () => Effect.void })),
     Layer.provide(observedStore(script)),
     Layer.provide(scriptedThreads(script)),
     // Reviews are judged in FactoryReview.test.ts, approvals recorded in FactoryRecord.test.ts and

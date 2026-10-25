@@ -48,6 +48,7 @@ import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
+import * as FactoryWorkComments from "./FactoryWorkComments.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
@@ -204,6 +205,8 @@ const fakes = (world: World) =>
 /** The worker with the real thread effects over the fakes, in-memory SQLite and real git. */
 const makeLayer = (world: World) =>
   FactoryWorker.layer.pipe(
+    // Transition comments are posted in FactoryWorkComments.test.ts; none is posted here.
+    Layer.provide(Layer.mock(FactoryWorkComments.FactoryWorkComments)({ post: () => Effect.void })),
     Layer.provide(
       Layer.mergeAll(
         FactoryThreadEffects.layer,

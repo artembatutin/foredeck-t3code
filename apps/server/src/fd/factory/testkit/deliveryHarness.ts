@@ -24,7 +24,7 @@ import {
   type FactoryDeliveryId,
   FactoryProjectSettings,
 } from "@t3tools/contracts/fd/factory";
-import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
+import type { WorkCommentInput, WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -293,6 +293,12 @@ export interface PullRequestCall {
   readonly branch: string;
 }
 
+/** A comment posted through Work, as the Work service received it. */
+export interface CommentCall {
+  readonly actor: WorkManagement.WorkActor;
+  readonly input: WorkCommentInput;
+}
+
 /** The pull request the fake PR service opens for any branch. */
 export const fakePullRequest = { number: 7, url: "https://github.com/acme/alpha/pull/7" };
 
@@ -415,6 +421,21 @@ const work = WorkManagement.WorkService.layer.pipe(
   Layer.provide(Layer.mock(ServerSecretStore.ServerSecretStore)({})),
 );
 
+/** `work`, recording each comment before Work posts it. */
+const recordingWork = (calls: Array<CommentCall>) =>
+  Layer.effect(
+    WorkManagement.WorkService.WorkService,
+    Effect.map(WorkManagement.WorkService.WorkService, (service) =>
+      WorkManagement.WorkService.WorkService.of({
+        ...service,
+        addComment: (actor, input) =>
+          Effect.sync(() => calls.push({ actor, input })).pipe(
+            Effect.andThen(service.addComment(actor, input)),
+          ),
+      }),
+    ),
+  ).pipe(Layer.provideMerge(work));
+
 /**
  * Factory's reactor over the event sink the orchestrator commits through. `Factory.workerLayer`
  * cannot be used here: it brings the server runtime's own sink, which never sees the replay
@@ -453,6 +474,7 @@ const makeLayer = (input: {
   readonly provider: FakeProvider;
   readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
   readonly pullRequestCalls: Array<PullRequestCall>;
+  readonly commentCalls: Array<CommentCall>;
   readonly root: string;
   readonly t3Home: string;
 }) => {
@@ -479,7 +501,7 @@ const makeLayer = (input: {
     Layer.provide(fakePullRequests(input.pullRequestCalls)),
     Layer.provide(ProviderRegistryMock.layer()),
     Layer.provide(instances),
-    Layer.provideMerge(work),
+    Layer.provideMerge(recordingWork(input.commentCalls)),
     Layer.provideMerge(threadLaunch),
     Layer.provideMerge(projectService),
     Layer.provideMerge(ThreadManagement.layer),
@@ -582,6 +604,8 @@ export interface World {
   readonly rootStatus: string;
   /** Every stacked action the fake PR service ran, in order. */
   readonly pullRequestCalls: ReadonlyArray<PullRequestCall>;
+  /** Every comment posted through Work, in order; the item's own source holds them too. */
+  readonly commentCalls: ReadonlyArray<CommentCall>;
   readonly evidenceDir: (deliveryId: FactoryDeliveryId) => string;
   readonly exists: (path: string) => Effect.Effect<boolean>;
   /** Starts the delivery and returns it once its author's first turn is running. */
@@ -627,6 +651,7 @@ export const withProject = <A, E>(
     yield* fileSystem.makeDirectory(root);
     const provider = yield* makeFakeProvider;
     const pullRequestCalls: Array<PullRequestCall> = [];
+    const commentCalls: Array<CommentCall> = [];
 
     return yield* Effect.gen(function* () {
       // The project's remote: a bare repository the fake PR service pushes to.
@@ -715,6 +740,7 @@ export const withProject = <A, E>(
         itemTitle: item.title,
         rootStatus,
         pullRequestCalls,
+        commentCalls,
         evidenceDir: (deliveryId) => path.join(t3Home, "userdata", "fd-factory", deliveryId),
         exists: (target) => fileSystem.exists(target).pipe(Effect.orElseSucceed(() => false)),
         start: startWith({}),
@@ -728,6 +754,7 @@ export const withProject = <A, E>(
           provider,
           supportedRuntimeModes: options.supportedRuntimeModes,
           pullRequestCalls,
+          commentCalls,
           root,
           t3Home,
         }),

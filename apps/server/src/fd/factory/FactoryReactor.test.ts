@@ -36,6 +36,7 @@ import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
+import * as FactoryWorkComments from "./FactoryWorkComments.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import { FactoryStoreError } from "./persistence/errors.ts";
@@ -312,6 +313,8 @@ const setup = Effect.gen(function* () {
     if (logLevel === "Warn" && typeof first === "string") world.warnings.push(first);
   });
   const worker = FactoryWorker.layer.pipe(
+    // Transition comments are posted in FactoryWorkComments.test.ts; none is posted here.
+    Layer.provide(Layer.mock(FactoryWorkComments.FactoryWorkComments)({ post: () => Effect.void })),
     Layer.provide(failingStore(world)),
     Layer.provide(fakeThreads(world)),
     Layer.provide(fakeVerify(world)),

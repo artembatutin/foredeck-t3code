@@ -9,6 +9,7 @@ import * as FactoryReview from "./FactoryReview.ts";
 import * as FactoryService from "./FactoryService.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
+import * as FactoryWorkComments from "./FactoryWorkComments.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryMigrations from "./persistence/FactoryMigrations.ts";
@@ -46,8 +47,8 @@ export const layerPersistence = Layer.mergeAll(
  * reactor. Needs Work's service, the orchestration application (thread launches, management and
  * the orchestrator), the project store and service, server settings and config, the provider
  * registry (for model options), the Git workflow (for pull requests), the git driver and the
- * process runner. The thread, verify, review, record and pull request effects stay private to
- * the service and worker.
+ * process runner. The thread, verify, review, record and pull request effects and the Work
+ * comments on transitions stay private to the service and worker.
  * server.ts also mounts `layerPersistence` with core and Work persistence, so the ledger migrates
  * with theirs; one build shares the one instance.
  */
@@ -60,6 +61,7 @@ export const layerLive = FactoryService.layer.pipe(
       FactoryReview.layer,
       FactoryRecord.layer,
       FactoryPullRequest.layer,
+      FactoryWorkComments.layer,
     ),
   ),
   Layer.provide(FactoryEvidence.layer),

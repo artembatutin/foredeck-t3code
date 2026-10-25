@@ -113,7 +113,8 @@ const blockReason = (state: FactoryDeliveryState, block: FactoryBlock): string =
   }
 };
 
-const needsYou = (state: FactoryDeliveryState): string | undefined => {
+/** Why a blocked delivery waits on its owner; its Work comment on blocking says the same. */
+export const needsYou = (state: FactoryDeliveryState): string | undefined => {
   if (state.status !== "blocked") return undefined;
   const reason =
     state.block === null ? "Factory blocked this delivery." : blockReason(state, state.block);

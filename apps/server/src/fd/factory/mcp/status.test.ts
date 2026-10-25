@@ -46,6 +46,7 @@ import * as FactoryReview from "../FactoryReview.ts";
 import * as FactoryService from "../FactoryService.ts";
 import * as FactorySettings from "../FactorySettings.ts";
 import * as FactoryThreadEffects from "../FactoryThreadEffects.ts";
+import * as FactoryWorkComments from "../FactoryWorkComments.ts";
 import * as FactoryWorker from "../FactoryWorker.ts";
 import * as Factory from "../index.ts";
 import { FactoryStoreError } from "../persistence/errors.ts";
@@ -123,6 +124,8 @@ const shells = new Map<ThreadId, OrchestrationV2ThreadShell>([
  */
 const layer = FactoryService.layer.pipe(
   Layer.provideMerge(FactoryWorker.layer),
+  // Transition comments are posted in FactoryWorkComments.test.ts; none is posted here.
+  Layer.provide(Layer.mock(FactoryWorkComments.FactoryWorkComments)({ post: () => Effect.void })),
   Layer.provide(FactoryReview.layer),
   Layer.provide(FactoryEvidence.layer),
   Layer.provide(

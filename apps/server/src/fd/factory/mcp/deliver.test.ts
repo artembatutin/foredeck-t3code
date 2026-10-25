@@ -34,6 +34,7 @@ import * as FactoryReview from "../FactoryReview.ts";
 import * as FactoryService from "../FactoryService.ts";
 import * as FactorySettings from "../FactorySettings.ts";
 import * as FactoryThreadEffects from "../FactoryThreadEffects.ts";
+import * as FactoryWorkComments from "../FactoryWorkComments.ts";
 import * as FactoryWorker from "../FactoryWorker.ts";
 import * as Factory from "../index.ts";
 import {
@@ -330,6 +331,8 @@ const missingProject = (() => {
   const itemRef = { sourceId, itemId: WorkItemId.make("fd-aaaaaa") };
   const layer = FactoryService.layer.pipe(
     Layer.provideMerge(FactoryWorker.layer),
+    // Transition comments are posted in FactoryWorkComments.test.ts; none is posted here.
+    Layer.provide(Layer.mock(FactoryWorkComments.FactoryWorkComments)({ post: () => Effect.void })),
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProjectStore.ProjectStoreV2)({ get: () => Effect.succeedNone }),

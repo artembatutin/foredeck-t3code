@@ -51,6 +51,7 @@ import * as FactoryReview from "./FactoryReview.ts";
 import * as FactoryService from "./FactoryService.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
+import * as FactoryWorkComments from "./FactoryWorkComments.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
@@ -251,6 +252,8 @@ const gatedRecord = (world: World) =>
 const makeLayer = (world: World) =>
   FactoryService.layer.pipe(
     Layer.provideMerge(FactoryWorker.layer),
+    // Transition comments are posted in FactoryWorkComments.test.ts; none is posted here.
+    Layer.provide(Layer.mock(FactoryWorkComments.FactoryWorkComments)({ post: () => Effect.void })),
     Layer.provideMerge(FactoryPullRequest.layer),
     Layer.provide(FactoryReview.layer),
     Layer.provide(gatedRecord(world)),

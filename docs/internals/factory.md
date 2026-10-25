@@ -286,3 +286,23 @@ Factory cannot name.
 
 Deliveries approved before the PR stage existed load without a pull request and stay `approved` at
 `record`, awaiting nothing; nothing opens their pull request on its own.
+
+## Each transition posts one Work comment, from the step that stored it
+
+A delivery's move into blocked, waiting, approved or pr_open posts one comment on its item through
+`WorkService.addComment`, so GitHub, Jira and Markdown sources show what needs the owner
+([`comments.ts`](../../apps/server/src/fd/factory/pipeline/comments.ts) decides which and renders
+it). The worker queues the post once the step is stored and never lets it change the delivery: a
+failed post is logged, and the next transition comments again. The poster is a Factory actor, not
+an agent's, so Work adds no attribution trailer; the text is a fixed template, and facts that would
+name an AI tool, carry attribution or mention someone give way to the template alone.
+
+The trap is idempotence. Work replays a `clientRequestId` from memory, for a day, so a request id
+does not stop a second post after a restart. Factory therefore comments only from the step that
+stored the transition, never from a status it reads back: a boot sweep or resume that caught up on
+blocked deliveries would post again after every restart. A crash between the store and the post
+loses that comment, the lesser failure: a duplicate would be worse. The id must still name the
+transition, not only the status, or within that day Work would answer a later block with the first
+block's result and post nothing. The effect count does not tell blocks apart, since a resume
+replays a lost launch under the launch's effect id; the stage attempt count does, because every
+resume starts an attempt ([`FactoryWorker.ts`](../../apps/server/src/fd/factory/FactoryWorker.ts)).
