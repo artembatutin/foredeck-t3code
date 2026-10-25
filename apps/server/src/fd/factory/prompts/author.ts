@@ -43,10 +43,17 @@ export const itemSections = (item: FactoryAuthorItem, heading: string): Array<st
     `work-item: ${workItemRefString(item.ref)}`,
   ];
   const sections = [header.join("\n")];
-  const body = truncate(item.body, BODY_MAX_CHARS);
-  if (body.text.trim().length > 0) {
+  // Cut after trimming, so surrounding whitespace never fills the preview and hides what follows.
+  const body = truncate(item.body.trim(), BODY_MAX_CHARS);
+  const cut = body.truncated || item.bodyTruncated;
+  // A body Work cut short has more to read even when the part it returned is blank.
+  if (body.text.length > 0 || cut) {
     sections.push(
-      `Description:\n${body.text}${body.truncated || item.bodyTruncated ? "\n[description truncated; read the rest with work_read]" : ""}`,
+      [
+        "Description:",
+        ...(body.text.length > 0 ? [body.text] : []),
+        ...(cut ? ["[description truncated; read the rest with work_read]"] : []),
+      ].join("\n"),
     );
   }
   return sections;

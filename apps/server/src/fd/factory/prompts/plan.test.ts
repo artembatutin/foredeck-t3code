@@ -62,3 +62,37 @@ describe("renderPlanPrompt", () => {
     expect(carriesAiAttribution(prompt)).toBe(false);
   });
 });
+
+describe("renderPlanPrompt descriptions", () => {
+  const MARKER = "[description truncated; read the rest with work_read]";
+  const requirement = "Exports must include a header row.";
+  const render = (body: string, bodyTruncated = false) =>
+    renderPlanPrompt({ item: { ...item, body, bodyTruncated }, branch: "work/fd-parent" });
+  const whitespace = (length: number) => " \n\t".repeat(length).slice(0, length);
+  const empty = render("");
+
+  it("keeps a requirement that follows 16,000 whitespace characters", () => {
+    const prompt = render(`${whitespace(16_000)}${requirement}`);
+    expect(prompt).toContain(`Description:\n${requirement}`);
+    expect(prompt).not.toContain(MARKER);
+    expect(prompt).not.toBe(empty);
+  });
+
+  it("signals content past the preview instead of dropping it silently", () => {
+    const prompt = render(`Intro.${whitespace(16_000)}${requirement}`);
+    expect(prompt).toContain("Description:\nIntro.");
+    expect(prompt).toContain(MARKER);
+    expect(prompt).not.toContain(requirement);
+    expect(prompt.length).toBeLessThan(empty.length + 16_100);
+  });
+
+  it("signals a body Work cut short even when the part it returned is blank", () => {
+    expect(render(whitespace(16_000), true)).toContain(`Description:\n${MARKER}`);
+  });
+
+  it("renders a truly empty body without a description or a notice", () => {
+    expect(empty).not.toContain("Description:");
+    expect(empty).not.toContain(MARKER);
+    expect(render(whitespace(20_000))).toBe(empty);
+  });
+});
