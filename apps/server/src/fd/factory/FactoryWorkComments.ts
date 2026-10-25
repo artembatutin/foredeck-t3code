@@ -6,16 +6,22 @@ import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 
 import { type WorkActor, WorkService } from "../work-management/index.ts";
 import * as FactoryWorkCommentStore from "./persistence/FactoryWorkCommentStore.ts";
 
 /**
- * How long one post or item read may take: longer than the 30-second deadline Work's sources give
- * a request, so a source's own timeout is reported first. It bounds how long a stopping server
- * waits.
+ * How long one post may take: longer than the 30-second deadline Work's sources give a request,
+ * so a source's own timeout is reported first. It bounds how long a stopping server waits.
  */
 const POST_DEADLINE = Duration.seconds(60);
+
+/**
+ * How long a lookup through an item's whole comment history may take: it reads page after page,
+ * and runs only at boot, for a comment a crash left unfinished.
+ */
+const LOOKUP_DEADLINE = Duration.minutes(5);
 
 /**
  * Posts a delivery transition's recorded comment on its item through Work, so GitHub, Jira and
@@ -27,11 +33,10 @@ export class FactoryWorkComments extends Context.Service<
     /**
      * Claims the comment and posts it when this call claimed it; its delivery, status and
      * transition number make its `clientRequestId`, and its posted text ends with its reference.
-     * A comment another process claimed and never finished (it died mid-post) is looked for on
-     * the item by that reference instead: finished when the item shows it, posted when the item
-     * shows it missing, and kept unfinished, for the next boot to look again, when the read cannot
-     * tell. Nothing interrupts it from the claim to the finish, so a stopping server finishes a
-     * post it began. A finished comment is never posted again.
+     * A comment another process claimed and never finished (it died mid-post) is looked for
+     * through the item's whole comment history by that reference instead: finished when it is
+     * there, posted when it is not. Nothing interrupts it from the claim to the finish, so a
+     * stopping server finishes a post it began. A finished comment is never posted again.
      */
     readonly post: (input: {
       readonly itemRef: WorkItemRef;
@@ -82,37 +87,27 @@ const make = Effect.gen(function* () {
     );
 
   /**
-   * Whether the item holds the comment of a process that died mid-post: `unknown` when it does not
-   * show it but Work bounded its comments, so the comment may be among those left out.
-   */
-  const lookUp = (
-    itemRef: WorkItemRef,
-    comment: FactoryWorkCommentStore.StoredFactoryWorkComment,
-  ) =>
-    Effect.suspend(() => work.getItem(poster(comment.deliveryId), { ref: itemRef })).pipe(
-      Effect.timeout(POST_DEADLINE),
-      Effect.map((item) => {
-        const marker = reference(comment);
-        if (item.comments.some(({ body }) => body.includes(marker))) return "posted" as const;
-        return item.commentsTruncated ? ("unknown" as const) : ("missing" as const);
-      }),
-    );
-
-  /**
-   * Finishes the unfinished comment if its item shows it, and posts it if its item shows it
-   * missing. A read that fails or cannot tell leaves it unfinished: neither posted on a guess,
-   * which could post it twice, nor dropped.
+   * Finishes the unfinished comment when its item holds it, and posts it when its item does not.
+   * Work looks through every comment, so a missing reference means the post never landed. A
+   * lookup that fails leaves the comment unfinished, for the next boot: neither posted on a
+   * guess, which could post it twice, nor dropped. The lookup only reads, so a stopping server
+   * may cut it off, leaving the comment the same way.
    */
   const reconcile = (
     itemRef: WorkItemRef,
     comment: FactoryWorkCommentStore.StoredFactoryWorkComment,
   ) =>
-    lookUp(itemRef, comment).pipe(
+    Effect.suspend(() =>
+      work.findComment(poster(comment.deliveryId), { ref: itemRef, text: reference(comment) }),
+    ).pipe(
+      Effect.timeout(LOOKUP_DEADLINE),
+      Effect.interruptible,
+      Effect.map((found) => (Option.isSome(found) ? ("posted" as const) : ("missing" as const))),
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause)
           ? Effect.interrupt
           : Effect.logWarning(
-              "factory could not read its delivery's item to finish a comment",
+              "factory could not look up an unfinished comment on its delivery's item",
               cause,
             ).pipe(Effect.as("unread" as const)),
       ),
@@ -122,10 +117,6 @@ const make = Effect.gen(function* () {
             return store.finish(comment);
           case "missing":
             return send(itemRef, comment).pipe(Effect.andThen(store.finish(comment)));
-          case "unknown":
-            return Effect.logWarning(
-              "factory cannot tell whether an unfinished Work comment reached its item; it stays unfinished",
-            );
           case "unread":
             return Effect.void;
         }

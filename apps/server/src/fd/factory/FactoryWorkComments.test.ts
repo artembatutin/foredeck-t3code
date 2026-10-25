@@ -4,7 +4,6 @@ import { AuthWorkWriteScope, ProjectId, RunId, ThreadId } from "@t3tools/contrac
 import { FactoryDeliveryId, FactoryProjectSettings } from "@t3tools/contracts/fd/factory";
 import {
   type WorkCommentInput,
-  type WorkItemDetail,
   WorkItemId,
   WorkSourceId,
 } from "@t3tools/contracts/fd/work-management";
@@ -63,12 +62,12 @@ interface World {
   held: Hold | null;
   /** The comment bodies the item holds, oldest first: every post Work took lands here. */
   readonly source: Array<string>;
-  /** Whether Work reads the item's comments as cut to a bound. */
-  truncated: boolean;
-  /** Whether reading the item fails, as with a source that cannot be reached. */
-  readFails: boolean;
-  /** How many times the item was read. */
-  reads: number;
+  /** Whether looking a comment up fails, as with a source that cannot be reached. */
+  lookupFails: boolean;
+  /** While set, every lookup waits for `release`; `posting` resolves once one waits. */
+  lookupHeld: Hold | null;
+  /** How many comment lookups ran. */
+  lookups: number;
   readonly warnings: Array<string>;
 }
 
@@ -125,27 +124,32 @@ const fakeWork = (world: World) =>
             );
         }
       }),
-    getItem: () =>
-      Effect.suspend(() => {
-        world.reads += 1;
-        if (world.readFails) {
-          return Effect.fail(
+    // The whole history, however long; Factory never reads the bounded `getItem` list.
+    findComment: (_actor, { text }) =>
+      Effect.gen(function* () {
+        world.lookups += 1;
+        const held = world.lookupHeld;
+        if (held !== null) {
+          yield* Deferred.succeed(held.posting, undefined);
+          yield* Deferred.await(held.release);
+        }
+        if (world.lookupFails) {
+          return yield* Effect.fail(
             new FakeWorkUnavailable({
               detail: "The source could not be reached.",
             }) as unknown as WorkDomainError,
           );
         }
-        // Only the comments are read.
-        return Effect.succeed({
-          comments: world.source.map((body, index) => ({
-            id: String(index + 1),
-            author: null,
-            body,
-            createdAt: "2026-10-25T08:00:00.000Z",
-            updatedAt: null,
-          })),
-          commentsTruncated: world.truncated,
-        } as unknown as WorkItemDetail);
+        const index = world.source.findIndex((body) => body.includes(text));
+        return index === -1
+          ? Option.none()
+          : Option.some({
+              id: String(index + 1),
+              author: null,
+              body: world.source[index] ?? "",
+              createdAt: "2026-10-25T08:00:00.000Z",
+              updatedAt: null,
+            });
       }),
   });
 
@@ -229,9 +233,9 @@ const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
     work: "posts",
     held: null,
     source: [],
-    truncated: false,
-    readFails: false,
-    reads: 0,
+    lookupFails: false,
+    lookupHeld: null,
+    lookups: 0,
     warnings: [],
   };
   return body(world).pipe(Effect.provide(baseLayer(world)), Effect.scoped);
@@ -707,6 +711,8 @@ describe("Work comments on a delivery's transitions", () => {
 
   describe("a comment a process claimed and died before finishing", () => {
     const deleted = blockedText("The author thread was deleted.");
+    /** More comments than any bounded read of the item shows. */
+    const others = Array.from({ length: 60 }, (_, index) => `Comment ${index + 1} by the team.`);
 
     /**
      * Stores what a process that died mid-post leaves: the delivery's comments with these bodies,
@@ -728,117 +734,106 @@ describe("Work comments on a delivery's transitions", () => {
     const unfinished = Effect.flatMap(FactoryWorkCommentStore.FactoryWorkCommentStore, (store) =>
       store.listUnfinished(),
     );
+    const restarts = (world: World, times: number) =>
+      Effect.forEach(Array.from({ length: times }), () => boot(world, Effect.void), {
+        discard: true,
+      });
 
-    it.effect("is posted after a restart when its item does not hold it", () =>
+    it.effect("is posted once after restarts when it never reached a long history", () =>
       withWorld((world) =>
         Effect.gen(function* () {
           const first = authoringOf("first");
-          // The delivery's first block was posted; it died after claiming the same text again.
-          world.source.push(`${deleted} ${referenceOf(first.id, 1)}`);
+          // An identical earlier block is in the history, past the first 50 comments.
+          world.source.push(...others.slice(0, 55), `${deleted} ${referenceOf(first.id, 1)}`);
+          world.source.push(...others.slice(55));
           yield* diedPosting(first, [deleted, deleted]);
 
-          yield* boot(world, Effect.void);
+          yield* restarts(world, 3);
           assert.deepStrictEqual(
             world.posts.map(({ input }) => input.body),
             [`${deleted} ${referenceOf(first.id, 2)}`],
           );
-          assert.strictEqual(world.reads, 1);
-          // Finished: a later boot neither reads the item nor posts.
-          yield* boot(world, Effect.void);
-          assert.strictEqual(world.posts.length, 1);
-          assert.strictEqual(world.reads, 1);
-        }),
-      ),
-    );
-
-    it.effect("is not posted again when its item took it before the process died", () =>
-      withWorld((world) =>
-        Effect.gen(function* () {
-          const first = authoringOf("first");
-          world.source.push(`${deleted} ${referenceOf(first.id, 1)}`);
-          yield* diedPosting(first, [deleted]);
-
-          yield* boot(world, Effect.void);
-          assert.deepStrictEqual(world.posts, []);
-          assert.deepStrictEqual(yield* unfinished, []);
-          yield* boot(world, Effect.void);
-          assert.deepStrictEqual(world.posts, []);
-          assert.strictEqual(world.reads, 1);
-        }),
-      ),
-    );
-
-    it.effect(
-      "is kept, neither posted nor dropped, while its item's bounded comments may leave it out",
-      () =>
-        withWorld((world) =>
-          Effect.gen(function* () {
-            const first = authoringOf("first");
-            world.truncated = true;
-            yield* diedPosting(first, [deleted]);
-
-            // Every boot looks again while a read cannot tell.
-            for (const reads of [1, 2]) {
-              yield* boot(world, Effect.void);
-              assert.deepStrictEqual(world.posts, []);
-              assert.strictEqual(world.reads, reads);
-              assert.strictEqual((yield* unfinished).length, 1);
-            }
-            assert.include(
-              world.warnings,
-              "factory cannot tell whether an unfinished Work comment reached its item; it stays unfinished",
-            );
-
-            // Once a read can show it missing, it is posted, once.
-            world.truncated = false;
-            yield* boot(world, Effect.void);
-            yield* boot(world, Effect.void);
-            assert.deepStrictEqual(
-              world.posts.map(({ input }) => input.body),
-              [`${deleted} ${referenceOf(first.id, 1)}`],
-            );
-            assert.deepStrictEqual(yield* unfinished, []);
-          }),
-        ),
-    );
-
-    it.effect("is finished when its item's bounded comments show it", () =>
-      withWorld((world) =>
-        Effect.gen(function* () {
-          const first = authoringOf("first");
-          world.truncated = true;
-          world.source.push(`${deleted} ${referenceOf(first.id, 1)}`);
-          yield* diedPosting(first, [deleted]);
-
-          yield* boot(world, Effect.void);
-          assert.deepStrictEqual(world.posts, []);
+          // Looked up once; finished, no later boot looks again.
+          assert.strictEqual(world.lookups, 1);
           assert.deepStrictEqual(yield* unfinished, []);
         }),
       ),
     );
 
-    it.effect("waits for the next boot when its item cannot be read", () =>
+    it.effect("is not posted again after restarts when a long history already holds it", () =>
       withWorld((world) =>
         Effect.gen(function* () {
           const first = authoringOf("first");
-          world.readFails = true;
+          // The source took the post, the 56th of 61 comments, before the process died.
+          world.source.push(...others.slice(0, 55), `${deleted} ${referenceOf(first.id, 1)}`);
+          world.source.push(...others.slice(55));
           yield* diedPosting(first, [deleted]);
 
-          yield* boot(world, Effect.void);
+          yield* restarts(world, 3);
+          assert.deepStrictEqual(world.posts, []);
+          assert.strictEqual(world.lookups, 1);
+          assert.deepStrictEqual(yield* unfinished, []);
+        }),
+      ),
+    );
+
+    it.effect("waits for the next boot when its item cannot be looked up", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const first = authoringOf("first");
+          world.source.push(...others);
+          world.lookupFails = true;
+          yield* diedPosting(first, [deleted]);
+
+          yield* restarts(world, 2);
           assert.deepStrictEqual(world.posts, []);
           assert.include(
             world.warnings,
-            "factory could not read its delivery's item to finish a comment",
+            "factory could not look up an unfinished comment on its delivery's item",
           );
           assert.strictEqual((yield* unfinished).length, 1);
 
-          world.readFails = false;
-          yield* boot(world, Effect.void);
+          world.lookupFails = false;
+          yield* restarts(world, 2);
           assert.deepStrictEqual(
             world.posts.map(({ input }) => input.body),
             [`${deleted} ${referenceOf(first.id, 1)}`],
           );
           assert.deepStrictEqual(yield* unfinished, []);
+        }),
+      ),
+    );
+
+    it.effect("lets a stopping server cut off its lookup, leaving it for the next boot", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const first = authoringOf("first");
+          world.source.push(...others);
+          yield* diedPosting(first, [deleted]);
+          const [comment] = yield* unfinished;
+          if (comment === undefined) return assert.fail("No comment was left unfinished.");
+          const held = yield* makeHold;
+          world.lookupHeld = held;
+
+          yield* Effect.gen(function* () {
+            const poster = yield* FactoryWorkComments.FactoryWorkComments;
+            const recovering = yield* poster
+              .post({ itemRef: { ...itemRef, itemId: WorkItemId.make("fd-first") }, comment })
+              .pipe(Effect.forkChild);
+            yield* Deferred.await(held.posting);
+            yield* Effect.yieldNow;
+            // The stop ends the lookup at once; it never waits on the source.
+            yield* Fiber.interrupt(recovering);
+          }).pipe(Effect.provide(FactoryWorkComments.layer));
+          assert.deepStrictEqual(world.posts, []);
+          assert.strictEqual((yield* unfinished).length, 1);
+
+          world.lookupHeld = null;
+          yield* restarts(world, 2);
+          assert.deepStrictEqual(
+            world.posts.map(({ input }) => input.body),
+            [`${deleted} ${referenceOf(first.id, 1)}`],
+          );
         }),
       ),
     );

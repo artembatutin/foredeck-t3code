@@ -307,10 +307,9 @@ interrupting the two, so a stopping server finishes a post it began. The boot sw
 comments nobody claimed, which a process that stopped with them still queued leaves behind. A
 comment claimed and never finished belongs to a process that died mid-post, so it may or may not
 have reached the source. Every posted comment therefore ends with a reference naming its delivery
-and number, and the sweep posts such a comment only when its item's comments do not show that
-reference. The reference also tells a later block apart from an earlier one with the same text.
-Work reads at most 50 comments of an item and does not say which it left out (Markdown sources keep
-the oldest), so a cut list without the reference cannot tell. The comment then stays unfinished,
-with a warning, and every boot reads the item again: it is neither posted on a guess, which could
-post it twice, nor dropped. Settling that case needs Work to look a comment up by key, which it does
-not offer ([`FactoryWorkComments.ts`](../../apps/server/src/fd/factory/FactoryWorkComments.ts)).
+and number, and the sweep looks for that reference through the item's whole comment history with
+`WorkService.findComment`: found, the comment is finished; missing, it is posted. The item's
+ordinary read cannot answer this, since Work bounds it to 50 comments (Markdown keeps the oldest).
+A lookup that fails leaves the comment unfinished for the next boot, never posted on a guess. The
+reference also tells a later block apart from an earlier one with the same text
+([`FactoryWorkComments.ts`](../../apps/server/src/fd/factory/FactoryWorkComments.ts)).
