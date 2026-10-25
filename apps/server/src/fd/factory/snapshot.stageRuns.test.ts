@@ -67,6 +67,8 @@ const SUMMARY_KEYS = new Set([
   "threadId",
   "startedAt",
   "finishedAt",
+  "receiptNumber",
+  "reviewNumber",
 ]);
 
 /** Asserts no attempt on the wire names its run, evidence or fingerprint, or any other key. */
@@ -159,7 +161,8 @@ describe("stage attempts of a delivery that ran", () => {
         const startedAt = delivered.stageRuns.map((run) => run.startedAt);
         expect(startedAt).toEqual(startedAt.toSorted());
 
-        // The stored attempts point at their evidence; the snapshot carries none of it.
+        // The stored attempts point at their evidence; the snapshot carries none of it, only
+        // the numbers that tie the verify attempt to its receipt and the review to its review.
         const evidence = world.evidenceDir(author.deliveryId);
         const stored = (stage: FactoryStageName) =>
           delivered.stageRuns.find((run) => run.stage === stage);
@@ -174,8 +177,12 @@ describe("stage attempts of a delivery that ran", () => {
             ...(run.threadId === null ? {} : { threadId: run.threadId }),
             startedAt: run.startedAt,
             ...(run.finishedAt === null ? {} : { finishedAt: run.finishedAt }),
+            ...(run.stage === "verify" ? { receiptNumber: 1 } : {}),
+            ...(run.stage === "review" ? { reviewNumber: 1 } : {}),
           })),
         );
+        expect(snapshot.receipts.map(({ number }) => number)).toEqual([1]);
+        expect(snapshot.reviews.map(({ number }) => number)).toEqual([1]);
         assertSummariesOnly(snapshot, [evidence, "verify-1", "review-1", "approval-item"]);
       }),
     ),

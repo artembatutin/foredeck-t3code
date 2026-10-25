@@ -182,7 +182,11 @@ describe("factoryErrorText", () => {
 });
 
 describe("the current delivery", () => {
-  const receipt = (finishedAt: string, code: number | null): FactoryVerifyReceiptSummary => ({
+  const receipt = (
+    finishedAt: string,
+    code: number | null,
+    number?: number,
+  ): FactoryVerifyReceiptSummary => ({
     headSha: HEAD,
     tree: HEAD,
     startedAt: finishedAt,
@@ -190,6 +194,7 @@ describe("the current delivery", () => {
     code,
     timedOut: false,
     durationMs: 65_000,
+    ...(number === undefined ? {} : { number }),
   });
   const review: FactoryReviewSummary = {
     headSha: HEAD,
@@ -197,6 +202,7 @@ describe("the current delivery", () => {
     blocking: true,
     findings: { high: 1, medium: 2, low: 0 },
     reviewedAt: "2026-10-21T09:30:00.000Z",
+    number: 1,
   };
   const author = ThreadId.make("thread-author");
   const reviewer = ThreadId.make("thread-reviewer");
@@ -249,6 +255,7 @@ describe("the current delivery", () => {
               outcome: "failed",
               startedAt: "2026-10-21T09:11:00.000Z",
               finishedAt: "2026-10-21T09:13:00.000Z",
+              receiptNumber: 1,
             },
             {
               stage: "repair",
@@ -264,6 +271,7 @@ describe("the current delivery", () => {
               outcome: "passed",
               startedAt: "2026-10-21T09:21:00.000Z",
               finishedAt: "2026-10-21T09:23:00.000Z",
+              receiptNumber: 2,
             },
             {
               stage: "review",
@@ -274,9 +282,10 @@ describe("the current delivery", () => {
             },
           ],
           receipts: [
-            receipt("2026-10-21T09:12:00.000Z", 1),
-            receipt("2026-10-21T09:22:00.000Z", 0),
+            receipt("2026-10-21T09:12:00.000Z", 1, 1),
+            receipt("2026-10-21T09:22:00.000Z", 0, 2),
           ],
+          // Accepted while its attempt is still active, so no attempt names it yet.
           reviews: [review],
         }),
       ],
@@ -330,9 +339,13 @@ describe("the current delivery", () => {
         outcome: "In progress",
         startedAt: "2026-10-21T09:24:00.000Z",
         receipts: [],
-        reviews: ["Changes required, blocking on 0123456: 1 high, 2 medium, 0 low"],
+        reviews: [],
         thread: { environmentId, threadId: reviewer },
       },
+    ]);
+    expect(view?.delivery?.receipts).toEqual([]);
+    expect(view?.delivery?.reviews.map((line) => line.text)).toEqual([
+      "Changes required, blocking on 0123456: 1 high, 2 medium, 0 low",
     ]);
     const keys = view?.delivery?.timeline.map((row) => row.key) ?? [];
     expect(new Set(keys).size).toBe(keys.length);

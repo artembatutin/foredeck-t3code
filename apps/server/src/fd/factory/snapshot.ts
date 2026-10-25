@@ -2,6 +2,7 @@ import type { ThreadId } from "@t3tools/contracts";
 import {
   FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
   type FactoryDelivery,
+  type FactoryReviewSummary,
   type FactoryStageKind,
   type FactoryStageName,
   type FactoryStageRunSummary,
@@ -13,6 +14,7 @@ import type { FactoryDeliveryWithRuns } from "./FactoryService.ts";
 import type { StoredFactoryStageRun } from "./persistence/FactoryStageRunStore.ts";
 import { standardStages } from "./pipeline/definitions.ts";
 import type {
+  FactoryAcceptedReview,
   FactoryBlock,
   FactoryDeliveryState,
   FactoryReceiptRefusal,
@@ -23,26 +25,75 @@ import type {
 const stageKind = (stage: FactoryStageName): FactoryStageKind =>
   stage === "repair" ? "agent" : standardStages[stage].kind;
 
-/** A receipt without its command, log path, output hash or settings hash. */
-const receiptSummary = (receipt: FactoryVerifyReceipt): FactoryVerifyReceiptSummary => ({
-  headSha: receipt.headSha,
-  tree: receipt.tree,
-  startedAt: receipt.startedAt,
-  finishedAt: receipt.finishedAt,
-  code: receipt.code,
-  timedOut: receipt.timedOut,
-  durationMs: receipt.durationMs,
-});
+// `FactoryEvidence` names a numbered run's files `<prefix>-<n>.<extension>`: a receipt's log and
+// JSON share their verify run's number, and an accepted review's JSON has a number of its own.
+const RECEIPT_LOG = /(?:^|[\\/])verify-(\d+)\.log$/;
+const RECEIPT_JSON = /(?:^|[\\/])verify-(\d+)\.json$/;
+const REVIEW_JSON = /(?:^|[\\/])review-(\d+)\.json$/;
 
-/** An attempt without its run id, evidence path or failure fingerprint. */
-const stageRunSummary = (run: StoredFactoryStageRun): FactoryStageRunSummary => ({
-  stage: run.stage,
-  attempt: run.attempt,
-  outcome: run.outcome,
-  ...(run.threadId === null ? {} : { threadId: run.threadId }),
-  startedAt: run.startedAt,
-  ...(run.finishedAt === null ? {} : { finishedAt: run.finishedAt }),
-});
+/** The run number of an evidence file named as `file` matches; undefined for any other file. */
+const evidenceNumber = (path: string | null, file: RegExp): number | undefined => {
+  const digits = path === null ? undefined : file.exec(path)?.[1];
+  if (digits === undefined) return undefined;
+  const number = Number(digits);
+  return Number.isSafeInteger(number) && number > 0 ? number : undefined;
+};
+
+/** A receipt without its command, log path, output hash or settings hash, numbered by its log. */
+const receiptSummary = (receipt: FactoryVerifyReceipt): FactoryVerifyReceiptSummary => {
+  const number = evidenceNumber(receipt.logPath, RECEIPT_LOG);
+  return {
+    headSha: receipt.headSha,
+    tree: receipt.tree,
+    startedAt: receipt.startedAt,
+    finishedAt: receipt.finishedAt,
+    code: receipt.code,
+    timedOut: receipt.timedOut,
+    durationMs: receipt.durationMs,
+    ...(number === undefined ? {} : { number }),
+  };
+};
+
+/** An accepted review's summary, numbered by its evidence. */
+const reviewSummary = (review: FactoryAcceptedReview): FactoryReviewSummary => {
+  const number = evidenceNumber(review.evidencePath, REVIEW_JSON);
+  return number === undefined ? review.summary : { ...review.summary, number };
+};
+
+/** The numbers of the receipts and reviews a snapshot carries. */
+interface SnapshotEvidence {
+  readonly receipts: ReadonlySet<number>;
+  readonly reviews: ReadonlySet<number>;
+}
+
+const numbersOf = (summaries: ReadonlyArray<{ readonly number?: number }>) =>
+  new Set(summaries.flatMap(({ number }) => (number === undefined ? [] : [number])));
+
+/**
+ * An attempt without its run id, evidence path or failure fingerprint. It names the receipt or
+ * review its recorded evidence is, when the snapshot carries that one: a verify attempt records
+ * its receipt's JSON and a review attempt the review it accepted, while a refused run's log, an
+ * approval or no evidence at all names nothing.
+ */
+const stageRunSummary = (
+  run: StoredFactoryStageRun,
+  evidence: SnapshotEvidence,
+): FactoryStageRunSummary => {
+  const receiptNumber = evidenceNumber(run.evidencePath, RECEIPT_JSON);
+  const reviewNumber = evidenceNumber(run.evidencePath, REVIEW_JSON);
+  return {
+    stage: run.stage,
+    attempt: run.attempt,
+    outcome: run.outcome,
+    ...(run.threadId === null ? {} : { threadId: run.threadId }),
+    startedAt: run.startedAt,
+    ...(run.finishedAt === null ? {} : { finishedAt: run.finishedAt }),
+    ...(receiptNumber !== undefined && evidence.receipts.has(receiptNumber)
+      ? { receiptNumber }
+      : {}),
+    ...(reviewNumber !== undefined && evidence.reviews.has(reviewNumber) ? { reviewNumber } : {}),
+  };
+};
 
 const NEEDS_YOU_MAX_LENGTH = 280;
 
@@ -138,12 +189,16 @@ export const needsYou = (state: FactoryDeliveryState): string | undefined => {
 
 /**
  * A delivery as clients see it: its progress, threads and the summaries of its receipts, reviews
- * and newest stage attempts, never their logs or evidence paths. `needsYou` is set only while it
+ * and newest stage attempts, never their logs or evidence paths. Receipts and reviews carry their
+ * evidence numbers, and each attempt names the one it produced. `needsYou` is set only while it
  * is blocked.
  */
 export const toFactoryDelivery = (delivery: FactoryDeliveryWithRuns): FactoryDelivery => {
   const { state } = delivery;
   const reason = needsYou(state);
+  const receipts = state.receipts.map(receiptSummary);
+  const reviews = state.reviews.map(reviewSummary);
+  const evidence = { receipts: numbersOf(receipts), reviews: numbersOf(reviews) };
   return {
     deliveryId: delivery.deliveryId,
     projectId: delivery.projectId,
@@ -157,10 +212,12 @@ export const toFactoryDelivery = (delivery: FactoryDeliveryWithRuns): FactoryDel
     branch: state.branch,
     ...(state.worktreePath === null ? {} : { worktreePath: state.worktreePath }),
     threads: state.threads,
-    receipts: state.receipts.map(receiptSummary),
-    reviews: state.reviews.map((review) => review.summary),
+    receipts,
+    reviews,
     // Attempts are appended in start order, so the newest are the last.
-    stageRuns: delivery.stageRuns.slice(-FACTORY_SNAPSHOT_STAGE_RUNS_MAX).map(stageRunSummary),
+    stageRuns: delivery.stageRuns
+      .slice(-FACTORY_SNAPSHOT_STAGE_RUNS_MAX)
+      .map((run) => stageRunSummary(run, evidence)),
     ...(reason === undefined ? {} : { needsYou: reason }),
     createdAt: delivery.createdAt,
     updatedAt: delivery.updatedAt,

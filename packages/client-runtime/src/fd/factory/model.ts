@@ -102,9 +102,16 @@ export const factoryControls = (
   };
 };
 
+/** Whether the server lists `delivery` before `other`: newer first, then the greater id. */
+const listsBefore = (delivery: FactoryDelivery, other: FactoryDelivery) => {
+  const newer = Date.parse(delivery.createdAt) - Date.parse(other.createdAt);
+  return newer === 0 ? delivery.deliveryId > other.deliveryId : newer > 0;
+};
+
 /**
  * The delivery an item's surfaces show: the one not done or cancelled (the server allows one),
- * otherwise the newest; undefined when the item has none.
+ * otherwise the newest; undefined when the item has none. Ties go the way the server lists
+ * deliveries, so the choice never depends on the order they arrive in.
  */
 export const currentDelivery = (
   deliveries: ReadonlyArray<FactoryDelivery>,
@@ -128,7 +135,7 @@ export const currentDelivery = (
       if (active) current = delivery;
       continue;
     }
-    if (Date.parse(delivery.createdAt) > Date.parse(current.createdAt)) current = delivery;
+    if (listsBefore(delivery, current)) current = delivery;
   }
   return current;
 };
@@ -142,44 +149,75 @@ export interface FactoryTimelineEntry {
   readonly threadId: ThreadId | undefined;
   readonly startedAt: string | undefined;
   readonly finishedAt: string | undefined;
+  /** The receipt the attempt's command produced, as the server names it. */
+  readonly receipts: ReadonlyArray<FactoryVerifyReceiptSummary>;
+  /** The review the attempt accepted, as the server names it. */
+  readonly reviews: ReadonlyArray<FactoryReviewSummary>;
+}
+
+export interface FactoryTimeline {
+  readonly entries: ReadonlyArray<FactoryTimelineEntry>;
+  /**
+   * The receipts and reviews no entry holds, oldest first: from a server that does not name the
+   * attempt that produced them, while that attempt is active, or once it is older than the
+   * snapshot's attempts. Each receipt and review is in exactly one place.
+   */
   readonly receipts: ReadonlyArray<FactoryVerifyReceiptSummary>;
   readonly reviews: ReadonlyArray<FactoryReviewSummary>;
 }
 
-const within = (run: FactoryStageRunSummary, at: string) => {
-  const time = Date.parse(at);
-  return (
-    time >= Date.parse(run.startedAt) &&
-    (run.finishedAt === undefined || time <= Date.parse(run.finishedAt))
-  );
+/** Hands each piece of evidence to the first attempt that names its number, and only to it. */
+const claimer = <A extends { readonly number?: number }>(evidence: ReadonlyArray<A>) => {
+  const claimed = new Set<number>();
+  return {
+    claim: (number: number | undefined): ReadonlyArray<A> => {
+      if (number === undefined) return [];
+      const index = evidence.findIndex(
+        (piece, position) => piece.number === number && !claimed.has(position),
+      );
+      const piece = evidence[index];
+      if (piece === undefined) return [];
+      claimed.add(index);
+      return [piece];
+    },
+    unclaimed: () => evidence.filter((_, position) => !claimed.has(position)),
+  };
 };
 
 /**
- * A delivery's stage attempts in start order. A verify attempt carries the receipts finished
- * within it and a review attempt the reviews judged within it; receipts and reviews older than
- * the snapshot's attempts are left out. A snapshot from a server that sends no attempts reads as
- * its current stage holding every receipt and review.
+ * A delivery's stage attempts in start order, each holding the receipt or review the server says
+ * it produced. Times never decide it: an attempt can end in the millisecond its successor starts
+ * and its receipt finishes, so a time window would show that receipt under both. A snapshot from
+ * a server that sends no attempts reads as its current stage holding every receipt and review.
  */
 export const factoryTimeline = (
   delivery: Pick<FactoryDelivery, "stage" | "stageRuns" | "receipts" | "reviews">,
-): ReadonlyArray<FactoryTimelineEntry> => {
+): FactoryTimeline => {
   if (delivery.stageRuns.length === 0) {
-    if (delivery.stage === undefined) return [];
-    return [
-      {
-        stage: delivery.stage.name,
-        round: null,
-        outcome: null,
-        threadId: undefined,
-        startedAt: undefined,
-        finishedAt: undefined,
-        receipts: delivery.receipts,
-        reviews: delivery.reviews,
-      },
-    ];
+    if (delivery.stage === undefined) {
+      return { entries: [], receipts: delivery.receipts, reviews: delivery.reviews };
+    }
+    return {
+      entries: [
+        {
+          stage: delivery.stage.name,
+          round: null,
+          outcome: null,
+          threadId: undefined,
+          startedAt: undefined,
+          finishedAt: undefined,
+          receipts: delivery.receipts,
+          reviews: delivery.reviews,
+        },
+      ],
+      receipts: [],
+      reviews: [],
+    };
   }
+  const receipts = claimer(delivery.receipts);
+  const reviews = claimer(delivery.reviews);
   // `map` returned a new array; Hermes has no `toSorted`.
-  return delivery.stageRuns
+  const entries = delivery.stageRuns
     .map((run, index) => ({ run, index }))
     .sort(
       (left, right) =>
@@ -193,13 +231,8 @@ export const factoryTimeline = (
       threadId: run.threadId,
       startedAt: run.startedAt,
       finishedAt: run.finishedAt,
-      receipts:
-        run.stage === "verify"
-          ? delivery.receipts.filter((receipt) => within(run, receipt.finishedAt))
-          : [],
-      reviews:
-        run.stage === "review"
-          ? delivery.reviews.filter((review) => within(run, review.reviewedAt))
-          : [],
+      receipts: receipts.claim(run.receiptNumber),
+      reviews: reviews.claim(run.reviewNumber),
     }));
+  return { entries, receipts: receipts.unclaimed(), reviews: reviews.unclaimed() };
 };

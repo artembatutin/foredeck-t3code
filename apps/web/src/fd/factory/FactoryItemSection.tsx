@@ -224,6 +224,20 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
           ))}
         </ol>
       ) : null}
+      {delivery !== null && (delivery.receipts.length > 0 || delivery.reviews.length > 0) ? (
+        <div
+          className="space-y-0.5 rounded-md border p-2 text-xs"
+          aria-label="Receipts and reviews"
+        >
+          <p className="text-muted-foreground">Receipts and reviews</p>
+          {delivery.receipts.map((receipt) => (
+            <p key={receipt.key}>Verify: {receipt.text}</p>
+          ))}
+          {delivery.reviews.map((review) => (
+            <p key={review.key}>Review: {review.text}</p>
+          ))}
+        </div>
+      ) : null}
       <AlertDialog
         open={cancelling !== null}
         onOpenChange={(open) => {

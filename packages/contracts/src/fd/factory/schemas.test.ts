@@ -291,12 +291,13 @@ describe("FactoryVerifyReceiptSummary", () => {
     code: true,
     timedOut: true,
     durationMs: true,
+    number: true,
   };
 
   it("keeps a receipt's outcome and drops its log path and command", () => {
-    const summary = decode(receipt);
+    const summary = decode({ ...receipt, number: 4 });
     expect(Object.keys(summary).sort()).toEqual(Object.keys(summaryKeys).sort());
-    expect(summary).toEqual(receiptSummary);
+    expect(summary).toEqual({ ...receiptSummary, number: 4 });
   });
 });
 

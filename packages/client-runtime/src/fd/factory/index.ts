@@ -10,5 +10,6 @@ export {
   type FactoryControls,
   type FactoryStage,
   type FactoryStatus,
+  type FactoryTimeline,
   type FactoryTimelineEntry,
 } from "./model.ts";

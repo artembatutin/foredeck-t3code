@@ -39,7 +39,7 @@ const delivery = (overrides: Partial<FactoryDelivery> = {}): FactoryDelivery => 
   ...overrides,
 });
 
-const receipt = (minute: number, code: number): FactoryVerifyReceiptSummary => ({
+const receipt = (minute: number, code: number, number?: number): FactoryVerifyReceiptSummary => ({
   headSha: sha("a"),
   tree: sha("b"),
   startedAt: at(minute - 1),
@@ -47,14 +47,16 @@ const receipt = (minute: number, code: number): FactoryVerifyReceiptSummary => (
   code,
   timedOut: false,
   durationMs: 60_000,
+  ...(number === undefined ? {} : { number }),
 });
 
-const review = (minute: number): FactoryReviewSummary => ({
+const review = (minute: number, number?: number): FactoryReviewSummary => ({
   headSha: sha("a"),
   verdict: "pass",
   blocking: false,
   findings: { high: 0, medium: 0, low: 1 },
   reviewedAt: at(minute),
+  ...(number === undefined ? {} : { number }),
 });
 
 const STATUSES: ReadonlyArray<FactoryStatus> = [
@@ -211,15 +213,17 @@ describe("factoryTimeline", () => {
   const author = ThreadId.make("author");
   const reviewer = ThreadId.make("reviewer");
 
-  it("places each receipt and review on the attempt it was recorded in", () => {
-    const failed = receipt(12, 1);
-    const passed = receipt(22, 0);
-    const accepted = review(27);
-    const timeline = factoryTimeline(
+  it("places each receipt and review on the attempt that produced it", () => {
+    const older = receipt(0, 0, 1);
+    const olderReview = review(0, 1);
+    const failed = receipt(12, 1, 2);
+    const passed = receipt(22, 0, 3);
+    const accepted = review(27, 2);
+    const { entries: timeline, ...unattached } = factoryTimeline(
       delivery({
         // An older receipt and review than the snapshot's attempts belong to no attempt.
-        receipts: [receipt(0, 0), failed, passed],
-        reviews: [review(0), accepted],
+        receipts: [older, failed, passed],
+        reviews: [olderReview, accepted],
         stageRuns: [
           // Out of order on purpose: the timeline follows start times.
           {
@@ -228,6 +232,7 @@ describe("factoryTimeline", () => {
             outcome: "passed",
             startedAt: at(20),
             finishedAt: at(23),
+            receiptNumber: 3,
           },
           {
             stage: "author",
@@ -243,6 +248,7 @@ describe("factoryTimeline", () => {
             outcome: "failed",
             startedAt: at(10),
             finishedAt: at(13),
+            receiptNumber: 2,
           },
           {
             stage: "repair",
@@ -259,6 +265,7 @@ describe("factoryTimeline", () => {
             threadId: reviewer,
             startedAt: at(23),
             finishedAt: at(29),
+            reviewNumber: 2,
           },
           { stage: "record", attempt: 1, outcome: null, startedAt: at(29) },
         ],
@@ -324,11 +331,13 @@ describe("factoryTimeline", () => {
       },
     ]);
     expect(timeline.at(-1)?.finishedAt).toBeUndefined();
+    expect(unattached).toEqual({ receipts: [older], reviews: [olderReview] });
   });
 
-  it("gives an active attempt what was recorded since it started", () => {
-    const submitted = review(31);
-    const [entry] = factoryTimeline(
+  it("lists a review accepted while its attempt is active for the delivery", () => {
+    // The server names an attempt's review once the attempt ends.
+    const submitted = review(31, 1);
+    const { entries, reviews } = factoryTimeline(
       delivery({
         reviews: [submitted],
         stageRuns: [
@@ -336,7 +345,8 @@ describe("factoryTimeline", () => {
         ],
       }),
     );
-    expect(entry).toMatchObject({ stage: "review", round: 2, outcome: null, reviews: [submitted] });
+    expect(entries).toMatchObject([{ stage: "review", round: 2, outcome: null, reviews: [] }]);
+    expect(reviews).toEqual([submitted]);
   });
 
   it("reads an old server's snapshot as its current stage with every receipt and review", () => {
@@ -344,18 +354,26 @@ describe("factoryTimeline", () => {
     const reviews = [review(27)];
     expect(
       factoryTimeline(delivery({ stage: { name: "review", kind: "agent" }, receipts, reviews })),
-    ).toEqual([
-      {
-        stage: "review",
-        round: null,
-        outcome: null,
-        threadId: undefined,
-        startedAt: undefined,
-        finishedAt: undefined,
-        receipts,
-        reviews,
-      },
-    ]);
-    expect(factoryTimeline(delivery({ status: "queued" }))).toEqual([]);
+    ).toEqual({
+      entries: [
+        {
+          stage: "review",
+          round: null,
+          outcome: null,
+          threadId: undefined,
+          startedAt: undefined,
+          finishedAt: undefined,
+          receipts,
+          reviews,
+        },
+      ],
+      receipts: [],
+      reviews: [],
+    });
+    expect(factoryTimeline(delivery({ status: "queued" }))).toEqual({
+      entries: [],
+      receipts: [],
+      reviews: [],
+    });
   });
 });

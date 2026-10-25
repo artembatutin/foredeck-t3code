@@ -96,6 +96,9 @@ export interface FactoryDeliveryView {
   readonly branch: string | undefined;
   readonly controls: FactoryControls;
   readonly timeline: ReadonlyArray<FactoryTimelineRow>;
+  /** The receipts and reviews no attempt of the timeline holds. */
+  readonly receipts: ReadonlyArray<FactoryEvidenceLine>;
+  readonly reviews: ReadonlyArray<FactoryEvidenceLine>;
 }
 
 export interface FactoryItemSectionView {
@@ -121,6 +124,16 @@ export const reviewText = (review: FactoryReviewSummary): string => {
   const { high, medium, low } = review.findings;
   return `${verdict}${review.blocking ? ", blocking" : ""} on ${short(review.headSha)}: ${high} high, ${medium} medium, ${low} low`;
 };
+
+const receiptLine = (receipt: FactoryVerifyReceiptSummary): FactoryEvidenceLine => ({
+  key: `${receipt.finishedAt}:${receipt.headSha}`,
+  text: receiptText(receipt),
+});
+
+const reviewLine = (review: FactoryReviewSummary): FactoryEvidenceLine => ({
+  key: `${review.reviewedAt}:${review.headSha}`,
+  text: reviewText(review),
+});
 
 const isActive = (delivery: FactoryDelivery) =>
   delivery.status !== "done" && delivery.status !== "cancelled";
@@ -157,6 +170,7 @@ export function factoryItemSection(input: {
   if (current === undefined) return deliver ? { deliver, delivery: null } : null;
 
   const controls = factoryControls(current);
+  const timeline = factoryTimeline(current);
   return {
     deliver,
     delivery: {
@@ -171,7 +185,7 @@ export function factoryItemSection(input: {
         resume: connected && controls.resume && permitted.resume,
         cancel: connected && controls.cancel && permitted.cancel,
       },
-      timeline: factoryTimeline(current).map((entry, index) => ({
+      timeline: timeline.entries.map((entry, index) => ({
         key: `${entry.stage}:${entry.round ?? "-"}:${entry.startedAt ?? "-"}:${index}`,
         stage: FACTORY_STAGE_LABELS[entry.stage],
         round: entry.round,
@@ -182,19 +196,15 @@ export function factoryItemSection(input: {
               : "In progress"
             : OUTCOME_LABELS[entry.outcome],
         startedAt: entry.startedAt,
-        receipts: entry.receipts.map((receipt) => ({
-          key: `${receipt.finishedAt}:${receipt.headSha}`,
-          text: receiptText(receipt),
-        })),
-        reviews: entry.reviews.map((review) => ({
-          key: `${review.reviewedAt}:${review.headSha}`,
-          text: reviewText(review),
-        })),
+        receipts: entry.receipts.map(receiptLine),
+        reviews: entry.reviews.map(reviewLine),
         thread:
           entry.threadId === undefined
             ? null
             : buildThreadRouteParams(scopeThreadRef(input.environmentId, entry.threadId)),
       })),
+      receipts: timeline.receipts.map(receiptLine),
+      reviews: timeline.reviews.map(reviewLine),
     },
   };
 }

@@ -257,8 +257,18 @@ const verifyReceiptSummaryFields = {
   durationMs: NonNegativeInt,
 };
 
+/**
+ * The number Factory's evidence folder gave a delivery's verify run or accepted review
+ * (`verify-<n>`, `review-<n>`): from 1, never reused within the delivery, and never a path.
+ */
+const FactoryEvidenceNumber = PositiveInt;
+
 /** What clients see of a verify run: never the log, its path or the command line. */
-export const FactoryVerifyReceiptSummary = Schema.Struct(verifyReceiptSummaryFields);
+export const FactoryVerifyReceiptSummary = Schema.Struct({
+  ...verifyReceiptSummaryFields,
+  /** The run's number, named by the stage attempt that produced it; older servers send none. */
+  number: Schema.optionalKey(FactoryEvidenceNumber),
+});
 export type FactoryVerifyReceiptSummary = typeof FactoryVerifyReceiptSummary.Type;
 
 /**
@@ -283,6 +293,8 @@ export const FactoryReviewSummary = Schema.Struct({
   blocking: Schema.Boolean,
   findings: Schema.Struct({ high: NonNegativeInt, medium: NonNegativeInt, low: NonNegativeInt }),
   reviewedAt: IsoDateTime,
+  /** The review's number, named by the stage attempt that accepted it; older servers send none. */
+  number: Schema.optionalKey(FactoryEvidenceNumber),
 });
 export type FactoryReviewSummary = typeof FactoryReviewSummary.Type;
 
@@ -348,6 +360,14 @@ export const FactoryStageRunSummary = Schema.Struct({
   startedAt: IsoDateTime,
   /** Absent while the attempt is active. */
   finishedAt: Schema.optionalKey(IsoDateTime),
+  /**
+   * The `number` of the receipt the attempt's command produced, or of the review the attempt
+   * accepted. Absent when it produced none (a refused run, a failure before any, a stop or cancel
+   * first, or an attempt still active) and from older servers: clients attach a receipt or review
+   * to an attempt only by these, never by its times.
+   */
+  receiptNumber: Schema.optionalKey(FactoryEvidenceNumber),
+  reviewNumber: Schema.optionalKey(FactoryEvidenceNumber),
 });
 export type FactoryStageRunSummary = typeof FactoryStageRunSummary.Type;
 

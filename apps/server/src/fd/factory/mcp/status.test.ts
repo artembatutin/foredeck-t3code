@@ -314,7 +314,8 @@ describe("factory_status by delivery", () => {
         rounds: { fix: 1, review: 0 },
         branch: "feature/item-a",
         threads: { author: "thread-author", reviewer: "thread-reviewer" },
-        reviews: [summary],
+        // Numbered by their evidence, which itself stays out of the result.
+        reviews: [{ ...summary, number: 1 }],
         needsYou:
           "The review requires changes with no review round left (1 high, 0 medium, 2 low).",
       });
@@ -327,6 +328,7 @@ describe("factory_status by delivery", () => {
           code: 0,
           timedOut: false,
           durationMs: 65_000,
+          number: 1,
         },
       ]);
       const text = JSON.stringify(result);
