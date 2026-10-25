@@ -38,6 +38,7 @@ export const FACTORY_WS_METHODS = {
   factoryDeliveriesList: "factory.deliveries.list",
   factoryDeliveriesSubscribe: "factory.deliveries.subscribe",
   factoryPlanUpdate: "factory.plan.update",
+  factoryPlanApprove: "factory.plan.approve",
   factoryPlanReject: "factory.plan.reject",
   factoryPlanReplan: "factory.plan.replan",
 } as const;
@@ -88,12 +89,17 @@ const WsFactoryDeliveriesListRpc = Rpc.make(FACTORY_WS_METHODS.factoryDeliveries
 
 /**
  * The plan gate's owner actions, each on a delivery waiting at the gate and refused on any other.
- * Update stores the edited plan, which keeps the delivery waiting; reject cancels the delivery;
- * replan sends the note to the planner thread and plans again. Servers advertising `planning`
- * serve them.
+ * Update stores the edited plan, which keeps the delivery waiting; approve freezes the plan and
+ * creates its child items and deliveries; reject cancels the delivery; replan sends the note to
+ * the planner thread and plans again. Servers advertising `planning` serve them.
  */
 const WsFactoryPlanUpdateRpc = Rpc.make(FACTORY_WS_METHODS.factoryPlanUpdate, {
   payload: FactoryPlanUpdateInput,
+  success: FactoryDelivery,
+  error: FactoryRpcError,
+});
+const WsFactoryPlanApproveRpc = Rpc.make(FACTORY_WS_METHODS.factoryPlanApprove, {
+  payload: FactoryDeliveryRefInput,
   success: FactoryDelivery,
   error: FactoryRpcError,
 });
@@ -130,6 +136,7 @@ export const FactoryRpcs = [
   WsFactoryDeliveriesListRpc,
   WsFactoryDeliveriesSubscribeRpc,
   WsFactoryPlanUpdateRpc,
+  WsFactoryPlanApproveRpc,
   WsFactoryPlanRejectRpc,
   WsFactoryPlanReplanRpc,
 ] as const;
@@ -153,6 +160,7 @@ export const FACTORY_CLIENT_GUARDED_RPC_SCOPES = {
   [FACTORY_WS_METHODS.factoryDeliveriesResume]: AuthOrchestrationOperateScope,
   [FACTORY_WS_METHODS.factoryDeliveriesCancel]: AuthOrchestrationOperateScope,
   [FACTORY_WS_METHODS.factoryPlanUpdate]: AuthOrchestrationOperateScope,
+  [FACTORY_WS_METHODS.factoryPlanApprove]: AuthOrchestrationOperateScope,
   [FACTORY_WS_METHODS.factoryPlanReject]: AuthOrchestrationOperateScope,
   [FACTORY_WS_METHODS.factoryPlanReplan]: AuthOrchestrationOperateScope,
 } as const;

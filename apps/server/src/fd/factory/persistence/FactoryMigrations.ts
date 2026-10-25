@@ -109,6 +109,12 @@ const FactoryWorkCommentOutcomes = Effect.gen(function* () {
     WHERE attempted_at IS NOT NULL`;
 });
 
+const FactoryTaskChildItems = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  // The Work item an approved plan's task created as its child; tasks written before it have none.
+  yield* sql`ALTER TABLE fd_factory_tasks ADD COLUMN child_item_id TEXT`;
+});
+
 export const factoryMigrationEntries = [
   [1, "FactorySettings", FactorySettings],
   [2, "FactoryDeliveries", FactoryDeliveries],
@@ -116,6 +122,7 @@ export const factoryMigrationEntries = [
   [4, "FactoryStageRuns", FactoryStageRuns],
   [5, "FactoryWorkComments", FactoryWorkComments],
   [6, "FactoryWorkCommentOutcomes", FactoryWorkCommentOutcomes],
+  [7, "FactoryTaskChildItems", FactoryTaskChildItems],
 ] as const;
 
 const run = Migrator.make({});

@@ -43,6 +43,7 @@ import * as ServerRuntimeStartup from "../../../serverRuntimeStartup.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import { WorkService } from "../../work-management/index.ts";
+import * as FactoryChildren from "../FactoryChildren.ts";
 import * as FactoryPlanning from "../FactoryPlanning.ts";
 import * as FactoryPullRequest from "../FactoryPullRequest.ts";
 import * as FactoryRecord from "../FactoryRecord.ts";
@@ -121,6 +122,7 @@ describe("Factory plan RPC errors", () => {
         resume: () => unexpected,
         cancel: () => unexpected,
         updatePlan: () => unexpected,
+        approvePlan: () => unexpected,
         rejectPlan: () => unexpected,
         replan: () => unexpected,
         submitPlan: () => unexpected,
@@ -173,7 +175,7 @@ describe("Factory plan RPC errors", () => {
         _tag: "FactoryError",
         reason: "refused",
         message:
-          "Only a delivery waiting at the plan gate can have its plan edited, rejected or replanned; this one is running.",
+          "Only a delivery waiting at the plan gate can have its plan approved, edited, rejected or replanned; this one is running.",
         deliveryId,
       },
     },
@@ -285,6 +287,7 @@ const makeLayer = (calls: PlannerCalls, release: Deferred.Deferred<void>) =>
     Layer.provide(plannerThreads(calls, release)),
     Layer.provide(
       Layer.mergeAll(
+        Layer.mock(FactoryChildren.FactoryChildren)({}),
         Layer.mock(FactoryPlanning.FactoryPlanning)({}),
         Layer.mock(FactoryReview.FactoryReview)({}),
         Layer.mock(FactoryRecord.FactoryRecord)({}),
@@ -474,6 +477,7 @@ describe("Factory plan RPC authorization", () => {
           resume: () => unexpected,
           cancel: () => unexpected,
           updatePlan: () => notFound("update"),
+          approvePlan: () => unexpected,
           rejectPlan: () => notFound("reject"),
           replan: () => notFound("replan"),
           submitPlan: () => unexpected,

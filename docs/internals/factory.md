@@ -105,8 +105,9 @@ write therefore runs through `FactoryChanges.transact`
 ([`FactoryChanges.ts`](../../apps/server/src/fd/factory/FactoryChanges.ts)), which moves the epoch
 only once the write has committed, so a refetch on the new value reads it. Today the writers are
 the start's insert, the worker's step (stop, resume, cancel, plan and review submissions and the
-plan gate's actions are steps) and the settings write; a new writer that bypasses `transact`
-leaves every client stale until something else moves the epoch.
+plan gate's actions are steps), the child deliveries a parent's approval stores and the settings
+write; a new writer that bypasses `transact` leaves every client stale until something else moves
+the epoch.
 
 `transact` opens the transaction itself rather than wrap a caller's. `withTransaction` commits
 inside its own uninterruptible mask and raises an interrupt that arrived meanwhile as the mask
@@ -194,9 +195,32 @@ planner's ([`plan/edit.ts`](../../apps/server/src/fd/factory/plan/edit.ts)). The
 the edited plan as any value and the replan note as any string: the RPC server turns a payload
 that fails decoding into a defect before any handler runs, so the server judges both itself and a
 malformed one is refused as `invalid_request` with Factory's fixed text. The edit replaces the
-tasks in the delivery's state while `plan.json` keeps what the planner submitted, so whatever acts
-on the approved plan reads the state. A replan is a new plan round opened by a turn carrying the
-owner's note; the gate's attempt it leaves ends failed, and the next accepted plan replaces the old.
+tasks in the delivery's state while `plan.json` keeps what the planner submitted, so approval
+freezes the state's tasks, stored as the delivery's task rows in the step that approves. A replan
+is a new plan round opened by a turn carrying the owner's note; the gate's attempt it leaves ends
+failed, and the next accepted plan replaces the old.
+
+## Child items are found again before they are created
+
+Approval runs child creation as a worker effect
+([`FactoryChildren`](../../apps/server/src/fd/factory/FactoryChildren.ts)): one item per task in
+the parent's Markdown source, under the parent, then a field-only update making it blocked by the
+previous task's child, since Work's create takes no dependency. Neither write is idempotent across
+a restart: Work replays a `clientRequestId` only from memory. So each child is recorded on its task
+before the next is created, and a task without a record may still have a child from a run that
+stopped between the create and the record. Every child's body opens with a reference naming the
+delivery and task ([`plan/childItem.ts`](../../apps/server/src/fd/factory/plan/childItem.ts)); the
+next run searches the source for it and takes only an item under the parent whose body holds it
+exactly. It opens the body because Markdown's search indexes a bounded prefix. Work's lists are
+paged and can be stale, so a lookup that could not read the whole source, or that finds two such
+items, fails the effect instead of creating one or picking one; either guess could duplicate a
+child or chain the wrong dependency.
+
+Nothing of a task is cut to fit a Work item: approval refuses a plan whose child body would pass
+Work's bound, and the owner shortens it at the gate. The children's deliveries are stored only once
+every child exists, under ids derived from the parent and task, in one transaction that first
+checks the parent still awaits the effect, so a parent cancelled meanwhile queues none. The Work
+items an effect wrote after a cancel stay, as the server's other effects do.
 
 ## Clients see a review's details as it was accepted
 
@@ -298,6 +322,8 @@ Stopped before the plan gate, it waits there again on the same plan. Its planner
 and replayed like an author's (`plannerLaunch`). A recorded planner gets one retry turn in a new
 plan round, because a plan accepted before the block, from a run that failed after submitting,
 must not stand in for what the resumed planner submits.
+Once its plan is approved, a parent launches no thread until its children run, so its planner's
+deletion does not hold it: a resume creates the children it lacks, keeping those recorded.
 
 By owner decision an explicit resume grants a fresh retry allowance: repair rounds, the fix-commit
 turn and failure fingerprints start over, while the limits the delivery started with stay, and so

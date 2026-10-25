@@ -21,6 +21,7 @@ import * as ServerRuntimeStartup from "../../../serverRuntimeStartup.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import { type WorkDomainError, WorkService } from "../../work-management/index.ts";
 import * as FactoryChanges from "../FactoryChanges.ts";
+import * as FactoryChildren from "../FactoryChildren.ts";
 import * as FactoryPlanning from "../FactoryPlanning.ts";
 import * as FactoryReview from "../FactoryReview.ts";
 import * as FactoryService from "../FactoryService.ts";
@@ -70,6 +71,7 @@ describe("Factory RPC errors", () => {
       resume: () => unexpected,
       cancel: () => unexpected,
       updatePlan: () => unexpected,
+      approvePlan: () => unexpected,
       rejectPlan: () => unexpected,
       replan: () => unexpected,
       submitPlan: () => unexpected,
@@ -318,6 +320,7 @@ describe("Factory RPC handlers over real stores", () => {
         Layer.mock(FactoryWorker.FactoryWorker)({}),
         FactoryChanges.layer,
         Layer.mock(FactoryReview.FactoryReview)({}),
+        Layer.mock(FactoryChildren.FactoryChildren)({}),
         Layer.mock(FactoryPlanning.FactoryPlanning)({}),
         Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({}),
         Layer.mock(ThreadLaunch.ThreadLaunchService)({}),

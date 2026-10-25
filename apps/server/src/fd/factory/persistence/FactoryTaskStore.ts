@@ -1,5 +1,6 @@
 import { IsoDateTime, PositiveInt, TrimmedNonEmptyString } from "@t3tools/contracts";
 import { FactoryDeliveryId, FactoryPlanTask, FactoryTaskId } from "@t3tools/contracts/fd/factory";
+import { WorkItemId } from "@t3tools/contracts/fd/work-management";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -21,6 +22,11 @@ export const StoredFactoryTask = Schema.Struct({
   plan: Schema.NullOr(FactoryPlanTask),
   /** The commit the task's last approval covered. */
   lastReviewedSha: Schema.NullOr(TrimmedNonEmptyString),
+  /**
+   * The child Work item created for an approved plan's task, in the parent item's source; null
+   * until it is recorded, and for a single item.
+   */
+  childItemId: Schema.NullOr(WorkItemId),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -51,6 +57,12 @@ export class FactoryTaskStore extends Context.Service<
       readonly taskId: FactoryTaskId;
       readonly sha: string;
     }) => Effect.Effect<Option.Option<StoredFactoryTask>, FactoryStoreError>;
+    /** Records the task's child Work item; none when the task does not exist. */
+    readonly setChildItem: (input: {
+      readonly deliveryId: FactoryDeliveryId;
+      readonly taskId: FactoryTaskId;
+      readonly itemId: WorkItemId;
+    }) => Effect.Effect<Option.Option<StoredFactoryTask>, FactoryStoreError>;
   }
 >()("t3/fd/factory/persistence/FactoryTaskStore") {}
 
@@ -72,6 +84,7 @@ const make = Effect.gen(function* () {
         position,
         plan_json AS plan,
         last_reviewed_sha AS "lastReviewedSha",
+        child_item_id AS "childItemId",
         created_at AS "createdAt",
         updated_at AS "updatedAt"
       FROM fd_factory_tasks
@@ -94,11 +107,12 @@ const make = Effect.gen(function* () {
     Request: TaskDbRow,
     execute: (row) => sql`
       INSERT INTO fd_factory_tasks (
-        delivery_id, task_id, position, plan_json, last_reviewed_sha, created_at, updated_at
+        delivery_id, task_id, position, plan_json, last_reviewed_sha, child_item_id, created_at,
+        updated_at
       )
       VALUES (
         ${row.deliveryId}, ${row.taskId}, ${row.position}, ${row.plan}, ${row.lastReviewedSha},
-        ${row.createdAt}, ${row.updatedAt}
+        ${row.childItemId}, ${row.createdAt}, ${row.updatedAt}
       )
     `,
   });
@@ -116,6 +130,19 @@ const make = Effect.gen(function* () {
     `,
   });
 
+  const writeChildItem = SqlSchema.void({
+    Request: Schema.Struct({
+      deliveryId: FactoryDeliveryId,
+      taskId: FactoryTaskId,
+      itemId: WorkItemId,
+      updatedAt: IsoDateTime,
+    }),
+    execute: ({ deliveryId, taskId, itemId, updatedAt }) => sql`
+      UPDATE fd_factory_tasks SET child_item_id = ${itemId}, updated_at = ${updatedAt}
+      WHERE delivery_id = ${deliveryId} AND task_id = ${taskId}
+    `,
+  });
+
   const insert: FactoryTaskStore["Service"]["insert"] = (input) =>
     Effect.gen(function* () {
       const [next] = yield* selectNextPosition(input.deliveryId);
@@ -126,6 +153,7 @@ const make = Effect.gen(function* () {
         position: next?.next ?? 1,
         plan: input.plan ?? null,
         lastReviewedSha: null,
+        childItemId: null,
         createdAt: at,
         updatedAt: at,
       };
@@ -144,6 +172,17 @@ const make = Effect.gen(function* () {
       Effect.catchTags(FactoryStoreError.catchStorage("tasks.setLastReviewedSha")),
     );
 
+  const setChildItem: FactoryTaskStore["Service"]["setChildItem"] = (input) =>
+    Effect.gen(function* () {
+      const updatedAt = yield* now;
+      yield* writeChildItem({ ...input, updatedAt });
+      const [task] = yield* selectTasks({ deliveryId: input.deliveryId, taskId: input.taskId });
+      return Option.fromUndefinedOr(task);
+    }).pipe(
+      sql.withTransaction,
+      Effect.catchTags(FactoryStoreError.catchStorage("tasks.setChildItem")),
+    );
+
   return FactoryTaskStore.of({
     insert,
     listByDelivery: (deliveryId) =>
@@ -151,6 +190,7 @@ const make = Effect.gen(function* () {
         Effect.catchTags(FactoryStoreError.catchStorage("tasks.listByDelivery")),
       ),
     setLastReviewedSha,
+    setChildItem,
   });
 });
 

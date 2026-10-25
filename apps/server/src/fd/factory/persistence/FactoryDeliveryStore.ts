@@ -132,6 +132,8 @@ const StoredEffect = Schema.Union([
   }),
   Schema.Struct({ id: PositiveInt, type: Schema.Literal("record_approval") }),
   Schema.Struct({ id: PositiveInt, type: Schema.Literal("open_pr") }),
+  // Added with plan approval.
+  Schema.Struct({ id: PositiveInt, type: Schema.Literal("create_children") }),
 ]);
 
 const StoredCommit = { headSha: Schema.String, tree: Schema.String };
@@ -244,6 +246,9 @@ const StoredDeliveryState = Schema.Struct({
   ),
   planRound: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
   plan: Schema.NullOr(StoredAcceptedPlan).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  // Added with plan approval: rows stored before it never had a plan approved.
+  planApproved: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  children: Schema.Array(FactoryDeliveryId).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   // Added with the PR stage: rows stored before it opened none.
   pullRequest: Schema.NullOr(
     Schema.Struct({ number: PositiveInt, url: Schema.String, headBranch: Schema.String }),

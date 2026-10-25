@@ -245,8 +245,8 @@ export const toFactoryDelivery = (delivery: FactoryDeliveryWithRuns): FactoryDel
     projectId: delivery.projectId,
     itemRef: delivery.itemRef,
     ...(delivery.parentId === null ? {} : { parentId: delivery.parentId }),
-    // A single item has no children; parents arrive with planning.
-    childIds: [],
+    // A parent's children once its approved plan created them; a single item has none.
+    childIds: state.children,
     status: state.status,
     ...(state.stage === null ? {} : { stage: { name: state.stage, kind: stageKind(state.stage) } }),
     rounds: state.rounds,

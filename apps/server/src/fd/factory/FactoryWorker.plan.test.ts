@@ -11,6 +11,7 @@ import * as ServerConfig from "../../config.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
+import * as FactoryChildren from "./FactoryChildren.ts";
 import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
@@ -133,6 +134,7 @@ const makeLayer = (calls: PlannerCalls, fallback: FactoryPlanJudgment) =>
     Layer.provide(Layer.mock(FactoryReview.FactoryReview)({})),
     Layer.provide(fallbackPlanning(fallback)),
     Layer.provide(Layer.mock(FactoryRecord.FactoryRecord)({})),
+    Layer.provide(Layer.mock(FactoryChildren.FactoryChildren)({})),
     Layer.provide(Layer.mock(FactoryPullRequest.FactoryPullRequest)({})),
     Layer.provide(Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({})),
     Layer.provideMerge(FactorySettings.layer),

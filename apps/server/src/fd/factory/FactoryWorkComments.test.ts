@@ -26,6 +26,7 @@ import * as ProcessRunner from "../../processRunner.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { type WorkActor, type WorkDomainError, WorkService } from "../work-management/index.ts";
+import * as FactoryChildren from "./FactoryChildren.ts";
 import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryReactor from "./FactoryReactor.ts";
@@ -190,6 +191,7 @@ const baseLayer = (world: World) =>
     fakeOrchestration,
     // No delivery here is reviewed, records an approval or opens its pull request.
     Layer.mock(FactoryReview.FactoryReview)({}),
+    Layer.mock(FactoryChildren.FactoryChildren)({}),
     Layer.mock(FactoryPlanning.FactoryPlanning)({}),
     Layer.mock(FactoryRecord.FactoryRecord)({}),
     Layer.mock(FactoryPullRequest.FactoryPullRequest)({}),

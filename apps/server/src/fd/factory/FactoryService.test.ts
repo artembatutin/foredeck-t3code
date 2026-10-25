@@ -28,6 +28,7 @@ import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkDomainError, WorkService } from "../work-management/index.ts";
+import * as FactoryChildren from "./FactoryChildren.ts";
 import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
@@ -162,6 +163,7 @@ const fakes = (world: World) =>
     // FactoryReview.test.ts, FactoryRecord.test.ts and FactoryPullRequest.test.ts cover those.
     Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({}),
     Layer.mock(FactoryReview.FactoryReview)({}),
+    Layer.mock(FactoryChildren.FactoryChildren)({}),
     Layer.mock(FactoryPlanning.FactoryPlanning)({}),
     Layer.mock(FactoryRecord.FactoryRecord)({}),
     Layer.mock(FactoryPullRequest.FactoryPullRequest)({}),

@@ -421,18 +421,25 @@ const work = WorkManagement.WorkService.layer.pipe(
   Layer.provide(Layer.mock(ServerSecretStore.ServerSecretStore)({})),
 );
 
-/** `work`, recording each comment before Work posts it. */
-const recordingWork = (calls: Array<CommentCall>) =>
+type WorkServiceShape = WorkManagement.WorkService.WorkService["Service"];
+
+/** `work`, recording each comment before Work posts it, then wrapped by `wrap`. */
+const recordingWork = (
+  calls: Array<CommentCall>,
+  wrap: (service: WorkServiceShape) => WorkServiceShape,
+) =>
   Layer.effect(
     WorkManagement.WorkService.WorkService,
     Effect.map(WorkManagement.WorkService.WorkService, (service) =>
-      WorkManagement.WorkService.WorkService.of({
-        ...service,
-        addComment: (actor, input) =>
-          Effect.sync(() => calls.push({ actor, input })).pipe(
-            Effect.andThen(service.addComment(actor, input)),
-          ),
-      }),
+      WorkManagement.WorkService.WorkService.of(
+        wrap({
+          ...service,
+          addComment: (actor, input) =>
+            Effect.sync(() => calls.push({ actor, input })).pipe(
+              Effect.andThen(service.addComment(actor, input)),
+            ),
+        }),
+      ),
     ),
   ).pipe(Layer.provideMerge(work));
 
@@ -475,6 +482,7 @@ const makeLayer = (input: {
   readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
   readonly pullRequestCalls: Array<PullRequestCall>;
   readonly commentCalls: Array<CommentCall>;
+  readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
   readonly root: string;
   readonly t3Home: string;
 }) => {
@@ -501,7 +509,7 @@ const makeLayer = (input: {
     Layer.provide(fakePullRequests(input.pullRequestCalls)),
     Layer.provide(ProviderRegistryMock.layer()),
     Layer.provide(instances),
-    Layer.provideMerge(recordingWork(input.commentCalls)),
+    Layer.provideMerge(recordingWork(input.commentCalls, input.wrapWork)),
     Layer.provideMerge(threadLaunch),
     Layer.provideMerge(projectService),
     Layer.provideMerge(ThreadManagement.layer),
@@ -641,6 +649,8 @@ export const withProject = <A, E>(
     readonly limits?: { readonly maxFixRounds?: number; readonly maxReviewRounds?: number };
     /** The runtime modes the provider advertises; none, so it runs any, when absent. */
     readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
+    /** Wraps the Work service the server runs with, to fail some of its calls. */
+    readonly work?: (service: WorkServiceShape) => WorkServiceShape;
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -756,6 +766,7 @@ export const withProject = <A, E>(
           supportedRuntimeModes: options.supportedRuntimeModes,
           pullRequestCalls,
           commentCalls,
+          wrapWork: options.work ?? ((service) => service),
           root,
           t3Home,
         }),

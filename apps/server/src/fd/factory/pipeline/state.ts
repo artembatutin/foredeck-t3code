@@ -1,5 +1,6 @@
 import type { OrchestrationV2RunStatus, RunId, RuntimeMode, ThreadId } from "@t3tools/contracts";
 import type {
+  FactoryDeliveryId,
   FactoryDeliveryStatus,
   FactoryPlan,
   FactoryPlanTask,
@@ -145,7 +146,12 @@ export type FactoryEffectRequest =
    * The PR stage: push the delivery branch and open its pull request, linked to the author
    * thread, for the commit its task was approved for.
    */
-  | { readonly type: "open_pr" };
+  | { readonly type: "open_pr" }
+  /**
+   * A parent's approved plan: create the child Work item of each of its tasks that has none yet,
+   * in plan order, then store the children's queued deliveries.
+   */
+  | { readonly type: "create_children" };
 
 export type FactoryRepairKind = "fix-verify" | "fix-review";
 
@@ -365,6 +371,11 @@ export type FactoryEvent =
    * stepped: these tasks replace the plan's, and the delivery waits on.
    */
   | { readonly type: "plan.updated"; readonly tasks: ReadonlyArray<FactoryPlanTask> }
+  /**
+   * The owner's approval of the plan at the gate, judged before it is stepped: the plan is frozen
+   * and the parent creates its children.
+   */
+  | { readonly type: "plan.approved" }
   /** The owner's rejection of the plan at the gate: the delivery ends cancelled. */
   | { readonly type: "plan.rejected" }
   /**
@@ -454,6 +465,12 @@ export type FactoryEvent =
       readonly type: "pr.opened";
       readonly effectId: number;
       readonly pullRequest: FactoryOpenedPullRequest;
+    }
+  /** A `create_children` result: the child deliveries, in plan order. */
+  | {
+      readonly type: "children.created";
+      readonly effectId: number;
+      readonly children: ReadonlyArray<FactoryDeliveryId>;
     }
   /** The worker could not carry out the effect; `detail` is bounded and safe to show. */
   | { readonly type: "effect.failed"; readonly effectId: number; readonly detail: string };
@@ -588,6 +605,10 @@ export interface FactoryDeliveryState {
    * waits on this one's tasks.
    */
   readonly plan: FactoryAcceptedPlan | null;
+  /** Set once the owner approves a parent's plan, which freezes it as its tasks. */
+  readonly planApproved: boolean;
+  /** A parent's child deliveries in plan order, once they are created; none before. */
+  readonly children: ReadonlyArray<FactoryDeliveryId>;
   /** Set once the PR stage has opened the delivery's pull request. */
   readonly pullRequest: FactoryOpenedPullRequest | null;
   /** Set while the delivery is blocked. */
@@ -682,6 +703,8 @@ export const queuedDeliveryState = (input: {
   reviewResponse: null,
   planRound: 0,
   plan: null,
+  planApproved: false,
+  children: [],
   pullRequest: null,
   block: null,
   checkpoint: null,

@@ -28,6 +28,7 @@ import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementSer
 import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import { workBranchName, WorkService } from "../../work-management/index.ts";
+import * as FactoryChildren from "../FactoryChildren.ts";
 import * as FactoryPlanning from "../FactoryPlanning.ts";
 import * as FactoryPullRequest from "../FactoryPullRequest.ts";
 import * as FactoryRecord from "../FactoryRecord.ts";
@@ -342,6 +343,7 @@ const missingProject = (() => {
         Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({}),
         Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({}),
         Layer.mock(FactoryReview.FactoryReview)({}),
+        Layer.mock(FactoryChildren.FactoryChildren)({}),
         Layer.mock(FactoryPlanning.FactoryPlanning)({}),
         Layer.mock(FactoryRecord.FactoryRecord)({}),
         Layer.mock(FactoryPullRequest.FactoryPullRequest)({}),

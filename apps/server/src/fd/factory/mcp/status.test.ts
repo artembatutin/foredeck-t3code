@@ -40,6 +40,7 @@ import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import { type WorkDomainError, WorkService } from "../../work-management/index.ts";
+import * as FactoryChildren from "../FactoryChildren.ts";
 import * as FactoryPlanning from "../FactoryPlanning.ts";
 import * as FactoryPullRequest from "../FactoryPullRequest.ts";
 import * as FactoryRecord from "../FactoryRecord.ts";
@@ -128,6 +129,7 @@ const layer = FactoryService.layer.pipe(
   // Transition comments are posted in FactoryWorkComments.test.ts; none is posted here.
   Layer.provide(Layer.mock(FactoryWorkComments.FactoryWorkComments)({ post: () => Effect.void })),
   Layer.provide(FactoryReview.layer),
+  Layer.provide(Layer.mock(FactoryChildren.FactoryChildren)({})),
   Layer.provide(Layer.mock(FactoryPlanning.FactoryPlanning)({})),
   Layer.provide(FactoryEvidence.layer),
   Layer.provide(

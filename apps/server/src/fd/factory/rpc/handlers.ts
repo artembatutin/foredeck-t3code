@@ -97,6 +97,8 @@ export const wsHandlers = (input: {
     [FACTORY_WS_METHODS.factoryDeliveriesSubscribe]: () => factory.subscribe,
     [FACTORY_WS_METHODS.factoryPlanUpdate]: ({ deliveryId, plan }) =>
       forDelivery(deliveryId, command(factory.updatePlan({ deliveryId, plan }))),
+    [FACTORY_WS_METHODS.factoryPlanApprove]: ({ deliveryId }) =>
+      forDelivery(deliveryId, command(factory.approvePlan(deliveryId))),
     [FACTORY_WS_METHODS.factoryPlanReject]: ({ deliveryId }) =>
       forDelivery(deliveryId, command(factory.rejectPlan(deliveryId))),
     [FACTORY_WS_METHODS.factoryPlanReplan]: ({ deliveryId, note }) =>

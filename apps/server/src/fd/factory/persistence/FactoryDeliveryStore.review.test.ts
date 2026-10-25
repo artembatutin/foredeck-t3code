@@ -183,6 +183,9 @@ describe("FactoryDeliveryStore with review state", () => {
         plannerLaunch: null,
         planRound: 0,
         plan: null,
+        // Nor plan approval: no plan was approved, and no child was created.
+        planApproved: false,
+        children: [],
       });
       assert.deepStrictEqual(
         (yield* store.listActive()).map((delivery) => delivery.deliveryId),

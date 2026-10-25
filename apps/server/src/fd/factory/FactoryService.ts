@@ -65,6 +65,7 @@ import {
   unrecordedAuthorLaunch,
   unrecordedPlannerLaunch,
 } from "./pipeline/state.ts";
+import { uncreatableTasks } from "./plan/childItem.ts";
 import { validatePlanEdit } from "./plan/edit.ts";
 
 const FactoryReceiptRefusal = Schema.Literals(["head_changed", "tree_dirty"]);
@@ -247,15 +248,28 @@ export class FactoryCancelRefusedError extends Schema.TaggedError<FactoryCancelR
 }
 
 /**
- * Only a delivery waiting at the plan gate takes its owner's plan edit, rejection or replan;
- * nothing changed.
+ * Only a delivery waiting at the plan gate takes its owner's plan approval, edit, rejection or
+ * replan; nothing changed.
  */
 export class FactoryPlanGateRefusedError extends Schema.TaggedError<FactoryPlanGateRefusedError>()(
   "FactoryPlanGateRefusedError",
   { deliveryId: FactoryDeliveryId, status: FactoryDeliveryStatus },
 ) {
   override get message(): string {
-    return `Factory delivery ${this.deliveryId} is ${this.status} and not waiting at the plan gate, so its plan cannot be edited, rejected or replanned.`;
+    return `Factory delivery ${this.deliveryId} is ${this.status} and not waiting at the plan gate, so its plan cannot be approved, edited, rejected or replanned.`;
+  }
+}
+
+/**
+ * These tasks' child items would be longer than a Work item holds, and nothing of a task is cut
+ * to fit; nothing changed.
+ */
+export class FactoryChildItemTooLongError extends Schema.TaggedError<FactoryChildItemTooLongError>()(
+  "FactoryChildItemTooLongError",
+  { deliveryId: FactoryDeliveryId, taskIds: Schema.Array(FactoryTaskId) },
+) {
+  override get message(): string {
+    return `The child items of tasks ${this.taskIds.join(", ")} of Factory delivery ${this.deliveryId} would be longer than a Work item holds.`;
   }
 }
 
@@ -434,6 +448,27 @@ export class FactoryService extends Context.Service<
       | FactoryStoreError
     >;
     /**
+     * The owner's approval of the plan a parent waits on at the plan gate. The plan is frozen:
+     * its tasks are stored in plan order with the approval, and no edit, replan or second
+     * approval is taken after it. The running parent then creates, as a worker effect, one child
+     * Work item per task in the parent item's Markdown source, under the parent item and blocked
+     * by the previous task's, and stores the children's queued deliveries on its branch and
+     * worktree (see `FactoryChildren`); it starts none of them, and blocks where its per-child
+     * phase would begin, which this server cannot run yet. A Work failure blocks it with every
+     * child recorded so far kept, and a resume goes on after them. Refused, with nothing changed,
+     * for a delivery not waiting at the gate, or a plan with a task whose child item would be
+     * longer than a Work item holds.
+     */
+    readonly approvePlan: (
+      deliveryId: FactoryDeliveryId,
+    ) => Effect.Effect<
+      FactoryDeliveryWithRuns,
+      | FactoryPlanGateRefusedError
+      | FactoryChildItemTooLongError
+      | FactoryDeliveryNotFoundError
+      | FactoryStoreError
+    >;
+    /**
      * The owner's rejection of the plan a parent waits on at the plan gate: the delivery ends
      * cancelled, issuing nothing; its planner thread, worktree and branch stay. Refused, with
      * nothing changed, for a delivery not waiting at the gate.
@@ -497,8 +532,9 @@ export class FactoryService extends Context.Service<
     /**
      * Factory's change epoch: its value on subscribe, then each move. It moves after each write
      * commits (a delivery's start, each engine step, a stop, resume or cancel, a plan or review
-     * submission, a plan edit, rejection or replan, a settings write) and never for a refusal, so
-     * a subscriber refetches what it shows on each value.
+     * submission, a plan approval, edit, rejection or replan, the child deliveries an approval
+     * stores, a settings write) and never for a refusal, so a subscriber refetches what it shows
+     * on each value.
      */
     readonly subscribe: Stream.Stream<number>;
   }
@@ -937,6 +973,24 @@ const make = Effect.gen(function* () {
     return steppedWithRuns(stepped.value);
   });
 
+  const approvePlan: FactoryService["Service"]["approvePlan"] = Effect.fn(
+    "FactoryService.approvePlan",
+  )(function* (deliveryId) {
+    const stepped = yield* worker.stepWith(deliveryId, (current) =>
+      Effect.gen(function* () {
+        const plan = yield* atGate(current);
+        // Work would refuse such a child; the owner shortens the plan rather than lose any of it.
+        const taskIds = uncreatableTasks(current.itemRef, deliveryId, plan.tasks);
+        if (taskIds.length > 0) {
+          return yield* new FactoryChildItemTooLongError({ deliveryId, taskIds });
+        }
+        return { event: { type: "plan.approved" } as const, value: undefined };
+      }),
+    );
+    if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
+    return steppedWithRuns(stepped.value);
+  });
+
   const rejectPlan: FactoryService["Service"]["rejectPlan"] = Effect.fn(
     "FactoryService.rejectPlan",
   )(function* (deliveryId) {
@@ -986,6 +1040,7 @@ const make = Effect.gen(function* () {
     resume,
     cancel,
     updatePlan,
+    approvePlan,
     rejectPlan,
     replan,
     submitPlan,

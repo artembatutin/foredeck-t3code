@@ -37,6 +37,7 @@ import * as ServerSettings from "../../../serverSettings.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import { WorkService } from "../../work-management/index.ts";
+import * as FactoryChildren from "../FactoryChildren.ts";
 import * as FactoryPlanning from "../FactoryPlanning.ts";
 import * as FactoryPullRequest from "../FactoryPullRequest.ts";
 import * as FactoryRecord from "../FactoryRecord.ts";
@@ -110,6 +111,7 @@ const layer = FactoryService.layer.pipe(
       Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({}),
       Layer.mock(FactoryReview.FactoryReview)({}),
       Layer.mock(FactoryRecord.FactoryRecord)({}),
+      Layer.mock(FactoryChildren.FactoryChildren)({}),
       Layer.mock(FactoryPullRequest.FactoryPullRequest)({}),
       Layer.mock(ProjectionStore.ProjectionStoreV2)({
         getThreadShell: (threadId) => Effect.sync(() => shellOf(threadId)),

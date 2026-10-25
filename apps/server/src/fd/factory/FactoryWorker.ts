@@ -20,6 +20,7 @@ import * as TxRef from "effect/TxRef";
 
 import type * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as FactoryChanges from "./FactoryChanges.ts";
+import * as FactoryChildren from "./FactoryChildren.ts";
 import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
@@ -31,6 +32,7 @@ import { readSettle } from "./git/settleCheck.ts";
 import { FactoryStoreError } from "./persistence/errors.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
+import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 import * as FactoryWorkCommentStore from "./persistence/FactoryWorkCommentStore.ts";
 import { transitionComment } from "./pipeline/comments.ts";
 import { advance } from "./pipeline/engine.ts";
@@ -68,7 +70,8 @@ class FactoryStageCommandError extends Schema.TaggedError<FactoryStageCommandErr
  * stores the new state with its stage attempts, then queues the effects the engine returned;
  * each effect's result (or failure) is fed back as the delivery's next step. A step that moves
  * the delivery into a status its item announces records that Work comment with the new state and
- * then queues it. Each step that stores something moves the deliveries' change epoch once it has
+ * then queues it. A step that approves a parent's plan stores its tasks, in plan order, with the
+ * approval. Each step that stores something moves the deliveries' change epoch once it has
  * committed.
  */
 export class FactoryWorker extends Context.Service<
@@ -174,6 +177,8 @@ const describeEffect = (effect: FactoryEffect) => {
       return "record the approval";
     case "open_pr":
       return "open the pull request";
+    case "create_children":
+      return "create the child items";
   }
 };
 
@@ -255,6 +260,7 @@ const evidenceOf = (
 const make = Effect.gen(function* () {
   const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
   const stageRuns = yield* FactoryStageRunStore.FactoryStageRunStore;
+  const tasks = yield* FactoryTaskStore.FactoryTaskStore;
   const settings = yield* FactorySettings.FactorySettings;
   const verifyRunner = yield* FactoryVerifyRunner.FactoryVerifyRunner;
   const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
@@ -262,6 +268,7 @@ const make = Effect.gen(function* () {
   const reviews = yield* FactoryReview.FactoryReview;
   const records = yield* FactoryRecord.FactoryRecord;
   const pullRequests = yield* FactoryPullRequest.FactoryPullRequest;
+  const children = yield* FactoryChildren.FactoryChildren;
   const commentStore = yield* FactoryWorkCommentStore.FactoryWorkCommentStore;
   const poster = yield* FactoryWorkComments.FactoryWorkComments;
   const changes = yield* FactoryChanges.FactoryChanges;
@@ -411,6 +418,14 @@ const make = Effect.gen(function* () {
             pullRequest,
           })),
         );
+      case "create_children":
+        return children.create(delivery, effect).pipe(
+          Effect.map((created): FactoryEvent => ({
+            type: "children.created",
+            effectId: effect.id,
+            children: created,
+          })),
+        );
     }
   };
 
@@ -510,11 +525,20 @@ const make = Effect.gen(function* () {
     // Only the step that stores a transition announces it, and records its comment with it: a
     // repeated event changes nothing, and a restart posts only what no process has attempted.
     const comment = transitionComment(before, next.delivery);
+    // The approval freezes the plan: its tasks are stored with it, so no approved parent lacks
+    // them and none is stored twice.
+    const approvedTasks =
+      !before.planApproved && next.delivery.planApproved ? (next.delivery.plan?.tasks ?? []) : [];
     const recorded = yield* deliveries.update(deliveryId, next.delivery).pipe(
       Effect.flatMap((updated) =>
         Option.isNone(updated)
           ? Effect.succeedNone
-          : recordAttempts(deliveryId, before, next.delivery, evidence).pipe(
+          : Effect.forEach(
+              approvedTasks,
+              (task) => tasks.insert({ deliveryId, taskId: task.id, plan: task }),
+              { discard: true },
+            ).pipe(
+              Effect.andThen(recordAttempts(deliveryId, before, next.delivery, evidence)),
               Effect.andThen(
                 comment === undefined
                   ? Effect.succeedNone

@@ -455,6 +455,7 @@ describe("FactoryTaskStore", () => {
         position: 1,
         plan: null,
         lastReviewedSha: null,
+        childItemId: null,
         createdAt: single.createdAt,
         updatedAt: single.createdAt,
       });

@@ -25,6 +25,7 @@ export type FactoryServiceError =
   | FactoryService.FactoryResumeRefusedError
   | FactoryService.FactoryCancelRefusedError
   | FactoryService.FactoryPlanGateRefusedError
+  | FactoryService.FactoryChildItemTooLongError
   | FactoryService.FactoryPlanEditInvalidError
   | FactoryService.FactoryReplanNoteInvalidError
   | FactoryDeliveryStore.FactoryDeliveryActive
@@ -83,7 +84,14 @@ export const toFactoryError = (error: FactoryServiceError): FactoryError => {
     case "FactoryPlanGateRefusedError":
       return new FactoryError({
         reason: "refused",
-        message: `Only a delivery waiting at the plan gate can have its plan edited, rejected or replanned; this one is ${error.status}.`,
+        message: `Only a delivery waiting at the plan gate can have its plan approved, edited, rejected or replanned; this one is ${error.status}.`,
+        deliveryId: error.deliveryId,
+      });
+    case "FactoryChildItemTooLongError":
+      return new FactoryError({
+        reason: "invalid_request",
+        message:
+          "Factory cannot approve this plan: a task's child item would be longer than a Work item holds, and Factory does not cut a task's summary, acceptance criteria or test plan. Edit the plan to shorten its longest tasks, then approve it.",
         deliveryId: error.deliveryId,
       });
     case "FactoryPlanEditInvalidError":
