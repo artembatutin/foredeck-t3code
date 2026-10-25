@@ -103,7 +103,7 @@ describe("RPC authorization scopes", () => {
     );
   });
 
-  it("keeps Factory reads behind orchestration:read and guards exactly its five controls", () => {
+  it("keeps Factory reads behind orchestration:read and guards exactly its eight controls", () => {
     for (const method of Object.values(FACTORY_WS_METHODS)) {
       expect(Object.hasOwn(RPC_REQUIRED_SCOPES, method)).toBe(true);
     }
@@ -118,6 +118,9 @@ describe("RPC authorization scopes", () => {
         FACTORY_WS_METHODS.factoryDeliveriesStop,
         FACTORY_WS_METHODS.factoryDeliveriesResume,
         FACTORY_WS_METHODS.factoryDeliveriesCancel,
+        FACTORY_WS_METHODS.factoryPlanUpdate,
+        FACTORY_WS_METHODS.factoryPlanReject,
+        FACTORY_WS_METHODS.factoryPlanReplan,
       ].sort(),
     );
     expect(requiredScopeForRpcMethod(FACTORY_WS_METHODS.factorySettingsSet)).toBe(
@@ -128,6 +131,9 @@ describe("RPC authorization scopes", () => {
       FACTORY_WS_METHODS.factoryDeliveriesStop,
       FACTORY_WS_METHODS.factoryDeliveriesResume,
       FACTORY_WS_METHODS.factoryDeliveriesCancel,
+      FACTORY_WS_METHODS.factoryPlanUpdate,
+      FACTORY_WS_METHODS.factoryPlanReject,
+      FACTORY_WS_METHODS.factoryPlanReplan,
     ]) {
       expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
     }
@@ -599,6 +605,9 @@ describe("Factory RPC authorization", () => {
                 [FACTORY_WS_METHODS.factoryDeliveriesList]: reached("list"),
                 [FACTORY_WS_METHODS.factoryDeliveriesSubscribe]: () =>
                   Stream.fromEffect(reached("subscribe")()),
+                [FACTORY_WS_METHODS.factoryPlanUpdate]: reached("plan.update"),
+                [FACTORY_WS_METHODS.factoryPlanReject]: reached("plan.reject"),
+                [FACTORY_WS_METHODS.factoryPlanReplan]: reached("plan.replan"),
               }),
             ),
             RpcAuthorization.layer(
@@ -644,6 +653,23 @@ describe("Factory RPC authorization", () => {
       missing: AuthOrchestrationOperateScope,
       call: (client: FactoryClient) =>
         client[FACTORY_WS_METHODS.factoryDeliveriesCancel]({ deliveryId }),
+    },
+    {
+      name: "plan.update without orchestration:operate",
+      missing: AuthOrchestrationOperateScope,
+      call: (client: FactoryClient) =>
+        client[FACTORY_WS_METHODS.factoryPlanUpdate]({ deliveryId, plan: { tasks: [] } }),
+    },
+    {
+      name: "plan.reject without orchestration:operate",
+      missing: AuthOrchestrationOperateScope,
+      call: (client: FactoryClient) => client[FACTORY_WS_METHODS.factoryPlanReject]({ deliveryId }),
+    },
+    {
+      name: "plan.replan without orchestration:operate",
+      missing: AuthOrchestrationOperateScope,
+      call: (client: FactoryClient) =>
+        client[FACTORY_WS_METHODS.factoryPlanReplan]({ deliveryId, note: "Split the export." }),
     },
     {
       name: "settings.get without orchestration:read",

@@ -45,7 +45,12 @@ import { authorThreadTitle, renderAuthorPrompt } from "./prompts/author.ts";
 import { renderFixCommitPrompt } from "./prompts/fixCommit.ts";
 import { renderFixReviewPrompt } from "./prompts/fixReview.ts";
 import { renderFixVerifyPrompt } from "./prompts/fixVerify.ts";
-import { planThreadTitle, renderPlanPrompt, renderPlanRetryPrompt } from "./prompts/plan.ts";
+import {
+  planThreadTitle,
+  renderPlanPrompt,
+  renderPlanRetryPrompt,
+  renderReplanPrompt,
+} from "./prompts/plan.ts";
 import {
   renderReviewPrompt,
   renderReviewRetryPrompt,
@@ -194,6 +199,14 @@ export class FactoryThreadEffects extends Context.Service<
     readonly sendPlanRetryTurn: (
       delivery: StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "send_plan_retry_turn" }>,
+    ) => Effect.Effect<{ readonly runId: RunId }, FactoryThreadEffectFailure>;
+    /**
+     * Sends the owner's replan note to the planner thread, queued behind whatever the thread is
+     * doing, and reports the run it started on the effect's thread.
+     */
+    readonly sendReplanTurn: (
+      delivery: StoredFactoryDelivery,
+      effect: Extract<FactoryEffect, { readonly type: "send_replan_turn" }>,
     ) => Effect.Effect<{ readonly runId: RunId }, FactoryThreadEffectFailure>;
     /** Sends the reviewer's retry turn and reports the run it started on the effect's thread. */
     readonly sendReviewRetryTurn: (
@@ -586,6 +599,7 @@ const make = Effect.gen(function* () {
     kind:
       | "fix-commit"
       | "plan-retry"
+      | "replan"
       | "review-retry"
       | "fix-verify"
       | "fix-review"
@@ -700,6 +714,8 @@ const make = Effect.gen(function* () {
         "plan-retry",
         renderPlanRetryPrompt({ problems: effect.problems, checkpoint: effect.checkpoint ?? null }),
       ),
+    sendReplanTurn: (delivery, effect) =>
+      sendTurn(delivery, effect, "replan", renderReplanPrompt({ note: effect.note })),
     sendReviewRetryTurn: (delivery, effect) =>
       sendTurn(
         delivery,

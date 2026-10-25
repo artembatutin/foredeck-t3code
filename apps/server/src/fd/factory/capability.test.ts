@@ -36,7 +36,10 @@ it.layer(NodeServices.layer)("Factory capability", (it) => {
 
       // Encoded by the server and decoded by a client, it still reads as Factory support.
       const received = decodeDescriptor(encodeDescriptor(descriptor));
-      assert.deepStrictEqual(factorySupport(received.capabilities), { version: 1 });
+      assert.deepStrictEqual(factorySupport(received.capabilities), {
+        version: 1,
+        planning: true,
+      });
     }),
   );
 });

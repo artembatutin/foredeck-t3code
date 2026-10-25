@@ -13,6 +13,7 @@ import { WS_METHODS, WsRpcGroup } from "../../rpc.ts";
 import {
   FACTORY_CAPABILITY,
   FACTORY_CLIENT_GUARDED_RPC_SCOPES,
+  FactoryCapability,
   FACTORY_RPC_INSTRUMENTATION,
   FACTORY_RPC_READ_SCOPES,
   FACTORY_WS_METHODS,
@@ -21,6 +22,8 @@ import {
 } from "./index.ts";
 
 const decodeDescriptor = Schema.decodeUnknownSync(ExecutionEnvironmentDescriptor);
+const encodeCapability = Schema.encodeSync(FactoryCapability);
+const decodeBeforePlanning = Schema.decodeUnknownSync(Schema.Struct({ version: Schema.Int }));
 const encodeCapabilities = Schema.encodeSync(ExecutionEnvironmentCapabilities);
 const descriptor = {
   environmentId: "environment-1",
@@ -66,17 +69,44 @@ describe("factorySupport", () => {
   );
 
   it("supports the version 1 capability, even with fields a newer server adds", () => {
-    expect(factorySupport(withFactory({ version: 1 }))).toEqual({ version: 1 });
+    expect(factorySupport(withFactory({ version: 1 }))).toEqual({ version: 1, planning: false });
     expect(factorySupport(withFactory({ version: 1, features: ["plans"] }))).toEqual({
       version: 1,
+      planning: false,
     });
   });
 
-  it("advertises version 1 and encodes it unchanged", () => {
-    expect(FACTORY_CAPABILITY).toEqual({ version: 1 });
+  it("advertises version 1 with planning and encodes it unchanged", () => {
+    expect(FACTORY_CAPABILITY).toEqual({ version: 1, planning: true });
     const capabilities = withFactory(FACTORY_CAPABILITY);
-    expect(factorySupport(capabilities)).toEqual({ version: 1 });
+    expect(factorySupport(capabilities)).toEqual({ version: 1, planning: true });
     expect(encodeCapabilities(capabilities).factory).toEqual(FACTORY_CAPABILITY);
+  });
+});
+
+describe("factorySupport planning", () => {
+  it("reports planning only for a server that advertises it", () => {
+    expect(factorySupport(withFactory({ version: 1, planning: true }))?.planning).toBe(true);
+    // A server from before planning omits the field; one may also say it has none.
+    expect(factorySupport(withFactory({ version: 1 }))?.planning).toBe(false);
+    expect(factorySupport(withFactory({ version: 1, planning: false }))?.planning).toBe(false);
+  });
+
+  it("still treats another major version as unsupported, planning or not", () => {
+    expect(factorySupport(withFactory({ version: 2, planning: true }))).toBeUndefined();
+    expect(factorySupport(withFactory({ version: 0 }))).toBeUndefined();
+  });
+
+  it("drops a capability whose planning this build cannot read, without failing the descriptor", () => {
+    const capabilities = withFactory({ version: 1, planning: "yes" });
+    expect(capabilities.repositoryIdentity).toBe(true);
+    expect(factorySupport(capabilities)).toBeUndefined();
+  });
+
+  it("is ignored by a client from before planning, which still sees version 1", () => {
+    // That client's capability schema is the version alone; the field a newer server adds is
+    // dropped, so its support is the same as against a server without planning.
+    expect(decodeBeforePlanning(encodeCapability(FACTORY_CAPABILITY))).toEqual({ version: 1 });
   });
 });
 

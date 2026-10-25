@@ -68,6 +68,7 @@ const scriptedThreads = (script: ThreadScript) =>
           script.turn?.(store, delivery, effect) ?? Effect.die("turn not scripted"),
         // Planning is driven in FactoryWorker.plan.test.ts.
         sendPlanRetryTurn: () => Effect.die("plan retry turn not scripted"),
+        sendReplanTurn: () => Effect.die("replan turn not scripted"),
         sendReviewRetryTurn: () => Effect.die("review retry turn not scripted"),
         // Repair rounds are driven in FactoryRepair.test.ts.
         sendRepairTurn: () => Effect.die("repair turn not scripted"),

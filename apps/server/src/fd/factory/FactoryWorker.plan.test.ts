@@ -101,6 +101,8 @@ const plannerThreads = (calls: PlannerCalls) =>
         Effect.sync(() => calls.retries.push({ threadId, problems })).pipe(
           Effect.as({ runId: retryRun }),
         ),
+      // Replans are driven in FactoryPlanGate.test.ts.
+      sendReplanTurn: () => Effect.die("replan turn not scripted"),
       sendReviewRetryTurn: () => Effect.die("review retry turn not scripted"),
       sendRepairTurn: () => Effect.die("repair turn not scripted"),
       sendReviewFollowUpTurn: () => Effect.die("review follow-up turn not scripted"),

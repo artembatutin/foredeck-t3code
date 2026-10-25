@@ -1,4 +1,4 @@
-import { FactoryError } from "@t3tools/contracts/fd/factory";
+import { FACTORY_REPLAN_NOTE_MAX_LENGTH, FactoryError } from "@t3tools/contracts/fd/factory";
 
 import type * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import type * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
@@ -24,6 +24,9 @@ export type FactoryServiceError =
   | FactoryService.FactoryStopRefusedError
   | FactoryService.FactoryResumeRefusedError
   | FactoryService.FactoryCancelRefusedError
+  | FactoryService.FactoryPlanGateRefusedError
+  | FactoryService.FactoryPlanEditInvalidError
+  | FactoryService.FactoryReplanNoteInvalidError
   | FactoryDeliveryStore.FactoryDeliveryActive
   | FactoryThreadEffects.FactoryProjectMissingError
   | FactoryBranchUnavailableError
@@ -75,6 +78,25 @@ export const toFactoryError = (error: FactoryServiceError): FactoryError => {
       return new FactoryError({
         reason: "refused",
         message: `This delivery is already ${error.status}, so it cannot be cancelled.`,
+        deliveryId: error.deliveryId,
+      });
+    case "FactoryPlanGateRefusedError":
+      return new FactoryError({
+        reason: "refused",
+        message: `Only a delivery waiting at the plan gate can have its plan edited, rejected or replanned; this one is ${error.status}.`,
+        deliveryId: error.deliveryId,
+      });
+    case "FactoryPlanEditInvalidError":
+      return new FactoryError({
+        reason: "invalid_request",
+        message:
+          "Factory refused the edited plan. An edit can change task titles, summaries, acceptance criteria and test plans, reorder tasks and remove some, and every criterion needs a test plan entry; it cannot add tasks, empty the plan, or change task ids, kinds, likely paths, risk or the planner's note.",
+        deliveryId: error.deliveryId,
+      });
+    case "FactoryReplanNoteInvalidError":
+      return new FactoryError({
+        reason: "invalid_request",
+        message: `Write a note of at most ${FACTORY_REPLAN_NOTE_MAX_LENGTH} characters telling the planner what to change.`,
         deliveryId: error.deliveryId,
       });
     case "FactoryParentSourceUnsupportedError":

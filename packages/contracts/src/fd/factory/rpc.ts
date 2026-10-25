@@ -15,6 +15,8 @@ import {
   FactoryDeliveryRefInput,
   FactoryDeliveryStartInput,
   FactoryError,
+  FactoryPlanReplanInput,
+  FactoryPlanUpdateInput,
   FactoryProjectSettings,
   FactorySettingsGetInput,
   FactorySettingsSetInput,
@@ -35,6 +37,9 @@ export const FACTORY_WS_METHODS = {
   factoryDeliveriesGet: "factory.deliveries.get",
   factoryDeliveriesList: "factory.deliveries.list",
   factoryDeliveriesSubscribe: "factory.deliveries.subscribe",
+  factoryPlanUpdate: "factory.plan.update",
+  factoryPlanReject: "factory.plan.reject",
+  factoryPlanReplan: "factory.plan.replan",
 } as const;
 
 const FactoryRpcError = Schema.Union([FactoryError, EnvironmentAuthorizationError]);
@@ -82,6 +87,28 @@ const WsFactoryDeliveriesListRpc = Rpc.make(FACTORY_WS_METHODS.factoryDeliveries
 });
 
 /**
+ * The plan gate's owner actions, each on a delivery waiting at the gate and refused on any other.
+ * Update stores the edited plan, which keeps the delivery waiting; reject cancels the delivery;
+ * replan sends the note to the planner thread and plans again. Servers advertising `planning`
+ * serve them.
+ */
+const WsFactoryPlanUpdateRpc = Rpc.make(FACTORY_WS_METHODS.factoryPlanUpdate, {
+  payload: FactoryPlanUpdateInput,
+  success: FactoryDelivery,
+  error: FactoryRpcError,
+});
+const WsFactoryPlanRejectRpc = Rpc.make(FACTORY_WS_METHODS.factoryPlanReject, {
+  payload: FactoryDeliveryRefInput,
+  success: FactoryDelivery,
+  error: FactoryRpcError,
+});
+const WsFactoryPlanReplanRpc = Rpc.make(FACTORY_WS_METHODS.factoryPlanReplan, {
+  payload: FactoryPlanReplanInput,
+  success: FactoryDelivery,
+  error: FactoryRpcError,
+});
+
+/**
  * An epoch that moves after every committed delivery or settings write, Work's refresh epoch for
  * Factory: clients refetch the deliveries and settings they show on each value. It carries no data.
  */
@@ -102,6 +129,9 @@ export const FactoryRpcs = [
   WsFactoryDeliveriesGetRpc,
   WsFactoryDeliveriesListRpc,
   WsFactoryDeliveriesSubscribeRpc,
+  WsFactoryPlanUpdateRpc,
+  WsFactoryPlanRejectRpc,
+  WsFactoryPlanReplanRpc,
 ] as const;
 
 /** Reads, authorized server-side only; the client never guards them. */
@@ -114,7 +144,7 @@ export const FACTORY_RPC_READ_SCOPES = {
 
 /**
  * Writes, guarded on the client through `permissionAtom` and again on the server. Delivery
- * controls run and interrupt agent threads, as starting a thread does.
+ * controls and the plan gate's actions run and interrupt agent threads, as starting a thread does.
  */
 export const FACTORY_CLIENT_GUARDED_RPC_SCOPES = {
   [FACTORY_WS_METHODS.factorySettingsSet]: AuthSettingsWriteScope,
@@ -122,6 +152,9 @@ export const FACTORY_CLIENT_GUARDED_RPC_SCOPES = {
   [FACTORY_WS_METHODS.factoryDeliveriesStop]: AuthOrchestrationOperateScope,
   [FACTORY_WS_METHODS.factoryDeliveriesResume]: AuthOrchestrationOperateScope,
   [FACTORY_WS_METHODS.factoryDeliveriesCancel]: AuthOrchestrationOperateScope,
+  [FACTORY_WS_METHODS.factoryPlanUpdate]: AuthOrchestrationOperateScope,
+  [FACTORY_WS_METHODS.factoryPlanReject]: AuthOrchestrationOperateScope,
+  [FACTORY_WS_METHODS.factoryPlanReplan]: AuthOrchestrationOperateScope,
 } as const;
 
 /** Every Factory method under one instrumentation class. */

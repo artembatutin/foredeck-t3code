@@ -71,6 +71,7 @@ const scriptedThreads = (world: World) =>
         Effect.sync(() =>
           world.retries.push({ threadId, ...(checkpoint === undefined ? {} : { checkpoint }) }),
         ).pipe(Effect.as({ runId: retryRun })),
+      sendReplanTurn: () => Effect.die("replan turn not scripted"),
       sendReviewRetryTurn: () => Effect.die("review retry turn not scripted"),
       sendRepairTurn: () => Effect.die("repair turn not scripted"),
       sendReviewFollowUpTurn: () => Effect.die("review follow-up turn not scripted"),

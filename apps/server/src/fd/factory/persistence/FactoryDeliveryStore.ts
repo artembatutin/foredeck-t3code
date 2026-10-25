@@ -98,6 +98,13 @@ const StoredEffect = Schema.Union([
     problems: Problems,
     checkpoint: Schema.optionalKey(FactoryStageName),
   }),
+  // Added with the plan gate's replan.
+  Schema.Struct({
+    id: PositiveInt,
+    type: Schema.Literal("send_replan_turn"),
+    threadId: ThreadId,
+    note: Schema.String,
+  }),
   Schema.Struct({
     id: PositiveInt,
     type: Schema.Literal("read_fallback_review"),

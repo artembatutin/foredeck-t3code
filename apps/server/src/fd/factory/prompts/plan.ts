@@ -4,7 +4,8 @@ import { type FactoryAuthorItem, itemSections } from "./author.ts";
 
 /**
  * The planner's messages: the first, with the parent Work item and Looper's plan rules condensed,
- * and the retry turns. Pure, so the exact text a planner receives is tested rather than inferred.
+ * the retry turns and the owner's replan. Pure, so the exact text a planner receives is tested
+ * rather than inferred.
  */
 
 const TITLE_MAX_CHARS = 100;
@@ -101,5 +102,21 @@ export const renderPlanRetryPrompt = (input: {
     `Factory is resuming this delivery from its \`${input.checkpoint}\` checkpoint and needs your plan again.`,
     ...(problems === "" ? [] : [`Your last plan had these problems:\n${problems}`]),
     `Submit the whole plan again, following the rules of your first message: ${RESUBMIT}`,
+  ].join("\n\n");
+};
+
+/**
+ * The follow-up an owner's replan sends: the owner's note on the plan the delivery waited on at
+ * the gate, quoted as written, and the request for a whole new plan.
+ */
+export const renderReplanPrompt = (input: { readonly note: string }): string => {
+  const note = input.note
+    .split("\n")
+    .map((line) => (line.length === 0 ? ">" : `> ${line}`))
+    .join("\n");
+  return [
+    "The owner sent your plan back from Factory's plan gate with this note:",
+    note,
+    `Plan again as the note asks, following the rules of your first message, and submit the whole plan: ${RESUBMIT}`,
   ].join("\n\n");
 };

@@ -2,6 +2,7 @@ import type { ThreadId } from "@t3tools/contracts";
 import {
   FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
   type FactoryDelivery,
+  type FactoryPlan,
   type FactoryReviewSummary,
   type FactoryStageKind,
   type FactoryStageName,
@@ -13,7 +14,9 @@ import {
 import type { FactoryDeliveryWithRuns } from "./FactoryService.ts";
 import type { StoredFactoryStageRun } from "./persistence/FactoryStageRunStore.ts";
 import { standardStages } from "./pipeline/definitions.ts";
+import { acceptedPlan } from "./pipeline/state.ts";
 import type {
+  FactoryAcceptedPlan,
   FactoryAcceptedReview,
   FactoryBlock,
   FactoryDeliveryState,
@@ -63,6 +66,12 @@ const reviewSummary = (review: FactoryAcceptedReview): FactoryReviewSummary => {
     ...(review.details === undefined ? {} : { details: review.details }),
   };
 };
+
+/** A recorded plan's tasks and note, without its round, source or evidence path. */
+const planSnapshot = ({ tasks, note }: FactoryAcceptedPlan): FactoryPlan => ({
+  tasks,
+  ...(note === undefined ? {} : { note }),
+});
 
 /** The numbers of the receipts and reviews a snapshot carries. */
 interface SnapshotEvidence {
@@ -220,12 +229,14 @@ export const needsYou = (state: FactoryDeliveryState): string | undefined => {
  * A delivery as clients see it: its progress, threads and the summaries of its receipts, reviews
  * and newest stage attempts, never their logs or evidence paths. Receipts and reviews carry their
  * evidence numbers, and each attempt names the one it produced; reviews carry the bounded details
- * kept when they were accepted. `needsYou` is set only while it waits at the plan gate or is
- * blocked.
+ * kept when they were accepted. The current plan round's plan is carried while one is recorded,
+ * so a parent waiting at the plan gate shows the plan it waits on. `needsYou` is set only while it
+ * waits at the plan gate or is blocked.
  */
 export const toFactoryDelivery = (delivery: FactoryDeliveryWithRuns): FactoryDelivery => {
   const { state } = delivery;
   const reason = needsYou(state);
+  const plan = acceptedPlan(state);
   const receipts = state.receipts.map(receiptSummary);
   const reviews = state.reviews.map(reviewSummary);
   const evidence = { receipts: numbersOf(receipts), reviews: numbersOf(reviews) };
@@ -248,6 +259,7 @@ export const toFactoryDelivery = (delivery: FactoryDeliveryWithRuns): FactoryDel
     stageRuns: delivery.stageRuns
       .slice(-FACTORY_SNAPSHOT_STAGE_RUNS_MAX)
       .map((run) => stageRunSummary(run, evidence)),
+    ...(plan === undefined ? {} : { plan: planSnapshot(plan) }),
     ...(reason === undefined ? {} : { needsYou: reason }),
     createdAt: delivery.createdAt,
     updatedAt: delivery.updatedAt,

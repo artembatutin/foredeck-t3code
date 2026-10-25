@@ -104,9 +104,9 @@ deliveries and settings they show on each value; the stream itself carries no da
 write therefore runs through `FactoryChanges.transact`
 ([`FactoryChanges.ts`](../../apps/server/src/fd/factory/FactoryChanges.ts)), which moves the epoch
 only once the write has committed, so a refetch on the new value reads it. Today the writers are
-the start's insert, the worker's step (stop, resume, cancel and review submissions are steps) and
-the settings write; a new writer that bypasses `transact` leaves every client stale until
-something else moves the epoch.
+the start's insert, the worker's step (stop, resume, cancel, plan and review submissions and the
+plan gate's actions are steps) and the settings write; a new writer that bypasses `transact`
+leaves every client stale until something else moves the epoch.
 
 `transact` opens the transaction itself rather than wrap a caller's. `withTransaction` commits
 inside its own uninterruptible mask and raises an interrupt that arrived meanwhile as the mask
@@ -182,6 +182,18 @@ It is taken only while the planner thread is live in the very run the delivery a
 the lock: a tool call names its thread, not its run, and a turn queued behind the planner's run can
 start before that run's end reaches the delivery; that turn's plan must not stand as the earlier
 run's ([`FactoryService.submitPlan`](../../apps/server/src/fd/factory/FactoryService.ts)).
+
+## The owner's plan edit lives in the state, not the evidence
+
+At the plan gate the owner edits, rejects or replans the plan, each decided under the delivery's
+step lock on the plan stored then, and refused anywhere but the gate
+([`FactoryService.ts`](../../apps/server/src/fd/factory/FactoryService.ts)). By owner decision an
+edit may change only the tasks' titles, summaries, criteria and test plans, their order and which
+stay, and must pass the planner's validator; ids, kinds, likely paths, risk and the note stay the
+planner's ([`plan/edit.ts`](../../apps/server/src/fd/factory/plan/edit.ts)). The edit replaces the
+tasks in the delivery's state while `plan.json` keeps what the planner submitted, so whatever acts
+on the approved plan reads the state. A replan is a new plan round opened by a turn carrying the
+owner's note; the gate's attempt it leaves ends failed, and the next accepted plan replaces the old.
 
 ## Clients see a review's details as it was accepted
 

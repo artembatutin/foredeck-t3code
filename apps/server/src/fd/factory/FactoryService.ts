@@ -1,8 +1,11 @@
 import { AuthWorkReadScope, type ProjectId, type RuntimeMode, ThreadId } from "@t3tools/contracts";
 import {
+  FACTORY_REPLAN_NOTE_MAX_LENGTH,
   FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
   FactoryDeliveryId,
   FactoryDeliveryStatus,
+  type FactoryPlan,
+  FactoryReplanNote,
   FactoryTaskId,
 } from "@t3tools/contracts/fd/factory";
 import {
@@ -57,11 +60,13 @@ import {
   type FactoryLaunchEffect,
   type FactoryResumeCheck,
   isTerminal,
+  planAtGate,
   queuedDeliveryState,
   runsStages,
   unrecordedAuthorLaunch,
   unrecordedPlannerLaunch,
 } from "./pipeline/state.ts";
+import { validatePlanEdit } from "./plan/edit.ts";
 
 const FactoryReceiptRefusal = Schema.Literals(["head_changed", "tree_dirty"]);
 
@@ -242,6 +247,46 @@ export class FactoryCancelRefusedError extends Schema.TaggedError<FactoryCancelR
   }
 }
 
+/**
+ * Only a delivery waiting at the plan gate takes its owner's plan edit, rejection or replan;
+ * nothing changed.
+ */
+export class FactoryPlanGateRefusedError extends Schema.TaggedError<FactoryPlanGateRefusedError>()(
+  "FactoryPlanGateRefusedError",
+  { deliveryId: FactoryDeliveryId, status: FactoryDeliveryStatus },
+) {
+  override get message(): string {
+    return `Factory delivery ${this.deliveryId} is ${this.status} and not waiting at the plan gate, so its plan cannot be edited, rejected or replanned.`;
+  }
+}
+
+/**
+ * The owner's edit of the plan at the gate fails the plan validator or changes what an edit may
+ * not; nothing changed.
+ */
+export class FactoryPlanEditInvalidError extends Schema.TaggedError<FactoryPlanEditInvalidError>()(
+  "FactoryPlanEditInvalidError",
+  {
+    deliveryId: FactoryDeliveryId,
+    /** Bounded descriptions of what to correct. */
+    problems: Schema.Array(Schema.String),
+  },
+) {
+  override get message(): string {
+    return `The edited plan of Factory delivery ${this.deliveryId} is invalid: ${this.problems.join(" ")}`;
+  }
+}
+
+/** A replan note is blank or longer than the contract's bound; nothing changed. */
+export class FactoryReplanNoteInvalidError extends Schema.TaggedError<FactoryReplanNoteInvalidError>()(
+  "FactoryReplanNoteInvalidError",
+  { deliveryId: FactoryDeliveryId },
+) {
+  override get message(): string {
+    return `A replan note for Factory delivery ${this.deliveryId} must be nonblank and at most ${FACTORY_REPLAN_NOTE_MAX_LENGTH} characters.`;
+  }
+}
+
 /** Why a start was refused. Every refusal comes before the delivery's row is written. */
 export type FactoryStartError =
   | WorkDomainError
@@ -370,6 +415,54 @@ export class FactoryService extends Context.Service<
       FactoryCancelRefusedError | FactoryDeliveryNotFoundError | FactoryStoreError
     >;
     /**
+     * The owner's edit of the plan a parent waits on at the plan gate: `plan` replaces it, and the
+     * delivery waits on. The edit is judged under the delivery's lock by the planner's plan
+     * validator and the edit rules (see `validatePlanEdit`): it may change the tasks' titles,
+     * summaries, acceptance criteria and test plans, reorder the tasks and leave some out, but
+     * keeps at least one, adds none and keeps each one's id, kind, likely paths and risk, and the
+     * planner's note. The plan's evidence stays what the planner submitted. Refused, with nothing
+     * changed, for an edit that breaks a rule or a delivery not waiting at the gate.
+     */
+    readonly updatePlan: (input: {
+      readonly deliveryId: FactoryDeliveryId;
+      readonly plan: FactoryPlan;
+    }) => Effect.Effect<
+      FactoryDeliveryWithRuns,
+      | FactoryPlanGateRefusedError
+      | FactoryPlanEditInvalidError
+      | FactoryDeliveryNotFoundError
+      | FactoryStoreError
+    >;
+    /**
+     * The owner's rejection of the plan a parent waits on at the plan gate: the delivery ends
+     * cancelled, issuing nothing; its planner thread, worktree and branch stay. Refused, with
+     * nothing changed, for a delivery not waiting at the gate.
+     */
+    readonly rejectPlan: (
+      deliveryId: FactoryDeliveryId,
+    ) => Effect.Effect<
+      FactoryDeliveryWithRuns,
+      FactoryPlanGateRefusedError | FactoryDeliveryNotFoundError | FactoryStoreError
+    >;
+    /**
+     * The owner's replan of the plan a parent waits on at the plan gate: the delivery returns to
+     * the plan stage in a new plan round, with a fresh retry allowance, and the planner thread
+     * gets `note` (trimmed) as a follow-up turn queued behind whatever it runs. The plan it then
+     * submits is judged like its first, and one with tasks waits at the gate in place of this
+     * one. Refused, with nothing changed, for a blank or overlong note or a delivery not waiting
+     * at the gate.
+     */
+    readonly replan: (input: {
+      readonly deliveryId: FactoryDeliveryId;
+      readonly note: string;
+    }) => Effect.Effect<
+      FactoryDeliveryWithRuns,
+      | FactoryPlanGateRefusedError
+      | FactoryReplanNoteInvalidError
+      | FactoryDeliveryNotFoundError
+      | FactoryStoreError
+    >;
+    /**
      * A reviewer's `factory_submit_review`. Taken only from the thread an active delivery
      * registered as its reviewer, while the review stage awaits that thread's run and before
      * the round has an accepted review; any other call is refused with nothing changed. The
@@ -404,8 +497,8 @@ export class FactoryService extends Context.Service<
     /**
      * Factory's change epoch: its value on subscribe, then each move. It moves after each write
      * commits (a delivery's start, each engine step, a stop, resume or cancel, a plan or review
-     * submission, a settings write) and never for a refusal, so a subscriber refetches what it
-     * shows on each value.
+     * submission, a plan edit, rejection or replan, a settings write) and never for a refusal, so
+     * a subscriber refetches what it shows on each value.
      */
     readonly subscribe: Stream.Stream<number>;
   }
@@ -806,6 +899,76 @@ const make = Effect.gen(function* () {
     },
   );
 
+  // The plan gate's actions decide under the delivery's lock, like stop and cancel: the plan they
+  // judge is the one stored when they step.
+  const atGate = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) => {
+    const plan = planAtGate(delivery.state);
+    return plan === undefined
+      ? Effect.fail(
+          new FactoryPlanGateRefusedError({
+            deliveryId: delivery.deliveryId,
+            status: delivery.state.status,
+          }),
+        )
+      : Effect.succeed(plan);
+  };
+
+  const updatePlan: FactoryService["Service"]["updatePlan"] = Effect.fn(
+    "FactoryService.updatePlan",
+  )(function* ({ deliveryId, plan }) {
+    const stepped = yield* worker.stepWith(deliveryId, (current) =>
+      Effect.gen(function* () {
+        const recorded = yield* atGate(current);
+        const used = (yield* tasks.listByDelivery(deliveryId)).map(({ taskId }) => taskId);
+        const edit = validatePlanEdit(recorded, plan, used);
+        if (edit.status === "invalid") {
+          return yield* new FactoryPlanEditInvalidError({
+            deliveryId,
+            problems: edit.problems.map((problem) => problem.description),
+          });
+        }
+        return {
+          event: { type: "plan.updated", tasks: edit.plan.tasks } as const,
+          value: undefined,
+        };
+      }),
+    );
+    if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
+    return steppedWithRuns(stepped.value);
+  });
+
+  const rejectPlan: FactoryService["Service"]["rejectPlan"] = Effect.fn(
+    "FactoryService.rejectPlan",
+  )(function* (deliveryId) {
+    const stepped = yield* worker.stepWith(deliveryId, (current) =>
+      atGate(current).pipe(
+        Effect.as({ event: { type: "plan.rejected" } as const, value: undefined }),
+      ),
+    );
+    if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
+    return steppedWithRuns(stepped.value);
+  });
+
+  const decodeReplanNote = Schema.decodeUnknownOption(FactoryReplanNote);
+
+  const replan: FactoryService["Service"]["replan"] = Effect.fn("FactoryService.replan")(
+    function* (input) {
+      const { deliveryId } = input;
+      const note = decodeReplanNote(input.note);
+      if (Option.isNone(note)) return yield* new FactoryReplanNoteInvalidError({ deliveryId });
+      const stepped = yield* worker.stepWith(deliveryId, (current) =>
+        atGate(current).pipe(
+          Effect.as({
+            event: { type: "plan.replanned", note: note.value } as const,
+            value: undefined,
+          }),
+        ),
+      );
+      if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
+      return steppedWithRuns(stepped.value);
+    },
+  );
+
   return FactoryService.of({
     start,
     get: (deliveryId) =>
@@ -822,6 +985,9 @@ const make = Effect.gen(function* () {
     stop,
     resume,
     cancel,
+    updatePlan,
+    rejectPlan,
+    replan,
     submitPlan,
     submitReview,
     subscribe: changes.changes,

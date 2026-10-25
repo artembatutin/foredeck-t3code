@@ -160,6 +160,8 @@ const describeEffect = (effect: FactoryEffect) => {
       return "read the plan in the planner's last message";
     case "send_plan_retry_turn":
       return "send the plan retry turn";
+    case "send_replan_turn":
+      return "send the replan turn";
     case "read_fallback_review":
       return "read the review in the reviewer's last message";
     case "send_review_retry_turn":
@@ -385,6 +387,8 @@ const make = Effect.gen(function* () {
         );
       case "send_plan_retry_turn":
         return threads.sendPlanRetryTurn(delivery, effect).pipe(Effect.map(turnStarted));
+      case "send_replan_turn":
+        return threads.sendReplanTurn(delivery, effect).pipe(Effect.map(turnStarted));
       case "send_review_retry_turn":
         return threads.sendReviewRetryTurn(delivery, effect).pipe(Effect.map(turnStarted));
       case "send_repair_turn":
@@ -412,12 +416,13 @@ const make = Effect.gen(function* () {
 
   /**
    * Records the stage attempts a step implies. Leaving a stage finishes its active attempt:
-   * failed when the delivery left it for a repair round, passed when it advanced otherwise, and
-   * by how it stopped proceeding when it did. Entering one appends the next attempt, and the
-   * attempt carries the run the delivery now awaits; a resumed delivery enters its stage again,
-   * since the attempt it stopped or blocked in has ended. An approved delivery still proceeds:
-   * its PR attempt ends when the pull request is open or the delivery blocks. A delivery waiting
-   * at the plan gate keeps the gate's attempt open until its owner decides.
+   * failed when the delivery left it for a repair round or the owner sent its plan back from the
+   * gate, passed when it advanced otherwise, and by how it stopped proceeding when it did.
+   * Entering one appends the next attempt, and the attempt carries the run the delivery now
+   * awaits; a resumed delivery enters its stage again, since the attempt it stopped or blocked in
+   * has ended. An approved delivery still proceeds: its PR attempt ends when the pull request is
+   * open or the delivery blocks. A delivery waiting at the plan gate keeps the gate's attempt
+   * open until its owner decides.
    */
   const recordAttempts = Effect.fn("FactoryWorker.recordAttempts")(function* (
     deliveryId: FactoryDeliveryId,
@@ -439,10 +444,13 @@ const make = Effect.gen(function* () {
 
     if (active !== undefined && attemptOpen(before) && (advanced || stopped)) {
       const { path, fingerprint } = evidence;
+      // A repair round is the stage's verdict that the commit is wanting, and a replan the
+      // owner's that the plan is.
+      const wanting =
+        after.stage === "repair" || (before.stage === "approve_plan" && after.stage === "plan");
       yield* stageRuns.finish({
         ...attemptOf(active),
-        // A repair round is the stage's verdict that the commit is wanting.
-        outcome: advanced ? (after.stage === "repair" ? "failed" : "passed") : outcomeOf(after),
+        outcome: advanced ? (wanting ? "failed" : "passed") : outcomeOf(after),
         ...(path === undefined ? {} : { evidencePath: path }),
         ...(fingerprint === undefined ? {} : { fingerprint }),
       });

@@ -46,8 +46,8 @@ export const wsHandlers = (input: {
   readonly startup: ServerRuntimeStartup.ServerRuntimeStartup["Service"];
 }) => {
   const { factory, settings, startup } = input;
-  // Direct WebSocket calls are not gated on command readiness, so delivery controls, which run
-  // and interrupt threads, queue like core's commands.
+  // Direct WebSocket calls are not gated on command readiness, so delivery controls and the plan
+  // gate's actions, which run and interrupt threads, queue like core's commands.
   const command = (
     effect: Effect.Effect<FactoryService.FactoryDeliveryWithRuns, FactoryServiceError>,
   ) => snapshot(startup.enqueueCommand(effect));
@@ -95,6 +95,12 @@ export const wsHandlers = (input: {
         Effect.mapError(toFactoryError),
       ),
     [FACTORY_WS_METHODS.factoryDeliveriesSubscribe]: () => factory.subscribe,
+    [FACTORY_WS_METHODS.factoryPlanUpdate]: ({ deliveryId, plan }) =>
+      forDelivery(deliveryId, command(factory.updatePlan({ deliveryId, plan }))),
+    [FACTORY_WS_METHODS.factoryPlanReject]: ({ deliveryId }) =>
+      forDelivery(deliveryId, command(factory.rejectPlan(deliveryId))),
+    [FACTORY_WS_METHODS.factoryPlanReplan]: ({ deliveryId, note }) =>
+      forDelivery(deliveryId, command(factory.replan({ deliveryId, note }))),
   } satisfies FactoryHandlers;
 };
 

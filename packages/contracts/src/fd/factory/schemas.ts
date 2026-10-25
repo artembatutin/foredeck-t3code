@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
+  ForwardCompatibleOptional,
   IsoDateTime,
   NonNegativeInt,
   PositiveInt,
@@ -459,6 +460,13 @@ export const FactoryDelivery = Schema.Struct({
   stageRuns: ForwardCompatibleList(FactoryStageRunSummary).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  /**
+   * The plan of the delivery's current plan round while one is recorded: its tasks and the
+   * planner's note, never its evidence. A parent waiting at the plan gate waits on this one, which
+   * the owner edits, rejects or replans. Absent from servers from before planning; from a newer
+   * server, a plan this build cannot read is left out instead of failing the snapshot.
+   */
+  plan: ForwardCompatibleOptional(FactoryPlan),
   /** Why the delivery waits on the owner, at a gate or blocked; absent when it does not. */
   needsYou: Schema.optionalKey(Schema.String),
   createdAt: IsoDateTime,
@@ -491,6 +499,28 @@ export type FactoryDeliveryStartInput = typeof FactoryDeliveryStartInput.Type;
 export const FactoryDeliveryRefInput = Schema.Struct({ deliveryId: FactoryDeliveryId });
 export type FactoryDeliveryRefInput = typeof FactoryDeliveryRefInput.Type;
 
+/**
+ * The owner's edit of the plan a delivery waits on at the plan gate: the whole plan as it should
+ * stand. It may change the tasks' titles, summaries, acceptance criteria and test plans, reorder
+ * the tasks and leave some out; ids, kinds, likely paths, risk and the note stay the planner's.
+ */
+export const FactoryPlanUpdateInput = Schema.Struct({
+  deliveryId: FactoryDeliveryId,
+  plan: FactoryPlan,
+});
+export type FactoryPlanUpdateInput = typeof FactoryPlanUpdateInput.Type;
+
+export const FACTORY_REPLAN_NOTE_MAX_LENGTH = 8000;
+
+/** What the owner asks the planner to change; the planner thread gets it as a follow-up turn. */
+export const FactoryReplanNote = FactoryText(FACTORY_REPLAN_NOTE_MAX_LENGTH);
+
+export const FactoryPlanReplanInput = Schema.Struct({
+  deliveryId: FactoryDeliveryId,
+  note: FactoryReplanNote,
+});
+export type FactoryPlanReplanInput = typeof FactoryPlanReplanInput.Type;
+
 /** Every delivery on the environment, or one project's. */
 export const FactoryDeliveryListInput = Schema.Struct({ projectId: Schema.optionalKey(ProjectId) });
 export type FactoryDeliveryListInput = typeof FactoryDeliveryListInput.Type;
@@ -512,9 +542,11 @@ const FACTORY_ERROR_REASONS = [
 ] as const;
 
 /**
- * `not_configured`: the project's Factory settings lack what the request needs (a verify
- * command). `conflict`: the item already has a delivery that is not done or cancelled.
- * `refused`: the delivery's status, or the project's checkout, does not allow the request now.
+ * `invalid_request`: the request is not one Factory takes, such as a plan edit that changes what
+ * the owner may not change. `not_configured`: the project's Factory settings lack what the request
+ * needs (a verify command). `conflict`: the item already has a delivery that is not done or
+ * cancelled. `refused`: the delivery's status, or the project's checkout, does not allow the
+ * request now.
  * `unsupported_source`: the item's Work source cannot hold what the request needs (a parent's
  * children, which only a Markdown source can). `unavailable`: storage or the server failed, or a
  * reason this build does not know (a newer server's reasons decode here rather than failing).

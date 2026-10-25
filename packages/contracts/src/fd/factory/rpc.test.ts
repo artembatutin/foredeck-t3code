@@ -35,13 +35,17 @@ describe("Factory RPC methods", () => {
     expect(Object.keys(FACTORY_RPC_INSTRUMENTATION).sort()).toEqual([...methods].sort());
   });
 
-  it("guard exactly the five mutations, each with its grant", () => {
+  it("guard exactly the eight mutations, each with its grant", () => {
     expect(FACTORY_CLIENT_GUARDED_RPC_SCOPES).toEqual({
       "factory.settings.set": AuthSettingsWriteScope,
       "factory.deliveries.start": AuthOrchestrationOperateScope,
       "factory.deliveries.stop": AuthOrchestrationOperateScope,
       "factory.deliveries.resume": AuthOrchestrationOperateScope,
       "factory.deliveries.cancel": AuthOrchestrationOperateScope,
+      // The plan gate's actions run and interrupt planner threads, as delivery controls do.
+      "factory.plan.update": AuthOrchestrationOperateScope,
+      "factory.plan.reject": AuthOrchestrationOperateScope,
+      "factory.plan.replan": AuthOrchestrationOperateScope,
     });
     expect(FACTORY_RPC_READ_SCOPES).toEqual({
       "factory.settings.get": AuthOrchestrationReadScope,

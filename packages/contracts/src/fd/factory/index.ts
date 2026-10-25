@@ -31,6 +31,10 @@ export {
   FactoryDeliveryRefInput,
   FactoryDeliveryListInput,
   FactoryDeliveryList,
+  FactoryPlanUpdateInput,
+  FACTORY_REPLAN_NOTE_MAX_LENGTH,
+  FactoryReplanNote,
+  FactoryPlanReplanInput,
   FactoryErrorReason,
   FactoryError,
 } from "./schemas.ts";

@@ -2,6 +2,7 @@ import type { OrchestrationV2RunStatus, RunId, RuntimeMode, ThreadId } from "@t3
 import type {
   FactoryDeliveryStatus,
   FactoryPlan,
+  FactoryPlanTask,
   FactoryReviewDetails,
   FactoryReviewSummary,
   FactoryRole,
@@ -100,6 +101,11 @@ export type FactoryEffectRequest =
       readonly checkpoint?: FactoryStageName;
     }
   /**
+   * The owner's replan: a follow-up turn giving the planner the owner's note on the plan it waited
+   * on at the gate, and asking for its whole plan again.
+   */
+  | { readonly type: "send_replan_turn"; readonly threadId: ThreadId; readonly note: string }
+  /**
    * Judge the review in the last assistant message of this reviewer run, for a run that ended
    * without an accepted submission (providers without t3 MCP tools answer in a fenced block).
    */
@@ -161,6 +167,7 @@ export type FactoryTurnEffect = Extract<
     readonly type:
       | "send_fix_commit_turn"
       | "send_plan_retry_turn"
+      | "send_replan_turn"
       | "send_review_retry_turn"
       | "send_repair_turn"
       | "send_review_follow_up_turn";
@@ -170,6 +177,7 @@ export type FactoryTurnEffect = Extract<
 export const isTurnEffect = (effect: FactoryEffect): effect is FactoryTurnEffect =>
   effect.type === "send_fix_commit_turn" ||
   effect.type === "send_plan_retry_turn" ||
+  effect.type === "send_replan_turn" ||
   effect.type === "send_review_retry_turn" ||
   effect.type === "send_repair_turn" ||
   effect.type === "send_review_follow_up_turn";
@@ -353,6 +361,18 @@ export type FactoryEvent =
   /** The owner's cancel: the delivery ends, whatever it awaits. */
   | { readonly type: "cancel" }
   /**
+   * The owner's edit of the plan the delivery waits on at the plan gate, judged before it is
+   * stepped: these tasks replace the plan's, and the delivery waits on.
+   */
+  | { readonly type: "plan.updated"; readonly tasks: ReadonlyArray<FactoryPlanTask> }
+  /** The owner's rejection of the plan at the gate: the delivery ends cancelled. */
+  | { readonly type: "plan.rejected" }
+  /**
+   * The owner's replan at the gate: the planner gets the note in a new plan round, and the next
+   * accepted plan waits at the gate in place of this one.
+   */
+  | { readonly type: "plan.replanned"; readonly note: string }
+  /**
    * A `launch_thread` result; `baseline` is HEAD before the thread's first turn. `worktreePath`
    * is null when the launch ended the run before a new worktree was recorded.
    */
@@ -365,9 +385,9 @@ export type FactoryEvent =
       readonly baseline: string;
     }
   /**
-   * A `send_fix_commit_turn`, `send_plan_retry_turn`, `send_review_retry_turn`,
-   * `send_repair_turn` or `send_review_follow_up_turn` result: the run that turn started on the
-   * effect's thread.
+   * A `send_fix_commit_turn`, `send_plan_retry_turn`, `send_replan_turn`,
+   * `send_review_retry_turn`, `send_repair_turn` or `send_review_follow_up_turn` result: the run
+   * that turn started on the effect's thread.
    */
   | { readonly type: "turn.started"; readonly effectId: number; readonly runId: RunId }
   | {
@@ -700,6 +720,19 @@ export const unrecordedPlannerLaunch = (
 export const acceptedPlan = (delivery: FactoryDeliveryState) => {
   const { plan } = delivery;
   return plan !== null && plan.round === delivery.planRound ? plan : undefined;
+};
+
+/**
+ * The plan a parent waits on at the plan gate for its owner: the current round's accepted plan,
+ * which has tasks, from its planner thread. Undefined for a delivery in any other state, which
+ * takes no plan action.
+ */
+export const planAtGate = (delivery: FactoryDeliveryState) => {
+  if (delivery.status !== "waiting" || delivery.stage !== "approve_plan") return undefined;
+  const plan = acceptedPlan(delivery);
+  return plan !== undefined && plan.tasks.length > 0 && delivery.threads.planner !== undefined
+    ? plan
+    : undefined;
 };
 
 /** The accepted review of the current round, once there is one. */

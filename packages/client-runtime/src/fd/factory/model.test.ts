@@ -81,7 +81,8 @@ describe("serverFactorySupport", () => {
     // The cast narrows the environment descriptor to the capabilities support reads.
     const support = (value: ReturnType<typeof config> | null | undefined) =>
       serverFactorySupport(value as Parameters<typeof serverFactorySupport>[0]);
-    expect(support(config({ version: 1 }))).toEqual({ version: 1 });
+    // A server from before planning is still Factory, without the plan gate.
+    expect(support(config({ version: 1 }))).toEqual({ version: 1, planning: false });
     expect(support(config({ version: 2 }))).toBeUndefined();
     expect(support(config())).toBeUndefined();
     expect(support(null)).toBeUndefined();

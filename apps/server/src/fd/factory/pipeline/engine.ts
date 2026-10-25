@@ -9,6 +9,7 @@ import {
   isTerminal,
   isTurnEffect,
   issue,
+  planAtGate,
   receiptFailed,
   runsStages,
   unrecordedAuthorLaunch,
@@ -425,7 +426,10 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * completes. A run that completes without one has its last message's fenced plan read, and the
  * round's first invalid submission is answered once (by the tool's reply in the same turn, or a
  * retry turn on the planner thread); a second blocks. A plan with tasks leaves the parent waiting
- * at `approve_plan` for its owner, awaiting nothing; an empty plan blocks it with the note.
+ * at `approve_plan` for its owner, awaiting nothing; an empty plan blocks it with the note. At the
+ * gate the owner can replace the plan's tasks with an edit judged beforehand, reject the plan,
+ * which cancels the delivery, or replan: the planner thread gets the owner's note as a follow-up
+ * turn in a new plan round, and the plan it then submits waits at the gate in place of the old.
  *
  * A single item runs from start to its pull request: the author thread, the branch settle
  * check with at most one fix-commit turn, the verify command, then a reviewer thread whose one
@@ -473,6 +477,34 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       return isTerminal(delivery)
         ? unchanged(delivery)
         : step({ ...delivery, status: "cancelled", awaiting: null, block: null, checkpoint: null });
+    // The owner's plan actions are taken only at the plan gate, where the delivery awaits nothing.
+    case "plan.updated": {
+      const plan = planAtGate(delivery);
+      // The gate waits only on a plan with tasks.
+      return plan === undefined || event.tasks.length === 0
+        ? unchanged(delivery)
+        : step({ ...delivery, plan: { ...plan, tasks: event.tasks } });
+    }
+    case "plan.rejected":
+      return planAtGate(delivery) === undefined
+        ? unchanged(delivery)
+        : step({ ...delivery, status: "cancelled" });
+    case "plan.replanned": {
+      // A plan waits at the gate only with its planner recorded.
+      const { planner } = delivery.threads;
+      if (planAtGate(delivery) === undefined || planner === undefined) return unchanged(delivery);
+      // A new plan round, with a fresh retry allowance and no plan accepted for it yet.
+      return issue(
+        {
+          ...delivery,
+          status: "running",
+          stage: "plan",
+          planRound: delivery.planRound + 1,
+          invalidSubmissions: 0,
+        },
+        { type: "send_replan_turn", threadId: planner, note: event.note },
+      );
+    }
   }
   // Approved, the delivery only opens its pull request: its threads' runs and deletions no
   // longer change it.

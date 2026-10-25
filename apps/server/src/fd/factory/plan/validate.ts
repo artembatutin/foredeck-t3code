@@ -12,6 +12,11 @@ export type FactoryPlanProblemRule =
   /** The fenced fallback's: the final message holds no ```json block, or one that is not JSON. */
   | "no_json_block"
   | "invalid_json"
+  /** An owner's edit's (see `edit.ts`): what the edit may not change of the recorded plan. */
+  | "plan_emptied"
+  | "task_added"
+  | "task_field_changed"
+  | "note_changed"
   /** Stands for the problems past the count bound. */
   | "more_problems";
 
@@ -162,7 +167,10 @@ const outlineProblems = (
   return problems;
 };
 
-const capped = (problems: ReadonlyArray<FactoryPlanProblem>): ReadonlyArray<FactoryPlanProblem> =>
+/** The problems, those past the count bound counted in one `more_problems` entry. */
+export const cappedProblems = (
+  problems: ReadonlyArray<FactoryPlanProblem>,
+): ReadonlyArray<FactoryPlanProblem> =>
   problems.length <= MAX_PROBLEMS
     ? problems
     : [
@@ -193,7 +201,7 @@ export const validatePlan = (
   }
   problems.push(...outlineProblems(outlines(value), new Set(usedTaskIds)));
   if (Result.isFailure(decoded) || problems.length > 0) {
-    return { status: "invalid", problems: capped(problems) };
+    return { status: "invalid", problems: cappedProblems(problems) };
   }
   const plan = decoded.success;
   return plan.tasks.length === 0
