@@ -584,7 +584,7 @@ export const threadProjection = (threadId: ThreadId) =>
 /** What a test body runs with: the server layers and the platform. */
 type Services = Layer.Success<ReturnType<typeof makeLayer>> | NodeServices.NodeServices;
 
-/** A started delivery whose author's first turn is running. */
+/** A started delivery whose first thread's (the author's, or a parent's planner's) turn runs. */
 interface StartedAuthor {
   readonly deliveryId: FactoryDeliveryId;
   readonly threadId: ThreadId;
@@ -610,8 +610,9 @@ export interface World {
   readonly exists: (path: string) => Effect.Effect<boolean>;
   /** Starts the delivery and returns it once its author's first turn is running. */
   readonly start: Effect.Effect<StartedAuthor, never, Services>;
-  /** `start`, with the start's options. */
+  /** `start`, with the start's options; a parent returns once its planner's turn is running. */
   readonly startWith: (options: {
+    readonly kind?: "single" | "parent";
     readonly runtimeModeCeiling?: RuntimeMode;
   }) => Effect.Effect<StartedAuthor, never, Services>;
   /** Returns a delivery started some other way (an MCP tool) once its author's turn is running. */
@@ -700,7 +701,7 @@ export const withProject = <A, E>(
           const { awaiting, worktreePath } = (yield* delivery(deliveryId)).state;
           assert.strictEqual(awaiting?.type, "run");
           if (awaiting?.type !== "run" || worktreePath === null) {
-            return assert.fail("The author launch did not record its run and worktree.");
+            return assert.fail("The first launch did not record its run and worktree.");
           }
           // The launch returns once the worktree is recorded; the run starts once preparation
           // releases it.

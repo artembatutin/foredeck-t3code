@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryReactor from "./FactoryReactor.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
@@ -49,8 +50,8 @@ export const layerPersistence = Layer.mergeAll(
  * reactor. Needs Work's service, the orchestration application (thread launches, management and
  * the orchestrator), the project store and service, server settings and config, the provider
  * registry (for model options), the Git workflow (for pull requests), the git driver and the
- * process runner. The thread, verify, review, record and pull request effects and the Work
- * comments on transitions stay private to the service and worker.
+ * process runner. The thread, verify, plan, review, record and pull request effects and the
+ * Work comments on transitions stay private to the service and worker.
  * server.ts also mounts `layerPersistence` with core and Work persistence, so the ledger migrates
  * with theirs; one build shares the one instance.
  */
@@ -60,6 +61,7 @@ export const layerLive = FactoryService.layer.pipe(
     Layer.mergeAll(
       FactoryThreadEffects.layer,
       FactoryVerifyRunner.layer,
+      FactoryPlanning.layer,
       FactoryReview.layer,
       FactoryRecord.layer,
       FactoryPullRequest.layer,

@@ -30,6 +30,7 @@ import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { WorkService } from "../work-management/index.ts";
+import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
@@ -310,6 +311,7 @@ const layer = FactoryService.layer.pipe(
       Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({ interruptRun: () => Effect.void }),
       Layer.mock(FactoryWorkComments.FactoryWorkComments)({ post: () => Effect.void }),
       Layer.mock(FactoryReview.FactoryReview)({}),
+      Layer.mock(FactoryPlanning.FactoryPlanning)({}),
       Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({}),
       Layer.mock(FactoryRecord.FactoryRecord)({}),
       Layer.mock(FactoryPullRequest.FactoryPullRequest)({}),

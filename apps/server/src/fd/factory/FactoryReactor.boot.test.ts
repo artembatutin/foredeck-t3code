@@ -28,6 +28,7 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
+import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryReactor from "./FactoryReactor.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
@@ -269,6 +270,7 @@ const setup = Effect.gen(function* () {
     Layer.provide(fakeVerify(world)),
     // No delivery here is reviewed, records an approval or opens its pull request.
     Layer.provide(Layer.mock(FactoryReview.FactoryReview)({})),
+    Layer.provide(Layer.mock(FactoryPlanning.FactoryPlanning)({})),
     Layer.provide(Layer.mock(FactoryRecord.FactoryRecord)({})),
     Layer.provide(Layer.mock(FactoryPullRequest.FactoryPullRequest)({})),
   );

@@ -59,11 +59,15 @@ export const wsHandlers = (input: {
       settings
         .set(payload.projectId, payload.settings)
         .pipe(Effect.as(payload.settings), Effect.mapError(toFactoryError)),
-    [FACTORY_WS_METHODS.factoryDeliveriesStart]: ({ itemRef }) =>
+    [FACTORY_WS_METHODS.factoryDeliveriesStart]: ({ itemRef, kind }) =>
       Effect.annotateCurrentSpan({
         "work.source_id": itemRef.sourceId,
         "work.item_id": itemRef.itemId,
-      }).pipe(Effect.andThen(command(factory.start({ itemRef })))),
+      }).pipe(
+        Effect.andThen(
+          command(factory.start({ itemRef, ...(kind === undefined ? {} : { kind }) })),
+        ),
+      ),
     [FACTORY_WS_METHODS.factoryDeliveriesStop]: ({ deliveryId }) =>
       forDelivery(deliveryId, command(factory.stop(deliveryId))),
     [FACTORY_WS_METHODS.factoryDeliveriesResume]: ({ deliveryId }) =>

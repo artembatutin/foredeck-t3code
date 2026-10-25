@@ -62,9 +62,10 @@ which its owner may change.
 ([agent grants](./work-management.md#agent-grants), `actorFromCaller`): a read-only client or a
 plan-mode thread only reads, and a thread caller acts only while its run is live. With a rule of
 its own, a thread that `work_start_thread` refuses could start threads for the same item through
-Factory. The caller's runtime mode becomes the delivery's ceiling. `factory_submit_review` is the
-exception: a reviewer works in plan mode by design, and the tool records only the calling thread's
-own review, so it checks instead that the caller is the delivery's registered reviewer
+Factory. The caller's runtime mode becomes the delivery's ceiling. `factory_submit_review` and
+`factory_submit_plan` are the exceptions: reviewers and planners work in plan mode by design, and
+each tool records only the calling thread's own review or plan, so it checks instead that the
+caller is the delivery's registered reviewer or planner
 ([`mcp/handlers.ts`](../../apps/server/src/fd/factory/mcp/handlers.ts)).
 
 ## Work never imports Factory

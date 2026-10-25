@@ -166,6 +166,7 @@ it.effect("production mcp layer lists worktree tools over http", () =>
         "work_link_thread",
         "work_start_thread",
         "factory_submit_review",
+        "factory_submit_plan",
         "factory_status",
         "factory_deliver",
       ])

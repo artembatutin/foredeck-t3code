@@ -5,7 +5,12 @@ import {
   FactoryDeliveryStatus,
   FactoryTaskId,
 } from "@t3tools/contracts/fd/factory";
-import { type WorkItemRef, workItemRefString } from "@t3tools/contracts/fd/work-management";
+import {
+  type WorkItemRef,
+  workItemRefString,
+  WorkSourceId,
+  WorkSourceKind,
+} from "@t3tools/contracts/fd/work-management";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
@@ -29,6 +34,7 @@ import {
   workBranchName,
 } from "../work-management/index.ts";
 import * as FactoryChanges from "./FactoryChanges.ts";
+import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
@@ -42,14 +48,19 @@ import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 import {
+  acceptedPlan,
   acceptedReview,
+  type FactoryAcceptedPlan,
   type FactoryAcceptedReview,
+  type FactoryDeliveryKind,
   type FactoryEvent,
+  type FactoryLaunchEffect,
   type FactoryResumeCheck,
   isTerminal,
   queuedDeliveryState,
   runsStages,
   unrecordedAuthorLaunch,
+  unrecordedPlannerLaunch,
 } from "./pipeline/state.ts";
 
 const FactoryReceiptRefusal = Schema.Literals(["head_changed", "tree_dirty"]);
@@ -116,6 +127,70 @@ type FactorySubmitReviewError =
   | FactoryReview.FactoryReviewJudgeError
   | FactoryStoreError;
 
+/** A plan submission refused before it was judged: nothing was recorded. */
+export class FactoryPlanRefusedError extends Schema.TaggedError<FactoryPlanRefusedError>()(
+  "FactoryPlanRefusedError",
+  {
+    threadId: ThreadId,
+    /**
+     * `not_planner`: no active delivery has this thread as its planner. `plan_not_active`: its
+     * delivery is not running the plan stage, or not this thread's run. `already_accepted`: this
+     * plan round's plan is already accepted.
+     */
+    reason: Schema.Literals(["not_planner", "plan_not_active", "already_accepted"]),
+  },
+) {
+  override get message(): string {
+    switch (this.reason) {
+      case "not_planner":
+        return `Thread ${this.threadId} is not the planner of an active Factory delivery.`;
+      case "plan_not_active":
+        return `The Factory plan of thread ${this.threadId} is not waiting for a submission.`;
+      case "already_accepted":
+        return `Factory already accepted this round's plan from thread ${this.threadId}.`;
+    }
+  }
+}
+
+/** The submitted plan is invalid. The first is the planner's to correct; a second blocks. */
+export class FactoryPlanInvalidError extends Schema.TaggedError<FactoryPlanInvalidError>()(
+  "FactoryPlanInvalidError",
+  {
+    deliveryId: FactoryDeliveryId,
+    /** Bounded descriptions of what to correct. */
+    problems: Schema.Array(Schema.String),
+    /** The delivery blocked on this submission: no further one is taken. */
+    blocked: Schema.Boolean,
+  },
+) {
+  override get message(): string {
+    const problems = this.problems.join(" ");
+    return this.blocked
+      ? `The plan is invalid again, so Factory blocked the delivery: ${problems}`
+      : `The plan is invalid. Correct these problems and submit the whole plan again: ${problems}`;
+  }
+}
+
+/** Why a plan submission was not accepted. Refusals and judging failures record nothing. */
+type FactorySubmitPlanError =
+  | FactoryPlanRefusedError
+  | FactoryPlanInvalidError
+  | FactoryPlanning.FactoryPlanJudgeError
+  | FactoryStoreError;
+
+/**
+ * A parent's planned tasks become child items in its Work source, which only a Markdown source
+ * can create; nothing was written.
+ */
+export class FactoryParentSourceUnsupportedError extends Schema.TaggedError<FactoryParentSourceUnsupportedError>()(
+  "FactoryParentSourceUnsupportedError",
+  { sourceId: WorkSourceId, sourceKind: WorkSourceKind },
+) {
+  override get message(): string {
+    return `Factory plans a parent only from a Markdown Work source; source ${this.sourceId} is ${this.sourceKind}.`;
+  }
+}
+
 /** No delivery id could be minted; nothing was written. */
 export class FactoryDeliveryIdError extends Schema.TaggedError<FactoryDeliveryIdError>()(
   "FactoryDeliveryIdError",
@@ -169,6 +244,7 @@ export class FactoryCancelRefusedError extends Schema.TaggedError<FactoryCancelR
 /** Why a start was refused. Every refusal comes before the delivery's row is written. */
 export type FactoryStartError =
   | WorkDomainError
+  | FactoryParentSourceUnsupportedError
   | FactorySettings.FactorySettingsStorageError
   | FactorySettings.FactoryVerifyCommandMissingError
   | ProjectStore.ProjectStoreV2Error
@@ -198,21 +274,25 @@ export class FactoryService extends Context.Service<
   FactoryService,
   {
     /**
-     * Starts a delivery of a single Work item. The author works on a new worktree of the branch
-     * Work's thread starts would name, created from the canonical checkout's HEAD; when an earlier
-     * delivery of the item or any ref already holds that name, the first free one of `-2`, `-3`,
-     * … after it (see `freshBranchName`), so an earlier delivery keeps its work. The delivery
-     * is stored queued with the item as its one task, then started, so its author launch is
-     * queued once the running state is stored. Refused, with nothing written: an item Work
-     * cannot read, a project without a verify command or not on this environment, a base the
-     * worktree cannot start from, or an item that already has a delivery that is not done or
-     * cancelled. With `runtimeModeCeiling`, which the delivery keeps, none of its threads ever
-     * launches or runs broader than that mode (a caller's own, for an agent's start), and a launch
-     * on a provider that offers no mode within it fails before anything runs; without one they
-     * launch with the project's default.
+     * Starts a delivery of a Work item: a single item (the default), or a parent, which plans
+     * its children first. Its first thread works on a new worktree of the branch Work's thread
+     * starts would name, created from the canonical checkout's HEAD; when an earlier delivery of
+     * the item or any ref already holds that name, the first free one of `-2`, `-3`, … after it
+     * (see `freshBranchName`), so an earlier delivery keeps its work. A single item is stored
+     * queued with the item as its one task, a parent with no task until its plan is approved;
+     * then the delivery is started, so its author or planner launch is queued once the running
+     * state is stored. Refused, with nothing written: an item Work cannot read, a parent whose
+     * source is not Markdown (the only kind that can hold its children), a project without a
+     * verify command or not on this environment, a base the worktree cannot start from, or an
+     * item that already has a delivery that is not done or cancelled. With `runtimeModeCeiling`,
+     * which the delivery keeps, none of its threads ever launches or runs broader than that mode
+     * (a caller's own, for an agent's start), and a launch on a provider that offers no mode
+     * within it fails before anything runs; without one they launch with the project's default.
      */
     readonly start: (input: {
       readonly itemRef: WorkItemRef;
+      /** Single when absent. */
+      readonly kind?: FactoryDeliveryKind;
       readonly runtimeModeCeiling?: RuntimeMode;
     }) => Effect.Effect<FactoryDeliveryWithRuns, FactoryStartError>;
     readonly get: (
@@ -261,7 +341,9 @@ export class FactoryService extends Context.Service<
      * again, every time. A delivery that issued an author launch but never recorded its result
      * issues that launch again, which picks up the thread, run and worktree it made if it went
      * through, and never starts a second author; if that run had ended, however it ended, the
-     * branch it left is settled and verified at once. A resume grants a fresh retry allowance
+     * branch it left is settled and verified at once. A parent that stopped or blocked while
+     * planning resumes into planning, its unrecorded planner launch replayed alike, and a
+     * recorded planner asked for its plan again. A resume grants a fresh retry allowance
      * (owner decision): repair rounds and failure fingerprints start over, its limits do not.
      * Refused, with nothing changed, in any other status.
      */
@@ -302,10 +384,25 @@ export class FactoryService extends Context.Service<
       FactorySubmitReviewError
     >;
     /**
+     * A planner's `factory_submit_plan`. Taken only from the thread an active delivery registered
+     * as its planner, while the plan stage awaits that thread's run and before the plan round has
+     * an accepted plan; any other call is refused with nothing changed. The plan is judged (see
+     * `FactoryPlanning`) and the judgment recorded on the delivery: an accepted plan, with tasks
+     * or without, is acted on once the planner's run completes, and an invalid one fails with its
+     * problems (the second in a round blocks the delivery).
+     */
+    readonly submitPlan: (input: {
+      readonly threadId: ThreadId;
+      readonly plan: unknown;
+    }) => Effect.Effect<
+      { readonly deliveryId: FactoryDeliveryId; readonly plan: FactoryAcceptedPlan },
+      FactorySubmitPlanError
+    >;
+    /**
      * Factory's change epoch: its value on subscribe, then each move. It moves after each write
-     * commits (a delivery's start, each engine step, a stop, resume or cancel, a review submission,
-     * a settings write) and never for a refusal, so a subscriber refetches what it shows on each
-     * value.
+     * commits (a delivery's start, each engine step, a stop, resume or cancel, a plan or review
+     * submission, a settings write) and never for a refusal, so a subscriber refetches what it
+     * shows on each value.
      */
     readonly subscribe: Stream.Stream<number>;
   }
@@ -326,6 +423,7 @@ const make = Effect.gen(function* () {
   const stageRuns = yield* FactoryStageRunStore.FactoryStageRunStore;
   const tasks = yield* FactoryTaskStore.FactoryTaskStore;
   const worker = yield* FactoryWorker.FactoryWorker;
+  const plans = yield* FactoryPlanning.FactoryPlanning;
   const reviews = yield* FactoryReview.FactoryReview;
   const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
   const changes = yield* FactoryChanges.FactoryChanges;
@@ -382,7 +480,16 @@ const make = Effect.gen(function* () {
       // The active-item index keys on Work's spelling, so another spelling of the item cannot
       // hold a second delivery.
       const itemRef = yield* work.canonicalRef(input.itemRef);
-      const { projectId } = (yield* work.resolveSource(itemRef.sourceId)).stored;
+      const kind = input.kind ?? "single";
+      const source = (yield* work.resolveSource(itemRef.sourceId)).stored;
+      // Owner decision: a parent's tasks become child items only in a Markdown source.
+      if (kind === "parent" && source.kind !== "markdown") {
+        return yield* new FactoryParentSourceUnsupportedError({
+          sourceId: source.sourceId,
+          sourceKind: source.kind,
+        });
+      }
+      const { projectId } = source;
       const { limits } = yield* settings.requireDeliverySettings(projectId);
       const project = Option.getOrUndefined(yield* projects.get(projectId));
       if (project === undefined) {
@@ -401,7 +508,7 @@ const make = Effect.gen(function* () {
           base: workBranchName(item),
           taken: earlier.map(({ state }) => state.branch),
         }).pipe(Effect.provideContext(gitContext));
-        // The workspace the author's launch asks for (see `agentStage`), checked before any row
+        // The workspace the first launch asks for (see `agentStage`), checked before any row
         // exists: the launch itself would accept a base with no commit and fail inside the
         // thread. Core's check lets HEAD through in a repository with no commits yet, so Factory
         // looks for one itself.
@@ -422,8 +529,9 @@ const make = Effect.gen(function* () {
             .pipe(Effect.mapError((cause) => new FactoryDeliveryIdError({ cause }))),
         );
         // The insert refuses an item with an active delivery inside its transaction, so of two
-        // starts only one is stored, even from another spelling. The item's task row is written
-        // in the same transaction: a refused start adds none, and no stored delivery lacks it.
+        // starts only one is stored, even from another spelling. A single item's task row is
+        // written in the same transaction: a refused start adds none, and no stored single item
+        // lacks it. A parent's tasks are its approved plan's.
         return yield* deliveries
           .insert({
             deliveryId,
@@ -431,6 +539,7 @@ const make = Effect.gen(function* () {
             itemRef,
             // The round limits stay those the delivery started with.
             state: queuedDeliveryState({
+              kind,
               branch: workspace.branch,
               baseRef: workspace.baseRef,
               limits: {
@@ -443,7 +552,11 @@ const make = Effect.gen(function* () {
             }),
           })
           .pipe(
-            Effect.tap(() => tasks.insert({ deliveryId, taskId: SINGLE_ITEM_TASK })),
+            Effect.tap(() =>
+              kind === "single"
+                ? tasks.insert({ deliveryId, taskId: SINGLE_ITEM_TASK })
+                : Effect.void,
+            ),
             (write) => changes.transact(write),
             Effect.catchTags({
               SqlError: (cause) =>
@@ -520,6 +633,59 @@ const make = Effect.gen(function* () {
     }
   });
 
+  const submitPlan: FactoryService["Service"]["submitPlan"] = Effect.fn(
+    "FactoryService.submitPlan",
+  )(function* ({ threadId, plan }) {
+    const refuse = (reason: FactoryPlanRefusedError["reason"]) =>
+      Effect.fail(new FactoryPlanRefusedError({ threadId, reason }));
+    // A planner thread belongs to the one delivery that launched it.
+    const owner = (yield* deliveries.listActive()).find(
+      ({ state }) => state.threads.planner === threadId,
+    );
+    if (owner === undefined) return yield* refuse("not_planner");
+    const { deliveryId } = owner;
+
+    // Judged and recorded under the delivery's lock, so the run cannot end in between: the
+    // engine then takes the judgment exactly when these checks pass.
+    const stepped = yield* worker.stepWith(deliveryId, (current) =>
+      Effect.gen(function* () {
+        const { state } = current;
+        const { awaiting } = state;
+        if (state.threads.planner !== threadId) return yield* refuse("not_planner");
+        // A stopping delivery still finishes its plan round.
+        if (
+          !runsStages(state) ||
+          state.stage !== "plan" ||
+          awaiting?.type !== "run" ||
+          awaiting.threadId !== threadId
+        ) {
+          return yield* refuse("plan_not_active");
+        }
+        if (acceptedPlan(state) !== undefined) return yield* refuse("already_accepted");
+        const judgment = yield* plans.judge(current, { source: "mcp", threadId, plan });
+        const event: FactoryEvent = {
+          type: "plan.submitted",
+          round: state.planRound,
+          threadId,
+          runId: awaiting.runId,
+          judgment,
+        };
+        return { event, value: { judgment, round: state.planRound } };
+      }),
+    );
+    // Deliveries are never deleted, so this one is still stored.
+    if (Option.isNone(stepped)) return yield* refuse("not_planner");
+    const { delivery, value } = stepped.value;
+    const { judgment } = value;
+    return judgment.type === "accepted"
+      ? { deliveryId, plan: { ...judgment.plan, round: value.round } }
+      : yield* new FactoryPlanInvalidError({
+          deliveryId,
+          problems: judgment.problems,
+          blocked: delivery.state.status === "blocked",
+        });
+  });
+
   // Both decide and step under the delivery's lock, so no run end or effect result lands between
   // the status they check and the step.
   const stop: FactoryService["Service"]["stop"] = Effect.fn("FactoryService.stop")(
@@ -548,17 +714,30 @@ const make = Effect.gen(function* () {
         threads.threadState(threadId).pipe(Effect.map((found) => found !== "present")),
       );
       if (state.threads.author === undefined) {
-        // An author launch whose result was never recorded is issued again and replays the
-        // thread it made, if any; a thread it made and the owner deleted since blocks instead.
-        const launch = unrecordedAuthorLaunch(state);
-        const found =
-          launch === undefined ? "missing" : yield* threads.launchState(delivery, launch);
+        // An author or planner launch whose result was never recorded is issued again and
+        // replays the thread it made, if any; a thread it made and the owner deleted since blocks
+        // instead.
+        const lostLaunch = (launch: FactoryLaunchEffect | undefined) =>
+          launch === undefined
+            ? Effect.succeed({ found: "missing" as const, deleted: [] })
+            : threads.launchState(delivery, launch).pipe(
+                Effect.map((found) => ({
+                  found,
+                  deleted:
+                    found === "deleted"
+                      ? [FactoryThreadEffects.launchThreadId(deliveryId, launch.id)]
+                      : [],
+                })),
+              );
+        const author = yield* lostLaunch(unrecordedAuthorLaunch(state));
+        const plannerLaunch = unrecordedPlannerLaunch(state);
+        const planner = yield* lostLaunch(plannerLaunch);
         return {
-          deletedThreads:
-            launch !== undefined && found === "deleted"
-              ? [...gone, FactoryThreadEffects.launchThreadId(deliveryId, launch.id)]
-              : gone,
-          unrecordedAuthorRunEnded: found === "ended",
+          deletedThreads: [...gone, ...author.deleted, ...planner.deleted],
+          unrecordedAuthorRunEnded: author.found === "ended",
+          ...(plannerLaunch === undefined
+            ? {}
+            : { unrecordedPlannerRunEnded: planner.found === "ended" }),
           worktree: null,
         } satisfies FactoryResumeCheck;
       }
@@ -634,6 +813,7 @@ const make = Effect.gen(function* () {
     stop,
     resume,
     cancel,
+    submitPlan,
     submitReview,
     subscribe: changes.changes,
   });

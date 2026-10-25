@@ -28,6 +28,7 @@ import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementSer
 import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import { workBranchName, WorkService } from "../../work-management/index.ts";
+import * as FactoryPlanning from "../FactoryPlanning.ts";
 import * as FactoryPullRequest from "../FactoryPullRequest.ts";
 import * as FactoryRecord from "../FactoryRecord.ts";
 import * as FactoryReview from "../FactoryReview.ts";
@@ -235,23 +236,24 @@ describe("factory_deliver callers that may not start threads", () => {
 });
 
 describe("factory_deliver kinds", () => {
-  it.live("refuses a parent delivery with fixed text and writes nothing", () =>
+  it.live("delivers a Markdown item as a parent by launching its planner first", () =>
     withProject(verifyCommands.passes, (world) =>
       Effect.gen(function* () {
-        const result = yield* deliver(threadIn(world.projectId), {
-          item: world.itemKey,
-          kind: "parent",
-        });
+        const caller = threadIn(world.projectId, { runtimeMode: "auto-accept-edits" });
 
-        assertFailure(result, {
-          _tag: "FactoryMcpFailure",
-          code: "unsupported_kind",
-          message:
-            "Factory cannot deliver a parent item yet: planning its children is not available. Omit kind to deliver the item itself.",
-        });
-        yield* drainFactory;
-        assert.deepStrictEqual(yield* deliveriesOf(world), []);
-        assert.deepStrictEqual(world.provider.started, []);
+        const deliveryId = deliveredId(
+          yield* deliver(caller, { item: world.itemKey, kind: "parent" }),
+        );
+        const planner = yield* world.launched(deliveryId);
+
+        const state = yield* stateOf(deliveryId);
+        assert.strictEqual(state.kind, "parent");
+        assert.strictEqual(state.stage, "plan");
+        assert.strictEqual(state.threads.planner, planner.threadId);
+        assert.isUndefined(state.threads.author);
+        const turn = world.provider.started.find((started) => started.runId === planner.runId);
+        assert.strictEqual(turn?.runtimePolicy.interactionMode, "plan");
+        assert.strictEqual(turn?.runtimePolicy.runtimeMode, "auto-accept-edits");
       }),
     ),
   );
@@ -340,6 +342,7 @@ const missingProject = (() => {
         Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({}),
         Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({}),
         Layer.mock(FactoryReview.FactoryReview)({}),
+        Layer.mock(FactoryPlanning.FactoryPlanning)({}),
         Layer.mock(FactoryRecord.FactoryRecord)({}),
         Layer.mock(FactoryPullRequest.FactoryPullRequest)({}),
         Layer.mock(GitVcsDriver.GitVcsDriver)({}),

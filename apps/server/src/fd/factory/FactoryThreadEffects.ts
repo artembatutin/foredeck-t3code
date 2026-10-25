@@ -45,6 +45,7 @@ import { authorThreadTitle, renderAuthorPrompt } from "./prompts/author.ts";
 import { renderFixCommitPrompt } from "./prompts/fixCommit.ts";
 import { renderFixReviewPrompt } from "./prompts/fixReview.ts";
 import { renderFixVerifyPrompt } from "./prompts/fixVerify.ts";
+import { planThreadTitle, renderPlanPrompt, renderPlanRetryPrompt } from "./prompts/plan.ts";
 import {
   renderReviewPrompt,
   renderReviewRetryPrompt,
@@ -60,16 +61,6 @@ export class FactoryProjectMissingError extends Schema.TaggedError<FactoryProjec
 ) {
   override get message(): string {
     return `Project ${this.projectId} is not available on this environment.`;
-  }
-}
-
-/** Only the author and reviewer roles have prompts in this phase. */
-export class FactoryRoleUnsupportedError extends Schema.TaggedError<FactoryRoleUnsupportedError>()(
-  "FactoryRoleUnsupportedError",
-  { role: FactoryRole },
-) {
-  override get message(): string {
-    return `Factory cannot launch a ${this.role} thread yet.`;
   }
 }
 
@@ -195,6 +186,14 @@ export class FactoryThreadEffects extends Context.Service<
     readonly sendFixCommitTurn: (
       delivery: StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "send_fix_commit_turn" }>,
+    ) => Effect.Effect<{ readonly runId: RunId }, FactoryThreadEffectFailure>;
+    /**
+     * Sends the planner's turn asking for its whole plan again and reports the run it started on
+     * the effect's thread.
+     */
+    readonly sendPlanRetryTurn: (
+      delivery: StoredFactoryDelivery,
+      effect: Extract<FactoryEffect, { readonly type: "send_plan_retry_turn" }>,
     ) => Effect.Effect<{ readonly runId: RunId }, FactoryThreadEffectFailure>;
     /** Sends the reviewer's retry turn and reports the run it started on the effect's thread. */
     readonly sendReviewRetryTurn: (
@@ -461,7 +460,6 @@ const make = Effect.gen(function* () {
   const launchThread: FactoryThreadEffects["Service"]["launchThread"] = (delivery, effect) =>
     Effect.gen(function* () {
       const { role } = effect;
-      if (role === "planner") return yield* new FactoryRoleUnsupportedError({ role });
       const { deliveryId, projectId, state } = delivery;
       // A review starts from the verified commit; without one, nothing is launched.
       const basis = role === "reviewer" ? yield* reviewBasis(delivery) : null;
@@ -484,11 +482,11 @@ const make = Effect.gen(function* () {
           : yield* resolveCommit(workspace.worktreePath, "HEAD");
 
       // The order Work's thread starts use, with the role's profile as the explicit choice. A
-      // reviewer without a profile of its own uses the author's. A launch starts a first round,
-      // so only a high-risk task escalates it.
+      // planner or reviewer without a profile of its own uses the author's. A launch starts a
+      // first round, so only a high-risk task escalates it.
       const modelSelection = yield* escalated(
         delivery,
-        (role === "reviewer" ? (roles.reviewer ?? roles.author) : roles.author) ??
+        (role === "author" ? roles.author : (roles[role] ?? roles.author)) ??
           resolved.defaultModelSelection ??
           getAutoBootstrapThreadModelSelection(),
         1,
@@ -500,15 +498,11 @@ const make = Effect.gen(function* () {
         modelSelection.instanceId,
         resolved.defaultRuntimeMode,
       );
-      // Reviewers work in plan mode: they read and judge, and never change the worktree.
+      // Planners and reviewers work in plan mode: they read and judge, and never change the
+      // worktree.
       const opening =
-        basis === null
+        basis !== null
           ? {
-              title: authorThreadTitle(item),
-              text: renderAuthorPrompt({ item, branch: state.branch }),
-              interactionMode: "default" as const,
-            }
-          : {
               title: reviewThreadTitle(item),
               text: renderReviewPrompt({
                 item,
@@ -517,7 +511,18 @@ const make = Effect.gen(function* () {
                 receipt: basis.receipt,
               }),
               interactionMode: "plan" as const,
-            };
+            }
+          : role === "planner"
+            ? {
+                title: planThreadTitle(item),
+                text: renderPlanPrompt({ item, branch: state.branch }),
+                interactionMode: "plan" as const,
+              }
+            : {
+                title: authorThreadTitle(item),
+                text: renderAuthorPrompt({ item, branch: state.branch }),
+                interactionMode: "default" as const,
+              };
       // Derived from the effect, so a retried launch replays its receipt instead of starting a
       // second thread, and finds its Work link already stored.
       const commandId = CommandId.make(`factory-launch:${deliveryId}:${effect.id}`);
@@ -571,7 +576,13 @@ const make = Effect.gen(function* () {
   const sendTurn = (
     delivery: StoredFactoryDelivery,
     effect: { readonly id: number; readonly threadId: ThreadId },
-    kind: "fix-commit" | "review-retry" | "fix-verify" | "fix-review" | "review-follow-up",
+    kind:
+      | "fix-commit"
+      | "plan-retry"
+      | "review-retry"
+      | "fix-verify"
+      | "fix-review"
+      | "review-follow-up",
     text: string,
     modelSelection?: ModelSelection,
   ) =>
@@ -674,6 +685,13 @@ const make = Effect.gen(function* () {
           baseline: delivery.state.baseline,
           checkpoint: effect.checkpoint ?? null,
         }),
+      ),
+    sendPlanRetryTurn: (delivery, effect) =>
+      sendTurn(
+        delivery,
+        effect,
+        "plan-retry",
+        renderPlanRetryPrompt({ problems: effect.problems, checkpoint: effect.checkpoint ?? null }),
       ),
     sendReviewRetryTurn: (delivery, effect) =>
       sendTurn(

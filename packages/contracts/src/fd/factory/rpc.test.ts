@@ -79,10 +79,6 @@ describe("Factory RPC payloads", () => {
     expect(decodeStart({ itemRef, kind: "single" })).toEqual({ itemRef, kind: "single" });
   });
 
-  it("refuses a parent delivery, which this build cannot run", () => {
-    expect(() => decodeStart({ itemRef, kind: "parent" })).toThrow();
-  });
-
   it("reads an error reason from a newer server as unavailable", () => {
     const decodeError = Schema.decodeUnknownSync(FactoryError);
     expect(

@@ -1,9 +1,17 @@
+import type { FactoryStageName } from "@t3tools/contracts/fd/factory";
+
 import { type FactoryAuthorItem, itemSections } from "./author.ts";
 
 /**
- * The planner's first message: the parent Work item and Looper's plan rules, condensed. Pure, so
- * the exact text a planner receives is tested rather than inferred.
+ * The planner's messages: the first, with the parent Work item and Looper's plan rules condensed,
+ * and the retry turns. Pure, so the exact text a planner receives is tested rather than inferred.
  */
+
+const TITLE_MAX_CHARS = 100;
+
+/** `Plan <key>: <title>`, cut to the thread title limit. */
+export const planThreadTitle = (item: Pick<FactoryAuthorItem, "key" | "title">): string =>
+  `Plan ${item.key}: ${item.title}`.slice(0, TITLE_MAX_CHARS);
 
 const RULES = [
   "Inspect only: read the repository and the item, and change no file, stage or commit nothing, and switch no branch.",
@@ -67,4 +75,31 @@ export const renderPlanPrompt = (input: {
     `${SUBMIT}\n\n${EXAMPLE}`,
   );
   return sections.join("\n\n");
+};
+
+const RESUBMIT =
+  "call the `factory_submit_plan` tool, and end your final message with the same plan as JSON in one fenced ```json block. Change no file.";
+
+/**
+ * A follow-up asking the planner for its whole plan again: after an invalid fallback plan, the
+ * round's one retry, listing its problems; on a resume, a new round's first submission, naming the
+ * checkpoint and the problems of the plan the delivery blocked on, if any.
+ */
+export const renderPlanRetryPrompt = (input: {
+  readonly problems: ReadonlyArray<string>;
+  /** Set on a resume: the checkpoint the delivery resumes from. */
+  readonly checkpoint: FactoryStageName | null;
+}): string => {
+  const problems = input.problems.map((problem) => `- ${problem}`).join("\n");
+  if (input.checkpoint === null) {
+    return [
+      `Factory could not accept your plan:\n${problems}`,
+      `Correct these problems and submit the whole plan again: ${RESUBMIT} This is the last attempt before the delivery blocks.`,
+    ].join("\n\n");
+  }
+  return [
+    `Factory is resuming this delivery from its \`${input.checkpoint}\` checkpoint and needs your plan again.`,
+    ...(problems === "" ? [] : [`Your last plan had these problems:\n${problems}`]),
+    `Submit the whole plan again, following the rules of your first message: ${RESUBMIT}`,
+  ].join("\n\n");
 };

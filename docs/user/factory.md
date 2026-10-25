@@ -18,9 +18,9 @@ use **Factory**:
   such as your test script. It must leave the checkout as it found it: a run that commits or
   changes files is refused and the delivery blocks.
 - **Setup command** is optional. It can be saved, but deliveries do not run it yet.
-- **Role models** pick the model for the **Author** and the **Reviewer** from that environment's
-  providers. **Default** uses the project's model, and the reviewer's default is the author's. The
-  **Planner** model is not used yet.
+- **Role models** pick the model for the **Planner**, the **Author** and the **Reviewer** from that
+  environment's providers. **Default** uses the project's model, and the planner and the reviewer
+  default to the author's. The planner plans an item delivered as a parent.
 - **Limits** set how many **Fix rounds** and **Review rounds** a delivery may spend, and the
   **Verify timeout** in minutes.
 

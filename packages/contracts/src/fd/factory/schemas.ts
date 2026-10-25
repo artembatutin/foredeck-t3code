@@ -479,10 +479,11 @@ export type FactorySettingsSetInput = typeof FactorySettingsSetInput.Type;
 export const FactoryDeliveryStartInput = Schema.Struct({
   itemRef: WorkItemRef,
   /**
-   * Absent means `single`. Parents arrive with planning; until then a newer client's `parent`
-   * fails to decode here instead of being delivered as a single item.
+   * Absent means `single`. `parent` plans the item's children first, and only a Markdown source
+   * can hold them. A server from before planning fails to decode `parent` rather than deliver
+   * the item as a single one.
    */
-  kind: Schema.optionalKey(Schema.Literal("single")),
+  kind: Schema.optionalKey(Schema.Literals(["single", "parent"])),
 });
 export type FactoryDeliveryStartInput = typeof FactoryDeliveryStartInput.Type;
 
@@ -506,6 +507,7 @@ const FACTORY_ERROR_REASONS = [
   "not_configured",
   "conflict",
   "refused",
+  "unsupported_source",
   "unavailable",
 ] as const;
 
@@ -513,8 +515,9 @@ const FACTORY_ERROR_REASONS = [
  * `not_configured`: the project's Factory settings lack what the request needs (a verify
  * command). `conflict`: the item already has a delivery that is not done or cancelled.
  * `refused`: the delivery's status, or the project's checkout, does not allow the request now.
- * `unavailable`: storage or the server failed, or a reason this build does not know (a newer
- * server's reasons decode here rather than failing).
+ * `unsupported_source`: the item's Work source cannot hold what the request needs (a parent's
+ * children, which only a Markdown source can). `unavailable`: storage or the server failed, or a
+ * reason this build does not know (a newer server's reasons decode here rather than failing).
  */
 export const FactoryErrorReason = literalsOr(FACTORY_ERROR_REASONS, "unavailable");
 export type FactoryErrorReason = typeof FactoryErrorReason.Type;

@@ -18,6 +18,7 @@ export type FactoryServiceError =
   | FactorySettings.FactorySettingsStorageError
   | FactorySettings.FactoryUnknownPipelineError
   | FactorySettings.FactoryVerifyCommandMissingError
+  | FactoryService.FactoryParentSourceUnsupportedError
   | FactoryService.FactoryDeliveryIdError
   | FactoryService.FactoryDeliveryNotFoundError
   | FactoryService.FactoryStopRefusedError
@@ -75,6 +76,12 @@ export const toFactoryError = (error: FactoryServiceError): FactoryError => {
         reason: "refused",
         message: `This delivery is already ${error.status}, so it cannot be cancelled.`,
         deliveryId: error.deliveryId,
+      });
+    case "FactoryParentSourceUnsupportedError":
+      return new FactoryError({
+        reason: "unsupported_source",
+        message:
+          "Factory plans a parent item only from a Markdown Work source, which can hold its child items. Deliver it as a single item instead.",
       });
     case "FactoryProjectMissingError":
       return new FactoryError({

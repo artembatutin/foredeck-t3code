@@ -48,6 +48,10 @@ export class FactoryEvidence extends Context.Service<
       deliveryId: FactoryDeliveryId,
       taskId: FactoryTaskId,
     ) => Effect.Effect<string, FactoryEvidenceError>;
+    /** The delivery's `plan.json` path in its folder, created on demand. */
+    readonly planFile: (
+      deliveryId: FactoryDeliveryId,
+    ) => Effect.Effect<string, FactoryEvidenceError>;
   }
 >()("t3/fd/factory/verify/FactoryEvidence") {}
 
@@ -86,6 +90,9 @@ const make = Effect.gen(function* () {
     }),
     approvalFile: Effect.fn("FactoryEvidence.approvalFile")(function* (deliveryId, taskId) {
       return path.join(yield* directoryOf(deliveryId), `approval-${taskId}.json`);
+    }),
+    planFile: Effect.fn("FactoryEvidence.planFile")(function* (deliveryId) {
+      return path.join(yield* directoryOf(deliveryId), "plan.json");
     }),
   });
 });

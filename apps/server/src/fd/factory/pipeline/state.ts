@@ -365,8 +365,9 @@ export type FactoryEvent =
       readonly baseline: string;
     }
   /**
-   * A `send_fix_commit_turn`, `send_review_retry_turn`, `send_repair_turn` or
-   * `send_review_follow_up_turn` result: the run that turn started on the effect's thread.
+   * A `send_fix_commit_turn`, `send_plan_retry_turn`, `send_review_retry_turn`,
+   * `send_repair_turn` or `send_review_follow_up_turn` result: the run that turn started on the
+   * effect's thread.
    */
   | { readonly type: "turn.started"; readonly effectId: number; readonly runId: RunId }
   | {

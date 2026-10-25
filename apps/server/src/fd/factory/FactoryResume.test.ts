@@ -45,6 +45,7 @@ import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistry
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService, workBranchName } from "../work-management/index.ts";
+import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
@@ -256,6 +257,7 @@ const makeLayer = (world: World) =>
     Layer.provide(Layer.mock(FactoryWorkComments.FactoryWorkComments)({ post: () => Effect.void })),
     Layer.provideMerge(FactoryPullRequest.layer),
     Layer.provide(FactoryReview.layer),
+    Layer.provide(Layer.mock(FactoryPlanning.FactoryPlanning)({})),
     Layer.provide(gatedRecord(world)),
     Layer.provide(FactoryVerifyRunner.layer.pipe(Layer.provide(ProcessRunner.layer))),
     Layer.provide(FactoryEvidence.layer),

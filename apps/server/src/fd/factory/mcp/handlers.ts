@@ -65,6 +65,8 @@ const startCode = (
       return "no_base_commit";
     case "FactoryBranchUnavailableError":
       return "no_free_branch";
+    case "FactoryParentSourceUnsupportedError":
+      return "unsupported_source";
     default:
       return reason === "not_found" || reason === "invalid_request" ? reason : "unavailable";
   }
@@ -152,6 +154,38 @@ export const toolLayer = McpToolAccess.toLayer(FactoryToolkit, {
       };
     }),
   ),
+  // The planner's own plan, under the reviewer's rule: a planner works in plan mode, and only the
+  // registered planner's submission is taken.
+  factory_submit_plan: McpToolAccess.actsAsCaller(({ plan }) =>
+    Effect.gen(function* () {
+      const { thread } = yield* requireThreadScope((yield* loadCaller()).scope, "This tool");
+      const service = yield* FactoryService.FactoryService;
+      const accepted = yield* service.submitPlan({ threadId: thread.threadId, plan }).pipe(
+        Effect.mapError((error) => {
+          switch (error._tag) {
+            case "FactoryPlanRefusedError":
+              return new FactoryMcpFailure({ code: error.reason, message: error.message });
+            case "FactoryPlanInvalidError":
+              return new FactoryMcpFailure({
+                code: error.blocked ? "delivery_blocked" : "invalid_plan",
+                message: error.message,
+              });
+            default:
+              // Judging or storage failed, so nothing was recorded; the cause stays server-side.
+              return new FactoryMcpFailure({
+                code: "unavailable",
+                message: "Factory could not take the plan; nothing was recorded.",
+              });
+          }
+        }),
+      );
+      return {
+        deliveryId: accepted.deliveryId,
+        round: accepted.plan.round,
+        taskIds: accepted.plan.tasks.map((task) => task.id),
+      };
+    }),
+  ),
   // Snapshots only, never a log or evidence path, so a read-only client or a plan-mode thread
   // may read any delivery, as `work_read` reads any item.
   factory_status: McpToolAccess.reads(({ delivery, item, sourceId, projectId }) =>
@@ -205,13 +239,6 @@ export const toolLayer = McpToolAccess.toLayer(FactoryToolkit, {
               "A Factory delivery starts threads, and a plan-mode thread or read-only client only reads.",
           });
         }
-        if (kind === "parent") {
-          return yield* new FactoryMcpFailure({
-            code: "unsupported_kind",
-            message:
-              "Factory cannot deliver a parent item yet: planning its children is not available. Omit kind to deliver the item itself.",
-          });
-        }
         const itemRef = yield* resolveItem({
           item,
           ...(sourceId === undefined ? {} : { sourceId }),
@@ -219,7 +246,11 @@ export const toolLayer = McpToolAccess.toLayer(FactoryToolkit, {
         });
         const service = yield* FactoryService.FactoryService;
         const delivery = yield* service
-          .start({ itemRef, runtimeModeCeiling: started.runtimeMode })
+          .start({
+            itemRef,
+            ...(kind === undefined ? {} : { kind }),
+            runtimeModeCeiling: started.runtimeMode,
+          })
           .pipe(Effect.mapError(startFailure));
         return { delivery: toFactoryDelivery(delivery) };
       }),

@@ -20,6 +20,7 @@ import * as TxRef from "effect/TxRef";
 
 import type * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as FactoryChanges from "./FactoryChanges.ts";
+import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
@@ -59,19 +60,6 @@ class FactoryStageCommandError extends Schema.TaggedError<FactoryStageCommandErr
 ) {
   override get message(): string {
     return `Factory has no command to run for stage ${this.stage} of this delivery.`;
-  }
-}
-
-/**
- * This server cannot yet read a planner's fenced plan or send its retry turn; the delivery blocks
- * on the effect, as it does on a planner launch.
- */
-class FactoryPlanningUnavailableError extends Schema.TaggedError<FactoryPlanningUnavailableError>()(
-  "FactoryPlanningUnavailableError",
-  { effect: Schema.Literals(["read_fallback_plan", "send_plan_retry_turn"]) },
-) {
-  override get message(): string {
-    return `Factory cannot carry out ${this.effect} for a planner yet.`;
   }
 }
 
@@ -268,6 +256,7 @@ const make = Effect.gen(function* () {
   const settings = yield* FactorySettings.FactorySettings;
   const verifyRunner = yield* FactoryVerifyRunner.FactoryVerifyRunner;
   const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
+  const plans = yield* FactoryPlanning.FactoryPlanning;
   const reviews = yield* FactoryReview.FactoryReview;
   const records = yield* FactoryRecord.FactoryRecord;
   const pullRequests = yield* FactoryPullRequest.FactoryPullRequest;
@@ -387,8 +376,15 @@ const make = Effect.gen(function* () {
           })),
         );
       case "read_fallback_plan":
+        return plans.judgeFallback(delivery, effect).pipe(
+          Effect.map((judgment): FactoryEvent => ({
+            type: "plan.read",
+            effectId: effect.id,
+            judgment,
+          })),
+        );
       case "send_plan_retry_turn":
-        return Effect.fail(new FactoryPlanningUnavailableError({ effect: effect.type }));
+        return threads.sendPlanRetryTurn(delivery, effect).pipe(Effect.map(turnStarted));
       case "send_review_retry_turn":
         return threads.sendReviewRetryTurn(delivery, effect).pipe(Effect.map(turnStarted));
       case "send_repair_turn":

@@ -11,6 +11,7 @@ import * as ServerConfig from "../../config.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
+import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
@@ -21,7 +22,6 @@ import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
-import { advance } from "./pipeline/engine.ts";
 import { queuedDeliveryState } from "./pipeline/state.ts";
 import type { FactoryDeliveryState, FactoryEvent, FactoryPlanJudgment } from "./pipeline/state.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
@@ -34,28 +34,30 @@ const itemRef = {
 const deliveryId = FactoryDeliveryId.make("delivery-plan");
 const planner = ThreadId.make("thread-planner");
 const planRun = RunId.make("run-plan");
+const retryRun = RunId.make("run-plan-retry");
 const worktreePath = "/worktrees/item-7";
-const planEvidence = "/t3/userdata/fd-factory/delivery-plan/plan-1.json";
+const planEvidence = "/t3/userdata/fd-factory/delivery-plan/plan.json";
 
 const queued = queuedDeliveryState({ kind: "parent", branch: "feature/item-7", baseRef: "HEAD" });
-const accepted: FactoryPlanJudgment = {
+const plan = {
+  tasks: [
+    {
+      id: FactoryTaskId.make("export-button"),
+      title: "Add the export button",
+      kind: "feature",
+      summary: "Add an export button to the report toolbar.",
+      acceptance: ["The toolbar shows Export."],
+      testPlan: [{ criterion: 1, check: "Toolbar renders Export.", paths: ["src/a.test.ts"] }],
+      likelyPaths: ["src/toolbar.ts"],
+      risk: "normal",
+    },
+  ],
+  evidencePath: planEvidence,
+} as const;
+const accepted: FactoryPlanJudgment = { type: "accepted", plan: { ...plan, source: "mcp" } };
+const fallbackAccepted: FactoryPlanJudgment = {
   type: "accepted",
-  plan: {
-    tasks: [
-      {
-        id: FactoryTaskId.make("export-button"),
-        title: "Add the export button",
-        kind: "feature",
-        summary: "Add an export button to the report toolbar.",
-        acceptance: ["The toolbar shows Export."],
-        testPlan: [{ criterion: 1, check: "Toolbar renders Export.", paths: ["src/a.test.ts"] }],
-        likelyPaths: ["src/toolbar.ts"],
-        risk: "normal",
-      },
-    ],
-    source: "mcp",
-    evidencePath: planEvidence,
-  },
+  plan: { ...plan, source: "fallback" },
 };
 const submitted: FactoryEvent = {
   type: "plan.submitted",
@@ -64,14 +66,6 @@ const submitted: FactoryEvent = {
   runId: planRun,
   judgment: accepted,
 };
-const launched: FactoryEvent = {
-  type: "thread.launched",
-  effectId: 1,
-  threadId: planner,
-  runId: planRun,
-  worktreePath,
-  baseline: "b".repeat(40),
-};
 const completed: FactoryEvent = {
   type: "run.finished",
   threadId: planner,
@@ -79,11 +73,17 @@ const completed: FactoryEvent = {
   status: "completed",
 };
 
-const fold = (state: FactoryDeliveryState, ...events: ReadonlyArray<FactoryEvent>) =>
-  events.reduce((current, event) => advance(current, event).delivery, state);
+/** What the scripted planner effects were asked to do. */
+interface PlannerCalls {
+  readonly interrupted: Array<ThreadId>;
+  readonly retries: Array<{
+    readonly threadId: ThreadId;
+    readonly problems: ReadonlyArray<string>;
+  }>;
+}
 
-/** The threads the worker launches and interrupts; anything else is not scripted here. */
-const plannerThreads = (interrupted: Array<ThreadId>) =>
+/** The threads the worker launches, retries and interrupts; anything else is not scripted here. */
+const plannerThreads = (calls: PlannerCalls) =>
   Layer.succeed(
     FactoryThreadEffects.FactoryThreadEffects,
     FactoryThreadEffects.FactoryThreadEffects.of({
@@ -97,6 +97,10 @@ const plannerThreads = (interrupted: Array<ThreadId>) =>
             })
           : Effect.die("only the planner launches here"),
       sendFixCommitTurn: () => Effect.die("fix-commit turn not scripted"),
+      sendPlanRetryTurn: (_delivery, { threadId, problems }) =>
+        Effect.sync(() => calls.retries.push({ threadId, problems })).pipe(
+          Effect.as({ runId: retryRun }),
+        ),
       sendReviewRetryTurn: () => Effect.die("review retry turn not scripted"),
       sendRepairTurn: () => Effect.die("repair turn not scripted"),
       sendReviewFollowUpTurn: () => Effect.die("review follow-up turn not scripted"),
@@ -104,16 +108,27 @@ const plannerThreads = (interrupted: Array<ThreadId>) =>
       threadState: () => Effect.die("thread read not scripted"),
       // Every run is still going; its end arrives as a step.
       runEnded: () => Effect.succeedNone,
-      interruptRun: (_delivery, { threadId }) => Effect.sync(() => interrupted.push(threadId)),
+      interruptRun: (_delivery, { threadId }) =>
+        Effect.sync(() => calls.interrupted.push(threadId)),
     }),
   );
 
+/** Planning judges the planner's first run's fenced plan as `fallback`. */
+const fallbackPlanning = (fallback: FactoryPlanJudgment) =>
+  Layer.mock(FactoryPlanning.FactoryPlanning)({
+    judgeFallback: (_delivery, effect) =>
+      effect.threadId === planner && effect.runId === planRun
+        ? Effect.succeed(fallback)
+        : Effect.die("only the planner's first run is read here"),
+  });
+
 /** The worker on in-memory SQLite with a scripted planner; no command, review or PR runs. */
-const makeLayer = (interrupted: Array<ThreadId>) =>
+const makeLayer = (calls: PlannerCalls, fallback: FactoryPlanJudgment) =>
   FactoryWorker.layer.pipe(
     Layer.provide(Layer.mock(FactoryWorkComments.FactoryWorkComments)({ post: () => Effect.void })),
-    Layer.provide(plannerThreads(interrupted)),
+    Layer.provide(plannerThreads(calls)),
     Layer.provide(Layer.mock(FactoryReview.FactoryReview)({})),
+    Layer.provide(fallbackPlanning(fallback)),
     Layer.provide(Layer.mock(FactoryRecord.FactoryRecord)({})),
     Layer.provide(Layer.mock(FactoryPullRequest.FactoryPullRequest)({})),
     Layer.provide(Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({})),
@@ -127,10 +142,11 @@ const makeLayer = (interrupted: Array<ThreadId>) =>
   );
 
 const withWorker = <A, E, R>(
-  body: (interrupted: ReadonlyArray<ThreadId>) => Effect.Effect<A, E, R>,
+  body: (calls: PlannerCalls) => Effect.Effect<A, E, R>,
+  fallback: FactoryPlanJudgment = fallbackAccepted,
 ) => {
-  const interrupted: Array<ThreadId> = [];
-  return body(interrupted).pipe(Effect.provide(makeLayer(interrupted)), Effect.scoped);
+  const calls: PlannerCalls = { interrupted: [], retries: [] };
+  return body(calls).pipe(Effect.provide(makeLayer(calls, fallback)), Effect.scoped);
 };
 
 const insert = (state: FactoryDeliveryState) =>
@@ -174,7 +190,7 @@ const startPlanning = Effect.gen(function* () {
 
 describe("FactoryWorker planning", () => {
   it.effect("waits at the plan gate with the plan attempt passed and the gate's attempt open", () =>
-    withWorker((interrupted) =>
+    withWorker(({ interrupted }) =>
       Effect.gen(function* () {
         yield* startPlanning;
         assert.deepStrictEqual(yield* attempts, [planAttempt(null)]);
@@ -227,47 +243,48 @@ describe("FactoryWorker planning", () => {
     ),
   );
 
-  it.effect("blocks on the fallback plan read, which this server cannot carry out yet", () =>
+  it.effect("reads the fallback plan of a run that ended without one and waits at the gate", () =>
     withWorker(() =>
       Effect.gen(function* () {
         yield* startPlanning;
         yield* step(completed);
         const state = yield* stateOf;
-        assert.strictEqual(state.status, "blocked");
-        assert.deepStrictEqual(state.block, {
-          reason: "effect_failed",
-          effect: { id: 2, type: "read_fallback_plan", threadId: planner, runId: planRun },
-          detail:
-            "Factory could not read the plan in the planner's last message (FactoryPlanningUnavailableError).",
-        });
-        assert.deepStrictEqual(yield* attempts, [planAttempt("blocked")]);
+        assert.strictEqual(state.status, "waiting");
+        assert.strictEqual(state.stage, "approve_plan");
+        assert.deepStrictEqual(state.plan, { ...plan, source: "fallback", round: 1 });
+        assert.deepStrictEqual(yield* attempts, [
+          planAttempt("passed"),
+          { stage: "approve_plan", outcome: null, threadId: null, evidencePath: null },
+        ]);
       }),
     ),
   );
 
-  it.effect("blocks on the plan retry turn, which this server cannot send yet", () =>
-    withWorker(() =>
-      Effect.gen(function* () {
-        // Stored awaiting the fallback read, as the step before it left it.
-        yield* insert(fold(queued, { type: "start" }, launched, completed));
-        yield* step({
-          type: "plan.read",
-          effectId: 2,
-          judgment: { type: "invalid", problems: ["No fenced block."] },
-        });
-        const state = yield* stateOf;
-        assert.deepStrictEqual(state.block, {
-          reason: "effect_failed",
-          effect: {
-            id: 3,
-            type: "send_plan_retry_turn",
+  it.effect("sends the plan retry turn on the planner thread and awaits its run", () =>
+    withWorker(
+      ({ retries }) =>
+        Effect.gen(function* () {
+          yield* startPlanning;
+          yield* step(completed);
+          assert.deepStrictEqual(retries, [{ threadId: planner, problems: ["No fenced block."] }]);
+          const state = yield* stateOf;
+          assert.strictEqual(state.status, "running");
+          assert.strictEqual(state.invalidSubmissions, 1);
+          assert.deepStrictEqual(state.awaiting, {
+            type: "run",
             threadId: planner,
-            problems: ["No fenced block."],
-          },
-          detail: "Factory could not send the plan retry turn (FactoryPlanningUnavailableError).",
-        });
-        assert.strictEqual(state.invalidSubmissions, 1);
-      }),
+            runId: retryRun,
+          });
+          // The plan round goes on in the same attempt, now on the retry's run.
+          const runs = yield* Effect.flatMap(FactoryStageRunStore.FactoryStageRunStore, (store) =>
+            store.listByDelivery(deliveryId),
+          );
+          assert.deepStrictEqual(
+            runs.map(({ stage, outcome, runId }) => ({ stage, outcome, runId })),
+            [{ stage: "plan", outcome: null, runId: retryRun }],
+          );
+        }),
+      { type: "invalid", problems: ["No fenced block."] },
     ),
   );
 });
