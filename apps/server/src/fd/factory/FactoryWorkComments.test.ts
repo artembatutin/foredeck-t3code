@@ -768,19 +768,50 @@ describe("Work comments on a delivery's transitions", () => {
       ),
     );
 
-    it.effect("is not posted when its item's bounded comments may leave it out", () =>
+    it.effect(
+      "is kept, neither posted nor dropped, while its item's bounded comments may leave it out",
+      () =>
+        withWorld((world) =>
+          Effect.gen(function* () {
+            const first = authoringOf("first");
+            world.truncated = true;
+            yield* diedPosting(first, [deleted]);
+
+            // Every boot looks again while a read cannot tell.
+            for (const reads of [1, 2]) {
+              yield* boot(world, Effect.void);
+              assert.deepStrictEqual(world.posts, []);
+              assert.strictEqual(world.reads, reads);
+              assert.strictEqual((yield* unfinished).length, 1);
+            }
+            assert.include(
+              world.warnings,
+              "factory cannot tell whether an unfinished Work comment reached its item; it stays unfinished",
+            );
+
+            // Once a read can show it missing, it is posted, once.
+            world.truncated = false;
+            yield* boot(world, Effect.void);
+            yield* boot(world, Effect.void);
+            assert.deepStrictEqual(
+              world.posts.map(({ input }) => input.body),
+              [`${deleted} ${referenceOf(first.id, 1)}`],
+            );
+            assert.deepStrictEqual(yield* unfinished, []);
+          }),
+        ),
+    );
+
+    it.effect("is finished when its item's bounded comments show it", () =>
       withWorld((world) =>
         Effect.gen(function* () {
           const first = authoringOf("first");
           world.truncated = true;
+          world.source.push(`${deleted} ${referenceOf(first.id, 1)}`);
           yield* diedPosting(first, [deleted]);
 
           yield* boot(world, Effect.void);
           assert.deepStrictEqual(world.posts, []);
-          assert.include(
-            world.warnings,
-            "factory cannot tell whether an unfinished Work comment reached its item, so it is not posted again",
-          );
           assert.deepStrictEqual(yield* unfinished, []);
         }),
       ),

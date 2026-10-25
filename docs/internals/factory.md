@@ -310,6 +310,7 @@ have reached the source. Every posted comment therefore ends with a reference na
 and number, and the sweep posts such a comment only when its item's comments do not show that
 reference. The reference also tells a later block apart from an earlier one with the same text.
 Work reads at most 50 comments of an item and does not say which it left out (Markdown sources keep
-the oldest), so when it cut the list and the reference is not in it, the comment is not posted again
-and a warning is logged. That is the one case where a transition's comment can still be missing
-([`FactoryWorkComments.ts`](../../apps/server/src/fd/factory/FactoryWorkComments.ts)).
+the oldest), so a cut list without the reference cannot tell. The comment then stays unfinished,
+with a warning, and every boot reads the item again: it is neither posted on a guess, which could
+post it twice, nor dropped. Settling that case needs Work to look a comment up by key, which it does
+not offer ([`FactoryWorkComments.ts`](../../apps/server/src/fd/factory/FactoryWorkComments.ts)).

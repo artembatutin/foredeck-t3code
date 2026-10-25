@@ -28,9 +28,10 @@ export class FactoryWorkComments extends Context.Service<
      * Claims the comment and posts it when this call claimed it; its delivery, status and
      * transition number make its `clientRequestId`, and its posted text ends with its reference.
      * A comment another process claimed and never finished (it died mid-post) is looked for on
-     * the item by that reference instead, and posted only when the item shows it missing. Nothing
-     * interrupts it from the claim to the finish, so a stopping server finishes a post it began. A
-     * finished comment is never posted again.
+     * the item by that reference instead: finished when the item shows it, posted when the item
+     * shows it missing, and kept unfinished, for the next boot to look again, when the read cannot
+     * tell. Nothing interrupts it from the claim to the finish, so a stopping server finishes a
+     * post it began. A finished comment is never posted again.
      */
     readonly post: (input: {
       readonly itemRef: WorkItemRef;
@@ -97,7 +98,11 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  /** Posts the unfinished comment if its item shows it missing; a read that fails leaves it. */
+  /**
+   * Finishes the unfinished comment if its item shows it, and posts it if its item shows it
+   * missing. A read that fails or cannot tell leaves it unfinished: neither posted on a guess,
+   * which could post it twice, nor dropped.
+   */
   const reconcile = (
     itemRef: WorkItemRef,
     comment: FactoryWorkCommentStore.StoredFactoryWorkComment,
@@ -119,8 +124,8 @@ const make = Effect.gen(function* () {
             return send(itemRef, comment).pipe(Effect.andThen(store.finish(comment)));
           case "unknown":
             return Effect.logWarning(
-              "factory cannot tell whether an unfinished Work comment reached its item, so it is not posted again",
-            ).pipe(Effect.andThen(store.finish(comment)));
+              "factory cannot tell whether an unfinished Work comment reached its item; it stays unfinished",
+            );
           case "unread":
             return Effect.void;
         }
@@ -144,7 +149,11 @@ const make = Effect.gen(function* () {
           Effect.logWarning("factory could not record a Work comment's progress", error),
       }),
       Effect.uninterruptible,
-      Effect.annotateLogs({ deliveryId: comment.deliveryId, status: comment.status }),
+      Effect.annotateLogs({
+        deliveryId: comment.deliveryId,
+        status: comment.status,
+        transition: comment.transition,
+      }),
     );
 
   return FactoryWorkComments.of({ post });
