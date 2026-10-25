@@ -307,7 +307,7 @@ describe("factory_status by delivery", () => {
 
       const result = resultOf(yield* status(readOnlyClient, { delivery: "delivery-reviewed" }));
 
-      assert.deepStrictEqual(result, { delivery: toFactoryDelivery(stored) });
+      assert.deepStrictEqual(result, { delivery: toFactoryDelivery({ ...stored, stageRuns: [] }) });
       assert.deepInclude(result.delivery as object, {
         status: "blocked",
         stage: { name: "review", kind: "agent" },
@@ -355,7 +355,10 @@ describe("factory_status by item", () => {
       );
       const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
       const expected = yield* store.listByItem(markdownItem);
-      assert.deepStrictEqual(result.deliveries, expected.toReversed().map(toFactoryDelivery));
+      assert.deepStrictEqual(
+        result.deliveries,
+        expected.toReversed().map((stored) => toFactoryDelivery({ ...stored, stageRuns: [] })),
+      );
     }).pipe(Effect.provide(layer)),
   );
 

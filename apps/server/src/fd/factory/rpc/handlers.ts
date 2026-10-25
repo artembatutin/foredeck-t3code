@@ -12,7 +12,6 @@ import { RpcInstrumentation } from "../../../observability/RpcInstrumentation.ts
 import * as ServerRuntimeStartup from "../../../serverRuntimeStartup.ts";
 import * as FactoryService from "../FactoryService.ts";
 import * as FactorySettings from "../FactorySettings.ts";
-import type * as FactoryDeliveryStore from "../persistence/FactoryDeliveryStore.ts";
 import { toFactoryDelivery } from "../snapshot.ts";
 import { type FactoryServiceError, toFactoryError } from "../wireError.ts";
 
@@ -31,7 +30,7 @@ type FactoryHandlers = RpcGroup.HandlersFrom<RpcGroup.Rpcs<typeof FactoryServerR
 export const WS_METHOD_TAGS = Object.values(FACTORY_WS_METHODS);
 
 const snapshot = (
-  effect: Effect.Effect<FactoryDeliveryStore.StoredFactoryDelivery, FactoryServiceError>,
+  effect: Effect.Effect<FactoryService.FactoryDeliveryWithRuns, FactoryServiceError>,
 ) => effect.pipe(Effect.map(toFactoryDelivery), Effect.mapError(toFactoryError));
 
 const forDelivery = <A, E>(deliveryId: FactoryDeliveryId, effect: Effect.Effect<A, E>) =>
@@ -50,7 +49,7 @@ export const wsHandlers = (input: {
   // Direct WebSocket calls are not gated on command readiness, so delivery controls, which run
   // and interrupt threads, queue like core's commands.
   const command = (
-    effect: Effect.Effect<FactoryDeliveryStore.StoredFactoryDelivery, FactoryServiceError>,
+    effect: Effect.Effect<FactoryService.FactoryDeliveryWithRuns, FactoryServiceError>,
   ) => snapshot(startup.enqueueCommand(effect));
   return {
     [FACTORY_WS_METHODS.factorySettingsGet]: ({ projectId }) =>

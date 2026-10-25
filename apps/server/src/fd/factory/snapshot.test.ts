@@ -9,7 +9,7 @@ import {
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
 import * as Schema from "effect/Schema";
 
-import type { StoredFactoryDelivery } from "./persistence/FactoryDeliveryStore.ts";
+import type { FactoryDeliveryWithRuns } from "./FactoryService.ts";
 import {
   type FactoryBlock,
   type FactoryDeliveryState,
@@ -66,12 +66,13 @@ const running: FactoryDeliveryState = {
   effectsIssued: 1,
 };
 
-const stored = (state: FactoryDeliveryState): StoredFactoryDelivery => ({
+const stored = (state: FactoryDeliveryState): FactoryDeliveryWithRuns => ({
   deliveryId,
   projectId,
   itemRef,
   parentId: null,
   state,
+  stageRuns: [],
   createdAt: "2026-10-24T09:00:00.000Z",
   updatedAt: "2026-10-24T10:06:00.000Z",
 });
@@ -96,6 +97,7 @@ describe("toFactoryDelivery", () => {
       threads: { author },
       receipts: [],
       reviews: [],
+      stageRuns: [],
       createdAt: "2026-10-24T09:00:00.000Z",
       updatedAt: "2026-10-24T10:06:00.000Z",
     });

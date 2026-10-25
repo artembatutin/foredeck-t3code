@@ -1,5 +1,9 @@
 import { IsoDateTime, PositiveInt, RunId, ThreadId } from "@t3tools/contracts";
-import { FactoryDeliveryId, FactoryStageName } from "@t3tools/contracts/fd/factory";
+import {
+  FactoryDeliveryId,
+  FactoryStageName,
+  FactoryStageOutcome,
+} from "@t3tools/contracts/fd/factory";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -10,10 +14,6 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlSchema from "effect/sql/SqlSchema";
 
 import { FactoryStoreError } from "./errors.ts";
-
-/** How a stage attempt ended. */
-export const FactoryStageOutcome = Schema.Literals(["passed", "failed", "blocked", "cancelled"]);
-export type FactoryStageOutcome = typeof FactoryStageOutcome.Type;
 
 /** One attempt of one stage of a delivery. It is active until it has an outcome. */
 export const StoredFactoryStageRun = Schema.Struct({
@@ -76,6 +76,16 @@ export class FactoryStageRunStore extends Context.Service<
     readonly listByDelivery: (
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<ReadonlyArray<StoredFactoryStageRun>, FactoryStoreError>;
+    /**
+     * Every attempt of these deliveries in one read, each delivery's in the order they started;
+     * a delivery without attempts has none.
+     */
+    readonly listByDeliveries: (
+      deliveryIds: ReadonlyArray<FactoryDeliveryId>,
+    ) => Effect.Effect<
+      ReadonlyMap<FactoryDeliveryId, ReadonlyArray<StoredFactoryStageRun>>,
+      FactoryStoreError
+    >;
   }
 >()("t3/fd/factory/persistence/FactoryStageRunStore") {}
 
@@ -88,6 +98,7 @@ const make = Effect.gen(function* () {
   const selectRuns = SqlSchema.findAll({
     Request: Schema.Struct({
       deliveryId: Schema.optional(FactoryDeliveryId),
+      deliveryIds: Schema.optional(Schema.Array(FactoryDeliveryId)),
       stage: Schema.optional(FactoryStageName),
       attempt: Schema.optional(PositiveInt),
       threadId: Schema.optional(ThreadId),
@@ -109,6 +120,12 @@ const make = Effect.gen(function* () {
       FROM fd_factory_stage_runs
       WHERE ${sql.and([
         ...(request.deliveryId === undefined ? [] : [sql`delivery_id = ${request.deliveryId}`]),
+        // One bound parameter however many deliveries, within SQLite's parameter limit.
+        ...(request.deliveryIds === undefined
+          ? []
+          : [
+              sql`delivery_id IN (SELECT value FROM json_each(${JSON.stringify(request.deliveryIds)}))`,
+            ]),
         ...(request.stage === undefined ? [] : [sql`stage = ${request.stage}`]),
         ...(request.attempt === undefined ? [] : [sql`attempt = ${request.attempt}`]),
         ...(request.threadId === undefined ? [] : [sql`thread_id = ${request.threadId}`]),
@@ -245,6 +262,19 @@ const make = Effect.gen(function* () {
     listByDelivery: (deliveryId) =>
       selectRuns({ deliveryId }).pipe(
         Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.listByDelivery")),
+      ),
+    listByDeliveries: (deliveryIds) =>
+      (deliveryIds.length === 0 ? Effect.succeed([]) : selectRuns({ deliveryIds })).pipe(
+        Effect.map((rows) => {
+          const byDelivery = new Map<FactoryDeliveryId, Array<StoredFactoryStageRun>>();
+          for (const row of rows) {
+            const runs = byDelivery.get(row.deliveryId);
+            if (runs === undefined) byDelivery.set(row.deliveryId, [row]);
+            else runs.push(row);
+          }
+          return byDelivery;
+        }),
+        Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.listByDeliveries")),
       ),
   });
 });

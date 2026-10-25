@@ -36,6 +36,7 @@ import { readSettle } from "./git/settleCheck.ts";
 import { readWorktreeState } from "./git/worktreeState.ts";
 import { FactoryStoreError } from "./persistence/errors.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
+import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 import {
   acceptedReview,
@@ -175,7 +176,16 @@ export type FactoryStartError =
   | FactoryDeliveryStore.FactoryDeliveryActive
   | FactoryStoreError;
 
-/** Factory's deliveries for transports, MCP tools and scheduled tasks. */
+/** A stored delivery with every stage attempt it made, in the order they started. */
+export type FactoryDeliveryWithRuns = FactoryDeliveryStore.StoredFactoryDelivery & {
+  readonly stageRuns: ReadonlyArray<FactoryStageRunStore.StoredFactoryStageRun>;
+};
+
+/**
+ * Factory's deliveries for transports, MCP tools and scheduled tasks. Each delivery it returns
+ * carries its stage attempts, read after its step is stored: a read that fails fails the call,
+ * though the step stands and the change epoch has moved for it.
+ */
 export class FactoryService extends Context.Service<
   FactoryService,
   {
@@ -196,20 +206,17 @@ export class FactoryService extends Context.Service<
     readonly start: (input: {
       readonly itemRef: WorkItemRef;
       readonly runtimeModeCeiling?: RuntimeMode;
-    }) => Effect.Effect<FactoryDeliveryStore.StoredFactoryDelivery, FactoryStartError>;
+    }) => Effect.Effect<FactoryDeliveryWithRuns, FactoryStartError>;
     readonly get: (
       deliveryId: FactoryDeliveryId,
-    ) => Effect.Effect<
-      Option.Option<FactoryDeliveryStore.StoredFactoryDelivery>,
-      FactoryStoreError
-    >;
-    /** Every delivery, or one project's, whatever its status, newest first. */
+    ) => Effect.Effect<Option.Option<FactoryDeliveryWithRuns>, FactoryStoreError>;
+    /**
+     * Every delivery, or one project's, whatever its status, newest first. Their attempts are
+     * one read, however many deliveries there are.
+     */
     readonly list: (input: {
       readonly projectId?: ProjectId;
-    }) => Effect.Effect<
-      ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>,
-      FactoryStoreError
-    >;
+    }) => Effect.Effect<ReadonlyArray<FactoryDeliveryWithRuns>, FactoryStoreError>;
     /**
      * The item in Work's canonical spelling, which deliveries are stored under, and every
      * delivery of it, whatever its status, newest first. An item without deliveries has none,
@@ -218,7 +225,7 @@ export class FactoryService extends Context.Service<
     readonly listByItem: (itemRef: WorkItemRef) => Effect.Effect<
       {
         readonly itemRef: WorkItemRef;
-        readonly deliveries: ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>;
+        readonly deliveries: ReadonlyArray<FactoryDeliveryWithRuns>;
       },
       WorkDomainError | FactoryStoreError
     >;
@@ -232,7 +239,7 @@ export class FactoryService extends Context.Service<
     readonly stop: (
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<
-      FactoryDeliveryStore.StoredFactoryDelivery,
+      FactoryDeliveryWithRuns,
       FactoryStopRefusedError | FactoryDeliveryNotFoundError | FactoryStoreError
     >;
     /**
@@ -253,7 +260,7 @@ export class FactoryService extends Context.Service<
     readonly resume: (
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<
-      FactoryDeliveryStore.StoredFactoryDelivery,
+      FactoryDeliveryWithRuns,
       | FactoryResumeRefusedError
       | FactoryDeliveryNotFoundError
       | FactoryStoreError
@@ -268,7 +275,7 @@ export class FactoryService extends Context.Service<
     readonly cancel: (
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<
-      FactoryDeliveryStore.StoredFactoryDelivery,
+      FactoryDeliveryWithRuns,
       FactoryCancelRefusedError | FactoryDeliveryNotFoundError | FactoryStoreError
     >;
     /**
@@ -308,6 +315,7 @@ const make = Effect.gen(function* () {
   const launches = yield* ThreadLaunch.ThreadLaunchService;
   const settings = yield* FactorySettings.FactorySettings;
   const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+  const stageRuns = yield* FactoryStageRunStore.FactoryStageRunStore;
   const tasks = yield* FactoryTaskStore.FactoryTaskStore;
   const worker = yield* FactoryWorker.FactoryWorker;
   const reviews = yield* FactoryReview.FactoryReview;
@@ -318,6 +326,22 @@ const make = Effect.gen(function* () {
   // Starts of one item, by its canonical spelling. One server owns a T3 home, so an in-process
   // lock is enough, as for Work's thread starts.
   const itemLocks = yield* KeyedLock.make<string>();
+
+  const withRuns = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
+    stageRuns
+      .listByDelivery(delivery.deliveryId)
+      .pipe(Effect.map((runs) => ({ ...delivery, stageRuns: runs })));
+
+  /** The deliveries with their attempts, in one read of the attempts however many there are. */
+  const allWithRuns = (stored: ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>) =>
+    stageRuns.listByDeliveries(stored.map(({ deliveryId }) => deliveryId)).pipe(
+      Effect.map((runs) =>
+        stored.map((delivery) => ({
+          ...delivery,
+          stageRuns: runs.get(delivery.deliveryId) ?? [],
+        })),
+      ),
+    );
 
   const start: FactoryService["Service"]["start"] = Effect.fn("FactoryService.start")(
     function* (input) {
@@ -395,7 +419,7 @@ const make = Effect.gen(function* () {
       }).pipe((locked) => itemLocks.withLock(workItemRefString(itemRef), locked));
       // A storage failure here leaves the delivery queued with nothing launched.
       const started = yield* worker.step(queued.deliveryId, { type: "start" });
-      return Option.getOrElse(started, () => queued);
+      return yield* withRuns(Option.getOrElse(started, () => queued));
     },
   );
 
@@ -467,7 +491,7 @@ const make = Effect.gen(function* () {
           : Effect.fail(new FactoryStopRefusedError({ deliveryId, status: state.status })),
       );
       if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
-      return stepped.value.delivery;
+      return yield* withRuns(stepped.value.delivery);
     },
   );
 
@@ -539,7 +563,7 @@ const make = Effect.gen(function* () {
         }),
       );
       if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
-      return stepped.value.delivery;
+      return yield* withRuns(stepped.value.delivery);
     },
   );
 
@@ -551,18 +575,25 @@ const make = Effect.gen(function* () {
           : Effect.succeed({ event: { type: "cancel" } as const, value: undefined }),
       );
       if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
-      return stepped.value.delivery;
+      return yield* withRuns(stepped.value.delivery);
     },
   );
 
   return FactoryService.of({
     start,
-    get: deliveries.get,
-    list: deliveries.list,
+    get: (deliveryId) =>
+      deliveries
+        .get(deliveryId)
+        .pipe(
+          Effect.flatMap((found) =>
+            Option.isNone(found) ? Effect.succeedNone : Effect.asSome(withRuns(found.value)),
+          ),
+        ),
+    list: (input) => deliveries.list(input).pipe(Effect.flatMap(allWithRuns)),
     listByItem: (input) =>
       Effect.gen(function* () {
         const itemRef = yield* work.canonicalRef(input);
-        return { itemRef, deliveries: yield* deliveries.list({ itemRef }) };
+        return { itemRef, deliveries: yield* allWithRuns(yield* deliveries.list({ itemRef })) };
       }),
     stop,
     resume,

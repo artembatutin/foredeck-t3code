@@ -322,6 +322,22 @@ const snapshot = {
   threads: { author: "thread-author", reviewer: "thread-reviewer" },
   receipts: [receiptSummary],
   reviews: [reviewSummary],
+  stageRuns: [
+    {
+      stage: "verify",
+      attempt: 1,
+      outcome: "passed",
+      startedAt: "2026-10-23T09:00:00.000Z",
+      finishedAt: "2026-10-23T09:01:00.000Z",
+    },
+    {
+      stage: "review",
+      attempt: 2,
+      outcome: null,
+      threadId: "thread-reviewer",
+      startedAt: "2026-10-23T09:02:00.000Z",
+    },
+  ],
   needsYou: "Review found the same high finding twice on an unchanged tree.",
   createdAt: "2026-10-23T08:59:00.000Z",
   updatedAt: "2026-10-23T09:05:00.000Z",
@@ -385,7 +401,7 @@ describe("FactoryDelivery", () => {
       updatedAt: snapshot.createdAt,
     };
     const decoded = decode(minimal);
-    expect(decoded).toEqual(minimal);
+    expect(decoded).toEqual({ ...minimal, stageRuns: [] });
     expect(decoded.stage).toBeUndefined();
     expect(decoded.needsYou).toBeUndefined();
   });

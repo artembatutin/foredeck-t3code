@@ -1,9 +1,9 @@
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
-  ForwardCompatibleArray,
   IsoDateTime,
   NonNegativeInt,
   PositiveInt,
@@ -61,6 +61,7 @@ const FACTORY_STAGE_NAMES = [
   "follow_through",
 ] as const;
 const FACTORY_STAGE_KINDS = ["agent", "command", "gate", "integrate", "pr"] as const;
+const FACTORY_STAGE_OUTCOMES = ["passed", "failed", "blocked", "cancelled"] as const;
 
 export const FactoryDeliveryStatus = Schema.Literals(FACTORY_DELIVERY_STATUSES);
 export type FactoryDeliveryStatus = typeof FactoryDeliveryStatus.Type;
@@ -70,6 +71,10 @@ export type FactoryStageName = typeof FactoryStageName.Type;
 
 export const FactoryStageKind = Schema.Literals(FACTORY_STAGE_KINDS);
 export type FactoryStageKind = typeof FactoryStageKind.Type;
+
+/** How a stage attempt ended. */
+export const FactoryStageOutcome = Schema.Literals(FACTORY_STAGE_OUTCOMES);
+export type FactoryStageOutcome = typeof FactoryStageOutcome.Type;
 
 /** The roles a delivery runs threads for. */
 export const FactoryRole = Schema.Literals(["planner", "author", "reviewer"]);
@@ -298,16 +303,60 @@ const literalsOr = <const L extends ReadonlyArray<string>>(literals: L, fallback
   );
 };
 
+/**
+ * A server→client list a newer server may send entries of that this build cannot read: each
+ * entry is decoded and encoded on its own, and one that fails is left out. Plain values on the
+ * wire, unlike `ForwardCompatibleArray`: an RPC result, or a list holding the delivery, first
+ * checks the raw value against its schema's encoded form, which keeps each entry's checks but not
+ * that array's fallback, so one unreadable receipt, review or attempt would fail the whole
+ * delivery or response.
+ */
+const ForwardCompatibleList = <A, I>(entry: Schema.Codec<A, I>) => {
+  const decodeEntry = Schema.decodeUnknownOption(entry);
+  const encodeEntry = Schema.encodeOption(entry);
+  return Schema.Array(Schema.Unknown).pipe(
+    Schema.decodeTo(
+      Schema.Array(Schema.toType(entry)),
+      SchemaTransformation.transform<ReadonlyArray<A>, ReadonlyArray<unknown>>({
+        decode: (values) => values.flatMap((value) => Option.toArray(decodeEntry(value))),
+        encode: (entries) => entries.flatMap((value) => Option.toArray(encodeEntry(value))),
+      }),
+    ),
+  );
+};
+
 const FactoryDeliveryStage = Schema.Struct({
   name: literalsOr([...FACTORY_STAGE_NAMES, "unknown"], "unknown"),
   kind: literalsOr([...FACTORY_STAGE_KINDS, "unknown"], "unknown"),
 });
 
+/** A snapshot carries at most this many stage attempts: the delivery's newest. */
+export const FACTORY_SNAPSHOT_STAGE_RUNS_MAX = 50;
+
 /**
- * A delivery as clients see it; receipts and reviews are summaries, never logs. From a newer
- * server, a status, stage name or stage kind this build does not know decodes as `unknown`
- * (show it read-only, offer no controls), unknown fields are dropped, and a receipt or review
- * summary this build cannot read is left out instead of failing the snapshot.
+ * One attempt of one stage as clients see it: never its evidence path, failure fingerprint or
+ * log. From a newer server, a stage or outcome this build does not know decodes as `unknown`.
+ */
+export const FactoryStageRunSummary = Schema.Struct({
+  stage: literalsOr([...FACTORY_STAGE_NAMES, "unknown"], "unknown"),
+  /** 1-based, counted per stage of the delivery. */
+  attempt: PositiveInt,
+  /** Null while the attempt is active. */
+  outcome: Schema.NullOr(literalsOr([...FACTORY_STAGE_OUTCOMES, "unknown"], "unknown")),
+  /** The thread doing the attempt's work, for agent stages once it is launched. */
+  threadId: Schema.optionalKey(ThreadId),
+  startedAt: IsoDateTime,
+  /** Absent while the attempt is active. */
+  finishedAt: Schema.optionalKey(IsoDateTime),
+});
+export type FactoryStageRunSummary = typeof FactoryStageRunSummary.Type;
+
+/**
+ * A delivery as clients see it; receipts, reviews and stage attempts are summaries, never logs.
+ * From a newer server, a status, stage name, stage kind or attempt outcome this build does not
+ * know decodes as `unknown` (show it read-only, offer no controls), unknown fields are dropped,
+ * and a receipt, review summary or attempt this build cannot read is left out instead of failing
+ * the snapshot.
  */
 export const FactoryDelivery = Schema.Struct({
   deliveryId: FactoryDeliveryId,
@@ -330,8 +379,15 @@ export const FactoryDelivery = Schema.Struct({
     author: Schema.optionalKey(ThreadId),
     reviewer: Schema.optionalKey(ThreadId),
   }),
-  receipts: ForwardCompatibleArray(FactoryVerifyReceiptSummary),
-  reviews: ForwardCompatibleArray(FactoryReviewSummary),
+  receipts: ForwardCompatibleList(FactoryVerifyReceiptSummary),
+  reviews: ForwardCompatibleList(FactoryReviewSummary),
+  /**
+   * The newest stage attempts, at most `FACTORY_SNAPSHOT_STAGE_RUNS_MAX`, in the order they
+   * started. Older servers send none.
+   */
+  stageRuns: ForwardCompatibleList(FactoryStageRunSummary).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   /** Why the delivery waits on the owner, at a gate or blocked; absent when it does not. */
   needsYou: Schema.optionalKey(Schema.String),
   createdAt: IsoDateTime,
@@ -369,7 +425,7 @@ export type FactoryDeliveryListInput = typeof FactoryDeliveryListInput.Type;
 
 /** Newest first. A delivery this build cannot read is left out instead of failing the list. */
 export const FactoryDeliveryList = Schema.Struct({
-  deliveries: ForwardCompatibleArray(FactoryDelivery),
+  deliveries: ForwardCompatibleList(FactoryDelivery),
 });
 export type FactoryDeliveryList = typeof FactoryDeliveryList.Type;
 

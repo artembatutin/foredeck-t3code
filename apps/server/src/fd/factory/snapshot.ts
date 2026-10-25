@@ -1,13 +1,16 @@
 import type { ThreadId } from "@t3tools/contracts";
-import type {
-  FactoryDelivery,
-  FactoryStageKind,
-  FactoryStageName,
-  FactoryVerifyReceipt,
-  FactoryVerifyReceiptSummary,
+import {
+  FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
+  type FactoryDelivery,
+  type FactoryStageKind,
+  type FactoryStageName,
+  type FactoryStageRunSummary,
+  type FactoryVerifyReceipt,
+  type FactoryVerifyReceiptSummary,
 } from "@t3tools/contracts/fd/factory";
 
-import type { StoredFactoryDelivery } from "./persistence/FactoryDeliveryStore.ts";
+import type { FactoryDeliveryWithRuns } from "./FactoryService.ts";
+import type { StoredFactoryStageRun } from "./persistence/FactoryStageRunStore.ts";
 import { standardStages } from "./pipeline/definitions.ts";
 import type {
   FactoryBlock,
@@ -29,6 +32,16 @@ const receiptSummary = (receipt: FactoryVerifyReceipt): FactoryVerifyReceiptSumm
   code: receipt.code,
   timedOut: receipt.timedOut,
   durationMs: receipt.durationMs,
+});
+
+/** An attempt without its run id, evidence path or failure fingerprint. */
+const stageRunSummary = (run: StoredFactoryStageRun): FactoryStageRunSummary => ({
+  stage: run.stage,
+  attempt: run.attempt,
+  outcome: run.outcome,
+  ...(run.threadId === null ? {} : { threadId: run.threadId }),
+  startedAt: run.startedAt,
+  ...(run.finishedAt === null ? {} : { finishedAt: run.finishedAt }),
 });
 
 const NEEDS_YOU_MAX_LENGTH = 280;
@@ -124,10 +137,11 @@ export const needsYou = (state: FactoryDeliveryState): string | undefined => {
 };
 
 /**
- * A delivery as clients see it: its progress, threads and the summaries of its receipts and
- * reviews, never their logs or evidence paths. `needsYou` is set only while it is blocked.
+ * A delivery as clients see it: its progress, threads and the summaries of its receipts, reviews
+ * and newest stage attempts, never their logs or evidence paths. `needsYou` is set only while it
+ * is blocked.
  */
-export const toFactoryDelivery = (delivery: StoredFactoryDelivery): FactoryDelivery => {
+export const toFactoryDelivery = (delivery: FactoryDeliveryWithRuns): FactoryDelivery => {
   const { state } = delivery;
   const reason = needsYou(state);
   return {
@@ -145,6 +159,8 @@ export const toFactoryDelivery = (delivery: StoredFactoryDelivery): FactoryDeliv
     threads: state.threads,
     receipts: state.receipts.map(receiptSummary),
     reviews: state.reviews.map((review) => review.summary),
+    // Attempts are appended in start order, so the newest are the last.
+    stageRuns: delivery.stageRuns.slice(-FACTORY_SNAPSHOT_STAGE_RUNS_MAX).map(stageRunSummary),
     ...(reason === undefined ? {} : { needsYou: reason }),
     createdAt: delivery.createdAt,
     updatedAt: delivery.updatedAt,

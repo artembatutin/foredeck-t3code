@@ -38,6 +38,7 @@ import * as FactoryWorkComments from "./FactoryWorkComments.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
+import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import type { FactoryEffect } from "./pipeline/state.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 
@@ -534,7 +535,16 @@ describe("FactoryService.get", () => {
         const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
         const known = yield* get(started.deliveryId);
         assert.strictEqual(Option.getOrThrow(known).deliveryId, started.deliveryId);
-        assert.deepStrictEqual(known, yield* store.get(started.deliveryId));
+        const stageRuns = yield* Effect.flatMap(FactoryStageRunStore.FactoryStageRunStore, (runs) =>
+          runs.listByDelivery(started.deliveryId),
+        );
+        assert.deepStrictEqual(
+          known,
+          Option.map(yield* store.get(started.deliveryId), (delivery) => ({
+            ...delivery,
+            stageRuns,
+          })),
+        );
         assert.isTrue(Option.isNone(yield* get(FactoryDeliveryId.make("delivery-unknown"))));
       }),
     ),

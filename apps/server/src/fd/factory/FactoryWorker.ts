@@ -1,5 +1,9 @@
 import type { RunId, ThreadId } from "@t3tools/contracts";
-import { type FactoryDeliveryId, FactoryStageName } from "@t3tools/contracts/fd/factory";
+import {
+  type FactoryDeliveryId,
+  FactoryStageName,
+  type FactoryStageOutcome,
+} from "@t3tools/contracts/fd/factory";
 import { type DrainableWorker, makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Cause from "effect/Cause";
@@ -170,7 +174,7 @@ const failureDetail = (effect: FactoryEffect, cause: Cause.Cause<unknown>) => {
 };
 
 /** How an attempt ends when its delivery stops running in `state`. */
-const outcomeOf = (state: FactoryDeliveryState): FactoryStageRunStore.FactoryStageOutcome => {
+const outcomeOf = (state: FactoryDeliveryState): FactoryStageOutcome => {
   if (state.status === "blocked") {
     // The stage did its work and judged the commit wanting; any other block is not a verdict.
     const reason = state.block?.reason;
