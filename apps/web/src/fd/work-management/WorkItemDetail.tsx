@@ -60,7 +60,11 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { buildThreadRouteParams } from "../../threadRoutes";
 import { LinkThreadDialog } from "./LinkThreadDialog";
 import { STATUS_LABELS, WorkStatusBadge } from "./shared";
-import { StartWorkThreadDialog, type StartWorkThreadTarget } from "./StartWorkThreadDialog";
+import {
+  type StartWorkThreadAction,
+  StartWorkThreadDialog,
+  type StartWorkThreadTarget,
+} from "./StartWorkThreadDialog";
 import { useWorkWritable, workCommands, workEnvironment } from "./state";
 import { WorkItemFieldControls, WorkRelationshipEditor } from "./WorkItemFields";
 
@@ -74,18 +78,23 @@ export type WorkItemSection = ComponentType<{
   readonly item: WorkItemDetailValue;
 }>;
 
-/** The inline detail of one Work item: everything an owner can do with it. */
+/**
+ * The inline detail of one Work item: everything an owner can do with it. `startAction` joins
+ * the start dialog's actions.
+ */
 export function WorkItemDetail({
   environmentId,
   projectId,
   itemRef,
   itemSection,
+  startAction,
   onClose,
 }: {
   environmentId: EnvironmentId;
   projectId: ProjectId;
   itemRef: WorkItemRef;
   itemSection?: WorkItemSection | undefined;
+  startAction?: StartWorkThreadAction | undefined;
   onClose: () => void;
 }) {
   const query = useEnvironmentQuery(
@@ -122,6 +131,7 @@ export function WorkItemDetail({
       projectId={projectId}
       item={item}
       itemSection={itemSection}
+      startAction={startAction}
       refreshing={query.isPending}
       onRefresh={query.refresh}
       onFullRefresh={fullRefresh}
@@ -135,6 +145,7 @@ function LoadedWorkItem({
   projectId,
   item,
   itemSection: ItemSection,
+  startAction,
   refreshing,
   onRefresh,
   onFullRefresh,
@@ -144,6 +155,7 @@ function LoadedWorkItem({
   projectId: ProjectId;
   item: WorkItemDetailValue;
   itemSection: WorkItemSection | undefined;
+  startAction: StartWorkThreadAction | undefined;
   refreshing: boolean;
   onRefresh: () => void;
   onFullRefresh: () => void;
@@ -747,6 +759,7 @@ function LoadedWorkItem({
       </div>
       <StartWorkThreadDialog
         target={startTarget}
+        action={startAction}
         onOpenChange={(open) => (open ? undefined : setStartTarget(null))}
       />
       <LinkThreadDialog

@@ -71,6 +71,7 @@ import {
   workCommands,
   workEnvironment,
 } from "./state";
+import type { StartWorkThreadAction } from "./StartWorkThreadDialog";
 import { WorkItemDetail, type WorkItemSection } from "./WorkItemDetail";
 
 const PREFERENCES_KEY = "t3code:work-list-preferences";
@@ -108,14 +109,17 @@ export function validateWorkSearch(raw: Record<string, unknown>): WorkSearch {
 
 /**
  * The Work page: one project's items from all of its sources, with an inline detail. The route
- * may pass `itemSection` for the detail to render beside the item's linked threads.
+ * may pass `itemSection` for the detail to render beside the item's linked threads, and
+ * `startAction` for the item's start dialog to offer.
  */
 export function WorkRouteView({
   search,
   itemSection,
+  startAction,
 }: {
   search: WorkSearch;
   itemSection?: WorkItemSection;
+  startAction?: StartWorkThreadAction;
 }) {
   const navigate = useNavigate();
   const setSearch = useCallback(
@@ -517,6 +521,7 @@ export function WorkRouteView({
               projectId={selectedProject.id}
               itemRef={selectedRef}
               itemSection={itemSection}
+              startAction={startAction}
               onClose={() => setSearch({ item: undefined })}
             />
           </div>

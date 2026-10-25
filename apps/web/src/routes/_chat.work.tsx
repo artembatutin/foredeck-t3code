@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 
-import { FactoryItemSection } from "~/fd/factory";
+import { FactoryItemSection, FactoryStartDialogAction } from "~/fd/factory";
 import { validateWorkSearch, WorkRouteView } from "~/fd/work-management";
 
 export const Route = createFileRoute("/_chat/work")({
@@ -9,5 +9,11 @@ export const Route = createFileRoute("/_chat/work")({
 });
 
 function WorkRoute() {
-  return <WorkRouteView search={Route.useSearch()} itemSection={FactoryItemSection} />;
+  return (
+    <WorkRouteView
+      search={Route.useSearch()}
+      itemSection={FactoryItemSection}
+      startAction={FactoryStartDialogAction}
+    />
+  );
 }

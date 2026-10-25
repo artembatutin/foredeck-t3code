@@ -20,39 +20,9 @@ import type {
 } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import { formatDuration } from "@t3tools/shared/orchestrationTiming";
-import * as Cause from "effect/Cause";
-import * as Option from "effect/Option";
 
 import { buildThreadRouteParams } from "../../threadRoutes";
-
-/** Shown when a start is refused because the project has no verify command. */
-export const FACTORY_NOT_CONFIGURED_TEXT =
-  "Set a verify command in Project settings → Factory before delivering this item.";
-
-const FALLBACK_ERROR_TEXT = "Factory could not complete the request. Try again.";
-
-/**
- * The text a failed Factory command shows: fixed text naming the settings path for a missing
- * verify command, a Factory error's own fixed message otherwise (a newer server's unknown reasons
- * included), and the failure's message for anything else.
- */
-export function factoryErrorText(cause: Cause.Cause<unknown>): string {
-  const error = Option.getOrNull(Cause.findErrorOption(cause)) as {
-    readonly _tag?: unknown;
-    readonly reason?: unknown;
-    readonly message?: unknown;
-  } | null;
-  if (error !== null && typeof error === "object" && error._tag === "FactoryError") {
-    if (error.reason === "not_configured") return FACTORY_NOT_CONFIGURED_TEXT;
-    return typeof error.message === "string" && error.message.trim().length > 0
-      ? error.message
-      : FALLBACK_ERROR_TEXT;
-  }
-  const squashed = Cause.squash(cause);
-  return squashed instanceof Error && squashed.message.trim().length > 0
-    ? squashed.message
-    : FALLBACK_ERROR_TEXT;
-}
+import { deliveriesWithStarted, factoryDeliverable, type FactoryStartedDelivery } from "./deliver";
 
 /** Whether this session holds each command's grant where the destination serves Factory. */
 export interface FactoryItemPermissions {
@@ -145,17 +115,12 @@ const reviewLine = (review: FactoryReviewSummary): FactoryReviewLine => ({
   ...factoryReviewNotes(review),
 });
 
-const isActive = (delivery: FactoryDelivery) =>
-  delivery.status !== "done" && delivery.status !== "cancelled";
-
 /**
  * What a Work item's Factory section shows, or null when it shows nothing: on a server without
  * Factory, before the project's deliveries load, and for an item with no delivery the session
- * cannot start. Deliver is offered only when no delivery of the item is still open (one with a
- * status this build does not know counts as open). `started` is the delivery a start just
- * returned, counted until the list holds it, so Deliver is not offered again in between. Nothing
- * is offered while the environment is not connected, as during a reconnect's backoff, though the
- * deliveries read before still show.
+ * cannot start. Deliver follows `factoryDeliverable`, the rule every Deliver entry point shares.
+ * Nothing is offered while the environment is not connected, as during a reconnect's backoff,
+ * though the deliveries read before still show.
  */
 export function factoryItemSection(input: {
   readonly environmentId: EnvironmentId;
@@ -164,19 +129,15 @@ export function factoryItemSection(input: {
   readonly connected: boolean;
   /** The project's deliveries; null until they load. */
   readonly deliveries: ReadonlyArray<FactoryDelivery> | null;
-  readonly started: FactoryDelivery | null;
+  /** Every delivery a start in this session returned, counted until the list holds it. */
+  readonly started: ReadonlyArray<FactoryStartedDelivery>;
   readonly permitted: FactoryItemPermissions;
 }): FactoryItemSectionView | null {
-  if (!input.supported || input.deliveries === null) return null;
-  const { started } = input;
-  const deliveries =
-    started === null ||
-    input.deliveries.some((delivery) => delivery.deliveryId === started.deliveryId)
-      ? input.deliveries
-      : [started, ...input.deliveries];
+  const deliveries = deliveriesWithStarted(input);
+  if (!input.supported || deliveries === null) return null;
   const { connected, permitted } = input;
   const current = currentDelivery(deliveries, input.itemRef);
-  const deliver = connected && permitted.start && (current === undefined || !isActive(current));
+  const deliver = factoryDeliverable({ ...input, startPermitted: permitted.start });
   if (current === undefined) return deliver ? { deliver, delivery: null } : null;
 
   const controls = factoryControls(current);

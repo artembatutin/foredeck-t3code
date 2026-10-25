@@ -2,20 +2,16 @@ import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import {
   type FactoryDelivery,
   FactoryDeliveryId,
-  FactoryError,
   type FactoryReviewSummary,
   type FactoryVerifyReceiptSummary,
 } from "@t3tools/contracts/fd/factory";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
-import * as Cause from "effect/Cause";
-import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
+import { factoryDeliverable } from "./deliver";
 import {
   cancelConfirmationTarget,
-  FACTORY_NOT_CONFIGURED_TEXT,
   type FactoryItemPermissions,
-  factoryErrorText,
   factoryItemSection,
 } from "./itemSection";
 
@@ -41,8 +37,6 @@ const delivery = (id: string, overrides: Partial<FactoryDelivery> = {}): Factory
   ...overrides,
 });
 
-const decodeFactoryError = Schema.decodeUnknownSync(FactoryError);
-
 const ALLOWED: FactoryItemPermissions = { start: true, stop: true, resume: true, cancel: true };
 const DENIED: FactoryItemPermissions = { start: false, stop: false, resume: false, cancel: false };
 
@@ -55,7 +49,7 @@ const section = (
     supported: true,
     connected: true,
     deliveries: [],
-    started: null,
+    started: [],
     permitted: ALLOWED,
     ...overrides,
   });
@@ -127,7 +121,7 @@ describe("Deliver", () => {
   });
 
   it("counts a delivery the start returned until the list holds it", () => {
-    const started = delivery("d3", { status: "queued" });
+    const started = [{ environmentId, delivery: delivery("d3", { status: "queued" }) }];
     expect(section({ started })).toMatchObject({
       deliver: false,
       delivery: { deliveryId: "d3", label: "Queued" },
@@ -137,47 +131,39 @@ describe("Deliver", () => {
       section({ started, deliveries: [delivery("d3", { status: "cancelled" })] }),
     ).toMatchObject({ deliver: true, delivery: { deliveryId: "d3", label: "Cancelled" } });
   });
-});
 
-describe("factoryErrorText", () => {
-  const failure = (reason: FactoryError["reason"], message: string) =>
-    Cause.fail(new FactoryError({ reason, message }));
-
-  it("names Project settings → Factory when the project has no verify command", () => {
-    const text = factoryErrorText(
-      failure(
-        "not_configured",
-        "Set a verify command in the project's Factory settings before starting a delivery.",
-      ),
-    );
-    expect(text).toBe(FACTORY_NOT_CONFIGURED_TEXT);
-    expect(text).toContain("Project settings → Factory");
-  });
-
-  it("shows a Factory error's own fixed message for other reasons", () => {
-    const conflict = "This Work item already has a Factory delivery that is not done or cancelled.";
-    expect(factoryErrorText(failure("conflict", conflict))).toBe(conflict);
-    const refused = "Only a running delivery can stop after its step; this one is blocked.";
-    expect(factoryErrorText(failure("refused", refused))).toBe(refused);
-  });
-
-  it("shows the message of a reason this build does not know", () => {
-    const error = decodeFactoryError({
-      _tag: "FactoryError",
-      reason: "quota_exceeded",
-      message: "Factory has too many deliveries running.",
-    });
-    expect(error.reason).toBe("unavailable");
-    expect(factoryErrorText(Cause.fail(error))).toBe("Factory has too many deliveries running.");
-  });
-
-  it("falls back to fixed text when a failure carries no message", () => {
-    const fallback = "Factory could not complete the request. Try again.";
-    expect(factoryErrorText(failure("unavailable", "  "))).toBe(fallback);
-    expect(factoryErrorText(Cause.die("boom"))).toBe(fallback);
-    expect(factoryErrorText(Cause.fail(new Error("The connection closed.")))).toBe(
-      "The connection closed.",
-    );
+  it("follows the shared Deliver rule for the same inputs", () => {
+    const histories = [
+      null,
+      [],
+      [delivery("d1", { status: "running" })],
+      [delivery("d1", { status: "unknown" })],
+      [delivery("d1", { status: "done" }), delivery("d2", { status: "cancelled" })],
+    ];
+    const starts = [[], [{ environmentId, delivery: delivery("d9", { status: "queued" }) }]];
+    for (const supported of [true, false]) {
+      for (const connected of [true, false]) {
+        for (const start of [true, false]) {
+          for (const deliveries of histories) {
+            for (const started of starts) {
+              const permitted = { ...ALLOWED, start };
+              const inputs = { supported, connected, deliveries, started, permitted };
+              expect(section(inputs)?.deliver ?? false).toBe(
+                factoryDeliverable({
+                  environmentId,
+                  itemRef,
+                  supported,
+                  connected,
+                  startPermitted: start,
+                  deliveries,
+                  started,
+                }),
+              );
+            }
+          }
+        }
+      }
+    }
   });
 });
 

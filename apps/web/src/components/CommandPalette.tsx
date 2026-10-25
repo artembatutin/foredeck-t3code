@@ -208,6 +208,7 @@ import { Checkbox } from "./ui/checkbox";
 import { ProjectFavicon } from "./ProjectFavicon";
 import { ProjectFilePicker } from "./files/ProjectFilePicker";
 import { openLinkPullRequestDialog } from "./pullRequest/LinkPullRequestDialog";
+import { useFactoryPaletteActions } from "../fd/factory";
 import { workPaletteActions } from "../fd/work-management";
 import { ProjectContentSearchDialog } from "./search/ProjectContentSearchDialog";
 import { toggleThemeEditorForTheme } from "./settings/themeEditorStore";
@@ -659,6 +660,7 @@ function OpenCommandPaletteDialog(props: {
     select: (params) => resolveThreadRouteTarget(params),
   });
   const projects = useProjects();
+  const factoryPaletteActions = useFactoryPaletteActions();
   const referenceThreadRef =
     pathname === "/pull-requests"
       ? environments.some(
@@ -2239,6 +2241,7 @@ function OpenCommandPaletteDialog(props: {
       },
     }),
   );
+  actionItems.push(...factoryPaletteActions);
 
   actionItems.push({
     kind: "action",

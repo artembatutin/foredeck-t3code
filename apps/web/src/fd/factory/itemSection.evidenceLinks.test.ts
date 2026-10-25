@@ -90,7 +90,7 @@ const viewOf = (overrides: Partial<FactoryDelivery>) =>
         ...overrides,
       },
     ],
-    started: null,
+    started: [],
     permitted: { start: true, stop: true, resume: true, cancel: true },
   })?.delivery;
 

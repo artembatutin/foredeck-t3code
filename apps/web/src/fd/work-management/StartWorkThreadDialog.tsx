@@ -8,7 +8,7 @@ import type { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import type { WorkItemSummary, WorkThreadMode } from "@t3tools/contracts/fd/work-management";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { useNavigate } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { type ComponentType, useEffect, useMemo, useState } from "react";
 
 import { Button } from "../../components/ui/button";
 import {
@@ -43,11 +43,26 @@ export interface StartWorkThreadTarget {
   readonly openThreadId: ThreadId | null;
 }
 
+/**
+ * An action another feature adds to the dialog's footer. The route passes it in, so Work never
+ * imports the feature. `run` runs it under the dialog's pending state: null closes the dialog,
+ * a text keeps it open showing that text.
+ */
+export type StartWorkThreadAction = ComponentType<{
+  readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId;
+  readonly item: StartWorkThreadTarget["item"];
+  readonly disabled: boolean;
+  readonly run: (action: () => Promise<string | null>) => Promise<void>;
+}>;
+
 export function StartWorkThreadDialog({
   target,
+  action: Action,
   onOpenChange,
 }: {
   target: StartWorkThreadTarget | null;
+  action?: StartWorkThreadAction | undefined;
   onOpenChange: (open: boolean) => void;
 }) {
   const navigate = useNavigate();
@@ -119,6 +134,15 @@ export function StartWorkThreadDialog({
     setPending(false);
     if (result._tag === "Success") openThread(result.value.threadId);
     else setError(workCommandError(result));
+  };
+
+  const runAction = async (action: () => Promise<string | null>) => {
+    setPending(true);
+    setError(null);
+    const failure = await action();
+    setPending(false);
+    if (failure === null) onOpenChange(false);
+    else setError(failure);
   };
 
   const help = MODES.find((entry) => entry.value === mode)?.help;
@@ -202,6 +226,15 @@ export function StartWorkThreadDialog({
           >
             Cancel
           </Button>
+          {Action && target !== null ? (
+            <Action
+              environmentId={target.environmentId}
+              projectId={target.projectId}
+              item={target.item}
+              disabled={pending}
+              run={runAction}
+            />
+          ) : null}
           {target?.openThreadId ? (
             <>
               <Button

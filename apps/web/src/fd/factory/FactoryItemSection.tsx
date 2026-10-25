@@ -18,12 +18,11 @@ import {
 } from "../../components/ui/alert-dialog";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
-import { useConnectedEnvironmentIds } from "../../state/environments";
-import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { factoryErrorText } from "./deliver";
+import { useFactoryDeliverState, useFactoryStart, useReportOpenWorkItem } from "./hooks";
 import {
   cancelConfirmationTarget,
-  factoryErrorText,
   factoryItemSection,
   type FactoryReviewLine,
 } from "./itemSection";
@@ -37,7 +36,8 @@ interface FactoryItemSectionProps {
 
 /**
  * The Work item detail's Factory section: Deliver, and the item's current delivery with its
- * timeline and controls. Renders nothing on a server without Factory. Mounted by the Work route.
+ * timeline and controls. Renders nothing on a server without Factory. Mounted by the Work route;
+ * while mounted it reports its item as the one the palette's Deliver acts on.
  */
 export function FactoryItemSection(props: FactoryItemSectionProps) {
   // A pending action, error or start belongs to one destination and item.
@@ -54,34 +54,28 @@ type Action = "start" | "stop" | "resume" | "cancel";
 
 function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps) {
   const navigate = useNavigate();
-  const supported = useAtomValue(factoryEnvironment.supported(environmentId));
-  const connected = useConnectedEnvironmentIds().includes(environmentId);
-  const deliveriesQuery = useEnvironmentQuery(
-    factoryEnvironment.deliveries({ environmentId, input: { projectId } }),
-  );
+  const target = { environmentId, projectId, itemRef: item.ref };
+  useReportOpenWorkItem({ ...target, key: item.key });
+  const { destination, deliveriesQuery } = useFactoryDeliverState(target);
   const permitted = {
-    start: useAtomValue(factoryEnvironment.start.permissionAtom(environmentId)),
+    start: destination.startPermitted,
     stop: useAtomValue(factoryEnvironment.stop.permissionAtom(environmentId)),
     resume: useAtomValue(factoryEnvironment.resume.permissionAtom(environmentId)),
     cancel: useAtomValue(factoryEnvironment.cancel.permissionAtom(environmentId)),
   };
-  const start = useAtomCommand(factoryEnvironment.start);
+  const start = useFactoryStart();
   const stop = useAtomCommand(factoryEnvironment.stop);
   const resume = useAtomCommand(factoryEnvironment.resume);
   const cancel = useAtomCommand(factoryEnvironment.cancel);
   const [pending, setPending] = useState<Action | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [started, setStarted] = useState<FactoryDelivery | null>(null);
   // The delivery the open cancel confirmation was opened for.
   const [confirmingCancel, setConfirmingCancel] = useState<FactoryDeliveryId | null>(null);
 
   const view = factoryItemSection({
     environmentId,
     itemRef: item.ref,
-    supported,
-    connected,
-    deliveries: deliveriesQuery.data?.deliveries ?? null,
-    started,
+    ...destination,
     permitted,
   });
   const cancelling = cancelConfirmationTarget(view, confirmingCancel);
@@ -95,25 +89,24 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
   }
 
   /**
-   * Runs one command. The view changes only when the change stream refetches the deliveries, so
-   * a refused command leaves it as it was, with the refusal shown.
+   * Runs one command. The view changes only when the change stream refetches the deliveries (or,
+   * for a start, once the start's delivery is recorded), so a refused command leaves it as it
+   * was, with the refusal shown.
    */
-  const run = async (
-    action: Action,
-    execute: () => Promise<AtomCommandResult<FactoryDelivery, unknown>>,
-  ) => {
+  const run = async (action: Action, execute: () => Promise<string | null>) => {
     setPending(action);
     setError(null);
-    const result = await execute();
+    const failure = await execute();
     setPending(null);
-    if (result._tag === "Failure") {
-      setError(factoryErrorText(result.cause));
-    } else if (action === "start") {
-      setStarted(result.value);
-    }
+    if (failure !== null) setError(failure);
   };
+  const command =
+    (execute: () => Promise<AtomCommandResult<FactoryDelivery, unknown>>) => async () => {
+      const result = await execute();
+      return result._tag === "Failure" ? factoryErrorText(result.cause) : null;
+    };
   const delivery = view.delivery;
-  const target =
+  const control =
     delivery === null ? null : { environmentId, input: { deliveryId: delivery.deliveryId } };
 
   return (
@@ -133,9 +126,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
           <Button
             size="xs"
             disabled={pending !== null}
-            onClick={() =>
-              void run("start", () => start({ environmentId, input: { itemRef: item.ref } }))
-            }
+            onClick={() => void run("start", () => start(target))}
           >
             <FactoryIcon />
             Deliver
@@ -145,7 +136,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
       {delivery?.needsYou !== undefined ? (
         <p className="text-sm text-warning-foreground">{delivery.needsYou}</p>
       ) : null}
-      {delivery !== null && target !== null ? (
+      {delivery !== null && control !== null ? (
         <>
           <p className="text-muted-foreground text-xs">
             {delivery.branch === undefined ? "" : `${delivery.branch} · `}
@@ -158,7 +149,12 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
                   size="xs"
                   variant="outline"
                   disabled={pending !== null}
-                  onClick={() => void run("stop", () => stop(target))}
+                  onClick={() =>
+                    void run(
+                      "stop",
+                      command(() => stop(control)),
+                    )
+                  }
                 >
                   Stop after step
                 </Button>
@@ -168,7 +164,12 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
                   size="xs"
                   variant="outline"
                   disabled={pending !== null}
-                  onClick={() => void run("resume", () => resume(target))}
+                  onClick={() =>
+                    void run(
+                      "resume",
+                      command(() => resume(control)),
+                    )
+                  }
                 >
                   Resume
                 </Button>
@@ -265,8 +266,9 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
               onClick={() => {
                 if (cancelling === null) return;
                 setConfirmingCancel(null);
-                void run("cancel", () =>
-                  cancel({ environmentId, input: { deliveryId: cancelling } }),
+                void run(
+                  "cancel",
+                  command(() => cancel({ environmentId, input: { deliveryId: cancelling } })),
                 );
               }}
             >

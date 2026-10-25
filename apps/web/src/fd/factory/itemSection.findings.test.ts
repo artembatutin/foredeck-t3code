@@ -147,7 +147,7 @@ const viewOf = (overrides: Partial<FactoryDelivery>) =>
     supported: true,
     connected: true,
     deliveries: [delivery(overrides)],
-    started: null,
+    started: [],
     permitted: { start: true, stop: true, resume: true, cancel: true },
   })?.delivery;
 
