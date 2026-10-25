@@ -77,12 +77,13 @@ export class FactoryStageRunStore extends Context.Service<
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<ReadonlyArray<StoredFactoryStageRun>, FactoryStoreError>;
     /**
-     * Every attempt of these deliveries in one read, each delivery's in the order they started;
-     * a delivery without attempts has none.
+     * The newest `limit` attempts of each of these deliveries in one read, each delivery's in the
+     * order they started; a delivery without attempts has none. Older attempts are not read.
      */
-    readonly listByDeliveries: (
-      deliveryIds: ReadonlyArray<FactoryDeliveryId>,
-    ) => Effect.Effect<
+    readonly listNewestByDeliveries: (input: {
+      readonly deliveryIds: ReadonlyArray<FactoryDeliveryId>;
+      readonly limit: number;
+    }) => Effect.Effect<
       ReadonlyMap<FactoryDeliveryId, ReadonlyArray<StoredFactoryStageRun>>,
       FactoryStoreError
     >;
@@ -98,7 +99,6 @@ const make = Effect.gen(function* () {
   const selectRuns = SqlSchema.findAll({
     Request: Schema.Struct({
       deliveryId: Schema.optional(FactoryDeliveryId),
-      deliveryIds: Schema.optional(Schema.Array(FactoryDeliveryId)),
       stage: Schema.optional(FactoryStageName),
       attempt: Schema.optional(PositiveInt),
       threadId: Schema.optional(ThreadId),
@@ -120,18 +120,43 @@ const make = Effect.gen(function* () {
       FROM fd_factory_stage_runs
       WHERE ${sql.and([
         ...(request.deliveryId === undefined ? [] : [sql`delivery_id = ${request.deliveryId}`]),
-        // One bound parameter however many deliveries, within SQLite's parameter limit.
-        ...(request.deliveryIds === undefined
-          ? []
-          : [
-              sql`delivery_id IN (SELECT value FROM json_each(${JSON.stringify(request.deliveryIds)}))`,
-            ]),
         ...(request.stage === undefined ? [] : [sql`stage = ${request.stage}`]),
         ...(request.attempt === undefined ? [] : [sql`attempt = ${request.attempt}`]),
         ...(request.threadId === undefined ? [] : [sql`thread_id = ${request.threadId}`]),
         ...(request.activeOnly === true ? [sql`finished_at IS NULL`] : []),
       ])}
       ORDER BY rowid ASC
+    `,
+  });
+
+  // The window keeps each delivery's newest rows in SQL, so only those are returned and decoded
+  // however long its history. The ids are one bound parameter however many, within SQLite's
+  // parameter limit.
+  const selectNewestRuns = SqlSchema.findAll({
+    Request: Schema.Struct({ deliveryIds: Schema.Array(FactoryDeliveryId), limit: PositiveInt }),
+    Result: StoredFactoryStageRun,
+    execute: ({ deliveryIds, limit }) => sql`
+      SELECT
+        delivery_id AS "deliveryId",
+        stage,
+        attempt,
+        thread_id AS "threadId",
+        run_id AS "runId",
+        outcome,
+        evidence_path AS "evidencePath",
+        fingerprint,
+        started_at AS "startedAt",
+        finished_at AS "finishedAt"
+      FROM (
+        SELECT
+          *,
+          rowid AS position,
+          ROW_NUMBER() OVER (PARTITION BY delivery_id ORDER BY rowid DESC) AS recency
+        FROM fd_factory_stage_runs
+        WHERE delivery_id IN (SELECT value FROM json_each(${JSON.stringify(deliveryIds)}))
+      )
+      WHERE recency <= ${limit}
+      ORDER BY position ASC
     `,
   });
 
@@ -263,8 +288,11 @@ const make = Effect.gen(function* () {
       selectRuns({ deliveryId }).pipe(
         Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.listByDelivery")),
       ),
-    listByDeliveries: (deliveryIds) =>
-      (deliveryIds.length === 0 ? Effect.succeed([]) : selectRuns({ deliveryIds })).pipe(
+    listNewestByDeliveries: ({ deliveryIds, limit }) =>
+      (deliveryIds.length === 0
+        ? Effect.succeed([])
+        : selectNewestRuns({ deliveryIds, limit })
+      ).pipe(
         Effect.map((rows) => {
           const byDelivery = new Map<FactoryDeliveryId, Array<StoredFactoryStageRun>>();
           for (const row of rows) {
@@ -274,7 +302,7 @@ const make = Effect.gen(function* () {
           }
           return byDelivery;
         }),
-        Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.listByDeliveries")),
+        Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.listNewestByDeliveries")),
       ),
   });
 });

@@ -1,11 +1,13 @@
 import { AuthWorkReadScope, type ProjectId, type RuntimeMode, ThreadId } from "@t3tools/contracts";
 import {
+  FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
   FactoryDeliveryId,
   FactoryDeliveryStatus,
   FactoryTaskId,
 } from "@t3tools/contracts/fd/factory";
 import { type WorkItemRef, workItemRefString } from "@t3tools/contracts/fd/work-management";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -13,6 +15,7 @@ import type * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 import type * as Stream from "effect/Stream";
 
 import type * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
@@ -176,15 +179,20 @@ export type FactoryStartError =
   | FactoryDeliveryStore.FactoryDeliveryActive
   | FactoryStoreError;
 
-/** A stored delivery with every stage attempt it made, in the order they started. */
+/**
+ * A stored delivery with its newest stage attempts, as many as a snapshot carries, in the order
+ * they started.
+ */
 export type FactoryDeliveryWithRuns = FactoryDeliveryStore.StoredFactoryDelivery & {
   readonly stageRuns: ReadonlyArray<FactoryStageRunStore.StoredFactoryStageRun>;
 };
 
 /**
  * Factory's deliveries for transports, MCP tools and scheduled tasks. Each delivery it returns
- * carries its stage attempts, read after its step is stored: a read that fails fails the call,
- * though the step stands and the change epoch has moved for it.
+ * carries the stage attempts of the same moment: a read takes both from one snapshot of the
+ * database, and a control reads the attempts of its own step before any later step can store
+ * more. A control whose attempt read fails fails, though its step stands and the change epoch has
+ * moved for it.
  */
 export class FactoryService extends Context.Service<
   FactoryService,
@@ -212,7 +220,7 @@ export class FactoryService extends Context.Service<
     ) => Effect.Effect<Option.Option<FactoryDeliveryWithRuns>, FactoryStoreError>;
     /**
      * Every delivery, or one project's, whatever its status, newest first. Their attempts are
-     * one read, however many deliveries there are.
+     * one bounded read, however many deliveries there are.
      */
     readonly list: (input: {
       readonly projectId?: ProjectId;
@@ -321,27 +329,53 @@ const make = Effect.gen(function* () {
   const reviews = yield* FactoryReview.FactoryReview;
   const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
   const changes = yield* FactoryChanges.FactoryChanges;
+  const sql = yield* SqlClient.SqlClient;
   const crypto = yield* Crypto.Crypto;
   const gitContext = yield* Effect.context<FileSystem.FileSystem | GitVcsDriver.GitVcsDriver>();
   // Starts of one item, by its canonical spelling. One server owns a T3 home, so an in-process
   // lock is enough, as for Work's thread starts.
   const itemLocks = yield* KeyedLock.make<string>();
 
-  const withRuns = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
+  /** The deliveries with their newest attempts, in one read however many there are. */
+  const withRuns = (stored: ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>) =>
     stageRuns
-      .listByDelivery(delivery.deliveryId)
-      .pipe(Effect.map((runs) => ({ ...delivery, stageRuns: runs })));
+      .listNewestByDeliveries({
+        deliveryIds: stored.map(({ deliveryId }) => deliveryId),
+        limit: FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
+      })
+      .pipe(
+        Effect.map((runs) =>
+          stored.map((delivery) => ({
+            ...delivery,
+            stageRuns: runs.get(delivery.deliveryId) ?? [],
+          })),
+        ),
+      );
 
-  /** The deliveries with their attempts, in one read of the attempts however many there are. */
-  const allWithRuns = (stored: ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>) =>
-    stageRuns.listByDeliveries(stored.map(({ deliveryId }) => deliveryId)).pipe(
-      Effect.map((runs) =>
-        stored.map((delivery) => ({
-          ...delivery,
-          stageRuns: runs.get(delivery.deliveryId) ?? [],
-        })),
-      ),
+  /**
+   * Reads deliveries and their attempts in one read-only transaction, a single snapshot of the
+   * database: a step stored between the two reads would otherwise pair one state with the next
+   * state's attempts.
+   */
+  const readWithRuns = (
+    operation: string,
+    read: Effect.Effect<
+      ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>,
+      FactoryStoreError
+    >,
+  ) =>
+    sql.withTransaction(read.pipe(Effect.flatMap(withRuns))).pipe(
+      NodeSqliteClient.readOnly,
+      Effect.catchTags({
+        SqlError: (cause) => Effect.fail(new FactoryStoreError({ operation, cause })),
+      }),
     );
+
+  /** A stepped delivery with the attempts of that step. */
+  const steppedWithRuns = (stepped: {
+    readonly delivery: FactoryDeliveryStore.StoredFactoryDelivery;
+    readonly stageRuns: ReadonlyArray<FactoryStageRunStore.StoredFactoryStageRun>;
+  }) => ({ ...stepped.delivery, stageRuns: stepped.stageRuns });
 
   const start: FactoryService["Service"]["start"] = Effect.fn("FactoryService.start")(
     function* (input) {
@@ -418,8 +452,13 @@ const make = Effect.gen(function* () {
           );
       }).pipe((locked) => itemLocks.withLock(workItemRefString(itemRef), locked));
       // A storage failure here leaves the delivery queued with nothing launched.
-      const started = yield* worker.step(queued.deliveryId, { type: "start" });
-      return yield* withRuns(Option.getOrElse(started, () => queued));
+      const started = yield* worker.stepWith(queued.deliveryId, () =>
+        Effect.succeed({ event: { type: "start" } as const, value: undefined }),
+      );
+      return Option.match(started, {
+        onNone: () => ({ ...queued, stageRuns: [] }),
+        onSome: steppedWithRuns,
+      });
     },
   );
 
@@ -491,7 +530,7 @@ const make = Effect.gen(function* () {
           : Effect.fail(new FactoryStopRefusedError({ deliveryId, status: state.status })),
       );
       if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
-      return yield* withRuns(stepped.value.delivery);
+      return steppedWithRuns(stepped.value);
     },
   );
 
@@ -563,7 +602,7 @@ const make = Effect.gen(function* () {
         }),
       );
       if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
-      return yield* withRuns(stepped.value.delivery);
+      return steppedWithRuns(stepped.value);
     },
   );
 
@@ -575,25 +614,22 @@ const make = Effect.gen(function* () {
           : Effect.succeed({ event: { type: "cancel" } as const, value: undefined }),
       );
       if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
-      return yield* withRuns(stepped.value.delivery);
+      return steppedWithRuns(stepped.value);
     },
   );
 
   return FactoryService.of({
     start,
     get: (deliveryId) =>
-      deliveries
-        .get(deliveryId)
-        .pipe(
-          Effect.flatMap((found) =>
-            Option.isNone(found) ? Effect.succeedNone : Effect.asSome(withRuns(found.value)),
-          ),
-        ),
-    list: (input) => deliveries.list(input).pipe(Effect.flatMap(allWithRuns)),
+      readWithRuns("service.get", deliveries.get(deliveryId).pipe(Effect.map(Option.toArray))).pipe(
+        Effect.map(([delivery]) => Option.fromUndefinedOr(delivery)),
+      ),
+    list: (input) => readWithRuns("service.list", deliveries.list(input)),
     listByItem: (input) =>
       Effect.gen(function* () {
         const itemRef = yield* work.canonicalRef(input);
-        return { itemRef, deliveries: yield* allWithRuns(yield* deliveries.list({ itemRef })) };
+        const read = yield* readWithRuns("service.listByItem", deliveries.list({ itemRef }));
+        return { itemRef, deliveries: read };
       }),
     stop,
     resume,

@@ -1,5 +1,6 @@
 import type { RunId, ThreadId } from "@t3tools/contracts";
 import {
+  FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
   type FactoryDeliveryId,
   FactoryStageName,
   type FactoryStageOutcome,
@@ -81,8 +82,10 @@ export class FactoryWorker extends Context.Service<
     /**
      * Decides an event from the stored delivery, then steps it, both under the delivery's lock:
      * no other step of the delivery runs between what `decide` read and the step. A decision
-     * that fails steps nothing. Returns the stored result with the decision's value; none for
-     * an unknown delivery, where `decide` does not run.
+     * that fails steps nothing. Returns the stored result, its newest stage attempts as a
+     * snapshot carries them (read under the same lock, so they are that result's and no later
+     * step's) and the decision's value; none for an unknown delivery, where `decide` does not
+     * run.
      */
     readonly stepWith: <A, E>(
       deliveryId: FactoryDeliveryId,
@@ -92,6 +95,7 @@ export class FactoryWorker extends Context.Service<
     ) => Effect.Effect<
       Option.Option<{
         readonly delivery: FactoryDeliveryStore.StoredFactoryDelivery;
+        readonly stageRuns: ReadonlyArray<FactoryStageRunStore.StoredFactoryStageRun>;
         readonly value: A;
       }>,
       E | FactoryStoreError
@@ -519,7 +523,18 @@ const make = Effect.gen(function* () {
         if (Option.isNone(current)) return Option.none();
         const { event, value } = yield* decide(current.value);
         const stored = yield* stepLocked(deliveryId, event);
-        return Option.map(stored, (delivery) => ({ delivery, value }));
+        if (Option.isNone(stored)) return Option.none();
+        // Every write of a delivery's state and attempts after its insert holds its lock, so
+        // while this step holds it the attempts read are the stored result's.
+        const runs = yield* stageRuns.listNewestByDeliveries({
+          deliveryIds: [deliveryId],
+          limit: FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
+        });
+        return Option.some({
+          delivery: stored.value,
+          stageRuns: runs.get(deliveryId) ?? [],
+          value,
+        });
       }),
     );
 

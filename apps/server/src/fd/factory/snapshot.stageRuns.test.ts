@@ -11,7 +11,9 @@ import {
 } from "@t3tools/contracts/fd/factory";
 import { WorkItemId, type WorkItemRef, WorkSourceId } from "@t3tools/contracts/fd/work-management";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -28,11 +30,13 @@ import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { WorkService } from "../work-management/index.ts";
-import * as FactoryChanges from "./FactoryChanges.ts";
+import * as FactoryPullRequest from "./FactoryPullRequest.ts";
+import * as FactoryRecord from "./FactoryRecord.ts";
 import * as FactoryReview from "./FactoryReview.ts";
 import * as FactoryService from "./FactoryService.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
+import * as FactoryWorkComments from "./FactoryWorkComments.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import { toolLayer } from "./mcp/handlers.ts";
@@ -42,6 +46,7 @@ import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import { queuedDeliveryState } from "./pipeline/state.ts";
 import { wsHandlers } from "./rpc/handlers.ts";
 import { toFactoryDelivery } from "./snapshot.ts";
+import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 import {
   authorCommits,
   drainOrchestration,
@@ -253,36 +258,54 @@ describe("the stage attempt cap", () => {
   });
 });
 
-/** The stage-run reads the service made, in order. */
-const stageRunReads: Array<"listByDelivery" | "listByDeliveries"> = [];
+/** The stage-run reads made of the store, each with the rows it returned. */
+const storeReads: Array<{ readonly method: string; readonly rows: number }> = [];
+/** Runs once, inside the next bounded read of attempts, before the store is read. */
+let beforeAttempts: Effect.Effect<void> | undefined;
 
-/** The real stage-run store, recording each read the service makes of it. */
+/** The real stage-run store, recording its reads and running `beforeAttempts`. */
 const recordedStageRuns = Layer.effect(
   FactoryStageRunStore.FactoryStageRunStore,
   Effect.gen(function* () {
     const store = yield* FactoryStageRunStore.FactoryStageRunStore;
+    const record = (method: string, rows: number) =>
+      Effect.sync(() => storeReads.push({ method, rows }));
     return FactoryStageRunStore.FactoryStageRunStore.of({
       ...store,
       listByDelivery: (id) =>
-        Effect.sync(() => stageRunReads.push("listByDelivery")).pipe(
-          Effect.andThen(store.listByDelivery(id)),
-        ),
-      listByDeliveries: (ids) =>
-        Effect.sync(() => stageRunReads.push("listByDeliveries")).pipe(
-          Effect.andThen(store.listByDeliveries(ids)),
-        ),
+        store.listByDelivery(id).pipe(Effect.tap((runs) => record("listByDelivery", runs.length))),
+      listNewestByDeliveries: (input) =>
+        Effect.suspend(() => {
+          const before = beforeAttempts ?? Effect.void;
+          beforeAttempts = undefined;
+          return before.pipe(
+            Effect.andThen(store.listNewestByDeliveries(input)),
+            Effect.tap((runs) =>
+              record(
+                "listNewestByDeliveries",
+                [...runs.values()].reduce((rows, attempts) => rows + attempts.length, 0),
+              ),
+            ),
+          );
+        }),
     });
   }),
 );
 
-/** The real service over real stores; nothing here launches, reviews or reads Git. */
+/**
+ * The real service and worker over real stores. Nothing here launches, reviews or reads Git; a
+ * cancel's interrupts reach no thread.
+ */
 const layer = FactoryService.layer.pipe(
+  Layer.provideMerge(FactoryWorker.layer),
   Layer.provide(
     Layer.mergeAll(
-      Layer.mock(FactoryWorker.FactoryWorker)({}),
-      FactoryChanges.layer,
+      Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({ interruptRun: () => Effect.void }),
+      Layer.mock(FactoryWorkComments.FactoryWorkComments)({ post: () => Effect.void }),
       Layer.mock(FactoryReview.FactoryReview)({}),
-      Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({}),
+      Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({}),
+      Layer.mock(FactoryRecord.FactoryRecord)({}),
+      Layer.mock(FactoryPullRequest.FactoryPullRequest)({}),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
       Layer.mock(ProjectStore.ProjectStoreV2)({}),
       Layer.mock(GitVcsDriver.GitVcsDriver)({}),
@@ -341,6 +364,31 @@ const ids = {
   newer: FactoryDeliveryId.make("delivery-newer"),
 };
 
+/** Appends the stage's next attempt, finished with `outcome` when given, as a step would. */
+const appendAttempt = (
+  id: FactoryDeliveryId,
+  stage: FactoryStageName,
+  threadId: ThreadId | undefined,
+  outcome?: FactoryStageOutcome,
+) =>
+  Effect.gen(function* () {
+    const runs = yield* FactoryStageRunStore.FactoryStageRunStore;
+    const run = yield* runs.append({
+      deliveryId: id,
+      stage,
+      ...(threadId === undefined ? {} : { threadId, runId: RunId.make(`run-${id}-${stage}`) }),
+    });
+    if (outcome === undefined) return;
+    yield* runs.finish({
+      deliveryId: id,
+      stage,
+      attempt: run.attempt,
+      outcome,
+      evidencePath: `/t3/userdata/fd-factory/${id}/${stage}-${run.attempt}.json`,
+      ...(outcome === "failed" ? { fingerprint: `fingerprint-${id}` } : {}),
+    });
+  });
+
 /**
  * Four deliveries a second apart, so they list newest first: `old` and `newer` of one item in
  * project alpha, `mid` in beta, and `idle` without attempts. Their attempts interleave, as
@@ -348,7 +396,6 @@ const ids = {
  */
 const seed = Effect.gen(function* () {
   const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
-  const runs = yield* FactoryStageRunStore.FactoryStageRunStore;
   const insert = (id: FactoryDeliveryId, projectId: ProjectId, item: string, status = "running") =>
     Effect.gen(function* () {
       yield* deliveries.insert({
@@ -367,35 +414,13 @@ const seed = Effect.gen(function* () {
   yield* insert(ids.idle, alpha, "fd-cccccc");
   yield* insert(ids.newer, alpha, "fd-aaaaaa");
 
-  const attempt = (
-    id: FactoryDeliveryId,
-    stage: FactoryStageName,
-    threadId: ThreadId | undefined,
-    outcome?: FactoryStageOutcome,
-  ) =>
-    Effect.gen(function* () {
-      const run = yield* runs.append({
-        deliveryId: id,
-        stage,
-        ...(threadId === undefined ? {} : { threadId, runId: RunId.make(`run-${id}-${stage}`) }),
-      });
-      if (outcome === undefined) return;
-      yield* runs.finish({
-        deliveryId: id,
-        stage,
-        attempt: run.attempt,
-        outcome,
-        evidencePath: `/t3/userdata/fd-factory/${id}/${stage}-${run.attempt}.json`,
-        ...(outcome === "failed" ? { fingerprint: `fingerprint-${id}` } : {}),
-      });
-    });
-  yield* attempt(ids.old, "author", ThreadId.make("thread-old-author"), "passed");
-  yield* attempt(ids.mid, "author", ThreadId.make("thread-mid-author"), "passed");
-  yield* attempt(ids.old, "verify", undefined, "failed");
-  yield* attempt(ids.newer, "author", ThreadId.make("thread-newer-author"), "passed");
-  yield* attempt(ids.mid, "verify", undefined, "passed");
-  yield* attempt(ids.old, "repair", ThreadId.make("thread-old-author"), "cancelled");
-  yield* attempt(ids.newer, "verify", undefined);
+  yield* appendAttempt(ids.old, "author", ThreadId.make("thread-old-author"), "passed");
+  yield* appendAttempt(ids.mid, "author", ThreadId.make("thread-mid-author"), "passed");
+  yield* appendAttempt(ids.old, "verify", undefined, "failed");
+  yield* appendAttempt(ids.newer, "author", ThreadId.make("thread-newer-author"), "passed");
+  yield* appendAttempt(ids.mid, "verify", undefined, "passed");
+  yield* appendAttempt(ids.old, "repair", ThreadId.make("thread-old-author"), "cancelled");
+  yield* appendAttempt(ids.newer, "verify", undefined);
 });
 
 const expectedAttempts = {
@@ -415,18 +440,21 @@ const expectedAttempts = {
   ],
 };
 
+/** Runs a read and returns it with the stage-run reads it made of the store. */
+const reading = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    storeReads.length = 0;
+    const value = yield* effect;
+    return { value, reads: [...storeReads] };
+  });
+
+const bounded = (rows: number) => [{ method: "listNewestByDeliveries", rows }];
+
 describe("stage attempts of listed deliveries", () => {
   it.effect("gives each delivery its own attempts from one read of the store", () =>
     Effect.gen(function* () {
       yield* seed;
       const factory = yield* FactoryService.FactoryService;
-      /** Runs a read and returns it with the stage-run reads it made. */
-      const reading = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-        Effect.gen(function* () {
-          stageRunReads.length = 0;
-          const value = yield* effect;
-          return { value, reads: [...stageRunReads] };
-        });
 
       const all = yield* reading(factory.list({}));
       expect(all.value.map(({ deliveryId: id }) => id)).toEqual([
@@ -438,7 +466,7 @@ describe("stage attempts of listed deliveries", () => {
       for (const delivery of all.value) {
         expect(attemptsOf(delivery)).toEqual(expectedAttempts[delivery.deliveryId]);
       }
-      expect(all.reads).toEqual(["listByDeliveries"]);
+      expect(all.reads).toEqual(bounded(7));
 
       // One read however many deliveries the list holds.
       const alphaOnly = yield* reading(factory.list({ projectId: alpha }));
@@ -447,20 +475,55 @@ describe("stage attempts of listed deliveries", () => {
         ids.idle,
         ids.old,
       ]);
-      expect(alphaOnly.reads).toEqual(["listByDeliveries"]);
+      expect(alphaOnly.reads).toEqual(bounded(5));
       const item = yield* reading(factory.listByItem(itemRef("fd-aaaaaa")));
       expect(item.value.deliveries.map(attemptsOf)).toEqual([
         expectedAttempts[ids.newer],
         expectedAttempts[ids.old],
       ]);
-      expect(item.reads).toEqual(["listByDeliveries"]);
+      expect(item.reads).toEqual(bounded(5));
       const none = yield* reading(factory.list({ projectId: ProjectId.make("project-none") }));
       expect(none.value).toEqual([]);
-      expect(none.reads).toEqual(["listByDeliveries"]);
+      expect(none.reads).toEqual(bounded(0));
 
       const one = yield* reading(factory.get(ids.old));
       expect(attemptsOf(Option.getOrThrow(one.value))).toEqual(expectedAttempts[ids.old]);
-      expect(one.reads).toEqual(["listByDelivery"]);
+      expect(one.reads).toEqual(bounded(3));
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("reads no more than a snapshot's attempts of each delivery from the store", () =>
+    Effect.gen(function* () {
+      yield* seed;
+      // `mid` reviews far more often than a snapshot shows, interleaved with four of `old`'s.
+      for (let index = 0; index < FACTORY_SNAPSHOT_STAGE_RUNS_MAX * 2; index++) {
+        yield* appendAttempt(ids.mid, "review", undefined, "failed");
+        if (index % 25 === 0) yield* appendAttempt(ids.old, "review", undefined, "failed");
+      }
+      const factory = yield* FactoryService.FactoryService;
+
+      const all = yield* reading(factory.list({}));
+      expect(all.value.map(({ deliveryId: id, stageRuns }) => [id, stageRuns.length])).toEqual([
+        [ids.newer, 2],
+        [ids.idle, 0],
+        [ids.mid, FACTORY_SNAPSHOT_STAGE_RUNS_MAX],
+        [ids.old, 7],
+      ]);
+      expect(all.reads).toEqual(bounded(2 + FACTORY_SNAPSHOT_STAGE_RUNS_MAX + 7));
+      // `mid`'s newest: its last reviews, in the order they started.
+      const reviewsKept = Array.from(
+        { length: FACTORY_SNAPSHOT_STAGE_RUNS_MAX },
+        (_, index) => FACTORY_SNAPSHOT_STAGE_RUNS_MAX + 1 + index,
+      );
+      const mid = all.value.find(({ deliveryId: id }) => id === ids.mid);
+      expect(mid?.stageRuns.map(({ stage, attempt }) => [stage, attempt])).toEqual(
+        reviewsKept.map((attempt) => ["review", attempt]),
+      );
+      expect(attemptsOf(all.value[3]!).slice(0, 3)).toEqual(expectedAttempts[ids.old]);
+
+      const one = yield* reading(factory.get(ids.mid));
+      expect(Option.getOrThrow(one.value).stageRuns).toEqual(mid?.stageRuns);
+      expect(one.reads).toEqual(bounded(FACTORY_SNAPSHOT_STAGE_RUNS_MAX));
     }).pipe(Effect.provide(layer)),
   );
 
@@ -502,16 +565,8 @@ describe("stage attempts of listed deliveries", () => {
   it.effect("sends at most the cap of a long delivery's attempts through get", () =>
     Effect.gen(function* () {
       yield* seed;
-      const runs = yield* FactoryStageRunStore.FactoryStageRunStore;
       for (let index = 0; index < FACTORY_SNAPSHOT_STAGE_RUNS_MAX + 3; index++) {
-        const run = yield* runs.append({ deliveryId: ids.mid, stage: "review" });
-        yield* runs.finish({
-          deliveryId: ids.mid,
-          stage: "review",
-          attempt: run.attempt,
-          outcome: "failed",
-          fingerprint: `fingerprint-${index}`,
-        });
+        yield* appendAttempt(ids.mid, "review", undefined, "failed");
       }
       const factory = yield* FactoryService.FactoryService;
       const settings = yield* FactorySettings.FactorySettings;
@@ -525,6 +580,105 @@ describe("stage attempts of listed deliveries", () => {
         stage: "review",
         attempt: FACTORY_SNAPSHOT_STAGE_RUNS_MAX + 3,
       });
+    }).pipe(Effect.provide(layer)),
+  );
+});
+
+const authorOf = (id: FactoryDeliveryId) => ThreadId.make(`thread-${id}-author`);
+const reviewerOf = (id: FactoryDeliveryId) => ThreadId.make(`thread-${id}-reviewer`);
+
+/**
+ * A delivery in its first review round: author and verify passed, and the review's attempt is
+ * active on the reviewer thread, whose run the delivery awaits.
+ */
+const reviewing = (id: FactoryDeliveryId, item: string) =>
+  Effect.gen(function* () {
+    const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+    yield* deliveries.insert({
+      deliveryId: id,
+      projectId: alpha,
+      itemRef: itemRef(item),
+      state: {
+        ...queuedDeliveryState({ branch: `work/${item}`, baseRef: "HEAD" }),
+        status: "running",
+        stage: "review",
+        threads: { author: authorOf(id), reviewer: reviewerOf(id) },
+        awaiting: { type: "run", threadId: reviewerOf(id), runId: RunId.make(`run-${id}-review`) },
+      },
+    });
+    yield* appendAttempt(id, "author", authorOf(id), "passed");
+    yield* appendAttempt(id, "verify", undefined, "passed");
+    yield* appendAttempt(id, "review", reviewerOf(id));
+  });
+
+/**
+ * Forks `write` to run in the middle of the next bounded attempt read, after the delivery rows
+ * it pairs them with were read: the read hands the turn to the write's fiber there, which runs
+ * as far as it may before the read goes on, as a step on another fiber can.
+ */
+const writeBetweenReads = <A, E, R>(write: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const between = yield* Deferred.make<void>();
+    beforeAttempts = Deferred.succeed(between, undefined).pipe(Effect.andThen(Effect.yieldNow));
+    return yield* Deferred.await(between).pipe(Effect.andThen(write), Effect.forkChild);
+  });
+
+describe("a delivery and its attempts are one moment", () => {
+  const delivery = ids.newer;
+  const reads = {
+    get: Effect.flatMap(FactoryService.FactoryService, (factory) => factory.get(delivery)).pipe(
+      Effect.map(Option.getOrThrow),
+    ),
+    list: Effect.flatMap(FactoryService.FactoryService, (factory) => factory.list({})).pipe(
+      Effect.map((listed) => listed.find(({ deliveryId: id }) => id === delivery)!),
+    ),
+    listByItem: Effect.flatMap(FactoryService.FactoryService, (factory) =>
+      factory.listByItem(itemRef("fd-aaaaaa")),
+    ).pipe(Effect.map(({ deliveries }) => deliveries[0]!)),
+  };
+
+  it.effect.each(Object.keys(reads) as ReadonlyArray<keyof typeof reads>)(
+    "%s never pairs a state with a step stored between its reads",
+    (name) =>
+      Effect.gen(function* () {
+        yield* reviewing(delivery, "fd-aaaaaa");
+        const factory = yield* FactoryService.FactoryService;
+
+        // A cancel finishes the review's attempt and the delivery in one step, mid-read.
+        const cancelling = yield* writeBetweenReads(factory.cancel(delivery));
+        const during = yield* reads[name];
+        expect(beforeAttempts).toBeUndefined();
+        expect(during.state.status).toBe("running");
+        expect(attemptsOf(during).at(-1)).toEqual(["review", 1, null, reviewerOf(delivery)]);
+
+        // The cancel waited for the read, and the next read shows all of it.
+        expect((yield* Fiber.join(cancelling)).state.status).toBe("cancelled");
+        const after = yield* reads[name];
+        expect(after.state.status).toBe("cancelled");
+        expect(attemptsOf(after).at(-1)).toEqual(["review", 1, "cancelled", reviewerOf(delivery)]);
+      }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("a control answers with its own step's attempts, not a later step's", () =>
+    Effect.gen(function* () {
+      yield* reviewing(delivery, "fd-aaaaaa");
+      const factory = yield* FactoryService.FactoryService;
+
+      // The cancel's step is ready to run while the stop reads its attempts.
+      const cancelling = yield* writeBetweenReads(factory.cancel(delivery));
+      const stopping = yield* factory.stop(delivery);
+      expect(beforeAttempts).toBeUndefined();
+      expect(stopping.state.status).toBe("stopping");
+      expect(attemptsOf(stopping).at(-1)).toEqual(["review", 1, null, reviewerOf(delivery)]);
+
+      const cancelled = yield* Fiber.join(cancelling);
+      expect(cancelled.state.status).toBe("cancelled");
+      expect(attemptsOf(cancelled).at(-1)).toEqual([
+        "review",
+        1,
+        "cancelled",
+        reviewerOf(delivery),
+      ]);
     }).pipe(Effect.provide(layer)),
   );
 });
