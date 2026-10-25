@@ -426,6 +426,10 @@
     "./fd/work-management": {
       "types": "./src/fd/work-management/index.ts",
       "default": "./src/fd/work-management/index.ts"
+    },
+    "./fd/factory": {
+      "types": "./src/fd/factory/index.ts",
+      "default": "./src/fd/factory/index.ts"
     }
   },
   "scripts": {

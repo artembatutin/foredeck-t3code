@@ -268,7 +268,7 @@
     "apps/web/src/state/terminalSessions.ts": "Resolves terminal attach authority from the saved conversation and launch directory before subscribing.",
     "apps/web/src/themeBoot.test.ts": "Checks first-paint palette parity, saved choices and storage-unavailable fallback against the shared Foredeck source.",
     "apps/web/src/themePalette.ts": "Registers the fd palette and applies or clears its supplemental semantic roles through existing theme and preview paths.",
-    "packages/client-runtime/package.json": "Exports the shared multirepo feature entry point for web and mobile consumers. Exports the shared fd Work client entry point for web and mobile.",
+    "packages/client-runtime/package.json": "Exports the shared multirepo feature entry point for web and mobile consumers. Exports the shared fd Work client entry point for web and mobile. Exports the shared fd Factory client entry point for web and mobile.",
     "packages/client-runtime/src/connection/compatibility.test.ts": "Verifies repository negotiation preserves existing connection credentials and protocol metadata.",
     "packages/client-runtime/src/connection/compatibility.ts": "Announces repository protocol support on every direct, desktop, and relay WebSocket connection.",
     "packages/client-runtime/src/connection/resolver.test.ts": "Updates direct, desktop and relay connection expectations for the additive repository protocol flag.",
