@@ -418,9 +418,10 @@ export class FactoryService extends Context.Service<
     >;
     /**
      * Cancels a delivery that is not done or cancelled. It ends at once and issues nothing more,
-     * and whatever its threads still run is interrupted; the worktree, branch and commits stay. No
-     * later run end, effect result or review submission changes it, and its item can be
-     * delivered again. Refused, with nothing changed, once done or cancelled.
+     * and whatever its threads still run is interrupted; the worktree, branch and commits stay. A
+     * parent's children that are not approved are cancelled with it, alike. No later run end,
+     * effect result or review submission changes it, and its item can be delivered again.
+     * Refused, with nothing changed, once done or cancelled.
      */
     readonly cancel: (
       deliveryId: FactoryDeliveryId,
@@ -454,11 +455,12 @@ export class FactoryService extends Context.Service<
      * approval is taken after it. The running parent then creates, as a worker effect, one child
      * Work item per task in the parent item's Markdown source, under the parent item and blocked
      * by the previous task's, and stores the children's queued deliveries on its branch and
-     * worktree (see `FactoryChildren`); it starts none of them, and blocks where its per-child
-     * phase would begin, which this server cannot run yet. A Work failure blocks it with every
-     * child recorded so far kept, and a resume goes on after them. Refused, with nothing changed,
-     * for a delivery not waiting at the gate, or a plan with a task whose child item the source
-     * would refuse (see `uncreatableTasks`).
+     * worktree (see `FactoryChildren`). A Work failure blocks it with every child recorded so far
+     * kept, and a resume goes on after them. Then it runs its children in plan order, one at a
+     * time, each with an author thread of its own on the parent's worktree, starting the next
+     * once the one before is approved (see `FactoryWorker`). Refused, with nothing changed, for a
+     * delivery not waiting at the gate, or a plan with a task whose child item the source would
+     * refuse (see `uncreatableTasks`).
      */
     readonly approvePlan: (
       deliveryId: FactoryDeliveryId,

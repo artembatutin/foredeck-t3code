@@ -81,7 +81,7 @@ const launched = (effectId: number): FactoryEvent => ({
   threadId: planner,
   runId: planRun,
   worktreePath,
-  // A planner's launch reports its new worktree's HEAD; the task baseline is the author's.
+  // A planner's launch reports where it created the delivery branch.
   baseline: head,
 });
 const turnStarted = (effectId: number, runId: RunId): FactoryEvent => ({
@@ -178,15 +178,15 @@ describe("starting a delivery", () => {
     expect(step.effects).toEqual([{ ...plannerLaunch, role: "author" }]);
   });
 
-  it("records the planner and the worktree it made, and awaits the planner's run", () => {
+  it("records the planner, the worktree it made and where its branch started", () => {
     expect(planning).toEqual({
       ...awaitingLaunch,
       worktreePath,
+      // Where the planner's launch created the branch: the parent's first child starts there.
+      baseline: head,
       threads: { planner },
       awaiting: { type: "run", threadId: planner, runId: planRun },
     });
-    // The task baseline belongs to an author's first turn.
-    expect(planning.baseline).toBeNull();
   });
 });
 

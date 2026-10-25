@@ -9,6 +9,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import type * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
+import { taskOfChild } from "./FactoryChildren.ts";
 import type { FactoryBranchReadError, FactoryWorktreeMissingError } from "./git/branchFacts.ts";
 import { readWorktreeState } from "./git/worktreeState.ts";
 import type { FactoryStoreError } from "./persistence/errors.ts";
@@ -32,7 +33,10 @@ export class FactoryRecordBasisMissingError extends Schema.TaggedError<FactoryRe
   }
 }
 
-/** Record approves the one task of a delivery; this delivery has none, or several. */
+/**
+ * Record approves the one task of a delivery, or a child's task in its parent; this delivery has
+ * none, or several.
+ */
 export class FactoryRecordTaskError extends Schema.TaggedError<FactoryRecordTaskError>()(
   "FactoryRecordTaskError",
   { deliveryId: FactoryDeliveryId, tasks: NonNegativeInt },
@@ -71,8 +75,9 @@ const encodeEvidence = Schema.encodeEffect(Schema.fromJsonString(FactoryApproval
  * worktree's commit only when HEAD and its tree are the ones the last receipt verified, HEAD is
  * the commit the round's accepted review judged, and the worktree is clean. An approval writes
  * `approval-<taskId>.json` to the delivery's evidence, then sets the task's `lastReviewedSha`; a
- * later approval of the task replaces both. Any difference writes nothing: the outcome names the
- * expected and actual commit and what differed, and the engine blocks on it.
+ * later approval of the task replaces both. A child's task is its parent's task it was created
+ * for, whose `lastReviewedSha` the parent's next child starts from. Any difference writes nothing:
+ * the outcome names the expected and actual commit and what differed, and the engine blocks on it.
  */
 export class FactoryRecord extends Context.Service<
   FactoryRecord,
@@ -118,15 +123,26 @@ const make = Effect.gen(function* () {
     };
   });
 
+  /** The task the delivery's record approves: its one task, or a child's in its parent. */
+  const taskOf = Effect.fn("FactoryRecord.task")(function* (delivery: StoredFactoryDelivery) {
+    const { deliveryId, parentId } = delivery;
+    if (parentId !== null) {
+      const task = taskOfChild(parentId, yield* tasks.listByDelivery(parentId), deliveryId);
+      return task ?? (yield* new FactoryRecordTaskError({ deliveryId, tasks: 0 }));
+    }
+    const stored = yield* tasks.listByDelivery(deliveryId);
+    const [task] = stored;
+    if (task === undefined || stored.length > 1) {
+      return yield* new FactoryRecordTaskError({ deliveryId, tasks: stored.length });
+    }
+    return task;
+  });
+
   const record: FactoryRecord["Service"]["record"] = Effect.fn("FactoryRecord.record")(
     function* (delivery) {
       const { deliveryId } = delivery;
       const basis = yield* basisOf(delivery);
-      const stored = yield* tasks.listByDelivery(deliveryId);
-      const [task] = stored;
-      if (task === undefined || stored.length > 1) {
-        return yield* new FactoryRecordTaskError({ deliveryId, tasks: stored.length });
-      }
+      const task = yield* taskOf(delivery);
 
       const current = yield* readWorktreeState(basis.worktreePath).pipe(
         Effect.provideContext(gitContext),
@@ -164,7 +180,7 @@ const make = Effect.gen(function* () {
         ),
       );
       const updated = yield* tasks.setLastReviewedSha({
-        deliveryId,
+        deliveryId: task.deliveryId,
         taskId: task.taskId,
         sha: current.headSha,
       });

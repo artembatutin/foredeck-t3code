@@ -275,7 +275,7 @@ const fakeWork = (world: World) => {
   });
 };
 
-/** The planner thread is there and runs nothing; no thread is launched here. */
+/** The planner thread is there and runs nothing; a launch fails after it is recorded. */
 const fakeThreads = (world: World) =>
   Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({
     launchThread: (_delivery, effect) =>
@@ -427,8 +427,9 @@ const itemsOf = (items: ReadonlyArray<FakeItem>) =>
 
 /**
  * The parent once each task's child (`children`, the source's items when not given) exists under
- * it, blocked by the one before: its queued child deliveries are stored, and it blocks on the start
- * of the first, which this server's worker does not carry out yet.
+ * it, blocked by the one before: its child deliveries are stored, and it waits for the first,
+ * which it started on its worktree from where its branch started. Here that child's author launch
+ * fails; the other children wait queued.
  */
 const assertChildrenCreated = (world: World, children: ReadonlyArray<FakeItem> = world.items) =>
   Effect.gen(function* () {
@@ -440,21 +441,14 @@ const assertChildrenCreated = (world: World, children: ReadonlyArray<FakeItem> =
     ]);
     assert.deepStrictEqual(yield* childItemIds, itemIds);
 
-    const blocked = yield* parent;
-    const snapshot = toFactoryDelivery(blocked);
+    const waiting = yield* parent;
+    const snapshot = toFactoryDelivery(waiting);
     const childIds = tasks.map(({ id }) => FactoryChildren.childDeliveryId(parentId, id));
     assert.deepStrictEqual(snapshot.childIds, childIds);
-    assert.strictEqual(snapshot.status, "blocked");
+    assert.strictEqual(snapshot.status, "running");
     assert.deepStrictEqual(snapshot.stage, { name: "author", kind: "agent" });
-    const { block } = blocked.state;
-    assert.strictEqual(block?.reason, "effect_failed");
-    if (block?.reason === "effect_failed") {
-      assert.deepInclude(block.effect, { type: "start_child", child: childIds[0]! });
-    }
-    assert.strictEqual(
-      snapshot.needsYou,
-      "Factory could not start the child delivery (FactoryChildStartUnsupportedError).",
-    );
+    assert.deepStrictEqual(waiting.state.awaiting, { type: "child", deliveryId: childIds[0]! });
+    assert.isUndefined(snapshot.needsYou);
 
     const stored = yield* childrenOf;
     assert.deepStrictEqual(
@@ -465,21 +459,31 @@ const assertChildrenCreated = (world: World, children: ReadonlyArray<FakeItem> =
       const child = stored.find(({ deliveryId }) => deliveryId === childIds[index]);
       assert.deepStrictEqual(child?.itemRef, { sourceId, itemId: itemIds[index] });
       assert.strictEqual(child?.projectId, projectId);
-      assert.deepStrictEqual(
-        child?.state,
-        queuedDeliveryState({
-          kind: "child",
-          branch: "work/fd-parent",
-          baseRef: "HEAD",
-          worktreePath,
-          limits,
-          risk: task.risk,
-          runtimeModeCeiling: "auto-accept-edits",
-        }),
-      );
+      const queued = queuedDeliveryState({
+        kind: "child",
+        branch: "work/fd-parent",
+        baseRef: "HEAD",
+        worktreePath,
+        limits,
+        risk: task.risk,
+        runtimeModeCeiling: "auto-accept-edits",
+      });
+      if (index > 0) {
+        assert.deepStrictEqual(child?.state, queued);
+        continue;
+      }
+      // The first child's author launches on the parent's worktree, from where the planner's
+      // launch created the branch.
+      assert.strictEqual(child?.state.status, "blocked");
+      assert.strictEqual(child?.state.stage, "author");
+      assert.strictEqual(child?.state.baseline, "b".repeat(40));
+      assert.deepStrictEqual(child?.state.authorLaunch?.workspace, {
+        type: "existing_worktree",
+        worktreePath,
+      });
     }
-    // Nothing started: no thread was launched for any child.
-    assert.deepStrictEqual(world.launches, []);
+    // Only the first child's author was launched, once.
+    assert.deepStrictEqual(world.launches, ["author"]);
   });
 
 describe("approving a parent's plan", () => {

@@ -33,13 +33,21 @@ clean.
 
 The first thread of a delivery launches on a new worktree and branch; every later thread reuses
 that worktree, so one branch carries the delivery's commits and becomes its one PR. Settle checks
-judge only commits after the task baseline. For the first thread the baseline is the branch's
-creation entry in its reflog, because preparation creates the worktree after the launch returns,
-from whatever the base ref names by then: a commit resolved before the launch can be stale.
-Without a reflog, that commit stands only while HEAD has not moved, and otherwise the launch fails
-rather than guessing. A later thread's baseline is the worktree's HEAD before its first turn. See
+judge only commits after the task baseline, which is set once. For the first thread (a single
+item's author, a parent's planner) it is the branch's creation entry in its reflog, because
+preparation creates the worktree after the launch returns, from whatever the base ref names by
+then: a commit resolved before the launch can be stale. Without a reflog, that commit stands only
+while HEAD has not moved, and otherwise the launch fails rather than guessing. See
 [`FactoryThreadEffects.ts`](../../apps/server/src/fd/factory/FactoryThreadEffects.ts) and
 [`settle.ts`](../../apps/server/src/fd/factory/git/settle.ts).
+
+A parent's children share its worktree and branch, and each child's baseline is assigned when its
+parent starts it: where the parent's branch started for the first child, and the commit the task
+before it was approved for (its `lastReviewedSha`) after that. Not the HEAD its author finds: a
+commit made while the plan waits at the gate, or between two children, is then judged by the next
+child's settle check and review instead of passing into the branch unreviewed. A parent stored
+before planners recorded where its branch started has none, and its first child starts from that
+HEAD.
 
 ## A delivery's launches stay under its starter's mode
 
@@ -244,6 +252,17 @@ own limits and fingerprints but ends `approved` at record: the parent's one pull
 its work. Plan approval stored children as single items before the `child` kind existed, and a
 single item opens its own pull request, so the store reads any delivery with a parent as a child
 ([`FactoryDeliveryStore.ts`](../../apps/server/src/fd/factory/persistence/FactoryDeliveryStore.ts)).
+A child's record approves its task in the parent, where the next child, integrate and the pull
+request read the approved commit. A child that blocks blocks alone: the parent keeps waiting for
+it, and the owner resumes the child.
+
+The worker starts a child under the parent's lock, and only while the parent still awaits that
+start, so a cancelled parent starts none; a parent's cancel cancels its children that are not
+approved, interrupting what their threads run. It takes a parent's lock before a child's, never
+the other way: a child's approval reaches its parent only once the child's step has released its
+lock ([`FactoryWorker.ts`](../../apps/server/src/fd/factory/FactoryWorker.ts)). An approval stored
+while no server handed it on is handed on by the boot sweep, once, since the parent then waits for
+its next child.
 
 ## Clients see a review's details as it was accepted
 
@@ -281,7 +300,8 @@ the ones the last receipt recorded, HEAD must be the commit the accepted review 
 worktree must be clean. Otherwise nothing is written and the delivery blocks, naming both commits.
 Numbered verify and review evidence is never overwritten, but a task has one current approval: a
 later approval of the task replaces its `approval-<taskId>.json` and `lastReviewedSha`. A single
-item is its delivery's one task, written in the transaction that inserts the delivery. See
+item is its delivery's one task, written in the transaction that inserts the delivery; a child's
+task is its parent's task it was created for, and its approval goes to the child's evidence. See
 [`FactoryRecord.ts`](../../apps/server/src/fd/factory/FactoryRecord.ts).
 
 ## Stop waits for a stage boundary; cancel does not

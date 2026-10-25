@@ -102,6 +102,13 @@ export const childDeliveryId = (parentId: FactoryDeliveryId, taskId: FactoryTask
     `child-${NodeCrypto.createHash("sha256").update(`${parentId}\0${taskId}`).digest("hex").slice(0, 40)}`,
   );
 
+/** The parent's task a child delivery was created for, among the parent's tasks; none for another. */
+export const taskOfChild = <T extends { readonly taskId: FactoryTaskId }>(
+  parentId: FactoryDeliveryId,
+  tasks: ReadonlyArray<T>,
+  childId: FactoryDeliveryId,
+) => tasks.find(({ taskId }) => childDeliveryId(parentId, taskId) === childId);
+
 const make = Effect.gen(function* () {
   const work = yield* WorkService.WorkService;
   const tasks = yield* FactoryTaskStore.FactoryTaskStore;

@@ -65,13 +65,26 @@ class FactoryStageCommandError extends Schema.TaggedError<FactoryStageCommandErr
   }
 }
 
-/** This server does not run child deliveries yet: a parent blocks on its first child's start. */
-class FactoryChildStartUnsupportedError extends Schema.TaggedError<FactoryChildStartUnsupportedError>()(
-  "FactoryChildStartUnsupportedError",
-  { child: FactoryDeliveryId },
+/**
+ * A parent's child cannot start on the parent's branch: its delivery is not stored, it has no
+ * worktree to share, or the task before it records no approved commit to start from.
+ */
+class FactoryChildStartError extends Schema.TaggedError<FactoryChildStartError>()(
+  "FactoryChildStartError",
+  {
+    child: FactoryDeliveryId,
+    reason: Schema.Literals(["missing", "no_worktree", "no_baseline"]),
+  },
 ) {
   override get message(): string {
-    return `This server cannot start child delivery ${this.child} yet.`;
+    switch (this.reason) {
+      case "missing":
+        return `Factory child delivery ${this.child} is not stored.`;
+      case "no_worktree":
+        return `Factory child delivery ${this.child} has no worktree to share with its parent.`;
+      case "no_baseline":
+        return `The task before Factory child delivery ${this.child} records no approved commit.`;
+    }
   }
 }
 
@@ -83,6 +96,11 @@ class FactoryChildStartUnsupportedError extends Schema.TaggedError<FactoryChildS
  * then queues it. A step that approves a parent's plan stores its tasks, in plan order, with the
  * approval. Each step that stores something moves the deliveries' change epoch once it has
  * committed.
+ *
+ * A parent runs its children one at a time on its branch and worktree: the worker starts the
+ * child the parent waits for, and hands the parent each child's approval once it is stored. A
+ * cancelled parent cancels its children that are not approved. A parent's lock is taken before
+ * its children's, never while one of theirs is held.
  */
 export class FactoryWorker extends Context.Service<
   FactoryWorker,
@@ -138,6 +156,15 @@ export class FactoryWorker extends Context.Service<
       Option.Option<FactoryDeliveryStore.StoredFactoryDelivery>,
       FactoryStoreError
     >;
+    /**
+     * Steps a parent with the approval of the child it waits for, once that child is approved;
+     * the parent then waits for something else, so the approval is taken once. Any other parent,
+     * or delivery, is left as it is. The boot sweep calls this for a parent whose child was
+     * approved while no server handed the approval on.
+     */
+    readonly takeChildApproval: (
+      parentId: FactoryDeliveryId,
+    ) => Effect.Effect<void, FactoryStoreError>;
     /**
      * Queues every recorded Work comment that is not finished: its transition was stored by a
      * process that stopped before posting it, or died while posting it. The boot sweep calls this.
@@ -439,7 +466,9 @@ const make = Effect.gen(function* () {
           })),
         );
       case "start_child":
-        return Effect.fail(new FactoryChildStartUnsupportedError({ child: effect.child }));
+        return startChild(delivery, effect).pipe(
+          Effect.as<FactoryEvent>({ type: "child.started", effectId: effect.id }),
+        );
     }
   };
 
@@ -592,12 +621,102 @@ const make = Effect.gen(function* () {
           threadId === awaited?.threadId ? { threadId, runId: awaited.runId } : { threadId },
         );
       }
+      // A parent's children go with it, the one it waits for and those it never started, and
+      // stop what their threads run; an approved child keeps its approval.
+      for (const childId of before.children) yield* cancelChild(childId);
     }
     return Option.some(stored);
   });
 
+  /** Cancels a cancelled parent's child, under the child's lock, unless it was approved. */
+  // Annotated: it closes the cycle `stepLocked` → `cancelChild`.
+  const cancelChild = (childId: FactoryDeliveryId): Effect.Effect<void, FactoryStoreError> =>
+    locks.withLock(
+      childId,
+      Effect.gen(function* () {
+        const child = yield* deliveries.get(childId);
+        if (Option.isNone(child) || child.value.state.status === "approved") return;
+        yield* stepLocked(childId, { type: "cancel" });
+      }),
+    );
+
+  /**
+   * Starts the parent's child for `start_child`, under the parent's lock while the parent still
+   * awaits the effect: a parent cancelled meanwhile starts none. A child that started before is
+   * left as it is. The child works on the parent's worktree and branch, from its task baseline:
+   * where the parent's branch started for the first child, and the commit the task before it was
+   * approved for after that, so its settle check judges only commits made since.
+   */
+  const startChild = (
+    parent: FactoryDeliveryStore.StoredFactoryDelivery,
+    effect: Extract<FactoryEffect, { readonly type: "start_child" }>,
+  ) =>
+    locks.withLock(
+      parent.deliveryId,
+      Effect.gen(function* () {
+        const current = Option.getOrUndefined(yield* deliveries.get(parent.deliveryId));
+        const awaiting = current?.state.awaiting;
+        if (
+          current === undefined ||
+          awaiting?.type !== "effect" ||
+          awaiting.effect.id !== effect.id
+        ) {
+          return;
+        }
+        const { child: childId } = effect;
+        const refuse = (reason: FactoryChildStartError["reason"]) =>
+          new FactoryChildStartError({ child: childId, reason });
+        const child = Option.getOrUndefined(yield* deliveries.get(childId));
+        if (child === undefined) return yield* refuse("missing");
+        if (child.state.status !== "queued") return;
+        // Without one, its author's launch would create a worktree and branch of its own.
+        if (child.state.worktreePath === null) return yield* refuse("no_worktree");
+        const { children } = current.state;
+        const previous = children[children.indexOf(childId) - 1];
+        // A parent stored before planner launches recorded where its branch started has no
+        // baseline: its first child then starts from HEAD before its author's first turn, as a
+        // single item does.
+        const baseline =
+          previous === undefined
+            ? current.state.baseline
+            : (FactoryChildren.taskOfChild(
+                current.deliveryId,
+                yield* tasks.listByDelivery(current.deliveryId),
+                previous,
+              )?.lastReviewedSha ?? (yield* refuse("no_baseline")));
+        yield* locks.withLock(
+          childId,
+          stepLocked(childId, { type: "start", ...(baseline === null ? {} : { baseline }) }),
+        );
+      }),
+    );
+
+  /** `takeChildApproval` under the parent's lock. */
+  const takeChildApprovalLocked = (parentId: FactoryDeliveryId) =>
+    Effect.gen(function* () {
+      const awaiting = Option.getOrUndefined(yield* deliveries.get(parentId))?.state.awaiting;
+      if (awaiting?.type !== "child") return;
+      const child = yield* deliveries.get(awaiting.deliveryId);
+      if (Option.isNone(child) || child.value.state.status !== "approved") return;
+      yield* stepLocked(parentId, { type: "child.approved", deliveryId: awaiting.deliveryId });
+    });
+
+  const takeChildApproval: FactoryWorker["Service"]["takeChildApproval"] = (parentId) =>
+    locks.withLock(parentId, takeChildApprovalLocked(parentId));
+
+  // A child's approval reaches its parent once the child's lock is released.
   const step: FactoryWorker["Service"]["step"] = (deliveryId, event) =>
-    locks.withLock(deliveryId, stepLocked(deliveryId, event));
+    locks
+      .withLock(deliveryId, stepLocked(deliveryId, event))
+      .pipe(
+        Effect.tap((stored) =>
+          Option.isSome(stored) &&
+          stored.value.parentId !== null &&
+          stored.value.state.status === "approved"
+            ? takeChildApproval(stored.value.parentId)
+            : Effect.void,
+        ),
+      );
 
   const stepWith: FactoryWorker["Service"]["stepWith"] = (deliveryId, decide) =>
     locks.withLock(
@@ -647,6 +766,14 @@ const make = Effect.gen(function* () {
   // Annotated like `step`: it closes the cycle `stepLocked` → lane → `runJob` → `feed`.
   const feed = (job: Job, event: FactoryEvent): ReturnType<FactoryWorker["Service"]["step"]> => {
     const { deliveryId } = job.delivery;
+    if (event.type === "child.started") {
+      // The child runs from its start on, and its approval may be stored before the parent
+      // waits for it; the parent then takes it at once.
+      return locks.withLock(
+        deliveryId,
+        stepLocked(deliveryId, event).pipe(Effect.tap(() => takeChildApprovalLocked(deliveryId))),
+      );
+    }
     const run = runOf(job.effect, event);
     if (run === undefined) return step(deliveryId, event);
     return locks.withLock(
@@ -770,6 +897,7 @@ const make = Effect.gen(function* () {
     stepWith,
     stepThread,
     failInterruptedEffect,
+    takeChildApproval,
     postUnfinishedComments,
     drain: TxRef.get(outstanding).pipe(
       Effect.flatMap((count) => (count > 0 ? Effect.txRetry : Effect.void)),

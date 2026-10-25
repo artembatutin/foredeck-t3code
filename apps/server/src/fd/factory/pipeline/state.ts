@@ -153,9 +153,9 @@ export type FactoryEffectRequest =
    */
   | { readonly type: "create_children" }
   /**
-   * Start the parent's child delivery, which is queued, or leave it as it is when it has started
-   * before, as when a resume starts again the child a parent waited on. Answered by
-   * `child.started`, after which the parent waits for that child's approval.
+   * Start the parent's child delivery, which is queued, with its task baseline, or leave it as it
+   * is when it has started before, as when a resume starts again the child a parent waited on.
+   * Answered by `child.started`, after which the parent waits for that child's approval.
    */
   | { readonly type: "start_child"; readonly child: FactoryDeliveryId };
 
@@ -360,7 +360,12 @@ export interface FactoryResumeCheck {
  * the reactor's run and thread events name the thread and run they observed.
  */
 export type FactoryEvent =
-  | { readonly type: "start" }
+  /**
+   * Starts a queued delivery. A parent starts its child with the child's task baseline: where the
+   * parent's branch started for its first child, the commit the previous task was approved for
+   * after that.
+   */
+  | { readonly type: "start"; readonly baseline?: string }
   /**
    * The owner's stop after the current step: a running delivery becomes `stopping`, finishes the
    * work of its stage and stops where it would begin the next one.
@@ -564,7 +569,11 @@ export interface FactoryDeliveryState {
   readonly baseRef: string;
   /** Recorded by the first thread launch, or set at creation to share a worktree. */
   readonly worktreePath: string | null;
-  /** HEAD before the author's first turn; settle checks require it to be an ancestor of HEAD. */
+  /**
+   * The task baseline; settle checks require it to be an ancestor of HEAD and judge only the
+   * commits after it. Set once: HEAD before a single item's author's first turn, where a parent's
+   * planner launch created its branch, or a child's, assigned by its parent at its start.
+   */
   readonly baseline: string | null;
   /** The latest thread of each role. */
   readonly threads: Partial<Readonly<Record<FactoryRole, ThreadId>>>;

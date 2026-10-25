@@ -492,11 +492,17 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  */
 export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
   switch (event.type) {
-    case "start":
+    case "start": {
       if (delivery.status !== "queued") return unchanged(delivery);
+      const started = {
+        ...delivery,
+        status: "running" as const,
+        baseline: event.baseline ?? delivery.baseline,
+      };
       return delivery.kind === "parent"
-        ? beginPlan({ ...delivery, status: "running" })
-        : begin({ ...delivery, status: "running" }, standardStages.author);
+        ? beginPlan(started)
+        : begin(started, standardStages.author);
+    }
     case "stop":
       // Stopping already, the stop changes nothing; only a running delivery stops after its step.
       return delivery.status === "running"
@@ -571,8 +577,10 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       const recorded = {
         ...delivery,
         worktreePath: delivery.worktreePath ?? event.worktreePath,
-        // The task baseline is the author's; a reviewer starts at the commit it reviews.
-        baseline: launch.role === "author" ? event.baseline : delivery.baseline,
+        // The task baseline is set once, by the first author or planner launch (a parent's is
+        // where its branch started) unless a child's parent assigned it; a reviewer starts at the
+        // commit it reviews.
+        baseline: delivery.baseline ?? (launch.role === "reviewer" ? null : event.baseline),
         threads: { ...delivery.threads, [launch.role]: event.threadId },
       };
       const run = { threadId: event.threadId, runId: event.runId };

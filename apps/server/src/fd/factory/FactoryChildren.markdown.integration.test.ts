@@ -288,7 +288,8 @@ describe("approving a parent's plan in a Markdown source", () => {
         yield* assertTaskFiles(world, deliveryId, itemIds);
         assert.deepStrictEqual(yield* childrenInWork(world), itemIds.toSorted());
 
-        // Their queued deliveries are the parent's children, in plan order.
+        // Their deliveries are the parent's children, in plan order; the first runs, and the
+        // others wait their turn.
         const factory = yield* service;
         const snapshot = toFactoryDelivery(Option.getOrThrow(yield* factory.get(deliveryId)));
         assert.strictEqual(snapshot.childIds.length, 3);
@@ -296,10 +297,12 @@ describe("approving a parent's plan in a Markdown source", () => {
           const child = Option.getOrThrow(yield* factory.get(childId));
           assert.deepStrictEqual(child.itemRef, { ...world.itemRef, itemId: itemIds[index] });
           assert.strictEqual(child.parentId, deliveryId);
-          assert.strictEqual(child.state.status, "queued");
+          assert.strictEqual(child.state.status, index === 0 ? "running" : "queued");
         }
-        // Only the planner ran.
-        assert.strictEqual(world.provider.started.length, 1);
+        // Only the planner and the first child's author ran, on the parent's worktree.
+        const first = yield* world.launched(snapshot.childIds[0]!);
+        assert.strictEqual(first.worktreePath, snapshot.worktreePath);
+        assert.strictEqual(world.provider.started.length, 2);
       }),
     ),
   );
