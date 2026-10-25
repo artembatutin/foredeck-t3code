@@ -11,6 +11,7 @@ import * as TxRef from "effect/TxRef";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { forkParked } from "../../serverActivation.ts";
+import { launchDeliveryId } from "./FactoryThreadEffects.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import { type FactoryThreadEvent, isTerminalRunStatus } from "./pipeline/state.ts";
@@ -37,7 +38,21 @@ export class FactoryReactor extends Context.Service<
   }
 >()("t3/fd/factory/FactoryReactor") {}
 
-type Job = "boot" | FactoryThreadEvent;
+/** A run going live on a thread a Factory launch made; see `FactoryWorker.stopCancelledRun`. */
+interface LiveRun {
+  readonly type: "run.live";
+  readonly threadId: ThreadId;
+  readonly runId: RunId;
+}
+
+type Job = "boot" | FactoryThreadEvent | LiveRun;
+
+/**
+ * A restart continuation goes live as it starts. A launch's run is left alone while it prepares
+ * the workspace: a cancelled delivery's launch still makes its branch and worktree, and its run is
+ * interrupted once its launch reports (see `FactoryWorker`).
+ */
+const LIVE_RUN_STATUSES: ReadonlySet<string> = new Set(["starting", "running"]);
 
 const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
@@ -96,27 +111,41 @@ const make = Effect.gen(function* () {
       if (ended !== null) yield* worker.step(deliveryId, ended);
     }).pipe(Effect.catchCause(logSkipped("factory delivery reconcile skipped")));
 
-  // Comments a previous process recorded and never finished go first, in their order.
+  // Comments a previous process recorded and never finished go first, in their order. Work a
+  // cancelled delivery's thread carried on after the restart is stopped last, once every
+  // cancellation the restart cut short is complete.
   const bootSweep = worker.postUnfinishedComments.pipe(
     Effect.catchCause(logSkipped("factory comment recovery failed")),
     Effect.andThen(deliveries.listActive()),
     Effect.flatMap((active) => Effect.forEach(active, reconcile, { discard: true })),
     Effect.catchCause(logSkipped("factory boot reconcile failed")),
+    Effect.andThen(worker.stopCancelledRuns),
   );
 
-  const jobs = yield* makeDrainableWorker((job: Job) =>
-    job === "boot"
-      ? bootSweep
-      : worker.stepThread(job).pipe(Effect.catchCause(logSkipped("factory thread event skipped"))),
-  );
+  const jobs = yield* makeDrainableWorker((job: Job) => {
+    if (job === "boot") return bootSweep;
+    if (job.type === "run.live") return worker.stopCancelledRun(job);
+    return worker
+      .stepThread(job)
+      .pipe(Effect.catchCause(logSkipped("factory thread event skipped")));
+  });
 
-  /** Run ends and thread deletions; everything else passes by. */
+  /**
+   * A run's end, a thread's deletion, and a run going live on a thread a Factory launch made;
+   * everything else passes by.
+   */
   const onDomainEvent = (event: OrchestrationV2DomainEvent): Effect.Effect<void> => {
     switch (event.type) {
+      case "run.created":
       case "run.updated": {
         const { id: runId, threadId, status } = event.payload;
-        return isTerminalRunStatus(status)
-          ? jobs.enqueue({ type: "run.finished", threadId, runId, status })
+        if (isTerminalRunStatus(status)) {
+          return event.type === "run.updated"
+            ? jobs.enqueue({ type: "run.finished", threadId, runId, status })
+            : Effect.void;
+        }
+        return LIVE_RUN_STATUSES.has(status) && launchDeliveryId(threadId) !== undefined
+          ? jobs.enqueue({ type: "run.live", threadId, runId })
           : Effect.void;
       }
       case "thread.deleted":

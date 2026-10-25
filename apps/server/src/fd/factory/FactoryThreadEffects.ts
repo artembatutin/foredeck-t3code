@@ -136,9 +136,20 @@ type FactoryThreadState = "present" | "deleted" | "missing";
 export const launchThreadId = (deliveryId: FactoryDeliveryId, effectId: number) =>
   ThreadId.make(`factory-thread:${deliveryId}:${effectId}`);
 
+const LAUNCH_THREAD = /^factory-thread:(.+):\d+$/;
+
+/** The delivery whose launch made the thread (see `launchThreadId`); none for any other thread. */
+export const launchDeliveryId = (threadId: ThreadId) => {
+  const deliveryId = LAUNCH_THREAD.exec(threadId)?.[1];
+  return deliveryId === undefined ? undefined : FactoryDeliveryId.make(deliveryId);
+};
+
 /** The first message of a launch's thread, which starts the launch's run. */
 const launchMessageId = (deliveryId: FactoryDeliveryId, effectId: number) =>
   MessageId.make(`factory-launch-message:${deliveryId}:${effectId}`);
+
+/** Every message Factory sends: a launch's first message, or a turn's (see `sendTurn`). */
+const FACTORY_MESSAGE = /^factory-[a-z-]+-message:/;
 
 /**
  * What became of a launch: it made no thread, made one that was deleted since, or made one whose
@@ -236,6 +247,23 @@ export class FactoryThreadEffects extends Context.Service<
     readonly liveRun: (
       threadId: ThreadId,
     ) => Effect.Effect<RunId | null, ProjectionStore.ProjectionStoreV2Error>;
+    /**
+     * Whether the run carries on a turn Factory sent on the thread: the run's own message is
+     * Factory's, or the run continues, through a server restart's continuations, a run whose is.
+     * A turn the owner sent on the thread, and its continuations, are not.
+     */
+    readonly carriesFactoryTurn: (
+      threadId: ThreadId,
+      runId: RunId,
+    ) => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
+    /**
+     * The run each thread a Factory launch made is live in now, among the threads core recovery
+     * keeps track of (any with an unfinished run).
+     */
+    readonly launchedLiveRuns: Effect.Effect<
+      ReadonlyArray<{ readonly threadId: ThreadId; readonly runId: RunId }>,
+      ProjectionStore.ProjectionStoreV2Error
+    >;
     /** The run's status once it has ended; none while it has not. */
     readonly runEnded: (
       threadId: ThreadId,
@@ -737,6 +765,40 @@ const make = Effect.gen(function* () {
               : shell.activeRunId,
           ),
         ),
+    carriesFactoryTurn: (threadId, runId) =>
+      projections.getThreadRecords(threadId, ["runs"]).pipe(
+        Effect.map(({ runs }) => {
+          let run = runs.find((candidate) => candidate.id === runId);
+          // Each continuation names the run it continues; a chain is never longer than the runs.
+          for (let hops = 0; run !== undefined && hops <= runs.length; hops += 1) {
+            if (FACTORY_MESSAGE.test(run.userMessageId)) return true;
+            const continued = run.restartContinuationOfRunId;
+            run =
+              continued === undefined
+                ? undefined
+                : runs.find((candidate) => candidate.id === continued);
+          }
+          return false;
+        }),
+      ),
+    launchedLiveRuns: projections.getRecoveryThreadIds("runtime").pipe(
+      Effect.flatMap((threadIds) =>
+        Effect.forEach(
+          threadIds.filter((threadId) => launchDeliveryId(threadId) !== undefined),
+          (threadId) =>
+            projections
+              .getThreadShell(threadId)
+              .pipe(
+                Effect.map((shell) =>
+                  shell === null || shell.deletedAt !== null || shell.activeRunId === null
+                    ? []
+                    : [{ threadId, runId: shell.activeRunId }],
+                ),
+              ),
+        ),
+      ),
+      Effect.map((runs) => runs.flat()),
+    ),
     runEnded: (threadId, runId) =>
       readThreadRun(threadId, runId).pipe(
         Effect.map(({ status }) =>

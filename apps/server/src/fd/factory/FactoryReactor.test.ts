@@ -200,6 +200,8 @@ const fakeThreads = (world: World) =>
       }),
     sendFixCommitTurn: () => Effect.die("fix-commit turn not scripted"),
     sendReviewRetryTurn: () => Effect.die("review retry turn not scripted"),
+    // No run is live on a Factory thread when a sweep here starts.
+    launchedLiveRuns: Effect.succeed([]),
     runEnded: (threadId, runId) =>
       (world.onRunRead?.(threadId, runId) ?? Effect.void).pipe(Effect.as(Option.none())),
   });

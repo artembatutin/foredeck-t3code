@@ -68,16 +68,17 @@ class FactoryStageCommandError extends Schema.TaggedError<FactoryStageCommandErr
 }
 
 /**
- * A parent's child cannot start on the parent's branch: its delivery is not stored among the
- * parent's children, it has no worktree to share, or which commit it starts from cannot be
- * established (the task before it records no approved commit, or the parent recorded no branch
- * start and its branch's reflog does not hold it). Nothing was started.
+ * A parent's child cannot start, or its start be taken, on the parent's branch: its delivery is
+ * not stored among the parent's children, it has no worktree to share, which commit it starts from
+ * cannot be established (the task before it records no approved commit, or the parent recorded no
+ * branch start and its branch's reflog does not hold it), or the parent's first child started from
+ * a commit other than where the branch started. Nothing was started or taken.
  */
 class FactoryChildStartError extends Schema.TaggedError<FactoryChildStartError>()(
   "FactoryChildStartError",
   {
     child: FactoryDeliveryId,
-    reason: Schema.Literals(["missing", "no_worktree", "no_baseline"]),
+    reason: Schema.Literals(["missing", "no_worktree", "no_baseline", "baseline_mismatch"]),
   },
 ) {
   override get message(): string {
@@ -88,6 +89,8 @@ class FactoryChildStartError extends Schema.TaggedError<FactoryChildStartError>(
         return `Factory child delivery ${this.child} has no worktree to share with its parent.`;
       case "no_baseline":
         return `Factory cannot tell which commit child delivery ${this.child} starts from.`;
+      case "baseline_mismatch":
+        return `The first child of child delivery ${this.child}'s parent started from a commit other than where the parent's branch started.`;
     }
   }
 }
@@ -182,6 +185,23 @@ export class FactoryWorker extends Context.Service<
     readonly finishCancellation: (
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<void, FactoryStoreError>;
+    /**
+     * Interrupts a live run on a thread of a cancelled delivery when it carries on a turn Factory
+     * sent. A cancel commits before it interrupts what its threads run, so a server that stopped
+     * in between leaves that work to core's restart continuation, which carries it on in a new run
+     * the cancelled delivery never takes. The owner's own turns on the thread are left alone. A
+     * failure is logged, as a cancel's interrupt is. The reactor calls this as such a run goes
+     * live.
+     */
+    readonly stopCancelledRun: (run: {
+      readonly threadId: ThreadId;
+      readonly runId: RunId;
+    }) => Effect.Effect<void>;
+    /**
+     * `stopCancelledRun` for every run live on a thread a Factory launch made; the boot sweep
+     * calls this for runs that went live before the reactor was listening.
+     */
+    readonly stopCancelledRuns: Effect.Effect<void>;
     /**
      * Queues every recorded Work comment that is not finished: its transition was stored by a
      * process that stopped before posting it, or died while posting it. The boot sweep calls this.
@@ -669,57 +689,78 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  /**
-   * The `child.started` result for a child that has started: the first child's carries its
-   * baseline, where the parent's branch started.
-   */
-  const childStarted = (
-    parent: FactoryDeliveryStore.StoredFactoryDelivery,
-    effectId: number,
-    child: FactoryDeliveryStore.StoredFactoryDelivery,
-  ): FactoryEvent => {
-    const { baseline } = child.state;
-    return parent.state.children[0] === child.deliveryId && baseline !== null
-      ? { type: "child.started", effectId, baseline }
-      : { type: "child.started", effectId };
-  };
+  /** A `child.started` result, carrying where the parent's branch started when it recorded none. */
+  const childStarted = (effectId: number, branchStart: string | null): FactoryEvent =>
+    branchStart === null
+      ? { type: "child.started", effectId }
+      : { type: "child.started", effectId, baseline: branchStart };
 
   /**
-   * A child's task baseline: where the parent's branch started for the first child, and the
-   * commit the task before it was approved for after that, so its settle check and review judge
-   * only the commits made since. A parent stored before planner launches recorded where its
-   * branch started has it read from its branch's reflog, never from the worktree's HEAD, which
-   * commits since may have moved; a baseline that cannot be established refuses the start.
+   * Where a parent's branch started, when the parent recorded none: one stored before planner
+   * launches recorded it. Read from its branch's reflog, never from the worktree's HEAD, which
+   * commits since may have moved. Its first child, once started, must have started there: an
+   * earlier server started one from that HEAD, and its settle check and review then missed the
+   * commits before it. None for a parent that recorded it. Refused when it cannot be
+   * established, or the first child started elsewhere.
    */
-  const childBaseline = (
+  const unrecordedBranchStart = (
     parent: FactoryDeliveryStore.StoredFactoryDelivery,
-    childId: FactoryDeliveryId,
+    refuse: (reason: FactoryChildStartError["reason"]) => FactoryChildStartError,
   ) =>
     Effect.gen(function* () {
-      const refuse = (reason: FactoryChildStartError["reason"]) =>
-        new FactoryChildStartError({ child: childId, reason });
-      const { children, baseline, worktreePath, branch } = parent.state;
-      const index = children.indexOf(childId);
-      if (index < 0) return yield* refuse("missing");
-      const previous = children[index - 1];
-      if (previous !== undefined) {
-        const stored = yield* tasks.listByDelivery(parent.deliveryId);
-        const task = FactoryChildren.taskOfChild(parent.deliveryId, stored, previous);
-        return task?.lastReviewedSha ?? (yield* refuse("no_baseline"));
-      }
-      if (baseline !== null) return baseline;
+      const { baseline, worktreePath, branch, children } = parent.state;
+      if (baseline !== null) return null;
       if (worktreePath === null) return yield* refuse("no_worktree");
       const created = yield* readBranchCreation(worktreePath, branch).pipe(
         Effect.provideContext(gitContext),
       );
-      return Option.getOrUndefined(created) ?? (yield* refuse("no_baseline"));
+      if (Option.isNone(created)) return yield* refuse("no_baseline");
+      const [firstId] = children;
+      const first =
+        firstId === undefined ? undefined : Option.getOrUndefined(yield* deliveries.get(firstId));
+      if (
+        first !== undefined &&
+        first.state.status !== "queued" &&
+        first.state.baseline !== created.value
+      ) {
+        return yield* refuse("baseline_mismatch");
+      }
+      return created.value;
     });
+
+  /**
+   * A child's task baseline: where the parent's branch started (`branchStart` when the parent
+   * recorded none) for the first child, and the commit the task before it was approved for after
+   * that, so its settle check and review judge only the commits made since.
+   */
+  const childBaseline = (
+    parent: FactoryDeliveryStore.StoredFactoryDelivery,
+    childId: FactoryDeliveryId,
+    branchStart: string | null,
+    refuse: (reason: FactoryChildStartError["reason"]) => FactoryChildStartError,
+  ) =>
+    Effect.gen(function* () {
+      const { children, baseline } = parent.state;
+      const index = children.indexOf(childId);
+      if (index < 0) return yield* refuse("missing");
+      const previous = children[index - 1];
+      if (previous === undefined) {
+        return baseline ?? branchStart ?? (yield* refuse("no_baseline"));
+      }
+      const stored = yield* tasks.listByDelivery(parent.deliveryId);
+      const task = FactoryChildren.taskOfChild(parent.deliveryId, stored, previous);
+      return task?.lastReviewedSha ?? (yield* refuse("no_baseline"));
+    });
+
+  const childRefusal = (childId: FactoryDeliveryId) => (reason: FactoryChildStartError["reason"]) =>
+    new FactoryChildStartError({ child: childId, reason });
 
   /**
    * Carries out `start_child` under the parent's lock while the parent still awaits it: a parent
    * cancelled meanwhile starts none. Starts the child, which is queued, on the parent's worktree
-   * and branch from its task baseline (see `childBaseline`), or leaves one that started before as
-   * it is. Returns the result to feed back.
+   * and branch from its task baseline (see `childBaseline`), or takes one that started before as
+   * it is. Either way a parent without a recorded branch start establishes it first (see
+   * `unrecordedBranchStart`). Returns the result to feed back.
    */
   const startChild = (
     parent: FactoryDeliveryStore.StoredFactoryDelivery,
@@ -728,7 +769,6 @@ const make = Effect.gen(function* () {
     locks.withLock(
       parent.deliveryId,
       Effect.gen(function* () {
-        const result: FactoryEvent = { type: "child.started", effectId: effect.id };
         const current = Option.getOrUndefined(yield* deliveries.get(parent.deliveryId));
         const awaiting = current?.state.awaiting;
         // The parent no longer awaits the effect, so the result changes nothing.
@@ -737,25 +777,19 @@ const make = Effect.gen(function* () {
           awaiting?.type !== "effect" ||
           awaiting.effect.id !== effect.id
         ) {
-          return result;
+          return childStarted(effect.id, null);
         }
         const { child: childId } = effect;
-        const refuse = (reason: FactoryChildStartError["reason"]) =>
-          new FactoryChildStartError({ child: childId, reason });
+        const refuse = childRefusal(childId);
         const child = Option.getOrUndefined(yield* deliveries.get(childId));
         if (child === undefined) return yield* refuse("missing");
-        if (child.state.status !== "queued") return childStarted(current, effect.id, child);
+        const branchStart = yield* unrecordedBranchStart(current, refuse);
+        if (child.state.status !== "queued") return childStarted(effect.id, branchStart);
         // Without one, its author's launch would create a worktree and branch of its own.
         if (child.state.worktreePath === null) return yield* refuse("no_worktree");
-        const baseline = yield* childBaseline(current, childId);
-        const started = yield* locks.withLock(
-          childId,
-          stepLocked(childId, { type: "start", baseline }),
-        );
-        return Option.match(started, {
-          onNone: () => result,
-          onSome: (stored) => childStarted(current, effect.id, stored),
-        });
+        const baseline = yield* childBaseline(current, childId, branchStart, refuse);
+        yield* locks.withLock(childId, stepLocked(childId, { type: "start", baseline }));
+        return childStarted(effect.id, branchStart);
       }),
     );
 
@@ -918,13 +952,29 @@ const make = Effect.gen(function* () {
         // awaited effect is still queued or running here, or has already fed its result back.
         if (awaiting?.type !== "effect" || lanes.has(deliveryId)) return current;
         // A child's start is stored before its parent's result: one that took place is the
-        // result, and the child's approval stored since follows it.
+        // result, as the effect itself would take it, and the child's approval stored since
+        // follows it.
         const { effect } = awaiting;
         if (effect.type === "start_child") {
           const child = yield* deliveries.get(effect.child);
           if (Option.isSome(child) && child.value.state.status !== "queued") {
-            yield* stepLocked(deliveryId, childStarted(current.value, effect.id, child.value));
-            yield* takeChildApprovalLocked(deliveryId);
+            const failed = (tag: string): FactoryEvent => ({
+              type: "effect.failed",
+              effectId: effect.id,
+              detail: `Factory could not ${describeEffect(effect)} (${tag}).`,
+            });
+            const taken = yield* unrecordedBranchStart(
+              current.value,
+              childRefusal(effect.child),
+            ).pipe(
+              Effect.map((branchStart) => childStarted(effect.id, branchStart)),
+              Effect.catchTags({
+                FactoryChildStartError: (error) => Effect.succeed(failed(error._tag)),
+                FactoryBranchStartError: (error) => Effect.succeed(failed(error._tag)),
+              }),
+            );
+            yield* stepLocked(deliveryId, taken);
+            if (taken.type === "child.started") yield* takeChildApprovalLocked(deliveryId);
             return yield* deliveries.get(deliveryId);
           }
         }
@@ -950,6 +1000,33 @@ const make = Effect.gen(function* () {
         if (child?.state.status === "cancelled") return yield* cancelParent(deliveryId);
       }
     });
+
+  const stopCancelledRun: FactoryWorker["Service"]["stopCancelledRun"] = (run) =>
+    Effect.gen(function* () {
+      const deliveryId = FactoryThreadEffects.launchDeliveryId(run.threadId);
+      if (deliveryId === undefined) return;
+      const delivery = Option.getOrUndefined(yield* deliveries.get(deliveryId));
+      if (delivery?.state.status !== "cancelled") return;
+      if (!(yield* threads.carriesFactoryTurn(run.threadId, run.runId))) return;
+      yield* interruptCancelled(delivery, run);
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("factory could not stop a cancelled delivery's run", cause),
+      ),
+    );
+
+  const stopCancelledRuns: FactoryWorker["Service"]["stopCancelledRuns"] = Effect.suspend(
+    () => threads.launchedLiveRuns,
+  ).pipe(
+    Effect.flatMap((runs) => Effect.forEach(runs, stopCancelledRun, { discard: true })),
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.interrupt
+        : Effect.logWarning("factory could not read the live runs of its threads", cause),
+    ),
+  );
 
   /**
    * Runs an effect and feeds its result back. Suspended, so an executor that throws while
@@ -1001,6 +1078,8 @@ const make = Effect.gen(function* () {
     failInterruptedEffect,
     takeChildApproval,
     finishCancellation,
+    stopCancelledRun,
+    stopCancelledRuns,
     postUnfinishedComments,
     drain: TxRef.get(outstanding).pipe(
       Effect.flatMap((count) => (count > 0 ? Effect.txRetry : Effect.void)),

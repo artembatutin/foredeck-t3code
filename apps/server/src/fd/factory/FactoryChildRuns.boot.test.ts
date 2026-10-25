@@ -105,11 +105,20 @@ interface World {
     readonly threadId: ThreadId;
     readonly runId?: RunId;
   }>;
+  /**
+   * Runs live on threads Factory launched as a server starts, and whether each carries on a turn
+   * Factory sent (or the owner's own).
+   */
+  readonly liveRuns: Array<{
+    readonly threadId: ThreadId;
+    readonly runId: RunId;
+    readonly factoryTurn: boolean;
+  }>;
 }
 
-/** The thread and first run a delivery's launch effect makes here. */
+/** The thread and first run a delivery's launch effect makes here, its thread as Factory names it. */
 const launched = (deliveryId: FactoryDeliveryId, effectId: number) => ({
-  threadId: ThreadId.make(`thread-${deliveryId}-${effectId}`),
+  threadId: FactoryThreadEffects.launchThreadId(deliveryId, effectId),
   runId: RunId.make(`run-${deliveryId}-${effectId}`),
 });
 
@@ -130,6 +139,15 @@ const fakeThreads = (world: World) =>
         };
       }),
     threadState: () => Effect.succeed("present" as const),
+    launchedLiveRuns: Effect.sync(() =>
+      world.liveRuns.map(({ threadId, runId }) => ({ threadId, runId })),
+    ),
+    carriesFactoryTurn: (threadId, runId) =>
+      Effect.sync(
+        () =>
+          world.liveRuns.find((run) => run.threadId === threadId && run.runId === runId)
+            ?.factoryTurn ?? false,
+      ),
     runEnded: () => Effect.succeedNone,
     interruptRun: (delivery, run) =>
       Effect.sync(() => void world.interrupts.push({ deliveryId: delivery.deliveryId, ...run })),
@@ -186,7 +204,7 @@ const serverLayer = FactoryReactor.layer.pipe(
 );
 
 const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
-  const world: World = { launches: [], interrupts: [] };
+  const world: World = { launches: [], interrupts: [], liveRuns: [] };
   return body(world).pipe(Effect.provide(baseLayer(world)), Effect.scoped);
 };
 
@@ -249,19 +267,23 @@ const startedFirst: FactoryEvent = { type: "child.started", effectId: 3 };
 const queuedChild = (worktreePath = defaultWorktree) =>
   queuedDeliveryState({ kind: "child", branch, baseRef: "HEAD", worktreePath });
 /** A child its parent started from `baseline`, whose author's first run goes on. */
-const runningChild = (deliveryId: FactoryDeliveryId, baseline: string) =>
-  fold(queuedChild(), [
+const runningChild = (
+  deliveryId: FactoryDeliveryId,
+  baseline: string,
+  worktreePath = defaultWorktree,
+) =>
+  fold(queuedChild(worktreePath), [
     { type: "start", baseline },
     {
       type: "thread.launched",
       effectId: 1,
       ...launched(deliveryId, 1),
-      worktreePath: defaultWorktree,
+      worktreePath,
       baseline: launchHead,
     },
   ]);
-const approvedChild = (baseline: string): FactoryDeliveryState => ({
-  ...queuedChild(),
+const approvedChild = (baseline: string, worktreePath = defaultWorktree): FactoryDeliveryState => ({
+  ...queuedChild(worktreePath),
   status: "approved",
   stage: "record",
   baseline,
@@ -600,6 +622,139 @@ describe("a parent stored before its branch start was recorded", () => {
   );
 });
 
+/**
+ * How an earlier server could have started a stored-before parent's first child: from HEAD at its
+ * launch, after a commit on the branch (`elsewhere`), or where the branch started.
+ */
+const startedFirstChild = [
+  { started: "elsewhere", atBranchStart: false },
+  { started: "where its branch started", atBranchStart: true },
+] as const;
+
+describe("a parent stored before its branch start was recorded, its first child started", () => {
+  it.effect.each(startedFirstChild)(
+    "takes on resume a first child started $started only from the branch start",
+    ({ atBranchStart }) =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const checkout = yield* legacyCheckout({ reflog: true });
+          const startedFrom = atBranchStart ? checkout.start : checkout.head;
+          const queued = queuedChild(checkout.worktreePath);
+          yield* seed({
+            parent: legacyParent(checkout.worktreePath),
+            children: [runningChild(first, startedFrom, checkout.worktreePath), queued, queued],
+            firstTaskApproved: false,
+          });
+          const running = yield* stateOf(first);
+
+          yield* boot(Effect.flatMap(service, (factory) => factory.resume(parentId)));
+
+          const parent = yield* stateOf(parentId);
+          if (atBranchStart) {
+            assert.strictEqual(parent.status, "running");
+            assert.strictEqual(parent.baseline, checkout.start);
+            assert.deepStrictEqual(parent.awaiting, { type: "child", deliveryId: first });
+          } else {
+            // Its review missed the commit before its start: the parent blocks rather than take
+            // that start, or record it as where the branch started.
+            assert.strictEqual(parent.status, "blocked");
+            assert.deepStrictEqual(parent.block, {
+              reason: "effect_failed",
+              effect: { id: 4, type: "start_child", child: first },
+              detail: "Factory could not start the child delivery (FactoryChildStartError).",
+            });
+            assert.isNull(parent.baseline);
+          }
+          assert.deepStrictEqual(yield* stateOf(first), running);
+          assert.deepStrictEqual(world.launches, []);
+        }),
+      ),
+  );
+
+  it.effect.each(startedFirstChild)(
+    "takes at boot a lost start of a first child started $started only from the branch start",
+    ({ atBranchStart }) =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const checkout = yield* legacyCheckout({ reflog: true });
+          const startedFrom = atBranchStart ? checkout.start : checkout.head;
+          const queued = queuedChild(checkout.worktreePath);
+          // The child's start was stored, and the parent's result of it was lost.
+          yield* seed({
+            parent: { ...awaitingFirstStart(checkout.worktreePath), baseline: null },
+            children: [runningChild(first, startedFrom, checkout.worktreePath), queued, queued],
+            firstTaskApproved: false,
+          });
+
+          yield* sweep;
+
+          const parent = yield* stateOf(parentId);
+          if (atBranchStart) {
+            assert.deepStrictEqual(parent.awaiting, { type: "child", deliveryId: first });
+            assert.strictEqual(parent.baseline, checkout.start);
+          } else {
+            assert.deepStrictEqual(parent.block, {
+              reason: "effect_failed",
+              effect: { id: 3, type: "start_child", child: first },
+              detail: "Factory could not start the child delivery (FactoryChildStartError).",
+            });
+            assert.isNull(parent.baseline);
+          }
+          assert.deepStrictEqual(world.launches, []);
+
+          const before = yield* rows;
+          yield* sweep;
+          assert.deepStrictEqual(yield* rows, before);
+        }),
+      ),
+  );
+
+  it.effect.each(startedFirstChild)(
+    "hands on at boot a first child approved from $started only from the branch start",
+    ({ atBranchStart }) =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const checkout = yield* legacyCheckout({ reflog: true });
+          const startedFrom = atBranchStart ? checkout.start : checkout.head;
+          const queued = queuedChild(checkout.worktreePath);
+          // The parent took the first child's start without recording where its branch started,
+          // and the child was approved while no server handed the approval on.
+          yield* seed({
+            parent: {
+              ...fold(awaitingFirstStart(checkout.worktreePath), [startedFirst]),
+              baseline: null,
+            },
+            children: [approvedChild(startedFrom, checkout.worktreePath), queued, queued],
+            firstTaskApproved: true,
+          });
+
+          yield* sweep;
+
+          const parent = yield* stateOf(parentId);
+          assert.deepStrictEqual(parent.approvedChildren, [first]);
+          if (atBranchStart) {
+            assert.strictEqual(parent.baseline, checkout.start);
+            assert.deepStrictEqual(parent.awaiting, { type: "child", deliveryId: second });
+            assert.strictEqual((yield* stateOf(second)).baseline, firstApproved);
+            assert.deepStrictEqual(
+              world.launches.map(({ deliveryId }) => deliveryId),
+              [second],
+            );
+          } else {
+            assert.deepStrictEqual(parent.block, {
+              reason: "effect_failed",
+              effect: { id: 4, type: "start_child", child: second },
+              detail: "Factory could not start the child delivery (FactoryChildStartError).",
+            });
+            assert.isNull(parent.baseline);
+            assert.deepStrictEqual(yield* stateOf(second), queued);
+            assert.deepStrictEqual(world.launches, []);
+          }
+        }),
+      ),
+  );
+});
+
 describe("a cancellation a restart cut short", () => {
   it.effect("cancels the unfinished children of a cancelled parent, stopping their runs", () =>
     withWorld((world) =>
@@ -682,6 +837,97 @@ describe("a cancellation a restart cut short", () => {
         const before = yield* rows;
         yield* sweep;
         assert.deepStrictEqual(yield* rows, before);
+      }),
+    ),
+  );
+
+  it.effect.each([
+    { shape: "with its parent", parentCancelled: true },
+    { shape: "on its own", parentCancelled: false },
+  ])(
+    "stops the turn a restart carried on for a child cancelled $shape before its interrupt",
+    ({ parentCancelled }) =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          // The cancels were stored and the server stopped before any interrupt was sent; core's
+          // restart continuation carried the child's author turn on in a new run.
+          const waiting = fold(awaitingFirstStart(), [
+            startedFirst,
+            { type: "child.approved", deliveryId: first },
+            { type: "child.started", effectId: 4 },
+          ]);
+          const cancel = (state: FactoryDeliveryState) =>
+            advance(state, { type: "cancel" }).delivery;
+          yield* seed({
+            parent: parentCancelled ? cancel(waiting) : waiting,
+            children: [
+              approvedChild(branchStart),
+              cancel(runningChild(second, firstApproved)),
+              parentCancelled ? cancel(queuedChild()) : queuedChild(),
+            ],
+            firstTaskApproved: true,
+          });
+          const author = launched(second, 1);
+          const continued = RunId.make("run-continued-after-restart");
+          world.liveRuns.push({ threadId: author.threadId, runId: continued, factoryTurn: true });
+          // A run live on the approved child's thread belongs to no cancelled delivery.
+          const approved = launched(first, 1);
+          world.liveRuns.push({
+            threadId: approved.threadId,
+            runId: approved.runId,
+            factoryTurn: true,
+          });
+
+          yield* sweep;
+
+          assert.deepStrictEqual(
+            world.interrupts.filter(({ deliveryId }) => deliveryId === second),
+            [{ deliveryId: second, threadId: author.threadId, runId: continued }],
+          );
+          assert.isFalse(world.interrupts.some(({ deliveryId }) => deliveryId === first));
+          for (const deliveryId of [parentId, second, third]) {
+            assert.strictEqual((yield* stateOf(deliveryId)).status, "cancelled");
+          }
+          assert.strictEqual((yield* stateOf(first)).status, "approved");
+          assert.deepStrictEqual(world.launches, []);
+
+          // Once its run stops, the next server finds nothing more to stop.
+          world.liveRuns.length = 0;
+          const before = { rows: yield* rows, interrupts: world.interrupts.length };
+          yield* sweep;
+          assert.deepStrictEqual(
+            { rows: yield* rows, interrupts: world.interrupts.length },
+            before,
+          );
+        }),
+      ),
+  );
+
+  it.effect("leaves the owner's own turn on a cancelled child's thread alone", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const waiting = fold(awaitingFirstStart(), [startedFirst]);
+        const cancel = (state: FactoryDeliveryState) => advance(state, { type: "cancel" }).delivery;
+        yield* seed({
+          parent: cancel(waiting),
+          children: [
+            cancel(runningChild(first, branchStart)),
+            cancel(queuedChild()),
+            cancel(queuedChild()),
+          ],
+          firstTaskApproved: false,
+        });
+        const author = launched(first, 1);
+        // The owner went on with the thread after the cancel; a restart carried that turn on.
+        world.liveRuns.push({
+          threadId: author.threadId,
+          runId: RunId.make("run-owner-turn"),
+          factoryTurn: false,
+        });
+
+        yield* sweep;
+
+        assert.deepStrictEqual(world.interrupts, []);
       }),
     ),
   );

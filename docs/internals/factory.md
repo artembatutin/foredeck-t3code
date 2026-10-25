@@ -47,8 +47,10 @@ before it was approved for (its `lastReviewedSha`) after that. Not the HEAD its 
 commit made while the plan waits at the gate, or between two children, is then judged by the next
 child's settle check and review instead of passing into the branch unreviewed. A parent stored
 before planner launches recorded where its branch started has it read from its branch's reflog
-when its first child starts, and keeps it; a reflog that no longer holds the creation refuses the
-start, and the parent blocks rather than take HEAD for it.
+at its next child start, and keeps it. A first child an earlier server already started counts only
+if it started there: that server took HEAD, and the child's review then missed the commits before
+it. A reflog that no longer holds the creation, or a first child started elsewhere, refuses the
+start, and the parent blocks rather than record a later commit as its base.
 
 ## A delivery's launches stay under its starter's mode
 
@@ -267,7 +269,20 @@ A parent's cancel cancels its children that are not approved, and by owner decis
 cancel cancels its parent, so its unfinished siblings too; each stops what its threads run, and
 approved children keep their approvals. Each delivery's cancel is its own commit, so the boot
 sweep completes a cancellation a restart cut short between a parent and its children before
-anything else moves them. The worker takes a parent's lock before a child's, never the other way:
+anything else moves them.
+
+A cancel's interrupts are sent after it commits, and a server that stops in between leaves its
+agent working until core's restart recovery cuts the turn. With continue-after-restart on, core
+then carries the turn on in a new run on the same thread
+([`RestartContinuation.ts`](../../apps/server/src/orchestration-v2/RestartContinuation.ts)), which
+the cancelled delivery never takes. Core skips only runs whose interrupt it recorded, and once
+recovery has ended the run, an interrupt no longer records one. So Factory stops the
+continuation itself: a run going live on a thread a Factory launch made (its id names the
+delivery) is interrupted when that delivery is cancelled and the run carries on a turn Factory
+sent, judged by the message that began the chain of continuations. The reactor checks as runs go
+live, and the boot sweep checks the runs already live. The owner's own turns on such a thread
+are theirs, and a launch still preparing its workspace is left to the late-launch interrupt, so a
+cancelled launch still makes its branch and worktree. The worker takes a parent's lock before a child's, never the other way:
 a child's approval or cancel reaches its parent only once the child's step has released its lock
 ([`FactoryWorker.ts`](../../apps/server/src/fd/factory/FactoryWorker.ts)). An approval stored
 while no server handed it on is handed on by the boot sweep, once, since the parent then waits for

@@ -110,6 +110,8 @@ const plannerThreads = (calls: PlannerCalls) =>
       launchState: () => Effect.die("launch read not scripted"),
       threadState: () => Effect.die("thread read not scripted"),
       liveRun: () => Effect.die("live run read not scripted"),
+      carriesFactoryTurn: () => Effect.die("factory turn read not scripted"),
+      launchedLiveRuns: Effect.die("live runs read not scripted"),
       // Every run is still going; its end arrives as a step.
       runEnded: () => Effect.succeedNone,
       interruptRun: (_delivery, { threadId }) =>
