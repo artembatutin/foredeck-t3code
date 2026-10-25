@@ -17,6 +17,28 @@ export {
   type FactoryTimelineEntry,
 } from "./model.ts";
 export {
+  addFactoryPlanCriterion,
+  addFactoryTestPlanEntry,
+  editFactoryPlanCriterion,
+  editFactoryPlanTask,
+  editFactoryTestPlanEntry,
+  FACTORY_PLAN_BOUNDS,
+  factoryPlanDraft,
+  factoryPlanDraftEdited,
+  factoryPlanFromDraft,
+  moveFactoryPlanTask,
+  removeFactoryPlanCriterion,
+  removeFactoryPlanTask,
+  removeFactoryTestPlanEntry,
+  type FactoryPlanDraft,
+  type FactoryPlanDraftResult,
+  type FactoryPlanErrors,
+  type FactoryPlanTaskDraft,
+  type FactoryPlanTaskErrors,
+  type FactoryPlanTaskField,
+  type FactoryTestPlanEntryDraft,
+} from "./planDraft.ts";
+export {
   cancelConfirmationTarget,
   factoryDeliveryView,
   receiptText,
