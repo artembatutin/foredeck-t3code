@@ -80,16 +80,27 @@ export interface FactoryControls {
 
 const isTerminal = (status: FactoryStatus) => status === "done" || status === "cancelled";
 
+const NO_CONTROLS: FactoryControls = { stop: false, resume: false, cancel: false };
+
 /**
- * The controls a status offers, as the server's engine accepts them: stop only while running,
- * resume while stopping, stopped or blocked, and cancel until the delivery ends. A status this
- * build does not know offers none.
+ * The controls a delivery offers, as the server's engine accepts them: stop only while running,
+ * resume while stopping, stopped or blocked, and cancel until the delivery ends. A delivery this
+ * build cannot fully read, with a status or a current stage name or kind it does not know, is
+ * read-only and offers none.
  */
-export const factoryControls = (status: FactoryStatus): FactoryControls => ({
-  stop: status === "running",
-  resume: status === "stopping" || status === "stopped" || status === "blocked",
-  cancel: status !== "unknown" && !isTerminal(status),
-});
+export const factoryControls = (
+  delivery: Pick<FactoryDelivery, "status" | "stage">,
+): FactoryControls => {
+  const { status, stage } = delivery;
+  if (status === "unknown" || stage?.name === "unknown" || stage?.kind === "unknown") {
+    return NO_CONTROLS;
+  }
+  return {
+    stop: status === "running",
+    resume: status === "stopping" || status === "stopped" || status === "blocked",
+    cancel: !isTerminal(status),
+  };
+};
 
 /**
  * The delivery an item's surfaces show: the one not done or cancelled (the server allows one),

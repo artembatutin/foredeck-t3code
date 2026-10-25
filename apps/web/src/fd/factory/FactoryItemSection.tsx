@@ -1,7 +1,7 @@
 import { useAtomValue } from "@effect/atom-react";
 import type { AtomCommandResult } from "@t3tools/client-runtime/state/runtime";
 import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
-import type { FactoryDelivery } from "@t3tools/contracts/fd/factory";
+import type { FactoryDelivery, FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemSummary } from "@t3tools/contracts/fd/work-management";
 import { useNavigate } from "@tanstack/react-router";
 import { FactoryIcon } from "lucide-react";
@@ -18,9 +18,10 @@ import {
 } from "../../components/ui/alert-dialog";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
+import { useConnectedEnvironmentIds } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
-import { factoryErrorText, factoryItemSection } from "./itemSection";
+import { cancelConfirmationTarget, factoryErrorText, factoryItemSection } from "./itemSection";
 import { factoryEnvironment } from "./state";
 
 interface FactoryItemSectionProps {
@@ -49,6 +50,7 @@ type Action = "start" | "stop" | "resume" | "cancel";
 function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps) {
   const navigate = useNavigate();
   const supported = useAtomValue(factoryEnvironment.supported(environmentId));
+  const connected = useConnectedEnvironmentIds().includes(environmentId);
   const deliveriesQuery = useEnvironmentQuery(
     factoryEnvironment.deliveries({ environmentId, input: { projectId } }),
   );
@@ -65,16 +67,22 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
   const [pending, setPending] = useState<Action | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [started, setStarted] = useState<FactoryDelivery | null>(null);
-  const [confirmingCancel, setConfirmingCancel] = useState(false);
+  // The delivery the open cancel confirmation was opened for.
+  const [confirmingCancel, setConfirmingCancel] = useState<FactoryDeliveryId | null>(null);
 
   const view = factoryItemSection({
     environmentId,
     itemRef: item.ref,
     supported,
+    connected,
     deliveries: deliveriesQuery.data?.deliveries ?? null,
     started,
     permitted,
   });
+  const cancelling = cancelConfirmationTarget(view, confirmingCancel);
+  // Adjusted during render: a confirmation whose delivery was replaced or can no longer be
+  // cancelled closes, and does not come back if that delivery becomes cancellable again.
+  if (confirmingCancel !== null && cancelling === null) setConfirmingCancel(null);
   if (view === null) {
     return deliveriesQuery.error === null ? null : (
       <p className="text-destructive text-sm">{deliveriesQuery.error}</p>
@@ -165,7 +173,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
                   size="xs"
                   variant="ghost"
                   disabled={pending !== null}
-                  onClick={() => setConfirmingCancel(true)}
+                  onClick={() => setConfirmingCancel(delivery.deliveryId)}
                 >
                   Cancel delivery
                 </Button>
@@ -216,31 +224,38 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
           ))}
         </ol>
       ) : null}
-      {target !== null ? (
-        <AlertDialog open={confirmingCancel} onOpenChange={setConfirmingCancel}>
-          <AlertDialogPopup>
-            <AlertDialogHeader>
-              <AlertDialogTitle>Cancel the delivery of {item.key}?</AlertDialogTitle>
-              <AlertDialogDescription>
-                Its agents stop what they are working on and the delivery ends. Its branch, worktree
-                and commits stay; delivering the item again starts on a new branch.
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogClose render={<Button variant="outline" />}>Keep it</AlertDialogClose>
-              <Button
-                variant="destructive"
-                onClick={() => {
-                  setConfirmingCancel(false);
-                  void run("cancel", () => cancel(target));
-                }}
-              >
-                Cancel delivery
-              </Button>
-            </AlertDialogFooter>
-          </AlertDialogPopup>
-        </AlertDialog>
-      ) : null}
+      <AlertDialog
+        open={cancelling !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmingCancel(null);
+        }}
+      >
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Cancel the delivery of {item.key}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Its agents stop what they are working on and the delivery ends. Its branch, worktree
+              and commits stay; delivering the item again starts on a new branch.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" />}>Keep it</AlertDialogClose>
+            <Button
+              variant="destructive"
+              disabled={cancelling === null || pending !== null}
+              onClick={() => {
+                if (cancelling === null) return;
+                setConfirmingCancel(null);
+                void run("cancel", () =>
+                  cancel({ environmentId, input: { deliveryId: cancelling } }),
+                );
+              }}
+            >
+              Cancel delivery
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
     </section>
   );
 }

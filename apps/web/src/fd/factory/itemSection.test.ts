@@ -12,6 +12,7 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  cancelConfirmationTarget,
   FACTORY_NOT_CONFIGURED_TEXT,
   type FactoryItemPermissions,
   factoryErrorText,
@@ -52,6 +53,7 @@ const section = (
     environmentId,
     itemRef,
     supported: true,
+    connected: true,
     deliveries: [],
     started: null,
     permitted: ALLOWED,
@@ -397,5 +399,98 @@ describe("controls", () => {
       cancel: false,
     });
     expect(controlsOf("running", DENIED)).toEqual({ stop: false, resume: false, cancel: false });
+  });
+
+  it("offers nothing at a current stage this build cannot read", () => {
+    const none = { stop: false, resume: false, cancel: false };
+    const at = (stage: NonNullable<FactoryDelivery["stage"]>) =>
+      section({ deliveries: [delivery("d1", { status: "running", stage })] })?.delivery?.controls;
+    expect(at({ name: "verify", kind: "command" })).toEqual({
+      stop: true,
+      resume: false,
+      cancel: true,
+    });
+    expect(at({ name: "unknown", kind: "command" })).toEqual(none);
+    expect(at({ name: "verify", kind: "unknown" })).toEqual(none);
+  });
+
+  it("offers nothing while the environment reconnects, and still shows the delivery", () => {
+    const deliveries = [
+      delivery("d1", { status: "blocked", needsYou: "Review found a high finding." }),
+    ];
+    expect(section({ deliveries })?.delivery?.controls).toEqual({
+      stop: false,
+      resume: true,
+      cancel: true,
+    });
+    // Connected, then in a reconnect's backoff with the deliveries read before.
+    expect(section({ deliveries, connected: false })).toMatchObject({
+      deliver: false,
+      delivery: {
+        label: "Blocked",
+        needsYou: "Review found a high finding.",
+        controls: { stop: false, resume: false, cancel: false },
+      },
+    });
+    // Deliver waits for the connection too.
+    expect(section({ connected: false })).toBeNull();
+    expect(
+      section({ connected: false, deliveries: [delivery("d1", { status: "done" })] })?.deliver,
+    ).toBe(false);
+  });
+});
+
+describe("cancelConfirmationTarget", () => {
+  const a = FactoryDeliveryId.make("delivery-a");
+  const running = (id: string, overrides: Partial<FactoryDelivery> = {}) =>
+    section({ deliveries: [delivery(id, overrides)] });
+
+  it("cancels the delivery the confirmation was opened for while it still offers cancel", () => {
+    expect(cancelConfirmationTarget(running("delivery-a"), a)).toBe(a);
+    expect(cancelConfirmationTarget(running("delivery-a"), null)).toBeNull();
+  });
+
+  it("closes when another delivery replaced it", () => {
+    // Another client cancelled delivery A and started B while A's confirmation was open.
+    const replaced = section({
+      deliveries: [
+        delivery("delivery-b", { createdAt: "2026-10-21T10:00:00.000Z" }),
+        delivery("delivery-a", { status: "cancelled" }),
+      ],
+    });
+    expect(replaced?.delivery?.deliveryId).toBe("delivery-b");
+    expect(replaced?.delivery?.controls.cancel).toBe(true);
+    expect(cancelConfirmationTarget(replaced, a)).toBeNull();
+  });
+
+  it("closes when the delivery can no longer be cancelled", () => {
+    expect(cancelConfirmationTarget(running("delivery-a", { status: "done" }), a)).toBeNull();
+    expect(
+      cancelConfirmationTarget(
+        section({
+          deliveries: [delivery("delivery-a")],
+          permitted: { ...ALLOWED, cancel: false },
+        }),
+        a,
+      ),
+    ).toBeNull();
+    expect(
+      cancelConfirmationTarget(
+        section({ deliveries: [delivery("delivery-a")], connected: false }),
+        a,
+      ),
+    ).toBeNull();
+    expect(
+      cancelConfirmationTarget(
+        running("delivery-a", { stage: { name: "unknown", kind: "agent" } }),
+        a,
+      ),
+    ).toBeNull();
+    expect(
+      cancelConfirmationTarget(
+        section({ supported: false, deliveries: [delivery("delivery-a")] }),
+        a,
+      ),
+    ).toBeNull();
   });
 });

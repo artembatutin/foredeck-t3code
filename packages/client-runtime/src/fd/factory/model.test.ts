@@ -139,8 +139,22 @@ describe("factoryControls", () => {
   };
   it.each(STATUSES)("follows the engine for %s", (status) => {
     const [stop, resume, cancel] = expected[status];
-    expect(factoryControls(status)).toEqual({ stop, resume, cancel });
+    expect(factoryControls({ status })).toEqual({ stop, resume, cancel });
+    expect(factoryControls({ status, stage: { name: "verify", kind: "command" } })).toEqual({
+      stop,
+      resume,
+      cancel,
+    });
   });
+
+  it.each(STATUSES)(
+    "offers nothing for a %s delivery at a stage this build cannot read",
+    (status) => {
+      const none = { stop: false, resume: false, cancel: false };
+      expect(factoryControls({ status, stage: { name: "unknown", kind: "agent" } })).toEqual(none);
+      expect(factoryControls({ status, stage: { name: "review", kind: "unknown" } })).toEqual(none);
+    },
+  );
 });
 
 describe("currentDelivery", () => {

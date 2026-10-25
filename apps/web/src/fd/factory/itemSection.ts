@@ -130,12 +130,15 @@ const isActive = (delivery: FactoryDelivery) =>
  * Factory, before the project's deliveries load, and for an item with no delivery the session
  * cannot start. Deliver is offered only when no delivery of the item is still open (one with a
  * status this build does not know counts as open). `started` is the delivery a start just
- * returned, counted until the list holds it, so Deliver is not offered again in between.
+ * returned, counted until the list holds it, so Deliver is not offered again in between. Nothing
+ * is offered while the environment is not connected, as during a reconnect's backoff, though the
+ * deliveries read before still show.
  */
 export function factoryItemSection(input: {
   readonly environmentId: EnvironmentId;
   readonly itemRef: WorkItemRef;
   readonly supported: boolean;
+  readonly connected: boolean;
   /** The project's deliveries; null until they load. */
   readonly deliveries: ReadonlyArray<FactoryDelivery> | null;
   readonly started: FactoryDelivery | null;
@@ -148,11 +151,12 @@ export function factoryItemSection(input: {
     input.deliveries.some((delivery) => delivery.deliveryId === started.deliveryId)
       ? input.deliveries
       : [started, ...input.deliveries];
+  const { connected, permitted } = input;
   const current = currentDelivery(deliveries, input.itemRef);
-  const deliver = input.permitted.start && (current === undefined || !isActive(current));
+  const deliver = connected && permitted.start && (current === undefined || !isActive(current));
   if (current === undefined) return deliver ? { deliver, delivery: null } : null;
 
-  const controls = factoryControls(current.status);
+  const controls = factoryControls(current);
   return {
     deliver,
     delivery: {
@@ -163,9 +167,9 @@ export function factoryItemSection(input: {
       rounds: current.rounds,
       branch: current.branch,
       controls: {
-        stop: controls.stop && input.permitted.stop,
-        resume: controls.resume && input.permitted.resume,
-        cancel: controls.cancel && input.permitted.cancel,
+        stop: connected && controls.stop && permitted.stop,
+        resume: connected && controls.resume && permitted.resume,
+        cancel: connected && controls.cancel && permitted.cancel,
       },
       timeline: factoryTimeline(current).map((entry, index) => ({
         key: `${entry.stage}:${entry.round ?? "-"}:${entry.startedAt ?? "-"}:${index}`,
@@ -194,3 +198,17 @@ export function factoryItemSection(input: {
     },
   };
 }
+
+/**
+ * The delivery an open cancel confirmation cancels: the one it was opened for, while that is
+ * still the item's current delivery and still offers cancel. Otherwise null, and the
+ * confirmation closes, so confirming never cancels a delivery that replaced it, or one this
+ * session can no longer cancel.
+ */
+export const cancelConfirmationTarget = (
+  view: FactoryItemSectionView | null,
+  openedFor: FactoryDeliveryId | null,
+): FactoryDeliveryId | null =>
+  openedFor !== null && view?.delivery?.deliveryId === openedFor && view.delivery.controls.cancel
+    ? openedFor
+    : null;
