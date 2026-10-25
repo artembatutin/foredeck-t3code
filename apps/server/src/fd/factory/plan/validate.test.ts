@@ -1,3 +1,5 @@
+import { FactoryPlan } from "@t3tools/contracts/fd/factory";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import { MAX_PROBLEM_LENGTH, MAX_PROBLEMS, validatePlan } from "./validate.ts";
@@ -187,6 +189,22 @@ describe("validatePlan with no tasks", () => {
 
   it("judges an empty plan without a note as empty with no note", () => {
     expect(validatePlan({ tasks: [] }, ["a"])).toEqual({ status: "empty", note: null });
+  });
+
+  it("keeps a note's lines and their indentation exactly as written", () => {
+    const note = "Blocked on the owner:\n\n    vp test run fails on main\n  - first\n    - nested";
+    expect(validatePlan({ tasks: [], note }, [])).toEqual({ status: "empty", note });
+  });
+
+  it("carries the note as the contract holds it, within its bound and encodable", () => {
+    const encode = Schema.encodeUnknownSync(FactoryPlan);
+    const padded = `\n  ${"x".repeat(8000)}${" ".repeat(5000)}\n`;
+    const result = validatePlan({ tasks: [], note: padded }, []);
+    expect(result).toEqual({ status: "empty", note: "x".repeat(8000) });
+    // The submitted string itself is over the contract's 8000 limit and would not encode.
+    expect(() => encode({ tasks: [], note: padded })).toThrow(/at most 8000/);
+    if (result.status !== "empty" || result.note === null) return;
+    expect(encode({ tasks: [], note: result.note })).toEqual({ tasks: [], note: result.note });
   });
 
   it("never reports an empty plan with a problem as empty", () => {

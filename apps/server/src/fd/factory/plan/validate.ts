@@ -28,7 +28,14 @@ export interface FactoryPlanProblem {
  */
 export type FactoryPlanValidation =
   | { readonly status: "invalid"; readonly problems: ReadonlyArray<FactoryPlanProblem> }
-  | { readonly status: "empty"; readonly note: string | null }
+  | {
+      readonly status: "empty";
+      /**
+       * The note as `FactoryPlan` decodes it: its lines as written, without surrounding
+       * whitespace, which the contract trims from every plan text before checking its bound.
+       */
+      readonly note: string | null;
+    }
   | { readonly status: "valid"; readonly plan: FactoryPlan };
 
 export const MAX_PROBLEM_LENGTH = 300;
