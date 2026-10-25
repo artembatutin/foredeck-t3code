@@ -320,7 +320,13 @@ function CommandEditor({
         value={command.executable}
         onChange={(event) => onChange({ ...command, executable: event.target.value })}
       />
-      {executableError ? <p className="text-destructive text-xs">{executableError}</p> : null}
+      {executableError ? (
+        <p className="text-destructive text-xs">{executableError}</p>
+      ) : command.executable.length === 0 && command.args.length > 0 ? (
+        <p className="text-muted-foreground text-xs">
+          Without an executable, saving removes this command and its arguments.
+        </p>
+      ) : null}
       {command.args.map((arg, index) => (
         // Arguments have no identity of their own: their position is what the command runs.
         // oxlint-disable-next-line react/no-array-index-key -- an argument is its position

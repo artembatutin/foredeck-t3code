@@ -71,11 +71,29 @@ describe("factorySettingsDraft round trip", () => {
     expect(factorySettingsDraft(saved).verifyCommand.args).toStrictEqual(args);
   });
 
+  it("clears the verify command when only its executable is cleared", () => {
+    const draft = factorySettingsDraft(POPULATED);
+    // The form keeps the arguments when the executable input is emptied.
+    const cleared = { ...draft, verifyCommand: { ...draft.verifyCommand, executable: "" } };
+    expect(cleared.verifyCommand.args).toStrictEqual(["scripts/verify.ts", "--grep", "a b"]);
+    const settings = valid(cleared);
+    expect(settings.verifyCommand).toBeNull();
+    expect(settings.setupCommand).toStrictEqual(POPULATED.setupCommand);
+    expect(settings).toStrictEqual({ ...POPULATED, verifyCommand: null });
+  });
+
   it("clears the verify command when its executable and arguments are cleared", () => {
     const draft = factorySettingsDraft(POPULATED);
     const settings = valid({ ...draft, verifyCommand: { executable: "", args: [] } });
     expect(settings.verifyCommand).toBeNull();
     expect(settings.setupCommand).toStrictEqual(POPULATED.setupCommand);
+  });
+
+  it("clears the setup command when only its executable is cleared", () => {
+    const draft = factorySettingsDraft(POPULATED);
+    const settings = valid({ ...draft, setupCommand: { ...draft.setupCommand, executable: "" } });
+    expect(settings.setupCommand).toBeNull();
+    expect(settings.verifyCommand).toStrictEqual(POPULATED.verifyCommand);
   });
 
   it("trims the executable it saves", () => {
@@ -146,13 +164,17 @@ describe("factorySettingsFromDraft validation", () => {
     ).not.toThrow();
   });
 
-  it("rejects a blank executable that still has arguments", () => {
+  it("rejects a blank executable, with or without arguments", () => {
     const draft = factorySettingsDraft(POPULATED);
     rejects(
       { ...draft, verifyCommand: { executable: "   ", args: ["test"] } },
       "verifyCommand.executable",
     );
-    rejects({ ...draft, setupCommand: { executable: "", args: ["i"] } }, "setupCommand.executable");
+    rejects({ ...draft, verifyCommand: { executable: " ", args: [] } }, "verifyCommand.executable");
+    rejects(
+      { ...draft, setupCommand: { executable: "\t", args: ["i"] } },
+      "setupCommand.executable",
+    );
   });
 
   it("rejects an executable over 1024 characters and accepts one of 1024", () => {
@@ -186,7 +208,7 @@ describe("factorySettingsFromDraft validation", () => {
     const draft = withLimit("maxFixRounds", "11", withLimit("verifyTimeoutMinutes", "0"));
     const result = factorySettingsFromDraft({
       ...draft,
-      verifyCommand: { executable: "", args: ["x"] },
+      verifyCommand: { executable: "  ", args: ["x"] },
     });
     expect(result._tag === "Invalid" ? Object.keys(result.errors).toSorted() : []).toStrictEqual([
       "limits.maxFixRounds",

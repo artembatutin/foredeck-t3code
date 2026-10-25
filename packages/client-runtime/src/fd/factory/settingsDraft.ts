@@ -63,19 +63,19 @@ export const factorySettingsDraft = (settings: FactoryProjectSettings): FactoryS
 });
 
 /**
- * A command from its draft. A blank executable without arguments is no command; with arguments
- * it is refused rather than dropping them. Arguments are kept exactly as entered.
+ * A command from its draft. A cleared executable removes the command, whatever arguments the form
+ * still holds; one of only whitespace is refused as blank. Arguments are kept exactly as entered.
  */
 const commandFromDraft = (
   name: FactoryCommandName,
   draft: FactoryCommandDraft,
   errors: FactorySettingsErrors,
 ): FactoryCommand | null => {
+  if (draft.executable.length === 0) return null;
   const executable = draft.executable.trim();
   if (executable.length === 0) {
-    if (draft.args.length > 0) {
-      errors[`${name}.executable`] = "Enter the executable, or remove its arguments.";
-    }
+    errors[`${name}.executable`] =
+      "Enter the executable, or clear the field to remove the command.";
     return null;
   }
   if (executable.length > FACTORY_SETTINGS_BOUNDS.executableLength) {
