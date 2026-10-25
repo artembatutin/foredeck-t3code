@@ -222,7 +222,7 @@
     "apps/web/src/components/search/ProjectContentSearchDialog.test.tsx": "Preserves permission checks on existing content-search actions after integration with fd file navigation.",
     "apps/web/src/components/search/ProjectContentSearchDialog.tsx": "Composes repository selection and targets content search and result navigation at the selected checkout.",
     "apps/web/src/components/settings/ProjectActionsSettings.tsx": "Supplies repository authority when importing scripts from the representative project checkout.",
-    "apps/web/src/components/settings/ProjectSettingsPanel.tsx": "Mounts fd membership settings for each physical project and owning environment. Mounts fd Work source settings per project member.",
+    "apps/web/src/components/settings/ProjectSettingsPanel.tsx": "Mounts fd membership settings for each physical project and owning environment. Mounts fd Work source settings per project member. Mounts fd Factory settings per project member and owning environment.",
     "apps/web/src/components/settings/ProviderAuthenticationSection.tsx": "Uses ACP sign-in discovery and unsupported-method states for the dedicated local driver in the existing authentication UI.",
     "apps/web/src/components/settings/ProviderInstanceCard.tsx": "Shows native ACP management from advertised capabilities and custom-model controls only for schemas that support them, so the Cloud session-only catalog stays honest.",
     "apps/web/src/components/settings/ProviderSettingsForm.test.ts": "Verifies the actual Cloud form field update path decodes to valid API settings and restores the default budget when cleared.",

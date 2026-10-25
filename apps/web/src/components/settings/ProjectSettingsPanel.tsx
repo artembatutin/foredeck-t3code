@@ -46,6 +46,7 @@ import { ProjectActionsSettings } from "./ProjectActionsSettings";
 import { ProjectDefaultsSettings } from "./ProjectDefaultsSettings";
 import { projectGroupTitleNeedsUpdate } from "./ProjectSettingsPanel.logic";
 import { useSettingsProjectGroups } from "./useSettingsProjectGroups";
+import { FactorySettings } from "../../fd/factory";
 import { RepositorySettings } from "../../fd/multirepo";
 import { WorkSourcesSettings } from "../../fd/work-management";
 
@@ -553,6 +554,14 @@ function ProjectDetail({
         {group.memberProjects.map((member) => (
           <WorkSourcesSettings
             key={`work:${member.environmentId}:${member.id}`}
+            project={member}
+            serverConfig={environmentById.get(member.environmentId)?.serverConfig ?? null}
+            environmentLabel={environmentById.get(member.environmentId)?.label ?? "Environment"}
+          />
+        ))}
+        {group.memberProjects.map((member) => (
+          <FactorySettings
+            key={`factory:${member.environmentId}:${member.id}`}
             project={member}
             serverConfig={environmentById.get(member.environmentId)?.serverConfig ?? null}
             environmentLabel={environmentById.get(member.environmentId)?.label ?? "Environment"}

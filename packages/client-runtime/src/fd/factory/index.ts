@@ -16,3 +16,18 @@ export {
   type FactoryTimeline,
   type FactoryTimelineEntry,
 } from "./model.ts";
+export {
+  FACTORY_SETTINGS_BOUNDS,
+  factorySettingsDraft,
+  factorySettingsDraftEdited,
+  factorySettingsFromDraft,
+  rebaseFactorySettingsDraft,
+  type FactoryCommandDraft,
+  type FactoryCommandName,
+  type FactoryLimitName,
+  type FactoryRoleName,
+  type FactorySettingsDraft,
+  type FactorySettingsDraftResult,
+  type FactorySettingsErrors,
+  type FactorySettingsField,
+} from "./settingsDraft.ts";
