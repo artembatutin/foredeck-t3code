@@ -115,6 +115,16 @@ const FactoryTaskChildItems = Effect.gen(function* () {
   yield* sql`ALTER TABLE fd_factory_tasks ADD COLUMN child_item_id TEXT`;
 });
 
+const FactoryTaskChildClaims = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  // Set before a task's child item is created, so only a claimed task's child is looked for. A
+  // build from before claims may have begun any unrecorded planned task's child, so each counts
+  // as claimed.
+  yield* sql`ALTER TABLE fd_factory_tasks ADD COLUMN child_claimed_at TEXT`;
+  yield* sql`UPDATE fd_factory_tasks SET child_claimed_at = updated_at
+    WHERE plan_json IS NOT NULL AND child_item_id IS NULL`;
+});
+
 export const factoryMigrationEntries = [
   [1, "FactorySettings", FactorySettings],
   [2, "FactoryDeliveries", FactoryDeliveries],
@@ -123,6 +133,7 @@ export const factoryMigrationEntries = [
   [5, "FactoryWorkComments", FactoryWorkComments],
   [6, "FactoryWorkCommentOutcomes", FactoryWorkCommentOutcomes],
   [7, "FactoryTaskChildItems", FactoryTaskChildItems],
+  [8, "FactoryTaskChildClaims", FactoryTaskChildClaims],
 ] as const;
 
 const run = Migrator.make({});

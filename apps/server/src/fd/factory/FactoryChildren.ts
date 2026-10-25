@@ -5,7 +5,8 @@ import { AuthWorkReadScope, AuthWorkWriteScope } from "@t3tools/contracts";
 import { FactoryDeliveryId, FactoryTaskId } from "@t3tools/contracts/fd/factory";
 import type {
   WorkItemId,
-  WorkItemRef,
+  WorkItemSummary,
+  WorkListQuery,
   WorkListResult,
 } from "@t3tools/contracts/fd/work-management";
 import * as Context from "effect/Context";
@@ -25,8 +26,8 @@ import { childItemInput, childReference } from "./plan/childItem.ts";
 
 /**
  * Factory could not tell whether a task's child item exists: the parent's source could not be
- * read whole, or more than one item under the parent carries the task's reference. Nothing was
- * created for the task.
+ * read whole, or listed an item it could not read, or more than one item under the parent carries
+ * the task's reference. Nothing was created for the task.
  */
 export class FactoryChildLookupError extends Schema.TaggedError<FactoryChildLookupError>()(
   "FactoryChildLookupError",
@@ -64,13 +65,16 @@ export class FactoryChildren extends Context.Service<
      * branch and worktree with its limits and runtime-mode ceiling and the task's risk; none
      * starts.
      *
-     * A task that records its child is done. One that does not may have one from a run that
-     * stopped before recording it: the item under the parent whose body carries the task's
-     * reference (`childReference`) is taken instead of creating another. Work's lists are paged
-     * and may be stale, so a lookup that could not read the whole source, or that finds two such
-     * items, fails rather than guess. A Work failure fails the effect, keeping every child recorded
-     * so far, and the next run goes on after them. A child delivery stored before is kept, and
-     * none is stored once the parent no longer awaits `effect`, as when it was cancelled.
+     * A task that records its child is done. Each task is claimed before its child is created,
+     * so only a claimed one may have a child from a run that stopped before recording it: the item
+     * under the parent whose body carries the task's reference (`childReference`) is taken instead
+     * of creating another. A search cannot match a body Work could not read, and Work's lists are
+     * paged and may be stale, so finding none counts as absence only when every page of the source
+     * was read and none lists an item Work could not read; otherwise, or when two such items are
+     * found, the lookup fails rather than guess. A Work failure fails the effect, keeping every child
+     * recorded so far, and the next run goes on after them. A child delivery stored before is
+     * kept, and none is stored once the parent no longer awaits `effect`, as when it was
+     * cancelled.
      */
     readonly create: (
       parent: FactoryDeliveryStore.StoredFactoryDelivery,
@@ -104,10 +108,30 @@ const make = Effect.gen(function* () {
   const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
   const changes = yield* FactoryChanges.FactoryChanges;
 
+  /** Every page of a listing: its items, and whether any page was stale. */
+  const listAll = (actor: WorkActor, query: Omit<WorkListQuery, "cursor" | "limit">) =>
+    Effect.gen(function* () {
+      const items: Array<WorkItemSummary> = [];
+      let stale = false;
+      let cursor: string | null = null;
+      do {
+        const page: WorkListResult = yield* work.listItems(actor, {
+          ...query,
+          limit: LOOKUP_PAGE,
+          ...(cursor === null ? {} : { cursor }),
+        });
+        stale ||= page.stale;
+        items.push(...page.items);
+        cursor = page.nextCursor;
+      } while (cursor !== null);
+      return { items, stale };
+    });
+
   /**
    * The child item a run created for the task and never recorded: the one item under the parent
-   * whose body carries the task's reference. Read through every page of the source; none only
-   * when every page was read whole.
+   * whose body carries the task's reference. None only when the whole source was read and Work
+   * read every item it lists: an item whose file it could not read is listed as invalid, with no
+   * body for a search to match, and could be that child.
    */
   const findChild = (
     actor: WorkActor,
@@ -117,42 +141,23 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const { sourceId, itemId: parentItemId } = parent.itemRef;
       const reference = childReference(parent.deliveryId, taskId);
-      const candidates: Array<WorkItemRef> = [];
-      let complete = true;
-      let cursor: string | null = null;
-      do {
-        const page: WorkListResult = yield* work.listItems(actor, {
-          sourceId,
-          search: reference,
-          limit: LOOKUP_PAGE,
-          ...(cursor === null ? {} : { cursor }),
-        });
-        if (page.stale) complete = false;
-        for (const item of page.items) {
-          if (item.parent === parentItemId) candidates.push(item.ref);
-        }
-        cursor = page.nextCursor;
-      } while (cursor !== null);
+      const fail = (reason: FactoryChildLookupError["reason"]) =>
+        new FactoryChildLookupError({ deliveryId: parent.deliveryId, taskId, reason });
+      const searched = yield* listAll(actor, { sourceId, search: reference });
       // A search matches loosely; only the reference as written, in the item's own body, counts.
-      const found = yield* Effect.filter(candidates, (ref) =>
-        work.getItem(actor, { ref }).pipe(Effect.map(({ body }) => body.includes(reference))),
+      const found = yield* Effect.filter(
+        searched.items.filter((item) => item.parent === parentItemId),
+        ({ ref }) =>
+          work.getItem(actor, { ref }).pipe(Effect.map(({ body }) => body.includes(reference))),
       );
-      if (found.length > 1) {
-        return yield* new FactoryChildLookupError({
-          deliveryId: parent.deliveryId,
-          taskId,
-          reason: "ambiguous",
-        });
-      }
+      if (found.length > 1) return yield* fail("ambiguous");
       const [child] = found;
-      if (child === undefined && !complete) {
-        return yield* new FactoryChildLookupError({
-          deliveryId: parent.deliveryId,
-          taskId,
-          reason: "incomplete",
-        });
+      if (child !== undefined) return Option.some(child.ref.itemId);
+      const source = searched.stale ? searched : yield* listAll(actor, { sourceId });
+      if (source.stale || source.items.some(({ invalid }) => invalid !== null)) {
+        return yield* fail("incomplete");
       }
-      return Option.fromUndefinedOr(child?.itemId);
+      return Option.none();
     });
 
   /**
@@ -169,16 +174,19 @@ const make = Effect.gen(function* () {
       if (task.childItemId !== null) return task.childItemId;
       // Every task of a parent is a plan task; only a single item's task has no plan.
       if (task.plan === null) return yield* Effect.die("An approved task has no plan.");
-      const found = yield* findChild(actor, parent, task.taskId);
+      const { deliveryId } = parent;
+      // Claimed before any create, so an unclaimed task has no child to look for.
+      const found =
+        task.childClaimedAt === null
+          ? yield* tasks
+              .claimChild({ deliveryId, taskId: task.taskId })
+              .pipe(Effect.as(Option.none<WorkItemId>()))
+          : yield* findChild(actor, parent, task.taskId);
       const itemId = Option.isSome(found)
         ? found.value
         : (yield* work.createItem(
             actor,
-            childItemInput({
-              parent: parent.itemRef,
-              deliveryId: parent.deliveryId,
-              task: task.plan,
-            }),
+            childItemInput({ parent: parent.itemRef, deliveryId, task: task.plan }),
           )).ref.itemId;
       if (previous !== undefined) {
         yield* work.updateItem(actor, {
@@ -186,7 +194,7 @@ const make = Effect.gen(function* () {
           blockedBy: [previous],
         });
       }
-      yield* tasks.setChildItem({ deliveryId: parent.deliveryId, taskId: task.taskId, itemId });
+      yield* tasks.setChildItem({ deliveryId, taskId: task.taskId, itemId });
       return itemId;
     });
 

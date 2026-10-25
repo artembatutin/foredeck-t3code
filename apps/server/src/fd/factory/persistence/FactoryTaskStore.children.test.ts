@@ -57,7 +57,10 @@ describe("the task store's child items", () => {
       const manifest = FactoryMigrations.factoryMigrationEntries.map(
         ([id, name]) => [id, name] as const,
       );
-      assert.deepStrictEqual(manifest.at(-1), [7, "FactoryTaskChildItems"]);
+      assert.deepStrictEqual(manifest.slice(-2), [
+        [7, "FactoryTaskChildItems"],
+        [8, "FactoryTaskChildClaims"],
+      ]);
       assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), manifest);
       assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), []);
       assert.deepStrictEqual(yield* ledger, manifest);
@@ -96,19 +99,22 @@ describe("the task store's child items", () => {
 
       assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), [
         [7, "FactoryTaskChildItems"],
+        [8, "FactoryTaskChildClaims"],
       ]);
       const tasks = yield* FactoryTaskStore.FactoryTaskStore;
       const stored = yield* tasks.listByDelivery(deliveryId);
+      // The planned task may have had its child begun by that build, so it counts as claimed.
       assert.deepStrictEqual(
-        stored.map(({ taskId, position, plan, childItemId }) => [
+        stored.map(({ taskId, position, plan, childItemId, childClaimedAt }) => [
           taskId,
           position,
           plan,
           childItemId,
+          childClaimedAt,
         ]),
         [
-          [FactoryTaskId.make("item"), 1, null, null],
-          [plan.id, 2, plan, null],
+          [FactoryTaskId.make("item"), 1, null, null, null],
+          [plan.id, 2, plan, null, "2026-10-25T08:00:00.000Z"],
         ],
       );
 
@@ -126,6 +132,63 @@ describe("the task store's child items", () => {
         itemId,
       });
       assert.isTrue(Option.isNone(unknown));
+    }).pipe(Effect.provide(database)),
+  );
+
+  it.effect("migrate a ledger at 7 claiming only the planned tasks without a child", () =>
+    Effect.gen(function* () {
+      yield* migrateThrough(7);
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`
+        INSERT INTO fd_factory_deliveries (
+          delivery_id, project_id, source_id, item_id, parent_id, status, state_json, created_at,
+          updated_at
+        )
+        VALUES (
+          ${deliveryId}, 'project-alpha', 'source-1', 'fd-aaaaaa', NULL, 'blocked', '{}',
+          '2026-10-25T08:00:00.000Z', '2026-10-25T08:00:00.000Z'
+        )
+      `;
+      // A single item's task, a planned task with its child recorded, and one without.
+      for (const [position, taskId, planJson, childItemId, updatedAt] of [
+        [1, "item", null, null, "2026-10-25T08:00:00.000Z"],
+        [2, "recorded", JSON.stringify(plan), "fd-cccccc", "2026-10-25T08:01:00.000Z"],
+        [3, plan.id, JSON.stringify(plan), null, "2026-10-25T08:02:00.000Z"],
+      ] as const) {
+        yield* sql`
+          INSERT INTO fd_factory_tasks (
+            delivery_id, task_id, position, plan_json, last_reviewed_sha, child_item_id,
+            created_at, updated_at
+          )
+          VALUES (
+            ${deliveryId}, ${taskId}, ${position}, ${planJson}, NULL, ${childItemId},
+            '2026-10-25T08:00:00.000Z', ${updatedAt}
+          )
+        `;
+      }
+
+      assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), [
+        [8, "FactoryTaskChildClaims"],
+      ]);
+      const tasks = yield* FactoryTaskStore.FactoryTaskStore;
+      assert.deepStrictEqual(
+        (yield* tasks.listByDelivery(deliveryId)).map(({ childClaimedAt }) => childClaimedAt),
+        [null, null, "2026-10-25T08:02:00.000Z"],
+      );
+
+      // A claim marks an unclaimed task once; a later claim keeps the first.
+      const single = FactoryTaskId.make("item");
+      const claimed = Option.getOrThrow(yield* tasks.claimChild({ deliveryId, taskId: single }));
+      assert.isNotNull(claimed.childClaimedAt);
+      const again = Option.getOrThrow(yield* tasks.claimChild({ deliveryId, taskId: single }));
+      assert.strictEqual(again.childClaimedAt, claimed.childClaimedAt);
+      const kept = Option.getOrThrow(yield* tasks.claimChild({ deliveryId, taskId: plan.id }));
+      assert.strictEqual(kept.childClaimedAt, "2026-10-25T08:02:00.000Z");
+      assert.isTrue(
+        Option.isNone(
+          yield* tasks.claimChild({ deliveryId, taskId: FactoryTaskId.make("missing") }),
+        ),
+      );
     }).pipe(Effect.provide(database)),
   );
 });

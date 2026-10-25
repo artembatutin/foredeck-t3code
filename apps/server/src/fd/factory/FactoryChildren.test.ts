@@ -118,6 +118,8 @@ interface FakeItem {
   readonly body: string;
   readonly parent: WorkItemId | null;
   blockedBy: ReadonlyArray<WorkItemId>;
+  /** Its file cannot be read: Work lists it as invalid, and neither searches nor serves its body. */
+  unreadable?: boolean;
 }
 
 /** The Markdown source as the fake holds it, and how it answers. */
@@ -173,12 +175,15 @@ const summaryOf = (item: FakeItem): WorkItemSummary => ({
   url: null,
   updatedAt: null,
   revision: "r1",
-  invalid: null,
+  invalid:
+    item.unreadable === true
+      ? { code: "unreadable", message: "The file could not be read." }
+      : null,
 });
 
 const detailOf = (item: FakeItem): WorkItemDetail => ({
   ...summaryOf(item),
-  body: item.body,
+  body: item.unreadable === true ? "" : item.body,
   bodyTruncated: false,
   bodyFidelity: "exact",
   comments: [],
@@ -197,7 +202,10 @@ const detailOf = (item: FakeItem): WorkItemDetail => ({
   },
 });
 
-/** A Markdown source: lists match title and body loosely, one item per page. */
+/**
+ * A Markdown source: lists match title and body loosely, one item per page, and an unreadable
+ * item by its title only.
+ */
 const fakeWork = (world: World) => {
   const reachable = Effect.suspend(() =>
     world.disconnectAt !== null && world.items.length >= world.disconnectAt
@@ -213,7 +221,9 @@ const fakeWork = (world: World) => {
         Effect.map(() => {
           const search = query.search?.toLowerCase() ?? "";
           const matches = world.items.filter((item) =>
-            `${item.title}\n\n${item.body}`.toLowerCase().includes(search),
+            `${item.title}\n\n${item.unreadable === true ? "" : item.body}`
+              .toLowerCase()
+              .includes(search),
           );
           const offset = query.cursor === undefined ? 0 : Number(query.cursor);
           return {
@@ -575,7 +585,7 @@ describe("approving a parent's plan", () => {
     ),
   );
 
-  it.effect("refuses a plan whose child item would not fit in Work, until it is shortened", () =>
+  it.effect("refuses a plan whose child items its source would refuse, until it is edited", () =>
     withWorld((world) =>
       Effect.gen(function* () {
         const criteria = Array.from({ length: 40 }, (_, index) => `${index}: ${"y".repeat(1990)}`);
@@ -589,22 +599,24 @@ describe("approving a parent's plan", () => {
             paths: [],
           })),
         };
-        yield* seedAtGate(decodePlan({ tasks: [tasks[0], oversized] }));
+        // A Work title, but Markdown cannot keep a line separator on the title's one line.
+        const separated = { ...tasks[2], title: "Sum the numeric\u2028columns" };
+        yield* seedAtGate(decodePlan({ tasks: [tasks[0], oversized, separated] }));
         yield* boot(
           Effect.gen(function* () {
             const factory = yield* service;
             const before = yield* parent;
             const epoch = yield* currentEpoch;
             const error = yield* Effect.flip(factory.approvePlan(parentId));
-            assert.strictEqual(error._tag, "FactoryChildItemTooLongError");
-            if (error._tag !== "FactoryChildItemTooLongError") return;
-            assert.deepStrictEqual(error.taskIds, [tasks[1].id]);
+            assert.strictEqual(error._tag, "FactoryChildItemUncreatableError");
+            if (error._tag !== "FactoryChildItemUncreatableError") return;
+            assert.deepStrictEqual(error.taskIds, [tasks[1].id, tasks[2].id]);
             assert.strictEqual(toFactoryError(error).reason, "invalid_request");
             assert.deepStrictEqual(yield* parent, before);
             assert.deepStrictEqual(yield* taskRows, []);
             assert.strictEqual(yield* currentEpoch, epoch);
 
-            // The owner shortens the task at the gate, and the plan is approved.
+            // The owner shortens one task and retitles the other at the gate; the plan is approved.
             const shortened = {
               ...oversized,
               acceptance: [criteria[0]!],
@@ -612,14 +624,14 @@ describe("approving a parent's plan", () => {
             };
             yield* factory.updatePlan({
               deliveryId: parentId,
-              plan: { tasks: [tasks[0], shortened] },
+              plan: { tasks: [tasks[0], shortened, tasks[2]] },
             });
             assert.strictEqual((yield* factory.approvePlan(parentId)).state.planApproved, true);
           }),
         );
         assert.deepStrictEqual(
           world.items.map(({ title }) => title),
-          [tasks[0].title, tasks[1].title],
+          tasks.map(({ title }) => title),
         );
       }),
     ),
@@ -706,23 +718,81 @@ describe("creating a parent's children", () => {
     ),
   );
 
-  it.effect("creates nothing while the source cannot be read whole", () =>
+  it.effect(
+    "creates a first child without a lookup, and recovers one only from a whole source",
+    () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          yield* seedAtGate();
+          // Nothing was claimed yet, so a stale source holds back no first creation.
+          world.stale = true;
+          world.failingCreates.add(2);
+          yield* boot(Effect.flatMap(service, (factory) => factory.approvePlan(parentId)));
+          assert.strictEqual(world.creates, 2);
+          assert.strictEqual(world.items.length, 1);
+
+          // The second task was claimed, so it may have a child: a stale source cannot say it has not.
+          world.failingCreates.clear();
+          yield* boot(Effect.flatMap(service, (factory) => factory.resume(parentId)));
+          const blocked = yield* boot(parent);
+          assert.deepStrictEqual(blocked.state.block, {
+            reason: "effect_failed",
+            effect: { id: 3, type: "create_children" },
+            detail: "Factory could not create the child items (FactoryChildLookupError).",
+          });
+          assert.strictEqual(world.creates, 2);
+
+          // Once the source reads whole, the second child is created at last: the failed attempt
+          // and one create per remaining task.
+          world.stale = false;
+          yield* boot(Effect.flatMap(service, (factory) => factory.resume(parentId)));
+          yield* boot(assertChildrenCreated(world));
+          assert.strictEqual(world.creates, 4);
+        }),
+      ),
+  );
+
+  it.effect("holds back recovery while an item cannot be read, never a first creation", () =>
     withWorld((world) =>
       Effect.gen(function* () {
         yield* seedAtGate();
-        world.stale = true;
-        yield* boot(Effect.flatMap(service, (factory) => factory.approvePlan(parentId)));
-        const blocked = yield* boot(parent);
-        assert.deepStrictEqual(blocked.state.block, {
-          reason: "effect_failed",
-          effect: { id: 2, type: "create_children" },
-          detail: "Factory could not create the child items (FactoryChildLookupError).",
+        // An unrelated file Work cannot read is in the source from the start.
+        world.items.push({
+          ref: { sourceId, itemId: WorkItemId.make("fd-broken") },
+          title: "fd-broken",
+          body: "",
+          parent: null,
+          blockedBy: [],
+          unreadable: true,
         });
-        assert.strictEqual(world.creates, 0);
+        const written = yield* Deferred.make<void>();
+        world.stopAfterCreate = { create: 2, written };
+        yield* stopsAfter(
+          Effect.gen(function* () {
+            yield* Effect.flatMap(service, (factory) => factory.approvePlan(parentId));
+            yield* Deferred.await(written);
+          }),
+        );
+        world.stopAfterCreate = null;
+        const [, first, second] = world.items as [FakeItem, FakeItem, FakeItem];
+        assert.deepStrictEqual(yield* childItemIds, [first.ref.itemId, null, null]);
 
-        world.stale = false;
+        // The unrecorded child's own file cannot be read now: no search finds its reference.
+        second.unreadable = true;
         yield* boot(Effect.flatMap(service, (factory) => factory.resume(parentId)));
-        yield* boot(assertChildrenCreated(world));
+        const blocked = yield* boot(parent);
+        assert.strictEqual(
+          blocked.state.block?.reason === "effect_failed" && blocked.state.block.detail,
+          "Factory could not create the child items (FactoryChildLookupError).",
+        );
+        assert.strictEqual(world.creates, 2);
+        assert.deepStrictEqual(yield* childItemIds, [first.ref.itemId, null, null]);
+
+        // Readable again, it is taken under its own id, though the other file still is not.
+        second.unreadable = false;
+        yield* boot(Effect.flatMap(service, (factory) => factory.resume(parentId)));
+        yield* boot(assertChildrenCreated(world, [first, second, world.items.at(-1)!]));
+        assert.strictEqual(world.creates, 3);
       }),
     ),
   );
@@ -731,36 +801,39 @@ describe("creating a parent's children", () => {
     withWorld((world) =>
       Effect.gen(function* () {
         yield* seedAtGate();
-        const carrying = (itemId: string, task: FactoryPlanTask, itemParent: string): FakeItem => ({
+        world.failingCreates.add(2);
+        yield* boot(Effect.flatMap(service, (factory) => factory.approvePlan(parentId)));
+        const [created] = world.items as [FakeItem];
+        world.failingCreates.clear();
+
+        const carrying = (itemId: string, itemParent: string): FakeItem => ({
           ref: { sourceId, itemId: WorkItemId.make(itemId) },
-          title: task.title,
-          body: `${childReference(parentId, task.id)}\n\nCopied by hand.\n`,
+          title: tasks[1].title,
+          body: `${childReference(parentId, tasks[1].id)}\n\nCopied by hand.\n`,
           parent: WorkItemId.make(itemParent),
           blockedBy: [],
         });
-        // The first task's reference under another parent, and the second's twice under this one.
-        const elsewhere = carrying("fd-elsewhere-1", tasks[0], "fd-elsewhere");
-        const twin = carrying("fd-twin-2", tasks[1], parentRef.itemId);
-        world.items.push(elsewhere, carrying("fd-twin-1", tasks[1], parentRef.itemId), twin);
+        // The claimed task's reference under another parent, and twice under this one.
+        const elsewhere = carrying("fd-elsewhere-1", "fd-elsewhere");
+        const twin = carrying("fd-twin-1", parentRef.itemId);
+        const copy = carrying("fd-twin-2", parentRef.itemId);
+        world.items.push(elsewhere, twin, copy);
 
-        yield* boot(Effect.flatMap(service, (factory) => factory.approvePlan(parentId)));
+        yield* boot(Effect.flatMap(service, (factory) => factory.resume(parentId)));
         const blocked = yield* boot(parent);
         assert.strictEqual(
           blocked.state.block?.reason === "effect_failed" && blocked.state.block.detail,
           "Factory could not create the child items (FactoryChildLookupError).",
         );
-        // The first child was created rather than taken from another parent.
-        assert.strictEqual(world.creates, 1);
-        const created = world.items.at(-1)!;
-        assert.deepStrictEqual(yield* childItemIds, [created.ref.itemId, null, null]);
-        assert.deepStrictEqual(elsewhere.blockedBy, []);
-
-        // With one of the two gone, the other is taken for the second task.
-        world.items.splice(world.items.indexOf(twin), 1);
-        yield* boot(Effect.flatMap(service, (factory) => factory.resume(parentId)));
-        const [, taken] = world.items;
-        yield* boot(assertChildrenCreated(world, [created, taken!, world.items.at(-1)!]));
         assert.strictEqual(world.creates, 2);
+        assert.deepStrictEqual(yield* childItemIds, [created.ref.itemId, null, null]);
+
+        // With the copy gone, the one under this parent is taken; the other parent's never is.
+        world.items.splice(world.items.indexOf(copy), 1);
+        yield* boot(Effect.flatMap(service, (factory) => factory.resume(parentId)));
+        yield* boot(assertChildrenCreated(world, [created, twin, world.items.at(-1)!]));
+        assert.deepStrictEqual(elsewhere.blockedBy, []);
+        assert.strictEqual(world.creates, 3);
       }),
     ),
   );

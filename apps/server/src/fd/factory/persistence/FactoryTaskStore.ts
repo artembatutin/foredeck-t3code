@@ -27,6 +27,11 @@ export const StoredFactoryTask = Schema.Struct({
    * until it is recorded, and for a single item.
    */
   childItemId: Schema.NullOr(WorkItemId),
+  /**
+   * When a run began creating the task's child item; null until then. A claimed task without a
+   * recorded child may have one that a run created and never recorded.
+   */
+  childClaimedAt: Schema.NullOr(IsoDateTime),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -57,6 +62,14 @@ export class FactoryTaskStore extends Context.Service<
       readonly taskId: FactoryTaskId;
       readonly sha: string;
     }) => Effect.Effect<Option.Option<StoredFactoryTask>, FactoryStoreError>;
+    /**
+     * Marks the task's child as being created, before it is; a task claimed already keeps its
+     * first claim. None when the task does not exist.
+     */
+    readonly claimChild: (input: {
+      readonly deliveryId: FactoryDeliveryId;
+      readonly taskId: FactoryTaskId;
+    }) => Effect.Effect<Option.Option<StoredFactoryTask>, FactoryStoreError>;
     /** Records the task's child Work item; none when the task does not exist. */
     readonly setChildItem: (input: {
       readonly deliveryId: FactoryDeliveryId;
@@ -85,6 +98,7 @@ const make = Effect.gen(function* () {
         plan_json AS plan,
         last_reviewed_sha AS "lastReviewedSha",
         child_item_id AS "childItemId",
+        child_claimed_at AS "childClaimedAt",
         created_at AS "createdAt",
         updated_at AS "updatedAt"
       FROM fd_factory_tasks
@@ -107,12 +121,12 @@ const make = Effect.gen(function* () {
     Request: TaskDbRow,
     execute: (row) => sql`
       INSERT INTO fd_factory_tasks (
-        delivery_id, task_id, position, plan_json, last_reviewed_sha, child_item_id, created_at,
-        updated_at
+        delivery_id, task_id, position, plan_json, last_reviewed_sha, child_item_id,
+        child_claimed_at, created_at, updated_at
       )
       VALUES (
         ${row.deliveryId}, ${row.taskId}, ${row.position}, ${row.plan}, ${row.lastReviewedSha},
-        ${row.childItemId}, ${row.createdAt}, ${row.updatedAt}
+        ${row.childItemId}, ${row.childClaimedAt}, ${row.createdAt}, ${row.updatedAt}
       )
     `,
   });
@@ -143,6 +157,18 @@ const make = Effect.gen(function* () {
     `,
   });
 
+  const writeChildClaim = SqlSchema.void({
+    Request: Schema.Struct({
+      deliveryId: FactoryDeliveryId,
+      taskId: FactoryTaskId,
+      claimedAt: IsoDateTime,
+    }),
+    execute: ({ deliveryId, taskId, claimedAt }) => sql`
+      UPDATE fd_factory_tasks SET child_claimed_at = ${claimedAt}, updated_at = ${claimedAt}
+      WHERE delivery_id = ${deliveryId} AND task_id = ${taskId} AND child_claimed_at IS NULL
+    `,
+  });
+
   const insert: FactoryTaskStore["Service"]["insert"] = (input) =>
     Effect.gen(function* () {
       const [next] = yield* selectNextPosition(input.deliveryId);
@@ -154,6 +180,7 @@ const make = Effect.gen(function* () {
         plan: input.plan ?? null,
         lastReviewedSha: null,
         childItemId: null,
+        childClaimedAt: null,
         createdAt: at,
         updatedAt: at,
       };
@@ -170,6 +197,16 @@ const make = Effect.gen(function* () {
     }).pipe(
       sql.withTransaction,
       Effect.catchTags(FactoryStoreError.catchStorage("tasks.setLastReviewedSha")),
+    );
+
+  const claimChild: FactoryTaskStore["Service"]["claimChild"] = (input) =>
+    Effect.gen(function* () {
+      yield* writeChildClaim({ ...input, claimedAt: yield* now });
+      const [task] = yield* selectTasks(input);
+      return Option.fromUndefinedOr(task);
+    }).pipe(
+      sql.withTransaction,
+      Effect.catchTags(FactoryStoreError.catchStorage("tasks.claimChild")),
     );
 
   const setChildItem: FactoryTaskStore["Service"]["setChildItem"] = (input) =>
@@ -190,6 +227,7 @@ const make = Effect.gen(function* () {
         Effect.catchTags(FactoryStoreError.catchStorage("tasks.listByDelivery")),
       ),
     setLastReviewedSha,
+    claimChild,
     setChildItem,
   });
 });

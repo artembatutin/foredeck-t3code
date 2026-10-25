@@ -207,20 +207,28 @@ Approval runs child creation as a worker effect
 the parent's Markdown source, under the parent, then a field-only update making it blocked by the
 previous task's child, since Work's create takes no dependency. Neither write is idempotent across
 a restart: Work replays a `clientRequestId` only from memory. So each child is recorded on its task
-before the next is created, and a task without a record may still have a child from a run that
-stopped between the create and the record. Every child's body opens with a reference naming the
-delivery and task ([`plan/childItem.ts`](../../apps/server/src/fd/factory/plan/childItem.ts)); the
-next run searches the source for it and takes only an item under the parent whose body holds it
-exactly. It opens the body because Markdown's search indexes a bounded prefix. Work's lists are
-paged and can be stale, so a lookup that could not read the whole source, or that finds two such
-items, fails the effect instead of creating one or picking one; either guess could duplicate a
-child or chain the wrong dependency.
+before the next is created, and each task is claimed before its create, as Work comments are. Only
+a claimed task without a record can have a child from a run that stopped between the create and
+the record. Its body opens with a reference naming the delivery and task
+([`plan/childItem.ts`](../../apps/server/src/fd/factory/plan/childItem.ts)); the next run searches
+the source for it and takes only an item under the parent whose body holds it exactly. It opens
+the body because Markdown's search indexes a bounded prefix that starts with the title.
 
-Nothing of a task is cut to fit a Work item: approval refuses a plan whose child body would pass
-Work's bound, and the owner shortens it at the gate. The children's deliveries are stored only once
-every child exists, under ids derived from the parent and task, in one transaction that first
-checks the parent still awaits the effect, so a parent cancelled meanwhile queues none. The Work
-items an effect wrote after a cancel stay, as the server's other effects do.
+A miss proves nothing by itself. Work's lists are paged and can be stale, and a file Markdown
+cannot read or decode is listed as invalid with no body for a search to match, so it could be the
+child. The run takes a miss as absence only when it read every page of the source and none lists
+an invalid item; otherwise, or when two items carry the reference, the effect fails instead of
+creating one or picking one, since either guess could duplicate a child or chain the wrong
+dependency. An unclaimed task never looks, so a broken file elsewhere holds back only a recovery.
+
+Nothing of a task is cut or changed to fit its source. Markdown refuses a file with a line that
+reads as a merge conflict marker, so such a line of the task's text gets a backslash first, which
+Markdown renders as the same text. What has no such rendering is refused at the gate, where the
+owner can still edit the plan: a body past Work's bound, or a title with a line break a Work title
+allows and Markdown does not. The children's deliveries are stored only once every child exists,
+under ids derived from the parent and task, in one transaction that first checks the parent still
+awaits the effect, so a parent cancelled meanwhile queues none. The Work items an effect wrote
+after a cancel stay, as the server's other effects do.
 
 ## Clients see a review's details as it was accepted
 

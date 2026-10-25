@@ -261,15 +261,16 @@ export class FactoryPlanGateRefusedError extends Schema.TaggedError<FactoryPlanG
 }
 
 /**
- * These tasks' child items would be longer than a Work item holds, and nothing of a task is cut
- * to fit; nothing changed.
+ * The parent's Markdown source would refuse these tasks' child items: longer than a Work item
+ * holds, or titled with a line break it cannot store. Nothing of a task is cut or changed to fit;
+ * nothing changed.
  */
-export class FactoryChildItemTooLongError extends Schema.TaggedError<FactoryChildItemTooLongError>()(
-  "FactoryChildItemTooLongError",
+export class FactoryChildItemUncreatableError extends Schema.TaggedError<FactoryChildItemUncreatableError>()(
+  "FactoryChildItemUncreatableError",
   { deliveryId: FactoryDeliveryId, taskIds: Schema.Array(FactoryTaskId) },
 ) {
   override get message(): string {
-    return `The child items of tasks ${this.taskIds.join(", ")} of Factory delivery ${this.deliveryId} would be longer than a Work item holds.`;
+    return `The parent's Work source cannot hold the child items of tasks ${this.taskIds.join(", ")} of Factory delivery ${this.deliveryId} as written.`;
   }
 }
 
@@ -456,15 +457,15 @@ export class FactoryService extends Context.Service<
      * worktree (see `FactoryChildren`); it starts none of them, and blocks where its per-child
      * phase would begin, which this server cannot run yet. A Work failure blocks it with every
      * child recorded so far kept, and a resume goes on after them. Refused, with nothing changed,
-     * for a delivery not waiting at the gate, or a plan with a task whose child item would be
-     * longer than a Work item holds.
+     * for a delivery not waiting at the gate, or a plan with a task whose child item the source
+     * would refuse (see `uncreatableTasks`).
      */
     readonly approvePlan: (
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<
       FactoryDeliveryWithRuns,
       | FactoryPlanGateRefusedError
-      | FactoryChildItemTooLongError
+      | FactoryChildItemUncreatableError
       | FactoryDeliveryNotFoundError
       | FactoryStoreError
     >;
@@ -979,10 +980,10 @@ const make = Effect.gen(function* () {
     const stepped = yield* worker.stepWith(deliveryId, (current) =>
       Effect.gen(function* () {
         const plan = yield* atGate(current);
-        // Work would refuse such a child; the owner shortens the plan rather than lose any of it.
+        // The source would refuse such a child; the owner edits the plan rather than lose any of it.
         const taskIds = uncreatableTasks(current.itemRef, deliveryId, plan.tasks);
         if (taskIds.length > 0) {
-          return yield* new FactoryChildItemTooLongError({ deliveryId, taskIds });
+          return yield* new FactoryChildItemUncreatableError({ deliveryId, taskIds });
         }
         return { event: { type: "plan.approved" } as const, value: undefined };
       }),
