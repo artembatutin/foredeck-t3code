@@ -79,6 +79,7 @@ const scriptedThreads = (world: World) =>
           ? Effect.sync(() => world.launchState)
           : Effect.die("only the planner launch is read here"),
       threadState: () => Effect.die("no thread is recorded"),
+      liveRun: () => Effect.die("live run read not scripted"),
       runEnded: (_threadId, runId) =>
         Effect.sync(() =>
           runId === planRun && world.launchState === "ended"

@@ -225,6 +225,13 @@ export class FactoryThreadEffects extends Context.Service<
     readonly threadState: (
       threadId: ThreadId,
     ) => Effect.Effect<FactoryThreadState, ProjectionStore.ProjectionStoreV2Error>;
+    /**
+     * The run the thread is live in now, read from its shell as the MCP access gate reads it;
+     * null when it runs nothing, or was deleted or archived.
+     */
+    readonly liveRun: (
+      threadId: ThreadId,
+    ) => Effect.Effect<RunId | null, ProjectionStore.ProjectionStoreV2Error>;
     /** The run's status once it has ended; none while it has not. */
     readonly runEnded: (
       threadId: ThreadId,
@@ -734,6 +741,16 @@ const make = Effect.gen(function* () {
           ProjectionStoreThreadNotFoundError: () => Effect.succeed<FactoryThreadState>("missing"),
         }),
       ),
+    liveRun: (threadId) =>
+      projections
+        .getThreadShell(threadId)
+        .pipe(
+          Effect.map((shell) =>
+            shell === null || shell.deletedAt !== null || shell.archivedAt !== null
+              ? null
+              : shell.activeRunId,
+          ),
+        ),
     runEnded: (threadId, runId) =>
       readThreadRun(threadId, runId).pipe(
         Effect.map(({ status }) =>

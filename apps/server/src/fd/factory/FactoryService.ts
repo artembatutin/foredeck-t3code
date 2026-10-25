@@ -134,8 +134,8 @@ export class FactoryPlanRefusedError extends Schema.TaggedError<FactoryPlanRefus
     threadId: ThreadId,
     /**
      * `not_planner`: no active delivery has this thread as its planner. `plan_not_active`: its
-     * delivery is not running the plan stage, or not this thread's run. `already_accepted`: this
-     * plan round's plan is already accepted.
+     * delivery is not running the plan stage, or awaits a run of the thread other than the one
+     * the thread is live in. `already_accepted`: this plan round's plan is already accepted.
      */
     reason: Schema.Literals(["not_planner", "plan_not_active", "already_accepted"]),
   },
@@ -176,6 +176,7 @@ type FactorySubmitPlanError =
   | FactoryPlanRefusedError
   | FactoryPlanInvalidError
   | FactoryPlanning.FactoryPlanJudgeError
+  | ProjectionStore.ProjectionStoreV2Error
   | FactoryStoreError;
 
 /**
@@ -385,8 +386,10 @@ export class FactoryService extends Context.Service<
     >;
     /**
      * A planner's `factory_submit_plan`. Taken only from the thread an active delivery registered
-     * as its planner, while the plan stage awaits that thread's run and before the plan round has
-     * an accepted plan; any other call is refused with nothing changed. The plan is judged (see
+     * as its planner, while the plan stage awaits the run that thread is live in and before the
+     * plan round has an accepted plan; any other call is refused with nothing changed. A later
+     * turn of the planner thread is refused while the delivery still awaits the run before it,
+     * so no run's plan is recorded as another's. The plan is judged (see
      * `FactoryPlanning`) and the judgment recorded on the delivery: an accepted plan, with tasks
      * or without, is acted on once the planner's run completes, and an invalid one fails with its
      * problems (the second in a round blocks the delivery).
@@ -659,6 +662,12 @@ const make = Effect.gen(function* () {
           awaiting?.type !== "run" ||
           awaiting.threadId !== threadId
         ) {
+          return yield* refuse("plan_not_active");
+        }
+        // A tool call names its thread, not its run, so the run the thread is live in is read
+        // here, under the lock. A later turn of the thread can be live before the awaited run's
+        // end reaches the delivery, and its plan must never stand as the awaited run's.
+        if ((yield* threads.liveRun(threadId)) !== awaiting.runId) {
           return yield* refuse("plan_not_active");
         }
         if (acceptedPlan(state) !== undefined) return yield* refuse("already_accepted");

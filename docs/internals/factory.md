@@ -178,6 +178,10 @@ is never cut short. A run that completes without one has the fenced JSON of its 
 message judged the same way, for providers without t3 tools. The first invalid submission in a
 round, on either path, is answered once (by the tool's failure in the same turn, or a retry turn on
 the reviewer thread); the second blocks. A planner's plan follows the same rules in each plan round.
+It is taken only while the planner thread is live in the very run the delivery awaits, read under
+the lock: a tool call names its thread, not its run, and a turn queued behind the planner's run can
+start before that run's end reaches the delivery; that turn's plan must not stand as the earlier
+run's ([`FactoryService.submitPlan`](../../apps/server/src/fd/factory/FactoryService.ts)).
 
 ## Clients see a review's details as it was accepted
 

@@ -31,6 +31,9 @@ import * as ProjectionStore from "../../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../../orchestration-v2/ProjectStore.ts";
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
+import * as ProviderInstanceRegistry from "../../../provider/ProviderInstanceRegistry.ts";
+import * as ProviderRegistryMock from "../../../provider/testUtils/providerRegistryMock.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import { WorkService } from "../../work-management/index.ts";
@@ -65,43 +68,63 @@ const itemRef = {
 };
 const planner = ThreadId.make("thread-planner");
 const planRun = RunId.make("run-plan");
+/** A later turn of the planner thread, queued behind the planner's run. */
+const nextRun = RunId.make("run-plan-next");
 const reviewer = ThreadId.make("thread-reviewer");
 const unrelated = ThreadId.make("thread-unrelated");
 
-/** The calling threads, each live in its turn; planners and reviewers work in plan mode. */
-const shells = new Map<ThreadId, OrchestrationV2ThreadShell>([
-  [planner, liveThreadShell(planner, { interactionMode: "plan" })],
-  [reviewer, liveThreadShell(reviewer, { interactionMode: "plan" })],
-  [unrelated, liveThreadShell(unrelated)],
-]);
+/** The run the planner thread is live in; each test's seed sets it. */
+const live: { planner: RunId } = { planner: planRun };
 
 /**
- * FactoryService, the worker and plan judging as the server builds them, on in-memory SQLite with
- * the evidence folder under a temp T3 home. A submission issues no effect, so the services that
- * perform effects are stubs.
+ * The calling threads as the server reads them, each live in a turn; planners and reviewers work
+ * in plan mode. The MCP access gate and Factory read the same shells, as both read the projection.
+ */
+const shellOf = (threadId: ThreadId): OrchestrationV2ThreadShell | null => {
+  switch (threadId) {
+    case planner:
+      return liveThreadShell(planner, { interactionMode: "plan", activeRunId: live.planner });
+    case reviewer:
+      return liveThreadShell(reviewer, { interactionMode: "plan" });
+    case unrelated:
+      return liveThreadShell(unrelated);
+    default:
+      return null;
+  }
+};
+
+/**
+ * FactoryService, the worker, plan judging and the thread effects as the server builds them, on
+ * in-memory SQLite with the evidence folder under a temp T3 home. A submission issues no effect,
+ * so the services that perform effects are stubs, and of the projection only shells are read.
  */
 const layer = FactoryService.layer.pipe(
   Layer.provideMerge(FactoryWorker.layer),
   // Transition comments are posted in FactoryWorkComments.test.ts; none is posted here.
   Layer.provide(Layer.mock(FactoryWorkComments.FactoryWorkComments)({ post: () => Effect.void })),
   Layer.provide(FactoryPlanning.layer),
+  Layer.provide(FactoryThreadEffects.layer),
   Layer.provide(FactoryEvidence.layer),
   Layer.provide(
     Layer.mergeAll(
-      Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({}),
       Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({}),
       Layer.mock(FactoryReview.FactoryReview)({}),
       Layer.mock(FactoryRecord.FactoryRecord)({}),
       Layer.mock(FactoryPullRequest.FactoryPullRequest)({}),
-      Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+      Layer.mock(ProjectionStore.ProjectionStoreV2)({
+        getThreadShell: (threadId) => Effect.sync(() => shellOf(threadId)),
+      }),
       Layer.mock(ProjectStore.ProjectStoreV2)({}),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
       Layer.mock(WorkService.WorkService)({}),
+      Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({}),
+      ProviderRegistryMock.layer(),
+      ServerSettings.layerTest(),
     ),
   ),
   Layer.provideMerge(
     Layer.mock(ThreadManagement.ThreadManagementService)({
-      getThreadShell: (threadId) => Effect.succeed(shells.get(threadId) ?? null),
+      getThreadShell: (threadId) => Effect.sync(() => shellOf(threadId)),
     }),
   ),
   Layer.provideMerge(FactorySettings.layer),
@@ -206,11 +229,12 @@ const invalidPlan = {
 };
 
 /**
- * Stores the parent as its planner launch left it: the plan stage awaiting the planner's run.
- * `after` events follow, as later steps would have left it.
+ * Stores the parent as its planner launch left it: the plan stage awaiting the planner's run,
+ * the run the planner thread is live in. `after` events follow, as later steps would have left it.
  */
 const seedPlanning = (...after: ReadonlyArray<FactoryEvent>) =>
   Effect.gen(function* () {
+    live.planner = planRun;
     const events: ReadonlyArray<FactoryEvent> = [
       { type: "start" },
       {
@@ -365,6 +389,44 @@ describe("factory_submit_plan from the planner", () => {
         'Task id "export-csv" is already used in this delivery; choose an id it has not used.',
       );
       assert.isNull((yield* stored).plan);
+    }).pipe(Effect.provide(layer), Effect.scoped),
+  );
+});
+
+describe("factory_submit_plan from a later turn of the planner thread", () => {
+  // The owner queued a turn behind the planner's run: it ran once that run completed, while the
+  // run's end still waited to reach the delivery, which therefore still awaits the run before it.
+  it.effect("refuses it, recording nothing, so its plan never stands as the awaited run's", () =>
+    Effect.gen(function* () {
+      yield* seedPlanning();
+      live.planner = nextRun;
+      const before = yield* rawRow;
+      // A write now would move updated_at.
+      yield* TestClock.adjust("1 minute");
+
+      const valid = yield* submit(planner, twoTaskPlan);
+      const invalid = yield* submit(planner, invalidPlan);
+
+      for (const result of [valid, invalid]) {
+        assert.isTrue(result.isFailure);
+        assert.deepInclude(result.result as object, {
+          _tag: "FactoryMcpFailure",
+          code: "plan_not_active",
+        });
+      }
+      // Neither the plan nor the invalid submission counts for the awaited run's round.
+      assert.deepStrictEqual(yield* rawRow, before);
+      const state = yield* stored;
+      assert.isNull(state.plan);
+      assert.strictEqual(state.invalidSubmissions, 0);
+      assert.deepStrictEqual(state.awaiting, { type: "run", threadId: planner, runId: planRun });
+      assert.isFalse(yield* planFileExists);
+
+      // The awaited run itself is still heard.
+      live.planner = planRun;
+      const accepted = yield* submit(planner, twoTaskPlan);
+      assert.isFalse(accepted.isFailure, JSON.stringify(accepted.result));
+      assert.strictEqual((yield* stored).plan?.source, "mcp");
     }).pipe(Effect.provide(layer), Effect.scoped),
   );
 });
