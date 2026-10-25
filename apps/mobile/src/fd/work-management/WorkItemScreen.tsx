@@ -37,7 +37,7 @@ import type {
 } from "@t3tools/contracts/fd/work-management";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
-import { useCallback, useLayoutEffect, useMemo, useState } from "react";
+import { type ComponentType, useCallback, useLayoutEffect, useMemo, useState } from "react";
 import { Alert, Linking, Pressable, RefreshControl, ScrollView, View } from "react-native";
 
 import { AppText as Text, AppTextInput } from "../../components/AppText";
@@ -76,8 +76,21 @@ const MODES: ReadonlyArray<{ readonly value: WorkThreadMode; readonly label: str
 
 const INPUT_CLASS = "rounded-xl bg-card px-3 py-2 text-base text-foreground";
 
+/**
+ * A section another feature adds to the item screen, below its linked threads. The app's Stack
+ * passes it in when registering the screen, so Work never imports the feature.
+ */
+type WorkItemSection = ComponentType<{
+  readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId;
+  readonly item: WorkItemDetail;
+}>;
+
 /** One Work item: status, description, comments, linked threads and starting a thread. */
-export function WorkItemScreen({ route }: StaticScreenProps<WorkItemParams>) {
+export function WorkItemScreen({
+  route,
+  itemSection,
+}: StaticScreenProps<WorkItemParams> & { readonly itemSection?: WorkItemSection | undefined }) {
   const navigation = useNavigation();
   const ref = parseWorkItemRouteRef(route.params);
   const environmentId = route.params.environmentId;
@@ -126,6 +139,7 @@ export function WorkItemScreen({ route }: StaticScreenProps<WorkItemParams>) {
       environmentId={environmentId}
       projectId={route.params.projectId}
       item={item}
+      itemSection={itemSection}
       refreshing={query.isPending}
       onReload={refreshQuery}
       onRefresh={refresh}
@@ -142,6 +156,7 @@ function LoadedItem({
   environmentId,
   projectId,
   item,
+  itemSection: ItemSection,
   refreshing,
   onReload,
   onRefresh,
@@ -149,6 +164,7 @@ function LoadedItem({
   environmentId: EnvironmentId;
   projectId: ProjectId;
   item: WorkItemDetail;
+  itemSection: WorkItemSection | undefined;
   refreshing: boolean;
   onReload: () => void;
   onRefresh: () => void;
@@ -573,6 +589,10 @@ function LoadedItem({
             );
           })}
         </View>
+      ) : null}
+
+      {ItemSection ? (
+        <ItemSection environmentId={environmentId} projectId={projectId} item={item} />
       ) : null}
 
       <View className="gap-2">

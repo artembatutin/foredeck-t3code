@@ -17,6 +17,18 @@ export {
   type FactoryTimelineEntry,
 } from "./model.ts";
 export {
+  cancelConfirmationTarget,
+  factoryDeliveryView,
+  receiptText,
+  reviewText,
+  type FactoryControlPermissions,
+  type FactoryDeliveryView,
+  type FactoryEvidenceLine,
+  type FactoryReviewLine,
+  type FactoryThreadTarget,
+  type FactoryTimelineRow,
+} from "./section.ts";
+export {
   FACTORY_SETTINGS_BOUNDS,
   factorySettingsDraft,
   factorySettingsDraftEdited,

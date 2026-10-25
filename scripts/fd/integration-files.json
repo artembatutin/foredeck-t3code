@@ -361,7 +361,7 @@
     "apps/web/src/routes/_chat.work.tsx": "Thin route file for the Work page; search validation and the view come from the fd entry point. Passes the fd Factory item section into the Work item detail and Factory's Deliver action into its start dialog, so Work never imports Factory.",
     "packages/contracts/src/keybindings.ts": "Adds the work.open command literal.",
     "packages/shared/src/keybindings.ts": "Binds mod+shift+u to work.open outside terminal focus.",
-    "apps/mobile/src/Stack.tsx": "Registers the fd Work list, item and comment routes and lists the comment sheet as a workspace overlay.",
+    "apps/mobile/src/Stack.tsx": "Registers the fd Work list, item and comment routes and lists the comment sheet as a workspace overlay. Passes the fd Factory item section into the Work item screen, so Work never imports Factory.",
     "apps/mobile/src/features/home/MaterialThreadListToolbar.tsx": "Offers the fd Work header action on the Android threads tab when an environment advertises Work."
   }
 }

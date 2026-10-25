@@ -1,3 +1,4 @@
+import { FactoryItemSection } from "./fd/factory";
 import { WorkCommentSheet, WorkItemScreen, WorkListScreen } from "./fd/work-management";
 import { PullRequestGuideStopScreen } from "./features/pull-requests/guide/PullRequestGuideScreen";
 import { PullRequestInlineCommentScreen } from "./features/pull-requests/PullRequestInlineCommentScreen";
@@ -18,7 +19,7 @@ import {
   createNativeStackScreen,
   type NativeStackNavigationOptions,
 } from "@react-navigation/native-stack";
-import { useEffect, useRef, type ReactNode } from "react";
+import { type ComponentProps, useEffect, useRef, type ReactNode } from "react";
 import {
   Platform,
   Pressable,
@@ -793,7 +794,9 @@ const RootStackConfig = createWorkspaceStackNavigator({
       options: SOLID_HEADER_OPTIONS,
     }),
     WorkItem: createNativeStackScreen({
-      screen: WorkItemScreen,
+      screen: (props: ComponentProps<typeof WorkItemScreen>) => (
+        <WorkItemScreen {...props} itemSection={FactoryItemSection} />
+      ),
       linking: "work/:environmentId/:projectId/:sourceId/:itemId",
       options: SOLID_HEADER_OPTIONS,
     }),
