@@ -9,6 +9,7 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import {
+  type WorkComment,
   type WorkCommentInput,
   type WorkCommentResult,
   type WorkItemCreateInput,
@@ -167,6 +168,16 @@ export class WorkService extends Context.Service<
       actor: WorkActor,
       input: WorkCommentInput,
     ) => Effect.Effect<WorkCommentResult, WorkDomainError>;
+    /**
+     * A comment of the item whose text contains `text`, looked for through its whole comment
+     * history rather than the bounded list `getItem` returns; none when no comment does. For a
+     * server module that must tell whether a comment it may have posted is there; no transport
+     * exposes it.
+     */
+    readonly findComment: (
+      actor: WorkActor,
+      input: { readonly ref: WorkItemRef; readonly text: string },
+    ) => Effect.Effect<Option.Option<WorkComment>, WorkDomainError>;
     readonly listLinks: (
       actor: WorkActor,
       query: WorkLinksQuery,
@@ -938,6 +949,19 @@ const make = Effect.gen(function* () {
       return result;
     });
 
+  const findComment: WorkService["Service"]["findComment"] = (actor, input) =>
+    Effect.gen(function* () {
+      yield* requireGrants(actor, [AuthWorkReadScope]);
+      if (input.text.trim().length === 0) {
+        return yield* new WorkInvalid({ detail: "A comment lookup needs some text." });
+      }
+      // Read from the source, never the item cache: the caller asks because a bounded or cached
+      // read cannot answer.
+      const { adapter, runtime } = yield* resolveSource(input.ref.sourceId);
+      const ref = yield* canonicalRef(input.ref);
+      return yield* observed(ref.sourceId, adapter.findComment(runtime, ref.itemId, input.text));
+    });
+
   const isOpenThread = (threadId: WorkThreadLink["threadId"]) =>
     projections.getThreadShell(threadId).pipe(
       Effect.map(
@@ -1126,6 +1150,7 @@ const make = Effect.gen(function* () {
     updateItem,
     setStatus,
     addComment,
+    findComment,
     listLinks,
     setLink,
     refresh,

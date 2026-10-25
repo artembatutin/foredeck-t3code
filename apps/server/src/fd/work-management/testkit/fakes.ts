@@ -206,7 +206,10 @@ const identityOf = (config: WorkSourceConfig): string => {
 
 export interface FakeAdapter {
   readonly adapter: WorkSourceAdapter;
-  /** Source calls in order: `list`, `get:<itemId>`, `create`, `update`, `setStatus`, `comment`, `snapshots`. */
+  /**
+   * Source calls in order: `list`, `get:<itemId>`, `create`, `update`, `setStatus`, `comment`,
+   * `findComment`, `snapshots`.
+   */
   readonly calls: ReadonlyArray<string>;
   readonly count: (call: string) => number;
   /** Identities `prepare` ran for. */
@@ -395,6 +398,27 @@ export const fakeAdapter = (
           Effect.map(() => {
             comments.push({ itemId, body, actorId: actor.id });
             return { commentId: `comment-${comments.length}` };
+          }),
+        ),
+      ),
+    // Every comment `comment` added, whatever `get` shows.
+    findComment: (runtime, itemId, text) =>
+      call("findComment", () =>
+        find(runtime, itemId).pipe(
+          Effect.map(() => {
+            const index = comments.findIndex(
+              (comment) => comment.itemId === itemId && comment.body.includes(text),
+            );
+            const found = comments[index];
+            return found === undefined
+              ? Option.none()
+              : Option.some({
+                  id: `comment-${index + 1}`,
+                  author: { id: found.actorId, label: found.actorId },
+                  body: found.body,
+                  createdAt: "2026-10-25T00:00:00.000Z",
+                  updatedAt: null,
+                });
           }),
         ),
       ),

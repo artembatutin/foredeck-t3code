@@ -902,6 +902,24 @@ export const make: Effect.Effect<
     }).pipe(Effect.map(() => ({ commentId })));
   };
 
+  const findComment: WorkSourceAdapter["findComment"] = (runtime, itemId, text) =>
+    Effect.gen(function* () {
+      const source = yield* open(runtime);
+      const located = (yield* refresh(source)).byId.get(normalizeId(itemId));
+      if (located === undefined) return yield* new WorkItemNotFound({ itemId });
+      // The index keeps the first notes only; the file holds every one.
+      const { filename } = located.file;
+      const inspected = yield* inspect(path.join(source.route.path, filename), filename, undefined);
+      if (Option.isNone(inspected)) return yield* new WorkItemNotFound({ itemId });
+      const { document } = inspected.value;
+      if (document === undefined) {
+        return yield* new WorkUnavailable({ detail: "The task file could not be read." });
+      }
+      return Option.fromUndefinedOr(
+        parseNotes(document.item?.body ?? "").find((note) => note.body.includes(text)),
+      );
+    });
+
   const snapshots: WorkSourceAdapter["snapshots"] = (runtime, itemIds) =>
     Effect.gen(function* () {
       const view = yield* refresh(yield* open(runtime));
@@ -932,6 +950,7 @@ export const make: Effect.Effect<
     update,
     setStatus,
     comment,
+    findComment,
     snapshots,
     watch,
   } satisfies WorkSourceAdapter;

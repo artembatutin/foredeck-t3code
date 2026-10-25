@@ -29,6 +29,7 @@ import { GITHUB_WRITABLE_STATUSES, toGitHubState } from "../../model/status.ts";
 import type { WorkSourceAdapter, WorkSourceRuntime } from "../WorkSourceAdapter.ts";
 import {
   AssignableUsersResponse,
+  IssueCommentsResponse,
   IssueDetailResponse,
   IssueListResponse,
   IssueSearchResponse,
@@ -38,12 +39,14 @@ import {
   RestIssueJson,
   RestRepositoryJson,
   RestUserJson,
+  toComment,
   toDetail,
   toSummary,
 } from "./issueJson.ts";
 import {
   assignableUsersQuery,
   type IssueFieldSet,
+  issueCommentsQuery,
   issueDetailQuery,
   issueSnapshotsQuery,
   listIssuesQuery,
@@ -55,6 +58,8 @@ type GitHubConfig = Extract<WorkSourceConfig, { readonly kind: "github" }>;
 
 const VIEWER_TTL_MS = 10 * 60_000;
 const SNAPSHOT_BATCH = 50;
+/** Comments per page of a lookup; nested connections stay at 50 or fewer. */
+const COMMENTS_PAGE = 50;
 const decodeIssueSummary = Schema.decodeUnknownOption(IssueSummaryJson);
 
 const configOf = (runtime: Pick<WorkSourceRuntime, "config">): GitHubConfig => {
@@ -273,6 +278,22 @@ export const make = (options: GitHubIssuesOptions = {}) =>
         if (issue === null || issue === undefined) return yield* new WorkItemNotFound({ itemId });
         return toDetail(runtime.sourceId, issue);
       });
+
+    /** The page of the issue's comments just older than `before`; the newest page for null. */
+    const commentsPage = (
+      runtime: WorkSourceRuntime,
+      itemId: string,
+      number: number,
+      before: string | null,
+    ) =>
+      graphql(
+        runtime,
+        "work.issue.comments",
+        () => issueCommentsQuery,
+        { number, last: COMMENTS_PAGE, before },
+        IssueCommentsResponse,
+        itemId,
+      );
 
     /** Fails stale when the issue moved past the revision the caller saw. */
     const checkRevision = (
@@ -549,6 +570,36 @@ export const make = (options: GitHubIssuesOptions = {}) =>
             return { commentId: String(created.id) };
           }),
         ),
+      findComment: (runtime, itemId, text) =>
+        Effect.gen(function* () {
+          const number = issueNumber(itemId);
+          if (number === undefined) return yield* new WorkItemNotFound({ itemId });
+          // Newest first, so a recent comment ends the walk early; otherwise every page is read.
+          let before: string | null = null;
+          for (;;) {
+            const response: typeof IssueCommentsResponse.Type = yield* commentsPage(
+              runtime,
+              itemId,
+              number,
+              before,
+            );
+            const issue = response.data.repository?.issue;
+            if (issue === null || issue === undefined) {
+              return yield* new WorkItemNotFound({ itemId });
+            }
+            const { pageInfo, nodes } = issue.comments;
+            const found = nodes.findLast((node) => node !== null && node.body.includes(text));
+            if (found !== undefined && found !== null) return Option.some(toComment(found));
+            if (!pageInfo.hasPreviousPage) return Option.none();
+            // Stopping here would answer for comments never read.
+            if (pageInfo.startCursor === null) {
+              return yield* new WorkUnavailable({
+                detail: "GitHub ended a page of comments without a cursor.",
+              });
+            }
+            before = pageInfo.startCursor;
+          }
+        }),
       snapshots: (runtime, itemIds) =>
         Effect.gen(function* () {
           const numbers = itemIds

@@ -62,6 +62,14 @@ branch merges. That is why started threads are told to change status and notes
 through the `work_*` tools (which write the canonical copy) and to leave task
 frontmatter alone in their worktree.
 
+## Comment lookups read the whole history
+
+An item read returns a bounded list of comments, and which end it keeps differs by source
+(Markdown keeps the oldest, GitHub and Jira the newest), so a comment missing from it may still be
+there. `WorkService.findComment` pages through every comment instead, for a server module that must
+tell whether a comment it may have posted landed, as Factory does after a crash. No transport
+exposes it, so a full history never crosses the wire.
+
 ## Agent grants
 
 MCP callers get Work grants from what they may change, in `mcp/actor.ts`: a

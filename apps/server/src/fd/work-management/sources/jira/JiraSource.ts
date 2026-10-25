@@ -1,6 +1,7 @@
 import type { WorkItemSummary, WorkSourceConfig } from "@t3tools/contracts/fd/work-management";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
@@ -29,6 +30,8 @@ import {
   SEARCH_FIELDS,
   SearchResponse,
   ServerInfoResponse,
+  commentText,
+  toComment,
   toDetail,
   toSummary,
   toTransition,
@@ -42,6 +45,8 @@ type JiraConfig = Extract<WorkSourceConfig, { readonly kind: "jira" }>;
 /** Writes to issues recently written are named in searches so Jira's index catches up. */
 const RECONCILE_WINDOW_MS = 2 * 60_000;
 const SNAPSHOT_BATCH = 50;
+/** Comments per page of a lookup, the most a comment page returns. */
+const COMMENTS_PAGE = 100;
 const PREFERRED_TYPES = ["task", "story"];
 
 const decodeSearch = Schema.decodeEffect(SearchResponse);
@@ -572,6 +577,36 @@ export const make = (options: JiraSourceOptions = {}) =>
           ),
         );
       },
+      findComment: (runtime, itemId, text) =>
+        Effect.gen(function* () {
+          const key = normalizeIssueKey(itemId);
+          // Newest first, so a recent comment ends the walk early, and a comment added meanwhile
+          // shifts later pages back, so none is skipped; otherwise every page is read.
+          for (let startAt = 0; ;) {
+            const page = yield* call(runtime, {
+              operation: "jira.comments",
+              kind: "read",
+              path: `/rest/api/3/issue/${encodeURIComponent(key)}/comment`,
+              query: {
+                startAt: String(startAt),
+                maxResults: String(COMMENTS_PAGE),
+                orderBy: "-created",
+              },
+              itemId: key,
+            }).pipe(
+              Effect.flatMap((response) =>
+                decodeComments(response.body).pipe(Effect.mapError(unexpected)),
+              ),
+            );
+            const found = page.comments.find((comment) => commentText(comment).includes(text));
+            if (found !== undefined) return Option.some(toComment(found));
+            startAt += page.comments.length;
+            // The page size is Jira's to cap, so only an empty page or the total ends the walk.
+            if (page.comments.length === 0 || (page.total !== undefined && startAt >= page.total)) {
+              return Option.none();
+            }
+          }
+        }),
       snapshots: (runtime, itemIds) =>
         Effect.gen(function* () {
           const config = configOf(runtime);

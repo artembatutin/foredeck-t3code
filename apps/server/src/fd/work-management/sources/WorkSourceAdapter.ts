@@ -1,5 +1,6 @@
 import type { ProjectId } from "@t3tools/contracts";
 import type {
+  WorkComment,
   WorkCommentResult,
   WorkItemCreateInput,
   WorkItemDetail,
@@ -19,6 +20,7 @@ import type {
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import type * as Option from "effect/Option";
 import type * as Stream from "effect/Stream";
 
 import type { WorkActor } from "../authority.ts";
@@ -100,6 +102,16 @@ export interface WorkSourceAdapter {
     body: string,
     actor: WorkActor,
   ) => Effect.Effect<WorkCommentResult, WorkDomainError>;
+  /**
+   * A comment of the item whose text contains `text`, looked for through the item's whole
+   * comment history; none when no comment does. `get` returns a bounded list that can leave the
+   * comment out, so only this answer tells that it is not there.
+   */
+  readonly findComment: (
+    runtime: WorkSourceRuntime,
+    itemId: WorkItemId,
+    text: string,
+  ) => Effect.Effect<Option.Option<WorkComment>, WorkDomainError>;
   /** Current summaries for linked items, batched; missing items are simply absent. */
   readonly snapshots: (
     runtime: WorkSourceRuntime,

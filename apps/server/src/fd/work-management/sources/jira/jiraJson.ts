@@ -285,6 +285,25 @@ export const toTransition = (transition: TransitionJson): WorkTransition => {
   };
 };
 
+type CommentJson = (typeof CommentsResponse.Type)["comments"][number];
+
+/** A comment's text, as Markdown from its ADF body, whole. */
+export const commentText = (comment: CommentJson) => adfToMarkdown(comment.body ?? null).markdown;
+
+export const toComment = (comment: CommentJson): WorkComment => ({
+  id: comment.id,
+  author:
+    comment.author === null || comment.author === undefined
+      ? null
+      : {
+          id: comment.author.accountId ?? "",
+          label: comment.author.displayName ?? comment.author.accountId ?? "Unknown",
+        },
+  body: truncateText(commentText(comment), 16_000).text,
+  createdAt: normalizeTimestamp(comment.created),
+  updatedAt: comment.updated ? normalizeTimestamp(comment.updated) : null,
+});
+
 export const toDetail = (
   sourceId: WorkSourceId,
   siteOrigin: string,
@@ -297,19 +316,7 @@ export const toDetail = (
   const shown: Array<WorkComment> = comments.comments
     .toReversed()
     .slice(-COMMENTS_MAX)
-    .map((comment) => ({
-      id: comment.id,
-      author:
-        comment.author === null || comment.author === undefined
-          ? null
-          : {
-              id: comment.author.accountId ?? "",
-              label: comment.author.displayName ?? comment.author.accountId ?? "Unknown",
-            },
-      body: truncateText(adfToMarkdown(comment.body ?? null).markdown, 16_000).text,
-      createdAt: normalizeTimestamp(comment.created),
-      updatedAt: comment.updated ? normalizeTimestamp(comment.updated) : null,
-    }));
+    .map(toComment);
   return {
     ...toSummary(sourceId, siteOrigin, issue),
     body: bounded.text,

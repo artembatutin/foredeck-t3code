@@ -39,6 +39,21 @@ export const listIssuesQuery = (fields: IssueFieldSet) => `
   }
 `;
 
+/** One page of an issue's comments, newest first from `before`, for a walk through all of them. */
+export const issueCommentsQuery = `
+  query WorkIssueComments($owner: String!, $name: String!, $number: Int!, $last: Int!,
+                          $before: String) {
+    repository(owner: $owner, name: $name) {
+      issue(number: $number) {
+        comments(last: $last, before: $before) {
+          pageInfo { hasPreviousPage startCursor }
+          nodes { id body createdAt updatedAt author { login } }
+        }
+      }
+    }
+  }
+`;
+
 export const searchIssuesQuery = (fields: IssueFieldSet) => `
   query WorkIssueSearch($query: String!, $first: Int!, $after: String) {
     search(type: ISSUE, query: $query, first: $first, after: $after) {

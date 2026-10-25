@@ -25,6 +25,15 @@ const Actor = Schema.Struct({
   name: Schema.optional(Schema.NullOr(Schema.String)),
 });
 
+const CommentJson = Schema.Struct({
+  id: Schema.String,
+  body: Schema.String,
+  createdAt: Schema.String,
+  updatedAt: Schema.optional(Schema.NullOr(Schema.String)),
+  author: Schema.optional(Schema.NullOr(Schema.Struct({ login: Schema.String }))),
+});
+type CommentJson = typeof CommentJson.Type;
+
 export const IssueSummaryJson = Schema.Struct({
   id: Schema.String,
   number: Schema.Int,
@@ -63,17 +72,7 @@ export const IssueDetailJson = Schema.Struct({
   blocking: Schema.optional(Schema.NullOr(Connection(Schema.Struct({ number: Schema.Int })))),
   comments: Schema.Struct({
     totalCount: Schema.Int,
-    nodes: Schema.Array(
-      Schema.NullOr(
-        Schema.Struct({
-          id: Schema.String,
-          body: Schema.String,
-          createdAt: Schema.String,
-          updatedAt: Schema.optional(Schema.NullOr(Schema.String)),
-          author: Schema.optional(Schema.NullOr(Schema.Struct({ login: Schema.String }))),
-        }),
-      ),
-    ),
+    nodes: Schema.Array(Schema.NullOr(CommentJson)),
   }),
 });
 export type IssueDetailJson = typeof IssueDetailJson.Type;
@@ -114,6 +113,29 @@ export const IssueDetailResponse = Schema.fromJsonString(
   Schema.Struct({
     data: Schema.Struct({
       repository: Schema.NullOr(Schema.Struct({ issue: Schema.NullOr(IssueDetailJson) })),
+    }),
+  }),
+);
+
+/** One page of an issue's comments, walking back from the newest. */
+export const IssueCommentsResponse = Schema.fromJsonString(
+  Schema.Struct({
+    data: Schema.Struct({
+      repository: Schema.NullOr(
+        Schema.Struct({
+          issue: Schema.NullOr(
+            Schema.Struct({
+              comments: Schema.Struct({
+                pageInfo: Schema.Struct({
+                  hasPreviousPage: Schema.Boolean,
+                  startCursor: Schema.NullOr(Schema.String),
+                }),
+                nodes: Schema.Array(Schema.NullOr(CommentJson)),
+              }),
+            }),
+          ),
+        }),
+      ),
     }),
   }),
 );
@@ -217,17 +239,17 @@ export const toSummary = (sourceId: WorkSourceId, issue: IssueSummaryJson): Work
   };
 };
 
+export const toComment = (comment: CommentJson): WorkComment => ({
+  id: comment.id,
+  author: comment.author ? { id: comment.author.login, label: comment.author.login } : null,
+  body: truncateText(comment.body, 16_000).text,
+  createdAt: comment.createdAt,
+  updatedAt: comment.updatedAt ?? null,
+});
+
 export const toDetail = (sourceId: WorkSourceId, issue: IssueDetailJson): WorkSourceItemDetail => {
   const body = truncateText(issue.body ?? "", BODY_MAX_CHARS);
-  const comments: Array<WorkComment> = nodes(issue.comments)
-    .slice(-COMMENTS_MAX)
-    .map((comment) => ({
-      id: comment.id,
-      author: comment.author ? { id: comment.author.login, label: comment.author.login } : null,
-      body: truncateText(comment.body, 16_000).text,
-      createdAt: comment.createdAt,
-      updatedAt: comment.updatedAt ?? null,
-    }));
+  const comments: Array<WorkComment> = nodes(issue.comments).slice(-COMMENTS_MAX).map(toComment);
   const children: Array<WorkItemChild> = nodes(issue.subIssues).map((child) => ({
     itemId: WorkItemId.make(String(child.number)),
     key: `#${child.number}`,
