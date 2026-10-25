@@ -10,6 +10,7 @@ import {
 import {
   FactoryDeliveryId,
   FactoryDeliveryStatus,
+  FactoryPlan,
   FactoryReviewDetails,
   FactoryReviewSummary,
   FactoryRole,
@@ -83,6 +84,20 @@ const StoredEffect = Schema.Union([
     checkpoint: Schema.optionalKey(FactoryStageName),
   }),
   Schema.Struct({ id: PositiveInt, type: Schema.Literal("run_command"), stage: FactoryStageName }),
+  // Added with planning.
+  Schema.Struct({
+    id: PositiveInt,
+    type: Schema.Literal("read_fallback_plan"),
+    threadId: ThreadId,
+    runId: RunId,
+  }),
+  Schema.Struct({
+    id: PositiveInt,
+    type: Schema.Literal("send_plan_retry_turn"),
+    threadId: ThreadId,
+    problems: Problems,
+    checkpoint: Schema.optionalKey(FactoryStageName),
+  }),
   Schema.Struct({
     id: PositiveInt,
     type: Schema.Literal("read_fallback_review"),
@@ -146,6 +161,7 @@ const StoredBlock = Schema.Union([
   }),
   Schema.Struct({ reason: Schema.Literal("code_changed"), changes: ReceiptRefusals }),
   Schema.Struct({ reason: Schema.Literal("invalid_submission"), problems: Problems }),
+  Schema.Struct({ reason: Schema.Literal("plan_empty"), note: Schema.NullOr(Schema.String) }),
   Schema.Struct({
     reason: Schema.Literal("record_mismatch"),
     expected: Schema.Struct(StoredCommit),
@@ -166,9 +182,21 @@ const StoredAcceptedReview = Schema.Struct({
   details: Schema.optionalKey(FactoryReviewDetails),
 });
 
+const StoredAcceptedPlan = Schema.Struct({
+  ...FactoryPlan.fields,
+  round: PositiveInt,
+  source: Schema.Literals(["mcp", "fallback"]),
+  evidencePath: Schema.String,
+});
+
 const StoredRoundLimit = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 10 }));
 
 const StoredDeliveryState = Schema.Struct({
+  // Added with planning, as were the planner launch, plan round and plan: rows stored before it
+  // are single items that never planned.
+  kind: Schema.Literals(["single", "parent"]).pipe(
+    Schema.withDecodingDefault(Effect.succeed("single" as const)),
+  ),
   status: FactoryDeliveryStatus,
   stage: Schema.NullOr(FactoryStageName),
   branch: Schema.String,
@@ -182,6 +210,7 @@ const StoredDeliveryState = Schema.Struct({
   }),
   // Added with resume: rows stored before it recorded no launch.
   authorLaunch: Schema.NullOr(StoredLaunch).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  plannerLaunch: Schema.NullOr(StoredLaunch).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   awaiting: Schema.NullOr(StoredAwaiting),
   fixCommitTurns: NonNegativeInt,
   effectsIssued: NonNegativeInt,
@@ -206,6 +235,8 @@ const StoredDeliveryState = Schema.Struct({
   reviewResponse: Schema.NullOr(Schema.Struct({ threadId: ThreadId, runId: RunId })).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
+  planRound: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
+  plan: Schema.NullOr(StoredAcceptedPlan).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   // Added with the PR stage: rows stored before it opened none.
   pullRequest: Schema.NullOr(
     Schema.Struct({ number: PositiveInt, url: Schema.String, headBranch: Schema.String }),

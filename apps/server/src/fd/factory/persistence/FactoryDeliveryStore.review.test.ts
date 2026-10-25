@@ -178,6 +178,11 @@ describe("FactoryDeliveryStore with review state", () => {
         checkpoint: null,
         // Nor the author launch, recorded since resume: the row predates it.
         authorLaunch: null,
+        // Nor the planning fields: a gate-1 row is a single item that never planned.
+        kind: "single",
+        plannerLaunch: null,
+        planRound: 0,
+        plan: null,
       });
       assert.deepStrictEqual(
         (yield* store.listActive()).map((delivery) => delivery.deliveryId),

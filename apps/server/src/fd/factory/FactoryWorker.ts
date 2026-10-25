@@ -34,7 +34,13 @@ import * as FactoryWorkCommentStore from "./persistence/FactoryWorkCommentStore.
 import { transitionComment } from "./pipeline/comments.ts";
 import { advance } from "./pipeline/engine.ts";
 import { failureFingerprint } from "./pipeline/fingerprint.ts";
-import { acceptedReview, isProceeding, isTurnEffect, receiptFailed } from "./pipeline/state.ts";
+import {
+  acceptedPlan,
+  acceptedReview,
+  isProceeding,
+  isTurnEffect,
+  receiptFailed,
+} from "./pipeline/state.ts";
 import type {
   FactoryCommandOutcome,
   FactoryDeliveryState,
@@ -53,6 +59,19 @@ class FactoryStageCommandError extends Schema.TaggedError<FactoryStageCommandErr
 ) {
   override get message(): string {
     return `Factory has no command to run for stage ${this.stage} of this delivery.`;
+  }
+}
+
+/**
+ * This server cannot yet read a planner's fenced plan or send its retry turn; the delivery blocks
+ * on the effect, as it does on a planner launch.
+ */
+class FactoryPlanningUnavailableError extends Schema.TaggedError<FactoryPlanningUnavailableError>()(
+  "FactoryPlanningUnavailableError",
+  { effect: Schema.Literals(["read_fallback_plan", "send_plan_retry_turn"]) },
+) {
+  override get message(): string {
+    return `Factory cannot carry out ${this.effect} for a planner yet.`;
   }
 }
 
@@ -149,6 +168,10 @@ const describeEffect = (effect: FactoryEffect) => {
       return "check the branch";
     case "run_command":
       return `run the ${effect.stage} command`;
+    case "read_fallback_plan":
+      return "read the plan in the planner's last message";
+    case "send_plan_retry_turn":
+      return "send the plan retry turn";
     case "read_fallback_review":
       return "read the review in the reviewer's last message";
     case "send_review_retry_turn":
@@ -177,6 +200,13 @@ const failureDetail = (effect: FactoryEffect, cause: Cause.Cause<unknown>) => {
   return `Factory could not ${describeEffect(effect)} (${kind}).`;
 };
 
+/**
+ * Whether the delivery's current attempt is still under way in `state`: while it proceeds, and
+ * while it waits at the plan gate for its owner.
+ */
+const attemptOpen = (state: FactoryDeliveryState) =>
+  isProceeding(state) || state.status === "waiting";
+
 /** How an attempt ends when its delivery stops running in `state`. */
 const outcomeOf = (state: FactoryDeliveryState): FactoryStageOutcome => {
   if (state.status === "blocked") {
@@ -195,7 +225,8 @@ const outcomeOf = (state: FactoryDeliveryState): FactoryStageOutcome => {
 
 /**
  * The evidence of the attempt a step finishes, with a failure's fingerprint: the command's
- * receipt (or log), the review accepted in the review round being left, or the approval.
+ * receipt (or log), the plan accepted in the plan round being left, the review accepted in the
+ * review round being left, or the approval.
  */
 const evidenceOf = (
   event: FactoryEvent,
@@ -214,6 +245,13 @@ const evidenceOf = (
       path: outcome.type === "approved" ? outcome.evidencePath : undefined,
       fingerprint: undefined,
     };
+  }
+  if (before.stage === "plan") {
+    const plan =
+      event.type === "plan.read" && event.judgment.type === "accepted"
+        ? event.judgment.plan
+        : acceptedPlan(before);
+    return { path: plan?.evidencePath, fingerprint: undefined };
   }
   const review =
     before.stage !== "review"
@@ -348,6 +386,9 @@ const make = Effect.gen(function* () {
             judgment,
           })),
         );
+      case "read_fallback_plan":
+      case "send_plan_retry_turn":
+        return Effect.fail(new FactoryPlanningUnavailableError({ effect: effect.type }));
       case "send_review_retry_turn":
         return threads.sendReviewRetryTurn(delivery, effect).pipe(Effect.map(turnStarted));
       case "send_repair_turn":
@@ -379,7 +420,8 @@ const make = Effect.gen(function* () {
    * by how it stopped proceeding when it did. Entering one appends the next attempt, and the
    * attempt carries the run the delivery now awaits; a resumed delivery enters its stage again,
    * since the attempt it stopped or blocked in has ended. An approved delivery still proceeds:
-   * its PR attempt ends when the pull request is open or the delivery blocks.
+   * its PR attempt ends when the pull request is open or the delivery blocks. A delivery waiting
+   * at the plan gate keeps the gate's attempt open until its owner decides.
    */
   const recordAttempts = Effect.fn("FactoryWorker.recordAttempts")(function* (
     deliveryId: FactoryDeliveryId,
@@ -387,9 +429,9 @@ const make = Effect.gen(function* () {
     after: FactoryDeliveryState,
     evidence: ReturnType<typeof evidenceOf>,
   ) {
-    const stopped = !isProceeding(after);
+    const stopped = !attemptOpen(after);
     const advanced = after.stage !== before.stage;
-    const entered = advanced || (!isProceeding(before) && !stopped);
+    const entered = advanced || (!attemptOpen(before) && !stopped);
     let active = (yield* stageRuns.listByDelivery(deliveryId)).findLast(
       (run) => run.outcome === null && run.stage === before.stage,
     );
@@ -399,7 +441,7 @@ const make = Effect.gen(function* () {
       attempt: run.attempt,
     });
 
-    if (active !== undefined && isProceeding(before) && (advanced || stopped)) {
+    if (active !== undefined && attemptOpen(before) && (advanced || stopped)) {
       const { path, fingerprint } = evidence;
       yield* stageRuns.finish({
         ...attemptOf(active),

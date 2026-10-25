@@ -141,8 +141,8 @@ const threadLabel = (state: FactoryDeliveryState, threadId: ThreadId) => {
 
 /**
  * Why a blocked delivery waits on its owner, as one sentence: fixed text and the block's bounded
- * facts (roles, statuses, counts, settle and validation problems), never a log, a log path or a
- * cause. Effect failure details are the worker's fixed text already.
+ * facts (roles, statuses, counts, settle and validation problems, an empty plan's note), never a
+ * log, a log path or a cause. Effect failure details are the worker's fixed text already.
  */
 const blockReason = (state: FactoryDeliveryState, block: FactoryBlock): string => {
   switch (block.reason) {
@@ -175,17 +175,42 @@ const blockReason = (state: FactoryDeliveryState, block: FactoryBlock): string =
         ? "The code changed during review."
         : `The code changed during review: ${listed(block.changes.map((change) => CHECKOUT_CHANGES[change]))}.`;
     case "invalid_submission":
-      return firstProblem("The reviewer's submission was invalid again", block.problems);
+      return firstProblem(
+        state.stage === "plan"
+          ? "The planner's plan was invalid again"
+          : "The reviewer's submission was invalid again",
+        block.problems,
+      );
+    case "plan_empty":
+      // The note's lines run together: needsYou is one sentence.
+      return block.note === null
+        ? "The planner found nothing to plan."
+        : `The planner found nothing to plan: ${block.note.replace(/\s+/g, " ")}`;
     case "record_mismatch":
       return `The worktree no longer holds the verified, reviewed commit: ${listed(block.differences.map((difference) => RECORD_DIFFERENCES[difference]))}.`;
   }
 };
 
-/** Why a blocked delivery waits on its owner; its Work comment on blocking says the same. */
+/** What a delivery waiting at a gate waits on its owner for. */
+const gateReason = (state: FactoryDeliveryState): string => {
+  const count = state.plan?.tasks.length ?? 0;
+  return count === 0
+    ? "A plan awaits your approval."
+    : `A plan of ${count} ${count === 1 ? "task" : "tasks"} awaits your approval.`;
+};
+
+/**
+ * Why a delivery waits on its owner, at the plan gate or blocked; a blocked delivery's Work comment
+ * on blocking says the same.
+ */
 export const needsYou = (state: FactoryDeliveryState): string | undefined => {
-  if (state.status !== "blocked") return undefined;
+  if (state.status !== "blocked" && state.status !== "waiting") return undefined;
   const reason =
-    state.block === null ? "Factory blocked this delivery." : blockReason(state, state.block);
+    state.status === "waiting"
+      ? gateReason(state)
+      : state.block === null
+        ? "Factory blocked this delivery."
+        : blockReason(state, state.block);
   return reason.length > NEEDS_YOU_MAX_LENGTH
     ? `${reason.slice(0, NEEDS_YOU_MAX_LENGTH - 1)}…`
     : reason;
@@ -195,7 +220,8 @@ export const needsYou = (state: FactoryDeliveryState): string | undefined => {
  * A delivery as clients see it: its progress, threads and the summaries of its receipts, reviews
  * and newest stage attempts, never their logs or evidence paths. Receipts and reviews carry their
  * evidence numbers, and each attempt names the one it produced; reviews carry the bounded details
- * kept when they were accepted. `needsYou` is set only while it is blocked.
+ * kept when they were accepted. `needsYou` is set only while it waits at the plan gate or is
+ * blocked.
  */
 export const toFactoryDelivery = (delivery: FactoryDeliveryWithRuns): FactoryDelivery => {
   const { state } = delivery;

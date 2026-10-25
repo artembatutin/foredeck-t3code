@@ -3,9 +3,9 @@ import type { FactoryStageHandler } from "./registry.ts";
 
 /**
  * Agent stages launch a new thread for the stage's role. The delivery's first thread creates
- * its worktree; once a worktree path is recorded, every later thread works in it. An author
- * launch is recorded on the delivery as it is issued, so a launch whose result is lost can be
- * found and replayed (see `unrecordedAuthorLaunch`).
+ * its worktree; once a worktree path is recorded, every later thread works in it. An author or
+ * planner launch is recorded on the delivery as it is issued, so a launch whose result is lost
+ * can be found and replayed (see `unrecordedAuthorLaunch` and `unrecordedPlannerLaunch`).
  */
 export const agentStage: FactoryStageHandler<"agent"> = {
   kind: "agent",
@@ -22,8 +22,14 @@ export const agentStage: FactoryStageHandler<"agent"> = {
       },
     );
     const [launch] = next.effects;
-    return stage.role === "author" && launch?.type === "launch_thread"
-      ? { ...next, delivery: { ...next.delivery, authorLaunch: launch } }
-      : next;
+    if (launch?.type !== "launch_thread") return next;
+    switch (stage.role) {
+      case "author":
+        return { ...next, delivery: { ...next.delivery, authorLaunch: launch } };
+      case "planner":
+        return { ...next, delivery: { ...next.delivery, plannerLaunch: launch } };
+      case "reviewer":
+        return next;
+    }
   },
 };

@@ -1,6 +1,7 @@
 import type { OrchestrationV2RunStatus, RunId, RuntimeMode, ThreadId } from "@t3tools/contracts";
 import type {
   FactoryDeliveryStatus,
+  FactoryPlan,
   FactoryReviewDetails,
   FactoryReviewSummary,
   FactoryRole,
@@ -83,6 +84,22 @@ export type FactoryEffectRequest =
   /** Run the stage's project command in the worktree. */
   | { readonly type: "run_command"; readonly stage: FactoryStageName }
   /**
+   * Judge the plan in the last assistant message of this planner run, for a run that ended
+   * without an accepted submission (providers without t3 MCP tools answer in a fenced block).
+   */
+  | { readonly type: "read_fallback_plan"; readonly threadId: ThreadId; readonly runId: RunId }
+  /**
+   * A follow-up turn asking the planner to submit its whole plan again: the one turn a round's
+   * invalid fallback plan gets, listing its problems, or a resume's turn, which names the
+   * checkpoint and the problems of the submission it blocked on, if any.
+   */
+  | {
+      readonly type: "send_plan_retry_turn";
+      readonly threadId: ThreadId;
+      readonly problems: ReadonlyArray<string>;
+      readonly checkpoint?: FactoryStageName;
+    }
+  /**
    * Judge the review in the last assistant message of this reviewer run, for a run that ended
    * without an accepted submission (providers without t3 MCP tools answer in a fenced block).
    */
@@ -143,6 +160,7 @@ export type FactoryTurnEffect = Extract<
   {
     readonly type:
       | "send_fix_commit_turn"
+      | "send_plan_retry_turn"
       | "send_review_retry_turn"
       | "send_repair_turn"
       | "send_review_follow_up_turn";
@@ -151,6 +169,7 @@ export type FactoryTurnEffect = Extract<
 
 export const isTurnEffect = (effect: FactoryEffect): effect is FactoryTurnEffect =>
   effect.type === "send_fix_commit_turn" ||
+  effect.type === "send_plan_retry_turn" ||
   effect.type === "send_review_retry_turn" ||
   effect.type === "send_repair_turn" ||
   effect.type === "send_review_follow_up_turn";
@@ -226,6 +245,28 @@ export type FactoryReviewJudgment =
   | { readonly type: "invalid"; readonly problems: ReadonlyArray<string> }
   | { readonly type: "code_changed"; readonly changes: ReadonlyArray<FactoryReceiptRefusal> };
 
+/** Which path a plan came by: the `factory_submit_plan` tool, or the fenced-JSON fallback. */
+export type FactoryPlanSource = "mcp" | "fallback";
+
+/**
+ * A valid plan the delivery recorded, with tasks or without: the planner's tasks and note, and
+ * `evidencePath`, the plan's evidence file.
+ */
+export interface FactoryAcceptedPlan extends FactoryPlan {
+  /** The plan round it answers. */
+  readonly round: number;
+  readonly source: FactoryPlanSource;
+  readonly evidencePath: string;
+}
+
+/**
+ * The server's judgment of one plan submission. A valid plan is accepted, whether it has tasks or
+ * not; an invalid one goes back to the planner with its problems.
+ */
+export type FactoryPlanJudgment =
+  | { readonly type: "accepted"; readonly plan: Omit<FactoryAcceptedPlan, "round"> }
+  | { readonly type: "invalid"; readonly problems: ReadonlyArray<string> };
+
 /** A commit and its tree. */
 export interface FactoryCommit {
   readonly headSha: string;
@@ -272,12 +313,17 @@ export interface FactoryOpenedPullRequest {
  */
 export interface FactoryResumeCheck {
   /**
-   * Threads the delivery recorded that have been deleted since, and the thread of an author
-   * launch it never recorded (see `unrecordedAuthorLaunch`) when that was deleted.
+   * Threads the delivery recorded that have been deleted since, and the thread of an author or
+   * planner launch it never recorded (see `unrecordedAuthorLaunch`) when that was deleted.
    */
   readonly deletedThreads: ReadonlyArray<ThreadId>;
   /** Whether the run of an author launch the delivery never recorded has already ended. */
   readonly unrecordedAuthorRunEnded: boolean;
+  /**
+   * Whether the run of a parent's planner launch it never recorded (see
+   * `unrecordedPlannerLaunch`) has already ended; absent when it has none.
+   */
+  readonly unrecordedPlannerRunEnded?: boolean;
   /** The worktree once the author has launched; null before. */
   readonly worktree: {
     readonly settle: FactorySettleResult;
@@ -341,6 +387,23 @@ export type FactoryEvent =
       readonly type: "command.finished";
       readonly effectId: number;
       readonly outcome: FactoryCommandOutcome;
+    }
+  /**
+   * A planner's `factory_submit_plan` call, judged while its run is going. It names the plan round
+   * and the planner run it was made in.
+   */
+  | {
+      readonly type: "plan.submitted";
+      readonly round: number;
+      readonly threadId: ThreadId;
+      readonly runId: RunId;
+      readonly judgment: FactoryPlanJudgment;
+    }
+  /** A `read_fallback_plan` result. */
+  | {
+      readonly type: "plan.read";
+      readonly effectId: number;
+      readonly judgment: FactoryPlanJudgment;
     }
   /**
    * A reviewer's `factory_submit_review` call, judged while its run is going. It names the round
@@ -408,8 +471,13 @@ export type FactoryBlock =
   | { readonly reason: "review_changes_required"; readonly summary: FactoryReviewSummary }
   /** A review was submitted after HEAD moved from the verified receipt or the tree got dirty. */
   | { readonly reason: "code_changed"; readonly changes: ReadonlyArray<FactoryReceiptRefusal> }
-  /** The submission after the one corrected retry was invalid too; these are its problems. */
+  /**
+   * The plan or review submission after the one corrected retry was invalid too; these are its
+   * problems.
+   */
   | { readonly reason: "invalid_submission"; readonly problems: ReadonlyArray<string> }
+  /** The round's accepted plan has no tasks: planning ended with the planner's note, if any. */
+  | { readonly reason: "plan_empty"; readonly note: string | null }
   /** At record, the worktree no longer held the verified, reviewed commit on a clean tree. */
   | {
       readonly reason: "record_mismatch";
@@ -430,7 +498,14 @@ export interface FactoryRoundLimits {
  */
 export const defaultRoundLimits: FactoryRoundLimits = { maxFixRounds: 2, maxReviewRounds: 2 };
 
+/**
+ * A single item is its delivery's one task. A parent first plans its tasks, which wait at the
+ * plan gate for the owner's approval.
+ */
+export type FactoryDeliveryKind = "single" | "parent";
+
 export interface FactoryDeliveryState {
+  readonly kind: FactoryDeliveryKind;
   readonly status: FactoryDeliveryStatus;
   /** Null until the delivery starts; afterwards the current (or last) stage. */
   readonly stage: FactoryStageName | null;
@@ -447,6 +522,8 @@ export interface FactoryDeliveryState {
    * from its id, so a launch whose result was lost can be found again, whatever happened after.
    */
   readonly authorLaunch: FactoryLaunchEffect | null;
+  /** A parent's planner launch, recorded when it is issued, for the reason `authorLaunch` is. */
+  readonly plannerLaunch: FactoryLaunchEffect | null;
   readonly awaiting: FactoryAwaiting | null;
   /** Fix-commit turns spent on the current task's settle problems since it started or resumed. */
   readonly fixCommitTurns: number;
@@ -455,7 +532,9 @@ export interface FactoryDeliveryState {
   readonly receipts: ReadonlyArray<FactoryVerifyReceipt>;
   /** The current (or last) review round, from 1; 0 before the first review. */
   readonly reviewRound: number;
-  /** Invalid submissions in the current round; the first earns one corrected retry. */
+  /**
+   * Invalid submissions in the current plan or review round; the first earns one corrected retry.
+   */
   readonly invalidSubmissions: number;
   /** Accepted reviews, oldest first; at most one per round. */
   readonly reviews: ReadonlyArray<FactoryAcceptedReview>;
@@ -481,6 +560,13 @@ export interface FactoryDeliveryState {
   readonly fingerprints: ReadonlyArray<string>;
   /** The author's latest fix-review run; the next review round reads its reply as claims. */
   readonly reviewResponse: { readonly threadId: ThreadId; readonly runId: RunId } | null;
+  /** A parent's current (or last) plan round, from 1; 0 before planning, and for a single item. */
+  readonly planRound: number;
+  /**
+   * The latest accepted plan, at most one per plan round. A parent waiting at `approve_plan`
+   * waits on this one's tasks.
+   */
+  readonly plan: FactoryAcceptedPlan | null;
   /** Set once the PR stage has opened the delivery's pull request. */
   readonly pullRequest: FactoryOpenedPullRequest | null;
   /** Set while the delivery is blocked. */
@@ -538,6 +624,8 @@ export const blocked = (delivery: FactoryDeliveryState, block: FactoryBlock): Fa
 });
 
 export const queuedDeliveryState = (input: {
+  /** Single when absent. */
+  readonly kind?: FactoryDeliveryKind;
   readonly branch: string;
   readonly baseRef: string;
   readonly worktreePath?: string;
@@ -546,6 +634,7 @@ export const queuedDeliveryState = (input: {
   readonly risk?: FactoryTaskRisk;
   readonly runtimeModeCeiling?: RuntimeMode;
 }): FactoryDeliveryState => ({
+  kind: input.kind ?? "single",
   status: "queued",
   stage: null,
   branch: input.branch,
@@ -554,6 +643,7 @@ export const queuedDeliveryState = (input: {
   baseline: null,
   threads: {},
   authorLaunch: null,
+  plannerLaunch: null,
   awaiting: null,
   fixCommitTurns: 0,
   effectsIssued: 0,
@@ -569,6 +659,8 @@ export const queuedDeliveryState = (input: {
   rounds: { fix: 0, review: 0 },
   fingerprints: [],
   reviewResponse: null,
+  planRound: 0,
+  plan: null,
   pullRequest: null,
   block: null,
   checkpoint: null,
@@ -592,6 +684,21 @@ export const unrecordedAuthorLaunch = (
     block.effect.role === "author"
     ? block.effect
     : undefined;
+};
+
+/**
+ * A parent's planner launch that it issued but never recorded; see `unrecordedAuthorLaunch`.
+ * Planner launches were recorded from the first parent delivery on, so no block names one alone.
+ */
+export const unrecordedPlannerLaunch = (
+  delivery: FactoryDeliveryState,
+): FactoryLaunchEffect | undefined =>
+  delivery.threads.planner === undefined ? (delivery.plannerLaunch ?? undefined) : undefined;
+
+/** The accepted plan of the current plan round, once there is one. */
+export const acceptedPlan = (delivery: FactoryDeliveryState) => {
+  const { plan } = delivery;
+  return plan !== null && plan.round === delivery.planRound ? plan : undefined;
 };
 
 /** The accepted review of the current round, once there is one. */

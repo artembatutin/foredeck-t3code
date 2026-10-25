@@ -3,6 +3,7 @@ import type { FactoryStageName } from "@t3tools/contracts/fd/factory";
 import { standardStages } from "./definitions.ts";
 import type { FactoryStageDefinition } from "./definitions.ts";
 import {
+  acceptedPlan,
   acceptedReview,
   blocked,
   isTerminal,
@@ -11,14 +12,17 @@ import {
   receiptFailed,
   runsStages,
   unrecordedAuthorLaunch,
+  unrecordedPlannerLaunch,
 } from "./state.ts";
 import type {
+  FactoryAcceptedPlan,
   FactoryAcceptedReview,
   FactoryAdvance,
   FactoryBlock,
   FactoryDeliveryState,
   FactoryEffect,
   FactoryEvent,
+  FactoryPlanJudgment,
   FactoryRepairedStage,
   FactoryResumeCheck,
   FactoryReviewJudgment,
@@ -28,8 +32,11 @@ import { stageHandler } from "./stages/registry.ts";
 /** Repairable settle problems get this many mechanical fix-commit turns before the delivery blocks. */
 const FIX_COMMIT_TURNS = 1;
 
-/** Invalid review submissions a round answers with a corrected retry before the delivery blocks. */
-const REVIEW_RETRIES = 1;
+/**
+ * Invalid plan or review submissions a round answers with a corrected retry before the delivery
+ * blocks.
+ */
+const SUBMISSION_RETRIES = 1;
 
 /** A step that issues no effect; `issue` makes the steps that do. */
 const step = (delivery: FactoryDeliveryState): FactoryAdvance => ({ delivery, effects: [] });
@@ -61,6 +68,16 @@ const enter = (
   delivery.status === "stopping"
     ? step({ ...delivery, status: "stopped", awaiting: null, checkpoint })
     : proceed(delivery);
+
+/**
+ * A new plan round: a fresh retry budget, and no plan accepted for it yet. The first round
+ * launches the planner, which creates the delivery's worktree.
+ */
+const beginPlan = (delivery: FactoryDeliveryState): FactoryAdvance =>
+  begin(
+    { ...delivery, planRound: delivery.planRound + 1, invalidSubmissions: 0 },
+    standardStages.plan,
+  );
 
 /**
  * A new review round: a fresh retry budget, and no review accepted for it yet. The first round
@@ -230,6 +247,75 @@ const resume = (delivery: FactoryDeliveryState, check: FactoryResumeCheck): Fact
     : begin(resumed(delivery), standardStages.verify);
 };
 
+/**
+ * Picks a parent that stopped or blocked while planning up again; it never begins the author
+ * stage. A deleted thread of the delivery blocks it again. Stopped where it would have entered
+ * the plan gate, it waits there again on the same plan, issuing nothing. A planner launch the
+ * delivery issued but never recorded is issued again under its own id, as an author's is (see
+ * `resume`); when that run had already ended, the planner gets its retry turn once the launch is
+ * recorded. A recorded planner gets one plan retry turn in a new plan round, naming the problems
+ * of the submission it blocked on. Only a parent that issued no planner launch launches one, as
+ * `start` does.
+ */
+const resumePlanning = (
+  delivery: FactoryDeliveryState,
+  check: FactoryResumeCheck,
+): FactoryAdvance => {
+  const { planner } = delivery.threads;
+  const deleted =
+    planner !== undefined && check.deletedThreads.includes(planner)
+      ? planner
+      : check.deletedThreads[0];
+  if (deleted !== undefined) {
+    return blocked(delivery, { reason: "thread_deleted", threadId: deleted });
+  }
+  const plan = acceptedPlan(delivery);
+  if (delivery.checkpoint === "approve_plan" && plan !== undefined && plan.tasks.length > 0) {
+    return begin(resumed(delivery), standardStages.approve_plan);
+  }
+  if (planner === undefined) {
+    const lost = unrecordedPlannerLaunch(delivery);
+    if (lost === undefined) return beginPlan(resumed(delivery));
+    const launch =
+      check.unrecordedPlannerRunEnded === true
+        ? { ...lost, resumeCheckpoint: "plan" as const }
+        : lost;
+    return {
+      delivery: {
+        ...resumed(delivery),
+        stage: "plan",
+        awaiting: { type: "effect", effect: launch },
+      },
+      effects: [launch],
+    };
+  }
+  const { block } = delivery;
+  return issue(
+    {
+      ...resumed(delivery),
+      stage: "plan",
+      planRound: delivery.planRound + 1,
+      invalidSubmissions: 0,
+    },
+    {
+      type: "send_plan_retry_turn",
+      threadId: planner,
+      problems: block?.reason === "invalid_submission" ? block.problems : [],
+      checkpoint: "plan",
+    },
+  );
+};
+
+/**
+ * Acts on the round's accepted plan once its run has completed. A plan with tasks enters the plan
+ * gate, where the delivery waits for its owner; an empty one ends planning blocked, with the
+ * planner's note.
+ */
+const concludePlan = (delivery: FactoryDeliveryState, plan: FactoryAcceptedPlan) =>
+  plan.tasks.length === 0
+    ? blocked(delivery, { reason: "plan_empty", note: plan.note ?? null })
+    : enter(delivery, "approve_plan", (current) => begin(current, standardStages.approve_plan));
+
 /** Acts on the round's accepted review once its run has completed. */
 const concludeReview = (delivery: FactoryDeliveryState, review: FactoryAcceptedReview) =>
   review.summary.blocking
@@ -239,6 +325,43 @@ const concludeReview = (delivery: FactoryDeliveryState, review: FactoryAcceptedR
         exhausted: { reason: "review_changes_required", summary: review.summary },
       })
     : enter(delivery, "record", (current) => begin(current, standardStages.record));
+
+/** Counts an invalid submission: the round's first continues with `retry`, a second blocks. */
+const invalidSubmission = (
+  delivery: FactoryDeliveryState,
+  problems: ReadonlyArray<string>,
+  retry: (delivery: FactoryDeliveryState, problems: ReadonlyArray<string>) => FactoryAdvance,
+): FactoryAdvance => {
+  const counted = { ...delivery, invalidSubmissions: delivery.invalidSubmissions + 1 };
+  return counted.invalidSubmissions > SUBMISSION_RETRIES
+    ? blocked(counted, { reason: "invalid_submission", problems })
+    : retry(counted, problems);
+};
+
+/**
+ * Folds a judged plan into the plan round. `accepted` continues with the recorded plan and
+ * `retry` with the counted first invalid submission; a second invalid one blocks.
+ */
+const judgePlan = (
+  delivery: FactoryDeliveryState,
+  judgment: FactoryPlanJudgment,
+  next: {
+    readonly accepted: (
+      delivery: FactoryDeliveryState,
+      plan: FactoryAcceptedPlan,
+    ) => FactoryAdvance;
+    readonly retry: (
+      delivery: FactoryDeliveryState,
+      problems: ReadonlyArray<string>,
+    ) => FactoryAdvance;
+  },
+): FactoryAdvance => {
+  if (judgment.type === "invalid") {
+    return invalidSubmission(delivery, judgment.problems, next.retry);
+  }
+  const plan = { ...judgment.plan, round: delivery.planRound };
+  return next.accepted({ ...delivery, plan }, plan);
+};
 
 /**
  * Folds a judged submission into the round. `accepted` continues with the recorded review and
@@ -264,12 +387,8 @@ const judge = (
       const review = { ...judgment.review, round: delivery.reviewRound };
       return next.accepted({ ...delivery, reviews: [...delivery.reviews, review] }, review);
     }
-    case "invalid": {
-      const counted = { ...delivery, invalidSubmissions: delivery.invalidSubmissions + 1 };
-      return counted.invalidSubmissions > REVIEW_RETRIES
-        ? blocked(counted, { reason: "invalid_submission", problems: judgment.problems })
-        : next.retry(counted, judgment.problems);
-    }
+    case "invalid":
+      return invalidSubmission(delivery, judgment.problems, next.retry);
     case "code_changed":
       return blocked(delivery, { reason: "code_changed", changes: judgment.changes });
   }
@@ -301,7 +420,14 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * effect, a run of another thread or an earlier run, a submission for another round, a stage it
  * is not in, a delivery that does not run its stages) changes nothing.
  *
- * This covers a single item from start to its pull request: the author thread, the branch settle
+ * A parent first plans: a planner thread on a new worktree of the delivery branch submits its
+ * plan while its run goes on, and one accepted plan per plan round is acted on once that run
+ * completes. A run that completes without one has its last message's fenced plan read, and the
+ * round's first invalid submission is answered once (by the tool's reply in the same turn, or a
+ * retry turn on the planner thread); a second blocks. A plan with tasks leaves the parent waiting
+ * at `approve_plan` for its owner, awaiting nothing; an empty plan blocks it with the note.
+ *
+ * A single item runs from start to its pull request: the author thread, the branch settle
  * check with at most one fix-commit turn, the verify command, then a reviewer thread whose one
  * accepted review per round is acted on once its run completes. A failed verify or a blocking
  * review gets a repair turn on the author thread while the task has rounds of that kind left and
@@ -312,18 +438,20 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  *
  * The owner can stop a running delivery after its step, or cancel any delivery that is not done
  * or cancelled. A stopping delivery still completes the work of its stage (the settle check and
- * its fix-commit turn, the fallback review read, review submissions and their retry) and blocks on
- * a failure as a running one would; where it would begin verify, a review round, a repair round,
- * record or the PR stage, it is `stopped` instead. A cancelled delivery awaits nothing, so no later
- * event moves it. Resume undoes a stop that has not yet taken effect, and picks a stopped or
- * blocked delivery up from its checkpoint (see `resume`).
+ * its fix-commit turn, the fallback plan and review reads, plan and review submissions and their
+ * retry) and blocks on a failure as a running one would; where it would begin verify, a review
+ * round, a repair round, record, the PR stage or the plan gate, it is `stopped` instead. A
+ * cancelled delivery awaits nothing, so no later event moves it. Resume undoes a stop that has not
+ * yet taken effect, and picks a stopped or blocked delivery up from its checkpoint (see `resume`
+ * and, for a parent, `resumePlanning`).
  */
 export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
   switch (event.type) {
     case "start":
-      return delivery.status === "queued"
-        ? begin({ ...delivery, status: "running" }, standardStages.author)
-        : unchanged(delivery);
+      if (delivery.status !== "queued") return unchanged(delivery);
+      return delivery.kind === "parent"
+        ? beginPlan({ ...delivery, status: "running" })
+        : begin({ ...delivery, status: "running" }, standardStages.author);
     case "stop":
       // Stopping already, the stop changes nothing; only a running delivery stops after its step.
       return delivery.status === "running"
@@ -332,10 +460,15 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
     case "resume":
       // Stopping, the delivery runs on: what it awaits is still coming, so nothing is issued.
       if (delivery.status === "stopping") return step({ ...delivery, status: "running" });
-      return (delivery.status === "stopped" || delivery.status === "blocked") &&
-        event.check !== null
-        ? resume(delivery, event.check)
-        : unchanged(delivery);
+      if (
+        (delivery.status !== "stopped" && delivery.status !== "blocked") ||
+        event.check === null
+      ) {
+        return unchanged(delivery);
+      }
+      return delivery.kind === "parent"
+        ? resumePlanning(delivery, event.check)
+        : resume(delivery, event.check);
     case "cancel":
       return isTerminal(delivery)
         ? unchanged(delivery)
@@ -361,10 +494,18 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
         threads: { ...delivery.threads, [launch.role]: event.threadId },
       };
       const run = { threadId: event.threadId, runId: event.runId };
-      // A resume replayed this launch after its run had ended: no end is coming to await, and
-      // the branch it left is settled now, however the run ended.
-      return launch.resumeCheckpoint === undefined
-        ? step({ ...recorded, awaiting: { type: "run", ...run } })
+      if (launch.resumeCheckpoint === undefined) {
+        return step({ ...recorded, awaiting: { type: "run", ...run } });
+      }
+      // A resume replayed this launch after its run had ended: no end is coming to await. The
+      // branch an author left is settled now, however the run ended; a planner submits again.
+      return launch.role === "planner"
+        ? issue(recorded, {
+            type: "send_plan_retry_turn",
+            threadId: event.threadId,
+            problems: [],
+            checkpoint: launch.resumeCheckpoint,
+          })
         : issue(recorded, { type: "check_settle", ...run, checkpoint: launch.resumeCheckpoint });
     }
 
@@ -401,6 +542,17 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
           runId: event.runId,
           runStatus: event.status,
         });
+      }
+      if (delivery.stage === "plan") {
+        // A plan is acted on only once its run completed, like a review.
+        const accepted = acceptedPlan(delivery);
+        return accepted === undefined
+          ? issue(delivery, {
+              type: "read_fallback_plan",
+              threadId: event.threadId,
+              runId: event.runId,
+            })
+          : concludePlan(delivery, accepted);
       }
       if (delivery.stage === "review") {
         // A review is acted on only once its run completed; without one, the run's last
@@ -464,6 +616,34 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
         });
       }
       return enter(recorded, "review", beginReview);
+    }
+
+    case "plan.submitted": {
+      // Only the round's planner run, while it runs, and only until one plan is accepted.
+      if (
+        delivery.stage !== "plan" ||
+        event.round !== delivery.planRound ||
+        awaiting?.type !== "run" ||
+        awaiting.threadId !== event.threadId ||
+        awaiting.runId !== event.runId ||
+        acceptedPlan(delivery) !== undefined
+      ) {
+        return unchanged(delivery);
+      }
+      // The planner is still in its turn: an accepted plan waits for the run to complete, and an
+      // invalid one is corrected in the same turn from the tool's answer.
+      return judgePlan(delivery, event.judgment, { accepted: step, retry: step });
+    }
+
+    case "plan.read": {
+      const read = awaitedEffect(delivery, event.effectId, "read_fallback_plan");
+      if (read === undefined) return unchanged(delivery);
+      // The run has completed: act on an accepted plan now, or ask for a corrected one.
+      return judgePlan(delivery, event.judgment, {
+        accepted: concludePlan,
+        retry: (counted, problems) =>
+          issue(counted, { type: "send_plan_retry_turn", threadId: read.threadId, problems }),
+      });
     }
 
     case "review.submitted": {

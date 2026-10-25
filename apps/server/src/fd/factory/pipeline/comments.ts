@@ -37,8 +37,9 @@ const firstPublishable = (texts: ReadonlyArray<string>, fixed: string) =>
   texts.find(publishable) ?? fixed;
 
 /**
- * The block with none of the free text its problems or failure detail quote, so its message is
- * the reason's fixed text alone. The other reasons' facts are roles, statuses, stages and counts.
+ * The block with none of the free text its problems, failure detail or planner's note quote, so
+ * its message is the reason's fixed text alone. The other reasons' facts are roles, statuses,
+ * stages and counts.
  */
 const withoutFreeText = (block: FactoryBlock): FactoryBlock => {
   switch (block.reason) {
@@ -47,6 +48,8 @@ const withoutFreeText = (block: FactoryBlock): FactoryBlock => {
       return { ...block, problems: [] };
     case "effect_failed":
       return { ...block, detail: "Factory could not complete a step." };
+    case "plan_empty":
+      return { ...block, note: null };
     default:
       return block;
   }

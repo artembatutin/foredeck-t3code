@@ -176,7 +176,7 @@ to complete: a run that fails after submitting still blocks as a failed run, and
 is never cut short. A run that completes without one has the fenced JSON of its last assistant
 message judged the same way, for providers without t3 tools. The first invalid submission in a
 round, on either path, is answered once (by the tool's failure in the same turn, or a retry turn on
-the reviewer thread); the second blocks.
+the reviewer thread); the second blocks. A planner's plan follows the same rules in each plan round.
 
 ## Clients see a review's details as it was accepted
 
@@ -221,13 +221,14 @@ item is its delivery's one task, written in the transaction that inserts the del
 
 Stop after step is a status, not an interruption. A `stopping` delivery takes every event a running
 one does, so the turn or effect under way finishes, and it becomes `stopped` only where the engine
-would begin verify, a review round, a repair round, record or the PR stage, with that stage as its
-checkpoint ([`engine.ts`](../../apps/server/src/fd/factory/pipeline/engine.ts)). Work inside a
-stage is not a boundary: the settle check and its fix-commit turn, the fallback review read, a
-review submission and its retry. A failure found first still blocks, because a stopped delivery
-would hide it. Stopped where a repair round would begin, the failure's fingerprint is recorded but
-no round is spent, and the stage's attempt is recorded as failed. Only a running delivery can stop;
-an approved one is already in the last stage it runs.
+would begin verify, a review round, a repair round, record, the PR stage or the plan gate, with
+that stage as its checkpoint ([`engine.ts`](../../apps/server/src/fd/factory/pipeline/engine.ts)).
+Work inside a stage is not a boundary: the settle check and its fix-commit turn, the fallback plan
+and review reads, a plan or review submission and its retry. A failure found first still blocks,
+because a stopped delivery would hide it, and so does an empty plan. Stopped where a repair round
+would begin, the failure's fingerprint is recorded but no round is spent, and the stage's attempt
+is recorded as failed. Only a running delivery can stop; an approved one is already in the last
+stage it runs.
 
 Cancel ends a delivery whatever it awaits, and by owner decision interrupts what its agents are
 working on, through the thread's own interrupt. Every thread the delivery recorded is asked, not
@@ -271,6 +272,12 @@ it ended, no end is coming to await, so once the thread is recorded its branch i
 verified as a resume settles a recorded author's. A run still going is awaited like any other, and
 its failure after the resume blocks. A thread that launch made and the owner deleted since blocks
 every resume, like any deleted thread of the delivery.
+
+A parent that stopped or blocked while planning resumes into planning, never into authoring.
+Stopped before the plan gate, it waits there again on the same plan. Its planner launch is recorded
+and replayed like an author's (`plannerLaunch`). A recorded planner gets one retry turn in a new
+plan round, because a plan accepted before the block, from a run that failed after submitting,
+must not stand in for what the resumed planner submits.
 
 By owner decision an explicit resume grants a fresh retry allowance: repair rounds, the fix-commit
 turn and failure fingerprints start over, while the limits the delivery started with stay, and so

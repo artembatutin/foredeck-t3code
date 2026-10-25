@@ -27,7 +27,7 @@ describe("stageHandler", () => {
     ]);
   });
 
-  it("begins record by recording the approval, and blocks plan approval as unsupported", () => {
+  it("begins record by recording the approval, and waits for the owner at plan approval", () => {
     const lookup = stageHandler("gate");
     if (lookup.type !== "supported") throw new Error("gate stages are supported");
 
@@ -42,15 +42,9 @@ describe("stageHandler", () => {
       effects: [record],
     });
 
-    // The owner's gate is not built yet: the delivery stops there and issues nothing.
+    // The owner's gate: the delivery waits there and issues nothing.
     expect(lookup.handler.begin(delivery, standardStages.approve_plan)).toEqual({
-      delivery: {
-        ...delivery,
-        stage: "approve_plan",
-        status: "blocked",
-        awaiting: null,
-        block: { reason: "unsupported_stage", stage: "approve_plan" },
-      },
+      delivery: { ...delivery, stage: "approve_plan", status: "waiting", awaiting: null },
       effects: [],
     });
   });

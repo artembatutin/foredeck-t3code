@@ -122,7 +122,14 @@ describe("FactoryDeliveryStore with reviews accepted before details", () => {
     Effect.gen(function* () {
       yield* insertRow;
       const loaded = yield* load;
-      assert.deepStrictEqual(loaded.state, JSON.parse(storedStateJson));
+      assert.deepStrictEqual(loaded.state, {
+        ...JSON.parse(storedStateJson),
+        // The planning fields came later: the row is a single item that never planned.
+        kind: "single",
+        plannerLaunch: null,
+        planRound: 0,
+        plan: null,
+      });
       for (const review of loaded.state.reviews) expect(review).not.toHaveProperty("details");
     }).pipe(Effect.provide(persistence)),
   );
