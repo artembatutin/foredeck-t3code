@@ -1,4 +1,4 @@
-import { requestGuarded, runStreamGuarded } from "../rpc/client.ts";
+import { EnvironmentRpcUnavailableError, requestGuarded, runStreamGuarded } from "../rpc/client.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as Option from "effect/Option";
@@ -395,159 +395,232 @@ it.effect("assistant controls recheck the destination grant after it is revoked"
   ),
 );
 
+const factoryServer = (capabilities: object) =>
+  ({ environment: { capabilities } }) as unknown as ServerConfig;
+const FACTORY_SERVER = factoryServer({ factory: { version: 1 } });
+const isUnavailable = Schema.is(EnvironmentRpcUnavailableError);
+
+/**
+ * Factory's commands against a fake destination that records each method reaching it. Its server
+ * advertises Factory, in this client's view and in its session's config, until changed.
+ */
+const makeFactoryCommands = Effect.fn("TestFactoryCommands.make")(function* (
+  registry: AtomRegistry.AtomRegistry,
+) {
+  const sent: Array<string> = [];
+  // While set, a resume waits after reaching the server, holding its delivery's lane.
+  let hold:
+    | { readonly entered: Deferred.Deferred<void>; readonly release: Deferred.Deferred<void> }
+    | undefined;
+  const reply = (method: string) => () =>
+    Effect.gen(function* () {
+      sent.push(method);
+      if (method === WS_METHODS.factoryDeliveriesResume && hold !== undefined) {
+        yield* Deferred.succeed(hold.entered, undefined);
+        yield* Deferred.await(hold.release);
+      }
+      return {};
+    });
+  const methods = [
+    WS_METHODS.factoryDeliveriesStart,
+    WS_METHODS.factoryDeliveriesStop,
+    WS_METHODS.factoryDeliveriesResume,
+    WS_METHODS.factoryDeliveriesCancel,
+    WS_METHODS.factorySettingsSet,
+  ];
+  const client = Object.fromEntries(methods.map((method) => [method, reply(method)]));
+  const sessionTo = (serverConfig: ServerConfig) =>
+    ({ client, initialConfig: Effect.succeed(serverConfig) }) as unknown as RpcSession;
+  const session = yield* SubscriptionRef.make(Option.some(sessionTo(FACTORY_SERVER)));
+  const supervisor = {
+    target: { environmentId: env, label: "target" },
+    session,
+  } as unknown as EnvironmentSupervisor["Service"];
+  const serverConfigs = Atom.make<ReadonlyMap<EnvironmentId, ServerConfig>>(
+    new Map([[env, FACTORY_SERVER]]),
+  ).pipe(Atom.keepAlive);
+  const factory = createFactoryEnvironmentAtoms(
+    Atom.runtime(
+      Layer.succeed(EnvironmentRegistry, {
+        run: (_id: EnvironmentId, effect: Effect.Effect<unknown>) =>
+          Effect.provideService(effect, EnvironmentSupervisor, supervisor),
+      } as unknown as EnvironmentRegistry["Service"]),
+    ),
+    serverConfigs,
+  );
+  const ref = { deliveryId: FactoryDeliveryId.make("d1") };
+  const itemRef = {
+    sourceId: WorkSourceId.make("6f9b1c2e-3d4a-4b5c-8d6e-7f8091a2b3c4"),
+    itemId: WorkItemId.make("fd-7k3qa2"),
+  };
+  const commands = {
+    start: {
+      permission: factory.start.permissionAtom(env),
+      run: () => factory.start.run(registry, { environmentId: env, input: { itemRef } }),
+    },
+    stop: {
+      permission: factory.stop.permissionAtom(env),
+      run: () => factory.stop.run(registry, { environmentId: env, input: ref }),
+    },
+    resume: {
+      permission: factory.resume.permissionAtom(env),
+      run: () => factory.resume.run(registry, { environmentId: env, input: ref }),
+    },
+    cancel: {
+      permission: factory.cancel.permissionAtom(env),
+      run: () => factory.cancel.run(registry, { environmentId: env, input: ref }),
+    },
+    setSettings: {
+      permission: factory.setSettings.permissionAtom(env),
+      run: () =>
+        factory.setSettings.run(registry, {
+          environmentId: env,
+          input: { projectId: ProjectId.make("p1"), settings: factorySettings },
+        }),
+    },
+  };
+  const outcome = (result: AtomCommandResult<unknown, unknown>) => {
+    if (result._tag === "Success") return "sent";
+    const failure = Cause.squash(result.cause);
+    return isAuthorizationError(failure)
+      ? "denied"
+      : isUnavailable(failure)
+        ? "unsupported"
+        : "failed";
+  };
+  return {
+    sent,
+    methods,
+    commands,
+    controls: [commands.start, commands.stop, commands.resume, commands.cancel],
+    outcome,
+    runAll: (
+      selected: ReadonlyArray<{ readonly run: () => Promise<AtomCommandResult<unknown, unknown>> }>,
+    ) =>
+      Effect.forEach(selected, (command) => Effect.promise(command.run).pipe(Effect.map(outcome))),
+    permitted: (selected: ReadonlyArray<{ readonly permission: Atom.Atom<boolean> }>) =>
+      selected.map((command) => registry.get(command.permission)),
+    allow: (
+      scopes: ReadonlyArray<typeof AuthOrchestrationOperateScope | typeof AuthSettingsWriteScope>,
+    ) =>
+      registry.set(
+        sessions(env),
+        AsyncResult.success({ ...grant(false), scopes: [...scopes], permissions: [...scopes] }),
+      ),
+    /** This client's view of the destination's config; undefined before it arrives. */
+    viewConfig: (serverConfig: ServerConfig | undefined) =>
+      registry.set(
+        serverConfigs,
+        new Map(serverConfig === undefined ? [] : [[env, serverConfig] as const]),
+      ),
+    reconnect: (serverConfig: ServerConfig) =>
+      SubscriptionRef.set(session, Option.some(sessionTo(serverConfig))),
+    /** Holds the next resume on the server until the returned release runs. */
+    holdResume: Effect.gen(function* () {
+      const held = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() };
+      hold = held;
+      return held;
+    }),
+  };
+});
+
 it.effect(
   "Factory delivery controls and settings writes need their grants, rechecked when they run",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
         const registry = yield* setup;
-        const sent: Array<string> = [];
-        // While set, a resume waits after reaching the server, holding its delivery's lane.
-        let hold:
-          | { readonly entered: Deferred.Deferred<void>; readonly release: Deferred.Deferred<void> }
-          | undefined;
-        const reply = (method: string) => () =>
-          Effect.gen(function* () {
-            sent.push(method);
-            if (method === WS_METHODS.factoryDeliveriesResume && hold !== undefined) {
-              yield* Deferred.succeed(hold.entered, undefined);
-              yield* Deferred.await(hold.release);
-            }
-            return {};
-          });
-        const methods = [
-          WS_METHODS.factoryDeliveriesStart,
-          WS_METHODS.factoryDeliveriesStop,
-          WS_METHODS.factoryDeliveriesResume,
-          WS_METHODS.factoryDeliveriesCancel,
-          WS_METHODS.factorySettingsSet,
-        ];
-        const session = {
-          client: Object.fromEntries(methods.map((method) => [method, reply(method)])),
-        } as unknown as RpcSession;
-        const supervisor = {
-          target: { environmentId: env, label: "target" },
-          session: yield* SubscriptionRef.make(Option.some(session)),
-        } as unknown as EnvironmentSupervisor["Service"];
-        const factory = createFactoryEnvironmentAtoms(
-          Atom.runtime(
-            Layer.succeed(EnvironmentRegistry, {
-              run: (_id: EnvironmentId, effect: Effect.Effect<unknown>) =>
-                Effect.provideService(effect, EnvironmentSupervisor, supervisor),
-            } as unknown as EnvironmentRegistry["Service"]),
-          ),
-          Atom.make(new Map<EnvironmentId, ServerConfig>()),
-        );
-        const ref = { deliveryId: FactoryDeliveryId.make("d1") };
-        const itemRef = {
-          sourceId: WorkSourceId.make("6f9b1c2e-3d4a-4b5c-8d6e-7f8091a2b3c4"),
-          itemId: WorkItemId.make("fd-7k3qa2"),
-        };
-        const commands = {
-          start: {
-            permission: factory.start.permissionAtom(env),
-            run: () => factory.start.run(registry, { environmentId: env, input: { itemRef } }),
-          },
-          stop: {
-            permission: factory.stop.permissionAtom(env),
-            run: () => factory.stop.run(registry, { environmentId: env, input: ref }),
-          },
-          resume: {
-            permission: factory.resume.permissionAtom(env),
-            run: () => factory.resume.run(registry, { environmentId: env, input: ref }),
-          },
-          cancel: {
-            permission: factory.cancel.permissionAtom(env),
-            run: () => factory.cancel.run(registry, { environmentId: env, input: ref }),
-          },
-          setSettings: {
-            permission: factory.setSettings.permissionAtom(env),
-            run: () =>
-              factory.setSettings.run(registry, {
-                environmentId: env,
-                input: {
-                  projectId: ProjectId.make("p1"),
-                  settings: factorySettings,
-                },
-              }),
-          },
-        };
-        const controls = [commands.start, commands.stop, commands.resume, commands.cancel];
-        const outcome = (result: AtomCommandResult<unknown, unknown>) =>
-          result._tag === "Success"
-            ? "sent"
-            : isAuthorizationError(Cause.squash(result.cause))
-              ? "denied"
-              : "failed";
-        const runAll = (
-          selected: ReadonlyArray<{
-            readonly run: () => Promise<AtomCommandResult<unknown, unknown>>;
-          }>,
-        ) =>
-          Effect.forEach(selected, (command) =>
-            Effect.promise(command.run).pipe(Effect.map(outcome)),
-          );
-        const allow = (
-          scopes: ReadonlyArray<
-            typeof AuthOrchestrationOperateScope | typeof AuthSettingsWriteScope
-          >,
-        ) =>
-          registry.set(
-            sessions(env),
-            AsyncResult.success({ ...grant(false), scopes: [...scopes], permissions: [...scopes] }),
-          );
+        const factory = yield* makeFactoryCommands(registry);
+        const all = Object.values(factory.commands);
 
-        allow([]);
-        expect(Object.values(commands).map((command) => registry.get(command.permission))).toEqual([
-          false,
-          false,
-          false,
-          false,
-          false,
-        ]);
-        expect(yield* runAll(Object.values(commands))).toEqual(Array(5).fill("denied"));
-        expect(sent).toEqual([]);
+        factory.allow([]);
+        expect(factory.permitted(all)).toEqual([false, false, false, false, false]);
+        expect(yield* factory.runAll(all)).toEqual(Array(5).fill("denied"));
+        expect(factory.sent).toEqual([]);
 
         // orchestration:operate runs the delivery controls but does not write settings.
-        allow([AuthOrchestrationOperateScope]);
-        expect(controls.map((command) => registry.get(command.permission))).toEqual([
-          true,
-          true,
-          true,
-          true,
-        ]);
-        expect(registry.get(commands.setSettings.permission)).toBe(false);
-        expect(yield* runAll([...controls, commands.setSettings])).toEqual([
+        factory.allow([AuthOrchestrationOperateScope]);
+        expect(factory.permitted(factory.controls)).toEqual([true, true, true, true]);
+        expect(factory.permitted([factory.commands.setSettings])).toEqual([false]);
+        expect(yield* factory.runAll([...factory.controls, factory.commands.setSettings])).toEqual([
           "sent",
           "sent",
           "sent",
           "sent",
           "denied",
         ]);
-        expect(sent).toEqual(methods.slice(0, 4));
+        expect(factory.sent).toEqual(factory.methods.slice(0, 4));
 
         // settings:write saves settings but does not run the controls.
-        sent.length = 0;
-        allow([AuthSettingsWriteScope]);
-        expect(registry.get(commands.setSettings.permission)).toBe(true);
-        expect(registry.get(commands.stop.permission)).toBe(false);
-        expect(yield* runAll([commands.setSettings, commands.stop])).toEqual(["sent", "denied"]);
-        expect(sent).toEqual([WS_METHODS.factorySettingsSet]);
+        factory.sent.length = 0;
+        factory.allow([AuthSettingsWriteScope]);
+        expect(factory.permitted([factory.commands.setSettings, factory.commands.stop])).toEqual([
+          true,
+          false,
+        ]);
+        expect(
+          yield* factory.runAll([factory.commands.setSettings, factory.commands.stop]),
+        ).toEqual(["sent", "denied"]);
+        expect(factory.sent).toEqual([WS_METHODS.factorySettingsSet]);
 
         // A cancel queued behind a resume of the same delivery is rechecked when its turn comes.
-        sent.length = 0;
-        allow([AuthOrchestrationOperateScope, AuthSettingsWriteScope]);
-        hold = { entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() };
-        const resumed = commands.resume.run();
-        yield* Deferred.await(hold.entered);
-        const cancelled = commands.cancel.run();
-        expect(registry.get(commands.cancel.permission)).toBe(true);
-        allow([]);
-        expect(registry.get(commands.cancel.permission)).toBe(false);
-        yield* Deferred.succeed(hold.release, undefined);
-        expect(outcome(yield* Effect.promise(() => resumed))).toBe("sent");
-        expect(outcome(yield* Effect.promise(() => cancelled))).toBe("denied");
-        expect(sent).toEqual([WS_METHODS.factoryDeliveriesResume]);
+        factory.sent.length = 0;
+        factory.allow([AuthOrchestrationOperateScope, AuthSettingsWriteScope]);
+        const held = yield* factory.holdResume;
+        const resumed = factory.commands.resume.run();
+        yield* Deferred.await(held.entered);
+        const cancelled = factory.commands.cancel.run();
+        expect(factory.permitted([factory.commands.cancel])).toEqual([true]);
+        factory.allow([]);
+        expect(factory.permitted([factory.commands.cancel])).toEqual([false]);
+        yield* Deferred.succeed(held.release, undefined);
+        expect(factory.outcome(yield* Effect.promise(() => resumed))).toBe("sent");
+        expect(factory.outcome(yield* Effect.promise(() => cancelled))).toBe("denied");
+        expect(factory.sent).toEqual([WS_METHODS.factoryDeliveriesResume]);
+      }),
+    ),
+);
+
+it.effect(
+  "Factory commands send nothing where the destination does not advertise Factory, grants held",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        const factory = yield* makeFactoryCommands(registry);
+        const all = Object.values(factory.commands);
+        factory.allow([AuthOrchestrationOperateScope, AuthSettingsWriteScope]);
+        expect(factory.permitted(all)).toEqual([true, true, true, true, true]);
+
+        // Before the destination's config arrives, and from a server that predates Factory.
+        for (const viewed of [undefined, factoryServer({})]) {
+          factory.viewConfig(viewed);
+          expect(factory.permitted(all)).toEqual([false, false, false, false, false]);
+          expect(yield* factory.runAll(all)).toEqual(Array(5).fill("unsupported"));
+        }
+        expect(factory.sent).toEqual([]);
+
+        // A cancel queued behind a resume of the same delivery is checked again when it runs.
+        factory.viewConfig(FACTORY_SERVER);
+        const held = yield* factory.holdResume;
+        const resumed = factory.commands.resume.run();
+        yield* Deferred.await(held.entered);
+        const cancelled = factory.commands.cancel.run();
+        factory.viewConfig(factoryServer({}));
+        expect(factory.permitted([factory.commands.cancel])).toEqual([false]);
+        yield* Deferred.succeed(held.release, undefined);
+        expect(factory.outcome(yield* Effect.promise(() => resumed))).toBe("sent");
+        expect(factory.outcome(yield* Effect.promise(() => cancelled))).toBe("unsupported");
+        expect(factory.sent).toEqual([WS_METHODS.factoryDeliveriesResume]);
+
+        // Reconnected to an older server, before its config replaces the one this client holds.
+        factory.sent.length = 0;
+        factory.viewConfig(FACTORY_SERVER);
+        yield* factory.reconnect(factoryServer({}));
+        expect(yield* factory.runAll(all)).toEqual(Array(5).fill("unsupported"));
+        expect(factory.sent).toEqual([]);
+        yield* factory.reconnect(FACTORY_SERVER);
+        expect(yield* factory.runAll([factory.commands.stop])).toEqual(["sent"]);
       }),
     ),
 );

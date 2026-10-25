@@ -65,8 +65,9 @@ const FACTORY = config({ factory: { version: 1 } });
 
 /**
  * Environments connected to fake sessions that record each Factory request as
- * `<environment> <method>` and stream the epochs offered to them. The registry runs its work on
- * a queue that `drain` empties, as a test drains a worker, so every check reads a settled state.
+ * `<environment> <method>` and stream the epochs offered to them. Each session's server
+ * advertises Factory until `reconnect` replaces it. The registry runs its work on a queue that
+ * `drain` empties, as a test drains a worker, so every check reads a settled state.
  */
 const makeHarness = Effect.fn("TestFactoryAtoms.makeHarness")(function* (
   environmentIds: ReadonlyArray<EnvironmentId>,
@@ -74,7 +75,10 @@ const makeHarness = Effect.fn("TestFactoryAtoms.makeHarness")(function* (
   const requests = yield* Queue.unbounded<string>();
   const record = (environmentId: EnvironmentId, method: string) =>
     Queue.offer(requests, `${environmentId} ${method}`);
+  // The environments whose change stream the server has seen end, in order.
+  const closed = yield* Queue.unbounded<EnvironmentId>();
   const epochs = new Map<EnvironmentId, Queue.Queue<number>>();
+  const sessions = new Map<EnvironmentId, (serverConfig: ServerConfig) => RpcSession>();
   const supervisors = new Map<
     EnvironmentId,
     EnvironmentSupervisor.EnvironmentSupervisor["Service"]
@@ -86,21 +90,22 @@ const makeHarness = Effect.fn("TestFactoryAtoms.makeHarness")(function* (
       <A>(method: string, value: A) =>
       () =>
         record(environmentId, method).pipe(Effect.as(value));
-    const session = {
-      client: {
-        [WS_METHODS.factoryDeliveriesSubscribe]: () =>
-          Stream.unwrap(
-            record(environmentId, WS_METHODS.factoryDeliveriesSubscribe).pipe(
-              Effect.as(Stream.fromQueue(environmentEpochs)),
-            ),
+    const client = {
+      [WS_METHODS.factoryDeliveriesSubscribe]: () =>
+        Stream.unwrap(
+          record(environmentId, WS_METHODS.factoryDeliveriesSubscribe).pipe(
+            Effect.as(Stream.fromQueue(environmentEpochs)),
           ),
-        [WS_METHODS.factoryDeliveriesList]: reply(WS_METHODS.factoryDeliveriesList, {
-          deliveries: [delivery],
-        }),
-        [WS_METHODS.factoryDeliveriesGet]: reply(WS_METHODS.factoryDeliveriesGet, delivery),
-        [WS_METHODS.factorySettingsGet]: reply(WS_METHODS.factorySettingsGet, settings),
-      },
-    } as unknown as RpcSession;
+        ).pipe(Stream.ensuring(Queue.offer(closed, environmentId))),
+      [WS_METHODS.factoryDeliveriesList]: reply(WS_METHODS.factoryDeliveriesList, {
+        deliveries: [delivery],
+      }),
+      [WS_METHODS.factoryDeliveriesGet]: reply(WS_METHODS.factoryDeliveriesGet, delivery),
+      [WS_METHODS.factorySettingsGet]: reply(WS_METHODS.factorySettingsGet, settings),
+    };
+    const session = (serverConfig: ServerConfig) =>
+      ({ client, initialConfig: Effect.succeed(serverConfig) }) as unknown as RpcSession;
+    sessions.set(environmentId, session);
     supervisors.set(
       environmentId,
       EnvironmentSupervisor.EnvironmentSupervisor.of({
@@ -118,7 +123,7 @@ const makeHarness = Effect.fn("TestFactoryAtoms.makeHarness")(function* (
           attempt: 1,
           generation: 1,
         }),
-        session: yield* SubscriptionRef.make(Option.some(session)),
+        session: yield* SubscriptionRef.make(Option.some(session(FACTORY))),
         prepared: yield* SubscriptionRef.make<Option.Option<PreparedConnection>>(Option.none()),
         connect: Effect.void,
         disconnect: Effect.void,
@@ -169,6 +174,11 @@ const makeHarness = Effect.fn("TestFactoryAtoms.makeHarness")(function* (
   });
   yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
   const factory = createFactoryEnvironmentAtoms(runtime, serverConfigs);
+  const readsOf = (environmentId: EnvironmentId): ReadonlyArray<Read> => [
+    factory.deliveries({ environmentId, input: { projectId } }),
+    factory.delivery({ environmentId, input: { deliveryId } }),
+    factory.settings({ environmentId, input: { projectId } }),
+  ];
   return {
     factory,
     registry,
@@ -183,6 +193,14 @@ const makeHarness = Effect.fn("TestFactoryAtoms.makeHarness")(function* (
     }),
     setConfigs: (configs: ReadonlyArray<readonly [EnvironmentId, ServerConfig]>) =>
       registry.set(serverConfigs, new Map(configs)),
+    /** Replaces the environment's session with one to a server that sent `serverConfig`. */
+    reconnect: (environmentId: EnvironmentId, serverConfig: ServerConfig) =>
+      SubscriptionRef.set(
+        supervisor(environmentId).session,
+        Option.some(sessions.get(environmentId)!(serverConfig)),
+      ),
+    /** The environments whose change stream ended since the last call. */
+    closed: Queue.clear(closed),
     emit: (environmentId: EnvironmentId, epoch: number) => {
       const queue = epochs.get(environmentId);
       if (queue === undefined) throw new Error(`No test environment ${environmentId}`);
@@ -192,14 +210,11 @@ const makeHarness = Effect.fn("TestFactoryAtoms.makeHarness")(function* (
     requests: Queue.clear(requests).pipe(Effect.map((made) => made.toSorted())),
     /** Every read of one environment, mounted for the rest of the test. */
     mountReads: (environmentId: EnvironmentId) => {
-      const reads: ReadonlyArray<Read> = [
-        factory.deliveries({ environmentId, input: { projectId } }),
-        factory.delivery({ environmentId, input: { deliveryId } }),
-        factory.settings({ environmentId, input: { projectId } }),
-      ];
+      const reads = readsOf(environmentId);
       for (const atom of reads) registry.mount(atom);
       return reads;
     },
+    readsOf,
   };
 });
 
@@ -336,10 +351,88 @@ describe("createFactoryEnvironmentAtoms", () => {
         ]);
         yield* harness.drain;
         expect(olderReads.every(isIdle)).toBe(true);
+        expect(yield* harness.closed).toEqual([older]);
         for (const atom of olderReads) harness.registry.refresh(atom);
         yield* harness.drain;
         expect(yield* harness.requests).toEqual([]);
+        // Nor does a reconnect with the reads still mounted, however its server answers.
+        yield* harness.reconnect(older, FACTORY);
+        yield* harness.emit(older, 0);
+        yield* harness.drain;
+        expect(yield* harness.requests).toEqual([]);
+        expect(olderReads.every(isIdle)).toBe(true);
       }),
     ),
+  );
+
+  it.effect(
+    "closes the change stream when support goes, and sends nothing after, though no view reads it",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const env = EnvironmentId.make("factory");
+          const harness = yield* makeHarness([env]);
+          harness.setConfigs([[env, FACTORY]]);
+          const atoms = [
+            harness.factory.changes({ environmentId: env, input: {} }),
+            ...harness.readsOf(env),
+          ];
+          const unmounts = atoms.map((atom) => harness.registry.mount(atom));
+          yield* harness.emit(env, 4);
+          yield* harness.drain;
+          expect(yield* harness.requests).toEqual(
+            requestsOf(env, [WS_METHODS.factoryDeliveriesSubscribe, ...READS]),
+          );
+          // The views go away; the reads they made stay cached, the stream open, on their idle TTL.
+          for (const unmount of unmounts) unmount();
+          yield* harness.drain;
+          expect(yield* harness.closed).toEqual([]);
+
+          harness.setConfigs([]);
+          yield* harness.drain;
+          expect(yield* harness.closed).toEqual([env]);
+
+          // A reconnect answering the same epoch, then a view opening again, reach nothing.
+          yield* harness.reconnect(env, FACTORY);
+          yield* harness.emit(env, 4);
+          yield* harness.drain;
+          expect(yield* harness.requests).toEqual([]);
+          const reopened = harness.mountReads(env);
+          yield* harness.drain;
+          expect(yield* harness.requests).toEqual([]);
+          expect(reopened.every((atom) => AsyncResult.isInitial(harness.registry.get(atom)))).toBe(
+            true,
+          );
+        }),
+      ),
+  );
+
+  it.effect(
+    "sends nothing over a session to a server without Factory, while the view still offers it",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const env = EnvironmentId.make("factory");
+          const harness = yield* makeHarness([env]);
+          harness.setConfigs([[env, FACTORY]]);
+          harness.registry.mount(harness.factory.changes({ environmentId: env, input: {} }));
+          harness.mountReads(env);
+          yield* harness.emit(env, 4);
+          yield* harness.drain;
+          yield* harness.requests;
+
+          // Reconnected to an older server, before its config replaces the one this client holds:
+          // the reads that re-run on a new session and the stream's resubscription are held.
+          yield* harness.reconnect(env, config({}));
+          yield* harness.drain;
+          expect(yield* harness.requests).toEqual([]);
+
+          yield* harness.reconnect(env, FACTORY);
+          yield* harness.drain;
+          expect(yield* harness.requests).toEqual(
+            requestsOf(env, [WS_METHODS.factoryDeliveriesSubscribe, ...READS]),
+          );
+        }),
+      ),
   );
 });
