@@ -23,8 +23,9 @@ const fenceClose = /^ {0,3}(?<fence>`{3,}|~{3,})\s*$/;
 /**
  * The body of the last fenced block whose info string is `json`. Fences follow CommonMark, so a
  * ```json line inside a longer or other fence is content, and an unclosed block runs to the end.
+ * The planner's fenced fallback reads its plan with it too.
  */
-const lastJsonBlock = (message: string): string | undefined => {
+export const lastJsonBlock = (message: string): string | undefined => {
   let last: string | undefined;
   let open: { readonly fence: string; readonly json: boolean; readonly body: string[] } | null =
     null;
