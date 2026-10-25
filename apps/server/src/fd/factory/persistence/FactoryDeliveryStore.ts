@@ -10,6 +10,7 @@ import {
 import {
   FactoryDeliveryId,
   FactoryDeliveryStatus,
+  FactoryReviewDetails,
   FactoryReviewSummary,
   FactoryRole,
   FactoryStageName,
@@ -161,6 +162,8 @@ const StoredAcceptedReview = Schema.Struct({
   summary: FactoryReviewSummary,
   evidencePath: Schema.String,
   fingerprint: Schema.optionalKey(Schema.String),
+  // Added with review details: reviews accepted before them have none, and none is made up.
+  details: Schema.optionalKey(FactoryReviewDetails),
 });
 
 const StoredRoundLimit = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 10 }));

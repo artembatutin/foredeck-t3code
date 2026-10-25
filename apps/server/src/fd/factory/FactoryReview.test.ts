@@ -645,6 +645,24 @@ describe("FactoryService.submitReview accepted reviews", () => {
                 reviewedAt: "1970-01-01T00:00:00.000Z",
               },
               evidencePath,
+              // FactoryReview.findings.test.ts covers the projection's bounds.
+              details: {
+                findings: [
+                  {
+                    id: "export-name",
+                    severity: "low",
+                    required: false,
+                    blocking: false,
+                    file: "src/export.ts",
+                    line: 1,
+                    detail:
+                      "The export is named for its format only, so a second format will need a rename.",
+                  },
+                ],
+                criteria: [],
+                missingEvidence: [],
+                omitted: { findings: 0, criteria: 0, missingEvidence: 0 },
+              },
             },
           });
           // Recorded, but not acted on while the reviewer's run goes on.

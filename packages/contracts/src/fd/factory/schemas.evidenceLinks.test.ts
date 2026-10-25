@@ -81,6 +81,8 @@ const REVIEW_KEYS: Record<keyof FactoryReviewSummary, true> = {
   findings: true,
   reviewedAt: true,
   number: true,
+  // Its nested keys are held in schemas.findings.test.ts.
+  details: true,
 };
 const ATTEMPT_KEYS: Record<keyof FactoryStageRunSummary, true> = {
   stage: true,

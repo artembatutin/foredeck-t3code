@@ -178,6 +178,16 @@ message judged the same way, for providers without t3 tools. The first invalid s
 round, on either path, is answered once (by the tool's failure in the same turn, or a retry turn on
 the reviewer thread); the second blocks.
 
+## Clients see a review's details as it was accepted
+
+Snapshots are built on every read and never read evidence, so what clients see of a review's
+findings, unverified criteria and missing evidence is projected once, when the review is accepted
+([`review/details.ts`](../../apps/server/src/fd/factory/review/details.ts)), and stored beside its
+summary: capped lists and truncated text, the rest counted. Blocks, the submit tool's reply and
+the evidence file keep the summary without it. Reviews accepted before details existed have none,
+and nothing backfills them. Stored state decodes with the contract's bounds, so they never shrink;
+raising them makes older clients leave out the reviews that use the room.
+
 ## Repair rounds stop on limits and repeated failures
 
 A failed verify or a blocking review becomes a repair turn on the author thread, then the branch is

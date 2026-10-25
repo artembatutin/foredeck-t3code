@@ -286,7 +286,56 @@ export const FactoryVerifyReceipt = Schema.Struct({
 });
 export type FactoryVerifyReceipt = typeof FactoryVerifyReceipt.Type;
 
-/** What clients see of a review round: the verdict and counts, not the findings' text. */
+/**
+ * A review summary lists at most this many entries of each detail list, and cuts each text to
+ * this length. Stored delivery state decodes with these bounds, so they never shrink; raising
+ * them makes older clients leave out the reviews that use the room.
+ */
+export const FACTORY_REVIEW_DETAILS_MAX = 20;
+export const FACTORY_REVIEW_DETAIL_MAX_LENGTH = 500;
+
+const FactoryReviewDetailText = FactoryText(FACTORY_REVIEW_DETAIL_MAX_LENGTH);
+const reviewDetailsMax = Schema.isMaxLength(FACTORY_REVIEW_DETAILS_MAX);
+
+/** One finding as clients see it. */
+const FactoryReviewFindingDetail = Schema.Struct({
+  id: FactorySlug,
+  severity: FactoryFindingSeverity,
+  required: Schema.Boolean,
+  /** Whether its severity was one the project blocks on when the review was judged. */
+  blocking: Schema.Boolean,
+  file: FactoryRepoPath,
+  /** Null when the finding concerns the whole file. */
+  line: Schema.NullOr(PositiveInt),
+  detail: FactoryReviewDetailText,
+});
+
+/** A criterion the reviewer found failed or could not test; each blocks the review. */
+const FactoryReviewCriterionDetail = Schema.Struct({
+  criterion: PositiveInt,
+  status: Schema.Literals(["failed", "untested"]),
+  /** The reviewer's account of it, without its paths. */
+  detail: FactoryReviewDetailText,
+});
+
+/**
+ * What a review raised, bounded for clients: its findings, the criteria it did not verify and the
+ * evidence it found missing (each of the last two blocks the review). The full review stays in the
+ * delivery's evidence; entries past a list's cap are counted in `omitted`, not sent.
+ */
+export const FactoryReviewDetails = Schema.Struct({
+  findings: Schema.Array(FactoryReviewFindingDetail).check(reviewDetailsMax),
+  criteria: Schema.Array(FactoryReviewCriterionDetail).check(reviewDetailsMax),
+  missingEvidence: Schema.Array(FactoryReviewDetailText).check(reviewDetailsMax),
+  omitted: Schema.Struct({
+    findings: NonNegativeInt,
+    criteria: NonNegativeInt,
+    missingEvidence: NonNegativeInt,
+  }),
+});
+export type FactoryReviewDetails = typeof FactoryReviewDetails.Type;
+
+/** What clients see of a review round: the verdict and counts, and what it raised, bounded. */
 export const FactoryReviewSummary = Schema.Struct({
   headSha: FactoryGitObjectId,
   verdict: FactoryReviewVerdict,
@@ -295,6 +344,8 @@ export const FactoryReviewSummary = Schema.Struct({
   reviewedAt: IsoDateTime,
   /** The review's number, named by the stage attempt that accepted it; older servers send none. */
   number: Schema.optionalKey(FactoryEvidenceNumber),
+  /** Absent from older servers, and for reviews accepted before servers kept details. */
+  details: Schema.optionalKey(FactoryReviewDetails),
 });
 export type FactoryReviewSummary = typeof FactoryReviewSummary.Type;
 

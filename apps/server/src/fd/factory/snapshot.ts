@@ -54,10 +54,14 @@ const receiptSummary = (receipt: FactoryVerifyReceipt): FactoryVerifyReceiptSumm
   };
 };
 
-/** An accepted review's summary, numbered by its evidence. */
+/** An accepted review's summary, numbered by its evidence, with the details kept for it. */
 const reviewSummary = (review: FactoryAcceptedReview): FactoryReviewSummary => {
   const number = evidenceNumber(review.evidencePath, REVIEW_JSON);
-  return number === undefined ? review.summary : { ...review.summary, number };
+  return {
+    ...review.summary,
+    ...(number === undefined ? {} : { number }),
+    ...(review.details === undefined ? {} : { details: review.details }),
+  };
 };
 
 /** The numbers of the receipts and reviews a snapshot carries. */
@@ -190,8 +194,8 @@ export const needsYou = (state: FactoryDeliveryState): string | undefined => {
 /**
  * A delivery as clients see it: its progress, threads and the summaries of its receipts, reviews
  * and newest stage attempts, never their logs or evidence paths. Receipts and reviews carry their
- * evidence numbers, and each attempt names the one it produced. `needsYou` is set only while it
- * is blocked.
+ * evidence numbers, and each attempt names the one it produced; reviews carry the bounded details
+ * kept when they were accepted. `needsYou` is set only while it is blocked.
  */
 export const toFactoryDelivery = (delivery: FactoryDeliveryWithRuns): FactoryDelivery => {
   const { state } = delivery;

@@ -6,6 +6,8 @@ import {
   type FactoryControls,
   factoryControls,
   factoryNeedsYou,
+  type FactoryReviewNote,
+  factoryReviewNotes,
   factoryTimeline,
   type FactoryTimelineEntry,
 } from "@t3tools/client-runtime/fd/factory";
@@ -74,6 +76,13 @@ export interface FactoryEvidenceLine {
   readonly text: string;
 }
 
+/** A review's line, with what it raised listed under it as plain text. */
+export interface FactoryReviewLine extends FactoryEvidenceLine {
+  readonly notes: ReadonlyArray<FactoryReviewNote>;
+  /** How many entries the server left out; undefined when it left none out. */
+  readonly omitted: string | undefined;
+}
+
 export interface FactoryTimelineRow {
   readonly key: string;
   readonly stage: string;
@@ -82,7 +91,7 @@ export interface FactoryTimelineRow {
   readonly outcome: string;
   readonly startedAt: string | undefined;
   readonly receipts: ReadonlyArray<FactoryEvidenceLine>;
-  readonly reviews: ReadonlyArray<FactoryEvidenceLine>;
+  readonly reviews: ReadonlyArray<FactoryReviewLine>;
   /** Route params of the attempt's thread; null when it has none. */
   readonly thread: { readonly environmentId: EnvironmentId; readonly threadId: ThreadId } | null;
 }
@@ -98,7 +107,7 @@ export interface FactoryDeliveryView {
   readonly timeline: ReadonlyArray<FactoryTimelineRow>;
   /** The receipts and reviews no attempt of the timeline holds. */
   readonly receipts: ReadonlyArray<FactoryEvidenceLine>;
-  readonly reviews: ReadonlyArray<FactoryEvidenceLine>;
+  readonly reviews: ReadonlyArray<FactoryReviewLine>;
 }
 
 export interface FactoryItemSectionView {
@@ -130,9 +139,10 @@ const receiptLine = (receipt: FactoryVerifyReceiptSummary): FactoryEvidenceLine 
   text: receiptText(receipt),
 });
 
-const reviewLine = (review: FactoryReviewSummary): FactoryEvidenceLine => ({
+const reviewLine = (review: FactoryReviewSummary): FactoryReviewLine => ({
   key: `${review.reviewedAt}:${review.headSha}`,
   text: reviewText(review),
+  ...factoryReviewNotes(review),
 });
 
 const isActive = (delivery: FactoryDelivery) =>

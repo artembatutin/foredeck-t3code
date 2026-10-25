@@ -27,6 +27,7 @@ import type {
   FactoryReviewJudgment,
   FactoryReviewSource,
 } from "./pipeline/state.ts";
+import { reviewDetails } from "./review/details.ts";
 import { type FactoryEvidencePathError, validateReviewInWorktree } from "./review/evidencePaths.ts";
 import { parseFencedReview } from "./review/fencedJson.ts";
 import { findingsToFix } from "./review/validate.ts";
@@ -124,9 +125,9 @@ type FactoryReviewCandidate =
  * last assistant message. A worktree whose HEAD or tree moved from the verified receipt, or that
  * is not clean, refuses any review. Otherwise the review must decode and pass the validation
  * port, evidence paths included; a valid one, blocking or not, is written to the delivery's
- * evidence as `review-<n>.json` and accepted, a blocking one with its failure fingerprint (its
- * findings to fix and the reviewed tree). Judging records nothing on the delivery; the engine
- * does, from the judgment.
+ * evidence as `review-<n>.json` and accepted with the bounded details clients see, a blocking one
+ * with its failure fingerprint (its findings to fix and the reviewed tree). Judging records
+ * nothing on the delivery; the engine does, from the judgment.
  */
 export class FactoryReview extends Context.Service<
   FactoryReview,
@@ -231,10 +232,11 @@ const make = Effect.gen(function* () {
       blockingReasons: validation.status === "blocking" ? validation.reasons : [],
       review,
     });
+    const details = reviewDetails(review, blockingSeverities);
     if (!blocking) {
       return {
         type: "accepted",
-        review: { source, summary, evidencePath },
+        review: { source, summary, evidencePath, details },
       } satisfies FactoryReviewJudgment;
     }
     const fingerprint = failureFingerprint({
@@ -244,7 +246,7 @@ const make = Effect.gen(function* () {
     });
     return {
       type: "accepted",
-      review: { source, summary, evidencePath, fingerprint },
+      review: { source, summary, evidencePath, fingerprint, details },
     } satisfies FactoryReviewJudgment;
   });
 

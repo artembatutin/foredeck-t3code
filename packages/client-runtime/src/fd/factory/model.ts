@@ -1,6 +1,7 @@
 import type { ServerConfig, ThreadId } from "@t3tools/contracts";
 import {
   type FactoryDelivery,
+  type FactoryFindingSeverity,
   type FactoryReviewSummary,
   type FactoryStageRunSummary,
   type FactorySupport,
@@ -235,4 +236,81 @@ export const factoryTimeline = (
       reviews: reviews.claim(run.reviewNumber),
     }));
   return { entries, receipts: receipts.unclaimed(), reviews: reviews.unclaimed() };
+};
+
+const SEVERITY_LABELS: Record<FactoryFindingSeverity, string> = {
+  high: "High",
+  medium: "Medium",
+  low: "Low",
+};
+
+/** One thing a review raised: a finding, a criterion it did not verify, or missing evidence. */
+export interface FactoryReviewNote {
+  readonly key: string;
+  /** A finding's severity, "Criterion 2 failed", "Criterion 3 untested" or "Missing evidence". */
+  readonly label: string;
+  /** Whether the reviewer marked the finding required. */
+  readonly required: boolean;
+  /** Whether it blocks the commit: a finding at a blocking severity, or any other note. */
+  readonly blocking: boolean;
+  /** Where a finding points, `file:line` or the file alone; undefined for other notes. */
+  readonly location: string | undefined;
+  /** The reviewer's words as the server bounded them. Plain text: never render it as markup. */
+  readonly detail: string;
+}
+
+export interface FactoryReviewNotes {
+  /** Findings first, as the server ordered them, then criteria, then missing evidence. */
+  readonly notes: ReadonlyArray<FactoryReviewNote>;
+  /** What the server left out of the lists, as a sentence; undefined when it left none out. */
+  readonly omitted: string | undefined;
+}
+
+/** "a", "a and b", "a, b and c". */
+const listed = (parts: ReadonlyArray<string>) =>
+  parts.length < 2 ? parts.join("") : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
+
+const more = (count: number, one: string, many: string) =>
+  count === 0 ? [] : [`${count} more ${count === 1 ? one : many}`];
+
+/**
+ * What a review raised, as both surfaces list it under the review. A review from a server that
+ * keeps no details, or one that raised nothing, has no notes.
+ */
+export const factoryReviewNotes = (review: FactoryReviewSummary): FactoryReviewNotes => {
+  const { details } = review;
+  if (details === undefined) return { notes: [], omitted: undefined };
+  const notes: Array<FactoryReviewNote> = [
+    ...details.findings.map((finding) => ({
+      key: `finding:${finding.id}`,
+      label: SEVERITY_LABELS[finding.severity],
+      required: finding.required,
+      blocking: finding.blocking,
+      location: finding.line === null ? finding.file : `${finding.file}:${finding.line}`,
+      detail: finding.detail,
+    })),
+    ...details.criteria.map((criterion) => ({
+      key: `criterion:${criterion.criterion}`,
+      label: `Criterion ${criterion.criterion} ${criterion.status}`,
+      required: false,
+      blocking: true,
+      location: undefined,
+      detail: criterion.detail,
+    })),
+    ...details.missingEvidence.map((detail, index) => ({
+      key: `missing:${index}`,
+      label: "Missing evidence",
+      required: false,
+      blocking: true,
+      location: undefined,
+      detail,
+    })),
+  ];
+  const { omitted } = details;
+  const left = [
+    ...more(omitted.findings, "finding", "findings"),
+    ...more(omitted.criteria, "criterion", "criteria"),
+    ...more(omitted.missingEvidence, "missing evidence entry", "missing evidence entries"),
+  ];
+  return { notes, omitted: left.length === 0 ? undefined : `Not shown: ${listed(left)}.` };
 };

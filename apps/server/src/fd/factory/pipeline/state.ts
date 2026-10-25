@@ -1,6 +1,7 @@
 import type { OrchestrationV2RunStatus, RunId, RuntimeMode, ThreadId } from "@t3tools/contracts";
 import type {
   FactoryDeliveryStatus,
+  FactoryReviewDetails,
   FactoryReviewSummary,
   FactoryRole,
   FactoryStageName,
@@ -208,6 +209,11 @@ export interface FactoryAcceptedReview {
   readonly evidencePath: string;
   /** Set on a blocking review: its failure fingerprint. */
   readonly fingerprint?: string;
+  /**
+   * What clients see of its findings, criteria and missing evidence, which snapshots add to its
+   * summary. Absent on reviews accepted before servers kept them.
+   */
+  readonly details?: FactoryReviewDetails;
 }
 
 /**

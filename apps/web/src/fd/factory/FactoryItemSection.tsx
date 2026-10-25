@@ -21,7 +21,12 @@ import { Button } from "../../components/ui/button";
 import { useConnectedEnvironmentIds } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
-import { cancelConfirmationTarget, factoryErrorText, factoryItemSection } from "./itemSection";
+import {
+  cancelConfirmationTarget,
+  factoryErrorText,
+  factoryItemSection,
+  type FactoryReviewLine,
+} from "./itemSection";
 import { factoryEnvironment } from "./state";
 
 interface FactoryItemSectionProps {
@@ -218,7 +223,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
                 <p key={receipt.key}>Verify: {receipt.text}</p>
               ))}
               {row.reviews.map((review) => (
-                <p key={review.key}>Review: {review.text}</p>
+                <ReviewEvidence key={review.key} review={review} />
               ))}
             </li>
           ))}
@@ -234,7 +239,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
             <p key={receipt.key}>Verify: {receipt.text}</p>
           ))}
           {delivery.reviews.map((review) => (
-            <p key={review.key}>Review: {review.text}</p>
+            <ReviewEvidence key={review.key} review={review} />
           ))}
         </div>
       ) : null}
@@ -271,5 +276,37 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
         </AlertDialogPopup>
       </AlertDialog>
     </section>
+  );
+}
+
+/**
+ * A review's line and what it raised. Reviewer text is rendered as text, never as HTML or
+ * Markdown, so nothing in it can run or link anywhere.
+ */
+function ReviewEvidence({ review }: { readonly review: FactoryReviewLine }) {
+  return (
+    <>
+      <p>Review: {review.text}</p>
+      {review.notes.length > 0 ? (
+        <ul className="space-y-1 ps-3" aria-label="Review findings">
+          {review.notes.map((note) => (
+            <li key={note.key}>
+              <p>
+                <span className="font-medium">{note.label}</span>
+                {note.required ? " · Required" : null}
+                {note.blocking ? " · Blocking" : null}
+                {note.location !== undefined ? (
+                  <span className="font-mono text-muted-foreground"> {note.location}</span>
+                ) : null}
+              </p>
+              <p className="whitespace-pre-wrap break-words">{note.detail}</p>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {review.omitted !== undefined ? (
+        <p className="ps-3 text-muted-foreground">{review.omitted}</p>
+      ) : null}
+    </>
   );
 }
