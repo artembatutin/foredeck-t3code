@@ -610,7 +610,10 @@ export const make = (options: JiraSourceOptions = {}) =>
           // comment already read, and the walk goes on after wherever that comment is now: an
           // added comment only repeats one, a deleted one would hide one. A walk that loses that
           // comment, or ends before the total it was told, starts over; one that keeps losing
-          // it cannot answer.
+          // it cannot answer. Without a total, a page with nothing new is the end only when it
+          // holds nothing but the last comment read, or is the first and empty: one that ends at
+          // that comment further down only repeated comments added since, and older ones may
+          // still be unread.
           for (let walk = 0; walk < COMMENT_WALKS; walk += 1) {
             let start = 0;
             let boundary: string | undefined;
@@ -627,8 +630,8 @@ export const make = (options: JiraSourceOptions = {}) =>
               const end = start + read.comments.length;
               const readAll = read.total !== undefined && end >= read.total;
               if (fresh.length === 0 || readAll) {
-                // A page with nothing new, short of the total it was told, is no answer.
-                if (readAll || read.total === undefined) return Option.none();
+                // `at` is -1 on an empty first page and 0 on a page of only the last comment read.
+                if (readAll || (read.total === undefined && at <= 0)) return Option.none();
                 break;
               }
               boundary = read.comments.at(-1)?.id;

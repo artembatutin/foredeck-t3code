@@ -106,6 +106,14 @@ const numbered = (count: number) =>
     created: "2026-10-20T10:00:00.000+0000",
   }));
 
+/** `count` comments newer than the `after` already on the issue, oldest first. */
+const newer = (after: number, count: number) =>
+  Array.from({ length: count }, (_, index) => ({
+    id: `c${after + index + 1}`,
+    body: adf("A new comment."),
+    created: "2026-10-25T09:00:00.000+0000",
+  }));
+
 const adapterWith = (fake: ReturnType<typeof fakeJira>) =>
   JiraSource.make({ readRetries: 0, issueWriteSpacingMs: 0 }).pipe(Effect.provide(fake.layer));
 
@@ -136,6 +144,13 @@ describe("JiraSource findComment", () => {
       const withoutTotal = yield* adapterWith(uncounted);
       assert.isTrue(Option.isNone(yield* withoutTotal.findComment(runtime, issue, "comment-121 ")));
       assert.deepStrictEqual(uncounted.starts, [0, 49, 98, 119]);
+
+      const empty = fakeJira([], { withTotal: false });
+      const withoutComments = yield* adapterWith(empty);
+      assert.isTrue(
+        Option.isNone(yield* withoutComments.findComment(runtime, issue, "comment-001 ")),
+      );
+      assert.deepStrictEqual(empty.starts, [0]);
     }),
   );
 
@@ -196,6 +211,44 @@ describe("JiraSource findComment", () => {
         Option.some("c70"),
       );
       assert.deepStrictEqual(again.starts, [0, 49]);
+    }),
+  );
+
+  it.effect("starts over when, without a total, a page ends at the last comment read", () =>
+    Effect.gen(function* () {
+      // 49 comments added after the first page push the 50 it read whole onto the next one,
+      // which ends at the last comment read with nothing new though older ones are unread.
+      const comments: Array<unknown> = numbered(120);
+      const fake = fakeJira(comments, {
+        withTotal: false,
+        afterRead: (reads) => {
+          if (reads === 1) comments.push(...newer(comments.length, 49));
+        },
+      });
+      const adapter = yield* adapterWith(fake);
+      const found = yield* adapter.findComment(runtime, issue, "comment-010 ");
+      assert.deepStrictEqual(
+        Option.map(found, ({ id }) => id),
+        Option.some("c10"),
+      );
+      assert.deepStrictEqual(fake.starts, [0, 49, 0, 49, 98, 147]);
+    }),
+  );
+
+  it.effect("cannot answer, without a total, while added comments keep repeating a page", () =>
+    Effect.gen(function* () {
+      const comments: Array<unknown> = numbered(120);
+      const fake = fakeJira(comments, {
+        withTotal: false,
+        afterRead: (reads) => {
+          if (reads % 2 === 1) comments.push(...newer(comments.length, 49));
+        },
+      });
+      const adapter = yield* adapterWith(fake);
+      const error = yield* Effect.flip(adapter.findComment(runtime, issue, "comment-010 "));
+      assert.strictEqual(error._tag, "WorkUnavailable");
+      // Three walks, each ending on a second page of comments it had already read.
+      assert.deepStrictEqual(fake.starts, [0, 49, 0, 49, 0, 49]);
     }),
   );
 
