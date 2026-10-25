@@ -168,9 +168,10 @@ export class FactoryWorker extends Context.Service<
     >;
     /**
      * Steps a parent with the approval of the child it waits for, once that child is approved;
-     * the parent then waits for something else, so the approval is taken once. Any other parent,
-     * or delivery, is left as it is. The boot sweep calls this for a parent whose child was
-     * approved while no server handed the approval on.
+     * the parent then waits for something else, so the approval is taken once. A parent without a
+     * recorded branch start takes that child's start again first (see `advance`). Any other
+     * parent, or delivery, is left as it is. The boot sweep calls this for a parent whose child
+     * was approved while no server handed the approval on.
      */
     readonly takeChildApproval: (
       parentId: FactoryDeliveryId,

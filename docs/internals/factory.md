@@ -50,7 +50,9 @@ before planner launches recorded where its branch started has it read from its b
 at its next child start, and keeps it. A first child an earlier server already started counts only
 if it started there: that server took HEAD, and the child's review then missed the commits before
 it. A reflog that no longer holds the creation, or a first child started elsewhere, refuses the
-start, and the parent blocks rather than record a later commit as its base.
+start, and the parent blocks rather than record a later commit as its base. Such a parent takes no
+child's approval before it has that commit either: the engine has it take the child's start again
+first, so a one-child plan cannot leave its children with the base unknown.
 
 ## A delivery's launches stay under its starter's mode
 

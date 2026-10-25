@@ -455,6 +455,15 @@ const factoryReactor = Layer.effectDiscard(
   Layer.provide(Layer.succeed(ServerActivation.ServerActivation, Effect.void)),
 );
 
+/** Factory down between boots: no reactor runs, and draining one is a mistake in the test. */
+const downReactor: typeof factoryReactor = Layer.succeed(
+  FactoryReactor.FactoryReactor,
+  FactoryReactor.FactoryReactor.of({
+    start: Effect.die("Factory's reactor starts only inside world.boot."),
+    drain: Effect.die("Factory's reactor runs only inside world.boot."),
+  }),
+);
+
 /**
  * The fake provider's instance as the instance registry holds it. The runtime policy and Factory
  * read only its advertised runtime modes; none advertised means it runs any mode it is given.
@@ -483,6 +492,7 @@ const makeLayer = (input: {
   readonly pullRequestCalls: Array<PullRequestCall>;
   readonly commentCalls: Array<CommentCall>;
   readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
+  readonly manualReactor: boolean;
   readonly root: string;
   readonly t3Home: string;
 }) => {
@@ -504,7 +514,7 @@ const makeLayer = (input: {
     ProviderAdapterRegistry.layerSingle(input.provider.adapter),
     { databaseLayer: database, runEffectWorker: false, runtimePolicyLayer: runtimePolicy },
   );
-  return factoryReactor.pipe(
+  return (input.manualReactor ? downReactor : factoryReactor).pipe(
     Layer.provideMerge(Factory.layerLive),
     Layer.provide(fakePullRequests(input.pullRequestCalls)),
     Layer.provide(ProviderRegistryMock.layer()),
@@ -628,6 +638,13 @@ export interface World {
     deliveryId: FactoryDeliveryId,
   ) => Effect.Effect<StartedAuthor, never, Services>;
   /**
+   * Runs `body` as a server process that boots Factory: a reactor of its own starts, and its boot
+   * sweep and what that set off finish first. With `manualReactor`, Factory's reactor runs only
+   * inside a boot, so between two boots it is down while core recovery and the effect worker go
+   * on; otherwise one reactor runs throughout, and this runs `body` as it is.
+   */
+  readonly boot: <A, E>(body: Effect.Effect<A, E, Services>) => Effect.Effect<A, E, Services>;
+  /**
    * Ends the provider turn of `runId` and waits until orchestration has finished the run and
    * Factory has handled its end, including every effect that followed. Returns the run's status.
    */
@@ -651,6 +668,8 @@ export const withProject = <A, E>(
     readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
     /** Wraps the Work service the server runs with, to fail some of its calls. */
     readonly work?: (service: WorkServiceShape) => WorkServiceShape;
+    /** Factory's reactor runs only inside `world.boot`; see there. */
+    readonly manualReactor?: boolean;
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -740,6 +759,16 @@ export const withProject = <A, E>(
           return run?.status ?? assert.fail(`Run ${runId} is gone.`);
         }).pipe(Effect.orDie);
 
+      const boot: World["boot"] = (body) =>
+        options.manualReactor !== true
+          ? body
+          : Effect.gen(function* () {
+              const reactor = yield* FactoryReactor.FactoryReactor;
+              yield* reactor.start;
+              yield* drainFactory;
+              return yield* body;
+            }).pipe(Effect.provide(FactoryReactor.layer), Effect.scoped);
+
       const rootStatus = yield* git(root, ["status", "--porcelain=v1", "--untracked-files=all"]);
       return yield* body({
         provider,
@@ -757,6 +786,7 @@ export const withProject = <A, E>(
         start: startWith({}),
         startWith,
         launched,
+        boot,
         endRun,
       });
     }).pipe(
@@ -767,6 +797,7 @@ export const withProject = <A, E>(
           pullRequestCalls,
           commentCalls,
           wrapWork: options.work ?? ((service) => service),
+          manualReactor: options.manualReactor === true,
           root,
           t3Home,
         }),

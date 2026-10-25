@@ -234,10 +234,10 @@ const fold = (state: FactoryDeliveryState, events: ReadonlyArray<FactoryEvent>) 
   events.reduce((current, event) => advance(current, event).delivery, state);
 
 /**
- * A parent whose plan its owner approved and whose children exist, awaiting the start of the
- * first (effect 3), on `worktreePath`.
+ * A parent whose plan (its first `taskCount` tasks) its owner approved and whose children exist,
+ * awaiting the start of the first (effect 3), on `worktreePath`.
  */
-const awaitingFirstStart = (worktreePath = defaultWorktree) =>
+const awaitingFirstStart = (worktreePath = defaultWorktree, taskCount = plan.tasks.length) =>
   fold(queuedDeliveryState({ kind: "parent", branch, baseRef: "HEAD" }), [
     { type: "start" },
     {
@@ -255,12 +255,17 @@ const awaitingFirstStart = (worktreePath = defaultWorktree) =>
       runId: planRun,
       judgment: {
         type: "accepted",
-        plan: { ...plan, source: "mcp", evidencePath: "/t3/userdata/fd-factory/plan.json" },
+        plan: {
+          ...plan,
+          tasks: plan.tasks.slice(0, taskCount),
+          source: "mcp",
+          evidencePath: "/t3/userdata/fd-factory/plan.json",
+        },
       },
     },
     { type: "run.finished", threadId: planner, runId: planRun, status: "completed" },
     { type: "plan.approved" },
-    { type: "children.created", effectId: 2, children },
+    { type: "children.created", effectId: 2, children: children.slice(0, taskCount) },
   ]);
 const startedFirst: FactoryEvent = { type: "child.started", effectId: 3 };
 
@@ -290,12 +295,12 @@ const approvedChild = (baseline: string, worktreePath = defaultWorktree): Factor
 });
 
 /**
- * Stores the parent and its tasks, the first approved for `firstApproved` when `approved`, and
- * each child in the state given.
+ * Stores the parent and a task for each child given, the first approved for `firstApproved` when
+ * `firstTaskApproved`, and each child in the state given.
  */
 const seed = (input: {
   readonly parent: FactoryDeliveryState;
-  readonly children: readonly [FactoryDeliveryState, FactoryDeliveryState, FactoryDeliveryState];
+  readonly children: ReadonlyArray<FactoryDeliveryState>;
   readonly firstTaskApproved: boolean;
 }) =>
   Effect.gen(function* () {
@@ -312,7 +317,7 @@ const seed = (input: {
     if (input.parent.status !== "cancelled") {
       yield* stageRuns.append({ deliveryId: parentId, stage: "author" });
     }
-    for (const [index, task] of plan.tasks.entries()) {
+    for (const [index, task] of plan.tasks.slice(0, input.children.length).entries()) {
       yield* tasks.insert({ deliveryId: parentId, taskId: task.id, plan: task });
       yield* tasks.setChildItem({
         deliveryId: parentId,
@@ -708,48 +713,84 @@ describe("a parent stored before its branch start was recorded, its first child 
         }),
       ),
   );
+});
 
-  it.effect.each(startedFirstChild)(
-    "hands on at boot a first child approved from $started only from the branch start",
-    ({ atBranchStart }) =>
+/**
+ * How a stored-before parent's first child stands when the parent is to take its approval: started
+ * where the branch started, or from a later commit, or where it started while the branch's reflog
+ * no longer records its creation.
+ */
+const approvalHandOffs = [
+  { taskCount: 1, case: "where its branch started", reflog: true, atBranchStart: true },
+  { taskCount: 1, case: "from a later commit", reflog: true, atBranchStart: false },
+  { taskCount: 1, case: "with its branch's creation lost", reflog: false, atBranchStart: true },
+  { taskCount: 3, case: "where its branch started", reflog: true, atBranchStart: true },
+  { taskCount: 3, case: "from a later commit", reflog: true, atBranchStart: false },
+  { taskCount: 3, case: "with its branch's creation lost", reflog: false, atBranchStart: true },
+] as const;
+
+describe("a stored-before parent taking its first child's approval at boot", () => {
+  it.effect.each(approvalHandOffs)(
+    "of $taskCount children takes it only with its branch start established, child $case",
+    ({ taskCount, reflog, atBranchStart }) =>
       withWorld((world) =>
         Effect.gen(function* () {
-          const checkout = yield* legacyCheckout({ reflog: true });
+          const checkout = yield* legacyCheckout({ reflog });
           const startedFrom = atBranchStart ? checkout.start : checkout.head;
           const queued = queuedChild(checkout.worktreePath);
+          const approved = approvedChild(startedFrom, checkout.worktreePath);
           // The parent took the first child's start without recording where its branch started,
           // and the child was approved while no server handed the approval on.
           yield* seed({
             parent: {
-              ...fold(awaitingFirstStart(checkout.worktreePath), [startedFirst]),
+              ...fold(awaitingFirstStart(checkout.worktreePath, taskCount), [startedFirst]),
               baseline: null,
             },
-            children: [approvedChild(startedFrom, checkout.worktreePath), queued, queued],
+            children: [approved, queued, queued].slice(0, taskCount),
             firstTaskApproved: true,
           });
 
           yield* sweep;
 
           const parent = yield* stateOf(parentId);
-          assert.deepStrictEqual(parent.approvedChildren, [first]);
-          if (atBranchStart) {
+          const taken = reflog && atBranchStart;
+          if (taken) {
+            // It took the child's start again, which records where its branch started, then the
+            // approval.
             assert.strictEqual(parent.baseline, checkout.start);
-            assert.deepStrictEqual(parent.awaiting, { type: "child", deliveryId: second });
-            assert.strictEqual((yield* stateOf(second)).baseline, firstApproved);
-            assert.deepStrictEqual(
-              world.launches.map(({ deliveryId }) => deliveryId),
-              [second],
-            );
+            assert.deepStrictEqual(parent.approvedChildren, [first]);
+            if (taskCount === 1) {
+              assert.strictEqual(parent.stage, "integrate");
+              assert.notStrictEqual(parent.awaiting?.type, "child");
+              assert.deepStrictEqual(world.launches, []);
+            } else {
+              assert.deepStrictEqual(parent.awaiting, { type: "child", deliveryId: second });
+              assert.strictEqual((yield* stateOf(second)).baseline, firstApproved);
+              assert.deepStrictEqual(
+                world.launches.map(({ deliveryId }) => deliveryId),
+                [second],
+              );
+            }
           } else {
+            // Without that start, the approval is not taken: the parent blocks before its next
+            // child or the stage after its children.
+            assert.strictEqual(parent.status, "blocked");
             assert.deepStrictEqual(parent.block, {
               reason: "effect_failed",
-              effect: { id: 4, type: "start_child", child: second },
+              effect: { id: 4, type: "start_child", child: first },
               detail: "Factory could not start the child delivery (FactoryChildStartError).",
             });
+            assert.deepStrictEqual(parent.approvedChildren, []);
             assert.isNull(parent.baseline);
-            assert.deepStrictEqual(yield* stateOf(second), queued);
+            assert.strictEqual(parent.stage, "author");
+            if (taskCount === 3) assert.deepStrictEqual(yield* stateOf(second), queued);
             assert.deepStrictEqual(world.launches, []);
           }
+          assert.deepStrictEqual(yield* stateOf(first), approved);
+
+          const before = yield* rows;
+          yield* sweep;
+          assert.deepStrictEqual(yield* rows, before);
         }),
       ),
   );

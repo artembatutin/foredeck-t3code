@@ -6,12 +6,12 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 
 import * as EffectOutbox from "../../orchestration-v2/EffectOutbox.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as ProviderRuntimeRecoveryService from "../../orchestration-v2/ProviderRuntimeRecoveryService.ts";
-import { continueRestartedRun } from "../../orchestration-v2/RestartContinuation.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 
 import * as Factory from "./index.ts";
@@ -124,11 +124,11 @@ const checkouts = (world: World) =>
 
 /**
  * A parent whose planner's plan (two tasks unless given) its owner approved, once its first child
- * has started; `atGate` runs while it waits at the plan gate. Returns the parent, its first two
- * children in plan order and all of them, and the repository's checkouts and the main branch's
- * commit from before the approval: the parent's branch started there.
+ * has started; `atGate` runs while it waits at the plan gate. Returns the parent, its children in
+ * plan order, and the repository's checkouts and the main branch's commit from before the
+ * approval: the parent's branch started there.
  */
-const approvedParent = <E = never, R = never>(
+const approvePlanned = <E = never, R = never>(
   world: World,
   options: {
     readonly plan?: unknown;
@@ -146,19 +146,29 @@ const approvedParent = <E = never, R = never>(
     yield* factory.approvePlan(planner.deliveryId);
     yield* drainFactory;
     const parent = yield* stateOf(planner.deliveryId);
-    const [first, second] = parent.children;
-    if (first === undefined || second === undefined) return assert.fail("Two children exist.");
     return {
       parentId: planner.deliveryId,
       planner: planner.threadId,
       worktreePath: planner.worktreePath,
       branch: parent.branch,
-      children: [first, second] as const,
       all: parent.children,
       before,
       branchStart,
     };
   }).pipe(Effect.orDie);
+
+/** `approvePlanned` for a plan of two or more tasks, with its first two children. */
+const approvedParent = <E = never, R = never>(
+  world: World,
+  options: Parameters<typeof approvePlanned<E, R>>[1] = {},
+) =>
+  approvePlanned(world, options).pipe(
+    Effect.map((parent) => {
+      const [first, second] = parent.all;
+      if (first === undefined || second === undefined) return assert.fail("Two children exist.");
+      return { ...parent, children: [first, second] as const };
+    }),
+  );
 
 /** The child's reviewer run, once it has started. */
 const reviewerOf = (childId: FactoryDeliveryId) =>
@@ -200,6 +210,50 @@ const approvalEvidence = (world: World, childId: FactoryDeliveryId, taskId: stri
     const path = yield* Path.Path;
     const file = path.join(world.evidenceDir(childId), `approval-${taskId}.json`);
     return { file, evidence: JSON.parse(yield* fileSystem.readFileString(file)) };
+  }).pipe(Effect.orDie);
+
+/** A plan of `twoTaskPlan`'s first task alone. */
+const oneTaskPlan = { tasks: [twoTaskPlan.tasks[0]] };
+
+/** Waits until the provider's running turn on the thread is stored, as core recovery reads it. */
+const providerTurnRunning = (threadId: ThreadId) =>
+  Effect.flatMap(EventSink.EventSinkV2, (sink) =>
+    sink.stream().pipe(
+      Stream.filter(
+        ({ event }) =>
+          event.type === "provider-turn.updated" &&
+          event.threadId === threadId &&
+          event.payload.status === "running",
+      ),
+      Stream.runHead,
+    ),
+  ).pipe(Effect.orDie);
+
+/** Core's runtime recovery, over the server's stores: its shutdown and startup reconciles. */
+const coreRecovery = Effect.service(
+  ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService,
+).pipe(
+  Effect.provide(ProviderRuntimeRecoveryService.layer.pipe(Layer.provide(EffectOutbox.layer))),
+);
+
+/** The restart continuation core's outbox holds for the run, by its status; none if it holds none. */
+const restartIntent = (runId: string) =>
+  Effect.flatMap(SqlClient.SqlClient, (sql) =>
+    sql<{ readonly status: string }>`
+      SELECT status FROM orchestration_v2_effect_outbox
+      WHERE effect_id = ${`effect:restart-continuation:${runId}`}
+        AND effect_type = 'provider-runtime.continue'
+    `.pipe(Effect.map((rows) => rows.map(({ status }) => status))),
+  ).pipe(Effect.orDie);
+
+/** Writes the cancel of each delivery as the step that stored it would, sending no interrupt. */
+const storeCancels = (deliveryIds: ReadonlyArray<FactoryDeliveryId>) =>
+  Effect.gen(function* () {
+    const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+    for (const deliveryId of deliveryIds) {
+      const state = yield* stateOf(deliveryId);
+      yield* store.update(deliveryId, advance(state, { type: "cancel" }).delivery);
+    }
   }).pipe(Effect.orDie);
 
 /** The thread's turns the provider was asked to start. */
@@ -594,116 +648,200 @@ describe("an approved parent's children", () => {
   );
 
   it.live.each([
-    { shape: "with its parent", parentCancelled: true },
-    { shape: "on its own", parentCancelled: false },
-  ])(
-    "stop the turn a restart carries on for a child cancelled $shape before its interrupt",
-    ({ parentCancelled }) =>
+    { case: "where its branch started", startedAt: "branch start", reflog: true },
+    { case: "from the HEAD it found", startedAt: "landed commit", reflog: true },
+    { case: "with its branch's creation lost", startedAt: "branch start", reflog: false },
+  ] as const)(
+    "hand a stored-before parent its only child's approval only from its branch start, $case",
+    ({ startedAt, reflog }) =>
       withProject(verifyCommands.passes, (world) =>
         Effect.gen(function* () {
-          const fileSystem = yield* FileSystem.FileSystem;
-          const worker = yield* Factory.FactoryWorker.FactoryWorker;
-          const parent = yield* approvedParent(world);
-          const [first, second] = parent.children;
-          const author = yield* world.launched(first);
-          // Its provider is working on the turn, as core recovery reads it.
-          yield* Effect.flatMap(EventSink.EventSinkV2, (sink) =>
-            sink.stream().pipe(
-              Stream.filter(
-                ({ event }) =>
-                  event.type === "provider-turn.updated" &&
-                  event.threadId === author.threadId &&
-                  event.payload.status === "running",
-              ),
-              Stream.runHead,
-            ),
-          );
-          yield* authorCommits(parent.worktreePath, "feat: export the table as CSV", "csv\n");
-          const committed = yield* head(parent.worktreePath);
-
-          // The cancels were stored, and the server stopped before it sent any interrupt.
           const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
-          const cut = parentCancelled ? [parent.parentId, first, second] : [first];
-          for (const deliveryId of cut) {
-            const state = yield* stateOf(deliveryId);
-            yield* store.update(deliveryId, advance(state, { type: "cancel" }).delivery);
+          // A commit lands on the branch while the one-task plan waits at the gate.
+          const parent = yield* approvePlanned(world, {
+            plan: oneTaskPlan,
+            atGate: (worktreePath) =>
+              authorCommits(worktreePath, "docs: note the CSV format", "format\n"),
+          });
+          const [first] = parent.all;
+          if (first === undefined) return assert.fail("The child exists.");
+          const author = yield* world.launched(first);
+          const landed = yield* head(parent.worktreePath);
+          assert.notStrictEqual(landed, parent.branchStart);
+
+          // As an earlier server stored them: the parent without where its branch started, and
+          // its child started from the commit the case names.
+          const parentState = yield* stateOf(parent.parentId);
+          yield* store.update(parent.parentId, { ...parentState, baseline: null });
+          const childState = yield* stateOf(first);
+          const childBaseline = startedAt === "branch start" ? parent.branchStart : landed;
+          yield* store.update(first, { ...childState, baseline: childBaseline });
+          if (!reflog) {
+            yield* git(world.root, [
+              "reflog",
+              "expire",
+              "--expire=now",
+              "--expire-unreachable=now",
+              `refs/heads/${parent.branch}`,
+            ]).pipe(Effect.orDie);
           }
 
-          // The restart: core recovery cuts the turn, Factory's sweep completes the cancellation,
-          // and core's restart continuation (as its effect worker runs it) carries the turn on.
-          const recovery = yield* Effect.service(
-            ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService,
-          ).pipe(
-            Effect.provide(
-              ProviderRuntimeRecoveryService.layer.pipe(Layer.provide(EffectOutbox.layer)),
-            ),
-          );
-          yield* recovery.reconcile("startup");
-          yield* drainOrchestration;
-          yield* worker.finishCancellation(parent.parentId);
-          yield* continueRestartedRun({ threadId: author.threadId, sourceRunId: author.runId });
-          yield* drainFactory;
-          yield* drainOrchestration;
-          yield* drainFactory;
+          // The child runs to its approval, which reaches the parent as it is stored.
+          yield* authorCommits(parent.worktreePath, "feat: export the table as CSV", "csv\n");
+          yield* world.endRun(author.runId, "completed");
+          yield* passReview(world, first);
+          assert.strictEqual((yield* stateOf(first)).status, "approved");
 
-          // Factory interrupted the continuation; once its provider stops, no run of the cancelled
-          // child's thread is live.
-          const continued = (yield* threadProjection(author.threadId)).runs.find(
-            (run) => run.restartContinuationOfRunId === author.runId,
-          );
-          if (continued === undefined) return assert.fail("Core did not continue the turn.");
-          const turn = world.provider.started.find(({ runId }) => runId === continued.id);
-          if (turn !== undefined) {
+          const after = yield* stateOf(parent.parentId);
+          if (reflog && startedAt === "branch start") {
+            // It took the child's start again, recording where its branch started, then the
+            // approval, and leaves its only child.
+            assert.strictEqual(after.baseline, parent.branchStart);
+            assert.deepStrictEqual(after.approvedChildren, [first]);
+            assert.strictEqual(after.stage, "integrate");
+          } else {
+            assert.strictEqual(after.status, "blocked");
+            assert.deepStrictEqual(after.block, {
+              reason: "effect_failed",
+              effect: { id: 4, type: "start_child", child: first },
+              detail: "Factory could not start the child delivery (FactoryChildStartError).",
+            });
+            assert.isNull(after.baseline);
+            assert.deepStrictEqual(after.approvedChildren, []);
+          }
+          assert.deepStrictEqual(world.pullRequestCalls, []);
+        }),
+      ),
+  );
+
+  it.live.each([
+    { shape: "with its parent", parentCancelled: true, continuation: "still pending" },
+    { shape: "with its parent", parentCancelled: true, continuation: "already running" },
+    { shape: "on its own", parentCancelled: false, continuation: "still pending" },
+    { shape: "on its own", parentCancelled: false, continuation: "already running" },
+  ] as const)(
+    "leave no Factory turn running after a restart cut a child cancelled $shape, its continuation $continuation as Factory boots",
+    ({ parentCancelled, continuation }) =>
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const fileSystem = yield* FileSystem.FileSystem;
+            const recovery = yield* coreRecovery;
+
+            // Server 1: the parent plans, and its first child's author works.
+            const { parent, author, committed } = yield* world.boot(
+              Effect.gen(function* () {
+                const parent = yield* approvedParent(world);
+                const author = yield* world.launched(parent.children[0]);
+                yield* providerTurnRunning(author.threadId);
+                yield* authorCommits(parent.worktreePath, "feat: export the table", "csv\n");
+                return { parent, author, committed: yield* head(parent.worktreePath) };
+              }),
+            );
+            const [first, second] = parent.children;
+            // Its cancels commit, and it stops before sending any interrupt, while core's
+            // shutdown records restart intent for the turn the provider is still working on.
+            yield* storeCancels(parentCancelled ? [parent.parentId, first, second] : [first]);
+            yield* recovery.prepareForShutdown;
+            yield* recovery.reconcile("shutdown");
+
+            // Server 2: core recovery runs first; the continuation waits in core's outbox.
+            yield* recovery.reconcile("startup");
+            assert.deepStrictEqual(yield* restartIntent(author.runId), ["pending"]);
+            if (continuation === "already running") {
+              // Core's effect worker delivers it before Factory's sweep runs.
+              yield* drainOrchestration;
+              const live = (yield* threadProjection(author.threadId)).runs.find(
+                (run) => run.restartContinuationOfRunId === author.runId,
+              );
+              assert.isFalse(live === undefined || isTerminalRunStatus(live.status));
+            }
+            yield* world.boot(
+              Effect.gen(function* () {
+                // Delivered after the sweep, it goes live while Factory listens.
+                yield* drainOrchestration;
+                yield* drainFactory;
+                yield* drainOrchestration;
+              }),
+            );
+            assert.deepStrictEqual(yield* restartIntent(author.runId), ["succeeded"]);
+
+            // Core carried the turn on, and Factory interrupted it through the thread's own
+            // interrupt; once its provider stops, no run of the thread is live.
+            const continued = (yield* threadProjection(author.threadId)).runs.find(
+              (run) => run.restartContinuationOfRunId === author.runId,
+            );
+            if (continued === undefined) return assert.fail("Core did not continue the turn.");
+            // Every turn the continuation got was asked to stop: an already running one's always,
+            // and a pending one's only if the provider started it before the interrupt landed.
+            const turns = world.provider.started.filter(({ runId }) => runId === continued.id);
+            if (continuation === "already running") assert.strictEqual(turns.length, 1);
             assert.deepStrictEqual(
               world.provider.interrupted.map(({ providerTurnId }) => providerTurnId),
-              [`provider-turn:${turn.attemptId}`],
+              turns.map(({ attemptId }) => `provider-turn:${attemptId}`),
             );
-            yield* world.endRun(continued.id, "cancelled");
-          }
-          const { runs } = yield* threadProjection(author.threadId);
-          assert.isTrue(runs.every(({ status }) => isTerminalRunStatus(status)));
-          for (const deliveryId of [parent.parentId, first, second]) {
-            assert.strictEqual((yield* stateOf(deliveryId)).status, "cancelled");
-          }
+            if (turns.length > 0) yield* world.boot(world.endRun(continued.id, "cancelled"));
+            const settled = (yield* threadProjection(author.threadId)).runs;
+            assert.isTrue(settled.every(({ status }) => isTerminalRunStatus(status)));
+            for (const deliveryId of [parent.parentId, first, second]) {
+              assert.strictEqual((yield* stateOf(deliveryId)).status, "cancelled");
+            }
 
-          // The owner's own turn on that thread afterwards is theirs, and runs on.
-          const ownTurn = yield* Effect.flatMap(
-            ThreadManagement.ThreadManagementService,
-            (threads) =>
-              threads.sendToThread({
-                projectId: world.projectId,
-                commandId: CommandId.make("owner-turn"),
-                threadId: author.threadId,
-                messageId: MessageId.make("owner-turn-message"),
-                text: "Summarize what you changed.",
-                attachments: [],
-                mode: "queue",
-                createdBy: "user",
-                creationSource: "web",
+            // Server 3: a repeated recovery finds nothing to carry on, and Factory nothing to stop.
+            const sql = yield* SqlClient.SqlClient;
+            const deliveryRows = sql`SELECT * FROM fd_factory_deliveries ORDER BY delivery_id`;
+            const before = yield* deliveryRows;
+            yield* recovery.reconcile("startup");
+            yield* world.boot(
+              Effect.gen(function* () {
+                yield* drainOrchestration;
+                yield* drainFactory;
               }),
-          );
-          yield* drainOrchestration;
-          yield* drainFactory;
-          const owned = (yield* threadProjection(author.threadId)).runs.find(
-            ({ id }) => id === ownTurn.run.id,
-          );
-          assert.isFalse(owned === undefined || isTerminalRunStatus(owned.status));
-          assert.isFalse(
-            world.provider.interrupted.some(
-              ({ providerTurnId }) =>
-                providerTurnId ===
-                `provider-turn:${world.provider.started.find(({ runId }) => runId === ownTurn.run.id)?.attemptId}`,
-            ),
-          );
+            );
+            assert.deepStrictEqual((yield* threadProjection(author.threadId)).runs, settled);
+            assert.strictEqual(world.provider.interrupted.length, turns.length);
+            assert.deepStrictEqual(yield* deliveryRows, before);
 
-          // The worktree, its branch and the commit stay.
-          assert.isTrue(yield* fileSystem.exists(parent.worktreePath));
-          assert.strictEqual(yield* head(parent.worktreePath), committed);
-          assert.strictEqual(
-            yield* git(world.root, ["rev-parse", `refs/heads/${parent.branch}`]),
-            committed,
-          );
-        }),
+            // The owner's own turn on that thread is theirs, and runs on.
+            const own = yield* world.boot(
+              Effect.gen(function* () {
+                const sent = yield* Effect.flatMap(
+                  ThreadManagement.ThreadManagementService,
+                  (threads) =>
+                    threads.sendToThread({
+                      projectId: world.projectId,
+                      commandId: CommandId.make("owner-turn"),
+                      threadId: author.threadId,
+                      messageId: MessageId.make("owner-turn-message"),
+                      text: "Summarize what you changed.",
+                      attachments: [],
+                      mode: "queue",
+                      createdBy: "user",
+                      creationSource: "web",
+                    }),
+                );
+                yield* drainOrchestration;
+                yield* drainFactory;
+                return sent.run.id;
+              }),
+            );
+            const owned = (yield* threadProjection(author.threadId)).runs.find(
+              ({ id }) => id === own,
+            );
+            assert.isFalse(owned === undefined || isTerminalRunStatus(owned.status));
+            assert.isTrue(world.provider.started.some(({ runId }) => runId === own));
+            assert.strictEqual(world.provider.interrupted.length, turns.length);
+
+            // The worktree, its branch and the commit stay.
+            assert.isTrue(yield* fileSystem.exists(parent.worktreePath));
+            assert.strictEqual(yield* head(parent.worktreePath), committed);
+            assert.strictEqual(
+              yield* git(world.root, ["rev-parse", `refs/heads/${parent.branch}`]),
+              committed,
+            );
+          }),
+        { manualReactor: true },
       ).pipe(Effect.orDie),
   );
 });

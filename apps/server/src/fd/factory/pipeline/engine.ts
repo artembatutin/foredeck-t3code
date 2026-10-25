@@ -467,7 +467,9 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * Or the owner approves it: the plan is frozen, and the running parent creates its children, then
  * runs them one at a time: it starts the first child that has not reported its approval and waits
  * on that child alone, and starts the next only once that one reports its approval. After the last
- * it begins the stage after its children.
+ * it begins the stage after its children. A parent stored before planner launches recorded where
+ * its branch started takes a child's approval only after taking that child's start again, which
+ * establishes it.
  *
  * A single item runs from start to its pull request: the author thread, the branch settle
  * check with at most one fix-commit turn, the verify command, then a reviewer thread whose one
@@ -813,13 +815,20 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
     case "child.approved":
       // Only the child the parent waits on: one it took before, or one it has not started, is
       // not.
-      return awaiting?.type === "child" && awaiting.deliveryId === event.deliveryId
-        ? continueChildren({
-            ...delivery,
-            awaiting: null,
-            approvedChildren: [...delivery.approvedChildren, event.deliveryId],
-          })
-        : unchanged(delivery);
+      if (awaiting?.type !== "child" || awaiting.deliveryId !== event.deliveryId) {
+        return unchanged(delivery);
+      }
+      // A parent stored before planner launches recorded where its branch started takes no
+      // child's approval without it: it takes that child's start again, which establishes it
+      // and holds the child to it, or blocks.
+      if (delivery.baseline === null) {
+        return issue(delivery, { type: "start_child", child: event.deliveryId });
+      }
+      return continueChildren({
+        ...delivery,
+        awaiting: null,
+        approvedChildren: [...delivery.approvedChildren, event.deliveryId],
+      });
 
     case "effect.failed":
       return awaiting?.type === "effect" && awaiting.effect.id === event.effectId
