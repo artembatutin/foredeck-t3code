@@ -82,4 +82,20 @@ describe("MarkdownSource findComment", () => {
       assert.strictEqual(error._tag, "WorkItemNotFound");
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
+
+  it.effect("cannot answer for a file that does not read as an item, and can once repaired", () =>
+    Effect.gen(function* () {
+      const { fs, file, adapter, runtime } = yield* withNotes(3);
+      const repaired = yield* fs.readFileString(file);
+      // Without its title the file no longer decodes as an item, though its notes are intact.
+      yield* fs.writeFileString(file, repaired.replace("title: Alpha\n", ""));
+      const broken = yield* adapter.get(runtime, itemId);
+      assert.isNotNull(broken.invalid);
+      const error = yield* Effect.flip(adapter.findComment(runtime, itemId, "note-002 "));
+      assert.strictEqual(error._tag, "WorkUnsupported");
+
+      yield* fs.writeFileString(file, repaired);
+      assert.isTrue(Option.isSome(yield* adapter.findComment(runtime, itemId, "note-002 ")));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
 });

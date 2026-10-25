@@ -47,6 +47,8 @@ const RECONCILE_WINDOW_MS = 2 * 60_000;
 const SNAPSHOT_BATCH = 50;
 /** Comments per page of a lookup, the most a comment page returns. */
 const COMMENTS_PAGE = 100;
+/** Walks a lookup starts before it gives up on comments that keep changing under it. */
+const COMMENT_WALKS = 3;
 const PREFERRED_TYPES = ["task", "story"];
 
 const decodeSearch = Schema.decodeEffect(SearchResponse);
@@ -580,10 +582,8 @@ export const make = (options: JiraSourceOptions = {}) =>
       findComment: (runtime, itemId, text) =>
         Effect.gen(function* () {
           const key = normalizeIssueKey(itemId);
-          // Newest first, so a recent comment ends the walk early, and a comment added meanwhile
-          // shifts later pages back, so none is skipped; otherwise every page is read.
-          for (let startAt = 0; ;) {
-            const page = yield* call(runtime, {
+          const page = (startAt: number) =>
+            call(runtime, {
               operation: "jira.comments",
               kind: "read",
               path: `/rest/api/3/issue/${encodeURIComponent(key)}/comment`,
@@ -597,15 +597,47 @@ export const make = (options: JiraSourceOptions = {}) =>
               Effect.flatMap((response) =>
                 decodeComments(response.body).pipe(Effect.mapError(unexpected)),
               ),
+              Effect.flatMap((read) =>
+                read.startAt === undefined || read.startAt === startAt
+                  ? Effect.succeed(read)
+                  : Effect.fail(
+                      new WorkUnavailable({ detail: "Jira answered for other comments." }),
+                    ),
+              ),
             );
-            const found = page.comments.find((comment) => commentText(comment).includes(text));
-            if (found !== undefined) return Option.some(toComment(found));
-            startAt += page.comments.length;
-            // The page size is Jira's to cap, so only an empty page or the total ends the walk.
-            if (page.comments.length === 0 || (page.total !== undefined && startAt >= page.total)) {
-              return Option.none();
+          // Newest first, so a recent comment ends the walk early. Offsets move when comments
+          // are added or deleted between pages, so each page after the first starts at the last
+          // comment already read, and the walk goes on after wherever that comment is now: an
+          // added comment only repeats one, a deleted one would hide one. A walk that loses that
+          // comment, or ends before the total it was told, starts over; one that keeps losing
+          // it cannot answer.
+          for (let walk = 0; walk < COMMENT_WALKS; walk += 1) {
+            let start = 0;
+            let boundary: string | undefined;
+            for (;;) {
+              const read: typeof CommentsResponse.Type = yield* page(start);
+              const at =
+                boundary === undefined
+                  ? -1
+                  : read.comments.findIndex((comment) => comment.id === boundary);
+              if (boundary !== undefined && at === -1) break;
+              const fresh = read.comments.slice(at + 1);
+              const found = fresh.find((comment) => commentText(comment).includes(text));
+              if (found !== undefined) return Option.some(toComment(found));
+              const end = start + read.comments.length;
+              const readAll = read.total !== undefined && end >= read.total;
+              if (fresh.length === 0 || readAll) {
+                // A page with nothing new, short of the total it was told, is no answer.
+                if (readAll || read.total === undefined) return Option.none();
+                break;
+              }
+              boundary = read.comments.at(-1)?.id;
+              start = end - 1;
             }
           }
+          return yield* new WorkUnavailable({
+            detail: "Jira's comments changed while they were read.",
+          });
         }),
       snapshots: (runtime, itemIds) =>
         Effect.gen(function* () {

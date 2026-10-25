@@ -915,8 +915,16 @@ export const make: Effect.Effect<
       if (document === undefined) {
         return yield* new WorkUnavailable({ detail: "The task file could not be read." });
       }
+      // A file that does not decode as an item has no body to read notes from, which is no
+      // answer: its notes are still in the file, and come back once it is repaired.
+      if (document.item === undefined) {
+        return yield* new WorkUnsupported({
+          detail:
+            inspected.value.file.diagnostic?.message ?? "The task file does not read as an item.",
+        });
+      }
       return Option.fromUndefinedOr(
-        parseNotes(document.item?.body ?? "").find((note) => note.body.includes(text)),
+        parseNotes(document.item.body).find((note) => note.body.includes(text)),
       );
     });
 

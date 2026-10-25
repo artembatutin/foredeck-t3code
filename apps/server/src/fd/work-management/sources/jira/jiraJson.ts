@@ -114,6 +114,7 @@ export const SearchResponse = Schema.fromJsonString(
 export const IssueResponse = Schema.fromJsonString(IssueJson);
 export const CommentsResponse = Schema.fromJsonString(
   Schema.Struct({
+    startAt: Schema.optional(Schema.Int),
     total: Schema.optional(Schema.Int),
     comments: Schema.Array(
       Schema.Struct({

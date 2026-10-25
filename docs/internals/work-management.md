@@ -70,6 +70,11 @@ there. `WorkService.findComment` pages through every comment instead, for a serv
 tell whether a comment it may have posted landed, as Factory does after a crash. No transport
 exposes it, so a full history never crosses the wire.
 
+Its none must mean the comment is not there, since a caller posts on it. A lookup that cannot read
+every comment fails instead: a Markdown file that does not decode as an item, or a Jira walk whose
+offsets moved under it. Jira pages by offset, and a comment deleted between pages would hide one,
+so each page after the first starts at the last comment read, and a walk that loses it starts over.
+
 ## Agent grants
 
 MCP callers get Work grants from what they may change, in `mcp/actor.ts`: a

@@ -39,9 +39,18 @@ const decoder = new TextDecoder();
 /**
  * A Jira issue whose comments, oldest first, are `comments`; it serves them newest first, at most
  * `pageCap` a page whatever is asked, and takes posted comments. `total` is left out when
- * `withTotal` is false, as some servers do.
+ * `withTotal` is false, as some servers do. `afterRead` runs after each page is served, to change
+ * the comments between pages; `servedFrom` stands in for a server that answers another offset.
  */
-const fakeJira = (comments: Array<unknown>, options: { readonly withTotal?: boolean } = {}) => {
+const fakeJira = (
+  comments: Array<unknown>,
+  options: {
+    readonly withTotal?: boolean;
+    readonly afterRead?: (reads: number) => void;
+    readonly servedFrom?: (startAt: number) => number;
+    readonly totalOverride?: number;
+  } = {},
+) => {
   const pageCap = 50;
   const starts: Array<number> = [];
   const client = HttpClient.make((request: HttpClientRequest.HttpClientRequest) =>
@@ -65,13 +74,17 @@ const fakeJira = (comments: Array<unknown>, options: { readonly withTotal?: bool
         Option.getOrElse(UrlParams.getFirst(request.urlParams, "startAt"), () => "0"),
       );
       starts.push(startAt);
+      const served = options.servedFrom?.(startAt) ?? startAt;
       const newestFirst = comments.toReversed();
-      const page = newestFirst.slice(startAt, startAt + pageCap);
+      const page = newestFirst.slice(served, served + pageCap);
+      const total = options.totalOverride ?? comments.length;
+      options.afterRead?.(starts.length);
       return HttpClientResponse.fromWeb(
         request,
         new Response(
           JSON.stringify({
-            ...(options.withTotal === false ? {} : { total: comments.length }),
+            startAt: served,
+            ...(options.withTotal === false ? {} : { total }),
             comments: page,
           }),
           { status: 200 },
@@ -106,8 +119,9 @@ describe("JiraSource findComment", () => {
         Option.map(found, ({ id }) => id),
         Option.some("c10"),
       );
-      // Jira served 50 a page though 100 were asked for; the walk went on from what it got.
-      assert.deepStrictEqual(fake.starts, [0, 50, 100]);
+      // Jira served 50 a page though 100 were asked for; each page after the first starts at
+      // the last comment already read.
+      assert.deepStrictEqual(fake.starts, [0, 49, 98]);
     }),
   );
 
@@ -116,12 +130,12 @@ describe("JiraSource findComment", () => {
       const counted = fakeJira(numbered(120));
       const withTotal = yield* adapterWith(counted);
       assert.isTrue(Option.isNone(yield* withTotal.findComment(runtime, issue, "comment-121 ")));
-      assert.deepStrictEqual(counted.starts, [0, 50, 100]);
+      assert.deepStrictEqual(counted.starts, [0, 49, 98]);
 
       const uncounted = fakeJira(numbered(120), { withTotal: false });
       const withoutTotal = yield* adapterWith(uncounted);
       assert.isTrue(Option.isNone(yield* withoutTotal.findComment(runtime, issue, "comment-121 ")));
-      assert.deepStrictEqual(uncounted.starts, [0, 50, 100, 120]);
+      assert.deepStrictEqual(uncounted.starts, [0, 49, 98, 119]);
     }),
   );
 
@@ -132,6 +146,90 @@ describe("JiraSource findComment", () => {
       const reference = "Factory delivery 3f2a8c1e-9b7d-4c2a-8e1f-0a1b2c3d4e5f, update 2.";
       yield* adapter.comment(runtime, issue, `The review blocked this item. ${reference}`, owner);
       assert.isTrue(Option.isSome(yield* adapter.findComment(runtime, issue, reference)));
+    }),
+  );
+
+  it.effect("still finds a comment after one already read is deleted between pages", () =>
+    Effect.gen(function* () {
+      // 100 comments; the one asked for is the 51st newest, just past the first page.
+      const comments: Array<unknown> = numbered(100);
+      const fake = fakeJira(comments, {
+        afterRead: (reads) => {
+          if (reads === 1) comments.pop();
+        },
+      });
+      const adapter = yield* adapterWith(fake);
+      const found = yield* adapter.findComment(runtime, issue, "comment-050 ");
+      assert.deepStrictEqual(
+        Option.map(found, ({ id }) => id),
+        Option.some("c50"),
+      );
+      // The second page no longer held the last comment read, so the walk started over.
+      assert.deepStrictEqual(fake.starts, [0, 49, 0]);
+    }),
+  );
+
+  it.effect("goes on past comments added between pages without skipping one", () =>
+    Effect.gen(function* () {
+      const added = (comments: Array<unknown>) => (reads: number) => {
+        if (reads === 1) {
+          comments.push({
+            id: `c${comments.length + 1}`,
+            body: adf("A new comment."),
+            created: "2026-10-25T09:00:00.000+0000",
+          });
+        }
+      };
+      const comments: Array<unknown> = numbered(120);
+      const fake = fakeJira(comments, { afterRead: added(comments) });
+      const adapter = yield* adapterWith(fake);
+      assert.isTrue(Option.isNone(yield* adapter.findComment(runtime, issue, "comment-200 ")));
+      // The added comment pushed the last one read to the second page's second place.
+      assert.deepStrictEqual(fake.starts, [0, 49, 98]);
+
+      // The comment right after the last one the first page read is still found.
+      const more: Array<unknown> = numbered(120);
+      const again = fakeJira(more, { afterRead: added(more) });
+      const second = yield* adapterWith(again);
+      assert.deepStrictEqual(
+        Option.map(yield* second.findComment(runtime, issue, "comment-070 "), ({ id }) => id),
+        Option.some("c70"),
+      );
+      assert.deepStrictEqual(again.starts, [0, 49]);
+    }),
+  );
+
+  it.effect("cannot answer while comments keep changing under the walk", () =>
+    Effect.gen(function* () {
+      const comments: Array<unknown> = numbered(100);
+      const fake = fakeJira(comments, {
+        afterRead: (reads) => {
+          if (reads % 2 === 1) comments.pop();
+        },
+      });
+      const adapter = yield* adapterWith(fake);
+      const error = yield* Effect.flip(adapter.findComment(runtime, issue, "comment-001 "));
+      assert.strictEqual(error._tag, "WorkUnavailable");
+      assert.deepStrictEqual(fake.starts, [0, 49, 0, 49, 0, 49]);
+    }),
+  );
+
+  it.effect("does not take an empty page short of its total for the end", () =>
+    Effect.gen(function* () {
+      const fake = fakeJira([], { totalOverride: 5 });
+      const adapter = yield* adapterWith(fake);
+      const error = yield* Effect.flip(adapter.findComment(runtime, issue, "comment-001 "));
+      assert.strictEqual(error._tag, "WorkUnavailable");
+    }),
+  );
+
+  it.effect("fails when Jira answers a page from another offset", () =>
+    Effect.gen(function* () {
+      const fake = fakeJira(numbered(120), { servedFrom: () => 0 });
+      const adapter = yield* adapterWith(fake);
+      const error = yield* Effect.flip(adapter.findComment(runtime, issue, "comment-010 "));
+      assert.strictEqual(error._tag, "WorkUnavailable");
+      assert.deepStrictEqual(fake.starts, [0, 49]);
     }),
   );
 });
