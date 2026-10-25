@@ -82,8 +82,8 @@ const WsFactoryDeliveriesListRpc = Rpc.make(FACTORY_WS_METHODS.factoryDeliveries
 });
 
 /**
- * An epoch that moves after every committed delivery write, Work's refresh epoch for Factory:
- * clients refetch the deliveries they show on each value. It carries no delivery data.
+ * An epoch that moves after every committed delivery or settings write, Work's refresh epoch for
+ * Factory: clients refetch the deliveries and settings they show on each value. It carries no data.
  */
 const WsFactoryDeliveriesSubscribeRpc = Rpc.make(FACTORY_WS_METHODS.factoryDeliveriesSubscribe, {
   payload: Schema.Struct({}),

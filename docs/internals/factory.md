@@ -99,13 +99,19 @@ when another entry starts importing it.
 ## Clients refetch on a change epoch
 
 Clients follow `factory.deliveries.subscribe`, an epoch like Work's refresh epoch, and refetch the
-deliveries they show on each value; the stream itself carries no delivery data. Every delivery
-write therefore runs its outermost transaction through `FactoryChanges.afterCommit`
+deliveries and settings they show on each value; the stream itself carries no data. Every Factory
+write therefore runs through `FactoryChanges.transact`
 ([`FactoryChanges.ts`](../../apps/server/src/fd/factory/FactoryChanges.ts)), which moves the epoch
-only once the write has committed, so a refetch on the new value reads it. Today the start's
-insert and the worker's step are the only writers (stop, resume, cancel and review submissions are
-steps); a new writer that bypasses `afterCommit` leaves every client stale until something else
-moves the epoch.
+only once the write has committed, so a refetch on the new value reads it. Today the writers are
+the start's insert, the worker's step (stop, resume, cancel and review submissions are steps) and
+the settings write; a new writer that bypasses `transact` leaves every client stale until
+something else moves the epoch.
+
+`transact` opens the transaction itself rather than wrap a caller's. `withTransaction` commits
+inside its own uninterruptible mask and raises an interrupt that arrived meanwhile as the mask
+ends, so an effect wrapped around it sees an interrupted exit for a write that committed, and
+would skip the move. Inside `transact`'s mask the write is restored to interruptible, and the
+commit and the move run before any held-off interrupt.
 
 ## The reactor tail starts at the sweep's position
 

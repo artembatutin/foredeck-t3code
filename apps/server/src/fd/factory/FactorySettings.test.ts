@@ -127,6 +127,13 @@ describe("FactorySettings", () => {
         ),
         ["get", "get", "set"],
       );
-    }).pipe(Effect.provide(FactorySettings.layer.pipe(Layer.provide(failing))));
+    }).pipe(
+      Effect.provide(
+        FactorySettings.layer.pipe(
+          Layer.provide(failing),
+          Layer.provide(SqlitePersistence.layerMemory),
+        ),
+      ),
+    );
   });
 });

@@ -6,6 +6,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
+import * as FactoryChanges from "./FactoryChanges.ts";
 import * as FactorySettingsStore from "./persistence/FactorySettingsStore.ts";
 import { pipelines } from "./pipeline/definitions.ts";
 
@@ -61,7 +62,10 @@ export class FactorySettings extends Context.Service<
     readonly get: (
       projectId: ProjectId,
     ) => Effect.Effect<FactoryProjectSettings, FactorySettingsStorageError>;
-    /** Replaces the project's settings. */
+    /**
+     * Replaces the project's settings. Once stored, the change epoch moves, so every client
+     * showing them refetches; a refused write moves nothing.
+     */
     readonly set: (
       projectId: ProjectId,
       settings: FactoryProjectSettings,
@@ -78,6 +82,7 @@ export class FactorySettings extends Context.Service<
 
 const make = Effect.gen(function* () {
   const store = yield* FactorySettingsStore.FactorySettingsStore;
+  const changes = yield* FactoryChanges.FactoryChanges;
 
   const get: FactorySettings["Service"]["get"] = (projectId) =>
     store.get(projectId).pipe(
@@ -92,9 +97,13 @@ const make = Effect.gen(function* () {
     get,
     set: (projectId, settings) =>
       pipelines.has(settings.pipelineId)
-        ? store.set(projectId, settings).pipe(
+        ? changes.transact(store.set(projectId, settings)).pipe(
             Effect.catchTags({
               FactoryStoreError: (cause) =>
+                Effect.fail(
+                  new FactorySettingsStorageError({ operation: "set", projectId, cause }),
+                ),
+              SqlError: (cause) =>
                 Effect.fail(
                   new FactorySettingsStorageError({ operation: "set", projectId, cause }),
                 ),
@@ -114,4 +123,7 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(FactorySettings, make);
+/** The settings, with the change epoch their writes move. */
+export const layer = Layer.effect(FactorySettings, make).pipe(
+  Layer.provideMerge(FactoryChanges.layer),
+);

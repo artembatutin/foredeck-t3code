@@ -13,7 +13,6 @@ import type * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import * as SqlClient from "effect/sql/SqlClient";
 import type * as Stream from "effect/Stream";
 
 import type * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
@@ -288,9 +287,10 @@ export class FactoryService extends Context.Service<
       FactorySubmitReviewError
     >;
     /**
-     * The deliveries' change epoch: its value on subscribe, then each move. It moves after each
-     * delivery write commits (a start, each engine step, a stop, resume or cancel, a review
-     * submission) and never for a refusal, so a subscriber refetches what it shows on each value.
+     * Factory's change epoch: its value on subscribe, then each move. It moves after each write
+     * commits (a delivery's start, each engine step, a stop, resume or cancel, a review submission,
+     * a settings write) and never for a refusal, so a subscriber refetches what it shows on each
+     * value.
      */
     readonly subscribe: Stream.Stream<number>;
   }
@@ -303,7 +303,6 @@ const itemReader: WorkActor = { id: "factory", grants: [AuthWorkReadScope], labe
 const SINGLE_ITEM_TASK = FactoryTaskId.make("item");
 
 const make = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
   const work = yield* WorkService.WorkService;
   const projects = yield* ProjectStore.ProjectStoreV2;
   const launches = yield* ThreadLaunch.ThreadLaunchService;
@@ -387,8 +386,7 @@ const make = Effect.gen(function* () {
           })
           .pipe(
             Effect.tap(() => tasks.insert({ deliveryId, taskId: SINGLE_ITEM_TASK })),
-            sql.withTransaction,
-            (transaction) => changes.afterCommit(transaction),
+            (write) => changes.transact(write),
             Effect.catchTags({
               SqlError: (cause) =>
                 Effect.fail(new FactoryStoreError({ operation: "service.start", cause })),

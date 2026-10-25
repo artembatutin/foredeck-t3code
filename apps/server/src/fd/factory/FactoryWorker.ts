@@ -11,7 +11,6 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
-import * as SqlClient from "effect/sql/SqlClient";
 import * as TxRef from "effect/TxRef";
 
 import type * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
@@ -218,7 +217,6 @@ const evidenceOf = (
 };
 
 const make = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
   const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
   const stageRuns = yield* FactoryStageRunStore.FactoryStageRunStore;
   const settings = yield* FactorySettings.FactorySettings;
@@ -471,8 +469,7 @@ const make = Effect.gen(function* () {
               Effect.map((announced) => Option.some({ delivery: updated.value, announced })),
             ),
       ),
-      sql.withTransaction,
-      (transaction) => changes.afterCommit(transaction, Option.isSome),
+      (write) => changes.transact(write, Option.isSome),
       Effect.catchTags({
         SqlError: (cause) =>
           Effect.fail(new FactoryStoreError({ operation: "worker.step", cause })),
