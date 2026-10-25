@@ -512,8 +512,8 @@ export type FactoryBlock =
   | { readonly reason: "effect_failed"; readonly effect: FactoryEffect; readonly detail: string }
   | { readonly reason: "unsettled"; readonly problems: ReadonlyArray<string> }
   /**
-   * The command ran and failed or timed out with no fix round left; its receipt is the last in
-   * `receipts`.
+   * The command ran and failed or timed out with no fix round left, or in a parent's integrate,
+   * which has none; its receipt is the last in `receipts`.
    */
   | { readonly reason: "verify_failed" }
   /** The stage failed exactly as it failed before on this task: same failure, same tree. */
@@ -522,8 +522,8 @@ export type FactoryBlock =
   /** The pipeline reached a stage kind this server cannot run. */
   | { readonly reason: "unsupported_stage"; readonly stage: FactoryStageName }
   /**
-   * The round's accepted review blocks the commit with no review round left; its full text is in
-   * its evidence.
+   * The round's accepted review blocks the commit with no review round left, or a parent's
+   * integrate review blocks its branch, which has none; its full text is in its evidence.
    */
   | { readonly reason: "review_changes_required"; readonly summary: FactoryReviewSummary }
   /** A review was submitted after HEAD moved from the verified receipt or the tree got dirty. */

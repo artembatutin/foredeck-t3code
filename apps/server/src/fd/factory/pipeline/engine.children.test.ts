@@ -177,17 +177,17 @@ describe("a parent waiting on a child", () => {
   it("enters the stage after its children once the last reports its approval", () => {
     const step = advance(onSecond, approvedChild(second));
     expect(step.delivery.approvedChildren).toEqual(children);
-    // Integrate is not built yet, so the parent blocks there, never at its children.
+    // Integrate begins with a fresh verify of the whole branch.
+    const verify = { id: 5, type: "run_command", stage: "verify" } as const;
     expect(step).toEqual({
       delivery: {
         ...onSecond,
         approvedChildren: children,
-        stage: "integrate",
-        status: "blocked",
-        awaiting: null,
-        block: { reason: "unsupported_stage", stage: "integrate" },
+        stage: "verify",
+        effectsIssued: verify.id,
+        awaiting: { type: "effect", effect: verify },
       },
-      effects: [],
+      effects: [verify],
     } satisfies FactoryAdvance);
   });
 
@@ -283,21 +283,24 @@ describe("resuming an approved parent with children", () => {
   });
 
   it("begins the stage after its children once every one reported its approval", () => {
-    const blocked = fold(onSecond, approvedChild(second));
+    const blocked = fold(onSecond, approvedChild(second), {
+      type: "effect.failed",
+      effectId: 5,
+      detail: "No.",
+    });
     const step = advance(blocked, resume);
     expect(step.delivery).toMatchObject({
-      status: "blocked",
-      stage: "integrate",
-      block: { reason: "unsupported_stage", stage: "integrate" },
+      status: "running",
+      stage: "verify",
+      block: null,
       approvedChildren: children,
     });
-    expect(step.effects).toEqual([]);
+    expect(step.effects).toEqual([{ id: 6, type: "run_command", stage: "verify" }]);
     // Stopped there, it begins that stage too.
     const stopped = fold(onSecond, { type: "stop" }, approvedChild(second));
-    expect(advance(stopped, resume).delivery).toMatchObject({
-      stage: "integrate",
-      block: { reason: "unsupported_stage", stage: "integrate" },
-    });
+    expect(advance(stopped, resume).effects).toEqual([
+      { id: 5, type: "run_command", stage: "verify" },
+    ]);
   });
 
   it("creates its children again when it has none", () => {

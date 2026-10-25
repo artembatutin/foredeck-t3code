@@ -11,7 +11,7 @@ const delivery = {
 };
 
 describe("stageHandler", () => {
-  it("registers the agent, command, gate and PR handlers, and not integrate yet", () => {
+  it("registers the agent, command, gate, integrate and PR handlers", () => {
     const lookups = FactoryStageKind.literals.map((kind) => [kind, stageHandler(kind)] as const);
     expect(
       lookups.map(([kind, lookup]) => [
@@ -22,7 +22,7 @@ describe("stageHandler", () => {
       ["agent", "agent"],
       ["command", "command"],
       ["gate", "gate"],
-      ["integrate", { type: "unsupported", kind: "integrate" }],
+      ["integrate", "integrate"],
       ["pr", "pr"],
     ]);
   });

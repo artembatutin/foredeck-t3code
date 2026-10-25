@@ -164,7 +164,10 @@ const blockReason = (state: FactoryDeliveryState, block: FactoryBlock): string =
     case "unsettled":
       return firstProblem("The branch does not settle", block.problems);
     case "verify_failed":
-      return "Verify failed with no fix round left.";
+      // A parent verifies only in integrate, which has no fix round.
+      return state.kind === "parent"
+        ? "Verify of the whole branch failed."
+        : "Verify failed with no fix round left.";
     case "repeated_failure":
       return block.stage === "verify"
         ? "Verify failed the same way after a repair, so Factory stopped repairing."
@@ -177,7 +180,10 @@ const blockReason = (state: FactoryDeliveryState, block: FactoryBlock): string =
       return `This server cannot run the ${block.stage} stage.`;
     case "review_changes_required": {
       const { high, medium, low } = block.summary.findings;
-      return `The review requires changes with no review round left (${high} high, ${medium} medium, ${low} low).`;
+      const counts = `(${high} high, ${medium} medium, ${low} low)`;
+      return state.kind === "parent"
+        ? `The review of the whole branch requires changes ${counts}.`
+        : `The review requires changes with no review round left ${counts}.`;
     }
     case "code_changed":
       return block.changes.length === 0

@@ -310,15 +310,16 @@ const resumePlanning = (
 
 /**
  * Goes on with a parent's per-child phase, one child at a time: it starts the first child that has
- * not reported its approval and waits for it, at the stage each child begins with, or begins the
- * stage after its children once every one has. A stopping parent is `stopped` where it would start
- * the child or begin that stage instead, with it as its checkpoint.
+ * not reported its approval and waits for it, at the stage each child begins with, or begins
+ * integrate once every one has, with a fresh verify of the whole branch: a child's receipt covers
+ * the commits up to its own. A stopping parent is `stopped` where it would start the child or
+ * begin integrate instead, with it as its checkpoint.
  */
 const continueChildren = (delivery: FactoryDeliveryState): FactoryAdvance => {
   const child = nextChild(delivery);
   if (child === undefined) {
     return enter(delivery, standardStages.integrate.name, (current) =>
-      begin(current, standardStages.integrate),
+      begin(current, standardStages.verify),
     );
   }
   return enter(delivery, standardStages.author.name, (current) =>
@@ -327,11 +328,11 @@ const continueChildren = (delivery: FactoryDeliveryState): FactoryAdvance => {
 };
 
 /**
- * Picks up a parent whose plan its owner approved. It launches no thread, so a deleted thread does
- * not hold it: its planner's work ended with the approval. Without its children it creates them
- * again, keeping every child it recorded before. With them it never creates one again: it starts
- * the first child that has not reported its approval, or begins the stage after its children once
- * every one has.
+ * Picks up a parent whose plan its owner approved. It resumes no thread, so a deleted thread does
+ * not hold it: its planner's work ended with the approval, and integrate launches a reviewer of
+ * its own. Without its children it creates them again, keeping every child it recorded before.
+ * With them it never creates one again: it starts the first child that has not reported its
+ * approval, or once every one has integrates afresh, with a new verify and a new reviewer.
  */
 const resumeApproved = (delivery: FactoryDeliveryState): FactoryAdvance =>
   delivery.children.length === 0
@@ -351,15 +352,31 @@ const concludePlan = (delivery: FactoryDeliveryState, plan: FactoryAcceptedPlan)
     ? blocked(delivery, { reason: "plan_empty", note: plan.note ?? null })
     : enter(delivery, "approve_plan", (current) => begin(current, standardStages.approve_plan));
 
-/** Acts on the round's accepted review once its run has completed. */
-const concludeReview = (delivery: FactoryDeliveryState, review: FactoryAcceptedReview) =>
-  review.summary.blocking
+/**
+ * Acts on the round's accepted review once its run has completed. A parent's integrate review has
+ * no repair round (owner decision): one that blocks blocks the parent, and one that passes
+ * approves its branch for the PR stage.
+ */
+const concludeReview = (delivery: FactoryDeliveryState, review: FactoryAcceptedReview) => {
+  if (delivery.stage === standardStages.integrate.name) {
+    return review.summary.blocking
+      ? blocked(delivery, { reason: "review_changes_required", summary: review.summary })
+      : enter(delivery, "pr", (current) =>
+          begin({ ...current, status: "approved" }, standardStages.pr),
+        );
+  }
+  return review.summary.blocking
     ? repair(delivery, {
         stage: "review",
         fingerprint: review.fingerprint,
         exhausted: { reason: "review_changes_required", summary: review.summary },
       })
     : enter(delivery, "record", (current) => begin(current, standardStages.record));
+};
+
+/** Whether the delivery is in a review round: a task's review, or a parent's integrate review. */
+const reviewing = (delivery: FactoryDeliveryState) =>
+  delivery.stage === standardStages.review.name || delivery.stage === standardStages.integrate.name;
 
 /** Counts an invalid submission: the round's first continues with `retry`, a second blocks. */
 const invalidSubmission = (
@@ -466,10 +483,14 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * turn in a new plan round, and the plan it then submits waits at the gate in place of the old.
  * Or the owner approves it: the plan is frozen, and the running parent creates its children, then
  * runs them one at a time: it starts the first child that has not reported its approval and waits
- * on that child alone, and starts the next only once that one reports its approval. After the last
- * it begins the stage after its children. A parent stored before planner launches recorded where
- * its branch started takes a child's approval only after taking that child's start again, which
- * establishes it.
+ * on that child alone, and starts the next only once that one reports its approval. A parent
+ * stored before planner launches recorded where its branch started takes a child's approval only
+ * after taking that child's start again, which establishes it. After the last child the parent
+ * integrates: it verifies its whole branch afresh, then a new reviewer thread reviews the branch
+ * from where it started by every task's criteria, under a single item's review rules (one
+ * accepted review per round, acted on once its run completes, the fenced read, one corrected
+ * retry). Integrate has no repair round: a failed verify or a blocking review blocks the parent,
+ * and a passing review approves it for the PR stage.
  *
  * A single item runs from start to its pull request: the author thread, the branch settle
  * check with at most one fix-commit turn, the verify command, then a reviewer thread whose one
@@ -490,7 +511,8 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * parent's next child or the stage after its children, it is `stopped` instead. A cancelled
  * delivery awaits nothing, so no later event moves it. Resume undoes a stop that has not yet taken
  * effect, and picks a stopped or blocked delivery up from its checkpoint (see `resume` and, for a
- * parent, `resumePlanning` and `resumeApproved`).
+ * parent, `resumePlanning` and `resumeApproved`); a parent past its children integrates again,
+ * from a fresh verify.
  */
 export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
   switch (event.type) {
@@ -646,7 +668,7 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
             })
           : concludePlan(delivery, accepted);
       }
-      if (delivery.stage === "review") {
+      if (reviewing(delivery)) {
         // A review is acted on only once its run completed; without one, the run's last
         // message may hold it in a fenced block.
         const accepted = acceptedReview(delivery);
@@ -700,6 +722,15 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
         return blocked(delivery, { reason: "receipt_refused", refusals: outcome.refusals });
       }
       const recorded = { ...delivery, receipts: [...delivery.receipts, outcome.receipt] };
+      // A parent verifies only in integrate, its whole branch, which has no repair round (owner
+      // decision): a failure blocks it, and a pass begins the integrate review.
+      if (delivery.kind === "parent") {
+        return receiptFailed(outcome.receipt)
+          ? blocked(recorded, { reason: "verify_failed" })
+          : enter(recorded, standardStages.integrate.name, (current) =>
+              begin(current, standardStages.integrate),
+            );
+      }
       if (receiptFailed(outcome.receipt)) {
         return repair(recorded, {
           stage: "verify",
@@ -741,7 +772,7 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
     case "review.submitted": {
       // Only the round's reviewer run, while it runs, and only until one review is accepted.
       if (
-        delivery.stage !== "review" ||
+        !reviewing(delivery) ||
         event.round !== delivery.reviewRound ||
         awaiting?.type !== "run" ||
         awaiting.threadId !== event.threadId ||

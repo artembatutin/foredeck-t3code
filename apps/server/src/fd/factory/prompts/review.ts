@@ -35,13 +35,19 @@ const RULES = [
   "Leave the Work item's status alone; Factory updates it.",
 ];
 
-const SHAPE = [
-  "The review's fields:",
-  '- `verdict`: "pass" only when nothing should block this commit, otherwise "changes-required".',
-  '- `findings`: each with a short stable `id` (letters, digits, `.`, `_`, `-`), a `severity` of "high", "medium" or "low", `required` (whether the commit must change for it), the repository-relative `file`, the `line` or null, and the causal `detail`.',
-  '- `acceptance`: one entry per acceptance criterion of the item, numbered from 1 in the order its description gives them (when it lists none, the behavior it asks for is criterion 1). Each has a `status` of "verified", "failed" or "untested", the `evidence` you checked, and `paths`: repository-relative files in this worktree that prove it, such as its tests. Mark a criterion verified only with such evidence.',
-  "- `missing_evidence`: what you needed to judge the work and could not find; empty when nothing is missing.",
-].join("\n");
+/** The criteria an item's review covers, numbered as its description gives them. */
+const ITEM_CRITERIA =
+  "one entry per acceptance criterion of the item, numbered from 1 in the order its description gives them (when it lists none, the behavior it asks for is criterion 1)";
+
+/** The review's fields, its `acceptance` covering `criteria`. */
+const shape = (criteria: string) =>
+  [
+    "The review's fields:",
+    '- `verdict`: "pass" only when nothing should block this commit, otherwise "changes-required".',
+    '- `findings`: each with a short stable `id` (letters, digits, `.`, `_`, `-`), a `severity` of "high", "medium" or "low", `required` (whether the commit must change for it), the repository-relative `file`, the `line` or null, and the causal `detail`.',
+    `- \`acceptance\`: ${criteria}. Each has a \`status\` of "verified", "failed" or "untested", the \`evidence\` you checked, and \`paths\`: repository-relative files in this worktree that prove it, such as its tests. Mark a criterion verified only with such evidence.`,
+    "- `missing_evidence`: what you needed to judge the work and could not find; empty when nothing is missing.",
+  ].join("\n");
 
 const EXAMPLE = `\`\`\`json
 {
@@ -94,10 +100,13 @@ export const verifiedCommitSection = (receipt: FactoryVerifyReceipt) =>
     `- Result: ${describeResult(receipt)} after ${Math.round(receipt.durationMs / 1000)} s, from ${receipt.startedAt} to ${receipt.finishedAt}`,
   ].join("\n");
 
-/** Every review round's rules, review fields and way to submit. */
-export const reviewInstructionSections = (): ReadonlyArray<string> => [
+/**
+ * Every review round's rules, review fields and way to submit. `criteria` says which criteria the
+ * review's `acceptance` covers, and how they are numbered; an item's by default.
+ */
+export const reviewInstructionSections = (criteria = ITEM_CRITERIA): ReadonlyArray<string> => [
   `Rules:\n${RULES.map((rule) => `- ${rule}`).join("\n")}`,
-  SHAPE,
+  shape(criteria),
   `${SUBMIT}\n\n${EXAMPLE}`,
 ];
 

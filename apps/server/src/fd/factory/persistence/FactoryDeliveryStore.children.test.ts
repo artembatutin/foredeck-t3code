@@ -234,7 +234,7 @@ describe("FactoryDeliveryStore with the per-child phase", () => {
     ["waiting on its first child", onFirst, "child", []],
     ["stopped where its second child would start", stoppedAfterFirst, null, [first]],
     ["waiting on its second child", onSecond, "child", [first]],
-    ["blocked at the stage after its children", afterChildren, null, children],
+    ["verifying its whole branch after its children", afterChildren, "effect", children],
   ] as const)("round-trips a parent %s", ([, state, awaiting, approved]) =>
     Effect.gen(function* () {
       assert.strictEqual(state.awaiting?.type ?? null, awaiting);

@@ -290,6 +290,23 @@ a child's approval or cancel reaches its parent only once the child's step has r
 while no server handed it on is handed on by the boot sweep, once, since the parent then waits for
 its next child.
 
+## Integrate verifies and reviews the whole branch afresh
+
+After its last child's approval a parent verifies its worktree's HEAD into a receipt of its own,
+never taking a child's: each child's receipt is for its own commit, and nothing else judges the
+tasks together. A passing receipt launches a new reviewer thread on the shared worktree, never a
+turn on a child's reviewer or an earlier integrate's, so the review starts from none of their
+accounts. It reviews the branch from where it started (the parent's baseline) by every approved
+task's criteria, numbered across the tasks in plan order, and its acceptance list has room for each
+criterion of the largest plan (`FactoryIntegrateReview`), which a task's review does not. Its
+submissions are judged like a review's, and taken only from the run the parent awaits, as a plan
+is (see [one accepted review per round](#one-accepted-review-per-round-acted-on-when-the-run-ends)).
+
+Integrate has no repair round (owner decision): a parent has no author thread of its own and its
+children are approved, so a failed verify or a blocking review blocks the parent for its owner. A
+resume verifies and reviews again, with a new reviewer, so whatever was committed meanwhile is
+judged with the rest.
+
 ## Clients see a review's details as it was accepted
 
 Snapshots are built on every read and never read evidence, so what clients see of a review's
@@ -394,7 +411,8 @@ plan round, because a plan accepted before the block, from a run that failed aft
 must not stand in for what the resumed planner submits.
 Once its plan is approved, a parent launches no thread until its children run, so its planner's
 deletion does not hold it: a resume creates the children it lacks, keeping those recorded, or once
-they exist starts the first that has not reported its approval, never creating one again.
+they exist starts the first that has not reported its approval, never creating one again. Past its
+last child it integrates afresh (see [integrate](#integrate-verifies-and-reviews-the-whole-branch-afresh)).
 
 By owner decision an explicit resume grants a fresh retry allowance: repair rounds, the fix-commit
 turn and failure fingerprints start over, while the limits the delivery started with stay, and so

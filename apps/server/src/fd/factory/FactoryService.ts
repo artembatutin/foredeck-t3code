@@ -77,8 +77,9 @@ export class FactoryReviewRefusedError extends Schema.TaggedError<FactoryReviewR
     threadId: ThreadId,
     /**
      * `not_reviewer`: no active delivery has this thread as its reviewer. `review_not_active`:
-     * its delivery is not running the review stage, or not this thread's run. `already_accepted`:
-     * this round's review is already accepted.
+     * its delivery is not running the review or integrate stage, or not this thread's run (in
+     * integrate, not the run the thread is live in). `already_accepted`: this round's review is
+     * already accepted.
      */
     reason: Schema.Literals(["not_reviewer", "review_not_active", "already_accepted"]),
   },
@@ -130,6 +131,7 @@ type FactorySubmitReviewError =
   | FactoryReviewInvalidError
   | FactoryReviewCodeChangedError
   | FactoryReview.FactoryReviewJudgeError
+  | ProjectionStore.ProjectionStoreV2Error
   | FactoryStoreError;
 
 /** A plan submission refused before it was judged: nothing was recorded. */
@@ -504,7 +506,9 @@ export class FactoryService extends Context.Service<
     /**
      * A reviewer's `factory_submit_review`. Taken only from the thread an active delivery
      * registered as its reviewer, while the review stage awaits that thread's run and before
-     * the round has an accepted review; any other call is refused with nothing changed. The
+     * the round has an accepted review; any other call is refused with nothing changed. A
+     * parent's integrate reviewer is held to the run the thread is live in too, as a planner is:
+     * a later turn of the thread is refused while the parent still awaits the run before it. The
      * review is judged (see `FactoryReview`) and the judgment recorded on the delivery: an
      * accepted review is acted on once the reviewer's run completes, an invalid one fails with
      * its problems (the second in a round blocks the delivery), and changed code blocks it.
@@ -730,13 +734,19 @@ const make = Effect.gen(function* () {
         const { state } = current;
         const { awaiting } = state;
         if (state.threads.reviewer !== threadId) return yield* refuse("not_reviewer");
+        const integrating = state.stage === "integrate";
         // A stopping delivery still finishes its review round.
         if (
           !runsStages(state) ||
-          state.stage !== "review" ||
+          (state.stage !== "review" && !integrating) ||
           awaiting?.type !== "run" ||
           awaiting.threadId !== threadId
         ) {
+          return yield* refuse("review_not_active");
+        }
+        // As for a plan: a tool call names its thread, not its run, and a later turn of the
+        // integrate reviewer can be live before the awaited run's end reaches the parent.
+        if (integrating && (yield* threads.liveRun(threadId)) !== awaiting.runId) {
           return yield* refuse("review_not_active");
         }
         if (acceptedReview(state) !== undefined) return yield* refuse("already_accepted");

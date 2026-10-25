@@ -135,6 +135,10 @@ const FactoryTestPlanEntry = Schema.Struct({
   paths: FactoryRepoPaths,
 });
 
+/** A plan holds at most this many tasks, each with at most this many acceptance criteria. */
+export const FACTORY_PLAN_TASKS_MAX = 50;
+export const FACTORY_TASK_CRITERIA_MAX = 50;
+
 /**
  * One planned task (port of a Looper `plan.json` task). Shape only: unique ids, a test plan entry
  * per criterion and ids unused in the delivery are the server's plan validation.
@@ -145,8 +149,10 @@ export const FactoryPlanTask = Schema.Struct({
   title: WorkItemTitle,
   kind: FactoryPlanTaskKind,
   summary: FactoryText(8000),
-  acceptance: Schema.Array(FactoryText(2000)).check(Schema.isBetweenLength(1, 50)),
-  testPlan: Schema.Array(FactoryTestPlanEntry).check(Schema.isMaxLength(50)),
+  acceptance: Schema.Array(FactoryText(2000)).check(
+    Schema.isBetweenLength(1, FACTORY_TASK_CRITERIA_MAX),
+  ),
+  testPlan: Schema.Array(FactoryTestPlanEntry).check(Schema.isMaxLength(FACTORY_TASK_CRITERIA_MAX)),
   likelyPaths: FactoryRepoPaths,
   risk: FactoryTaskRisk,
 });
@@ -154,7 +160,7 @@ export type FactoryPlanTask = typeof FactoryPlanTask.Type;
 
 /** A planner's submission. No tasks ends planning with the note, never an implied success. */
 export const FactoryPlan = Schema.Struct({
-  tasks: Schema.Array(FactoryPlanTask).check(Schema.isMaxLength(50)),
+  tasks: Schema.Array(FactoryPlanTask).check(Schema.isMaxLength(FACTORY_PLAN_TASKS_MAX)),
   note: Schema.optionalKey(FactoryText(8000)),
 });
 export type FactoryPlan = typeof FactoryPlan.Type;
@@ -199,6 +205,18 @@ export const FactoryReview = Schema.Struct({
   missing_evidence: Schema.Array(FactoryText(2000)).check(Schema.isMaxLength(50)),
 });
 export type FactoryReview = typeof FactoryReview.Type;
+
+/**
+ * An integrate reviewer's submission, a review of a parent's whole branch: `FactoryReview` with
+ * room for one acceptance entry per criterion of the largest plan, its criteria numbered across
+ * the approved tasks in plan order. Its type is the review's.
+ */
+export const FactoryIntegrateReview = Schema.Struct({
+  ...FactoryReview.fields,
+  acceptance: Schema.Array(FactoryAcceptanceCheck).check(
+    Schema.isMaxLength(FACTORY_PLAN_TASKS_MAX * FACTORY_TASK_CRITERIA_MAX),
+  ),
+});
 
 const RoleProfile = Schema.NullOr(ModelSelection).pipe(
   Schema.withDecodingDefault(Effect.succeed(null)),

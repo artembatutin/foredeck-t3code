@@ -298,7 +298,7 @@ const outcomeOf = (state: FactoryDeliveryState): FactoryStageOutcome => {
 /**
  * The evidence of the attempt a step finishes, with a failure's fingerprint: the command's
  * receipt (or log), the plan accepted in the plan round being left, the review accepted in the
- * review round being left, or the approval.
+ * review or integrate round being left, or the approval.
  */
 const evidenceOf = (
   event: FactoryEvent,
@@ -326,7 +326,7 @@ const evidenceOf = (
     return { path: plan?.evidencePath, fingerprint: undefined };
   }
   const review =
-    before.stage !== "review"
+    before.stage !== "review" && before.stage !== "integrate"
       ? undefined
       : event.type === "review.read" && event.judgment.type === "accepted"
         ? event.judgment.review

@@ -93,7 +93,8 @@ describe("a parent without a recorded branch start", () => {
     expect(restarted.delivery.awaiting).toEqual({ type: "child", deliveryId: first });
     const taken = advance(restarted.delivery, approval);
     expect(taken.delivery.approvedChildren).toEqual([first]);
-    expect(taken.delivery.stage).toBe(ids.length === 1 ? "integrate" : "author");
+    // Its only child taken, it begins integrate with a verify of the whole branch.
+    expect(taken.delivery.stage).toBe(ids.length === 1 ? "verify" : "author");
 
     // A start that cannot be taken blocks it, with the approval not taken.
     const refused = advance(retaking.delivery, {

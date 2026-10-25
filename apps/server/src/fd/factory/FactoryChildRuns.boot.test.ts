@@ -760,7 +760,8 @@ describe("a stored-before parent taking its first child's approval at boot", () 
             assert.strictEqual(parent.baseline, checkout.start);
             assert.deepStrictEqual(parent.approvedChildren, [first]);
             if (taskCount === 1) {
-              assert.strictEqual(parent.stage, "integrate");
+              // It leaves its only child for integrate, which verifies the whole branch first.
+              assert.strictEqual(parent.stage, "verify");
               assert.notStrictEqual(parent.awaiting?.type, "child");
               assert.deepStrictEqual(world.launches, []);
             } else {

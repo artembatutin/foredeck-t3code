@@ -1,8 +1,11 @@
 import { PositiveInt, ThreadId } from "@t3tools/contracts";
 import {
   FactoryDeliveryId,
+  FactoryIntegrateReview,
+  type FactoryPlanTask,
   FactoryReview as FactoryReviewSchema,
   FactoryReviewSummary,
+  FactoryTaskId,
   type FactoryVerifyReceipt,
 } from "@t3tools/contracts/fd/factory";
 import * as Context from "effect/Context";
@@ -27,19 +30,23 @@ import type {
   FactoryReviewJudgment,
   FactoryReviewSource,
 } from "./pipeline/state.ts";
+import { integrateCriteria } from "./prompts/integrate.ts";
 import { reviewDetails } from "./review/details.ts";
 import { type FactoryEvidencePathError, validateReviewInWorktree } from "./review/evidencePaths.ts";
 import { parseFencedReview } from "./review/fencedJson.ts";
 import { findingsToFix } from "./review/validate.ts";
 import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
 
-/** The delivery records no verified commit to review: no worktree, task baseline or receipt. */
+/**
+ * The delivery records nothing to review: no worktree, task baseline or receipt, or for an
+ * integrate review no approved task.
+ */
 export class FactoryReviewBasisMissingError extends Schema.TaggedError<FactoryReviewBasisMissingError>()(
   "FactoryReviewBasisMissingError",
   { deliveryId: FactoryDeliveryId },
 ) {
   override get message(): string {
-    return `Factory delivery ${this.deliveryId} records no verified commit to review.`;
+    return `Factory delivery ${this.deliveryId} records nothing to review.`;
   }
 }
 
@@ -53,7 +60,8 @@ export type FactoryReviewJudgeError =
 
 /**
  * What the current review round judges: the worktree's commit that `receipt` verified, with the
- * task `baseline` its commits follow.
+ * task `baseline` its commits follow. A parent's integrate review judges its whole branch, from
+ * where it started, by the criteria of every approved task.
  */
 interface FactoryReviewBasis {
   readonly round: number;
@@ -61,16 +69,32 @@ interface FactoryReviewBasis {
   readonly baseline: string;
   /** The passing receipt the review stage started from: the last one. */
   readonly receipt: FactoryVerifyReceipt;
+  /** An integrate review's approved tasks, in plan order; null for a task's own review. */
+  readonly tasks: ReadonlyArray<FactoryPlanTask> | null;
 }
 
 export const reviewBasis = (
   delivery: StoredFactoryDelivery,
 ): Effect.Effect<FactoryReviewBasis, FactoryReviewBasisMissingError> => {
-  const { reviewRound: round, worktreePath, baseline, receipts } = delivery.state;
+  const {
+    reviewRound: round,
+    worktreePath,
+    baseline,
+    receipts,
+    stage,
+    planApproved,
+    plan,
+  } = delivery.state;
   const receipt = receipts.at(-1);
-  return round < 1 || worktreePath === null || baseline === null || receipt === undefined
+  // Approval froze the plan's tasks: they are the parent's tasks, its children's to deliver.
+  const tasks = stage !== "integrate" ? null : planApproved ? (plan?.tasks ?? []) : [];
+  return round < 1 ||
+    worktreePath === null ||
+    baseline === null ||
+    receipt === undefined ||
+    tasks?.length === 0
     ? Effect.fail(new FactoryReviewBasisMissingError({ deliveryId: delivery.deliveryId }))
-    : Effect.succeed({ round, worktreePath, baseline, receipt });
+    : Effect.succeed({ round, worktreePath, baseline, receipt, tasks });
 };
 
 /** `review-<n>.json`: the review as submitted and the server's judgment of it. */
@@ -85,7 +109,18 @@ const FactoryReviewEvidence = Schema.Struct({
   summary: FactoryReviewSummary,
   /** Why the review blocks the commit; empty when it passes. */
   blockingReasons: Schema.Array(Schema.Struct({ rule: Schema.String, description: Schema.String })),
-  review: FactoryReviewSchema,
+  /** The widest shape, an integrate review's, so either kind of review is kept as submitted. */
+  review: FactoryIntegrateReview,
+  /**
+   * The criteria an integrate review was judged by, numbered as it was asked to answer them: the
+   * approved tasks', which the planner's `plan.json` may not show after an owner's edit. Absent
+   * for a task's own review.
+   */
+  criteria: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({ criterion: PositiveInt, taskId: FactoryTaskId, text: Schema.String }),
+    ),
+  ),
 });
 const REVIEW_EVIDENCE_VERSION = 1;
 const encodeEvidence = Schema.encodeEffect(Schema.fromJsonString(FactoryReviewEvidence));
@@ -106,6 +141,9 @@ export const readReviewEvidence = Effect.fn("FactoryReview.readEvidence")(functi
 });
 // Every issue at once, like the fenced fallback: the reviewer gets one corrected retry.
 const decodeReview = Schema.decodeUnknownResult(FactoryReviewSchema, { errors: "all" });
+const decodeIntegrateReview = Schema.decodeUnknownResult(FactoryIntegrateReview, {
+  errors: "all",
+});
 
 const MAX_PROBLEM = 1000;
 const bounded = (text: string) =>
@@ -126,8 +164,11 @@ type FactoryReviewCandidate =
  * is not clean, refuses any review. Otherwise the review must decode and pass the validation
  * port, evidence paths included; a valid one, blocking or not, is written to the delivery's
  * evidence as `review-<n>.json` and accepted with the bounded details clients see, a blocking one
- * with its failure fingerprint (its findings to fix and the reviewed tree). Judging records
- * nothing on the delivery; the engine does, from the judgment.
+ * with its failure fingerprint (its findings to fix and the reviewed tree). An integrate review
+ * of a parent's whole branch has an acceptance entry for each criterion of every approved task,
+ * numbered across them in plan order (see `renderIntegratePrompt`): one out of that range is
+ * invalid, and one missing blocks. Judging records nothing on the delivery; the engine does, from
+ * the judgment.
  */
 export class FactoryReview extends Context.Service<
   FactoryReview,
@@ -188,11 +229,11 @@ const make = Effect.gen(function* () {
 
   const judgeCandidate = Effect.fn("FactoryReview.judge")(function* (
     delivery: StoredFactoryDelivery,
+    basis: FactoryReviewBasis,
     source: FactoryReviewSource,
     threadId: ThreadId,
     candidate: FactoryReviewCandidate,
   ) {
-    const basis = yield* reviewBasis(delivery);
     // First: no review of a commit other than the verified one counts, however well formed.
     const changes = yield* codeChanges(basis).pipe(Effect.provideContext(context));
     if (changes.length > 0) {
@@ -202,9 +243,10 @@ const make = Effect.gen(function* () {
 
     const { review } = candidate;
     const { blockingSeverities } = yield* settings.get(delivery.projectId);
+    const criteria = basis.tasks === null ? null : integrateCriteria(basis.tasks);
     // A single item has no planned criteria; a planned child's count arrives with planning.
     const validation = yield* validateReviewInWorktree(basis.worktreePath, review, {
-      criteriaCount: null,
+      criteriaCount: criteria?.length ?? null,
       blockingSeverities,
     }).pipe(Effect.provideContext(context));
     if (validation.status === "invalid") {
@@ -231,6 +273,7 @@ const make = Effect.gen(function* () {
       summary,
       blockingReasons: validation.status === "blocking" ? validation.reasons : [],
       review,
+      ...(criteria === null ? {} : { criteria }),
     });
     const details = reviewDetails(review, blockingSeverities);
     if (!blocking) {
@@ -250,20 +293,25 @@ const make = Effect.gen(function* () {
     } satisfies FactoryReviewJudgment;
   });
 
-  const judge: FactoryReview["Service"]["judge"] = (delivery, submission) => {
-    const decoded = decodeReview(submission.review);
-    return judgeCandidate(
-      delivery,
-      submission.source,
-      submission.threadId,
-      Result.isSuccess(decoded)
-        ? { type: "review", review: decoded.success }
-        : {
-            type: "invalid",
-            problems: [bounded(`The review is not valid: ${decoded.failure.message}`)],
-          },
-    );
-  };
+  const judge: FactoryReview["Service"]["judge"] = (delivery, submission) =>
+    Effect.gen(function* () {
+      const basis = yield* reviewBasis(delivery);
+      const decoded = (basis.tasks === null ? decodeReview : decodeIntegrateReview)(
+        submission.review,
+      );
+      return yield* judgeCandidate(
+        delivery,
+        basis,
+        submission.source,
+        submission.threadId,
+        Result.isSuccess(decoded)
+          ? { type: "review", review: decoded.success }
+          : {
+              type: "invalid",
+              problems: [bounded(`The review is not valid: ${decoded.failure.message}`)],
+            },
+      );
+    });
 
   /** The text of the run's last assistant message that has any; none when it has none. */
   const lastAssistantText = (
@@ -283,8 +331,12 @@ const make = Effect.gen(function* () {
 
   const judgeFallback: FactoryReview["Service"]["judgeFallback"] = (delivery, effect) =>
     Effect.gen(function* () {
+      const basis = yield* reviewBasis(delivery);
       const text = yield* lastAssistantText(effect);
-      const parsed = text === null ? ({ status: "none" } as const) : parseFencedReview(text);
+      const parsed =
+        text === null
+          ? ({ status: "none" } as const)
+          : parseFencedReview(text, basis.tasks === null ? "review" : "integrate");
       const candidate: FactoryReviewCandidate =
         parsed.status === "decoded"
           ? { type: "review", review: parsed.review }
@@ -292,7 +344,7 @@ const make = Effect.gen(function* () {
               type: "invalid",
               problems: [parsed.status === "none" ? NO_FENCED_REVIEW : parsed.message],
             };
-      return yield* judgeCandidate(delivery, "fallback", effect.threadId, candidate);
+      return yield* judgeCandidate(delivery, basis, "fallback", effect.threadId, candidate);
     });
 
   return FactoryReview.of({ judge, judgeFallback });

@@ -1,4 +1,4 @@
-import { FactoryReview } from "@t3tools/contracts/fd/factory";
+import { FactoryIntegrateReview, FactoryReview } from "@t3tools/contracts/fd/factory";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
@@ -15,7 +15,10 @@ const MAX_MESSAGE = 1000;
 
 const decodeJson = Schema.decodeUnknownResult(Schema.fromJsonString(Schema.Unknown));
 // Every issue at once: the reviewer gets one corrected retry.
-const decodeReview = Schema.decodeUnknownResult(FactoryReview, { errors: "all" });
+const decoders = {
+  review: Schema.decodeUnknownResult(FactoryReview, { errors: "all" }),
+  integrate: Schema.decodeUnknownResult(FactoryIntegrateReview, { errors: "all" }),
+};
 
 const fenceOpen = /^ {0,3}(?<fence>`{3,}|~{3,})(?<info>.*)$/;
 const fenceClose = /^ {0,3}(?<fence>`{3,}|~{3,})\s*$/;
@@ -52,8 +55,14 @@ export const lastJsonBlock = (message: string): string | undefined => {
 const bounded = (message: string) =>
   message.length > MAX_MESSAGE ? `${message.slice(0, MAX_MESSAGE - 1)}…` : message;
 
-/** Decodes the last ```json block of `message` as a review; never throws. */
-export const parseFencedReview = (message: string): FactoryFencedReview => {
+/**
+ * Decodes the last ```json block of `message` as a review, or as an integrate reviewer's, which
+ * has room for every criterion of a parent's plan; never throws.
+ */
+export const parseFencedReview = (
+  message: string,
+  shape: keyof typeof decoders = "review",
+): FactoryFencedReview => {
   const block = lastJsonBlock(message);
   if (block === undefined) return { status: "none" };
   const json = decodeJson(block);
@@ -63,7 +72,7 @@ export const parseFencedReview = (message: string): FactoryFencedReview => {
       message: bounded(`The last json block is not valid JSON: ${json.failure.message}`),
     };
   }
-  const review = decodeReview(json.success);
+  const review = decoders[shape](json.success);
   if (Result.isFailure(review)) {
     return {
       status: "decode_failed",

@@ -261,6 +261,7 @@ describe("the engine's imports", () => {
         "stages/agent.ts",
         "stages/command.ts",
         "stages/gate.ts",
+        "stages/integrate.ts",
         "stages/pr.ts",
         "stages/registry.ts",
         "state.ts",

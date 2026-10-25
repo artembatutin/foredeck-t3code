@@ -46,6 +46,7 @@ import { authorThreadTitle, renderAuthorPrompt } from "./prompts/author.ts";
 import { renderFixCommitPrompt } from "./prompts/fixCommit.ts";
 import { renderFixReviewPrompt } from "./prompts/fixReview.ts";
 import { renderFixVerifyPrompt } from "./prompts/fixVerify.ts";
+import { integrateThreadTitle, renderIntegratePrompt } from "./prompts/integrate.ts";
 import {
   planThreadTitle,
   renderPlanPrompt,
@@ -516,20 +517,30 @@ const make = Effect.gen(function* () {
         modelSelection.instanceId,
         resolved.defaultRuntimeMode,
       );
+      // A task's reviewer judges its commits; a parent's integrate reviewer its whole branch, by
+      // every approved task's criteria.
+      const reviewOpening = ({ baseline, receipt, tasks }: NonNullable<typeof basis>) =>
+        tasks === null
+          ? {
+              title: reviewThreadTitle(item),
+              text: renderReviewPrompt({ item, branch: state.branch, baseline, receipt }),
+            }
+          : {
+              title: integrateThreadTitle(item),
+              text: renderIntegratePrompt({
+                item,
+                branch: state.branch,
+                baseRef: state.baseRef,
+                base: baseline,
+                receipt,
+                tasks,
+              }),
+            };
       // Planners and reviewers work in plan mode: they read and judge, and never change the
       // worktree.
       const opening =
         basis !== null
-          ? {
-              title: reviewThreadTitle(item),
-              text: renderReviewPrompt({
-                item,
-                branch: state.branch,
-                baseline: basis.baseline,
-                receipt: basis.receipt,
-              }),
-              interactionMode: "plan" as const,
-            }
+          ? { ...reviewOpening(basis), interactionMode: "plan" as const }
           : role === "planner"
             ? {
                 title: planThreadTitle(item),
