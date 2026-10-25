@@ -180,24 +180,45 @@ describe("transitionComment", () => {
     }
   });
 
-  it("drops facts that would name an AI tool, carry attribution or mention someone", () => {
-    const fixedBlock =
-      "Factory is blocked on this item and needs you. Resume or cancel the delivery in Foredeck.";
-    const quoting = (problem: string) =>
-      transitionComment(
-        inStatus("running"),
-        inStatus("blocked", { reason: "unsettled", problems: [problem] }),
-      )?.body;
+  it("drops only the facts that would name an AI tool, carry attribution or mention someone", () => {
+    const blockedBy = (block: FactoryBlock) =>
+      transitionComment(inStatus("running"), inStatus("blocked", block))?.body;
+    // Each unsafe fact goes, and the reason's fixed text stays.
     for (const problem of [
       'Commit 0123456789ab subject is not a Conventional Commit: "Update readme with Claude".',
       'Commit 0123456789ab subject is not a Conventional Commit: "Add export Generated-by: bot".',
       'Worktree is on branch "copilot/fix"; expected "work/fd-aaaaaa".',
       'Commit 0123456789ab subject is not a Conventional Commit: "Thanks @octocat".',
     ]) {
-      expect(quoting(problem), problem).toBe(fixedBlock);
+      expect(blockedBy({ reason: "unsettled", problems: [problem] }), problem).toBe(
+        blockedText("The branch does not settle."),
+      );
     }
-    // An address is not a mention.
-    expect(quoting('Worktree is on branch "ada@home"; expected "main".')).toBe(
+    expect(
+      blockedBy({
+        reason: "invalid_submission",
+        problems: ['findings[0].detail quotes "co-authored-by: an AI assistant".'],
+      }),
+    ).toBe(blockedText("The reviewer's submission was invalid again."));
+    expect(
+      blockedBy({
+        reason: "effect_failed",
+        effect: {
+          id: 4,
+          type: "launch_thread",
+          role: "reviewer",
+          workspace: { type: "existing_worktree", worktreePath: "/worktrees/fd-aaaaaa" },
+        },
+        detail: "Factory could not launch the reviewer thread (Gemini).",
+      }),
+    ).toBe(blockedText("Factory could not complete a step."));
+    // A safe fact stays: an address is not a mention.
+    expect(
+      blockedBy({
+        reason: "unsettled",
+        problems: ['Worktree is on branch "ada@home"; expected "main".'],
+      }),
+    ).toBe(
       blockedText('The branch does not settle: Worktree is on branch "ada@home"; expected "main".'),
     );
 

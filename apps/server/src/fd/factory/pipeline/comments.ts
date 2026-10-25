@@ -2,7 +2,7 @@ import type { FactoryDeliveryStatus } from "@t3tools/contracts/fd/factory";
 
 import { carriesAiAttribution, namesAiTool } from "../git/publishedText.ts";
 import { needsYou } from "../snapshot.ts";
-import type { FactoryDeliveryState } from "./state.ts";
+import type { FactoryBlock, FactoryDeliveryState } from "./state.ts";
 
 /**
  * The Work comment a delivery's transition posts on its item, so a tracker shows what Factory
@@ -24,23 +24,45 @@ export interface FactoryTransitionComment {
 /** A mention, which would notify someone on GitHub or Jira under the owner's credentials. */
 const MENTION = /(?<![\w@])@[A-Za-z0-9]/;
 
+const publishable = (text: string) =>
+  !namesAiTool(text) && !carriesAiAttribution(text) && !MENTION.test(text);
+
 /**
- * The text with its facts, or the fixed text without them when the facts (a quoted commit
- * subject or branch, a repository name in a URL) would make it name an AI agent, model or
- * provider, carry attribution, or mention someone. The fixed text never does.
+ * The first of the texts that names no AI agent, model or provider, carries no attribution and
+ * mentions no one, else `fixed`, which never does. Each text drops more of the facts that can
+ * bring those in: a quoted commit subject or branch, a review problem, an error tag, a repository
+ * name in a URL.
  */
-const withFacts = (text: string, fixed: string) =>
-  namesAiTool(text) || carriesAiAttribution(text) || MENTION.test(text) ? fixed : text;
+const firstPublishable = (texts: ReadonlyArray<string>, fixed: string) =>
+  texts.find(publishable) ?? fixed;
+
+/**
+ * The block with none of the free text its problems or failure detail quote, so its message is
+ * the reason's fixed text alone. The other reasons' facts are roles, statuses, stages and counts.
+ */
+const withoutFreeText = (block: FactoryBlock): FactoryBlock => {
+  switch (block.reason) {
+    case "unsettled":
+    case "invalid_submission":
+      return { ...block, problems: [] };
+    case "effect_failed":
+      return { ...block, detail: "Factory could not complete a step." };
+    default:
+      return block;
+  }
+};
 
 const BLOCKED = "Factory is blocked on this item and needs you.";
 const BLOCKED_ACTION = "Resume or cancel the delivery in Foredeck.";
+const blockedBody = (reason: string | undefined) =>
+  reason === undefined ? `${BLOCKED} ${BLOCKED_ACTION}` : `${BLOCKED} ${reason} ${BLOCKED_ACTION}`;
 
 /**
  * The comment for moving from `before` to `after`: one for entering blocked, waiting, approved or
  * pr_open from any other status, none for staying in a status or entering any other. A blocked
- * comment gives the block's fixed message, as the delivery's `needsYou` does; an approved one the
- * approved commit, the one the last receipt verified; a pr_open one the pull request's number and
- * URL.
+ * comment gives the block's message, as the delivery's `needsYou` does, and keeps the reason's
+ * fixed text when it drops the facts; an approved one the approved commit, the one the last
+ * receipt verified; a pr_open one the pull request's number and URL.
  */
 export const transitionComment = (
   before: FactoryDeliveryState,
@@ -49,12 +71,18 @@ export const transitionComment = (
   if (after.status === before.status) return undefined;
   switch (after.status) {
     case "blocked": {
-      const fixed = `${BLOCKED} ${BLOCKED_ACTION}`;
-      const reason = needsYou(after);
+      const { block } = after;
       return {
         status: "blocked",
-        body:
-          reason === undefined ? fixed : withFacts(`${BLOCKED} ${reason} ${BLOCKED_ACTION}`, fixed),
+        body: firstPublishable(
+          [
+            blockedBody(needsYou(after)),
+            ...(block === null
+              ? []
+              : [blockedBody(needsYou({ ...after, block: withoutFreeText(block) }))]),
+          ],
+          blockedBody(undefined),
+        ),
       };
     }
     case "waiting":
@@ -71,8 +99,10 @@ export const transitionComment = (
         body:
           commit === undefined
             ? fixed
-            : withFacts(
-                `Factory approved commit ${commit} for this item after verify and review, and is opening its pull request.`,
+            : firstPublishable(
+                [
+                  `Factory approved commit ${commit} for this item after verify and review, and is opening its pull request.`,
+                ],
                 fixed,
               ),
       };
@@ -85,7 +115,7 @@ export const transitionComment = (
       const opened = `Factory opened pull request #${pullRequest.number} for this item.`;
       return {
         status: "pr_open",
-        body: withFacts(`${opened} ${pullRequest.url}`, opened),
+        body: firstPublishable([`${opened} ${pullRequest.url}`], opened),
       };
     }
     default:
