@@ -9,6 +9,7 @@ import {
 } from "@t3tools/contracts/fd/work-management";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
@@ -36,6 +37,7 @@ import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
+import * as FactoryWorkCommentStore from "./persistence/FactoryWorkCommentStore.ts";
 import { advance } from "./pipeline/engine.ts";
 import { queuedDeliveryState } from "./pipeline/state.ts";
 import type { FactoryDeliveryState, FactoryEvent, FactoryRoundLimits } from "./pipeline/state.ts";
@@ -52,15 +54,20 @@ import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 interface World {
   /** Every comment Factory asked Work to post, in order, whether or not Work took it. */
   readonly posts: Array<{ readonly actor: WorkActor; readonly input: WorkCommentInput }>;
+  /** The request ids of the posts Work finished, in order. */
+  readonly finished: Array<string | undefined>;
   /** Work posts each comment, cannot reach the source, or the source refuses the comment. */
   work: "posts" | "unavailable" | "refuses";
-  /** While set, every post waits for `release`; `posting` resolves once one is waiting. */
-  held: {
-    readonly posting: Deferred.Deferred<void>;
-    readonly release: Deferred.Deferred<void>;
-  } | null;
+  /** While set, every post waits in Work for `release`; `posting` resolves once one waits. */
+  held: Hold | null;
   readonly warnings: Array<string>;
 }
+
+interface Hold {
+  readonly posting: Deferred.Deferred<void>;
+  readonly release: Deferred.Deferred<void>;
+}
+const makeHold = Effect.all({ posting: Deferred.make<void>(), release: Deferred.make<void>() });
 
 // Work's own errors are private to Work; these carry the same tags.
 class FakeWorkUnavailable extends Schema.TaggedError<FakeWorkUnavailable>()("WorkUnavailable", {
@@ -90,6 +97,7 @@ const fakeWork = (world: World) =>
           yield* Deferred.succeed(held.posting, undefined);
           yield* Deferred.await(held.release);
         }
+        world.finished.push(input.clientRequestId);
         switch (world.work) {
           case "posts":
             return { commentId: String(world.posts.length) };
@@ -161,11 +169,14 @@ const baseLayer = (world: World) =>
     Layer.provideMerge(NodeServices.layer),
   );
 
-/** One server process: its own worker, comment poster and reactor, logging warnings to `world`. */
-const serverLayer = (world: World) =>
+/**
+ * One server process: its own worker, comment poster and reactor, logging warnings to `world`.
+ * `poster` replaces the comment poster.
+ */
+const serverLayer = (world: World, poster = FactoryWorkComments.layer) =>
   FactoryReactor.layer.pipe(
     Layer.provideMerge(FactoryWorker.layer),
-    Layer.provide(FactoryWorkComments.layer),
+    Layer.provide(poster),
     Layer.provide(
       Logger.layer(
         [
@@ -180,7 +191,7 @@ const serverLayer = (world: World) =>
   );
 
 const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
-  const world: World = { posts: [], work: "posts", held: null, warnings: [] };
+  const world: World = { posts: [], finished: [], work: "posts", held: null, warnings: [] };
   return body(world).pipe(Effect.provide(baseLayer(world)), Effect.scoped);
 };
 
@@ -312,11 +323,31 @@ const resumeOn = (cwd: string) =>
   });
 
 /**
- * Runs `body` in a server process that stops as soon as `body` returns: whatever it queued and
- * has not finished is dropped or interrupted, as when the server shuts down.
+ * Runs `body` in a server process that stops as soon as `body` returns, with nothing drained:
+ * queued comments are dropped, as when the server shuts down. Its first post waits for `held`
+ * before the poster starts it, so the process stops with every comment it recorded queued.
  */
-const stopsAfter = <A, E, R>(world: World, body: Effect.Effect<A, E, R>) =>
-  body.pipe(Effect.scoped, Effect.provide(serverLayer(world)));
+const stopsAfter = <A, E, R>(world: World, held: Hold, body: Effect.Effect<A, E, R>) =>
+  body.pipe(
+    Effect.scoped,
+    Effect.provide(
+      serverLayer(
+        world,
+        Layer.effect(
+          FactoryWorkComments.FactoryWorkComments,
+          Effect.map(FactoryWorkComments.FactoryWorkComments, (poster) =>
+            FactoryWorkComments.FactoryWorkComments.of({
+              post: (job) =>
+                Deferred.succeed(held.posting, undefined).pipe(
+                  Effect.andThen(Deferred.await(held.release)),
+                  Effect.andThen(poster.post(job)),
+                ),
+            }),
+          ),
+        ).pipe(Layer.provide(FactoryWorkComments.layer)),
+      ),
+    ),
+  );
 
 /** A delivery of its own item, stored with its author's run going. */
 const authoringOf = (name: string) => {
@@ -506,55 +537,46 @@ describe("Work comments on a delivery's transitions", () => {
     ),
   );
 
-  it.effect(
-    "posts after a restart a comment the stopped process recorded and never began, and never again one it began",
-    () =>
-      withWorld((world) =>
-        Effect.gen(function* () {
-          const first = authoringOf("first");
-          const second = authoringOf("second");
-          yield* first.insert;
-          yield* second.insert;
-          const held = {
-            posting: yield* Deferred.make<void>(),
-            release: yield* Deferred.make<void>(),
-          };
-          world.held = held;
+  it.effect("posts after a restart the comments a stopped process recorded and never began", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const first = authoringOf("first");
+        const second = authoringOf("second");
+        yield* first.insert;
+        yield* second.insert;
+        const held = yield* makeHold;
 
-          yield* stopsAfter(
-            world,
-            Effect.gen(function* () {
-              // The first block's comment is being posted when the second delivery blocks.
-              yield* stepOf(first.id, first.deleted);
-              yield* Deferred.await(held.posting);
-              yield* stepOf(second.id, second.deleted);
-            }),
-          );
-          // The process stopped with the second comment still queued.
-          const blocked = yield* Effect.flatMap(FactoryDeliveryStore.FactoryDeliveryStore, (d) =>
-            d.get(second.id),
+        yield* stopsAfter(
+          world,
+          held,
+          Effect.gen(function* () {
+            // Both deliveries block; the process stops before either comment is posted.
+            yield* stepOf(first.id, first.deleted);
+            yield* Deferred.await(held.posting);
+            yield* stepOf(second.id, second.deleted);
+          }),
+        );
+        for (const { id } of [first, second]) {
+          const stored = yield* Effect.flatMap(FactoryDeliveryStore.FactoryDeliveryStore, (d) =>
+            d.get(id),
           ).pipe(Effect.map(Option.getOrThrow));
-          assert.strictEqual(blocked.state.status, "blocked");
-          assert.deepStrictEqual(
-            world.posts.map(({ actor }) => actor.id),
-            [`factory:${first.id}`],
-          );
+          assert.strictEqual(stored.state.status, "blocked");
+        }
+        assert.deepStrictEqual(world.posts, []);
 
-          // The next boot posts the comment nobody began; the one interrupted mid-post may have
-          // reached the source, so it is not posted again.
-          world.held = null;
-          yield* boot(world, Effect.void);
-          assert.deepStrictEqual(
-            world.posts.map(({ actor, input }) => [actor.id, input.body]),
-            [
-              [`factory:${first.id}`, blockedText("The author thread was deleted.")],
-              [`factory:${second.id}`, blockedText("The author thread was deleted.")],
-            ],
-          );
-          yield* boot(world, Effect.void);
-          assert.strictEqual(world.posts.length, 2);
-        }),
-      ),
+        // The next boot posts both, in the order they were recorded, and a later one nothing.
+        yield* boot(world, Effect.void);
+        assert.deepStrictEqual(
+          world.posts.map(({ actor, input }) => [actor.id, input.body]),
+          [
+            [`factory:${first.id}`, blockedText("The author thread was deleted.")],
+            [`factory:${second.id}`, blockedText("The author thread was deleted.")],
+          ],
+        );
+        yield* boot(world, Effect.void);
+        assert.strictEqual(world.posts.length, 2);
+      }),
+    ),
   );
 
   it.effect("posts a comment queued twice once", () =>
@@ -566,10 +588,7 @@ describe("Work comments on a delivery's transitions", () => {
           const second = authoringOf("second");
           yield* first.insert;
           yield* second.insert;
-          const held = {
-            posting: yield* Deferred.make<void>(),
-            release: yield* Deferred.make<void>(),
-          };
+          const held = yield* makeHold;
           world.held = held;
           yield* stepOf(first.id, first.deleted);
           yield* Deferred.await(held.posting);
@@ -588,6 +607,51 @@ describe("Work comments on a delivery's transitions", () => {
         }),
       ),
     ),
+  );
+
+  it.effect(
+    "finishes a post it began though the server stops meanwhile, and never posts it again",
+    () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const first = authoringOf("first");
+          yield* first.insert;
+          const comment = yield* Effect.flatMap(
+            FactoryWorkCommentStore.FactoryWorkCommentStore,
+            (store) =>
+              store.record({
+                deliveryId: first.id,
+                comment: { status: "blocked", body: blockedText("The author thread was deleted.") },
+              }),
+          );
+          const poster = yield* FactoryWorkComments.FactoryWorkComments;
+          const held = yield* makeHold;
+          world.held = held;
+
+          const posting = yield* poster.post({ itemRef, comment }).pipe(Effect.forkChild);
+          yield* Deferred.await(held.posting);
+          // Signalling resumed this fiber inside the post's; yielding lets the post reach its
+          // wait for `release` before the interrupt.
+          yield* Effect.yieldNow;
+          // The server stops while Work is still posting: the claim is stored, so a cut-off post
+          // would never be posted by anyone.
+          posting.interruptUnsafe();
+          yield* Deferred.succeed(held.release, undefined);
+          yield* Fiber.await(posting);
+          assert.deepStrictEqual(world.finished, [`factory:${first.id}:blocked:1`]);
+
+          // Claimed, it is never posted again, by this process or a later one.
+          world.held = null;
+          yield* poster.post({ itemRef, comment });
+          assert.strictEqual(world.posts.length, 1);
+          assert.deepStrictEqual(
+            yield* Effect.flatMap(FactoryWorkCommentStore.FactoryWorkCommentStore, (store) =>
+              store.listUnattempted(),
+            ),
+            [],
+          );
+        }).pipe(Effect.provide(FactoryWorkComments.layer)),
+      ),
   );
 
   describe("a comment Work does not post", () => {

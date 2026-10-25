@@ -246,19 +246,10 @@ const make = Effect.gen(function* () {
   // must not wait for them.
   yield* Effect.addFinalizer(() => TxRef.set(outstanding, 0));
   // Work comments post on one lane of their own, in the order they were recorded: a slow or
-  // failing Work source never holds up a delivery. Each is counted until it is done. A comment is
-  // claimed before it is posted, so one queued twice (live, and by a boot sweep) posts once, and
-  // one a stopped process began posting is never posted again. One this process could not claim
-  // stays unattempted, for the next boot.
+  // failing Work source never holds up a delivery. Each is counted until it is done. The poster
+  // claims each before posting it, so one queued twice (live, and by a boot sweep) posts once.
   const commentLane = yield* makeDrainableWorker((job: CommentJob) =>
-    commentStore.claim(job.comment).pipe(
-      Effect.flatMap((claimed) => (claimed ? poster.post(job) : Effect.void)),
-      Effect.catchTags({
-        FactoryStoreError: (error) =>
-          Effect.logWarning("factory could not claim a Work comment", error),
-      }),
-      Effect.ensuring(TxRef.update(outstanding, (count) => count - 1)),
-    ),
+    poster.post(job).pipe(Effect.ensuring(TxRef.update(outstanding, (count) => count - 1))),
   );
   const queueComment = (job: CommentJob) =>
     TxRef.update(outstanding, (count) => count + 1).pipe(Effect.andThen(commentLane.enqueue(job)));

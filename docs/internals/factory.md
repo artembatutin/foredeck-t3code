@@ -301,10 +301,12 @@ dropped, and the block reason's fixed text stays.
 The trap is idempotence. Work replays a `clientRequestId` from memory, for a day, so the id cannot
 stop a second post after a restart. Factory therefore never derives a comment from a status it reads
 back, only from the step that stored the transition: a boot sweep that caught up on blocked
-deliveries would post again after every restart. And it claims a recorded comment durably before
-posting it. The boot sweep posts the comments nobody claimed, which a process that stopped with them
-still queued leaves behind. A comment claimed and then interrupted may have reached the source, so
-it is never posted again; that loss is the lesser failure, since a duplicate would be the only
-alternative. The id carries the comment's number within its delivery, so a later block posts its
-own comment rather than getting the first one's result back from Work
-([`FactoryWorkCommentStore.ts`](../../apps/server/src/fd/factory/persistence/FactoryWorkCommentStore.ts)).
+deliveries would post again after every restart. A comment is claimed durably as its post begins,
+and nothing interrupts it from the claim to the end of the post, which is bounded, so a stopping
+server finishes a post it began instead of leaving it claimed and unsent. The boot sweep posts the
+comments nobody claimed, which a process that stopped with them still queued leaves behind. Only a
+process that dies between a claim and the end of its post leaves a comment that may or may not have
+reached the source; Factory cannot tell, so it is not posted again, because posting it again would
+risk the duplicate the rule forbids. The id carries the comment's number within its delivery, so a
+later block posts its own comment rather than getting the first one's result back from Work
+([`FactoryWorkComments.ts`](../../apps/server/src/fd/factory/FactoryWorkComments.ts)).
