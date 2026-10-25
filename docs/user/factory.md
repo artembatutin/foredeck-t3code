@@ -69,11 +69,12 @@ Factory does not change the item's status.
 - **Stop after step** lets the current step finish. The delivery shows **Stopping** and becomes
   **Stopped** at the next stage boundary, before it would verify, start a review or repair round,
   record or open the pull request. A problem found before then still blocks it.
-- **Resume** continues a stopped, stopping or blocked delivery. Factory checks the branch again and
-  verifies it before going on, even if nothing changed, unless all that is left is opening the
-  pull request for the commit it approved. A resumed delivery gets a fresh set of
-  repair rounds within the limits it started with. If you deleted one of its threads, it blocks
-  again; cancel it and deliver the item anew.
+- **Resume** on a delivery that is still **Stopping** takes back the stop: it goes on running from
+  the step under way, with the rounds it has already used. Resuming a **Stopped** or **Blocked**
+  delivery checks its branch again and verifies it before going on, even if nothing changed,
+  unless all that is left is opening the pull request for the commit it approved. It also gets a
+  fresh set of repair rounds within the limits it started with. If you deleted one of its threads,
+  it blocks again; cancel it and deliver the item anew.
 - **Cancel delivery** asks first, then interrupts what the delivery's agents are working on and
   ends it. The branch, worktree and commits stay. Verification or a pull request the server has
   already started finishes, but no longer changes the delivery. Delivering the item again starts
