@@ -16,7 +16,9 @@ everything. Select an item to read, edit, comment, change its status, start a
 thread or link one. **Add to prompt** opens a new thread in the item's project
 with a reference to the item in the composer. If an item changes while you edit
 its title or description, Work keeps your edit and shows the current version so
-you can reapply your edit or discard it.
+you can reapply your edit or discard it. **Deliver** hands the item to
+[Factory](./factory.md), which takes it through authoring, verification and
+review to one pull request.
 
 To add a source, open the project's settings and use **Work sources**. In a
 thread, the details panel lists the thread's linked items; use **Link work item**
@@ -150,6 +152,9 @@ through these tools:
 | `work_comment`      | Adds a comment, signed with the agent's name.             |
 | `work_link_thread`  | Links or unlinks a thread.                                |
 | `work_start_thread` | Starts a thread from an item in the agent's own modes.    |
+
+Agents deliver an item through Factory with `factory_deliver`; see
+[Factory](./factory.md#start-a-delivery).
 
 An agent names an item by the reference in its prompt
 (`<source id>:<item id>`), by a key such as `fd-7k3qa2`, or by its URL.

@@ -85,6 +85,14 @@ Open the project's settings and use **Work sources** to add where the project's
 Adding a source for the same folder or repository again restores the disconnected
 one instead of creating a second.
 
+## Factory
+
+Open the project's settings and use **Factory** to set the verify command a
+[Factory](./factory.md) delivery checks its work with, an optional setup command that deliveries
+do not run yet, the author and reviewer models, and the round limits and verify timeout. A project needs a verify command before
+its items can be delivered. Commands are an executable and its arguments, not a shell line. Each
+environment keeps its own Factory settings for its checkout of the project.
+
 ## Worktree branch names
 
 In **Settings → Source Control → Worktree branch naming**, choose a static prefix,
