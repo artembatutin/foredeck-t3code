@@ -1,8 +1,11 @@
+import type { EnvironmentId } from "@t3tools/contracts";
 import {
   FactoryPlanTask,
+  type FactoryDeliveryId,
   type FactoryPlan,
   type FactoryTaskId,
 } from "@t3tools/contracts/fd/factory";
+import * as Equal from "effect/Equal";
 import * as Schema from "effect/Schema";
 
 /** The bounds `FactoryPlan` decodes with; the draft refuses anything outside them. */
@@ -39,10 +42,21 @@ export interface FactoryPlanTaskDraft {
   readonly testPlan: ReadonlyArray<FactoryTestPlanEntryDraft>;
 }
 
-/** A plan as the owner edits it before approval; `base` keeps the note and the original order. */
-export interface FactoryPlanDraft {
+/** The delivery a plan belongs to. A delivery id is unique only within its environment. */
+export interface FactoryPlanDestination {
+  readonly environmentId: EnvironmentId;
+  readonly deliveryId: FactoryDeliveryId;
+}
+
+/**
+ * A plan as the owner edits it before approval, pinned to the delivery it was made for. `base`
+ * keeps the note and the original order, and is the plan the edits were made over. `current` is
+ * the server's newer plan while it differs from `base` under edits, and null otherwise.
+ */
+export interface FactoryPlanDraft extends FactoryPlanDestination {
   readonly base: FactoryPlan;
   readonly tasks: ReadonlyArray<FactoryPlanTaskDraft>;
+  readonly current: FactoryPlan | null;
 }
 
 /**
@@ -66,9 +80,19 @@ export type FactoryPlanTaskErrors = Partial<Record<FactoryPlanTaskField, string>
 /** Errors keyed by task id; a task without errors has no key. */
 export type FactoryPlanErrors = Readonly<Record<string, FactoryPlanTaskErrors>>;
 
+/**
+ * `Mismatch`: the draft was made for another delivery, named with the one asked for. `Changed`:
+ * the server's plan changed under edits; the owner reapplies or discards them first.
+ */
 export type FactoryPlanDraftResult =
   | { readonly _tag: "Valid"; readonly plan: FactoryPlan }
-  | { readonly _tag: "Invalid"; readonly errors: FactoryPlanErrors };
+  | { readonly _tag: "Invalid"; readonly errors: FactoryPlanErrors }
+  | {
+      readonly _tag: "Mismatch";
+      readonly draft: FactoryPlanDestination;
+      readonly requested: FactoryPlanDestination;
+    }
+  | { readonly _tag: "Changed"; readonly current: FactoryPlan };
 
 const taskDraft = (task: FactoryPlanTask): FactoryPlanTaskDraft => ({
   base: task,
@@ -82,11 +106,20 @@ const taskDraft = (task: FactoryPlanTask): FactoryPlanTaskDraft => ({
   })),
 });
 
-/** The draft of a submitted plan, unedited. */
-export const factoryPlanDraft = (plan: FactoryPlan): FactoryPlanDraft => ({
+/** The draft of a delivery's submitted plan, unedited. */
+export const factoryPlanDraft = (
+  destination: FactoryPlanDestination,
+  plan: FactoryPlan,
+): FactoryPlanDraft => ({
+  environmentId: destination.environmentId,
+  deliveryId: destination.deliveryId,
   base: plan,
   tasks: plan.tasks.map(taskDraft),
+  current: null,
 });
+
+const sameDestination = (left: FactoryPlanDestination, right: FactoryPlanDestination) =>
+  left.environmentId === right.environmentId && left.deliveryId === right.deliveryId;
 
 const updateTask = (
   draft: FactoryPlanDraft,
@@ -266,10 +299,22 @@ const taskFromDraft = (
 };
 
 /**
- * The plan a draft submits, or a message for each task field it cannot submit. The fields the
- * draft does not edit, and the plan's note, come from its base unchanged.
+ * The plan a draft submits for `destination`, or a message for each task field it cannot submit.
+ * The fields the draft does not edit, and the plan's note, come from its base unchanged. A draft
+ * made for another delivery, or one whose plan changed under its edits, submits nothing.
  */
-export const factoryPlanFromDraft = (draft: FactoryPlanDraft): FactoryPlanDraftResult => {
+export const factoryPlanFromDraft = (
+  draft: FactoryPlanDraft,
+  destination: FactoryPlanDestination,
+): FactoryPlanDraftResult => {
+  if (!sameDestination(draft, destination)) {
+    return {
+      _tag: "Mismatch",
+      draft: { environmentId: draft.environmentId, deliveryId: draft.deliveryId },
+      requested: { environmentId: destination.environmentId, deliveryId: destination.deliveryId },
+    };
+  }
+  if (draft.current !== null) return { _tag: "Changed", current: draft.current };
   const errors: Record<string, FactoryPlanTaskErrors> = {};
   const tasks = draft.tasks.map((task) => {
     const taskErrors: FactoryPlanTaskErrors = {};
@@ -284,9 +329,8 @@ export const factoryPlanFromDraft = (draft: FactoryPlanDraft): FactoryPlanDraftR
 const sameStrings = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>
   left.length === right.length && left.every((value, index) => value === right[index]);
 
-const sameTask = (left: FactoryPlanTaskDraft, right: FactoryPlanTaskDraft) =>
-  left.title === right.title &&
-  left.summary === right.summary &&
+// Criteria and test plan entries are one edit: entries name criteria by position.
+const sameCriteria = (left: FactoryPlanTaskDraft, right: FactoryPlanTaskDraft) =>
   sameStrings(left.acceptance, right.acceptance) &&
   left.testPlan.length === right.testPlan.length &&
   left.testPlan.every((entry, index) => {
@@ -298,9 +342,12 @@ const sameTask = (left: FactoryPlanTaskDraft, right: FactoryPlanTaskDraft) =>
     );
   });
 
+const sameTask = (left: FactoryPlanTaskDraft, right: FactoryPlanTaskDraft) =>
+  left.title === right.title && left.summary === right.summary && sameCriteria(left, right);
+
 /** Whether the draft differs from its base in task order, membership or any edited field. */
 export const factoryPlanDraftEdited = (draft: FactoryPlanDraft): boolean => {
-  const unedited = factoryPlanDraft(draft.base);
+  const unedited = factoryPlanDraft(draft, draft.base);
   return (
     draft.tasks.length !== unedited.tasks.length ||
     draft.tasks.some((task, index) => {
@@ -308,4 +355,70 @@ export const factoryPlanDraftEdited = (draft: FactoryPlanDraft): boolean => {
       return task.base.id !== base.base.id || !sameTask(task, base);
     })
   );
+};
+
+/**
+ * A draft once the server's plan for its delivery moves. An unedited draft follows the new plan.
+ * An edited one keeps every edit over its base and holds the new plan as `current` until the
+ * owner reapplies or discards the edits; a plan equal to the base clears `current`. A plan for
+ * another delivery leaves the draft as it is.
+ */
+export const rebaseFactoryPlanDraft = (
+  draft: FactoryPlanDraft,
+  destination: FactoryPlanDestination,
+  next: FactoryPlan,
+): FactoryPlanDraft => {
+  if (!sameDestination(draft, destination)) return draft;
+  const atBase = Equal.equals(next, draft.base);
+  if (!factoryPlanDraftEdited(draft)) {
+    return atBase && draft.current === null ? draft : factoryPlanDraft(destination, next);
+  }
+  if (atBase) return draft.current === null ? draft : { ...draft, current: null };
+  if (draft.current !== null && Equal.equals(next, draft.current)) return draft;
+  return { ...draft, current: next };
+};
+
+/** Drops the edits of a draft whose plan changed, leaving the new plan unedited. */
+export const discardFactoryPlanEdits = (draft: FactoryPlanDraft): FactoryPlanDraft =>
+  draft.current === null ? draft : factoryPlanDraft(draft, draft.current);
+
+/**
+ * Moves a draft's edits onto the plan that changed under them. Each field the owner edited (the
+ * title, the summary, or the criteria with their test plan entries) keeps the owner's value, and
+ * every other field takes the new plan's. Edits of a task the new plan dropped are dropped, a task
+ * the owner removed stays removed, and a task only the new plan has is added unedited, so the
+ * task ids are always the new plan's. The owner's order holds when they reordered tasks, with
+ * added tasks after it; otherwise the new plan's order does.
+ */
+export const reapplyFactoryPlanEdits = (draft: FactoryPlanDraft): FactoryPlanDraft => {
+  const next = draft.current;
+  if (next === null) return draft;
+  const before = new Map(draft.base.tasks.map((task) => [task.id, taskDraft(task)]));
+  const edited = new Map(draft.tasks.map((task) => [task.base.id, task]));
+  const keptOrder = draft.base.tasks.filter((task) => edited.has(task.id));
+  const reordered = draft.tasks.some((task, index) => task.base.id !== keptOrder[index]!.id);
+  const order = reordered
+    ? [
+        ...draft.tasks.flatMap((mine) => next.tasks.filter((task) => task.id === mine.base.id)),
+        ...next.tasks.filter((task) => !before.has(task.id)),
+      ]
+    : next.tasks;
+  const tasks = order.flatMap((task): ReadonlyArray<FactoryPlanTaskDraft> => {
+    const old = before.get(task.id);
+    const fresh = taskDraft(task);
+    if (old === undefined) return [fresh];
+    const mine = edited.get(task.id);
+    if (mine === undefined) return [];
+    const criteria = sameCriteria(mine, old) ? fresh : mine;
+    return [
+      {
+        base: task,
+        title: mine.title === old.title ? fresh.title : mine.title,
+        summary: mine.summary === old.summary ? fresh.summary : mine.summary,
+        acceptance: criteria.acceptance,
+        testPlan: criteria.testPlan,
+      },
+    ];
+  });
+  return { ...draft, base: next, tasks, current: null };
 };

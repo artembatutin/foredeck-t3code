@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
-import { FactoryPlan, FactoryTaskId } from "@t3tools/contracts/fd/factory";
+import { EnvironmentId } from "@t3tools/contracts";
+import { FactoryDeliveryId, FactoryPlan, FactoryTaskId } from "@t3tools/contracts/fd/factory";
 import * as Schema from "effect/Schema";
 
 import {
@@ -23,6 +24,10 @@ const decode = Schema.decodeUnknownSync(FactoryPlan);
 const SCHEMA = FactoryTaskId.make("schema");
 const SERVER = FactoryTaskId.make("server");
 const WEB = FactoryTaskId.make("web");
+const DESTINATION = {
+  environmentId: EnvironmentId.make("env-a"),
+  deliveryId: FactoryDeliveryId.make("delivery-1"),
+};
 
 const PLAN = decode({
   tasks: [
@@ -66,14 +71,14 @@ const PLAN = decode({
 
 /** The plan of a draft, which must also decode with the contract. */
 const valid = (draft: FactoryPlanDraft) => {
-  const result = factoryPlanFromDraft(draft);
-  if (result._tag !== "Valid") throw new Error(`invalid draft: ${JSON.stringify(result.errors)}`);
+  const result = factoryPlanFromDraft(draft, DESTINATION);
+  if (result._tag !== "Valid") throw new Error(`invalid draft: ${JSON.stringify(result)}`);
   expect(decode(result.plan)).toStrictEqual(result.plan);
   return result.plan;
 };
 
 const invalid = (draft: FactoryPlanDraft) => {
-  const result = factoryPlanFromDraft(draft);
+  const result = factoryPlanFromDraft(draft, DESTINATION);
   if (result._tag !== "Invalid") throw new Error("expected an invalid draft");
   return result.errors;
 };
@@ -83,7 +88,7 @@ const taskOf = (plan: FactoryPlan, id: FactoryTaskId) => plan.tasks.find((task) 
 describe("factoryPlanDraft round trip", () => {
   it("returns a two-task plan with its note unchanged", () => {
     const plan = decode({ tasks: PLAN.tasks.slice(0, 2), note: PLAN.note });
-    const draft = factoryPlanDraft(plan);
+    const draft = factoryPlanDraft(DESTINATION, plan);
     expect(factoryPlanDraftEdited(draft)).toBe(false);
     const result = valid(draft);
     expect(result).toStrictEqual(plan);
@@ -98,7 +103,7 @@ describe("factoryPlanDraft round trip", () => {
 
   it("returns a plan without a note without adding one", () => {
     const plan = decode({ tasks: PLAN.tasks });
-    const result = valid(factoryPlanDraft(plan));
+    const result = valid(factoryPlanDraft(DESTINATION, plan));
     expect(result).toStrictEqual(plan);
     expect("note" in result).toBe(false);
   });
@@ -164,7 +169,7 @@ describe("factoryPlanDraft edits", () => {
   it.each(edits)(
     "changes only the $name, and reverting it leaves the draft unedited",
     ({ edit, revert, expected }) => {
-      const edited = edit(factoryPlanDraft(PLAN));
+      const edited = edit(factoryPlanDraft(DESTINATION, PLAN));
       expect(factoryPlanDraftEdited(edited)).toBe(true);
       // The other tasks and every other field stay exactly as planned.
       expect(valid(edited)).toStrictEqual(expected(PLAN));
@@ -176,7 +181,10 @@ describe("factoryPlanDraft edits", () => {
 
   it("trims prose the contract trims, and keeps a title as written", () => {
     const draft = editFactoryPlanCriterion(
-      editFactoryPlanTask(factoryPlanDraft(PLAN), WEB, { title: " Show it", summary: "  Wide. " }),
+      editFactoryPlanTask(factoryPlanDraft(DESTINATION, PLAN), WEB, {
+        title: " Show it",
+        summary: "  Wide. ",
+      }),
       WEB,
       1,
       " Shown. ",
@@ -190,7 +198,7 @@ describe("factoryPlanDraft edits", () => {
 
 describe("factoryPlanDraft criteria", () => {
   it("drops a removed criterion's entries and renumbers later ones", () => {
-    const draft = removeFactoryPlanCriterion(factoryPlanDraft(PLAN), SCHEMA, 2);
+    const draft = removeFactoryPlanCriterion(factoryPlanDraft(DESTINATION, PLAN), SCHEMA, 2);
     const task = taskOf(valid(draft), SCHEMA);
     expect(task.acceptance).toStrictEqual(["Plans decode.", "Old plans still decode."]);
     expect(task.testPlan).toStrictEqual([
@@ -202,14 +210,14 @@ describe("factoryPlanDraft criteria", () => {
   });
 
   it("ignores removing a criterion the task does not have", () => {
-    const draft = factoryPlanDraft(PLAN);
+    const draft = factoryPlanDraft(DESTINATION, PLAN);
     expect(valid(removeFactoryPlanCriterion(draft, SCHEMA, 4))).toStrictEqual(PLAN);
     expect(valid(removeFactoryPlanCriterion(draft, SCHEMA, 0))).toStrictEqual(PLAN);
   });
 
   it("appends a criterion with no test plan entry until one is added", () => {
     const added = editFactoryPlanCriterion(
-      addFactoryPlanCriterion(factoryPlanDraft(PLAN), SERVER),
+      addFactoryPlanCriterion(factoryPlanDraft(DESTINATION, PLAN), SERVER),
       SERVER,
       2,
       "Refusals name the field.",
@@ -230,7 +238,7 @@ describe("factoryPlanDraft criteria", () => {
   });
 
   it("reports the criterion left without an entry when its entry is removed", () => {
-    const draft = removeFactoryTestPlanEntry(factoryPlanDraft(PLAN), SCHEMA, 1);
+    const draft = removeFactoryTestPlanEntry(factoryPlanDraft(DESTINATION, PLAN), SCHEMA, 1);
     expect(invalid(draft)).toStrictEqual({
       schema: { "acceptance.2.testPlan": "Add a test plan entry for criterion 2." },
     });
@@ -241,7 +249,7 @@ describe("factoryPlanDraft order", () => {
   const ids = (plan: FactoryPlan) => plan.tasks.map((task) => task.id);
 
   it("moves a task down and up, keeping every task's fields", () => {
-    const down = moveFactoryPlanTask(factoryPlanDraft(PLAN), SCHEMA, 1);
+    const down = moveFactoryPlanTask(factoryPlanDraft(DESTINATION, PLAN), SCHEMA, 1);
     const plan = valid(down);
     expect(ids(plan)).toStrictEqual(["server", "schema", "web"]);
     for (const task of PLAN.tasks) expect(taskOf(plan, task.id)).toStrictEqual(task);
@@ -252,14 +260,14 @@ describe("factoryPlanDraft order", () => {
   });
 
   it("changes nothing for a move past either end", () => {
-    const draft = factoryPlanDraft(PLAN);
+    const draft = factoryPlanDraft(DESTINATION, PLAN);
     expect(moveFactoryPlanTask(draft, WEB, 1)).toBe(draft);
     expect(moveFactoryPlanTask(draft, SCHEMA, -1)).toBe(draft);
     expect(valid(moveFactoryPlanTask(draft, WEB, 1))).toStrictEqual(PLAN);
   });
 
   it("removes a task, keeping the others' ids, fields and order", () => {
-    const draft = removeFactoryPlanTask(factoryPlanDraft(PLAN), SERVER);
+    const draft = removeFactoryPlanTask(factoryPlanDraft(DESTINATION, PLAN), SERVER);
     const plan = valid(draft);
     expect(ids(plan)).toStrictEqual(["schema", "web"]);
     expect(plan.tasks).toStrictEqual([taskOf(PLAN, SCHEMA), taskOf(PLAN, WEB)]);
@@ -269,7 +277,7 @@ describe("factoryPlanDraft order", () => {
 });
 
 describe("factoryPlanFromDraft errors", () => {
-  const draft = factoryPlanDraft(PLAN);
+  const draft = factoryPlanDraft(DESTINATION, PLAN);
   const long = (length: number) => "x".repeat(length);
 
   it.each([
