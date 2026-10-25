@@ -1,3 +1,4 @@
+export { createFactoryEnvironmentAtoms } from "./atoms.ts";
 export {
   currentDelivery,
   FACTORY_STAGE_LABELS,
