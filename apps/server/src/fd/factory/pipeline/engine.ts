@@ -353,25 +353,22 @@ const concludePlan = (delivery: FactoryDeliveryState, plan: FactoryAcceptedPlan)
     : enter(delivery, "approve_plan", (current) => begin(current, standardStages.approve_plan));
 
 /**
- * Acts on the round's accepted review once its run has completed. A parent's integrate review has
- * no repair round (owner decision): one that blocks blocks the parent, and one that passes
- * approves its branch for the PR stage.
+ * Acts on the round's accepted review once its run has completed. A passing one enters `record`,
+ * which approves the commit it judged: a task's, or a parent's whole branch after its integrate
+ * review. A parent's integrate review has no repair round (owner decision), so one that blocks
+ * blocks the parent.
  */
 const concludeReview = (delivery: FactoryDeliveryState, review: FactoryAcceptedReview) => {
-  if (delivery.stage === standardStages.integrate.name) {
-    return review.summary.blocking
-      ? blocked(delivery, { reason: "review_changes_required", summary: review.summary })
-      : enter(delivery, "pr", (current) =>
-          begin({ ...current, status: "approved" }, standardStages.pr),
-        );
+  if (!review.summary.blocking) {
+    return enter(delivery, "record", (current) => begin(current, standardStages.record));
   }
-  return review.summary.blocking
-    ? repair(delivery, {
+  return delivery.stage === standardStages.integrate.name
+    ? blocked(delivery, { reason: "review_changes_required", summary: review.summary })
+    : repair(delivery, {
         stage: "review",
         fingerprint: review.fingerprint,
         exhausted: { reason: "review_changes_required", summary: review.summary },
-      })
-    : enter(delivery, "record", (current) => begin(current, standardStages.record));
+      });
 };
 
 /** Whether the delivery is in a review round: a task's review, or a parent's integrate review. */
@@ -489,8 +486,9 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * integrates: it verifies its whole branch afresh, then a new reviewer thread reviews the branch
  * from where it started by every task's criteria, under a single item's review rules (one
  * accepted review per round, acted on once its run completes, the fenced read, one corrected
- * retry). Integrate has no repair round: a failed verify or a blocking review blocks the parent,
- * and a passing review approves it for the PR stage.
+ * retry). Integrate has no repair round: a failed verify or a blocking review blocks the parent.
+ * A passing review enters `record`, which approves the branch's reviewed commit, and the approved
+ * parent opens its one pull request as a single item does; its children open none.
  *
  * A single item runs from start to its pull request: the author thread, the branch settle
  * check with at most one fix-commit turn, the verify command, then a reviewer thread whose one

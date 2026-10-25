@@ -30,7 +30,7 @@ describe("the standard pipeline", () => {
     const { beforeChildren, perChild, afterChildren } = standardPipeline.parent;
     expect(names(beforeChildren)).toEqual(["plan", "approve_plan"]);
     expect(names(perChild)).toEqual(["author", "verify", "review", "record"]);
-    expect(names(afterChildren)).toEqual(["integrate", "pr", "follow_through"]);
+    expect(names(afterChildren)).toEqual(["integrate", "record", "pr", "follow_through"]);
   });
 
   it("uses only contract stage names and kinds", () => {

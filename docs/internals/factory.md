@@ -304,8 +304,9 @@ is (see [one accepted review per round](#one-accepted-review-per-round-acted-on-
 
 Integrate has no repair round (owner decision): a parent has no author thread of its own and its
 children are approved, so a failed verify or a blocking review blocks the parent for its owner. A
-resume verifies and reviews again, with a new reviewer, so whatever was committed meanwhile is
-judged with the rest.
+passing review enters [record](#record-checks-the-worktree-again), as a task's does. A resume
+verifies and reviews again, with a new reviewer, so whatever was committed meanwhile is judged
+with the rest.
 
 ## Clients see a review's details as it was accepted
 
@@ -344,8 +345,10 @@ worktree must be clean. Otherwise nothing is written and the delivery blocks, na
 Numbered verify and review evidence is never overwritten, but a task has one current approval: a
 later approval of the task replaces its `approval-<taskId>.json` and `lastReviewedSha`. A single
 item is its delivery's one task, written in the transaction that inserts the delivery; a child's
-task is its parent's task it was created for, and its approval goes to the child's evidence. See
-[`FactoryRecord.ts`](../../apps/server/src/fd/factory/FactoryRecord.ts).
+task is its parent's task it was created for, and its approval goes to the child's evidence. A
+parent's tasks hold its children's approvals, so after integrate it approves its whole branch
+with no task of its own: `approval.json` in its evidence, which its pull request reads for the
+commit to publish. See [`FactoryRecord.ts`](../../apps/server/src/fd/factory/FactoryRecord.ts).
 
 ## Stop waits for a stage boundary; cancel does not
 
@@ -453,6 +456,13 @@ thread; the stacked action's RPC handler in `ws.ts` does that afterwards. Factor
 `linkCreatedPullRequest` itself, so the author thread shows the pull request as one it created.
 A pull request step that reports no number and URL blocks rather than recording a pull request
 Factory cannot name.
+
+A parent opens the one pull request of its branch, for the commit its `approval.json` names, and
+only while each child is approved for the commit its own task records. The body lists the whole
+branch's verify and integrate review, then each child item in plan order with its key, title,
+verified commit and review, read from Work as the parent's title is. A parent has no author thread,
+so the pull request is linked to its last child's author. A child never reaches the PR stage, and
+the PR stage refuses one.
 
 Deliveries approved before the PR stage existed load without a pull request and stay `approved` at
 `record`, awaiting nothing; nothing opens their pull request on its own.

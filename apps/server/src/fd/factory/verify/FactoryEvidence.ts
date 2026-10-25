@@ -43,10 +43,13 @@ export class FactoryEvidence extends Context.Service<
       deliveryId: FactoryDeliveryId,
       prefix: "verify" | "review",
     ) => Effect.Effect<FactoryEvidenceRun, FactoryEvidenceError>;
-    /** The task's `approval-<taskId>.json` path in the delivery's folder, created on demand. */
+    /**
+     * The task's `approval-<taskId>.json` path in the delivery's folder, created on demand, or
+     * for no task (a parent's approval of its whole branch) `approval.json`.
+     */
     readonly approvalFile: (
       deliveryId: FactoryDeliveryId,
-      taskId: FactoryTaskId,
+      taskId: FactoryTaskId | null,
     ) => Effect.Effect<string, FactoryEvidenceError>;
     /** The delivery's `plan.json` path in its folder, created on demand. */
     readonly planFile: (
@@ -89,7 +92,8 @@ const make = Effect.gen(function* () {
       };
     }),
     approvalFile: Effect.fn("FactoryEvidence.approvalFile")(function* (deliveryId, taskId) {
-      return path.join(yield* directoryOf(deliveryId), `approval-${taskId}.json`);
+      const name = taskId === null ? "approval.json" : `approval-${taskId}.json`;
+      return path.join(yield* directoryOf(deliveryId), name);
     }),
     planFile: Effect.fn("FactoryEvidence.planFile")(function* (deliveryId) {
       return path.join(yield* directoryOf(deliveryId), "plan.json");

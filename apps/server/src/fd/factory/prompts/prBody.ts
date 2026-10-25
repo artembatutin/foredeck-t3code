@@ -15,13 +15,17 @@ import { commandLine, describeResult } from "./review.ts";
 /** What the pull request says about its item. */
 export type FactoryPullRequestItem = Pick<WorkItemDetail, "key" | "title" | "url">;
 
-/** An accepted task and what its approval rests on. */
-export interface FactoryPullRequestTask {
-  readonly title: string;
+/** What an approval rests on. */
+export interface FactoryPullRequestEvidence {
   /** The passing verify run of the approved commit. */
   readonly receipt: FactoryVerifyReceipt;
   /** The accepted review of that commit, and the round it closed. */
   readonly review: { readonly round: number; readonly summary: FactoryReviewSummary };
+}
+
+/** An accepted task, a parent's child item among them, and what its approval rests on. */
+export interface FactoryPullRequestTask extends FactoryPullRequestEvidence {
+  readonly title: string;
 }
 
 // The host's limits, which the stacked action's title and body overrides share.
@@ -36,33 +40,43 @@ const cut = (text: string, max: number) =>
 export const renderPullRequestTitle = (item: FactoryPullRequestItem): string =>
   cut(`${item.key}: ${item.title}`, TITLE_MAX_CHARS);
 
-const taskLines = (task: FactoryPullRequestTask, index: number) => {
-  const { receipt, review } = task;
+const evidenceLines = ({ receipt, review }: FactoryPullRequestEvidence, indent: string) => {
   const { high, medium, low } = review.summary.findings;
   return [
-    `${index + 1}. ${task.title}`,
-    `   - Verified commit: \`${receipt.headSha}\``,
-    `   - Verify command: \`${cut(commandLine(receipt), COMMAND_MAX_CHARS)}\`, ${describeResult(receipt)}`,
-    `   - Review: ${review.summary.verdict} in round ${review.round}, with ${high} high, ${medium} medium and ${low} low severity findings`,
-  ].join("\n");
+    `${indent}- Verified commit: \`${receipt.headSha}\``,
+    `${indent}- Verify command: \`${cut(commandLine(receipt), COMMAND_MAX_CHARS)}\`, ${describeResult(receipt)}`,
+    `${indent}- Review: ${review.summary.verdict} in round ${review.round}, with ${high} high, ${medium} medium and ${low} low severity findings`,
+  ];
 };
 
-/** The item, with its link when it has one, then each accepted task with its evidence. */
+const taskLines = (task: FactoryPullRequestTask, index: number) =>
+  [`${index + 1}. ${task.title}`, ...evidenceLines(task, "   ")].join("\n");
+
+/**
+ * The item, with its link when it has one, then each accepted task with its evidence. A parent's
+ * tasks are its child items in plan order, and its `branch`, the whole branch's verify and
+ * integrate review, comes before them: a body cut to the host's limit loses its end.
+ */
 export const renderPullRequestBody = (input: {
   readonly item: FactoryPullRequestItem;
   readonly tasks: ReadonlyArray<FactoryPullRequestTask>;
+  readonly branch?: FactoryPullRequestEvidence;
 }): string => {
-  const { item } = input;
+  const { item, branch } = input;
   const heading = [
     `Work item ${item.key}: ${item.title}`,
     ...(item.url === null ? [] : [`Link: ${item.url}`]),
   ];
-  return cut(
-    [heading.join("\n"), `Accepted tasks:\n\n${input.tasks.map(taskLines).join("\n")}`].join(
-      "\n\n",
-    ),
-    BODY_MAX_CHARS,
-  );
+  const tasks = input.tasks.map(taskLines).join("\n");
+  const sections =
+    branch === undefined
+      ? [heading.join("\n"), `Accepted tasks:\n\n${tasks}`]
+      : [
+          heading.join("\n"),
+          `Whole branch, verified and reviewed by every child's criteria:\n\n${evidenceLines(branch, "").join("\n")}`,
+          `Child items, in order:\n\n${tasks}`,
+        ];
+  return cut(sections.join("\n\n"), BODY_MAX_CHARS);
 };
 
 /** A rule the rendered title or body breaks; Factory publishes neither while one does. */

@@ -54,11 +54,15 @@ export type FactoryRecordError =
   | FactoryEvidence.FactoryEvidenceError
   | FactoryStoreError;
 
-/** `approval-<taskId>.json`: the commit the task was approved for and the evidence behind it. */
+/**
+ * `approval-<taskId>.json`: the commit the task was approved for and the evidence behind it. A
+ * parent's `approval.json` names no task: it approves the whole branch, by its integrate verify
+ * and review.
+ */
 const FactoryApprovalEvidence = Schema.Struct({
   version: PositiveInt,
   deliveryId: FactoryDeliveryId,
-  taskId: FactoryTaskId,
+  taskId: Schema.optionalKey(FactoryTaskId),
   headSha: Schema.String,
   tree: Schema.String,
   /** The passing receipt's `verify-<n>.json`. */
@@ -68,7 +72,30 @@ const FactoryApprovalEvidence = Schema.Struct({
   approvedAt: IsoDateTime,
 });
 const APPROVAL_EVIDENCE_VERSION = 1;
-const encodeEvidence = Schema.encodeEffect(Schema.fromJsonString(FactoryApprovalEvidence));
+const ApprovalJson = Schema.fromJsonString(FactoryApprovalEvidence);
+const encodeEvidence = Schema.encodeEffect(ApprovalJson);
+const decodeEvidence = Schema.decodeEffect(ApprovalJson);
+
+/**
+ * The parent's `approval.json`, which its record wrote for the commit its whole branch was
+ * approved for; none before any was written. One that cannot be read or decoded fails rather than
+ * count as none.
+ */
+export const readBranchApproval = Effect.fn("FactoryRecord.readBranchApproval")(function* (
+  deliveryId: FactoryDeliveryId,
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const evidence = yield* FactoryEvidence.FactoryEvidence;
+  const file = yield* evidence.approvalFile(deliveryId, null);
+  const failed = (cause: unknown) =>
+    new FactoryEvidence.FactoryEvidenceError({ operation: "read", path: file, cause });
+  if (!(yield* fileSystem.exists(file).pipe(Effect.mapError(failed)))) return Option.none();
+  return Option.some(
+    yield* fileSystem
+      .readFileString(file)
+      .pipe(Effect.flatMap(decodeEvidence), Effect.mapError(failed)),
+  );
+});
 
 /**
  * The record gate, which passes without the owner. It approves the delivery's task for the
@@ -76,8 +103,11 @@ const encodeEvidence = Schema.encodeEffect(Schema.fromJsonString(FactoryApproval
  * the commit the round's accepted review judged, and the worktree is clean. An approval writes
  * `approval-<taskId>.json` to the delivery's evidence, then sets the task's `lastReviewedSha`; a
  * later approval of the task replaces both. A child's task is its parent's task it was created
- * for, whose `lastReviewedSha` the parent's next child starts from. Any difference writes nothing:
- * the outcome names the expected and actual commit and what differed, and the engine blocks on it.
+ * for, whose `lastReviewedSha` the parent's next child starts from. A parent records its whole
+ * branch after its integrate verify and review: it writes `approval.json`, which its pull request
+ * reads, and leaves the approvals its children recorded on its tasks as they are. Any difference
+ * writes nothing: the outcome names the expected and actual commit and what differed, and the
+ * engine blocks on it.
  */
 export class FactoryRecord extends Context.Service<
   FactoryRecord,
@@ -142,7 +172,8 @@ const make = Effect.gen(function* () {
     function* (delivery) {
       const { deliveryId } = delivery;
       const basis = yield* basisOf(delivery);
-      const task = yield* taskOf(delivery);
+      // A parent's tasks are its children's; it approves its branch, not one of them.
+      const task = delivery.state.kind === "parent" ? null : yield* taskOf(delivery);
 
       const current = yield* readWorktreeState(basis.worktreePath).pipe(
         Effect.provideContext(gitContext),
@@ -162,11 +193,11 @@ const make = Effect.gen(function* () {
         } satisfies FactoryRecordOutcome;
       }
 
-      const file = yield* evidence.approvalFile(deliveryId, task.taskId);
+      const file = yield* evidence.approvalFile(deliveryId, task?.taskId ?? null);
       yield* encodeEvidence({
         version: APPROVAL_EVIDENCE_VERSION,
         deliveryId,
-        taskId: task.taskId,
+        ...(task === null ? {} : { taskId: task.taskId }),
         headSha: current.headSha,
         tree: current.tree,
         receiptPath: basis.receiptPath,
@@ -179,6 +210,9 @@ const make = Effect.gen(function* () {
             new FactoryEvidence.FactoryEvidenceError({ operation: "write", path: file, cause }),
         ),
       );
+      if (task === null) {
+        return { type: "approved", evidencePath: file } satisfies FactoryRecordOutcome;
+      }
       const updated = yield* tasks.setLastReviewedSha({
         deliveryId: task.deliveryId,
         taskId: task.taskId,

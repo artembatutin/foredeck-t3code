@@ -284,15 +284,15 @@ describe("a parent's integrate verify", () => {
 });
 
 describe("the integrate review", () => {
-  it("takes the awaited run's review, and a passing one leaves integrate once that run ends", () => {
+  it("takes the awaited run's review, and a passing one enters record once that run ends", () => {
     const taken = advance(reviewing, submitted(accepted(false)));
     expect(taken.effects).toEqual([]);
     expect(taken.delivery.awaiting).toEqual(reviewing.awaiting);
     expect(taken.delivery.reviews).toEqual([{ ...accepted(false).review, round: 1 }]);
 
     const done = advance(taken.delivery, reviewEnded());
-    expect(done.effects).toEqual([{ id: 7, type: "open_pr" }]);
-    expect(done.delivery).toMatchObject({ status: "approved", stage: "pr", block: null });
+    expect(done.effects).toEqual([{ id: 7, type: "record_approval" }]);
+    expect(done.delivery).toMatchObject({ status: "running", stage: "record", block: null });
   });
 
   it("blocks with a blocking review's summary, with no repair turn though rounds are left", () => {
@@ -347,7 +347,7 @@ describe("the integrate review", () => {
       effectId: 9,
       judgment: accepted(false, "fallback"),
     });
-    expect(done.delivery).toMatchObject({ status: "approved", stage: "pr" });
+    expect(done.delivery).toMatchObject({ status: "running", stage: "record" });
     expect(done.delivery.reviews.at(-1)?.source).toBe("fallback");
   });
 

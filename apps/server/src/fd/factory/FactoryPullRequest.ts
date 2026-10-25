@@ -5,10 +5,12 @@ import {
   type GitRunStackedActionResult,
 } from "@t3tools/contracts";
 import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
+import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import type * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as GitWorkflow from "../../git/GitWorkflowService.ts";
@@ -17,22 +19,32 @@ import type * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import type * as ProjectService from "../../project/ProjectService.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkActor, type WorkDomainError, WorkService } from "../work-management/index.ts";
+import { taskOfChild } from "./FactoryChildren.ts";
+import { readBranchApproval } from "./FactoryRecord.ts";
 import { FactoryBranchReadError, type FactoryWorktreeMissingError } from "./git/branchFacts.ts";
 import { readWorktreeState } from "./git/worktreeState.ts";
 import type { FactoryStoreError } from "./persistence/errors.ts";
-import type { StoredFactoryDelivery } from "./persistence/FactoryDeliveryStore.ts";
+import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 import { acceptedReview, receiptFailed } from "./pipeline/state.ts";
-import type { FactoryEffect, FactoryOpenedPullRequest } from "./pipeline/state.ts";
+import type {
+  FactoryDeliveryState,
+  FactoryEffect,
+  FactoryOpenedPullRequest,
+} from "./pipeline/state.ts";
 import {
+  type FactoryPullRequestEvidence,
   pullRequestTextProblems,
   renderPullRequestBody,
   renderPullRequestTitle,
 } from "./prompts/prBody.ts";
+import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
 
 /**
  * The delivery records nothing to open a pull request for: no worktree or author thread, no
- * passing last receipt and review, or no one task approved for the commit they cover.
+ * passing last receipt and review, or no one task approved for the commit they cover. For a
+ * parent: no approval of its branch for that commit, or a child that is not approved for its
+ * own verified, reviewed commit, or a last child without an author thread.
  */
 export class FactoryPullRequestBasisMissingError extends Schema.TaggedError<FactoryPullRequestBasisMissingError>()(
   "FactoryPullRequestBasisMissingError",
@@ -122,6 +134,7 @@ export type FactoryPullRequestError =
   | FactoryPullRequestPublishedUnapprovedError
   | FactoryWorktreeMissingError
   | FactoryBranchReadError
+  | FactoryEvidence.FactoryEvidenceError
   | FactoryStoreError
   | WorkDomainError
   | GitManagerServiceError;
@@ -129,16 +142,19 @@ export type FactoryPullRequestError =
 /**
  * The PR stage's work. Opens the delivery's pull request from its worktree through the stacked
  * Git action (`create_pr`) with the item's title and a body listing the accepted task and its
- * evidence, then links it to the author thread. Text that names an AI agent, model or provider or
- * carries attribution is never published. The action runs only while the worktree holds the
- * approved commit on a clean tree, and pushes that exact commit, so a commit made meanwhile never
- * reaches the remote. An open pull request for the branch is reported as it is, unchanged.
+ * evidence, then links it to the author thread. A parent's is its one pull request: its body lists
+ * its whole branch's verify and integrate review, then each child item in plan order with its
+ * own, and it is linked to the last child's author thread, since a parent has none. A child opens
+ * none. Text that names an AI agent, model or provider or carries attribution is never published.
+ * The action runs only while the worktree holds the approved commit on a clean tree, and pushes
+ * that exact commit, so a commit made meanwhile never reaches the remote. An open pull request for
+ * the branch is reported as it is, unchanged.
  */
 export class FactoryPullRequest extends Context.Service<
   FactoryPullRequest,
   {
     readonly open: (
-      delivery: StoredFactoryDelivery,
+      delivery: FactoryDeliveryStore.StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "open_pr" }>,
     ) => Effect.Effect<FactoryOpenedPullRequest, FactoryPullRequestError>;
   }
@@ -161,45 +177,115 @@ const openedPullRequest = ({ pr }: GitRunStackedActionResult) =>
     ? ({ number: pr.number, url: pr.url, headBranch: pr.headBranch } as const)
     : undefined;
 
+/**
+ * A delivery's last receipt and the review accepted in its current round, when that receipt passed
+ * and that review does not block; record checked that it judged the receipt's commit.
+ */
+const passingEvidence = (state: FactoryDeliveryState) => {
+  const receipt = state.receipts.at(-1);
+  const review = acceptedReview(state);
+  return receipt === undefined ||
+    receiptFailed(receipt) ||
+    review === undefined ||
+    review.summary.blocking
+    ? undefined
+    : ({
+        receipt,
+        review: { round: review.round, summary: review.summary },
+      } satisfies FactoryPullRequestEvidence);
+};
+
 const make = Effect.gen(function* () {
   const gitWorkflow = yield* GitWorkflow.GitWorkflowService;
   const git = yield* GitVcsDriver.GitVcsDriver;
   const work = yield* WorkService.WorkService;
+  const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
   const tasks = yield* FactoryTaskStore.FactoryTaskStore;
   const context = yield* Effect.context<
     | FileSystem.FileSystem
     | GitVcsDriver.GitVcsDriver
     | Orchestrator.OrchestratorV2
     | ProjectService.ProjectService
+    | FactoryEvidence.FactoryEvidence
   >();
 
-  /** The approved task and what its approval rests on. */
+  /** A single item's approved task and what its approval rests on. */
   const basisOf = Effect.fn("FactoryPullRequest.basis")(function* (
-    delivery: StoredFactoryDelivery,
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
   ) {
     const { deliveryId, state } = delivery;
-    const receipt = state.receipts.at(-1);
-    const review = acceptedReview(state);
+    const evidence = passingEvidence(state);
     const stored = yield* tasks.listByDelivery(deliveryId);
     const [task] = stored;
     if (
+      state.kind !== "single" ||
       state.worktreePath === null ||
       state.threads.author === undefined ||
-      receipt === undefined ||
-      receiptFailed(receipt) ||
-      review === undefined ||
-      review.summary.blocking ||
+      evidence === undefined ||
       task === undefined ||
       stored.length > 1 ||
-      task.lastReviewedSha !== receipt.headSha
+      task.lastReviewedSha !== evidence.receipt.headSha
     ) {
       return yield* new FactoryPullRequestBasisMissingError({ deliveryId });
     }
     return {
+      type: "single" as const,
       worktreePath: state.worktreePath,
       author: state.threads.author,
       approvedSha: task.lastReviewedSha,
-      task: { title: task.plan?.title, receipt, review },
+      task: { title: task.plan?.title, ...evidence },
+    };
+  });
+
+  /**
+   * A parent's approved branch and what its approval rests on: its `approval.json` for the commit
+   * its last receipt verified and its integrate review passed, and each child, in plan order,
+   * approved for the commit its own last receipt verified and its review passed.
+   */
+  const parentBasisOf = Effect.fn("FactoryPullRequest.parentBasis")(function* (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+  ) {
+    const { deliveryId, state } = delivery;
+    const missing = new FactoryPullRequestBasisMissingError({ deliveryId });
+    const branch = passingEvidence(state);
+    if (state.worktreePath === null || branch === undefined || state.children.length === 0) {
+      return yield* missing;
+    }
+    const approval = Option.getOrUndefined(
+      yield* readBranchApproval(deliveryId).pipe(Effect.provideContext(context)),
+    );
+    if (approval?.headSha !== branch.receipt.headSha || approval.tree !== branch.receipt.tree) {
+      return yield* missing;
+    }
+    const stored = yield* tasks.listByDelivery(deliveryId);
+    const children = yield* Effect.forEach(state.children, (childId) =>
+      Effect.gen(function* () {
+        const child = Option.getOrUndefined(yield* deliveries.get(childId));
+        const task = taskOfChild(deliveryId, stored, childId);
+        const evidence = child === undefined ? undefined : passingEvidence(child.state);
+        if (
+          child?.parentId !== deliveryId ||
+          child.state.status !== "approved" ||
+          evidence === undefined ||
+          task === undefined ||
+          task.childItemId === null ||
+          task.lastReviewedSha !== evidence.receipt.headSha
+        ) {
+          return yield* missing;
+        }
+        const ref: WorkItemRef = { sourceId: delivery.itemRef.sourceId, itemId: task.childItemId };
+        return { ref, author: child.state.threads.author, ...evidence };
+      }),
+    );
+    const author = children.at(-1)?.author;
+    if (author === undefined) return yield* missing;
+    return {
+      type: "parent" as const,
+      worktreePath: state.worktreePath,
+      author,
+      approvedSha: approval.headSha,
+      branch,
+      children,
     };
   });
 
@@ -230,20 +316,33 @@ const make = Effect.gen(function* () {
   const open: FactoryPullRequest["Service"]["open"] = Effect.fn("FactoryPullRequest.open")(
     function* (delivery, effect) {
       const { deliveryId, projectId } = delivery;
-      const basis = yield* basisOf(delivery);
-      const item = yield* work.getItem(itemReader(deliveryId), { ref: delivery.itemRef });
-      const { task } = basis;
+      const reader = itemReader(deliveryId);
+      const basis =
+        delivery.state.kind === "parent"
+          ? yield* parentBasisOf(delivery)
+          : yield* basisOf(delivery);
+      const item = yield* work.getItem(reader, { ref: delivery.itemRef });
       const prTitle = renderPullRequestTitle(item);
-      const prBody = renderPullRequestBody({
-        item,
-        tasks: [
-          {
-            title: task.title ?? item.title,
-            receipt: task.receipt,
-            review: { round: task.review.round, summary: task.review.summary },
-          },
-        ],
-      });
+      const prBody =
+        basis.type === "single"
+          ? renderPullRequestBody({
+              item,
+              tasks: [{ ...basis.task, title: basis.task.title ?? item.title }],
+            })
+          : renderPullRequestBody({
+              item,
+              branch: basis.branch,
+              // Each child as its item reads now, under its key, as the parent's title is.
+              tasks: yield* Effect.forEach(basis.children, ({ ref, receipt, review }) =>
+                work.getItem(reader, { ref }).pipe(
+                  Effect.map((child) => ({
+                    title: `${child.key}: ${child.title}`,
+                    receipt,
+                    review,
+                  })),
+                ),
+              ),
+            });
       const problems = pullRequestTextProblems({ title: prTitle, body: prBody });
       if (problems.length > 0) {
         return yield* new FactoryPullRequestTextRefusedError({ deliveryId, problems });

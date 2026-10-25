@@ -24,7 +24,8 @@ export interface FactoryPipeline {
 
 /**
  * The standard pipeline's stages. `record` is a gate the server passes on its own: it admits
- * only the verified, reviewed commit. Plan approval is the one gate that waits for the owner.
+ * only the verified, reviewed commit, a task's or, after integrate, a parent's whole branch's.
+ * Plan approval is the one gate that waits for the owner.
  * `repair` has no place in the order; it is a turn on the author thread between verify or
  * review and the next verify.
  */
@@ -59,7 +60,12 @@ export const standardPipeline: FactoryPipeline = {
       standardStages.review,
       standardStages.record,
     ],
-    afterChildren: [standardStages.integrate, standardStages.pr, standardStages.follow_through],
+    afterChildren: [
+      standardStages.integrate,
+      standardStages.record,
+      standardStages.pr,
+      standardStages.follow_through,
+    ],
   },
 };
 
