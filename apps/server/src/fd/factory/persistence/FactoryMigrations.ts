@@ -87,7 +87,7 @@ const FactoryStageRuns = Effect.gen(function* () {
 
 const FactoryWorkComments = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-  // A comment is attempted at most once: posted only after `attempted_at` is set.
+  // A comment is claimed, setting `attempted_at`, before it is posted.
   yield* sql`CREATE TABLE fd_factory_work_comments (
     delivery_id TEXT NOT NULL REFERENCES fd_factory_deliveries (delivery_id),
     transition INTEGER NOT NULL CHECK (transition >= 1),
@@ -99,12 +99,23 @@ const FactoryWorkComments = Effect.gen(function* () {
   )`;
 });
 
+const FactoryWorkCommentOutcomes = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  // Set once the post returned. A comment attempted but not finished was left by a process that
+  // died mid-post, and is reconciled against its item. Comments attempted before this column were
+  // never retried, so they count as finished.
+  yield* sql`ALTER TABLE fd_factory_work_comments ADD COLUMN finished_at TEXT`;
+  yield* sql`UPDATE fd_factory_work_comments SET finished_at = attempted_at
+    WHERE attempted_at IS NOT NULL`;
+});
+
 export const factoryMigrationEntries = [
   [1, "FactorySettings", FactorySettings],
   [2, "FactoryDeliveries", FactoryDeliveries],
   [3, "FactoryTasks", FactoryTasks],
   [4, "FactoryStageRuns", FactoryStageRuns],
   [5, "FactoryWorkComments", FactoryWorkComments],
+  [6, "FactoryWorkCommentOutcomes", FactoryWorkCommentOutcomes],
 ] as const;
 
 const run = Migrator.make({});

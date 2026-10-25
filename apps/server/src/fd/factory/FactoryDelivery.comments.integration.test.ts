@@ -123,9 +123,10 @@ describe("Factory's Work comments on a single-item delivery", () => {
         assert.strictEqual(state.status, "pr_open");
         const approved = state.receipts.at(-1)?.headSha;
         assert.isDefined(approved);
+        // Each ends with its reference, which a restart looks for on the item.
         const expected = [
-          `Factory approved commit ${approved} for this item after verify and review, and is opening its pull request.`,
-          `Factory opened pull request #${fakePullRequest.number} for this item. ${fakePullRequest.url}`,
+          `Factory approved commit ${approved} for this item after verify and review, and is opening its pull request. Factory delivery ${deliveryId}, update 1.`,
+          `Factory opened pull request #${fakePullRequest.number} for this item. ${fakePullRequest.url} Factory delivery ${deliveryId}, update 2.`,
         ];
         assert.deepStrictEqual(
           world.commentCalls.map(({ input }) => input.body),

@@ -4,6 +4,7 @@ import { AuthWorkWriteScope, ProjectId, RunId, ThreadId } from "@t3tools/contrac
 import { FactoryDeliveryId, FactoryProjectSettings } from "@t3tools/contracts/fd/factory";
 import {
   type WorkCommentInput,
+  type WorkItemDetail,
   WorkItemId,
   WorkSourceId,
 } from "@t3tools/contracts/fd/work-management";
@@ -60,6 +61,14 @@ interface World {
   work: "posts" | "unavailable" | "refuses";
   /** While set, every post waits in Work for `release`; `posting` resolves once one waits. */
   held: Hold | null;
+  /** The comment bodies the item holds, oldest first: every post Work took lands here. */
+  readonly source: Array<string>;
+  /** Whether Work reads the item's comments as cut to a bound. */
+  truncated: boolean;
+  /** Whether reading the item fails, as with a source that cannot be reached. */
+  readFails: boolean;
+  /** How many times the item was read. */
+  reads: number;
   readonly warnings: Array<string>;
 }
 
@@ -100,7 +109,8 @@ const fakeWork = (world: World) =>
         world.finished.push(input.clientRequestId);
         switch (world.work) {
           case "posts":
-            return { commentId: String(world.posts.length) };
+            world.source.push(input.body);
+            return { commentId: String(world.source.length) };
           case "unavailable":
             return yield* Effect.fail(
               new FakeWorkUnavailable({
@@ -114,6 +124,28 @@ const fakeWork = (world: World) =>
               }) as unknown as WorkDomainError,
             );
         }
+      }),
+    getItem: () =>
+      Effect.suspend(() => {
+        world.reads += 1;
+        if (world.readFails) {
+          return Effect.fail(
+            new FakeWorkUnavailable({
+              detail: "The source could not be reached.",
+            }) as unknown as WorkDomainError,
+          );
+        }
+        // Only the comments are read.
+        return Effect.succeed({
+          comments: world.source.map((body, index) => ({
+            id: String(index + 1),
+            author: null,
+            body,
+            createdAt: "2026-10-25T08:00:00.000Z",
+            updatedAt: null,
+          })),
+          commentsTruncated: world.truncated,
+        } as unknown as WorkItemDetail);
       }),
   });
 
@@ -191,7 +223,17 @@ const serverLayer = (world: World, poster = FactoryWorkComments.layer) =>
   );
 
 const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
-  const world: World = { posts: [], finished: [], work: "posts", held: null, warnings: [] };
+  const world: World = {
+    posts: [],
+    finished: [],
+    work: "posts",
+    held: null,
+    source: [],
+    truncated: false,
+    readFails: false,
+    reads: 0,
+    warnings: [],
+  };
   return body(world).pipe(Effect.provide(baseLayer(world)), Effect.scoped);
 };
 
@@ -381,7 +423,12 @@ const authoringOf = (name: string) => {
 const stepOf = (id: FactoryDeliveryId, event: FactoryEvent) =>
   Effect.flatMap(FactoryWorker.FactoryWorker, (worker) => worker.step(id, event));
 
-const bodies = (world: World) => world.posts.map(({ input }) => input.body);
+/** The reference a posted comment of the delivery ends with. */
+const referenceOf = (id: FactoryDeliveryId, transition: number) =>
+  `Factory delivery ${id}, update ${transition}.`;
+/** The comments posted, each without its reference. */
+const bodies = (world: World) =>
+  world.posts.map(({ input }) => input.body.replace(/ Factory delivery \S+, update \d+\.$/, ""));
 const requestIds = (world: World) => world.posts.map(({ input }) => input.clientRequestId);
 
 describe("Work comments on a delivery's transitions", () => {
@@ -401,6 +448,10 @@ describe("Work comments on a delivery's transitions", () => {
             assert.deepStrictEqual(blocked.state.block, { reason: "verify_failed" });
             assert.deepStrictEqual(bodies(world), [verifyFailedText]);
             const [post] = world.posts;
+            assert.strictEqual(
+              post?.input.body,
+              `${verifyFailedText} ${referenceOf(deliveryId, 1)}`,
+            );
             assert.deepStrictEqual(post?.input.ref, itemRef);
             assert.isDefined(post?.input.clientRequestId);
             // Factory's own actor, which writes to Work and is not an agent's.
@@ -568,10 +619,10 @@ describe("Work comments on a delivery's transitions", () => {
         yield* boot(world, Effect.void);
         assert.deepStrictEqual(
           world.posts.map(({ actor, input }) => [actor.id, input.body]),
-          [
-            [`factory:${first.id}`, blockedText("The author thread was deleted.")],
-            [`factory:${second.id}`, blockedText("The author thread was deleted.")],
-          ],
+          [first.id, second.id].map((id) => [
+            `factory:${id}`,
+            `${blockedText("The author thread was deleted.")} ${referenceOf(id, 1)}`,
+          ]),
         );
         yield* boot(world, Effect.void);
         assert.strictEqual(world.posts.length, 2);
@@ -596,7 +647,7 @@ describe("Work comments on a delivery's transitions", () => {
           // A sweep that finds the queued, unclaimed comment queues it a second time.
           yield* Effect.flatMap(
             FactoryWorker.FactoryWorker,
-            (worker) => worker.postUnattemptedComments,
+            (worker) => worker.postUnfinishedComments,
           );
           yield* Deferred.succeed(held.release, undefined);
           yield* drain;
@@ -646,13 +697,121 @@ describe("Work comments on a delivery's transitions", () => {
           assert.strictEqual(world.posts.length, 1);
           assert.deepStrictEqual(
             yield* Effect.flatMap(FactoryWorkCommentStore.FactoryWorkCommentStore, (store) =>
-              store.listUnattempted(),
+              store.listUnfinished(),
             ),
             [],
           );
         }).pipe(Effect.provide(FactoryWorkComments.layer)),
       ),
   );
+
+  describe("a comment a process claimed and died before finishing", () => {
+    const deleted = blockedText("The author thread was deleted.");
+
+    /**
+     * Stores what a process that died mid-post leaves: the delivery's comments with these bodies,
+     * the last claimed and never finished, the ones before it posted and finished.
+     */
+    const diedPosting = (delivery: ReturnType<typeof authoringOf>, texts: ReadonlyArray<string>) =>
+      Effect.gen(function* () {
+        yield* delivery.insert;
+        const store = yield* FactoryWorkCommentStore.FactoryWorkCommentStore;
+        for (const [index, body] of texts.entries()) {
+          const recorded = yield* store.record({
+            deliveryId: delivery.id,
+            comment: { status: "blocked", body },
+          });
+          yield* store.claim(recorded);
+          if (index < texts.length - 1) yield* store.finish(recorded);
+        }
+      });
+    const unfinished = Effect.flatMap(FactoryWorkCommentStore.FactoryWorkCommentStore, (store) =>
+      store.listUnfinished(),
+    );
+
+    it.effect("is posted after a restart when its item does not hold it", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const first = authoringOf("first");
+          // The delivery's first block was posted; it died after claiming the same text again.
+          world.source.push(`${deleted} ${referenceOf(first.id, 1)}`);
+          yield* diedPosting(first, [deleted, deleted]);
+
+          yield* boot(world, Effect.void);
+          assert.deepStrictEqual(
+            world.posts.map(({ input }) => input.body),
+            [`${deleted} ${referenceOf(first.id, 2)}`],
+          );
+          assert.strictEqual(world.reads, 1);
+          // Finished: a later boot neither reads the item nor posts.
+          yield* boot(world, Effect.void);
+          assert.strictEqual(world.posts.length, 1);
+          assert.strictEqual(world.reads, 1);
+        }),
+      ),
+    );
+
+    it.effect("is not posted again when its item took it before the process died", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const first = authoringOf("first");
+          world.source.push(`${deleted} ${referenceOf(first.id, 1)}`);
+          yield* diedPosting(first, [deleted]);
+
+          yield* boot(world, Effect.void);
+          assert.deepStrictEqual(world.posts, []);
+          assert.deepStrictEqual(yield* unfinished, []);
+          yield* boot(world, Effect.void);
+          assert.deepStrictEqual(world.posts, []);
+          assert.strictEqual(world.reads, 1);
+        }),
+      ),
+    );
+
+    it.effect("is not posted when its item's bounded comments may leave it out", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const first = authoringOf("first");
+          world.truncated = true;
+          yield* diedPosting(first, [deleted]);
+
+          yield* boot(world, Effect.void);
+          assert.deepStrictEqual(world.posts, []);
+          assert.include(
+            world.warnings,
+            "factory cannot tell whether an unfinished Work comment reached its item, so it is not posted again",
+          );
+          assert.deepStrictEqual(yield* unfinished, []);
+        }),
+      ),
+    );
+
+    it.effect("waits for the next boot when its item cannot be read", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const first = authoringOf("first");
+          world.readFails = true;
+          yield* diedPosting(first, [deleted]);
+
+          yield* boot(world, Effect.void);
+          assert.deepStrictEqual(world.posts, []);
+          assert.include(
+            world.warnings,
+            "factory could not read its delivery's item to finish a comment",
+          );
+          assert.strictEqual((yield* unfinished).length, 1);
+
+          world.readFails = false;
+          yield* boot(world, Effect.void);
+          assert.deepStrictEqual(
+            world.posts.map(({ input }) => input.body),
+            [`${deleted} ${referenceOf(first.id, 1)}`],
+          );
+          assert.deepStrictEqual(yield* unfinished, []);
+        }),
+      ),
+    );
+  });
 
   describe("a comment Work does not post", () => {
     const queued = queuedDeliveryState({ branch, baseRef: "main" });

@@ -110,13 +110,13 @@ export class FactoryWorker extends Context.Service<
       FactoryStoreError
     >;
     /**
-     * Queues every recorded Work comment no process has begun posting: its transition was stored
-     * by a process that stopped before posting it. The boot sweep calls this.
+     * Queues every recorded Work comment that is not finished: its transition was stored by a
+     * process that stopped before posting it, or died while posting it. The boot sweep calls this.
      */
-    readonly postUnattemptedComments: Effect.Effect<void, FactoryStoreError>;
+    readonly postUnfinishedComments: Effect.Effect<void, FactoryStoreError>;
     /**
      * Resolves once every queued effect and every step its result fed back have finished, and
-     * every Work comment queued has been posted, has failed or was found attempted already.
+     * every Work comment queued has been posted, has failed or was found finished already.
      */
     readonly drain: Effect.Effect<void>;
   }
@@ -247,7 +247,8 @@ const make = Effect.gen(function* () {
   yield* Effect.addFinalizer(() => TxRef.set(outstanding, 0));
   // Work comments post on one lane of their own, in the order they were recorded: a slow or
   // failing Work source never holds up a delivery. Each is counted until it is done. The poster
-  // claims each before posting it, so one queued twice (live, and by a boot sweep) posts once.
+  // claims each before posting it, so one queued twice (live, and by a boot sweep) posts once:
+  // the lane runs one at a time, so the second finds the first finished.
   const commentLane = yield* makeDrainableWorker((job: CommentJob) =>
     poster.post(job).pipe(Effect.ensuring(TxRef.update(outstanding, (count) => count - 1))),
   );
@@ -648,9 +649,9 @@ const make = Effect.gen(function* () {
       );
     });
 
-  const postUnattemptedComments: FactoryWorker["Service"]["postUnattemptedComments"] = Effect.gen(
+  const postUnfinishedComments: FactoryWorker["Service"]["postUnfinishedComments"] = Effect.gen(
     function* () {
-      for (const comment of yield* commentStore.listUnattempted()) {
+      for (const comment of yield* commentStore.listUnfinished()) {
         // Deliveries are never deleted, so every comment's delivery is stored.
         const delivery = yield* deliveries.get(comment.deliveryId);
         if (Option.isSome(delivery)) {
@@ -665,7 +666,7 @@ const make = Effect.gen(function* () {
     stepWith,
     stepThread,
     failInterruptedEffect,
-    postUnattemptedComments,
+    postUnfinishedComments,
     drain: TxRef.get(outstanding).pipe(
       Effect.flatMap((count) => (count > 0 ? Effect.txRetry : Effect.void)),
       Effect.tx,
