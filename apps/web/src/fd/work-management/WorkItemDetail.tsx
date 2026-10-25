@@ -35,7 +35,7 @@ import {
 } from "@t3tools/contracts/fd/work-management";
 import { useNavigate } from "@tanstack/react-router";
 import { ExternalLinkIcon, LinkIcon, MessageSquarePlusIcon, PlayIcon, XIcon } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { type ComponentType, useCallback, useMemo, useState } from "react";
 
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
@@ -64,16 +64,28 @@ import { StartWorkThreadDialog, type StartWorkThreadTarget } from "./StartWorkTh
 import { useWorkWritable, workCommands, workEnvironment } from "./state";
 import { WorkItemFieldControls, WorkRelationshipEditor } from "./WorkItemFields";
 
+/**
+ * A section another feature adds to the item detail, beside its linked threads. The route passes
+ * it in, so Work never imports the feature.
+ */
+export type WorkItemSection = ComponentType<{
+  readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId;
+  readonly item: WorkItemDetailValue;
+}>;
+
 /** The inline detail of one Work item: everything an owner can do with it. */
 export function WorkItemDetail({
   environmentId,
   projectId,
   itemRef,
+  itemSection,
   onClose,
 }: {
   environmentId: EnvironmentId;
   projectId: ProjectId;
   itemRef: WorkItemRef;
+  itemSection?: WorkItemSection | undefined;
   onClose: () => void;
 }) {
   const query = useEnvironmentQuery(
@@ -109,6 +121,7 @@ export function WorkItemDetail({
       environmentId={environmentId}
       projectId={projectId}
       item={item}
+      itemSection={itemSection}
       refreshing={query.isPending}
       onRefresh={query.refresh}
       onFullRefresh={fullRefresh}
@@ -121,6 +134,7 @@ function LoadedWorkItem({
   environmentId,
   projectId,
   item,
+  itemSection: ItemSection,
   refreshing,
   onRefresh,
   onFullRefresh,
@@ -129,6 +143,7 @@ function LoadedWorkItem({
   environmentId: EnvironmentId;
   projectId: ProjectId;
   item: WorkItemDetailValue;
+  itemSection: WorkItemSection | undefined;
   refreshing: boolean;
   onRefresh: () => void;
   onFullRefresh: () => void;
@@ -554,6 +569,10 @@ function LoadedWorkItem({
               );
             })}
           </section>
+        ) : null}
+
+        {ItemSection ? (
+          <ItemSection environmentId={environmentId} projectId={projectId} item={item} />
         ) : null}
 
         <section className="space-y-2" aria-label="Description">

@@ -71,7 +71,7 @@ import {
   workCommands,
   workEnvironment,
 } from "./state";
-import { WorkItemDetail } from "./WorkItemDetail";
+import { WorkItemDetail, type WorkItemSection } from "./WorkItemDetail";
 
 const PREFERENCES_KEY = "t3code:work-list-preferences";
 
@@ -106,8 +106,17 @@ export function validateWorkSearch(raw: Record<string, unknown>): WorkSearch {
   };
 }
 
-/** The Work page: one project's items from all of its sources, with an inline detail. */
-export function WorkRouteView({ search }: { search: WorkSearch }) {
+/**
+ * The Work page: one project's items from all of its sources, with an inline detail. The route
+ * may pass `itemSection` for the detail to render beside the item's linked threads.
+ */
+export function WorkRouteView({
+  search,
+  itemSection,
+}: {
+  search: WorkSearch;
+  itemSection?: WorkItemSection;
+}) {
   const navigate = useNavigate();
   const setSearch = useCallback(
     (patch: { readonly [Key in keyof WorkSearch]?: WorkSearch[Key] | undefined }) => {
@@ -507,6 +516,7 @@ export function WorkRouteView({ search }: { search: WorkSearch }) {
               environmentId={selectedProject.environmentId}
               projectId={selectedProject.id}
               itemRef={selectedRef}
+              itemSection={itemSection}
               onClose={() => setSearch({ item: undefined })}
             />
           </div>

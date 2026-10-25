@@ -1,5 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 
+import { FactoryItemSection } from "~/fd/factory";
 import { validateWorkSearch, WorkRouteView } from "~/fd/work-management";
 
 export const Route = createFileRoute("/_chat/work")({
@@ -8,5 +9,5 @@ export const Route = createFileRoute("/_chat/work")({
 });
 
 function WorkRoute() {
-  return <WorkRouteView search={Route.useSearch()} />;
+  return <WorkRouteView search={Route.useSearch()} itemSection={FactoryItemSection} />;
 }
