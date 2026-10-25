@@ -1,4 +1,6 @@
-import type { FactoryPlan, FactoryPlanTask } from "@t3tools/contracts/fd/factory";
+import { FactoryPlan, type FactoryPlanTask } from "@t3tools/contracts/fd/factory";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 
 import { cappedProblems, type FactoryPlanProblem, planProblem, validatePlan } from "./validate.ts";
 
@@ -23,31 +25,11 @@ const sameValue = (left: unknown, right: unknown) =>
 const listed = (parts: ReadonlyArray<string>) =>
   parts.length < 2 ? parts.join("") : `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
 
-/**
- * Judges the owner's edit of the plan waiting at the gate. The edited plan passes the planner's
- * plan validator, against the task ids the delivery already used, and changes of the recorded
- * plan only what the owner edits: task titles, summaries, acceptance criteria and test plans, the
- * order of the tasks, and which of them stay. It keeps at least one task, every task is one of the
- * recorded plan's under its id, with its kind, likely paths and risk, and the note stays the
- * planner's. Every problem is reported together.
- */
-export const validatePlanEdit = (
-  recorded: FactoryPlan,
-  edited: FactoryPlan,
-  usedTaskIds: Iterable<string>,
-): FactoryPlanEditValidation => {
-  const validation = validatePlan(edited, usedTaskIds);
-  const problems: FactoryPlanProblem[] =
-    validation.status === "invalid"
-      ? [...validation.problems]
-      : validation.status === "empty"
-        ? [
-            planProblem(
-              "plan_emptied",
-              "The edited plan has no tasks; keep at least one, or reject the plan.",
-            ),
-          ]
-        : [];
+const decodePlan = Schema.decodeUnknownOption(FactoryPlan);
+
+/** What `edited` changes of `recorded` that an edit may not. */
+const editProblems = (recorded: FactoryPlan, edited: FactoryPlan): FactoryPlanProblem[] => {
+  const problems: FactoryPlanProblem[] = [];
   const planned = new Map(recorded.tasks.map((task) => [task.id, task]));
   for (const task of edited.tasks) {
     const before = planned.get(task.id);
@@ -73,6 +55,38 @@ export const validatePlanEdit = (
   if (edited.note !== recorded.note) {
     problems.push(planProblem("note_changed", "An edit cannot change the planner's note."));
   }
+  return problems;
+};
+
+/**
+ * Judges the owner's edit of the plan waiting at the gate, as it arrived: any value. The edited
+ * plan passes the planner's plan validator, against the task ids the delivery already used, and
+ * changes of the recorded plan only what the owner edits: task titles, summaries, acceptance
+ * criteria and test plans, the order of the tasks, and which of them stay. It keeps at least one
+ * task, every task is one of the recorded plan's under its id, with its kind, likely paths and
+ * risk, and the note stays the planner's. Every problem is reported together; a value that is not
+ * a plan has only the validator's.
+ */
+export const validatePlanEdit = (
+  recorded: FactoryPlan,
+  edited: unknown,
+  usedTaskIds: Iterable<string>,
+): FactoryPlanEditValidation => {
+  const validation = validatePlan(edited, usedTaskIds);
+  const problems: FactoryPlanProblem[] =
+    validation.status === "invalid"
+      ? [...validation.problems]
+      : validation.status === "empty"
+        ? [
+            planProblem(
+              "plan_emptied",
+              "The edited plan has no tasks; keep at least one, or reject the plan.",
+            ),
+          ]
+        : [];
+  // A plan the validator refused for its ids or criteria still decodes, and gets the edit rules too.
+  const decoded = validation.status === "valid" ? Option.some(validation.plan) : decodePlan(edited);
+  if (Option.isSome(decoded)) problems.push(...editProblems(recorded, decoded.value));
   // The validator's decode, so the plan stored is the one it judged. A plan it did not pass has
   // a problem listed already.
   return validation.status === "valid" && problems.length === 0

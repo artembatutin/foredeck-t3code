@@ -4,7 +4,6 @@ import {
   FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
   FactoryDeliveryId,
   FactoryDeliveryStatus,
-  type FactoryPlan,
   FactoryReplanNote,
   FactoryTaskId,
 } from "@t3tools/contracts/fd/factory";
@@ -415,17 +414,18 @@ export class FactoryService extends Context.Service<
       FactoryCancelRefusedError | FactoryDeliveryNotFoundError | FactoryStoreError
     >;
     /**
-     * The owner's edit of the plan a parent waits on at the plan gate: `plan` replaces it, and the
-     * delivery waits on. The edit is judged under the delivery's lock by the planner's plan
-     * validator and the edit rules (see `validatePlanEdit`): it may change the tasks' titles,
-     * summaries, acceptance criteria and test plans, reorder the tasks and leave some out, but
-     * keeps at least one, adds none and keeps each one's id, kind, likely paths and risk, and the
-     * planner's note. The plan's evidence stays what the planner submitted. Refused, with nothing
-     * changed, for an edit that breaks a rule or a delivery not waiting at the gate.
+     * The owner's edit of the plan a parent waits on at the plan gate: `plan`, any value as it
+     * arrived, replaces it, and the delivery waits on. The edit is judged under the delivery's
+     * lock by the planner's plan validator and the edit rules (see `validatePlanEdit`): it may
+     * change the tasks' titles, summaries, acceptance criteria and test plans, reorder the tasks
+     * and leave some out, but keeps at least one, adds none and keeps each one's id, kind, likely
+     * paths and risk, and the planner's note. The plan's evidence stays what the planner
+     * submitted. Refused, with nothing changed, for a value that is not such an edit (malformed
+     * or not) or a delivery not waiting at the gate.
      */
     readonly updatePlan: (input: {
       readonly deliveryId: FactoryDeliveryId;
-      readonly plan: FactoryPlan;
+      readonly plan: unknown;
     }) => Effect.Effect<
       FactoryDeliveryWithRuns,
       | FactoryPlanGateRefusedError

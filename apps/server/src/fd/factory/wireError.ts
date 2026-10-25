@@ -90,7 +90,7 @@ export const toFactoryError = (error: FactoryServiceError): FactoryError => {
       return new FactoryError({
         reason: "invalid_request",
         message:
-          "Factory refused the edited plan. An edit can change task titles, summaries, acceptance criteria and test plans, reorder tasks and remove some, and every criterion needs a test plan entry; it cannot add tasks, empty the plan, or change task ids, kinds, likely paths, risk or the planner's note.",
+          "Factory refused the edited plan. An edited plan follows the planner's rules: nonblank text within its bounds, and a test plan entry for every criterion. An edit can change task titles, summaries, acceptance criteria and test plans, reorder tasks and remove some; it cannot add tasks, empty the plan, or change task ids, kinds, likely paths, risk or the planner's note.",
         deliveryId: error.deliveryId,
       });
     case "FactoryReplanNoteInvalidError":

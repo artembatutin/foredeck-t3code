@@ -10,6 +10,7 @@ import {
   FactoryDeliveryList,
   FactoryPlanReplanInput,
   FactoryPlanUpdateInput,
+  FactoryReplanNote,
   FactoryRpcs,
 } from "./index.ts";
 
@@ -132,24 +133,37 @@ describe("FactoryDelivery plan", () => {
 describe("Factory plan action payloads", () => {
   const decodeUpdate = Schema.decodeUnknownSync(FactoryPlanUpdateInput);
   const decodeReplan = Schema.decodeUnknownSync(FactoryPlanReplanInput);
+  const decodeNote = Schema.decodeUnknownSync(FactoryReplanNote);
 
-  it("takes an edited plan as a whole plan", () => {
+  it("carries an edited plan as sent, for the server to judge", () => {
     expect(decodeUpdate({ deliveryId: "d-1", plan })).toEqual({ deliveryId: "d-1", plan });
-    // Rules that need the recorded plan, such as no empty plan, are the server's to judge.
-    expect(decodeUpdate({ deliveryId: "d-1", plan: { tasks: [] } }).plan.tasks).toEqual([]);
-    expect(() => decodeUpdate({ deliveryId: "d-1", plan: { tasks: [{ id: "a" }] } })).toThrow();
-    expect(() => decodeUpdate({ deliveryId: "d-1" })).toThrow();
+    // No plan fails the request's decoding: the server refuses a bad edit as invalid_request.
+    for (const edited of [
+      { tasks: [] },
+      { tasks: [{ id: "a" }] },
+      { tasks: [{ ...task("a"), title: "  " }] },
+      { tasks: [{ ...task("a"), risk: "extreme" }] },
+      "none",
+      null,
+    ]) {
+      expect(decodeUpdate({ deliveryId: "d-1", plan: edited }).plan).toEqual(edited);
+    }
+    expect(() => decodeUpdate({ deliveryId: "not a delivery id", plan })).toThrow();
   });
 
-  it("takes a nonblank bounded replan note, trimmed", () => {
-    expect(decodeReplan({ deliveryId: "d-1", note: "  Split the export.\n" })).toEqual({
-      deliveryId: "d-1",
-      note: "Split the export.",
-    });
+  it("carries any replan note as sent, for the server to trim and bound", () => {
+    const tooLong = "n".repeat(FACTORY_REPLAN_NOTE_MAX_LENGTH + 1);
+    for (const note of ["", "  \n ", tooLong, "  Split the export.\n"]) {
+      expect(decodeReplan({ deliveryId: "d-1", note })).toEqual({ deliveryId: "d-1", note });
+    }
+  });
+
+  it("names the note rule the server applies: nonblank and bounded, trimmed", () => {
+    expect(decodeNote("  Split the export.\n")).toBe("Split the export.");
     const longest = "n".repeat(FACTORY_REPLAN_NOTE_MAX_LENGTH);
-    expect(decodeReplan({ deliveryId: "d-1", note: longest }).note).toBe(longest);
+    expect(decodeNote(longest)).toBe(longest);
     for (const note of ["", "  \n ", `${longest}n`, null]) {
-      expect(() => decodeReplan({ deliveryId: "d-1", note })).toThrow();
+      expect(() => decodeNote(note)).toThrow();
     }
   });
 });

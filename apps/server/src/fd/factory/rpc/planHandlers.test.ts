@@ -4,6 +4,7 @@ import {
   AuthEnvironmentScope,
   AuthOrchestrationOperateScope,
   ProjectId,
+  RpcScopeAuthorization,
   RunId,
   ThreadId,
   WsRpcGroup,
@@ -14,14 +15,21 @@ import {
   FactoryError,
   FactoryPlan,
   type FactoryPlanTask,
+  FactoryRpcs,
 } from "@t3tools/contracts/fd/factory";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
+import * as Rpc from "effect/rpc/Rpc";
 import type * as RpcClient from "effect/rpc/RpcClient";
-import type * as RpcGroup from "effect/rpc/RpcGroup";
+import * as RpcGroup from "effect/rpc/RpcGroup";
+import type * as RpcMessage from "effect/rpc/RpcMessage";
+import * as RpcServer from "effect/rpc/RpcServer";
 import * as RpcTest from "effect/rpc/RpcTest";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -90,6 +98,11 @@ const onTheWire = (error: unknown) => {
   expect(isFactoryError(error)).toBe(true);
   return encodeError(error as FactoryError);
 };
+
+/** The fixed texts of the plan gate's invalid requests. */
+const editMessage =
+  "Factory refused the edited plan. An edited plan follows the planner's rules: nonblank text within its bounds, and a test plan entry for every criterion. An edit can change task titles, summaries, acceptance criteria and test plans, reorder tasks and remove some; it cannot add tasks, empty the plan, or change task ids, kinds, likely paths, risk or the planner's note.";
+const noteMessage = "Write a note of at most 8000 characters telling the planner what to change.";
 
 describe("Factory plan RPC errors", () => {
   const deliveryId = FactoryDeliveryId.make("delivery-1");
@@ -174,8 +187,7 @@ describe("Factory plan RPC errors", () => {
       wire: {
         _tag: "FactoryError",
         reason: "invalid_request",
-        message:
-          "Factory refused the edited plan. An edit can change task titles, summaries, acceptance criteria and test plans, reorder tasks and remove some, and every criterion needs a test plan entry; it cannot add tasks, empty the plan, or change task ids, kinds, likely paths, risk or the planner's note.",
+        message: editMessage,
         deliveryId,
       },
     },
@@ -187,7 +199,7 @@ describe("Factory plan RPC errors", () => {
       wire: {
         _tag: "FactoryError",
         reason: "invalid_request",
-        message: "Write a note of at most 8000 characters telling the planner what to change.",
+        message: noteMessage,
         deliveryId,
       },
     },
@@ -530,4 +542,163 @@ describe("Factory plan RPC authorization", () => {
         expect(granted.reached).toEqual([method]);
       }),
   );
+});
+
+describe("Factory plan RPCs over the wire", () => {
+  const group = RpcGroup.make(...FactoryRpcs).middleware(RpcScopeAuthorization);
+
+  /** A method's exit as a client decodes it off the wire. */
+  const exitDecoders = new Map(
+    FactoryRpcs.map((rpc) => [
+      rpc._tag as string,
+      Schema.decodeUnknownSync(Schema.toCodecJson(Rpc.exitSchema(rpc))) as (
+        encoded: unknown,
+      ) => Exit.Exit<unknown, unknown>,
+    ]),
+  );
+
+  /**
+   * The Factory methods served as the WebSocket serves them: each request arrives JSON-encoded,
+   * the server decodes its payload before any handler runs, and the exit goes back encoded. The
+   * session holds every grant, and the handlers are the real ones over the real service.
+   */
+  const serveOverJson = Effect.gen(function* () {
+    const factory = yield* FactoryService.FactoryService;
+    const settings = yield* FactorySettings.FactorySettings;
+    const responses = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
+    let write:
+      | ((clientId: number, request: RpcMessage.FromClientEncoded) => Effect.Effect<void>)
+      | undefined;
+    const protocol = yield* RpcServer.Protocol.make((writeRequest) =>
+      Effect.gen(function* () {
+        write = writeRequest;
+        return {
+          disconnects: yield* Queue.make<number>(),
+          send: (_clientId: number, response: RpcMessage.FromServerEncoded) =>
+            Queue.offer(responses, JSON.parse(JSON.stringify(response))).pipe(Effect.asVoid),
+          end: () => Effect.void,
+          clientIds: Effect.succeed(new Set([0])),
+          initialMessage: Effect.succeedNone,
+          supportsAck: false,
+          supportsTransferables: false,
+          supportsSpanPropagation: false,
+          supportsNotifications: false,
+          codecFor: Schema.toCodecJson,
+        };
+      }),
+    );
+    yield* RpcServer.make(group).pipe(
+      Effect.provideService(RpcServer.Protocol, protocol),
+      Effect.provide(
+        Layer.mergeAll(
+          group.toLayer(Effect.succeed(wsHandlers({ factory, settings, startup: readyStartup }))),
+          RpcAuthorization.layer(AuthEnvironmentScope.literals),
+        ),
+      ),
+      Effect.forkScoped,
+    );
+    let requests = 0;
+    /** Sends `payload` as JSON to `tag` and returns the exit a client decodes from the answer. */
+    return (tag: string, payload: unknown) =>
+      Effect.gen(function* () {
+        const id = String((requests += 1));
+        if (write === undefined) return yield* Effect.die("The server is not running.");
+        yield* write(0, {
+          _tag: "Request",
+          id,
+          tag,
+          payload: JSON.parse(JSON.stringify(payload)),
+          headers: [],
+        });
+        while (true) {
+          const response = yield* Queue.take(responses);
+          if (response._tag === "Exit" && String(response.requestId) === id) {
+            return exitDecoders.get(tag)!(response.exit);
+          }
+        }
+      });
+  });
+
+  /** The wire error of a failed exit; a defect, or a success, fails the test. */
+  const factoryErrorOf = (exit: Exit.Exit<unknown, unknown>) => {
+    expect(Exit.isFailure(exit), "the request succeeded").toBe(true);
+    if (Exit.isSuccess(exit)) return undefined;
+    expect(Cause.hasDies(exit.cause), "the request died instead of failing").toBe(false);
+    return onTheWire(Option.getOrUndefined(Cause.findErrorOption(exit.cause)));
+  };
+
+  it.effect("refuses malformed edits and notes as invalid_request, changing nothing", () => {
+    const calls: PlannerCalls = { replans: [], interrupted: [] };
+    return Effect.gen(function* () {
+      const release = yield* Deferred.make<void>();
+      return yield* Effect.gen(function* () {
+        const factory = yield* FactoryService.FactoryService;
+        const worker = yield* FactoryWorker.FactoryWorker;
+        const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+        const send = yield* serveOverJson;
+        const epoch = factory.subscribe.pipe(Stream.runHead, Effect.map(Option.getOrThrow));
+        const deliveryId = FactoryDeliveryId.make("delivery-wire");
+        yield* seedAtGate(deliveryId, "fd-cccccc");
+        const before = yield* deliveries.get(deliveryId);
+        const start = yield* epoch;
+
+        const malformedEdits: ReadonlyArray<unknown> = [
+          { tasks: [{ ...first, title: "   " }, second] },
+          { tasks: [{ ...first, risk: "extreme" }, second] },
+          { tasks: [first, { ...second, kind: "perf" }] },
+          { tasks: [{ ...first, acceptance: ["c".repeat(2001)] }] },
+          { tasks: [{ ...first, testPlan: [{ criterion: 1, check: "x", paths: ["../up"] }] }] },
+          { tasks: "export-csv" },
+          { note: "No tasks list." },
+          "Keep the plan as it is.",
+          null,
+        ];
+        for (const edited of malformedEdits) {
+          const exit = yield* send(FACTORY_WS_METHODS.factoryPlanUpdate, {
+            deliveryId,
+            plan: edited,
+          });
+          expect(factoryErrorOf(exit), JSON.stringify(edited)).toStrictEqual({
+            _tag: "FactoryError",
+            reason: "invalid_request",
+            message: editMessage,
+            deliveryId,
+          });
+        }
+        for (const note of ["", " \n\t ", "n".repeat(8001)]) {
+          const exit = yield* send(FACTORY_WS_METHODS.factoryPlanReplan, { deliveryId, note });
+          expect(factoryErrorOf(exit)).toStrictEqual({
+            _tag: "FactoryError",
+            reason: "invalid_request",
+            message: noteMessage,
+            deliveryId,
+          });
+        }
+        // None of them stored anything, moved the epoch or reached the planner.
+        expect(yield* deliveries.get(deliveryId)).toStrictEqual(before);
+        expect(yield* epoch).toBe(start);
+        expect(calls.replans).toEqual([]);
+
+        // Well-formed actions still pass the same wire: an edit, then a replan, trimmed.
+        const edit = yield* send(FACTORY_WS_METHODS.factoryPlanUpdate, {
+          deliveryId,
+          plan: { tasks: [second, first] },
+        });
+        if (!Exit.isSuccess(edit)) return expect.fail("The edit did not succeed.");
+        expect((edit.value as { readonly plan?: FactoryPlan }).plan?.tasks).toEqual([
+          second,
+          first,
+        ]);
+        expect(yield* epoch).toBe(start + 1);
+        const replan = yield* send(FACTORY_WS_METHODS.factoryPlanReplan, {
+          deliveryId,
+          note: "  Split the header task.\n",
+        });
+        expect(Exit.isSuccess(replan)).toBe(true);
+        yield* Deferred.succeed(release, undefined);
+        yield* worker.drain;
+        expect(calls.replans).toEqual([{ threadId: planner, note: "Split the header task." }]);
+      }).pipe(Effect.provide(makeLayer(calls, release)));
+    }).pipe(Effect.scoped);
+  });
 });

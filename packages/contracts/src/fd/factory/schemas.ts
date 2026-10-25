@@ -501,23 +501,34 @@ export type FactoryDeliveryRefInput = typeof FactoryDeliveryRefInput.Type;
 
 /**
  * The owner's edit of the plan a delivery waits on at the plan gate: the whole plan as it should
- * stand. It may change the tasks' titles, summaries, acceptance criteria and test plans, reorder
- * the tasks and leave some out; ids, kinds, likely paths, risk and the note stay the planner's.
+ * stand, encoded as `FactoryPlan` encodes it. It may change the tasks' titles, summaries,
+ * acceptance criteria and test plans, reorder the tasks and leave some out; ids, kinds, likely
+ * paths, risk and the note stay the planner's. The wire takes any value here: the server judges
+ * it with the planner's plan validator and the edit rules, so a plan that breaks them, malformed
+ * or not, is refused as `invalid_request` rather than failing the request's decoding.
  */
 export const FactoryPlanUpdateInput = Schema.Struct({
   deliveryId: FactoryDeliveryId,
-  plan: FactoryPlan,
+  plan: Schema.Unknown,
 });
 export type FactoryPlanUpdateInput = typeof FactoryPlanUpdateInput.Type;
 
 export const FACTORY_REPLAN_NOTE_MAX_LENGTH = 8000;
 
-/** What the owner asks the planner to change; the planner thread gets it as a follow-up turn. */
+/**
+ * What the owner asks the planner to change, as the server takes it; the planner thread gets it
+ * as a follow-up turn. Clients can check a note against it before sending.
+ */
 export const FactoryReplanNote = FactoryText(FACTORY_REPLAN_NOTE_MAX_LENGTH);
 
+/**
+ * The wire takes any string as the note: the server trims it and refuses one that is blank or
+ * past `FACTORY_REPLAN_NOTE_MAX_LENGTH` as `invalid_request` (see `FactoryReplanNote`), rather
+ * than failing the request's decoding.
+ */
 export const FactoryPlanReplanInput = Schema.Struct({
   deliveryId: FactoryDeliveryId,
-  note: FactoryReplanNote,
+  note: Schema.String,
 });
 export type FactoryPlanReplanInput = typeof FactoryPlanReplanInput.Type;
 

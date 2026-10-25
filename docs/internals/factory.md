@@ -190,7 +190,10 @@ step lock on the plan stored then, and refused anywhere but the gate
 ([`FactoryService.ts`](../../apps/server/src/fd/factory/FactoryService.ts)). By owner decision an
 edit may change only the tasks' titles, summaries, criteria and test plans, their order and which
 stay, and must pass the planner's validator; ids, kinds, likely paths, risk and the note stay the
-planner's ([`plan/edit.ts`](../../apps/server/src/fd/factory/plan/edit.ts)). The edit replaces the
+planner's ([`plan/edit.ts`](../../apps/server/src/fd/factory/plan/edit.ts)). The RPC payloads carry
+the edited plan as any value and the replan note as any string: the RPC server turns a payload
+that fails decoding into a defect before any handler runs, so the server judges both itself and a
+malformed one is refused as `invalid_request` with Factory's fixed text. The edit replaces the
 tasks in the delivery's state while `plan.json` keeps what the planner submitted, so whatever acts
 on the approved plan reads the state. A replan is a new plan round opened by a turn carrying the
 owner's note; the gate's attempt it leaves ends failed, and the next accepted plan replaces the old.

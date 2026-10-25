@@ -217,6 +217,13 @@ describe("Factory plan gate edits", () => {
           withTasks([]),
           { tasks: plannerPlan.tasks, note: "The owner's own note." },
           { tasks: plannerPlan.tasks },
+          // Malformed edits reach the same judgment: the wire carries any value.
+          withTasks([{ ...csvTask, title: "  " }, headerTask]),
+          { ...plannerPlan, tasks: [{ ...csvTask, risk: "extreme" }, headerTask] },
+          { ...plannerPlan, tasks: [csvTask, { ...headerTask, kind: "perf" }] },
+          { ...plannerPlan, tasks: "export-csv" },
+          "Keep the plan as it is.",
+          null,
         ];
         for (const plan of refusals) {
           const error = yield* refused(deliveryId, factory.updatePlan({ deliveryId, plan }));
