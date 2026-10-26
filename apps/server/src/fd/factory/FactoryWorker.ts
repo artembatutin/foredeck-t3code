@@ -171,6 +171,20 @@ export class FactoryWorker extends Context.Service<
       FactoryStoreError
     >;
     /**
+     * Recovers what a PR stage whose result a restart lost after its watch command did, for a
+     * delivery blocked on that interrupted `open_pr` with no pull request recorded (see
+     * `failInterruptedEffect`): the pull request, the thread it is linked to and Factory's watch
+     * there, as that command's records prove them (see `FactoryPullRequest.recover`), then the
+     * wakes core committed there since. The delivery stays blocked for its owner, but a resume
+     * publishes to that pull request, its merge or close is taken, and a cancel at any stage after
+     * releases that watch. Nothing for any other delivery, or when the records prove nothing; a
+     * read that fails is logged and leaves the delivery blocked as it was. The boot sweep calls
+     * this.
+     */
+    readonly recoverPullRequest: (
+      deliveryId: FactoryDeliveryId,
+    ) => Effect.Effect<void, FactoryStoreError>;
+    /**
      * Steps a parent with the approval of the child it waits for, once that child is approved;
      * the parent then waits for something else, so the approval is taken once. A parent without a
      * recorded branch start takes that child's start again first (see `advance`). Any other
@@ -1284,6 +1298,45 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const recoverPullRequest: FactoryWorker["Service"]["recoverPullRequest"] = (deliveryId) =>
+    locks.withLock(
+      deliveryId,
+      Effect.gen(function* () {
+        const current = Option.getOrUndefined(yield* deliveries.get(deliveryId));
+        const block = current?.state.block;
+        if (
+          current === undefined ||
+          current.state.status !== "blocked" ||
+          current.state.pullRequest !== null ||
+          block?.reason !== "effect_failed" ||
+          block.effect.type !== "open_pr"
+        ) {
+          return;
+        }
+        const effect = block.effect;
+        const recovered = yield* Effect.exit(
+          Effect.suspend(() => pullRequests.recover(current, effect)),
+        );
+        if (Exit.isFailure(recovered)) {
+          if (Cause.hasInterruptsOnly(recovered.cause)) return yield* Effect.interrupt;
+          return yield* Effect.logWarning(
+            "factory could not recover a pull request a restart lost",
+            recovered.cause,
+          );
+        }
+        if (Option.isNone(recovered.value)) return;
+        const { pullRequest, threadId, watch, wakes } = recovered.value.value;
+        yield* stepLocked(deliveryId, {
+          type: "pr.recovered",
+          effectId: effect.id,
+          pullRequest,
+          pullRequestThread: threadId,
+          watch,
+        });
+        for (const wake of wakes) yield* stepLocked(deliveryId, wake);
+      }),
+    );
+
   const finishFamily: FactoryWorker["Service"]["finishFamily"] = (deliveryId) =>
     Effect.gen(function* () {
       const delivery = Option.getOrUndefined(yield* deliveries.get(deliveryId));
@@ -1400,6 +1453,7 @@ const make = Effect.gen(function* () {
     stepWith,
     stepThread,
     failInterruptedEffect,
+    recoverPullRequest,
     takeChildApproval,
     finishFamily,
     stopCancelledRun,

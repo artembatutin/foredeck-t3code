@@ -263,6 +263,26 @@ export class FactoryPullRequest extends Context.Service<
       FactoryPullRequestWatchError
     >;
     /**
+     * What a PR stage whose result a restart lost after its watch command did, from that command's
+     * records: the pull request the command started Factory's watch on, the thread it is linked
+     * to, and the watch and wakes there as `watch` reads them now. The command ran only once the
+     * stage had published and linked the pull request. None when core accepted no watch command
+     * of `effect`, or it started no watch: one that kept someone else's names no watch of
+     * Factory's, nor which pull request it was.
+     */
+    readonly recover: (
+      delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+      effect: Extract<FactoryEffect, { readonly type: "open_pr" }>,
+    ) => Effect.Effect<
+      Option.Option<{
+        readonly pullRequest: FactoryOpenedPullRequest;
+        readonly threadId: ThreadId;
+        readonly watch: FactoryWatchState;
+        readonly wakes: ReadonlyArray<FactoryWakeEvent>;
+      }>,
+      FactoryPullRequestWatchError
+    >;
+    /**
      * Ends Factory's watch on the delivery's pull request (see `isFactorys`), as a cancel asks,
      * only while it is that very watch: core checks its start under the thread's lock, so a watch
      * the owner started meanwhile stays. Reports that watch (the one on, else the latest Factory
@@ -838,6 +858,28 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const recover: FactoryPullRequest["Service"]["recover"] = Effect.fn("FactoryPullRequest.recover")(
+    function* (delivery, effect) {
+      const receipt = Option.getOrUndefined(
+        yield* receipts.getByCommandId(watchCommandId(delivery.deliveryId, effect.id)),
+      );
+      if (receipt?.status !== "accepted") return Option.none();
+      const { threadId } = receipt;
+      const { started } = yield* watchCommands(delivery, threadId);
+      const link = started.find(({ at }) => at === receipt.resultSequence)?.link;
+      if (link === undefined) return Option.none();
+      const pullRequest = {
+        number: link.number,
+        url: link.url,
+        // As the host names it once synced; `create_pr` publishes the delivery's branch by name.
+        headBranch: link.snapshot?.headBranch ?? delivery.state.branch,
+      };
+      // Read as the stage read it: an accepted command sent again replays, starting nothing.
+      const followed = yield* watch(delivery, effect, pullRequest, threadId);
+      return Option.map(followed, (found) => ({ pullRequest, threadId, ...found }));
+    },
+  );
+
   /**
    * Ends the watch that started at `startedAt` only if it is still the pull request's watch:
    * core's watch sync without a wake removes the watch under the thread's lock, and refuses one
@@ -1059,7 +1101,14 @@ const make = Effect.gen(function* () {
     }
   });
 
-  return FactoryPullRequest.of({ open, watch, release, closeOutItems, closeOutWorktree });
+  return FactoryPullRequest.of({
+    open,
+    watch,
+    recover,
+    release,
+    closeOutItems,
+    closeOutWorktree,
+  });
 });
 
 /**

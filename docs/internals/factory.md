@@ -637,6 +637,17 @@ whole-thread event, so those events can go: a command whose event is gone proves
 no watch of Factory's, and the watch the delivery already holds, judged while the events were
 there, stays Factory's. Only Factory's watch is ever ended.
 
+The boot sweep therefore recovers such a result as well as blocking on it
+([`FactoryWorker.recoverPullRequest`](../../apps/server/src/fd/factory/FactoryWorker.ts)). The
+command ran only once the stage had published and linked its pull request, so when core accepted
+it and it started Factory's watch, the delivery records the pull request that watch is on, the
+thread it is linked to and the watch, as the result would have, and stays blocked. Blocking alone
+is not enough: a resume clears the block and verifies or integrates again, so a cancel after that
+found no sign a PR stage had run, never released the watch, and left it to wake the thread with new
+work. Recorded, the pull request also takes its merge or close, and a resume pushes to it rather
+than open a second one. A command that kept someone else's watch proves nothing of Factory's, and
+the delivery blocks as before.
+
 A cancel marks the watch for release in the step that stores it, as does a close's cancel, once a
 PR stage ran or may have run. The worker then ends Factory's watch with core's
 `thread.pull-request-watch.sync` naming the watch's start and carrying no wake, which core applies
@@ -650,9 +661,10 @@ that removed it, at the link update the release recorded, only so their runs are
 one at once, a queued one as it starts, and the owner's own turns never. The pull request counts
 as much as the start: core stamps a watch with its command's millisecond, so a watch on another
 pull request of the thread can start at the same moment, and the release names Factory's even when
-the PR stage's result was lost before the delivery recorded it. Such a parent recorded no thread
-either, so the release reads it from the watch command's record, and the parent records it with
-where the watch ended: the wakes there are then its own to stop. Ending a merged pull request's
+the PR stage's result was lost before the delivery recorded it. A parent whose lost result no
+boot recovered has no thread recorded either, so the release reads it from the watch command's
+record, and the parent records it with where the watch ended: the wakes there are then its own to
+stop. Ending a merged pull request's
 watch at close-out is conditional on the watch read the same way, on the thread the PR stage linked
 it to.
 

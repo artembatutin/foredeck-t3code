@@ -26,11 +26,13 @@ import type {
   FactoryDeliveryState,
   FactoryEffect,
   FactoryEvent,
+  FactoryOpenedPullRequest,
   FactoryPlanJudgment,
   FactoryRepairedStage,
   FactoryResumeCheck,
   FactoryReviewJudgment,
   FactorySettleResult,
+  FactoryWatchState,
 } from "./state.ts";
 import { stageHandler } from "./stages/registry.ts";
 
@@ -387,6 +389,43 @@ const releasingWatch = (delivery: FactoryDeliveryState): FactoryDeliveryState =>
   return delivery.kind !== "child" && watched ? { ...delivery, releaseWatch: true } : delivery;
 };
 
+/**
+ * The delivery with the pull request its PR stage published recorded, a parent's with the thread
+ * it is linked to, where its feedback wakes, and with `watch`, what that stage found of the watch
+ * there, how it follows the pull request (see `FactoryFollowThrough`).
+ */
+const published = (
+  delivery: FactoryDeliveryState,
+  result: {
+    readonly pullRequest: FactoryOpenedPullRequest;
+    readonly pullRequestThread?: ThreadId;
+    readonly watch?: FactoryWatchState;
+  },
+): FactoryDeliveryState => {
+  const linked = result.pullRequestThread ?? delivery.pullRequestThread;
+  const { watch } = result;
+  const previous = delivery.followThrough;
+  return {
+    ...delivery,
+    pullRequest: result.pullRequest,
+    ...(delivery.kind === "parent" && linked !== undefined ? { pullRequestThread: linked } : {}),
+    ...(watch === undefined
+      ? {}
+      : {
+          followThrough: {
+            watchedAfter: previous?.watchedAfter ?? watch.firstAt,
+            armedAt: watch.at,
+            watchStartedAt: watch.held,
+            heldUntil: null,
+            runs: previous?.runs ?? [],
+            pending: previous?.pending ?? [],
+            // Only a watch this stage started clears an end core committed before.
+            watchEnded: watch.armed ? false : (previous?.watchEnded ?? false),
+          },
+        }),
+  };
+};
+
 /** The oldest pending wake adopted as a round; undefined when none is pending. */
 const adoptPending = (delivery: FactoryDeliveryState): FactoryAdvance | undefined => {
   const { followThrough } = delivery;
@@ -715,6 +754,20 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
           heldPullRequest: { number: event.number, url: event.url },
         },
       });
+    }
+    case "pr.recovered": {
+      // Only the PR stage a restart cut short, blocked on that very effect, whose result was
+      // never stored: what its watch command proves is recorded as the result would have been,
+      // so a resume publishes to that pull request, its merge or close is taken, and a cancel
+      // releases the watch whatever stage the delivery is in by then. It stays blocked.
+      const { block } = delivery;
+      return delivery.status !== "blocked" ||
+        block?.reason !== "effect_failed" ||
+        block.effect.type !== "open_pr" ||
+        block.effect.id !== event.effectId ||
+        delivery.pullRequest !== null
+        ? unchanged(delivery)
+        : step(published(delivery, event));
     }
     case "watch.released": {
       if (delivery.releaseWatch !== true) return unchanged(delivery);
@@ -1108,16 +1161,8 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       const open = awaitedEffect(delivery, event.effectId, "open_pr");
       if (open === undefined) return unchanged(delivery);
       // Published either way: the pull request is the delivery's, so a resume publishes to it
-      // again rather than open another, and its merge or close is taken. A parent keeps the
-      // thread it is linked to, where its feedback wakes.
-      const linked = event.pullRequestThread ?? delivery.pullRequestThread;
-      const recorded = {
-        ...delivery,
-        pullRequest: event.pullRequest,
-        ...(delivery.kind === "parent" && linked !== undefined
-          ? { pullRequestThread: linked }
-          : {}),
-      };
+      // again rather than open another, and its merge or close is taken.
+      const recorded = published(delivery, event);
       if (event.watchFailure !== undefined) {
         return blocked(recorded, {
           reason: "effect_failed",
@@ -1125,27 +1170,7 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
           detail: event.watchFailure,
         });
       }
-      const { watch } = event;
-      const previous = delivery.followThrough;
-      const next: FactoryDeliveryState = {
-        ...recorded,
-        status: "pr_open",
-        awaiting: null,
-        ...(watch === undefined
-          ? {}
-          : {
-              followThrough: {
-                watchedAfter: previous?.watchedAfter ?? watch.firstAt,
-                armedAt: watch.at,
-                watchStartedAt: watch.held,
-                heldUntil: null,
-                runs: previous?.runs ?? [],
-                pending: previous?.pending ?? [],
-                // Only a watch this stage started clears an end core committed before.
-                watchEnded: watch.armed ? false : (previous?.watchEnded ?? false),
-              },
-            }),
-      };
+      const next: FactoryDeliveryState = { ...recorded, status: "pr_open", awaiting: null };
       // A watch core ended is not started again on its own.
       if (next.followThrough?.watchEnded === true) {
         return blocked(next, { reason: "watch_ended" });

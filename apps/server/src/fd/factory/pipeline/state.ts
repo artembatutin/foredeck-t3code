@@ -594,6 +594,21 @@ export type FactoryEvent =
       readonly watchFailure?: string;
     }
   /**
+   * An `open_pr` result a restart lost after the stage's watch command, recovered by the boot sweep
+   * from that command's records once the delivery blocked on the interrupted effect: the pull
+   * request the command started Factory's watch on, the thread it is linked to, and what is left of
+   * that watch now (see `FactoryWatchState`). The command ran only once the stage had published and
+   * linked the pull request. Taken only while the delivery is blocked on that very effect with no
+   * pull request recorded; it stays blocked for its owner.
+   */
+  | {
+      readonly type: "pr.recovered";
+      readonly effectId: number;
+      readonly pullRequest: FactoryOpenedPullRequest;
+      readonly pullRequestThread: ThreadId;
+      readonly watch: FactoryWatchState;
+    }
+  /**
    * Factory's watch on pull request `number`/`url`, which started at `startedAt`, ended at
    * event-log position `at`, its first watch command being at `firstAt`, as a release of the
    * watch found. Taken in any status: a cancelled delivery then knows which wakes its watch sent,

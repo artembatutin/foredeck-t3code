@@ -143,13 +143,27 @@ describe("Factory follow-through: a PR stage whose result was lost after its wat
           assert.isNull(lost.pullRequest);
           assert.isUndefined(lost.followThrough);
 
-          // The next boot finds that effect cut short and blocks; the watch goes on.
+          // The next boot finds that effect cut short and blocks, and records what the watch
+          // command's records prove: the pull request it watched and that the watch is Factory's.
+          // The watch goes on.
           yield* losePublish(deliveryId, lost);
           yield* world.boot(Effect.void);
           const blocked = yield* stateOf(deliveryId);
           assert.strictEqual(blocked.status, "blocked");
           assert.strictEqual(blocked.block?.reason, "effect_failed");
-          assert.isUndefined(blocked.followThrough);
+          assert.deepStrictEqual(blocked.pullRequest, {
+            ...fakePullRequest,
+            headBranch: lost.branch,
+          });
+          assert.deepStrictEqual(blocked.followThrough, {
+            watchedAfter: armed.resultSequence,
+            armedAt: armed.resultSequence,
+            watchStartedAt: watch.startedAt,
+            heldUntil: null,
+            runs: [],
+            pending: [],
+            watchEnded: false,
+          });
           assert.strictEqual(
             (yield* linkOf(author, link.number)).watch?.startedAt,
             watch.startedAt,
@@ -160,13 +174,14 @@ describe("Factory follow-through: a PR stage whose result was lost after its wat
           yield* runStarted(wake);
           yield* endWhileDown(world, wake);
 
-          // The owner's resume publishes again. Its PR stage reads the watch the first command
-          // started, starts none, and takes the wake committed since that command as a round.
+          // The owner's resume publishes again, to the pull request recorded: a push, never a
+          // second create. Its PR stage reads the watch the first command started, starts none,
+          // and takes the wake committed since that command as a round.
           yield* resumeBooted(world, deliveryId);
           const resumed = yield* stateOf(deliveryId);
           assert.deepStrictEqual(
             world.pullRequestCalls.map(({ input }) => input.action),
-            ["create_pr", "create_pr"],
+            ["create_pr", "push"],
           );
           assert.isTrue(Option.isNone(yield* watchCommand(deliveryId, blocked.effectsIssued + 1)));
           assert.strictEqual(resumed.followThrough?.watchStartedAt, watch.startedAt);

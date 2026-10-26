@@ -249,10 +249,11 @@ const make = Effect.gen(function* () {
    * delivery awaiting a run then gets the run's end or its thread's deletion, as the tail would
    * have handed them on, so a stopping one stops where the run's end leads it. One awaiting an
    * effect lost it with the previous process and blocks, unless what it did is stored (see
-   * `failInterruptedEffect`). A parent awaiting its child takes the child's approval stored
-   * before the restart, and otherwise waits for that child. A delivery awaiting nothing else
-   * (queued, stopped, blocked) waits for its owner. Each step reads the delivery again, so one
-   * cancelled here takes nothing more.
+   * `failInterruptedEffect`); a PR stage blocked so after its watch command then records what
+   * that command proves (see `recoverPullRequest`). A parent awaiting its child takes the child's
+   * approval stored before the restart, and otherwise waits for that child. A delivery awaiting
+   * nothing else (queued, stopped, blocked) waits for its owner. Each step reads the delivery
+   * again, so one cancelled here takes nothing more.
    */
   const reconcile = (listed: FactoryDeliveryStore.StoredFactoryDelivery) =>
     Effect.gen(function* () {
@@ -264,17 +265,22 @@ const make = Effect.gen(function* () {
       yield* catchUpPullRequest(delivery);
       yield* catchUpFeedback(deliveryId);
       const awaiting = (yield* read)?.state.awaiting;
-      if (awaiting === undefined || awaiting === null) return;
-      if (awaiting.type === "child") {
+      if (awaiting?.type === "child") {
         yield* worker.takeChildApproval(deliveryId);
-        return;
-      }
-      if (awaiting.type === "effect") {
+      } else if (awaiting?.type === "effect") {
         yield* worker.failInterruptedEffect(deliveryId);
-        return;
+      } else if (awaiting?.type === "run") {
+        const ended = yield* projectedEnd(awaiting.threadId, awaiting.runId);
+        if (ended !== null) yield* worker.step(deliveryId, ended);
       }
-      const ended = yield* projectedEnd(awaiting.threadId, awaiting.runId);
-      if (ended !== null) yield* worker.step(deliveryId, ended);
+      // Blocked on a PR stage whose result the restart lost, as the step above may have just
+      // stored or an earlier server did, it records what that stage's watch command proves, then
+      // takes that pull request's merge or close stored meanwhile.
+      yield* worker.recoverPullRequest(deliveryId);
+      const recovered = yield* read;
+      if (delivery.state.pullRequest === null && recovered !== undefined) {
+        yield* catchUpPullRequest(recovered);
+      }
     }).pipe(Effect.catchCause(logSkipped("factory delivery reconcile skipped")));
 
   // Comments a previous process recorded and never finished go first, in their order. Work a

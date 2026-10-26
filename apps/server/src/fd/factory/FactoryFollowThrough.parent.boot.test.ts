@@ -1,23 +1,31 @@
 import { assert, describe, it } from "@effect/vitest";
-import { CommandId } from "@t3tools/contracts";
+import { CommandId, type RunId } from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Stream from "effect/Stream";
 
 import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore.ts";
+import * as EffectOutbox from "../../orchestration-v2/EffectOutbox.ts";
+import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as ProviderRuntimeRecoveryService from "../../orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
-import type { FactoryDeliveryState } from "./pipeline/state.ts";
+import { advance } from "./pipeline/engine.ts";
+import { type FactoryDeliveryState, isTerminalRunStatus } from "./pipeline/state.ts";
 import {
   drainFactory,
   drainOrchestration,
   ended,
+  type FactoryDispatch,
   fakePullRequest,
   runReached,
   stateOf,
+  threadProjection,
   verifyCommands,
   withProject,
   type World,
@@ -142,6 +150,52 @@ const losePublish = (deliveryId: FactoryDeliveryId, lost: FactoryDeliveryState) 
     });
   }).pipe(Effect.orDie);
 
+/** Which delivery the owner cancels: the parent, or its last child, which cancels the parent. */
+const targets = [
+  { cancelled: "the parent", child: false },
+  { cancelled: "its last child", child: true },
+] as const;
+
+/** Waits until the provider turn is stored running, as core's shutdown recovery reads it. */
+const providerTurnRunning = (providerTurnId: string) =>
+  Effect.flatMap(EventSink.EventSinkV2, (sink) =>
+    sink.stream().pipe(
+      Stream.filter(
+        ({ event }) =>
+          event.type === "provider-turn.updated" &&
+          event.payload.id === providerTurnId &&
+          event.payload.status === "running",
+      ),
+      Stream.runHead,
+    ),
+  ).pipe(Effect.orDie);
+
+/** Core's runtime recovery, over the server's stores: its shutdown and startup reconciles. */
+const coreRecovery = Effect.service(
+  ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService,
+).pipe(
+  Effect.provide(ProviderRuntimeRecoveryService.layer.pipe(Layer.provide(EffectOutbox.layer))),
+);
+
+/** The restart continuation core's outbox holds for the run, by its status; none if it holds none. */
+const restartIntent = (runId: RunId) =>
+  Effect.flatMap(SqlClient.SqlClient, (sql) =>
+    sql<{ readonly status: string }>`
+      SELECT status FROM orchestration_v2_effect_outbox
+      WHERE effect_id = ${`effect:restart-continuation:${runId}`}
+        AND effect_type = 'provider-runtime.continue'
+    `.pipe(Effect.map((rows) => rows.map(({ status }) => status))),
+  ).pipe(Effect.orDie);
+
+/** Writes the delivery's cancel as the step that stores it would, sending no interrupt. */
+const storeCancel = (deliveryId: FactoryDeliveryId) =>
+  Effect.gen(function* () {
+    const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+    const cancelled = advance(yield* stateOf(deliveryId), { type: "cancel" }).delivery;
+    assert.isTrue(cancelled.releaseWatch);
+    yield* store.update(deliveryId, cancelled);
+  }).pipe(Effect.orDie);
+
 /** Cancels the delivery as its owner does, with a server running Factory. */
 const cancelBooted = (world: World, deliveryId: FactoryDeliveryId) =>
   world.boot(
@@ -229,7 +283,7 @@ describe("Factory follow-through of a parent across restarts", () => {
 
 describe("Factory follow-through of a parent whose PR stage result was lost", () => {
   it.live(
-    "holds the watch that command started, through a boot, a resume, its wake and a cancel",
+    "recovers at boot the pull request, thread and watch its watch command proves, and a resume publishes there",
     () =>
       withProject(
         verifyCommands.passes,
@@ -243,27 +297,45 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
             assert.strictEqual(armed.status, "accepted");
             assert.strictEqual(armed.threadId, last.author);
 
-            // The next boot finds that effect cut short and blocks; the watch goes on.
+            // The next boot finds that effect cut short and blocks, then records what the watch
+            // command's records prove: the pull request, the thread it is linked to, and that the
+            // watch on it is Factory's. The watch goes on.
             yield* losePublish(deliveryId, lost);
             yield* world.boot(Effect.void);
             const blocked = yield* stateOf(deliveryId);
             assert.strictEqual(blocked.status, "blocked");
             assert.strictEqual(blocked.block?.reason, "effect_failed");
-            assert.isUndefined(blocked.pullRequestThread);
-            assert.isUndefined(blocked.followThrough);
+            assert.deepStrictEqual(blocked.pullRequest, {
+              ...fakePullRequest,
+              headBranch: lost.branch,
+            });
+            assert.strictEqual(blocked.pullRequestThread, last.author);
+            assert.deepStrictEqual(blocked.followThrough, {
+              watchedAfter: armed.resultSequence,
+              armedAt: armed.resultSequence,
+              watchStartedAt: watch.startedAt,
+              heldUntil: null,
+              runs: [],
+              pending: [],
+              watchEnded: false,
+            });
             assert.strictEqual(
               (yield* linkOf(last.author, fakePullRequest.number)).watch?.startedAt,
               watch.startedAt,
             );
+            // Another boot recovers nothing more.
+            const rows = yield* rowsOf(deliveryId);
+            yield* world.boot(Effect.void);
+            assert.deepStrictEqual(yield* rowsOf(deliveryId), rows);
 
             // That watch wakes the thread while the parent is blocked, and its run ends.
             const wake = yield* wakeThread(last.author, yield* linkOf(last.author, link.number));
             yield* runStarted(wake);
             yield* endWhileDown(world, wake);
 
-            // The owner's resume integrates afresh and publishes again. Its PR stage reads the
-            // watch the first command started there, starts none, and takes the wake committed
-            // since that command as a round.
+            // The owner's resume integrates afresh and publishes to the recovered pull request: a
+            // push, never a second create. Its PR stage reads the watch the first command started
+            // there, starts none, and takes the wake committed since that command as a round.
             yield* world.boot(
               Effect.gen(function* () {
                 yield* factory.resume(deliveryId).pipe(Effect.orDie);
@@ -282,7 +354,7 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
             const resumed = yield* stateOf(deliveryId);
             assert.deepStrictEqual(
               world.pullRequestCalls.map(({ input }) => input.action),
-              ["create_pr", "create_pr"],
+              ["create_pr", "push"],
             );
             assert.strictEqual(yield* acceptedWatchCommands(deliveryId, resumed.effectsIssued), 1);
             assert.strictEqual(resumed.pullRequestThread, last.author);
@@ -307,8 +379,86 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
       ),
   );
 
+  it.live.each(targets)(
+    "ends Factory's watch when $cancelled is cancelled while the resume's integrate review runs",
+    ({ child }) =>
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const factory = yield* service;
+            const parent = yield* publishedParent(world);
+            const { deliveryId, last } = parent;
+            const [first] = parent.children;
+            if (first === undefined) return assert.fail("The parent has no children.");
+            const watch = (yield* linkOf(last.author, fakePullRequest.number)).watch;
+            if (watch === undefined) return assert.fail("The PR stage started no watch.");
+            yield* losePublish(deliveryId, parent.lost);
+            yield* world.boot(Effect.void);
+
+            // Resumed, the parent clears its block and integrates afresh: nothing it awaits is
+            // the PR stage any more when the cancel comes.
+            yield* world.boot(
+              Effect.gen(function* () {
+                yield* factory.resume(deliveryId).pipe(Effect.orDie);
+                yield* drainFactory;
+              }),
+            );
+            const integrating = yield* stateOf(deliveryId);
+            assert.strictEqual(integrating.stage, "integrate");
+            assert.isNull(integrating.block);
+            assert.strictEqual(integrating.awaiting?.type, "run");
+            const firstRows = yield* rowsOf(first.deliveryId);
+            const lastState = yield* stateOf(last.deliveryId);
+            const lastRows = yield* rowsOf(last.deliveryId);
+            const sent: Array<FactoryDispatch> = [];
+            world.factoryDispatch.before = (command) => {
+              if (command.commandId.startsWith("factory-pr-unwatch:")) sent.push(command);
+              return Effect.void;
+            };
+
+            const reviewer = yield* world.boot(
+              Effect.gen(function* () {
+                const reviewer = yield* awaitedRun(deliveryId);
+                yield* factory.cancel(child ? last.deliveryId : deliveryId).pipe(Effect.orDie);
+                yield* drainFactory;
+                yield* drainOrchestration;
+                return reviewer;
+              }),
+            );
+            const cancelled = yield* stateOf(deliveryId);
+            assert.strictEqual(cancelled.status, "cancelled");
+            assert.isUndefined(cancelled.releaseWatch);
+            // Factory's watch ended, by a sync naming its start.
+            assert.isUndefined((yield* linkOf(last.author, fakePullRequest.number)).watch);
+            assert.deepStrictEqual(
+              sent.map((command) =>
+                command.type === "thread.pull-request-watch.sync"
+                  ? [command.type, command.threadId, command.startedAt]
+                  : [command.type],
+              ),
+              [["thread.pull-request-watch.sync", last.author, watch.startedAt]],
+            );
+            // The integrate reviewer stops; the approved children keep their approvals.
+            assert.deepStrictEqual(yield* cancelledRuns(reviewer.threadId, deliveryId), [
+              reviewer.runId,
+            ]);
+            assert.deepStrictEqual(yield* rowsOf(first.deliveryId), firstRows);
+            if (child) {
+              assert.deepStrictEqual(yield* stateOf(last.deliveryId), {
+                ...lastState,
+                status: "cancelled",
+              });
+            } else {
+              assert.deepStrictEqual(yield* rowsOf(last.deliveryId), lastRows);
+            }
+          }),
+        { manualReactor: true },
+      ),
+  );
+
   it.live(
-    "ends that watch on a cancel, and stops the wake it set off, never the owner's turn",
+    "ends the recovered watch on a cancel, and stops the wake it set off, never the owner's turn",
     () =>
       withProject(
         verifyCommands.passes,
@@ -321,7 +471,9 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
             assert.isDefined(watch);
             yield* losePublish(deliveryId, parent.lost);
             yield* world.boot(Effect.void);
-            assert.strictEqual((yield* stateOf(deliveryId)).block?.reason, "effect_failed");
+            const blocked = yield* stateOf(deliveryId);
+            assert.strictEqual(blocked.block?.reason, "effect_failed");
+            assert.strictEqual(blocked.pullRequestThread, last.author);
 
             // While no server runs Factory, the watch wakes the thread; the owner queues a turn
             // behind that wake.
@@ -333,15 +485,13 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
             assert.strictEqual(yield* runReached(wake, ["running", ...ended]), "running");
             const ownerRun = yield* ownerQueues(last.author, "Summarize the review comments.");
 
-            // The parent recorded no thread; its release finds it in the watch command's record,
-            // ends Factory's watch there and stops the wake as the parent's.
+            // The cancel ends Factory's watch there and stops the wake as the parent's.
             yield* cancelBooted(world, deliveryId);
             const cancelled = yield* stateOf(deliveryId);
             assert.strictEqual(cancelled.status, "cancelled");
             assert.isUndefined(cancelled.releaseWatch);
-            assert.strictEqual(cancelled.pullRequestThread, last.author);
             assert.strictEqual(cancelled.followThrough?.watchStartedAt, watch?.startedAt);
-            assert.deepStrictEqual(cancelled.followThrough?.runs, [wake]);
+            assert.include(cancelled.followThrough?.runs ?? [], wake);
             assert.isUndefined((yield* linkOf(last.author, fakePullRequest.number)).watch);
             assert.deepStrictEqual(yield* cancelledRuns(last.author, deliveryId), [wake]);
             assert.deepStrictEqual(interruptedTurns(world), [providerTurnOf(world, wake)]);
@@ -358,6 +508,39 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
             assert.deepStrictEqual(yield* cancelledRuns(last.author, deliveryId), [wake]);
             assert.strictEqual(yield* runStatus(last.author, ownerRun), "running");
             assert.deepStrictEqual(yield* childRows(parent), children);
+          }),
+        { manualReactor: true },
+      ),
+  );
+
+  it.live(
+    "finds the thread in the watch command's record for a cancel no boot recovered first",
+    () =>
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const worker = yield* Factory.FactoryWorker.FactoryWorker;
+            const parent = yield* publishedParent(world);
+            const { deliveryId, last } = parent;
+            const watch = (yield* linkOf(last.author, fakePullRequest.number)).watch;
+            assert.isDefined(watch);
+            // Blocked as a boot blocks it, but cancelled before a boot recovered what the watch
+            // command proves, as when the boot could not read the command's records.
+            yield* losePublish(deliveryId, parent.lost);
+            assert.isUndefined((yield* stateOf(deliveryId)).pullRequestThread);
+
+            yield* Effect.flatMap(service, (factory) => factory.cancel(deliveryId)).pipe(
+              Effect.orDie,
+            );
+            yield* worker.drain;
+            const cancelled = yield* stateOf(deliveryId);
+            assert.strictEqual(cancelled.status, "cancelled");
+            assert.isUndefined(cancelled.releaseWatch);
+            // The release read the thread from the command and recorded it with the watch's end.
+            assert.strictEqual(cancelled.pullRequestThread, last.author);
+            assert.strictEqual(cancelled.followThrough?.watchStartedAt, watch?.startedAt);
+            assert.isUndefined((yield* linkOf(last.author, fakePullRequest.number)).watch);
           }),
         { manualReactor: true },
       ),
@@ -386,7 +569,10 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
           const armed = Option.getOrThrow(yield* watchCommand(deliveryId, state.effectsIssued));
           assert.strictEqual(armed.status, "accepted");
           yield* losePublish(deliveryId, lost);
+          // That command started no watch, so its records prove no watch of Factory's: the boot
+          // recovers nothing.
           yield* world.boot(Effect.void);
+          assert.isNull((yield* stateOf(deliveryId)).pullRequest);
 
           yield* cancelBooted(world, deliveryId);
           const cancelled = yield* stateOf(deliveryId);
@@ -399,5 +585,122 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
         }),
       { manualReactor: true },
     ),
+  );
+});
+
+describe("Factory follow-through of a parent cancelled while a restart carried its wake on", () => {
+  it.live.each([{ continuation: "still pending" }, { continuation: "already running" }] as const)(
+    "stops the wake's continuation, $continuation as Factory boots, as the parent's, leaving its children approved and the owner's turn",
+    ({ continuation }) =>
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const recovery = yield* coreRecovery;
+
+            // Server 1: the parent's pull request is open, and it adopted a wake on its last
+            // child's author thread as a round, whose provider turn is running.
+            const parent = yield* world.boot(
+              Effect.gen(function* () {
+                const parent = yield* openParent(world);
+                const last = lastChild(parent);
+                const wake = yield* wakeThread(
+                  last.author,
+                  yield* linkOf(last.author, fakePullRequest.number),
+                );
+                yield* runStarted(wake);
+                yield* drainFactory;
+                yield* providerTurnRunning(providerTurnOf(world, wake));
+                return { ...parent, last, wake };
+              }),
+            );
+            const { deliveryId, last, wake } = parent;
+            assert.deepStrictEqual((yield* stateOf(deliveryId)).awaiting, {
+              type: "run",
+              threadId: last.author,
+              runId: wake,
+            });
+            const children = yield* childRows(parent);
+            // Its cancel commits, and it stops before interrupting anything or releasing its
+            // watch, while core's shutdown records restart intent for the wake's turn.
+            yield* storeCancel(deliveryId);
+            yield* recovery.prepareForShutdown;
+            yield* recovery.reconcile("shutdown");
+
+            // Server 2: core recovery runs first; the continuation waits in core's outbox.
+            yield* recovery.reconcile("startup");
+            assert.deepStrictEqual(yield* restartIntent(wake), ["pending"]);
+            if (continuation === "already running") {
+              // Core's effect worker delivers it before Factory's sweep runs.
+              yield* drainOrchestration;
+              const live = (yield* threadProjection(last.author)).runs.find(
+                (run) => run.restartContinuationOfRunId === wake,
+              );
+              assert.isFalse(live === undefined || isTerminalRunStatus(live.status));
+            }
+            yield* world.boot(
+              Effect.gen(function* () {
+                // Delivered after the sweep, it goes live while Factory listens.
+                yield* drainOrchestration;
+                yield* drainFactory;
+                yield* drainOrchestration;
+              }),
+            );
+            assert.deepStrictEqual(yield* restartIntent(wake), ["succeeded"]);
+
+            // Core carried the wake's turn on, and Factory interrupted it as the parent's: the
+            // approved child, whose id the thread carries, stopped nothing.
+            const continued = (yield* threadProjection(last.author)).runs.find(
+              (run) => run.restartContinuationOfRunId === wake,
+            );
+            if (continued === undefined) return assert.fail("Core did not continue the turn.");
+            const turns = world.provider.started.filter(({ runId }) => runId === continued.id);
+            if (continuation === "already running") assert.strictEqual(turns.length, 1);
+            assert.deepStrictEqual(
+              interruptedTurns(world),
+              turns.map(({ attemptId }) => `provider-turn:${attemptId}`),
+            );
+            assert.deepStrictEqual(yield* cancelledRuns(last.author, deliveryId), [continued.id]);
+            assert.deepStrictEqual(yield* cancelledRuns(last.author, last.deliveryId), []);
+            if (turns.length > 0) yield* world.boot(world.endRun(continued.id, "cancelled"));
+            const settled = (yield* threadProjection(last.author)).runs;
+            assert.isTrue(settled.every(({ status }) => isTerminalRunStatus(status)));
+            // The boot released the parent's watch; its children stay approved, untouched.
+            const cancelled = yield* stateOf(deliveryId);
+            assert.strictEqual(cancelled.status, "cancelled");
+            assert.isUndefined(cancelled.releaseWatch);
+            assert.isUndefined((yield* linkOf(last.author, fakePullRequest.number)).watch);
+            assert.deepStrictEqual(yield* childRows(parent), children);
+
+            // Server 3: a repeated recovery finds nothing to carry on, and Factory nothing to do.
+            const before = yield* rowsOf(deliveryId);
+            yield* recovery.reconcile("startup");
+            yield* world.boot(
+              Effect.gen(function* () {
+                yield* drainOrchestration;
+                yield* drainFactory;
+              }),
+            );
+            assert.deepStrictEqual((yield* threadProjection(last.author)).runs, settled);
+            assert.strictEqual(world.provider.interrupted.length, turns.length);
+            assert.deepStrictEqual(yield* rowsOf(deliveryId), before);
+            assert.deepStrictEqual(yield* childRows(parent), children);
+
+            // The owner's own turn on that thread is theirs, and runs on.
+            const own = yield* world.boot(
+              Effect.gen(function* () {
+                const runId = yield* world.ownerTurn(last.author, "Summarize what changed.");
+                yield* drainFactory;
+                yield* drainOrchestration;
+                return runId;
+              }),
+            );
+            const owned = (yield* threadProjection(last.author)).runs.find(({ id }) => id === own);
+            assert.isFalse(owned === undefined || isTerminalRunStatus(owned.status));
+            assert.strictEqual(world.provider.interrupted.length, turns.length);
+            assert.deepStrictEqual(yield* childRows(parent), children);
+          }),
+        { manualReactor: true },
+      ).pipe(Effect.orDie),
   );
 });
