@@ -1,13 +1,12 @@
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
-import { factoryFleet, type FactoryFleetEnvironment } from "@t3tools/client-runtime/fd/factory";
-import type { EnvironmentId } from "@t3tools/contracts";
+import { createFactoryFleetAtom, factoryFleet } from "@t3tools/client-runtime/fd/factory";
 import { useNavigate } from "@tanstack/react-router";
-import * as Option from "effect/Option";
-import { AsyncResult, Atom } from "effect/reactivity";
+import { Atom } from "effect/reactivity";
 import { useCallback, useEffect } from "react";
 
 import { toastManager } from "../../components/ui/toast";
 import { useConnectedEnvironmentIds } from "../../state/environments";
+import { environmentSummaries } from "../../state/presentation";
 import { useEnvironmentQuery } from "../../state/query";
 import { environmentServerConfigsAtom } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -44,29 +43,21 @@ const anySupportedAtom = Atom.make((get) =>
 ).pipe(Atom.withLabel("factory:any-supported"));
 
 /**
- * Every environment's deliveries, read without a project, so each refetches on its environment's
- * change epoch and stays idle where Factory is not served; and the active ones as the fleet.
+ * Every connected environment's deliveries, read without a project, so each refetches on its
+ * environment's change epoch and stays idle where Factory is not served; and the active ones as
+ * the fleet. Environments come with their actual connection phases: a cached config outlives
+ * its connection, and a Factory server that is not connected is named instead of read.
  */
+const fleetStateAtom = createFactoryFleetAtom({
+  environmentsAtom: environmentSummaries.environmentsAtom,
+  supported: factoryEnvironment.supported,
+  deliveries: (environmentId) => factoryEnvironment.deliveries({ environmentId, input: {} }),
+});
+
 const fleetAtom = Atom.make((get) => {
-  const environments: Array<FactoryFleetEnvironment> = [];
-  const failed: Array<EnvironmentId> = [];
-  let loading = false;
-  for (const environmentId of [...get(environmentServerConfigsAtom).keys()].toSorted()) {
-    const supported = get(factoryEnvironment.supported(environmentId));
-    if (!supported) continue;
-    const result = get(factoryEnvironment.deliveries({ environmentId, input: {} }));
-    const deliveries = Option.getOrNull(AsyncResult.value(result))?.deliveries ?? null;
-    if (result._tag === "Failure") failed.push(environmentId);
-    else if (deliveries === null) loading = true;
-    environments.push({ environmentId, supported, deliveries });
-  }
-  return {
-    environments: environments.map(({ environmentId }) => environmentId),
-    rows: factoryFleet(environments),
-    loading,
-    failed,
-  };
-}).pipe(Atom.withLabel("factory:fleet"));
+  const fleet = get(fleetStateAtom);
+  return { ...fleet, rows: factoryFleet(fleet.environments) };
+}).pipe(Atom.withLabel("factory:fleet-rows"));
 
 /** Whether any environment advertises Factory, for the sidebar's and the palette's entries. */
 export function useFactorySupported(): boolean {

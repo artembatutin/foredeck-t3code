@@ -211,8 +211,9 @@ delivery**.
 
 To see what needs you everywhere at once, open **Factory** from the sidebar or the command palette.
 It lists the active deliveries of every connected server that offers Factory, across projects, with
-those that need you first and the reason each one waits. Opening one takes you to its item in Work,
-where you resume or cancel it.
+those that need you first and the reason each one waits. A server that offers Factory but is not
+connected is named instead, and its deliveries return once it reconnects. Opening one takes you to
+its item in Work, where you resume or cancel it.
 
 Factory also posts one comment on the Work item each time a delivery becomes blocked or starts
 waiting, so the GitHub issue, Jira issue or task file shows it too. It posts again when a commit

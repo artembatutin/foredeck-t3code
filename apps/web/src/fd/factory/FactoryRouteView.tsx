@@ -13,12 +13,13 @@ import { Skeleton } from "../../components/ui/skeleton";
 import { isElectron } from "../../env";
 import { useProjects } from "../../state/entities";
 import { useEnvironments } from "../../state/environments";
-import { factoryFleetRowTarget } from "./fleetView";
+import { factoryFleetNotices, factoryFleetRowTarget } from "./fleetView";
 import { useFactoryFleet } from "./hooks";
 
 /**
- * The Factory page: every active delivery across the environments that serve Factory, those
- * that need you first. Each row opens its item in the Work page.
+ * The Factory page: every active delivery across the connected environments that serve Factory,
+ * those that need you first; a Factory server that is not connected is named instead. Each row
+ * opens its item in the Work page.
  */
 export function FactoryRouteView() {
   const navigate = useNavigate();
@@ -40,60 +41,55 @@ export function FactoryRouteView() {
       new Map(environments.map((environment) => [environment.environmentId, environment.label])),
     [environments],
   );
+  const notices = factoryFleetNotices(fleet, environmentLabels);
   const multipleEnvironments = fleet.environments.length > 1;
 
-  const body =
-    fleet.environments.length === 0 ? (
-      <Empty>
-        <EmptyHeader>
-          <EmptyTitle>Factory is not available</EmptyTitle>
-          <EmptyDescription>Connect to a server that offers Factory.</EmptyDescription>
-        </EmptyHeader>
-      </Empty>
-    ) : fleet.loading && fleet.rows.length === 0 ? (
-      <div className="space-y-2" aria-busy>
-        {[0, 1, 2].map((index) => (
-          <Skeleton key={index} className="h-12 w-full" />
-        ))}
-      </div>
-    ) : (
-      <>
-        {fleet.failed.length > 0 ? (
-          <p className="text-destructive text-sm">
-            Could not read deliveries on{" "}
-            {fleet.failed
-              .map((environmentId) => environmentLabels.get(environmentId) ?? environmentId)
-              .join(", ")}
-            .
-          </p>
-        ) : null}
-        {fleet.rows.length === 0 ? (
-          <p className="py-8 text-center text-muted-foreground text-sm">
-            {fleet.loading ? "Loading..." : "No active deliveries."}
-          </p>
-        ) : (
-          <ul className="divide-y rounded-lg border" aria-label="Active deliveries">
-            {fleet.rows.map((row) => (
-              <FactoryFleetRowItem
-                key={row.key}
-                row={row}
-                project={
-                  projectTitles.get(
-                    scopedProjectKey(scopeProjectRef(row.environmentId, row.projectId)),
-                  ) ?? row.projectId
-                }
-                environment={
-                  multipleEnvironments
-                    ? (environmentLabels.get(row.environmentId) ?? row.environmentId)
-                    : undefined
-                }
-                onOpen={() => void navigate(factoryFleetRowTarget(row))}
-              />
-            ))}
-          </ul>
-        )}
-      </>
-    );
+  const body = !notices.available ? (
+    <Empty>
+      <EmptyHeader>
+        <EmptyTitle>Factory is not available</EmptyTitle>
+        <EmptyDescription>Connect to a server that offers Factory.</EmptyDescription>
+      </EmptyHeader>
+    </Empty>
+  ) : (
+    <>
+      {notices.failed !== null ? (
+        <p className="text-destructive text-sm">{notices.failed}</p>
+      ) : null}
+      {notices.disconnected !== null ? (
+        <p className="text-muted-foreground text-sm">{notices.disconnected}</p>
+      ) : null}
+      {fleet.rows.length > 0 ? (
+        <ul className="divide-y rounded-lg border" aria-label="Active deliveries">
+          {fleet.rows.map((row) => (
+            <FactoryFleetRowItem
+              key={row.key}
+              row={row}
+              project={
+                projectTitles.get(
+                  scopedProjectKey(scopeProjectRef(row.environmentId, row.projectId)),
+                ) ?? row.projectId
+              }
+              environment={
+                multipleEnvironments
+                  ? (environmentLabels.get(row.environmentId) ?? row.environmentId)
+                  : undefined
+              }
+              onOpen={() => void navigate(factoryFleetRowTarget(row))}
+            />
+          ))}
+        </ul>
+      ) : fleet.loading ? (
+        <div className="space-y-2" aria-busy>
+          {[0, 1, 2].map((index) => (
+            <Skeleton key={index} className="h-12 w-full" />
+          ))}
+        </div>
+      ) : notices.empty !== null ? (
+        <p className="py-8 text-center text-muted-foreground text-sm">{notices.empty}</p>
+      ) : null}
+    </>
+  );
 
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">

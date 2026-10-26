@@ -1,5 +1,3 @@
-import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
-import { factoryFleet } from "@t3tools/client-runtime/fd/factory";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import { type FactoryDelivery, FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
@@ -7,7 +5,9 @@ import * as Cause from "effect/Cause";
 import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
-import { createMobileFleetAtom } from "./fleetAtom";
+import type { EnvironmentConnectionPhase } from "../../connection/presentation.ts";
+import { factoryFleet } from "./fleet.ts";
+import { createFactoryFleetAtom } from "./fleetAtom.ts";
 
 const envA = EnvironmentId.make("env-a");
 const envB = EnvironmentId.make("env-b");
@@ -82,7 +82,7 @@ const harness = (
       return get(results(environmentId));
     }),
   );
-  const fleet = createMobileFleetAtom({ environmentsAtom, supported, deliveries });
+  const fleet = createFactoryFleetAtom({ environmentsAtom, supported, deliveries });
   registry.mount(fleet);
   const settle = () => {
     for (let pass = 0; pass < 100 && tasks.length > 0; pass++) {
@@ -111,7 +111,7 @@ const harness = (
   };
 };
 
-describe("createMobileFleetAtom", () => {
+describe("createFactoryFleetAtom", () => {
   it("reads only connected Factory environments and names the rest as not connected", () => {
     const fleet = harness([
       [envA, "connected"],
@@ -203,5 +203,36 @@ describe("createMobileFleetAtom", () => {
       disconnected: [],
     });
     expect(fleet.held()).toEqual([]);
+  });
+
+  it("never reads unsupported environments, and keeps a connected one's rows beside them", () => {
+    const fleet = harness([
+      [envA, "connected"],
+      [envB, "reconnecting"],
+      [envC, "connected"],
+    ]);
+    fleet.support(envA, false);
+    fleet.support(envB, false);
+    fleet.load(envA, loaded(delivery("a1")));
+    fleet.load(envC, loaded(delivery("c1")));
+    expect(fleet.fleet()).toMatchObject({
+      rows: ["env-c:c1"],
+      loading: false,
+      failed: [],
+      disconnected: [],
+    });
+    expect(fleet.held()).toEqual([envC]);
+
+    // B reconnects still without Factory; A stops serving it; neither is ever read.
+    fleet.connect(envB, "connected");
+    fleet.connect(envA, "reconnecting");
+    expect(fleet.fleet()).toMatchObject({ rows: ["env-c:c1"], disconnected: [] });
+    expect(fleet.held()).toEqual([envC]);
+
+    // A server that starts advertising Factory while connected is read from then on.
+    fleet.connect(envA, "connected");
+    fleet.support(envA, true);
+    expect(fleet.held()).toEqual([envA, envC]);
+    expect(fleet.fleet()).toMatchObject({ rows: ["env-c:c1", "env-a:a1"], disconnected: [] });
   });
 });

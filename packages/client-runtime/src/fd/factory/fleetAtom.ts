@@ -1,12 +1,14 @@
-import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
-import type { FactoryFleetEnvironment } from "@t3tools/client-runtime/fd/factory";
 import type { EnvironmentId } from "@t3tools/contracts";
 import type { FactoryDelivery } from "@t3tools/contracts/fd/factory";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/reactivity";
 
-/** What the mobile fleet reads; the app passes its workspace connections and Factory atoms. */
-export interface MobileFleetSources {
+import type { EnvironmentConnectionPhase } from "../../connection/presentation.ts";
+import type { FactoryFleetEnvironment } from "./fleet.ts";
+
+/** What the fleet reads; each client passes its environment connections and Factory atoms. */
+interface FactoryFleetSources {
+  /** Every known environment with its actual connection phase, not its cached server config. */
   readonly environmentsAtom: Atom.Atom<
     ReadonlyArray<{
       readonly environmentId: EnvironmentId;
@@ -22,6 +24,17 @@ export interface MobileFleetSources {
   >;
 }
 
+/** The fleet's environments: those read, those whose read failed, and those not connected. */
+export interface FactoryFleetState {
+  /** The connected environments that serve Factory, with their deliveries once read. */
+  readonly environments: ReadonlyArray<FactoryFleetEnvironment>;
+  /** Whether a connected environment's deliveries are still loading. */
+  readonly loading: boolean;
+  readonly failed: ReadonlyArray<EnvironmentId>;
+  /** Environments whose server advertises Factory but that are not connected now. */
+  readonly disconnected: ReadonlyArray<EnvironmentId>;
+}
+
 /**
  * The fleet across the environments that serve Factory. Deliveries are read only while an
  * environment is connected: a server's config outlives its connection, and a read made while it
@@ -29,8 +42,8 @@ export interface MobileFleetSources {
  * finish loading. A Factory environment that is not connected is listed as such instead, and
  * read again once it reconnects.
  */
-export const createMobileFleetAtom = (sources: MobileFleetSources) =>
-  Atom.make((get) => {
+export const createFactoryFleetAtom = (sources: FactoryFleetSources) =>
+  Atom.make((get): FactoryFleetState => {
     const environments: Array<FactoryFleetEnvironment> = [];
     const failed: Array<EnvironmentId> = [];
     const disconnected: Array<EnvironmentId> = [];
