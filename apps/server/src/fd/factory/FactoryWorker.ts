@@ -500,8 +500,9 @@ const make = Effect.gen(function* () {
           })),
         );
       case "close_out":
+        // Its worktree is removed when the result is fed back (see `closeOutWorktree`).
         return pullRequests
-          .closeOut(delivery)
+          .closeOutItems(delivery)
           .pipe(Effect.as<FactoryEvent>({ type: "closed_out", effectId: effect.id }));
       case "create_children":
         return children.create(delivery, effect).pipe(
@@ -901,6 +902,43 @@ const make = Effect.gen(function* () {
         ),
       );
 
+  /**
+   * Feeds back a close-out whose items are done: removes the worktree, then stores the result,
+   * both under the delivery's lock, and only while the delivery still awaits this close-out. A
+   * cancel accepted while the items were set therefore keeps its worktree, and one that comes
+   * later finds the delivery done. A removal that fails fails the effect.
+   */
+  const closeOutWorktree = (job: Job, event: FactoryEvent) => {
+    const { deliveryId } = job.delivery;
+    return locks.withLock(
+      deliveryId,
+      Effect.gen(function* () {
+        const current = Option.getOrUndefined(yield* deliveries.get(deliveryId));
+        const awaiting = current?.state.awaiting;
+        if (
+          current === undefined ||
+          awaiting?.type !== "effect" ||
+          awaiting.effect.id !== job.effect.id
+        ) {
+          // Stale: the engine takes nothing of it.
+          return yield* stepLocked(deliveryId, event);
+        }
+        const removed = yield* Effect.exit(
+          Effect.suspend(() => pullRequests.closeOutWorktree(current)),
+        );
+        if (Exit.isFailure(removed)) {
+          if (Cause.hasInterruptsOnly(removed.cause)) return yield* Effect.interrupt;
+          return yield* stepLocked(deliveryId, {
+            type: "effect.failed",
+            effectId: job.effect.id,
+            detail: failureDetail(job.effect, removed.cause),
+          });
+        }
+        return yield* stepLocked(deliveryId, event);
+      }),
+    );
+  };
+
   /** The run a launch or turn result names; other results name none. */
   const runOf = (effect: FactoryEffect, event: FactoryEvent) => {
     if (event.type === "thread.launched") return { threadId: event.threadId, runId: event.runId };
@@ -926,6 +964,7 @@ const make = Effect.gen(function* () {
   // Annotated like `step`: it closes the cycle `stepLocked` → lane → `runJob` → `feed`.
   const feed = (job: Job, event: FactoryEvent): ReturnType<FactoryWorker["Service"]["step"]> => {
     const { deliveryId } = job.delivery;
+    if (event.type === "closed_out") return closeOutWorktree(job, event);
     if (event.type === "child.started") {
       // The child runs from its start on, and its approval may be stored before the parent
       // waits for it; the parent then takes it at once.

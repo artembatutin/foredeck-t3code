@@ -116,9 +116,11 @@ Factory does not change the item's status until its pull request merges.
 
 Factory follows the pull request on the thread it is linked to: the author's thread, or for a
 parent the last child's author's. When you merge it, Factory marks the item done, and for a parent
-each of its child items too, then removes the delivery's worktree unless it has uncommitted
-changes. The branch always stays. The delivery then shows **Done**. If an item cannot be marked
-done, the delivery blocks; **Resume** tries again.
+each of its child items too, leaving any already done as they are. Then it removes the delivery's
+worktree, unless it has uncommitted changes or a thread is still working in it. The branch always
+stays. The delivery then shows **Done**. If an item cannot be marked done or the worktree cannot be
+removed, the delivery blocks; **Resume** tries again. Cancelling the delivery while it finishes
+keeps the worktree.
 
 Closing the pull request without merging cancels the delivery and posts a comment on the item.
 The worktree, branch and commits stay; a parent's approved children keep their approval.

@@ -493,16 +493,31 @@ through the app requests a sync. Factory does not keep its threads from being se
 be a policy over the owner's threads.
 
 A merge is closed out as a worker effect, while the delivery stays `pr_open`
-([`FactoryPullRequest.closeOut`](../../apps/server/src/fd/factory/FactoryPullRequest.ts)): each
-child item done in plan order, then the delivery's own, through Work under a Factory actor, then
-the worktree removed through `GitWorkflowService.removeWorktree` from the project's checkout, only
-when clean and never that checkout itself. The branch stays. Setting an item done again changes
-nothing, so a resume of a close-out that failed, or that a restart lost, runs all of it again; the
-delivery blocks meanwhile rather than end done with its items unchanged. The delivery records how
-its pull request left `open` (`pullRequest.outcome`), so a report of either arriving later is
-inert, and a close's cancel is told apart from the owner's: only the close announces itself on
-the item. A closed parent cancels as an owner's cancel does, so its approved children keep their
-approvals; a merged parent's approved children are done once it is.
+([`FactoryPullRequest.ts`](../../apps/server/src/fd/factory/FactoryPullRequest.ts)): each child
+item done in plan order, then the delivery's own, through Work under a Factory actor, then the
+worktree removed through `GitWorkflowService.removeWorktree` from the project's checkout. The
+branch stays. A failed close-out, or one a restart lost, blocks the delivery rather than end it
+done with its items unchanged, and a resume runs all of it again. So each item is read first and
+one already done is left alone: a retry must not set done twice, which Jira refuses when no
+transition leads from Done to Done, and a Markdown write would restamp. Work's own writes move its
+read cache on, so the retry reads what the earlier attempt set.
+
+Removing the worktree is the one step that destroys anything, and a cancel keeps the checkout
+(owner decision). The item writes can take long and run outside the delivery's lock, so a cancel
+can be accepted meanwhile; the removal therefore runs under the lock, only while the delivery still
+awaits that very close-out, and the result is stored in the same hold
+([`FactoryWorker.ts`](../../apps/server/src/fd/factory/FactoryWorker.ts)). Items a close-out set
+before the cancel stay set, as other effects' writes do. The worktree stays when it has changes,
+when it is the project's checkout, and when a thread works in it: a run, run activity or
+background tasks in it, the rule core's checkout coordination applies, which covers only shared
+checkouts and branch changes. Git's own refusal covers only uncommitted changes, not an owner's
+turn that has written nothing yet. A turn starting between that check and the removal is not
+excluded; nothing in core leases a delivery's worktree.
+
+The delivery records how its pull request left `open` (`pullRequest.outcome`), so a report of
+either arriving later is inert, and a close's cancel is told apart from the owner's: only the close
+announces itself on the item. A closed parent cancels as an owner's cancel does, so its approved
+children keep their approvals; a merged parent's approved children are done once it is.
 
 ## Each transition posts one Work comment, from the step that stored it
 

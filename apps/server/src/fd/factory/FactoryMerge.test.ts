@@ -1,7 +1,8 @@
 import { assert, describe, it } from "@effect/vitest";
-import { AuthWorkReadScope } from "@t3tools/contracts";
+import { AuthWorkReadScope, AuthWorkWriteScope } from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
@@ -10,11 +11,13 @@ import * as Path from "effect/Path";
 import { type WorkActor, WorkService } from "../work-management/index.ts";
 import * as Factory from "./index.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
+import { isTerminalRunStatus } from "./pipeline/state.ts";
 import {
   drainFactory,
   fakePullRequest,
   git,
   stateOf,
+  threadProjection,
   verifyCommands,
   withProject,
 } from "./testkit/deliveryHarness.ts";
@@ -40,6 +43,11 @@ import {
 const service = Factory.FactoryService.FactoryService;
 
 const reader: WorkActor = { id: "session:owner", grants: [AuthWorkReadScope], label: "owner" };
+const owner: WorkActor = {
+  id: "session:owner",
+  grants: [AuthWorkReadScope, AuthWorkWriteScope],
+  label: "owner",
+};
 
 const attemptsOf = (deliveryId: FactoryDeliveryId) =>
   Effect.flatMap(FactoryStageRunStore.FactoryStageRunStore, (runs) =>
@@ -174,7 +182,7 @@ describe("Factory follow-through of a single item's pull request", () => {
 
   it.live("blocks on a close-out whose item write fails, and a resume closes it out", () => {
     const writes = statusWrites();
-    writes.fault.failing = true;
+    writes.fault.fails = () => true;
     return withProject(
       verifyCommands.passes,
       (world) =>
@@ -202,7 +210,7 @@ describe("Factory follow-through of a single item's pull request", () => {
           assert.deepStrictEqual(yield* stateOf(deliveryId), blocked);
           assert.strictEqual(writes.calls.length, 1);
 
-          writes.fault.failing = false;
+          writes.fault.fails = () => false;
           yield* factory.resume(deliveryId).pipe(Effect.orDie);
           yield* drainFactory;
           const done = yield* stateOf(deliveryId);
@@ -386,4 +394,246 @@ describe("Factory follow-through of a parent's pull request", () => {
       }),
     ),
   );
+});
+
+describe("Factory's close-out keeps what it must and is safe to run again", () => {
+  it.live("keeps the worktree of a delivery its owner cancels while its item is set done", () =>
+    Effect.gen(function* () {
+      const writing = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const writes = statusWrites();
+      return yield* withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const factory = yield* service;
+            const { deliveryId, threadId: author, worktreePath, state } = yield* openSingle(world);
+            const approved = state.receipts.at(-1)?.headSha ?? assert.fail("No receipt.");
+
+            // The merge's close-out waits in its item write.
+            yield* syncPullRequest(
+              author,
+              yield* linkOf(author, fakePullRequest.number),
+              "merged",
+              {
+                drain: false,
+              },
+            );
+            yield* Deferred.await(writing);
+            const closing = yield* stateOf(deliveryId);
+            assert.strictEqual(closing.status, "pr_open");
+            assert.strictEqual(closing.awaiting?.type, "effect");
+
+            // The owner's cancel is accepted meanwhile, then the write finishes.
+            const cancelled = yield* factory.cancel(deliveryId).pipe(Effect.orDie);
+            assert.strictEqual(cancelled.state.status, "cancelled");
+            yield* Deferred.succeed(release, undefined);
+            yield* drainFactory;
+
+            // The cancel keeps the checkout, and the close-out's result changes nothing.
+            assert.deepStrictEqual(yield* stateOf(deliveryId), cancelled.state);
+            assert.isTrue(yield* world.exists(worktreePath));
+            assert.deepStrictEqual(world.worktreeRemovals, []);
+            assert.strictEqual(yield* git(worktreePath, ["rev-parse", "HEAD"]), approved);
+            assert.strictEqual(
+              yield* git(world.root, ["rev-parse", `refs/heads/${state.branch}`]),
+              approved,
+            );
+            // The write under way when the cancel came landed, as other effects' writes do.
+            assert.deepStrictEqual(writes.written, [{ ref: world.itemRef, status: "done" }]);
+          }),
+        {
+          work: (work) => {
+            const recorded = writes.work(work);
+            return {
+              ...recorded,
+              setStatus: (actor, input) =>
+                Deferred.succeed(writing, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.andThen(recorded.setStatus(actor, input)),
+                ),
+            };
+          },
+        },
+      );
+    }),
+  );
+
+  it.live("keeps a clean worktree a thread is working in, and leaves that run alone", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const { deliveryId, threadId: author, worktreePath } = yield* openSingle(world);
+
+        // The owner asks the author thread for more before the pull request merges; its turn
+        // runs in the delivery's worktree and has written nothing yet.
+        const own = yield* world.ownerTurn(author, "Rename the export button to Download.");
+        assert.isTrue(world.provider.started.some(({ runId }) => runId === own));
+        assert.strictEqual(
+          yield* git(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]),
+          "",
+        );
+
+        yield* syncPullRequest(author, yield* linkOf(author, fakePullRequest.number), "merged");
+        const done = yield* stateOf(deliveryId);
+        assert.strictEqual(done.status, "done");
+        assert.strictEqual(yield* itemStatus(world.itemRef), "done");
+        // The worktree stays under the owner's turn, which runs on uninterrupted.
+        assert.deepStrictEqual(world.worktreeRemovals, []);
+        assert.isTrue(yield* world.exists(worktreePath));
+        assert.deepStrictEqual(world.provider.interrupted, []);
+        const running = (yield* threadProjection(author)).runs.find(({ id }) => id === own);
+        assert.isFalse(running === undefined || isTerminalRunStatus(running.status));
+
+        // The turn ends as its owner's: the worktree and the delivery stay as they are.
+        assert.strictEqual(yield* world.endRun(own, "completed"), "completed");
+        assert.isTrue(yield* world.exists(worktreePath));
+        assert.deepStrictEqual(yield* stateOf(deliveryId), done);
+      }),
+    ),
+  );
+
+  it.live("leaves an item already done as it is, where setting it done again is refused", () => {
+    const writes = statusWrites();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const { deliveryId, threadId: author, worktreePath } = yield* openSingle(world);
+          // Someone finished the item before the pull request merged.
+          yield* Effect.flatMap(WorkService.WorkService, (work) =>
+            work.setStatus(owner, { ref: world.itemRef, status: "done" }),
+          ).pipe(Effect.orDie);
+          const before = writes.calls.length;
+
+          yield* syncPullRequest(author, yield* linkOf(author, fakePullRequest.number), "merged");
+          assert.strictEqual((yield* stateOf(deliveryId)).status, "done");
+          assert.strictEqual(writes.calls.length, before);
+          assert.deepStrictEqual(world.worktreeRemovals, [{ cwd: world.root, path: worktreePath }]);
+        }),
+      { work: writes.work },
+    );
+  });
+
+  it.live(
+    "resumes a close-out whose removal failed after its item was set, writing it once",
+    () => {
+      const writes = statusWrites();
+      return withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const factory = yield* service;
+            const { deliveryId, threadId: author, worktreePath, state } = yield* openSingle(world);
+            const approved = state.receipts.at(-1)?.headSha ?? assert.fail("No receipt.");
+            // Git refuses to remove a locked worktree.
+            yield* git(world.root, [
+              "worktree",
+              "lock",
+              "--reason",
+              "kept by a test",
+              worktreePath,
+            ]);
+
+            yield* syncPullRequest(author, yield* linkOf(author, fakePullRequest.number), "merged");
+            const blocked = yield* stateOf(deliveryId);
+            assert.strictEqual(blocked.status, "blocked");
+            assert.deepStrictEqual(blocked.block, {
+              reason: "effect_failed",
+              effect: { id: blocked.effectsIssued, type: "close_out" },
+              detail: "Factory could not close out the merged pull request (GitCommandError).",
+            });
+            // The item was set; the worktree, branch and approval stay.
+            assert.deepStrictEqual(writes.written, [{ ref: world.itemRef, status: "done" }]);
+            assert.strictEqual(world.worktreeRemovals.length, 1);
+            assert.isTrue(yield* world.exists(worktreePath));
+            assert.strictEqual(
+              yield* git(world.root, ["rev-parse", `refs/heads/${state.branch}`]),
+              approved,
+            );
+            const fileSystem = yield* FileSystem.FileSystem;
+            const path = yield* Path.Path;
+            assert.isTrue(
+              yield* fileSystem.exists(
+                path.join(world.evidenceDir(deliveryId), "approval-item.json"),
+              ),
+            );
+
+            // Unlocked, a resume removes the worktree and sets nothing again.
+            yield* git(world.root, ["worktree", "unlock", worktreePath]);
+            yield* factory.resume(deliveryId).pipe(Effect.orDie);
+            yield* drainFactory;
+            assert.strictEqual((yield* stateOf(deliveryId)).status, "done");
+            assert.strictEqual(writes.calls.length, 1);
+            assert.strictEqual(world.worktreeRemovals.length, 2);
+            assert.isFalse(yield* world.exists(worktreePath));
+          }),
+        { work: writes.work },
+      );
+    },
+  );
+
+  it.live("resumes a parent's close-out that failed partway, setting each item done once", () => {
+    const writes = statusWrites();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const factory = yield* service;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const parent = yield* openParent(world);
+          const [first, last] = parent.children;
+          if (first === undefined || last === undefined) return assert.fail("Two children.");
+          const approvedChildren = yield* Effect.forEach(parent.children, ({ deliveryId }) =>
+            stateOf(deliveryId),
+          );
+          // The last child's item cannot be written the first time.
+          writes.fault.fails = (input) => input.ref.itemId === last.itemRef.itemId;
+
+          yield* syncPullRequest(
+            last.author,
+            yield* linkOf(last.author, fakePullRequest.number),
+            "merged",
+          );
+          const blocked = yield* stateOf(parent.deliveryId);
+          assert.strictEqual(blocked.status, "blocked");
+          assert.strictEqual(blocked.block?.reason, "effect_failed");
+          assert.strictEqual(yield* itemStatus(first.itemRef), "done");
+          assert.strictEqual(yield* itemStatus(last.itemRef), "todo");
+          assert.strictEqual(yield* itemStatus(world.itemRef), "todo");
+          // Its children stay approved, and its worktree, branch and approval stay.
+          for (const [index, { deliveryId }] of parent.children.entries()) {
+            assert.deepStrictEqual(yield* stateOf(deliveryId), approvedChildren[index]);
+          }
+          assert.isTrue(yield* world.exists(parent.worktreePath));
+          assert.deepStrictEqual(world.worktreeRemovals, []);
+          assert.isTrue(
+            yield* fileSystem.exists(
+              path.join(world.evidenceDir(parent.deliveryId), "approval.json"),
+            ),
+          );
+
+          writes.fault.fails = () => false;
+          yield* factory.resume(parent.deliveryId).pipe(Effect.orDie);
+          yield* drainFactory;
+          assert.strictEqual((yield* stateOf(parent.deliveryId)).status, "done");
+          // The first child's item is read done and left; the others are set once each.
+          assert.deepStrictEqual(
+            writes.calls.map(({ input }) => input.ref),
+            [first.itemRef, last.itemRef, last.itemRef, world.itemRef],
+          );
+          assert.deepStrictEqual(
+            writes.written.map(({ ref }) => ref),
+            [first.itemRef, last.itemRef, world.itemRef],
+          );
+          for (const { deliveryId } of parent.children) {
+            assert.strictEqual((yield* stateOf(deliveryId)).status, "done");
+          }
+          assert.deepStrictEqual(world.worktreeRemovals, [
+            { cwd: world.root, path: parent.worktreePath },
+          ]);
+        }),
+      { work: writes.work },
+    );
+  });
 });

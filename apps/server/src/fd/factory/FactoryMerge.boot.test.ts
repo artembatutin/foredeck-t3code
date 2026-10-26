@@ -137,7 +137,10 @@ describe("Factory's boot sweep of open pull requests", () => {
     ),
   );
 
-  it.live("blocks a close-out a restart lost, and a resume closes it out", () => {
+  it.live.each([
+    { when: "before its item write", written: false },
+    { when: "after its item write", written: true },
+  ])("blocks a close-out a restart lost $when, and a resume closes it out once", ({ written }) => {
     const writes = statusWrites();
     return withProject(
       verifyCommands.passes,
@@ -152,6 +155,11 @@ describe("Factory's boot sweep of open pull requests", () => {
           const other = yield* work
             .createItem(owner, { sourceId: world.itemRef.sourceId, title: "Add the import button" })
             .pipe(Effect.orDie);
+          // The stopped process may have set the item done before it stopped.
+          if (written) {
+            yield* work.setStatus(owner, { ref: other.ref, status: "done" }).pipe(Effect.orDie);
+          }
+          const before = writes.written.length;
           const merged = advance(
             { ...opened.state, worktreePath: null },
             { type: "pr.merged", number: fakePullRequest.number, url: fakePullRequest.url },
@@ -183,8 +191,8 @@ describe("Factory's boot sweep of open pull requests", () => {
             detail:
               "Factory could not close out the merged pull request: a server restart interrupted it.",
           });
-          assert.deepStrictEqual(writes.calls, []);
-          assert.strictEqual((yield* itemOf(other.ref)).status, "todo");
+          assert.strictEqual(writes.written.length, before);
+          assert.strictEqual((yield* itemOf(other.ref)).status, written ? "done" : "todo");
 
           // A resume closes it out.
           yield* world.boot(
@@ -193,8 +201,9 @@ describe("Factory's boot sweep of open pull requests", () => {
             ).pipe(Effect.orDie, Effect.andThen(drainFactory)),
           );
           assert.strictEqual((yield* stateOf(deliveryId)).status, "done");
+          // Set once, by whichever process got to it; a done item is never set done again.
           assert.deepStrictEqual(
-            writes.calls.map(({ input }) => input.ref),
+            writes.written.map(({ ref }) => ref),
             [other.ref],
           );
           assert.strictEqual((yield* itemOf(other.ref)).status, "done");

@@ -652,6 +652,11 @@ export interface World {
    */
   readonly boot: <A, E>(body: Effect.Effect<A, E, Services>) => Effect.Effect<A, E, Services>;
   /**
+   * Sends the owner's own turn on the thread, as the web client does, and returns its run once
+   * the provider has started it.
+   */
+  readonly ownerTurn: (threadId: ThreadId, text: string) => Effect.Effect<RunId, never, Services>;
+  /**
    * Ends the provider turn of `runId` and waits until orchestration has finished the run and
    * Factory has handled its end, including every effect that followed. Returns the run's status.
    */
@@ -767,6 +772,27 @@ export const withProject = <A, E>(
           return run?.status ?? assert.fail(`Run ${runId} is gone.`);
         }).pipe(Effect.orDie);
 
+      let ownerTurns = 0;
+      const ownerTurn: World["ownerTurn"] = (threadId, text) =>
+        Effect.gen(function* () {
+          ownerTurns += 1;
+          const threads = yield* ThreadManagement.ThreadManagementService;
+          const sent = yield* threads.sendToThread({
+            projectId,
+            commandId: CommandId.make(`owner-turn:${ownerTurns}`),
+            threadId,
+            messageId: MessageId.make(`owner-turn-message:${ownerTurns}`),
+            text,
+            attachments: [],
+            mode: "queue",
+            createdBy: "user",
+            creationSource: "web",
+          });
+          assert.strictEqual(yield* runReached(sent.run.id, ["starting", ...ended]), "starting");
+          yield* drainOrchestration;
+          return sent.run.id;
+        }).pipe(Effect.orDie);
+
       const boot: World["boot"] = (body) =>
         options.manualReactor !== true
           ? body
@@ -796,6 +822,7 @@ export const withProject = <A, E>(
         startWith,
         launched,
         boot,
+        ownerTurn,
         endRun,
       });
     }).pipe(

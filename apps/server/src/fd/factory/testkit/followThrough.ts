@@ -41,35 +41,47 @@ const reader: WorkActor = { id: "session:owner", grants: [AuthWorkReadScope], la
 export const closedComment =
   "Pull request #7 for this item was closed without merging, so Factory cancelled the delivery; its worktree, branch and commits stay.";
 
-// Work's own errors are private to Work; this carries the same tag.
+// Work's own errors are private to Work; these carry the same tags.
 class FakeWorkUnavailable extends Schema.TaggedError<FakeWorkUnavailable>()("WorkUnavailable", {
+  detail: Schema.String,
+}) {}
+class FakeWorkUnsupported extends Schema.TaggedError<FakeWorkUnsupported>()("WorkUnsupported", {
   detail: Schema.String,
 }) {}
 
 /**
- * Work recording each status it is asked to set, and refusing them while `fault.failing` is set;
- * pass `work` as the harness's Work option.
+ * Work recording each status it is asked to set, refusing those `fault.fails` picks, and, as
+ * Jira does, refusing to set done an item that is done already; pass `work` as the harness's Work
+ * option. `writes` counts the statuses it set.
  */
 export const statusWrites = () => {
-  const fault = { failing: false };
+  const fault = { fails: (_input: WorkSetStatusInput) => false };
   const calls: Array<{ readonly actor: WorkActor; readonly input: WorkSetStatusInput }> = [];
+  const written: Array<WorkSetStatusInput> = [];
   return {
     fault,
     calls,
+    written,
     work: (work: WorkService.WorkService["Service"]): WorkService.WorkService["Service"] => ({
       ...work,
       setStatus: (actor, input) =>
-        Effect.sync(() => calls.push({ actor, input })).pipe(
-          Effect.andThen(
-            fault.failing
-              ? Effect.fail(
-                  new FakeWorkUnavailable({
-                    detail: "The task file could not be written.",
-                  }) as unknown as WorkDomainError,
-                )
-              : work.setStatus(actor, input),
-          ),
-        ),
+        Effect.gen(function* () {
+          calls.push({ actor, input });
+          if (fault.fails(input)) {
+            return yield* new FakeWorkUnavailable({
+              detail: "The task file could not be written.",
+            }) as unknown as WorkDomainError;
+          }
+          const current = yield* work.getItem(actor, { ref: input.ref });
+          if (input.status === "done" && current.status === "done") {
+            return yield* new FakeWorkUnsupported({
+              detail: "No Jira transition reaches that status from here.",
+            }) as unknown as WorkDomainError;
+          }
+          const updated = yield* work.setStatus(actor, input);
+          written.push(input);
+          return updated;
+        }),
     }),
   };
 };

@@ -13,11 +13,13 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import * as GitWorkflow from "../../git/GitWorkflowService.ts";
 import { linkCreatedPullRequest } from "../../git/linkCreatedPullRequest.ts";
 import type * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import type * as ProjectService from "../../project/ProjectService.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
@@ -139,12 +141,15 @@ export class FactoryCloseOutChildMissingError extends Schema.TaggedError<Factory
   }
 }
 
-export type FactoryCloseOutError =
+export type FactoryCloseOutItemsError =
   | FactoryCloseOutChildMissingError
-  | FactoryBranchReadError
   | FactoryStoreError
+  | WorkDomainError;
+
+export type FactoryCloseOutWorktreeError =
+  | FactoryBranchReadError
   | ProjectStore.ProjectStoreV2Error
-  | WorkDomainError
+  | ProjectionStore.ProjectionStoreV2Error
   | GitCommandError;
 
 export type FactoryPullRequestError =
@@ -179,15 +184,25 @@ export class FactoryPullRequest extends Context.Service<
       effect: Extract<FactoryEffect, { readonly type: "open_pr" }>,
     ) => Effect.Effect<FactoryOpenedPullRequest, FactoryPullRequestError>;
     /**
-     * Follow-through once the delivery's pull request merged: sets each child item done in plan
-     * order for a parent, then the delivery's own item, through Work under a Factory actor; then
-     * removes the delivery's worktree through the Git workflow when it is clean. The branch always
-     * stays, and so does a dirty worktree, one already gone and the project's primary checkout.
-     * Setting an item done again changes nothing, so a resume runs it again from the start.
+     * Follow-through once the delivery's pull request merged, first part: sets each child item
+     * done in plan order for a parent, then the delivery's own item, through Work under a Factory
+     * actor. An item Work reads as done already is left as it is, so a retry after some of them
+     * were set, or an item someone else finished, writes nothing again: a source such as Jira
+     * refuses to move a done issue to done. A read or write that fails fails the close-out.
      */
-    readonly closeOut: (
+    readonly closeOutItems: (
       delivery: FactoryDeliveryStore.StoredFactoryDelivery,
-    ) => Effect.Effect<void, FactoryCloseOutError>;
+    ) => Effect.Effect<void, FactoryCloseOutItemsError>;
+    /**
+     * Follow-through once the delivery's pull request merged, second part: removes the delivery's
+     * worktree through the Git workflow when it is clean and no thread works in it. The branch
+     * always stays, and so does a worktree with changes, one a thread is working in, one already
+     * gone and the project's primary checkout. The worker calls this only under the delivery's
+     * lock, while the delivery still awaits its close-out, so a cancel never loses its checkout.
+     */
+    readonly closeOutWorktree: (
+      delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+    ) => Effect.Effect<void, FactoryCloseOutWorktreeError>;
   }
 >()("t3/fd/factory/FactoryPullRequest") {}
 
@@ -240,7 +255,9 @@ const make = Effect.gen(function* () {
   const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
   const tasks = yield* FactoryTaskStore.FactoryTaskStore;
   const projects = yield* ProjectStore.ProjectStoreV2;
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
   const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const context = yield* Effect.context<
     | FileSystem.FileSystem
     | GitVcsDriver.GitVcsDriver
@@ -467,17 +484,48 @@ const make = Effect.gen(function* () {
     ).pipe(Effect.map((children) => [...children, delivery.itemRef]));
 
   /** The path with its links resolved; as given when it cannot be resolved. */
-  const resolved = (path: string) =>
-    fileSystem.realPath(path).pipe(Effect.orElseSucceed(() => path));
+  const resolved = (target: string) =>
+    fileSystem.realPath(target).pipe(Effect.orElseSucceed(() => path.resolve(target)));
 
   /**
-   * Removes the delivery's worktree when it is clean, from the project's primary checkout, which
-   * is never removed itself. A worktree already gone needs nothing, and one with changes, or of a
-   * project no longer stored, stays as it is. The branch is never touched.
+   * Whether a thread is working in the checkout at `root` (resolved): one with a run, run
+   * activity or background tasks whose checkout is `root` or inside it. The rule core's checkout
+   * coordination applies before changing a shared checkout, which a delivery's own worktree is
+   * not, so it is applied here.
    */
-  const removeCleanWorktree = Effect.fn("FactoryPullRequest.removeCleanWorktree")(function* (
-    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
-  ) {
+  const inUse = (root: string) =>
+    Effect.gen(function* () {
+      const snapshot = yield* projections.getShellSnapshot({ unsettledOnly: true });
+      for (const thread of [...snapshot.threads, ...snapshot.archivedThreads]) {
+        if (
+          thread.activeRunId === null &&
+          thread.activityRunStatus == null &&
+          (thread.pendingBackgroundTasks?.length ?? 0) === 0
+        ) {
+          continue;
+        }
+        const checkouts =
+          thread.worktreePath !== null
+            ? [thread.worktreePath]
+            : (thread.workspaceBinding?.repositories.map(({ rootPath }) => rootPath) ?? []);
+        for (const checkout of checkouts) {
+          const relative = path.relative(root, yield* resolved(checkout));
+          if (
+            relative === "" ||
+            (relative !== ".." &&
+              !relative.startsWith(`..${path.sep}`) &&
+              !path.isAbsolute(relative))
+          ) {
+            return true;
+          }
+        }
+      }
+      return false;
+    });
+
+  const closeOutWorktree: FactoryPullRequest["Service"]["closeOutWorktree"] = Effect.fn(
+    "FactoryPullRequest.closeOutWorktree",
+  )(function* (delivery) {
     const { worktreePath } = delivery.state;
     if (worktreePath === null) return;
     const project = Option.getOrUndefined(
@@ -494,24 +542,30 @@ const make = Effect.gen(function* () {
       Effect.provideContext(context),
     );
     if (Option.isNone(current)) return;
-    if ((yield* resolved(worktreePath)) === (yield* resolved(project.workspaceRoot))) return;
+    const root = yield* resolved(worktreePath);
+    if (root === (yield* resolved(project.workspaceRoot))) return;
     if (!current.value.clean) return yield* kept("it has changes");
+    // A thread that has not written anything yet still works there: its run is left alone.
+    if (yield* inUse(root)) return yield* kept("a thread is working in it");
     // Not forced: Git refuses a worktree that changed since it was read, and the effect fails.
     yield* gitWorkflow.removeWorktree({ cwd: project.workspaceRoot, path: worktreePath });
   });
 
-  const closeOut: FactoryPullRequest["Service"]["closeOut"] = Effect.fn(
-    "FactoryPullRequest.closeOut",
+  const closeOutItems: FactoryPullRequest["Service"]["closeOutItems"] = Effect.fn(
+    "FactoryPullRequest.closeOutItems",
   )(function* (delivery) {
     const writer = itemWriter(delivery.deliveryId);
     // Every item is found before any is set, so a missing child sets none.
     for (const ref of yield* finishedItems(delivery)) {
+      // Work's own writes move its cache on, so a retry reads what an earlier attempt set. An
+      // item it cannot read in full is not taken as done.
+      const item = yield* work.getItem(writer, { ref });
+      if (item.status === "done" && item.invalid === null) continue;
       yield* work.setStatus(writer, { ref, status: "done" });
     }
-    yield* removeCleanWorktree(delivery);
   });
 
-  return FactoryPullRequest.of({ open, closeOut });
+  return FactoryPullRequest.of({ open, closeOutItems, closeOutWorktree });
 });
 
 export const layer = Layer.effect(FactoryPullRequest, make);
