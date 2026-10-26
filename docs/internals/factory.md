@@ -499,8 +499,10 @@ worktree removed through `GitWorkflowService.removeWorktree` from the project's 
 branch stays. A failed close-out, or one a restart lost, blocks the delivery rather than end it
 done with its items unchanged, and a resume runs all of it again. So each item is read first and
 one already done is left alone: a retry must not set done twice, which Jira refuses when no
-transition leads from Done to Done, and a Markdown write would restamp. Work's own writes move its
-read cache on, so the retry reads what the earlier attempt set.
+transition leads from Done to Done, and a Markdown write would restamp. Work keeps its reads for
+15 seconds, and only its own writes move that cache on, not a change made in the tracker, so the
+close-out refreshes Work before it reads: a done it remembered must not stand in for an item
+reopened since, or for one its source can no longer read in full, which is never taken as done.
 
 Removing the worktree is the one step that destroys anything, and a cancel keeps the checkout
 (owner decision). The item writes can take long and run outside the delivery's lock, so a cancel
@@ -510,9 +512,14 @@ awaits that very close-out, and the result is stored in the same hold
 before the cancel stay set, as other effects' writes do. The worktree stays when it has changes,
 when it is the project's checkout, and when a thread works in it: a run, run activity or
 background tasks in it, the rule core's checkout coordination applies, which covers only shared
-checkouts and branch changes. Git's own refusal covers only uncommitted changes, not an owner's
-turn that has written nothing yet. A turn starting between that check and the removal is not
-excluded; nothing in core leases a delivery's worktree.
+checkouts and branch changes. A thread works in its worktree, in the repositories it is bound to,
+or else in its project's root, which can be the delivery's worktree or a folder inside it. Settled
+threads count too: a thread settles with a background command such as a dev server still
+running, and its provider stops only when core's detach effect runs. A pull request watch counts
+as background work, as it does for core, so a watch still on a thread keeps the worktree. Git's
+own refusal covers only uncommitted changes, not an owner's turn that has written nothing yet. A
+turn starting between that check and the removal is not excluded; nothing in core leases a
+delivery's worktree.
 
 The delivery records how its pull request left `open` (`pullRequest.outcome`), so a report of
 either arriving later is inert, and a close's cancel is told apart from the owner's: only the close

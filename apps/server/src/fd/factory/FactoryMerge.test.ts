@@ -26,10 +26,13 @@ import {
   linkOf,
   linkPullRequest,
   closedComment,
+  editTaskFile,
   openParent,
   openSingle,
+  settleThread,
   statusWrites,
   syncPullRequest,
+  threadShell,
 } from "./testkit/followThrough.ts";
 
 /**
@@ -632,6 +635,150 @@ describe("Factory's close-out keeps what it must and is safe to run again", () =
           assert.deepStrictEqual(world.worktreeRemovals, [
             { cwd: world.root, path: parent.worktreePath },
           ]);
+        }),
+      { work: writes.work },
+    );
+  });
+});
+
+describe("Factory's close-out reads what is there now", () => {
+  it.live("keeps a clean worktree a settled thread's background command still runs in", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const { deliveryId, threadId: author, worktreePath } = yield* openSingle(world);
+        // The owner has the author thread start a dev server; its turn ends with the server
+        // running, and the owner settles the thread before its provider is stopped.
+        const own = yield* world.ownerTurn(author, "Start the dev server.");
+        const turn =
+          world.provider.started.find(({ runId }) => runId === own) ?? assert.fail("No turn.");
+        yield* world.provider.startCommand(turn, "vp dev");
+        assert.strictEqual(yield* world.endRun(own, "completed"), "completed");
+        yield* settleThread(author);
+        const settled = yield* threadShell(author);
+        assert.isNotNull(settled.settledAt);
+        assert.strictEqual(settled.activeRunId, null);
+        assert.deepStrictEqual(
+          settled.pendingBackgroundTasks?.map(({ kind }) => kind),
+          ["command"],
+        );
+        assert.strictEqual(
+          yield* git(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]),
+          "",
+        );
+
+        yield* syncPullRequest(author, yield* linkOf(author, fakePullRequest.number), "merged");
+        assert.strictEqual((yield* stateOf(deliveryId)).status, "done");
+        assert.strictEqual(yield* itemStatus(world.itemRef), "done");
+        assert.deepStrictEqual(world.worktreeRemovals, []);
+        assert.isTrue(yield* world.exists(worktreePath));
+        assert.deepStrictEqual(world.provider.interrupted, []);
+      }),
+    ),
+  );
+
+  it.live.each([
+    { where: "at", inside: "" },
+    { where: "inside", inside: "packages" },
+  ])("keeps a clean worktree a thread of a project rooted $where it is working in", ({ inside }) =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { deliveryId, threadId: author, worktreePath } = yield* openSingle(world);
+        const root = inside === "" ? worktreePath : path.join(worktreePath, inside);
+        // An empty folder is nothing Git reports: the worktree stays clean.
+        if (inside !== "") yield* fileSystem.makeDirectory(root);
+        const owner = yield* world.ownerThreadAt(root, "Look around this package.");
+        // Its thread has no worktree or bound repository: its turns run in its project's root.
+        const shell = yield* threadShell(owner.threadId);
+        assert.isNull(shell.worktreePath);
+        assert.isUndefined(shell.workspaceBinding);
+        assert.strictEqual(
+          yield* git(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]),
+          "",
+        );
+
+        yield* syncPullRequest(author, yield* linkOf(author, fakePullRequest.number), "merged");
+        assert.strictEqual((yield* stateOf(deliveryId)).status, "done");
+        assert.deepStrictEqual(world.worktreeRemovals, []);
+        assert.isTrue(yield* world.exists(root));
+        assert.deepStrictEqual(world.provider.interrupted, []);
+        const running = (yield* threadProjection(owner.threadId)).runs.find(
+          ({ id }) => id === owner.runId,
+        );
+        assert.isFalse(running === undefined || isTerminalRunStatus(running.status));
+      }),
+    ),
+  );
+
+  it.live("sets an item done that its tracker reopened after Work read it done", () => {
+    const writes = statusWrites();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const { deliveryId, threadId: author } = yield* openSingle(world);
+          // Work reads the item done, then the tracker reopens it behind Work's back: Work's
+          // read still says done.
+          yield* Effect.flatMap(WorkService.WorkService, (work) =>
+            work.setStatus(owner, { ref: world.itemRef, status: "done" }),
+          ).pipe(Effect.orDie);
+          assert.strictEqual(yield* itemStatus(world.itemRef), "done");
+          yield* editTaskFile(world, world.itemRef, (text) =>
+            text.replace(/^status: done$/m, "status: todo"),
+          );
+          assert.strictEqual(yield* itemStatus(world.itemRef), "done");
+          const before = writes.written.length;
+
+          yield* syncPullRequest(author, yield* linkOf(author, fakePullRequest.number), "merged");
+          assert.strictEqual((yield* stateOf(deliveryId)).status, "done");
+          // The close-out read the item as it is now and set it done again.
+          assert.deepStrictEqual(writes.written.slice(before), [
+            { ref: world.itemRef, status: "done" },
+          ]);
+          // Work's own write moved its reads on: the source holds the item done.
+          assert.strictEqual(yield* itemStatus(world.itemRef), "done");
+        }),
+      { work: writes.work },
+    );
+  });
+
+  it.live("blocks on an item Work read done that its source can no longer read in full", () => {
+    const writes = statusWrites();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const factory = yield* service;
+          const { deliveryId, threadId: author, worktreePath } = yield* openSingle(world);
+          yield* Effect.flatMap(WorkService.WorkService, (work) =>
+            work.setStatus(owner, { ref: world.itemRef, status: "done" }),
+          ).pipe(Effect.orDie);
+          assert.strictEqual(yield* itemStatus(world.itemRef), "done");
+          // A merge conflict lands in the task file: its source can list it but not trust it.
+          const marker = "<<<<<<< ours";
+          yield* editTaskFile(world, world.itemRef, (text) => `${text}\n${marker}\n`);
+          assert.strictEqual(yield* itemStatus(world.itemRef), "done");
+
+          yield* syncPullRequest(author, yield* linkOf(author, fakePullRequest.number), "merged");
+          const blocked = yield* stateOf(deliveryId);
+          assert.strictEqual(blocked.status, "blocked");
+          assert.deepStrictEqual(blocked.block, {
+            reason: "effect_failed",
+            effect: { id: blocked.effectsIssued, type: "close_out" },
+            detail: "Factory could not close out the merged pull request (WorkUnsupported).",
+          });
+          assert.deepStrictEqual(world.worktreeRemovals, []);
+          assert.isTrue(yield* world.exists(worktreePath));
+
+          // The conflict resolved, a resume reads the item done and leaves it as it is.
+          yield* editTaskFile(world, world.itemRef, (text) => text.replace(`\n${marker}\n`, ""));
+          const written = writes.written.length;
+          yield* factory.resume(deliveryId).pipe(Effect.orDie);
+          yield* drainFactory;
+          assert.strictEqual((yield* stateOf(deliveryId)).status, "done");
+          assert.strictEqual(writes.written.length, written);
+          assert.deepStrictEqual(world.worktreeRemovals, [{ cwd: world.root, path: worktreePath }]);
         }),
       { work: writes.work },
     );

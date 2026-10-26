@@ -186,9 +186,11 @@ export class FactoryPullRequest extends Context.Service<
     /**
      * Follow-through once the delivery's pull request merged, first part: sets each child item
      * done in plan order for a parent, then the delivery's own item, through Work under a Factory
-     * actor. An item Work reads as done already is left as it is, so a retry after some of them
-     * were set, or an item someone else finished, writes nothing again: a source such as Jira
-     * refuses to move a done issue to done. A read or write that fails fails the close-out.
+     * actor. An item the source reads as done already, after Work's reads are refreshed, is left
+     * as it is, so a retry after some of them were set, or an item someone else finished, writes
+     * nothing again: a source such as Jira refuses to move a done issue to done. An item the
+     * source cannot read in full is never taken as done, and a read or write that fails fails
+     * the close-out.
      */
     readonly closeOutItems: (
       delivery: FactoryDeliveryStore.StoredFactoryDelivery,
@@ -489,13 +491,20 @@ const make = Effect.gen(function* () {
 
   /**
    * Whether a thread is working in the checkout at `root` (resolved): one with a run, run
-   * activity or background tasks whose checkout is `root` or inside it. The rule core's checkout
-   * coordination applies before changing a shared checkout, which a delivery's own worktree is
-   * not, so it is applied here.
+   * activity or background tasks whose checkout is `root` or inside it. That checkout is its
+   * worktree, the repositories it is bound to, or else its project's root, where its turns run.
+   * Core's checkout coordination applies this rule only before changing a shared checkout, which
+   * a delivery's own worktree is not, so Factory applies it here, to settled threads too: a
+   * thread settles with a background command still running, and its provider stops only after.
    */
   const inUse = (root: string) =>
     Effect.gen(function* () {
-      const snapshot = yield* projections.getShellSnapshot({ unsettledOnly: true });
+      const snapshot = yield* projections.getShellSnapshot();
+      const projectRoots = new Map(
+        (yield* projects.list({ includeDeleted: true })).map(
+          (project) => [project.projectId, project.workspaceRoot] as const,
+        ),
+      );
       for (const thread of [...snapshot.threads, ...snapshot.archivedThreads]) {
         if (
           thread.activeRunId === null &&
@@ -504,10 +513,15 @@ const make = Effect.gen(function* () {
         ) {
           continue;
         }
+        const projectRoot = projectRoots.get(thread.projectId);
         const checkouts =
           thread.worktreePath !== null
             ? [thread.worktreePath]
-            : (thread.workspaceBinding?.repositories.map(({ rootPath }) => rootPath) ?? []);
+            : thread.workspaceBinding !== undefined
+              ? thread.workspaceBinding.repositories.map(({ rootPath }) => rootPath)
+              : projectRoot === undefined
+                ? []
+                : [projectRoot];
         for (const checkout of checkouts) {
           const relative = path.relative(root, yield* resolved(checkout));
           if (
@@ -556,9 +570,12 @@ const make = Effect.gen(function* () {
   )(function* (delivery) {
     const writer = itemWriter(delivery.deliveryId);
     // Every item is found before any is set, so a missing child sets none.
-    for (const ref of yield* finishedItems(delivery)) {
-      // Work's own writes move its cache on, so a retry reads what an earlier attempt set. An
-      // item it cannot read in full is not taken as done.
+    const items = yield* finishedItems(delivery);
+    // Work keeps what it read for a while, and a tracker's own changes do not reach that: the
+    // item read below must be the source's now, or a done one reopened since would stay open.
+    yield* work.refresh(writer, { sourceId: delivery.itemRef.sourceId });
+    for (const ref of items) {
+      // An item it cannot read in full is not taken as done.
       const item = yield* work.getItem(writer, { ref });
       if (item.status === "done" && item.invalid === null) continue;
       yield* work.setStatus(writer, { ref, status: "done" });

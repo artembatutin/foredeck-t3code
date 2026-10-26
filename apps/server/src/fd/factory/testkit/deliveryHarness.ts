@@ -15,6 +15,7 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   type RunId,
+  TurnItemId,
   type RuntimeMode,
   type ServerProvider,
   type ThreadId,
@@ -282,7 +283,39 @@ const makeFakeProvider = Effect.gen(function* () {
       });
     });
 
-  return { adapter, started, interrupted, endTurn, say };
+  /**
+   * Starts a command in the turn that goes on running in the background, as a dev server does:
+   * its run can end while the command still runs.
+   */
+  const startCommand = (turn: ProviderAdapter.ProviderAdapterV2TurnInput, input: string) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const id = `command:${turn.attemptId}`;
+      yield* Queue.offer(events, {
+        type: "turn_item.updated",
+        driver,
+        turnItem: {
+          id: TurnItemId.make(id),
+          threadId: turn.threadId,
+          runId: turn.runId,
+          nodeId: turn.rootNodeId,
+          providerThreadId: turn.providerThread.id,
+          providerTurnId: providerTurnId(turn),
+          nativeItemRef: { driver, nativeId: id, strength: "strong" },
+          parentItemId: null,
+          ordinal: 1,
+          status: "running",
+          title: null,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          type: "command_execution",
+          input,
+        },
+      });
+    });
+
+  return { adapter, started, interrupted, endTurn, say, startCommand };
 });
 
 type FakeProvider = Effect.Success<typeof makeFakeProvider>;
@@ -405,7 +438,11 @@ const threadLaunch = ThreadLaunch.layer.pipe(
       WorktreeSetupTracker.layer,
       Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({ get: () => Effect.succeed(null) }),
       Layer.mock(TerminalManager.TerminalManager)({}),
-      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/nowhere" }),
+      // No project here is the Scratch project, so no thread gets a folder of its own.
+      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+        namedProjectsRoot: "/nowhere",
+        folderForThread: () => Effect.succeedNone,
+      }),
       gitWorkflow,
       noSetupScript,
       noTextGeneration,
@@ -657,6 +694,15 @@ export interface World {
    */
   readonly ownerTurn: (threadId: ThreadId, text: string) => Effect.Effect<RunId, never, Services>;
   /**
+   * Adds a project of the owner's rooted at `root` and starts a thread on it with no worktree of
+   * its own, so its turns run in `root`. Returns the thread and its first run once the provider
+   * has started it.
+   */
+  readonly ownerThreadAt: (
+    root: string,
+    text: string,
+  ) => Effect.Effect<{ readonly threadId: ThreadId; readonly runId: RunId }, never, Services>;
+  /**
    * Ends the provider turn of `runId` and waits until orchestration has finished the run and
    * Factory has handled its end, including every effect that followed. Returns the run's status.
    */
@@ -793,6 +839,38 @@ export const withProject = <A, E>(
           return sent.run.id;
         }).pipe(Effect.orDie);
 
+      const ownerThreadAt: World["ownerThreadAt"] = (workspaceRoot, text) =>
+        Effect.gen(function* () {
+          ownerTurns += 1;
+          const ownerProject = ProjectId.make(`project-owner-${ownerTurns}`);
+          yield* projects.create({
+            commandId: CommandId.make(`create-owner-project:${ownerTurns}`),
+            projectId: ownerProject,
+            title: `Owner ${ownerTurns}`,
+            workspaceRoot,
+          });
+          const launches = yield* ThreadLaunch.ThreadLaunchService;
+          const messageId = MessageId.make(`owner-launch-message:${ownerTurns}`);
+          const launched = yield* launches.launch({
+            commandId: CommandId.make(`owner-launch:${ownerTurns}`),
+            projectId: ownerProject,
+            title: "Owner thread",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            workspaceStrategy: { type: "root" },
+            initialMessage: { messageId, text, attachments: [] },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const run =
+            launched.projection.runs.find((candidate) => candidate.userMessageId === messageId) ??
+            assert.fail("The owner's launch started no run.");
+          assert.strictEqual(yield* runReached(run.id, ["starting", ...ended]), "starting");
+          yield* drainOrchestration;
+          return { threadId: launched.threadId, runId: run.id };
+        }).pipe(Effect.orDie);
+
       const boot: World["boot"] = (body) =>
         options.manualReactor !== true
           ? body
@@ -823,6 +901,7 @@ export const withProject = <A, E>(
         launched,
         boot,
         ownerTurn,
+        ownerThreadAt,
         endRun,
       });
     }).pipe(

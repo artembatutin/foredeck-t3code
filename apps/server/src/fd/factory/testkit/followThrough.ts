@@ -11,7 +11,9 @@ import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef, WorkSetStatusInput } from "@t3tools/contracts/fd/work-management";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
@@ -280,3 +282,41 @@ export const itemStatus = (ref: WorkItemRef) =>
     Effect.map((item) => item.status),
     Effect.orDie,
   );
+
+/** The thread's shell as the projection holds it. */
+export const threadShell = (threadId: ThreadId) =>
+  Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+    orchestrator.getThreadShell(threadId),
+  ).pipe(
+    Effect.orDie,
+    Effect.map((shell) => shell ?? assert.fail(`Thread ${threadId} has no shell.`)),
+  );
+
+/**
+ * Settles the thread as its owner does. Its provider stops only once core's effect worker runs
+ * the detach this queues, which these tests leave queued.
+ */
+export const settleThread = (threadId: ThreadId) =>
+  Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+    orchestrator.dispatch({ type: "thread.settle", commandId: commandId("settle"), threadId }),
+  ).pipe(Effect.asVoid, Effect.orDie);
+
+/**
+ * Rewrites the item's task file in the project's Markdown source with `edit`, behind Work's
+ * back, as a change made in the tracker itself is.
+ */
+export const editTaskFile = (world: World, ref: WorkItemRef, edit: (text: string) => string) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = path.join(world.root, "tasks");
+    for (const name of yield* fileSystem.readDirectory(directory)) {
+      const file = path.join(directory, name);
+      const text = yield* fileSystem.readFileString(file);
+      if (!text.includes(`id: ${ref.itemId}`)) continue;
+      const edited = edit(text);
+      assert.notStrictEqual(edited, text);
+      return yield* fileSystem.writeFileString(file, edited);
+    }
+    return assert.fail(`No task file holds item ${ref.itemId}.`);
+  }).pipe(Effect.orDie);
