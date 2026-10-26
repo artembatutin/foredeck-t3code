@@ -1,9 +1,15 @@
-import type { OrchestrationV2DomainEvent, RunId, ThreadId } from "@t3tools/contracts";
+import type {
+  OrchestrationV2DomainEvent,
+  RunId,
+  ThreadId,
+  ThreadPullRequestLink,
+} from "@t3tools/contracts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TxRef from "effect/TxRef";
@@ -14,15 +20,22 @@ import { forkParked } from "../../serverActivation.ts";
 import { launchDeliveryId } from "./FactoryThreadEffects.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
-import { type FactoryThreadEvent, isTerminalRunStatus } from "./pipeline/state.ts";
+import {
+  type FactoryEvent,
+  type FactoryThreadEvent,
+  isTerminalRunStatus,
+} from "./pipeline/state.ts";
 
 /**
  * Feeds what happens to Factory's threads into their deliveries: a terminal run becomes
  * `run.finished` and a deleted thread `thread.deleted` for the delivery whose active stage
  * attempt owns the thread (any delivery recording it, for a deletion); other threads pass by.
+ * A pull request link that core's sync stored merged or closed on the thread a delivery's open
+ * pull request is linked to becomes `pr.merged` or `pr.closed` for that delivery; nothing polls.
  * A boot sweep catches up the deliveries that awaited something when the previous server stopped,
- * and posts the Work comments it recorded and never finished. The tail starts at the event log
- * position read before the sweep, so no event falls between the two.
+ * and the pull requests that merged or closed meanwhile, and posts the Work comments it recorded
+ * and never finished. The tail starts at the event log position read before the sweep, so no
+ * event falls between the two.
  */
 export class FactoryReactor extends Context.Service<
   FactoryReactor,
@@ -45,7 +58,28 @@ interface LiveRun {
   readonly runId: RunId;
 }
 
-type Job = "boot" | FactoryThreadEvent | LiveRun;
+/** A pull request event for the deliveries whose pull request is linked to the thread. */
+interface PullRequestEnded {
+  readonly type: "pr.ended";
+  readonly threadId: ThreadId;
+  readonly event: Extract<FactoryEvent, { readonly type: "pr.merged" | "pr.closed" }>;
+}
+
+type Job = "boot" | FactoryThreadEvent | LiveRun | PullRequestEnded;
+
+/**
+ * The event a link's stored snapshot makes: its pull request merged or closed, by number and URL.
+ * None while it is open, or before its first sync.
+ */
+const pullRequestEnded = (link: ThreadPullRequestLink): PullRequestEnded["event"] | undefined => {
+  const state = link.snapshot?.state;
+  if (state !== "merged" && state !== "closed") return undefined;
+  return {
+    type: state === "merged" ? "pr.merged" : "pr.closed",
+    number: link.number,
+    url: link.url,
+  };
+};
 
 /**
  * A restart continuation goes live as it starts. A launch's run is left alone while it prepares
@@ -83,22 +117,68 @@ const make = Effect.gen(function* () {
     );
 
   /**
+   * The thread a delivery's pull request is linked to: its author's, or for a parent, which has
+   * none, its last child's author's (see `FactoryPullRequest`). None without one.
+   */
+  const pullRequestThread = ({ state }: FactoryDeliveryStore.StoredFactoryDelivery) =>
+    Effect.gen(function* () {
+      if (state.kind !== "parent") return state.threads.author;
+      const last = state.children.at(-1);
+      if (last === undefined) return undefined;
+      return Option.getOrUndefined(yield* deliveries.get(last))?.state.threads.author;
+    });
+
+  /**
+   * Steps the deliveries with an open pull request linked to the thread with the link's merge or
+   * close. The engine takes it only for the pull request a delivery opened, and only once.
+   */
+  const stepPullRequest = ({ threadId, event }: PullRequestEnded) =>
+    Effect.gen(function* () {
+      for (const delivery of yield* deliveries.listActive()) {
+        if (delivery.state.status !== "pr_open") continue;
+        if ((yield* pullRequestThread(delivery)) !== threadId) continue;
+        yield* worker.step(delivery.deliveryId, event);
+      }
+    });
+
+  /**
+   * The merge or close of a delivery's open pull request that core's sync stored while no server
+   * ran Factory, read from its thread's link as the projection has it: the step the tail would
+   * have taken. None while the link shows it open.
+   */
+  const catchUpPullRequest = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
+    Effect.gen(function* () {
+      const { pullRequest } = delivery.state;
+      const threadId = yield* pullRequestThread(delivery);
+      if (pullRequest === null || threadId === undefined) return;
+      const shell = yield* projections.getThreadShell(threadId);
+      const link = shell?.pullRequests?.find(
+        (candidate) => candidate.number === pullRequest.number && candidate.url === pullRequest.url,
+      );
+      const event = link === undefined ? undefined : pullRequestEnded(link);
+      if (event !== undefined) yield* worker.step(delivery.deliveryId, event);
+    });
+
+  /**
    * Catches one delivery up with what happened while no server ran it, whatever its status. First
-   * a cancellation the restart cut short between a parent and its children is completed. A
-   * delivery awaiting a run gets the run's end or its thread's deletion, as the tail would have
-   * handed them on, so a stopping one stops where the run's end leads it. One awaiting an effect
-   * lost it with the previous process and blocks, unless what it did is stored (see
-   * `failInterruptedEffect`). A parent awaiting its child takes the child's approval stored
-   * before the restart, and otherwise waits for that child. A delivery awaiting nothing (queued,
-   * stopped, blocked, its pull request open) waits for its owner. Each step reads the delivery
-   * again, so one cancelled here takes nothing more.
+   * what a restart cut short between a parent and its children is completed. A delivery awaiting
+   * a run gets the run's end or its thread's deletion, as the tail would have handed them on, so a
+   * stopping one stops where the run's end leads it. One awaiting an effect lost it with the
+   * previous process and blocks, unless what it did is stored (see `failInterruptedEffect`). A
+   * parent awaiting its child takes the child's approval stored before the restart, and otherwise
+   * waits for that child. One with its pull request open takes its merge or close stored
+   * meanwhile. A delivery awaiting nothing else (queued, stopped, blocked) waits for its owner.
+   * Each step reads the delivery again, so one cancelled here takes nothing more.
    */
   const reconcile = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
     Effect.gen(function* () {
       const { deliveryId, state } = delivery;
-      yield* worker.finishCancellation(deliveryId);
+      yield* worker.finishFamily(deliveryId);
       const { awaiting } = state;
-      if (awaiting === null) return;
+      if (awaiting === null) {
+        if (state.status === "pr_open") yield* catchUpPullRequest(delivery);
+        return;
+      }
       if (awaiting.type === "child") {
         yield* worker.takeChildApproval(deliveryId);
         return;
@@ -125,14 +205,19 @@ const make = Effect.gen(function* () {
   const jobs = yield* makeDrainableWorker((job: Job) => {
     if (job === "boot") return bootSweep;
     if (job.type === "run.live") return worker.stopCancelledRun(job);
+    if (job.type === "pr.ended") {
+      return stepPullRequest(job).pipe(
+        Effect.catchCause(logSkipped("factory pull request event skipped")),
+      );
+    }
     return worker
       .stepThread(job)
       .pipe(Effect.catchCause(logSkipped("factory thread event skipped")));
   });
 
   /**
-   * A run's end, a thread's deletion, and a run going live on a thread a Factory launch made;
-   * everything else passes by.
+   * A run's end, a thread's deletion, a run going live on a thread a Factory launch made, and a
+   * pull request link stored merged or closed; everything else passes by.
    */
   const onDomainEvent = (event: OrchestrationV2DomainEvent): Effect.Effect<void> => {
     switch (event.type) {
@@ -150,6 +235,12 @@ const make = Effect.gen(function* () {
       }
       case "thread.deleted":
         return jobs.enqueue({ type: "thread.deleted", threadId: event.payload.id });
+      case "thread.pull-request-link-updated": {
+        const ended = pullRequestEnded(event.payload);
+        return ended === undefined
+          ? Effect.void
+          : jobs.enqueue({ type: "pr.ended", threadId: event.threadId, event: ended });
+      }
       default:
         return Effect.void;
     }

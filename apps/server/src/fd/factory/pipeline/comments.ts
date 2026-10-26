@@ -10,10 +10,13 @@ import type { FactoryBlock, FactoryDeliveryState } from "./state.ts";
  * what this returns once the step that made the transition is stored.
  */
 
-/** The statuses whose entry is announced: blocked and waiting need the owner; the others report. */
+/**
+ * The statuses whose entry is announced: blocked and waiting need the owner; the others report.
+ * Cancelled is announced only when the pull request closed: the owner's own cancel needs no word.
+ */
 export type FactoryCommentedStatus = Extract<
   FactoryDeliveryStatus,
-  "blocked" | "waiting" | "approved" | "pr_open"
+  "blocked" | "waiting" | "approved" | "pr_open" | "cancelled"
 >;
 
 export interface FactoryTransitionComment {
@@ -62,11 +65,12 @@ const blockedBody = (reason: string | undefined) =>
 
 /**
  * The comment for moving from `before` to `after`: one for entering blocked, waiting, approved or
- * pr_open from any other status, none for staying in a status or entering any other. A blocked
- * comment gives the block's message, as the delivery's `needsYou` does, and keeps the reason's
- * fixed text when it drops the facts; an approved one the approved commit, the one the last
- * receipt verified, and that its pull request is being opened unless it is a child, whose parent's
- * pull request carries it; a pr_open one the pull request's number and URL.
+ * pr_open from any other status, or cancelled because the pull request closed without merging,
+ * none for staying in a status or entering any other. A blocked comment gives the block's message,
+ * as the delivery's `needsYou` does, and keeps the reason's fixed text when it drops the facts; an
+ * approved one the approved commit, the one the last receipt verified, and that its pull request
+ * is being opened unless it is a child, whose parent's pull request carries it; a pr_open one the
+ * pull request's number and URL, and so does a closed one.
  */
 export const transitionComment = (
   before: FactoryDeliveryState,
@@ -118,6 +122,15 @@ export const transitionComment = (
       return {
         status: "pr_open",
         body: firstPublishable([`${opened} ${pullRequest.url}`], opened),
+      };
+    }
+    case "cancelled": {
+      const { pullRequest } = after;
+      if (pullRequest?.outcome !== "closed") return undefined;
+      const closed = `Pull request #${pullRequest.number} for this item was closed without merging, so Factory cancelled the delivery; its worktree, branch and commits stay.`;
+      return {
+        status: "cancelled",
+        body: firstPublishable([`${closed} ${pullRequest.url}`], closed),
       };
     }
     default:

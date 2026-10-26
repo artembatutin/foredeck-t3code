@@ -18,6 +18,7 @@ import {
   type RuntimeMode,
   type ServerProvider,
   type ThreadId,
+  type VcsRemoveWorktreeInput,
 } from "@t3tools/contracts";
 import {
   type FactoryCommand,
@@ -341,12 +342,13 @@ const gitWorkflow = GitWorkflow.layer.pipe(
 );
 
 /**
- * The fake PR service: the Git workflow Factory's PR stage calls. Its stacked action records the
+ * The fake PR service: the Git workflow Factory's PR stages call. Its stacked action records the
  * call with the worktree's HEAD and branch at that moment, pushes to the project's bare `origin`
  * the way `create_pr` does (the expected commit by its id, tracked as the branch's upstream, or
- * HEAD when given none), and reports the pull request open.
+ * HEAD when given none), and reports the pull request open. A worktree removal is recorded, then
+ * run by the real git driver.
  */
-const fakePullRequests = (calls: Array<PullRequestCall>) =>
+const fakePullRequests = (calls: Array<PullRequestCall>, removals: Array<VcsRemoveWorktreeInput>) =>
   Layer.unwrap(
     Effect.map(GitVcsDriver.GitVcsDriver, (git) => {
       const read = (cwd: string, args: ReadonlyArray<string>) =>
@@ -384,6 +386,8 @@ const fakePullRequests = (calls: Array<PullRequestCall>) =>
               toast: { title: "Created pull request", cta: { kind: "none" } },
             } satisfies GitRunStackedActionResult;
           }).pipe(Effect.orDie),
+        removeWorktree: (input) =>
+          Effect.sync(() => removals.push(input)).pipe(Effect.andThen(git.removeWorktree(input))),
       });
     }),
   );
@@ -490,6 +494,7 @@ const makeLayer = (input: {
   readonly provider: FakeProvider;
   readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
   readonly pullRequestCalls: Array<PullRequestCall>;
+  readonly worktreeRemovals: Array<VcsRemoveWorktreeInput>;
   readonly commentCalls: Array<CommentCall>;
   readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
   readonly manualReactor: boolean;
@@ -516,7 +521,7 @@ const makeLayer = (input: {
   );
   return (input.manualReactor ? downReactor : factoryReactor).pipe(
     Layer.provideMerge(Factory.layerLive),
-    Layer.provide(fakePullRequests(input.pullRequestCalls)),
+    Layer.provide(fakePullRequests(input.pullRequestCalls, input.worktreeRemovals)),
     Layer.provide(ProviderRegistryMock.layer()),
     Layer.provide(instances),
     Layer.provideMerge(recordingWork(input.commentCalls, input.wrapWork)),
@@ -622,6 +627,8 @@ export interface World {
   readonly rootStatus: string;
   /** Every stacked action the fake PR service ran, in order. */
   readonly pullRequestCalls: ReadonlyArray<PullRequestCall>;
+  /** Every worktree removal Factory asked the Git workflow for, in order. */
+  readonly worktreeRemovals: ReadonlyArray<VcsRemoveWorktreeInput>;
   /** Every comment posted through Work, in order; the item's own source holds them too. */
   readonly commentCalls: ReadonlyArray<CommentCall>;
   readonly evidenceDir: (deliveryId: FactoryDeliveryId) => string;
@@ -681,6 +688,7 @@ export const withProject = <A, E>(
     yield* fileSystem.makeDirectory(root);
     const provider = yield* makeFakeProvider;
     const pullRequestCalls: Array<PullRequestCall> = [];
+    const worktreeRemovals: Array<VcsRemoveWorktreeInput> = [];
     const commentCalls: Array<CommentCall> = [];
 
     return yield* Effect.gen(function* () {
@@ -780,6 +788,7 @@ export const withProject = <A, E>(
         itemTitle: item.title,
         rootStatus,
         pullRequestCalls,
+        worktreeRemovals,
         commentCalls,
         evidenceDir: (deliveryId) => path.join(t3Home, "userdata", "fd-factory", deliveryId),
         exists: (target) => fileSystem.exists(target).pipe(Effect.orElseSucceed(() => false)),
@@ -795,6 +804,7 @@ export const withProject = <A, E>(
           provider,
           supportedRuntimeModes: options.supportedRuntimeModes,
           pullRequestCalls,
+          worktreeRemovals,
           commentCalls,
           wrapWork: options.work ?? ((service) => service),
           manualReactor: options.manualReactor === true,

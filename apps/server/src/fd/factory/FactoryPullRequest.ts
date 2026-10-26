@@ -1,6 +1,8 @@
 import {
   AuthWorkReadScope,
+  AuthWorkWriteScope,
   CommandId,
+  type GitCommandError,
   type GitManagerServiceError,
   type GitRunStackedActionResult,
 } from "@t3tools/contracts";
@@ -8,7 +10,7 @@ import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
-import type * as FileSystem from "effect/FileSystem";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -16,6 +18,7 @@ import * as Schema from "effect/Schema";
 import * as GitWorkflow from "../../git/GitWorkflowService.ts";
 import { linkCreatedPullRequest } from "../../git/linkCreatedPullRequest.ts";
 import type * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import type * as ProjectService from "../../project/ProjectService.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkActor, type WorkDomainError, WorkService } from "../work-management/index.ts";
@@ -126,6 +129,24 @@ export class FactoryPullRequestNotOpenedError extends Schema.TaggedError<Factory
   }
 }
 
+/** A parent's child delivery is not stored, so its Work item is unknown; no item was set done. */
+export class FactoryCloseOutChildMissingError extends Schema.TaggedError<FactoryCloseOutChildMissingError>()(
+  "FactoryCloseOutChildMissingError",
+  { deliveryId: FactoryDeliveryId, childId: FactoryDeliveryId },
+) {
+  override get message(): string {
+    return `Factory delivery ${this.deliveryId} cannot find its child delivery ${this.childId} to finish its item.`;
+  }
+}
+
+export type FactoryCloseOutError =
+  | FactoryCloseOutChildMissingError
+  | FactoryBranchReadError
+  | FactoryStoreError
+  | ProjectStore.ProjectStoreV2Error
+  | WorkDomainError
+  | GitCommandError;
+
 export type FactoryPullRequestError =
   | FactoryPullRequestBasisMissingError
   | FactoryPullRequestUnapprovedError
@@ -140,7 +161,7 @@ export type FactoryPullRequestError =
   | GitManagerServiceError;
 
 /**
- * The PR stage's work. Opens the delivery's pull request from its worktree through the stacked
+ * The PR stages' work. Opens the delivery's pull request from its worktree through the stacked
  * Git action (`create_pr`) with the item's title and a body listing the accepted task and its
  * evidence, then links it to the author thread. A parent's is its one pull request: its body lists
  * its whole branch's verify and integrate review, then each child item in plan order with its
@@ -148,7 +169,7 @@ export type FactoryPullRequestError =
  * none. Text that names an AI agent, model or provider or carries attribution is never published.
  * The action runs only while the worktree holds the approved commit on a clean tree, and pushes
  * that exact commit, so a commit made meanwhile never reaches the remote. An open pull request for
- * the branch is reported as it is, unchanged.
+ * the branch is reported as it is, unchanged. Once someone merged it, closes the delivery out.
  */
 export class FactoryPullRequest extends Context.Service<
   FactoryPullRequest,
@@ -157,6 +178,16 @@ export class FactoryPullRequest extends Context.Service<
       delivery: FactoryDeliveryStore.StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "open_pr" }>,
     ) => Effect.Effect<FactoryOpenedPullRequest, FactoryPullRequestError>;
+    /**
+     * Follow-through once the delivery's pull request merged: sets each child item done in plan
+     * order for a parent, then the delivery's own item, through Work under a Factory actor; then
+     * removes the delivery's worktree through the Git workflow when it is clean. The branch always
+     * stays, and so does a dirty worktree, one already gone and the project's primary checkout.
+     * Setting an item done again changes nothing, so a resume runs it again from the start.
+     */
+    readonly closeOut: (
+      delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+    ) => Effect.Effect<void, FactoryCloseOutError>;
   }
 >()("t3/fd/factory/FactoryPullRequest") {}
 
@@ -164,6 +195,13 @@ export class FactoryPullRequest extends Context.Service<
 const itemReader = (deliveryId: FactoryDeliveryId): WorkActor => ({
   id: `factory:${deliveryId}`,
   grants: [AuthWorkReadScope],
+  label: "Factory",
+});
+
+/** Factory sets its delivery's items done under this actor; it is not an agent's. */
+const itemWriter = (deliveryId: FactoryDeliveryId): WorkActor => ({
+  id: `factory:${deliveryId}`,
+  grants: [AuthWorkReadScope, AuthWorkWriteScope],
   label: "Factory",
 });
 
@@ -201,6 +239,8 @@ const make = Effect.gen(function* () {
   const work = yield* WorkService.WorkService;
   const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
   const tasks = yield* FactoryTaskStore.FactoryTaskStore;
+  const projects = yield* ProjectStore.ProjectStoreV2;
+  const fileSystem = yield* FileSystem.FileSystem;
   const context = yield* Effect.context<
     | FileSystem.FileSystem
     | GitVcsDriver.GitVcsDriver
@@ -407,7 +447,71 @@ const make = Effect.gen(function* () {
     },
   );
 
-  return FactoryPullRequest.of({ open });
+  /** A merged delivery's items: a parent's children in plan order, then the delivery's own. */
+  const finishedItems = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
+    Effect.forEach(delivery.state.children, (childId) =>
+      deliveries.get(childId).pipe(
+        Effect.flatMap(
+          Option.match({
+            onNone: () =>
+              Effect.fail(
+                new FactoryCloseOutChildMissingError({
+                  deliveryId: delivery.deliveryId,
+                  childId,
+                }),
+              ),
+            onSome: (child) => Effect.succeed(child.itemRef),
+          }),
+        ),
+      ),
+    ).pipe(Effect.map((children) => [...children, delivery.itemRef]));
+
+  /** The path with its links resolved; as given when it cannot be resolved. */
+  const resolved = (path: string) =>
+    fileSystem.realPath(path).pipe(Effect.orElseSucceed(() => path));
+
+  /**
+   * Removes the delivery's worktree when it is clean, from the project's primary checkout, which
+   * is never removed itself. A worktree already gone needs nothing, and one with changes, or of a
+   * project no longer stored, stays as it is. The branch is never touched.
+   */
+  const removeCleanWorktree = Effect.fn("FactoryPullRequest.removeCleanWorktree")(function* (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+  ) {
+    const { worktreePath } = delivery.state;
+    if (worktreePath === null) return;
+    const project = Option.getOrUndefined(
+      yield* projects.get(delivery.projectId, { includeDeleted: true }),
+    );
+    const kept = (reason: string) =>
+      Effect.logInfo(`factory kept a merged delivery's worktree: ${reason}`).pipe(
+        Effect.annotateLogs({ deliveryId: delivery.deliveryId }),
+      );
+    if (project === undefined) return yield* kept("its project is not stored");
+    const current = yield* readWorktreeState(worktreePath).pipe(
+      Effect.asSome,
+      Effect.catchTags({ FactoryWorktreeMissingError: () => Effect.succeedNone }),
+      Effect.provideContext(context),
+    );
+    if (Option.isNone(current)) return;
+    if ((yield* resolved(worktreePath)) === (yield* resolved(project.workspaceRoot))) return;
+    if (!current.value.clean) return yield* kept("it has changes");
+    // Not forced: Git refuses a worktree that changed since it was read, and the effect fails.
+    yield* gitWorkflow.removeWorktree({ cwd: project.workspaceRoot, path: worktreePath });
+  });
+
+  const closeOut: FactoryPullRequest["Service"]["closeOut"] = Effect.fn(
+    "FactoryPullRequest.closeOut",
+  )(function* (delivery) {
+    const writer = itemWriter(delivery.deliveryId);
+    // Every item is found before any is set, so a missing child sets none.
+    for (const ref of yield* finishedItems(delivery)) {
+      yield* work.setStatus(writer, { ref, status: "done" });
+    }
+    yield* removeCleanWorktree(delivery);
+  });
+
+  return FactoryPullRequest.of({ open, closeOut });
 });
 
 export const layer = Layer.effect(FactoryPullRequest, make);

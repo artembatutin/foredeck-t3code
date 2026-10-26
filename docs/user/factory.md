@@ -110,7 +110,22 @@ on. On mobile, the item's screen in Work shows the same timeline and controls; s
 from web or desktop.
 
 Factory's threads are linked to the item but do not offer **Mark done?** or **Back to todo?**.
-Factory does not change the item's status.
+Factory does not change the item's status until its pull request merges.
+
+## When the pull request merges or closes
+
+Factory follows the pull request on the thread it is linked to: the author's thread, or for a
+parent the last child's author's. When you merge it, Factory marks the item done, and for a parent
+each of its child items too, then removes the delivery's worktree unless it has uncommitted
+changes. The branch always stays. The delivery then shows **Done**. If an item cannot be marked
+done, the delivery blocks; **Resume** tries again.
+
+Closing the pull request without merging cancels the delivery and posts a comment on the item.
+The worktree, branch and commits stay; a parent's approved children keep their approval.
+
+Factory notices a merge or close made outside the app only while that thread is not settled. A
+thread with an open pull request does not settle on its own; if you settle it yourself, unsettle
+it once the pull request is merged.
 
 ## Stop, resume or cancel
 
@@ -150,7 +165,8 @@ delivery**.
 
 Factory also posts one comment on the Work item each time a delivery becomes blocked or starts
 waiting, so the GitHub issue, Jira issue or task file shows it too. It posts again when a commit
-is approved and when the pull request opens. Factory sends no notifications.
+is approved, when the pull request opens and when it is closed without merging. Factory sends no
+notifications.
 
 Factory refuses to publish a pull request whose text would name an AI tool or credit one as an
 author, and blocks before pushing. The item's title and the verify command appear in the pull

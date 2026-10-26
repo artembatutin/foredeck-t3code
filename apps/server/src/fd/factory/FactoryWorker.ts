@@ -107,7 +107,8 @@ class FactoryChildStartError extends Schema.TaggedError<FactoryChildStartError>(
  * A parent runs its children one at a time on its branch and worktree: the worker starts the
  * child the parent waits for, and hands the parent each child's approval once it is stored. A
  * cancelled parent cancels its children that are not approved, and a child cancelled on its own
- * cancels its parent, so its unfinished siblings too (owner decision). A parent's lock is taken
+ * cancels its parent, so its unfinished siblings too (owner decision). A parent done once its
+ * merged pull request is closed out makes its approved children done. A parent's lock is taken
  * before its children's, never while one of theirs is held.
  */
 export class FactoryWorker extends Context.Service<
@@ -177,13 +178,14 @@ export class FactoryWorker extends Context.Service<
       parentId: FactoryDeliveryId,
     ) => Effect.Effect<void, FactoryStoreError>;
     /**
-     * Completes a cancellation a restart cut short. A parent's cancel is stored before its
-     * children's, and a child's before its parent's, so a child whose parent is cancelled is
-     * cancelled, unless approved, and a parent with a cancelled child is cancelled with its
-     * unfinished children; each stops what its threads run. Any other delivery is left as it is.
-     * The boot sweep calls this for every delivery that is not done or cancelled.
+     * Completes what a restart cut short between a parent and its children. A parent's cancel is
+     * stored before its children's, and a child's before its parent's, so a child whose parent is
+     * cancelled is cancelled, unless approved, and a parent with a cancelled child is cancelled
+     * with its unfinished children; each stops what its threads run. A merged parent is done
+     * before its children, so an approved child whose parent is done is done. Any other delivery
+     * is left as it is. The boot sweep calls this for every delivery that is not done or cancelled.
      */
-    readonly finishCancellation: (
+    readonly finishFamily: (
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<void, FactoryStoreError>;
     /**
@@ -252,6 +254,8 @@ const describeEffect = (effect: FactoryEffect) => {
       return "record the approval";
     case "open_pr":
       return "open the pull request";
+    case "close_out":
+      return "close out the merged pull request";
     case "create_children":
       return "create the child items";
     case "start_child":
@@ -495,6 +499,10 @@ const make = Effect.gen(function* () {
             pullRequest,
           })),
         );
+      case "close_out":
+        return pullRequests
+          .closeOut(delivery)
+          .pipe(Effect.as<FactoryEvent>({ type: "closed_out", effectId: effect.id }));
       case "create_children":
         return children.create(delivery, effect).pipe(
           Effect.map((created): FactoryEvent => ({
@@ -663,6 +671,10 @@ const make = Effect.gen(function* () {
       // stop what their threads run; an approved child keeps its approval.
       for (const childId of before.children) yield* cancelChild(childId);
     }
+    // Done once its merged pull request is closed out: the parent's approved children with it.
+    if (next.delivery.status === "done" && before.status !== "done") {
+      for (const childId of before.children) yield* finishChild(childId);
+    }
     return Option.some(stored);
   });
 
@@ -707,6 +719,11 @@ const make = Effect.gen(function* () {
         yield* stepLocked(childId, { type: "cancel" });
       }),
     );
+
+  /** Makes a merged parent's child done, under the child's lock, when it is approved. */
+  // Annotated like `cancelChild`: it closes the same cycle.
+  const finishChild = (childId: FactoryDeliveryId): Effect.Effect<void, FactoryStoreError> =>
+    locks.withLock(childId, stepLocked(childId, { type: "parent.done" }).pipe(Effect.asVoid));
 
   /**
    * Cancels the parent of a child cancelled on its own, under the parent's lock, unless it is
@@ -1019,13 +1036,14 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const finishCancellation: FactoryWorker["Service"]["finishCancellation"] = (deliveryId) =>
+  const finishFamily: FactoryWorker["Service"]["finishFamily"] = (deliveryId) =>
     Effect.gen(function* () {
       const delivery = Option.getOrUndefined(yield* deliveries.get(deliveryId));
       if (delivery === undefined || isTerminal(delivery.state)) return;
       if (delivery.parentId !== null) {
         const parent = Option.getOrUndefined(yield* deliveries.get(delivery.parentId));
         if (parent?.state.status === "cancelled") yield* cancelChild(deliveryId);
+        if (parent?.state.status === "done") yield* finishChild(deliveryId);
         return;
       }
       for (const childId of delivery.state.children) {
@@ -1110,7 +1128,7 @@ const make = Effect.gen(function* () {
     stepThread,
     failInterruptedEffect,
     takeChildApproval,
-    finishCancellation,
+    finishFamily,
     stopCancelledRun,
     stopCancelledRuns,
     postUnfinishedComments,

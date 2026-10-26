@@ -148,6 +148,11 @@ export type FactoryEffectRequest =
    */
   | { readonly type: "open_pr" }
   /**
+   * Follow-through after the delivery's pull request merged: set its Work item done, after every
+   * child item for a parent, and remove its worktree when it is clean, keeping the branch.
+   */
+  | { readonly type: "close_out" }
+  /**
    * A parent's approved plan: create the child Work item of each of its tasks that has none yet,
    * in plan order, then store the children's queued deliveries.
    */
@@ -326,7 +331,12 @@ export interface FactoryOpenedPullRequest {
   readonly url: string;
   /** The branch the pull request merges from, the delivery branch as the host names it. */
   readonly headBranch: string;
+  /** How it left `open`, once the delivery took its merge or close; absent while it is open. */
+  readonly outcome?: FactoryPullRequestOutcome;
 }
+
+/** A pull request that is no longer open: merged, or closed without merging. */
+export type FactoryPullRequestOutcome = "merged" | "closed";
 
 /**
  * What a resume of a stopped or blocked delivery found, read under the delivery's lock right
@@ -478,6 +488,19 @@ export type FactoryEvent =
       readonly effectId: number;
       readonly pullRequest: FactoryOpenedPullRequest;
     }
+  /**
+   * A pull request left `open`, as core's pull request sync stored it on the thread the delivery's
+   * pull request is linked to; it names that pull request by number and URL.
+   */
+  | {
+      readonly type: "pr.merged" | "pr.closed";
+      readonly number: number;
+      readonly url: string;
+    }
+  /** A `close_out` result: the items are done and the worktree is removed, or kept. */
+  | { readonly type: "closed_out"; readonly effectId: number }
+  /** A merged parent's close-out finished: its approved child is done with it. */
+  | { readonly type: "parent.done" }
   /** A `create_children` result: the child deliveries, in plan order. */
   | {
       readonly type: "children.created";
@@ -662,13 +685,16 @@ export const runsStages = (delivery: FactoryDeliveryState) =>
   delivery.status === "running" || delivery.status === "stopping";
 
 /**
- * Whether the server moves the delivery on by itself: while it runs its stages, and once
- * approved, while it opens its pull request. A delivery in any other status waits for its owner,
- * so no worker result is coming for an effect it still names. An approved child has nothing left
- * to run: its parent's pull request carries its work.
+ * Whether the server moves the delivery on by itself: while it runs its stages, once approved,
+ * while it opens its pull request, and with it open, while it closes out its merge. A delivery in
+ * any other status waits for its owner (or, with its pull request open, for the pull request), so
+ * no worker result is coming for an effect it still names. An approved child has nothing left to
+ * run: its parent's pull request carries its work.
  */
 export const isProceeding = (delivery: FactoryDeliveryState) =>
-  runsStages(delivery) || (delivery.status === "approved" && delivery.kind !== "child");
+  runsStages(delivery) ||
+  (delivery.status === "approved" && delivery.kind !== "child") ||
+  (delivery.status === "pr_open" && delivery.awaiting !== null);
 
 /** Done and cancelled deliveries never change again. */
 export const isTerminal = (delivery: FactoryDeliveryState) =>

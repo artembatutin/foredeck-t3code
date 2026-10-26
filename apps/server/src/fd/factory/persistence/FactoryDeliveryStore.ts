@@ -132,6 +132,8 @@ const StoredEffect = Schema.Union([
   }),
   Schema.Struct({ id: PositiveInt, type: Schema.Literal("record_approval") }),
   Schema.Struct({ id: PositiveInt, type: Schema.Literal("open_pr") }),
+  // Added with follow-through.
+  Schema.Struct({ id: PositiveInt, type: Schema.Literal("close_out") }),
   // Added with plan approval.
   Schema.Struct({ id: PositiveInt, type: Schema.Literal("create_children") }),
   // Added with the per-child phase.
@@ -258,9 +260,15 @@ const StoredDeliveryState = Schema.Struct({
   approvedChildren: Schema.Array(FactoryDeliveryId).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
-  // Added with the PR stage: rows stored before it opened none.
+  // Added with the PR stage: rows stored before it opened none. Its outcome was added with
+  // follow-through: a pull request stored without one is open.
   pullRequest: Schema.NullOr(
-    Schema.Struct({ number: PositiveInt, url: Schema.String, headBranch: Schema.String }),
+    Schema.Struct({
+      number: PositiveInt,
+      url: Schema.String,
+      headBranch: Schema.String,
+      outcome: Schema.optionalKey(Schema.Literals(["merged", "closed"])),
+    }),
   ).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   block: Schema.NullOr(StoredBlock),
   // Added with stop after step: rows stored before it name no checkpoint, even when stopped. The

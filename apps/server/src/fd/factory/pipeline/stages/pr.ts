@@ -4,7 +4,8 @@ import type { FactoryStageHandler } from "./registry.ts";
 /**
  * PR stages. `pr` opens the delivery's one pull request for its approved commit; the delivery
  * enters it approved and stays so until the worker reports the pull request. Follow-through is
- * not built yet, so a pipeline reaching it blocks there.
+ * entered only by that pull request's merge or close (see `advance`), never begun after `pr`, so a
+ * pipeline beginning it blocks there.
  */
 export const prStage: FactoryStageHandler<"pr"> = {
   kind: "pr",

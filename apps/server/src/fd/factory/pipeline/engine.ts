@@ -327,6 +327,10 @@ const continueChildren = (delivery: FactoryDeliveryState): FactoryAdvance => {
   );
 };
 
+/** Whether the delivery blocked closing out its merged pull request. */
+const closeOutFailed = ({ block }: FactoryDeliveryState) =>
+  block?.reason === "effect_failed" && block.effect.type === "close_out";
+
 /**
  * Picks up a parent whose plan its owner approved. It resumes no thread, so a deleted thread does
  * not hold it: its planner's work ended with the approval, and integrate launches a reviewer of
@@ -501,6 +505,13 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * item does, with its own rounds and fingerprints, but ends approved at record: its parent's pull
  * request carries its work.
  *
+ * Once its pull request is open, the delivery follows that pull request, as core's sync stores it
+ * on the thread it is linked to. A merge of that very pull request enters `follow_through` and
+ * issues the close-out (its Work items done, its worktree removed when clean); the delivery stays
+ * `pr_open` until that reports and is `done` then. A close without merging cancels it. Either is
+ * taken once, and only while the pull request is open: a later report of either changes nothing.
+ * Factory never merges. A merged parent's approved children are done once it is.
+ *
  * The owner can stop a running delivery after its step, or cancel any delivery that is not done
  * or cancelled. A stopping delivery still completes the work of its stage (the settle check and
  * its fix-commit turn, the fallback plan and review reads, plan and review submissions and their
@@ -510,7 +521,7 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * delivery awaits nothing, so no later event moves it. Resume undoes a stop that has not yet taken
  * effect, and picks a stopped or blocked delivery up from its checkpoint (see `resume` and, for a
  * parent, `resumePlanning` and `resumeApproved`); a parent past its children integrates again,
- * from a fresh verify.
+ * from a fresh verify. A delivery blocked closing out its merge closes out again.
  */
 export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
   switch (event.type) {
@@ -539,6 +550,10 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       ) {
         return unchanged(delivery);
       }
+      // The pull request merged and nothing else is left to judge: the close-out runs again.
+      if (closeOutFailed(delivery)) {
+        return issue({ ...resumed(delivery), status: "pr_open" }, { type: "close_out" });
+      }
       if (delivery.kind !== "parent") return resume(delivery, event.check);
       return delivery.planApproved
         ? resumeApproved(delivery)
@@ -547,6 +562,39 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       return isTerminal(delivery)
         ? unchanged(delivery)
         : step({ ...delivery, status: "cancelled", awaiting: null, block: null, checkpoint: null });
+    case "pr.merged":
+    case "pr.closed": {
+      // Only the pull request the delivery opened, and only once: with its outcome recorded, a
+      // later report of either changes nothing.
+      const { pullRequest } = delivery;
+      if (
+        delivery.status !== "pr_open" ||
+        pullRequest === null ||
+        pullRequest.outcome !== undefined ||
+        pullRequest.number !== event.number ||
+        pullRequest.url !== event.url
+      ) {
+        return unchanged(delivery);
+      }
+      const merged = event.type === "pr.merged";
+      const following = {
+        ...delivery,
+        stage: standardStages.follow_through.name,
+        pullRequest: {
+          ...pullRequest,
+          outcome: merged ? ("merged" as const) : ("closed" as const),
+        },
+      };
+      // Closed without merging, the delivery ends; its worktree, branch and commits stay.
+      return merged
+        ? issue(following, { type: "close_out" })
+        : step({ ...following, status: "cancelled", awaiting: null });
+    }
+    case "parent.done":
+      // Its parent's pull request carried its work, and is merged and closed out.
+      return delivery.kind === "child" && delivery.status === "approved"
+        ? step({ ...delivery, status: "done" })
+        : unchanged(delivery);
     // The owner's plan actions are taken only at the plan gate, where the delivery awaits nothing.
     case "plan.updated": {
       const plan = planAtGate(delivery);
@@ -584,12 +632,14 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       );
     }
   }
-  // Approved, the delivery only opens its pull request: its threads' runs and deletions no
-  // longer change it.
-  const opensPullRequest =
-    delivery.status === "approved" &&
-    (event.type === "pr.opened" || event.type === "effect.failed");
-  if (!runsStages(delivery) && !opensPullRequest) return unchanged(delivery);
+  // Approved, the delivery only opens its pull request, and with it open only closes out its
+  // merge: its threads' runs and deletions no longer change it.
+  const answersPullRequest =
+    (delivery.status === "approved" &&
+      (event.type === "pr.opened" || event.type === "effect.failed")) ||
+    (delivery.status === "pr_open" &&
+      (event.type === "closed_out" || event.type === "effect.failed"));
+  if (!runsStages(delivery) && !answersPullRequest) return unchanged(delivery);
   const { awaiting } = delivery;
 
   switch (event.type) {
@@ -822,6 +872,11 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
             awaiting: null,
             pullRequest: event.pullRequest,
           });
+
+    case "closed_out":
+      return awaitedEffect(delivery, event.effectId, "close_out") === undefined
+        ? unchanged(delivery)
+        : step({ ...delivery, status: "done", awaiting: null });
 
     case "children.created":
       return awaitedEffect(delivery, event.effectId, "create_children") === undefined

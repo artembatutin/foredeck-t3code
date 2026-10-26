@@ -16,6 +16,8 @@ const COMMENTED_STATUSES = [
   "waiting",
   "approved",
   "pr_open",
+  // Added with follow-through: a pull request closed without merging.
+  "cancelled",
 ] as const satisfies ReadonlyArray<FactoryCommentedStatus>;
 
 /** A transition's Work comment, recorded with the transition. */

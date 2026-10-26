@@ -473,9 +473,41 @@ the PR stage refuses one.
 Deliveries approved before the PR stage existed load without a pull request and stay `approved` at
 `record`, awaiting nothing; nothing opens their pull request on its own.
 
+## Follow-through reads the link core's sync stores
+
+Factory never merges, and it never asks the host about its pull request. It learns of a merge or
+close from the snapshot core's
+[pull request sync](../../apps/server/src/orchestration-v2/PullRequestSyncReactor.ts) commits as
+`thread.pull-request-link-updated`, on the thread the PR stage linked the pull request to: the
+author's, or a parent's last child's author's. Merge notifications are not enough, since they
+cover only merges run through the app, while the snapshot covers those and a merge on the host
+alike. The event must name the delivery's pull request by number and URL; the same pull request
+linked to another thread, or another on the author's, changes nothing. The boot sweep reads that
+link from the projection for each `pr_open` delivery, for the reason the tail starts where it does
+(see [the reactor tail](#the-reactor-tail-starts-at-the-sweeps-position)).
+
+The trap is settlement. Core's sync stops reading the links of settled threads. Auto-settlement
+leaves a thread with an open link alone, but its owner can settle it by hand, and a pull request
+merged on the host after that reaches Factory only once the thread is unsettled, or a merge
+through the app requests a sync. Factory does not keep its threads from being settled; that would
+be a policy over the owner's threads.
+
+A merge is closed out as a worker effect, while the delivery stays `pr_open`
+([`FactoryPullRequest.closeOut`](../../apps/server/src/fd/factory/FactoryPullRequest.ts)): each
+child item done in plan order, then the delivery's own, through Work under a Factory actor, then
+the worktree removed through `GitWorkflowService.removeWorktree` from the project's checkout, only
+when clean and never that checkout itself. The branch stays. Setting an item done again changes
+nothing, so a resume of a close-out that failed, or that a restart lost, runs all of it again; the
+delivery blocks meanwhile rather than end done with its items unchanged. The delivery records how
+its pull request left `open` (`pullRequest.outcome`), so a report of either arriving later is
+inert, and a close's cancel is told apart from the owner's: only the close announces itself on
+the item. A closed parent cancels as an owner's cancel does, so its approved children keep their
+approvals; a merged parent's approved children are done once it is.
+
 ## Each transition posts one Work comment, from the step that stored it
 
-A delivery's move into blocked, waiting, approved or pr_open posts one comment on its item through
+A delivery's move into blocked, waiting, approved or pr_open, or into cancelled because its pull
+request closed without merging, posts one comment on its item through
 `WorkService.addComment`, so GitHub, Jira and Markdown sources show what needs the owner
 ([`comments.ts`](../../apps/server/src/fd/factory/pipeline/comments.ts) decides which and renders
 it). The comment is recorded in the transaction that stores the transition, then queued, and

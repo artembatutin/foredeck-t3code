@@ -1,0 +1,270 @@
+import { assert } from "@effect/vitest";
+import {
+  AuthWorkReadScope,
+  CommandId,
+  type PullRequestState,
+  type RunId,
+  type ThreadId,
+  type ThreadPullRequestLink,
+} from "@t3tools/contracts";
+import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
+import type { WorkItemRef, WorkSetStatusInput } from "@t3tools/contracts/fd/work-management";
+import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+
+import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import { type WorkActor, type WorkDomainError, WorkService } from "../../work-management/index.ts";
+import * as Factory from "../index.ts";
+import {
+  authorCommits,
+  drainFactory,
+  drainOrchestration,
+  ended,
+  runReached,
+  stateOf,
+  type World,
+} from "./deliveryHarness.ts";
+
+/**
+ * Follow-through on the delivery harness: a delivery run to its open pull request, and the pull
+ * request links core's sync writes on its threads. A link's snapshot is dispatched as the sync
+ * reactor dispatches it, so Factory's reactor sees the event core commits.
+ */
+
+const service = Factory.FactoryService.FactoryService;
+
+const reader: WorkActor = { id: "session:owner", grants: [AuthWorkReadScope], label: "owner" };
+
+/** The fixed text of the comment a close without merging posts, before the URL and reference. */
+export const closedComment =
+  "Pull request #7 for this item was closed without merging, so Factory cancelled the delivery; its worktree, branch and commits stay.";
+
+// Work's own errors are private to Work; this carries the same tag.
+class FakeWorkUnavailable extends Schema.TaggedError<FakeWorkUnavailable>()("WorkUnavailable", {
+  detail: Schema.String,
+}) {}
+
+/**
+ * Work recording each status it is asked to set, and refusing them while `fault.failing` is set;
+ * pass `work` as the harness's Work option.
+ */
+export const statusWrites = () => {
+  const fault = { failing: false };
+  const calls: Array<{ readonly actor: WorkActor; readonly input: WorkSetStatusInput }> = [];
+  return {
+    fault,
+    calls,
+    work: (work: WorkService.WorkService["Service"]): WorkService.WorkService["Service"] => ({
+      ...work,
+      setStatus: (actor, input) =>
+        Effect.sync(() => calls.push({ actor, input })).pipe(
+          Effect.andThen(
+            fault.failing
+              ? Effect.fail(
+                  new FakeWorkUnavailable({
+                    detail: "The task file could not be written.",
+                  }) as unknown as WorkDomainError,
+                )
+              : work.setStatus(actor, input),
+          ),
+        ),
+    }),
+  };
+};
+
+/** A review that verifies each of `criteria` criteria and finds nothing. */
+export const passingReview = (criteria = 1) => ({
+  verdict: "pass",
+  findings: [],
+  acceptance: Array.from({ length: criteria }, (_, index) => ({
+    criterion: index + 1,
+    status: "verified",
+    evidence: "The export does what the criterion says.",
+    paths: ["export.ts"],
+  })),
+  missing_evidence: [],
+});
+
+/** The run the delivery awaits, once its provider turn has started. */
+const awaitedRun = (deliveryId: FactoryDeliveryId) =>
+  Effect.gen(function* () {
+    const { awaiting } = yield* stateOf(deliveryId);
+    if (awaiting?.type !== "run") return assert.fail("The delivery awaits no run.");
+    assert.strictEqual(yield* runReached(awaiting.runId, ["starting", ...ended]), "starting");
+    yield* drainOrchestration;
+    return awaiting;
+  });
+
+/** The author commits, verify passes and the reviewer passes it, on the delivery's threads. */
+const authorAndReview = (
+  world: World,
+  author: { readonly deliveryId: FactoryDeliveryId; readonly runId: RunId },
+  worktreePath: string,
+  subject: string,
+  text: string,
+) =>
+  Effect.gen(function* () {
+    yield* authorCommits(worktreePath, subject, text);
+    yield* world.endRun(author.runId, "completed");
+    const reviewer = yield* awaitedRun(author.deliveryId);
+    yield* Effect.flatMap(service, (factory) =>
+      factory.submitReview({ threadId: reviewer.threadId, review: passingReview() }),
+    );
+    yield* world.endRun(reviewer.runId, "completed");
+    return reviewer.threadId;
+  });
+
+/** A single item run to its open pull request, which is linked to its author thread. */
+export const openSingle = (world: World) =>
+  Effect.gen(function* () {
+    const author = yield* world.start;
+    const reviewer = yield* authorAndReview(
+      world,
+      author,
+      author.worktreePath,
+      "feat: add the export button",
+      "export const x = 1;\n",
+    );
+    const state = yield* stateOf(author.deliveryId);
+    assert.strictEqual(state.status, "pr_open");
+    return { ...author, reviewer, state };
+  }).pipe(Effect.orDie);
+
+/** Two tasks, so the parent has a first child and a last one. */
+const twoTaskPlan = {
+  tasks: [
+    {
+      id: "export-csv",
+      title: "Export the current table as CSV",
+      kind: "feature",
+      summary: "Add a CSV export of the visible rows behind the export button.",
+      acceptance: ["The export button downloads the visible rows as CSV."],
+      testPlan: [{ criterion: 1, check: "Export two rows.", paths: ["export.test.ts"] }],
+      likelyPaths: ["export.ts"],
+      risk: "normal",
+    },
+    {
+      id: "export-header",
+      title: "Write a header row first",
+      kind: "fix",
+      summary: "Spreadsheets read the first record as column names without a header row.",
+      acceptance: ["The CSV starts with the column names."],
+      testPlan: [{ criterion: 1, check: "Read the first line.", paths: ["export.test.ts"] }],
+      likelyPaths: ["export.ts"],
+      risk: "normal",
+    },
+  ],
+  note: "Both tasks change the export module.",
+};
+
+/**
+ * A parent of two children run to its open pull request, which is linked to its last child's
+ * author thread. Returns each child's delivery, item and author thread, in plan order.
+ */
+export const openParent = (world: World) =>
+  Effect.gen(function* () {
+    const factory = yield* service;
+    const planner = yield* world.startWith({ kind: "parent" });
+    yield* factory.submitPlan({ threadId: planner.threadId, plan: twoTaskPlan });
+    yield* world.endRun(planner.runId, "completed");
+    yield* factory.approvePlan(planner.deliveryId);
+    yield* drainFactory;
+    const children = [];
+    for (const [index, childId] of (yield* stateOf(planner.deliveryId)).children.entries()) {
+      const author = yield* world.launched(childId);
+      yield* authorAndReview(
+        world,
+        author,
+        author.worktreePath,
+        `feat: task ${index}`,
+        `${index}\n`,
+      );
+      const child = Option.getOrThrow(yield* factory.get(childId));
+      assert.strictEqual(child.state.status, "approved");
+      children.push({ deliveryId: childId, itemRef: child.itemRef, author: author.threadId });
+    }
+    const integrate = yield* awaitedRun(planner.deliveryId);
+    yield* factory.submitReview({ threadId: integrate.threadId, review: passingReview(2) });
+    yield* world.endRun(integrate.runId, "completed");
+    const state = yield* stateOf(planner.deliveryId);
+    assert.strictEqual(state.status, "pr_open");
+    return { deliveryId: planner.deliveryId, worktreePath: planner.worktreePath, children, state };
+  }).pipe(Effect.orDie);
+
+/** The thread's link to pull request `number` (at `url`, when given), as the projection has it. */
+export const linkOf = (threadId: ThreadId, number: number, url?: string) =>
+  Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+    orchestrator.getThreadShell(threadId),
+  ).pipe(
+    Effect.map(
+      (shell) =>
+        shell?.pullRequests?.find(
+          (link) => link.number === number && (url === undefined || link.url === url),
+        ) ?? assert.fail(`Thread ${threadId} links no pull request #${number}.`),
+    ),
+    Effect.orDie,
+  );
+
+let commands = 0;
+const commandId = (kind: string) => CommandId.make(`test-${kind}:${(commands += 1)}`);
+
+/** Links a pull request to the thread, as the owner would. */
+export const linkPullRequest = (
+  threadId: ThreadId,
+  link: Pick<ThreadPullRequestLink, "host" | "repository" | "number" | "url">,
+) =>
+  Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+    orchestrator.dispatch({
+      type: "thread.pull-request.link",
+      commandId: commandId("pr-link"),
+      threadId,
+      ...link,
+      source: "manual",
+    }),
+  ).pipe(Effect.asVoid, Effect.orDie);
+
+/**
+ * Stores a snapshot of the linked pull request in `state` on the thread, as core's sync does, and
+ * waits until Factory has handled the event it commits and everything that followed.
+ */
+export const syncPullRequest = (
+  threadId: ThreadId,
+  link: Pick<ThreadPullRequestLink, "host" | "repository" | "number">,
+  state: PullRequestState,
+  options: { readonly drain?: boolean } = {},
+) =>
+  Effect.gen(function* () {
+    const at = DateTime.formatIso(yield* DateTime.now);
+    yield* Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+      orchestrator.dispatch({
+        type: "thread.pull-request-link.sync",
+        commandId: commandId("pr-sync"),
+        threadId,
+        host: link.host,
+        repository: link.repository,
+        number: link.number,
+        snapshot: {
+          state,
+          title: "Add the export button",
+          headBranch: "feature/export",
+          baseBranch: "main",
+          isDraft: false,
+          updatedAt: at,
+          syncedAt: at,
+          closedAt: state === "open" ? null : at,
+          mergedAt: state === "merged" ? at : null,
+        },
+        stack: null,
+      }),
+    ).pipe(Effect.orDie);
+    if (options.drain !== false) yield* drainFactory;
+  });
+
+/** The item's status as Work reads it. */
+export const itemStatus = (ref: WorkItemRef) =>
+  Effect.flatMap(WorkService.WorkService, (work) => work.getItem(reader, { ref })).pipe(
+    Effect.map((item) => item.status),
+    Effect.orDie,
+  );
