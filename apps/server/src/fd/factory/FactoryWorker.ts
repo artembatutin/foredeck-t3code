@@ -462,10 +462,11 @@ const make = Effect.gen(function* () {
     });
 
   /**
-   * What an author's launch runs between core preparing its worktree and its opening turn: the
-   * project's setup command, as the settings read when the launch runs name it, under the verify
-   * timeout, then a check that the delivery still awaits the launch, so a delivery cancelled while
-   * setup ran gets no opening turn. None for any other launch, or without a setup command.
+   * What an author's launch runs in its worktree before its opening turn (see
+   * `FactoryThreadEffects.launchThread`): the project's setup command, as the settings read when
+   * the launch runs name it, under the verify timeout, then a check that the delivery still
+   * awaits the launch, so a delivery cancelled while setup ran gets no opening turn. None for any
+   * other launch, or without a setup command.
    */
   const openingSetup = (
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,

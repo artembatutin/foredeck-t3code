@@ -54,22 +54,31 @@ start, and the parent blocks rather than record a later commit as its base. Such
 child's approval before it has that commit either: the engine has it take the child's start again
 first, so a one-child plan cannot leave its children with the base unknown.
 
-## Setup runs before the author's opening turn, which Factory then sends
+## Setup runs before the author's opening turn
 
-Core starts a launch's opening turn as soon as its preparation releases the run, so a setup run
-once the launch returned would race the author. With a setup command, an author's launch creates
-the thread without its opening message, runs setup in the worktree core prepared, and only then
-sends that message itself, under the launch's message id
-([`FactoryThreadEffects.ts`](../../apps/server/src/fd/factory/FactoryThreadEffects.ts)). Without a
-run, core reports its preparation only to the in-memory setup tracker, so the launch waits there
-until preparation got as far as it would have released a run, past the project's own setup
-script. A replayed launch schedules no preparation, so one that finds no worktree and nothing
-under way fails rather than wait. The opening message decides what a replay does: once it exists,
-the replay runs nothing and returns its run; before, it runs setup again. The worker checks that
-the delivery still awaits the launch before the message is sent, so a cancel during setup leaves
-no turn; one landing after is stopped as any cancelled launch's run is. Only author launches run
-setup, through the verify runner with the verify timeout, logging to the delivery's evidence; a
-failure blocks the delivery with fixed text naming how the command ended.
+Core starts a launch's opening turn as soon as its preparation releases the run, and fails that
+run when preparation fails, starting the project's own setup script included, so setup must come
+before the launch hands core that turn
+([`FactoryThreadEffects.ts`](../../apps/server/src/fd/factory/FactoryThreadEffects.ts)). A child's
+author launches into the parent's worktree, which exists already: setup runs there first, and the
+launch is then an ordinary one, with core's gate intact. A single item's worktree exists only once
+its launch prepared it, so that launch creates the thread without its opening message and Factory
+sends the message itself after setup. With no run, core reports that preparation only to the
+in-memory setup tracker, so the launch waits there until preparation got as far as it would have
+released a run, and blocks when it ended short of that.
+
+A replay must neither run setup nor send the opening turn twice. The opening message decides:
+once it exists the replay runs nothing and returns its run, before it setup runs again. Factory
+sends it under the command id core's own launch would, so a replay that no longer runs setup (its
+command cleared since) replays that command instead of queuing a second turn. Core schedules no
+preparation for a launch it already accepted, so a replay that finds no worktree and none under
+way (a restart cut the preparation short) prepares the thread again under a command of its own;
+a restart after `git worktree add` but before the worktree was recorded leaves a branch that
+preparation cannot create again, as core's own retries cannot. The worker checks that the delivery
+still awaits the launch once setup ends, so a cancel meanwhile sends no turn; one landing after is
+stopped as any cancelled launch's run is. Only author launches run setup, through the verify
+runner with the verify timeout and its log in the delivery's evidence; a failure blocks the
+delivery with fixed text naming how the command ended.
 
 ## A delivery's launches stay under its starter's mode
 

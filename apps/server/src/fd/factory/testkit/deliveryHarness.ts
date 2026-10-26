@@ -477,25 +477,38 @@ const projectService = ProjectService.layer.pipe(
   ),
 );
 
+/**
+ * The project setup script each launch starts in its workspace: none, or what
+ * `hooks.runForThread` does when set.
+ */
+const hookedSetupScripts = (hooks: World["setupScripts"]) =>
+  Layer.succeed(ProjectSetupScriptRunner.ProjectSetupScriptRunner, {
+    runForThread: (input) =>
+      Effect.suspend(
+        () => hooks.runForThread?.(input) ?? Effect.succeed({ status: "no-script" as const }),
+      ),
+  });
+
 /** Thread launches as the server runs them, with no terminals, clones or Scratch folders. */
-const threadLaunch = ThreadLaunch.layer.pipe(
-  Layer.provide(
-    Layer.mergeAll(
-      WorktreeSetupTracker.layer,
-      Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({ get: () => Effect.succeed(null) }),
-      Layer.mock(TerminalManager.TerminalManager)({}),
-      // No project here is the Scratch project, so no thread gets a folder of its own.
-      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
-        namedProjectsRoot: "/nowhere",
-        folderForThread: () => Effect.succeedNone,
-      }),
-      gitWorkflow,
-      noSetupScript,
-      noTextGeneration,
-      ProviderRegistryMock.layer(),
+const threadLaunch = (setupScripts: World["setupScripts"]) =>
+  ThreadLaunch.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        WorktreeSetupTracker.layer,
+        Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({ get: () => Effect.succeed(null) }),
+        Layer.mock(TerminalManager.TerminalManager)({}),
+        // No project here is the Scratch project, so no thread gets a folder of its own.
+        Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+          namedProjectsRoot: "/nowhere",
+          folderForThread: () => Effect.succeedNone,
+        }),
+        gitWorkflow,
+        hookedSetupScripts(setupScripts),
+        noTextGeneration,
+        ProviderRegistryMock.layer(),
+      ),
     ),
-  ),
-);
+  );
 
 /** Work as the server builds it, with its real Markdown source. */
 const work = WorkManagement.WorkService.layer.pipe(
@@ -584,6 +597,7 @@ const makeLayer = (input: {
     beforeShell?: ((threadId: ThreadId) => Effect.Effect<void>) | undefined;
   };
   readonly processes: World["processes"];
+  readonly setupScripts: World["setupScripts"];
   readonly commentCalls: Array<CommentCall>;
   readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
   readonly manualReactor: boolean;
@@ -617,7 +631,7 @@ const makeLayer = (input: {
     Layer.provide(ProviderRegistryMock.layer()),
     Layer.provide(instances),
     Layer.provideMerge(recordingWork(input.commentCalls, input.wrapWork)),
-    Layer.provideMerge(threadLaunch),
+    Layer.provideMerge(threadLaunch(input.setupScripts)),
     Layer.provideMerge(projectService),
     Layer.provideMerge(ThreadManagement.layer),
     Layer.provideMerge(orchestration),
@@ -749,6 +763,15 @@ export interface World {
         ) => ReturnType<ProcessRunner.ProcessRunner["Service"]["run"]>)
       | undefined;
   };
+  /**
+   * Runs in place of the project setup script a thread launch starts in its workspace, when set;
+   * the project has none otherwise.
+   */
+  readonly setupScripts: {
+    runForThread?:
+      | ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"]["runForThread"]
+      | undefined;
+  };
   /** Every comment posted through Work, in order; the item's own source holds them too. */
   readonly commentCalls: ReadonlyArray<CommentCall>;
   readonly evidenceDir: (deliveryId: FactoryDeliveryId) => string;
@@ -826,6 +849,7 @@ export const withProject = <A, E>(
     const publishHooks: Array<Effect.Effect<void>> = [];
     const factoryDispatch: World["factoryDispatch"] = {};
     const processes: World["processes"] = {};
+    const setupScripts: World["setupScripts"] = {};
     const commentCalls: Array<CommentCall> = [];
 
     return yield* Effect.gen(function* () {
@@ -982,6 +1006,7 @@ export const withProject = <A, E>(
         publishHooks,
         factoryDispatch,
         processes,
+        setupScripts,
         commentCalls,
         evidenceDir: (deliveryId) => path.join(t3Home, "userdata", "fd-factory", deliveryId),
         exists: (target) => fileSystem.exists(target).pipe(Effect.orElseSucceed(() => false)),
@@ -1003,6 +1028,7 @@ export const withProject = <A, E>(
           publishHooks,
           factoryDispatch,
           processes,
+          setupScripts,
           commentCalls,
           wrapWork: options.work ?? ((service) => service),
           manualReactor: options.manualReactor === true,

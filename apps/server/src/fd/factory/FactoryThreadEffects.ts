@@ -200,10 +200,11 @@ export class FactoryThreadEffects extends Context.Service<
     /**
      * Launches the thread with its first turn, linked to the delivery's Work item, and reports
      * it once the launch has recorded the worktree, or has ended the run trying (the path is null
-     * then). With `beforeOpening` (an author's setup), the thread is launched without that turn,
-     * `beforeOpening` runs in its worktree once core has prepared it, and only then is the turn
-     * sent, under the launch's message id; a launch replayed after its turn was sent runs nothing
-     * again and reports that turn's run. A failure of `beforeOpening` fails the launch.
+     * then). With `beforeOpening` (an author's setup), it runs in the worktree before that turn:
+     * an existing worktree's before the launch, a new one's once core has prepared it for a thread
+     * launched without the turn, which is then sent under the launch's own ids. A launch replayed
+     * after its turn was sent runs nothing again and reports that turn's run, whatever
+     * `beforeOpening` it is given. A failure of `beforeOpening` fails the launch.
      */
     readonly launchThread: (
       delivery: StoredFactoryDelivery,
@@ -536,39 +537,59 @@ const make = Effect.gen(function* () {
     });
 
   /**
-   * The worktree of a thread launched without a message, once core's preparation got as far as it
-   * would have before starting that message's run: past the project's own setup script, which
-   * clients follow on the setup tracker, as no run reports it. A preparation that ended without a
-   * worktree, a deleted thread, and a replayed launch with none prepared (a replay schedules no
-   * preparation) fail. An existing worktree is recorded with the thread.
+   * The new worktree of a thread launched without a message, once core's preparation got as far
+   * as it would have before starting that message's run: past the project's own setup script,
+   * which clients follow on the setup tracker, as no run reports it. A preparation that ended
+   * without a worktree, and a deleted thread, fail.
+   *
+   * A replayed launch schedules no preparation. What an ended one recorded stands, its owner
+   * having resumed the delivery; with nothing recorded (a restart cut it short, or it failed) the
+   * thread is prepared again by `prepareAgain`, whose preparation is then awaited as a first
+   * launch's is. The snapshot the ended one left is not the new one's.
    */
-  const awaitRunlessWorkspace = (threadId: ThreadId, replayed: boolean) =>
+  const awaitRunlessWorkspace = (
+    threadId: ThreadId,
+    replayed: boolean,
+    prepareAgain: (afterSequence: number) => Effect.Effect<unknown, FactoryThreadEffectFailure>,
+  ) =>
     Effect.gen(function* () {
+      const afterSequence = yield* threads.getThreadEventSequence(threadId);
+      const first = yield* readRunlessPreparation(threadId);
+      const ended = replayed && !first.deleted && first.snapshot?.phase !== "running";
+      if (ended && first.worktreePath !== null) return first.worktreePath;
+      if (ended) yield* prepareAgain(afterSequence);
+      const stale = ended ? first.snapshot : null;
       const decide = ({
-        snapshot,
+        snapshot: current,
         worktreePath,
         deleted,
       }: Effect.Success<ReturnType<typeof readRunlessPreparation>>) => {
+        const snapshot =
+          current !== null &&
+          stale !== null &&
+          current.startedAt === stale.startedAt &&
+          current.sequence <= stale.sequence
+            ? null
+            : current;
         if (deleted) return { prepared: false } as const;
         if (snapshot !== null && !releasable(snapshot)) {
           return snapshot.phase === "running" ? undefined : ({ prepared: false } as const);
         }
         if (worktreePath !== null) return { prepared: true, worktreePath } as const;
-        // Waits only for a preparation this launch scheduled that has not begun yet.
-        return snapshot !== null || replayed ? ({ prepared: false } as const) : undefined;
+        // Waits only for a preparation that has not begun yet.
+        return snapshot !== null ? ({ prepared: false } as const) : undefined;
       };
-      const afterSequence = yield* threads.getThreadEventSequence(threadId);
-      const first = decide(yield* readRunlessPreparation(threadId));
+      const decided = decide(first);
       const next =
-        first !== undefined
-          ? Option.some(first)
+        decided !== undefined
+          ? Option.some(decided)
           : yield* Stream.merge(
               threads.streamStoredEventsFrom({ threadId, afterSequence }),
               Option.isSome(setupTracker) ? setupTracker.value.stream(threadId) : Stream.empty,
             ).pipe(
               Stream.mapEffect(() => readRunlessPreparation(threadId)),
               Stream.map(decide),
-              Stream.filter((decided) => decided !== undefined),
+              Stream.filter((decision) => decision !== undefined),
               Stream.runHead,
             );
       if (Option.isNone(next)) return yield* new FactoryLaunchWatchEndedError({ threadId });
@@ -576,6 +597,13 @@ const make = Effect.gen(function* () {
         ? next.value.worktreePath
         : yield* new FactoryWorkspacePreparationError({ threadId });
     });
+
+  /** Whether the thread exists with its opening turn, the run of `messageId`. */
+  const openingSent = (threadId: ThreadId, messageId: MessageId) =>
+    projections.getThreadRecords(threadId, ["runs"]).pipe(
+      Effect.map(({ runs }) => runs.some((run) => run.userMessageId === messageId)),
+      Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed(false) }),
+    );
 
   const launchThread: FactoryThreadEffects["Service"]["launchThread"] = (
     delivery,
@@ -663,11 +691,7 @@ const make = Effect.gen(function* () {
       const messageId = launchMessageId(deliveryId, effect.id);
       const threadId = launchThreadId(deliveryId, effect.id);
       const openingMessage = { messageId, text: opening.text, attachments: [] };
-      // Work links the thread to the delivery's item before the launch runs, so a run that ends
-      // before the launch returns is recorded on the link; a launch that creates no thread leaves
-      // no link. Core starts the opening turn's run as soon as it has prepared the workspace, so a
-      // launch with something to run first sends that turn itself afterwards.
-      const launch = launches.launch({
+      const launchInput = {
         commandId,
         threadId,
         projectId,
@@ -681,24 +705,54 @@ const make = Effect.gen(function* () {
           workspace.type === "worktree"
             ? { type: "worktree", baseRef: workspace.baseRef, branch: workspace.branch }
             : { type: "existing_worktree", worktreePath: workspace.worktreePath },
-        ...(beforeOpening === undefined ? { initialMessage: openingMessage } : {}),
         createdBy: "system",
         creationSource: "server",
-      });
+      } satisfies ThreadLaunch.ThreadLaunchInput;
+      // Core starts the opening turn's run once it has prepared the workspace, and fails that run
+      // when it cannot. An existing worktree is there already, so it gets `beforeOpening` first,
+      // unless a replay finds the turn sent, and is launched as any other. A new one exists only
+      // once the launch prepared it, so that launch leaves the turn for Factory to send after.
+      if (
+        beforeOpening !== undefined &&
+        workspace.type === "existing_worktree" &&
+        !(yield* openingSent(threadId, messageId))
+      ) {
+        yield* beforeOpening(workspace.worktreePath);
+      }
+      const runless = workspace.type === "worktree" ? beforeOpening : undefined;
+      // Work links the thread to the delivery's item before the launch runs, so a run that ends
+      // before the launch returns is recorded on the link; a launch that creates no thread leaves
+      // no link.
       const launched = yield* work.linkLaunch(
         { ref: delivery.itemRef, threadId, origin: "factory" },
-        launch,
+        launches.launch(
+          runless === undefined ? { ...launchInput, initialMessage: openingMessage } : launchInput,
+        ),
       );
       // A replay after the opening turn was sent finds its run, and runs nothing before it again.
       const run =
         launched.projection.runs.find((candidate) => candidate.userMessageId === messageId) ??
-        (beforeOpening === undefined
+        (runless === undefined
           ? undefined
           : yield* Effect.gen(function* () {
-              yield* beforeOpening(yield* awaitRunlessWorkspace(threadId, launched.resumed));
+              const worktreePath = yield* awaitRunlessWorkspace(
+                threadId,
+                launched.resumed,
+                // A command of its own for each preparation, as an accepted one schedules none.
+                (afterSequence) =>
+                  launches.launch({
+                    ...launchInput,
+                    commandId: CommandId.make(`${commandId}:prepare:${afterSequence}`),
+                    reuseExistingThread: true,
+                  }),
+              );
+              yield* runless(worktreePath);
+              // Under the command core's own launch would send it with, so a launch replayed
+              // without setup (its command since cleared) replays this turn instead of queuing a
+              // second.
               const sent = yield* ThreadMessageIntake.sendToThread({
                 projectId,
-                commandId: CommandId.make(`${commandId}:opening`),
+                commandId: CommandId.make(`${commandId}:initial-message`),
                 threadId,
                 ...openingMessage,
                 modelSelection,

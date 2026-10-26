@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import { AuthWorkReadScope, MessageId } from "@t3tools/contracts";
+import { AuthWorkReadScope, CommandId, MessageId, type ThreadId } from "@t3tools/contracts";
 import {
   type FactoryCommand,
   FactoryDeliveryId,
@@ -10,16 +10,21 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import type * as ProcessRunner from "../../processRunner.ts";
+import * as ProjectSetupScriptRunner from "../../project/ProjectSetupScriptRunner.ts";
 import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import { type WorkActor, WorkService } from "../work-management/index.ts";
 import { childDeliveryId } from "./FactoryChildren.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 import * as Factory from "./index.ts";
-import type { StoredFactoryDelivery } from "./persistence/FactoryDeliveryStore.ts";
+import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
+import { advance } from "./pipeline/engine.ts";
 import { queuedDeliveryState } from "./pipeline/state.ts";
 import { renderAuthorPrompt } from "./prompts/author.ts";
 import {
@@ -28,6 +33,7 @@ import {
   drainOrchestration,
   ended,
   git,
+  instanceId,
   runReached,
   stateOf,
   threadProjection,
@@ -149,6 +155,12 @@ const commitFile = (worktreePath: string, name: string, subject: string) =>
     yield* git(worktreePath, ["add", "-A"]);
     yield* git(worktreePath, [...identity, "commit", "--no-verify", "-m", subject]);
   }).pipe(Effect.orDie);
+
+/** The thread's shell; null when no thread has that id. */
+const threadShell = (threadId: ThreadId) =>
+  Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+    orchestrator.getThreadShell(threadId),
+  ).pipe(Effect.orDie);
 
 const openingMessageId = (deliveryId: FactoryDeliveryId) =>
   MessageId.make(`factory-launch-message:${deliveryId}:1`);
@@ -282,7 +294,8 @@ describe("Factory setup in a parent delivery", () => {
           assert.strictEqual((yield* stateOf(parentId)).status, "waiting");
           assert.deepStrictEqual(yield* markedRuns(marker), []);
 
-          // The child's author: setup runs in the parent's worktree before its opening turn.
+          // The child's author: setup runs in the parent's worktree before the author's launch,
+          // which then prepares the workspace and starts the opening turn as any launch does.
           const hold = yield* holdFirstRun(world, setup);
           yield* factory.approvePlan(parentId).pipe(Effect.orDie);
           const childId = childDeliveryId(parentId, FactoryTaskId.make("export-csv"));
@@ -290,9 +303,7 @@ describe("Factory setup in a parent delivery", () => {
           assert.strictEqual((yield* Deferred.await(hold.started)).cwd, planner.worktreePath);
           yield* Deferred.succeed(hold.start, undefined);
           yield* Deferred.await(hold.ended);
-          const beforeOpening = yield* threadProjection(childThread).pipe(Effect.orDie);
-          assert.strictEqual(beforeOpening.thread.worktreePath, planner.worktreePath);
-          assert.deepStrictEqual(beforeOpening.messages, []);
+          assert.isNull(yield* threadShell(childThread));
           assert.deepStrictEqual(
             world.provider.started.map(({ threadId }) => threadId),
             [planner.threadId],
@@ -454,7 +465,7 @@ const threadEffects = Layer.mergeAll(
 
 /** An unstored single-item delivery of the world's item and its author launch, on `branch`. */
 const replayedDelivery = (world: World, name: string, branch: string) => {
-  const delivery: StoredFactoryDelivery = {
+  const delivery: FactoryDeliveryStore.StoredFactoryDelivery = {
     deliveryId: FactoryDeliveryId.make(name),
     projectId: world.projectId,
     itemRef: world.itemRef,
@@ -473,34 +484,40 @@ const replayedDelivery = (world: World, name: string, branch: string) => {
 };
 
 describe("Factory setup on a replayed author launch", () => {
-  it.live("runs nothing again once the opening turn exists, and returns that turn's run", () =>
-    withProject(passingVerify, (world) =>
-      Effect.gen(function* () {
-        const effects = yield* FactoryThreadEffects.FactoryThreadEffects;
-        const runner = yield* FactoryVerifyRunner.FactoryVerifyRunner;
-        const marker = yield* markerIn(world, "setup-runs");
-        const { delivery, launch } = replayedDelivery(world, "delivery-sent", "feature/sent");
-        const setup = (worktreePath: string) =>
-          runner.setup({
-            deliveryId: delivery.deliveryId,
-            worktreePath,
-            command: markingSetup(marker),
-            timeoutMinutes: 30,
-          });
+  it.live(
+    "runs nothing again once the opening turn exists, with setup or without, and returns its run",
+    () =>
+      withProject(passingVerify, (world) =>
+        Effect.gen(function* () {
+          const effects = yield* FactoryThreadEffects.FactoryThreadEffects;
+          const runner = yield* FactoryVerifyRunner.FactoryVerifyRunner;
+          const marker = yield* markerIn(world, "setup-runs");
+          const { delivery, launch } = replayedDelivery(world, "delivery-sent", "feature/sent");
+          const setup = (worktreePath: string) =>
+            runner.setup({
+              deliveryId: delivery.deliveryId,
+              worktreePath,
+              command: markingSetup(marker),
+              timeoutMinutes: 30,
+            });
 
-        const first = yield* effects.launchThread(delivery, launch, setup);
-        const replayed = yield* effects.launchThread(delivery, launch, setup);
+          const first = yield* effects.launchThread(delivery, launch, setup);
+          const replayed = yield* effects.launchThread(delivery, launch, setup);
+          // The setup command cleared since: the launch replays the opening turn it sent, and
+          // neither queues nor prepares another.
+          const withoutSetup = yield* effects.launchThread(delivery, launch);
 
-        assert.deepStrictEqual(replayed, first);
-        assert.deepStrictEqual(yield* setupLogs(world, delivery.deliveryId), ["setup-1.log"]);
-        assert.strictEqual((yield* markedRuns(marker)).length, 1);
-        const thread = yield* threadProjection(first.threadId).pipe(Effect.orDie);
-        assert.deepStrictEqual(
-          thread.runs.map(({ id, userMessageId }) => ({ id, userMessageId })),
-          [{ id: first.runId, userMessageId: openingMessageId(delivery.deliveryId) }],
-        );
-      }).pipe(Effect.provide(threadEffects), Effect.orDie),
-    ),
+          assert.deepStrictEqual(replayed, first);
+          assert.deepStrictEqual(withoutSetup, first);
+          assert.deepStrictEqual(yield* setupLogs(world, delivery.deliveryId), ["setup-1.log"]);
+          assert.strictEqual((yield* markedRuns(marker)).length, 1);
+          const thread = yield* threadProjection(first.threadId).pipe(Effect.orDie);
+          assert.deepStrictEqual(
+            thread.runs.map(({ id, userMessageId }) => ({ id, userMessageId })),
+            [{ id: first.runId, userMessageId: openingMessageId(delivery.deliveryId) }],
+          );
+        }).pipe(Effect.provide(threadEffects), Effect.orDie),
+      ),
   );
 
   it.live("runs setup again and sends one opening turn when the first try sent none", () =>
@@ -591,5 +608,361 @@ describe("Factory setup and cancel", () => {
         assert.deepStrictEqual(world.provider.started, []);
       }),
     ),
+  );
+});
+
+describe("Factory setup on a replayed launch into an existing worktree", () => {
+  it.live("runs setup before the launch once, and replays the opening turn after it", () =>
+    withProject(passingVerify, (world) =>
+      Effect.gen(function* () {
+        const effects = yield* FactoryThreadEffects.FactoryThreadEffects;
+        const runner = yield* FactoryVerifyRunner.FactoryVerifyRunner;
+        const path = yield* Path.Path;
+        const marker = yield* markerIn(world, "setup-runs");
+        const branch = "feature/shared";
+        const worktreePath = path.join(world.t3Home, "shared-worktree");
+        yield* git(world.root, ["worktree", "add", "-b", branch, worktreePath, "main"]);
+        const deliveryId = FactoryDeliveryId.make("delivery-shared");
+        const delivery: FactoryDeliveryStore.StoredFactoryDelivery = {
+          ...replayedDelivery(world, deliveryId, branch).delivery,
+          state: queuedDeliveryState({ branch, baseRef: "main", worktreePath }),
+        };
+        const launch = {
+          id: 1,
+          type: "launch_thread",
+          role: "author",
+          workspace: { type: "existing_worktree", worktreePath },
+        } as const;
+        const threadId = FactoryThreadEffects.launchThreadId(deliveryId, 1);
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        // Records whether the thread existed when setup ran.
+        const threadAtSetup: Array<boolean> = [];
+        const setup = (cwd: string) =>
+          orchestrator.getThreadShell(threadId).pipe(
+            Effect.orDie,
+            Effect.tap((shell) => Effect.sync(() => threadAtSetup.push(shell !== null))),
+            Effect.andThen(
+              runner.setup({
+                deliveryId,
+                worktreePath: cwd,
+                command: markingSetup(marker),
+                timeoutMinutes: 30,
+              }),
+            ),
+          );
+
+        const first = yield* effects.launchThread(delivery, launch, setup);
+        const replayed = yield* effects.launchThread(delivery, launch, setup);
+        const withoutSetup = yield* effects.launchThread(delivery, launch);
+
+        // Setup ran once, in the worktree, before the launch made the thread.
+        assert.deepStrictEqual(threadAtSetup, [false]);
+        assert.deepStrictEqual(yield* markedRuns(marker), [yield* realPath(worktreePath)]);
+        assert.deepStrictEqual(yield* setupLogs(world, deliveryId), ["setup-1.log"]);
+        assert.deepStrictEqual(replayed, first);
+        assert.deepStrictEqual(withoutSetup, first);
+        assert.strictEqual(first.threadId, threadId);
+        assert.strictEqual(first.worktreePath, worktreePath);
+        const thread = yield* threadProjection(threadId).pipe(Effect.orDie);
+        assert.deepStrictEqual(
+          thread.runs.map(({ id, userMessageId }) => ({ id, userMessageId })),
+          [{ id: first.runId, userMessageId: openingMessageId(deliveryId) }],
+        );
+      }).pipe(Effect.provide(threadEffects), Effect.orDie),
+    ),
+  );
+});
+
+/** Plans the one-task parent and leaves it waiting at the plan gate. */
+const plannedParent = (world: World) =>
+  Effect.gen(function* () {
+    const factory = yield* service;
+    const planner = yield* world.startWith({ kind: "parent" });
+    yield* factory.submitPlan({ threadId: planner.threadId, plan: oneTaskPlan }).pipe(Effect.orDie);
+    yield* world.endRun(planner.runId, "completed");
+    const childId = childDeliveryId(planner.deliveryId, FactoryTaskId.make("export-csv"));
+    return { planner, childId, childThread: FactoryThreadEffects.launchThreadId(childId, 1) };
+  });
+
+/**
+ * Holds the project setup script core starts for `threadId` until `fail` is released, then fails
+ * it in `operation`, as a terminal that cannot open or take the command does. `started`
+ * completes once core has asked for it.
+ */
+const failingScript = (
+  world: World,
+  threadId: ThreadId,
+  operation: "openTerminal" | "writeCommand",
+) =>
+  Effect.gen(function* () {
+    const script = {
+      started: yield* Deferred.make<void>(),
+      fail: yield* Deferred.make<void>(),
+    };
+    world.setupScripts.runForThread = (input) =>
+      input.threadId !== threadId
+        ? Effect.succeed({ status: "no-script" as const })
+        : Deferred.succeed(script.started, undefined).pipe(
+            Effect.andThen(Deferred.await(script.fail)),
+            Effect.andThen(
+              Effect.fail(
+                new ProjectSetupScriptRunner.ProjectSetupScriptOperationError({
+                  threadId: input.threadId,
+                  worktreePath: input.worktreePath,
+                  operation,
+                  cause: "The terminal is unavailable.",
+                }),
+              ),
+            ),
+          );
+    return script;
+  });
+
+describe("Factory setup and core's workspace preparation", () => {
+  it.live.each(["openTerminal", "writeCommand"] as const)(
+    "starts no child author while core starts the project's setup script, nor once it fails (%s)",
+    (operation) =>
+      withProject(passingVerify, (world) =>
+        Effect.gen(function* () {
+          const factory = yield* service;
+          const marker = yield* markerIn(world, "setup-runs");
+          yield* useSetup(world, markingSetup(marker));
+          const { planner, childId, childThread } = yield* plannedParent(world);
+          const script = yield* failingScript(world, childThread, operation);
+
+          yield* factory.approvePlan(planner.deliveryId).pipe(Effect.orDie);
+
+          // Factory's setup ran in the shared worktree, then the launch; core holds the author's
+          // opening turn while it starts the project's own setup script.
+          yield* Deferred.await(script.started);
+          assert.deepStrictEqual(yield* markedRuns(marker), [
+            yield* realPath(planner.worktreePath),
+          ]);
+          const preparing = yield* threadProjection(childThread).pipe(Effect.orDie);
+          assert.deepStrictEqual(
+            preparing.runs.map(({ userMessageId, status }) => ({ userMessageId, status })),
+            [{ userMessageId: openingMessageId(childId), status: "preparing" }],
+          );
+          assert.deepStrictEqual(
+            world.provider.started.map(({ threadId }) => threadId),
+            [planner.threadId],
+          );
+
+          // Core fails the run when the script cannot start, so the author never starts.
+          yield* Deferred.succeed(script.fail, undefined);
+          yield* drainFactory;
+          yield* drainOrchestration;
+          yield* drainFactory;
+          const [run] = (yield* threadProjection(childThread).pipe(Effect.orDie)).runs;
+          if (run === undefined) return assert.fail("The child's launch recorded no run.");
+          assert.strictEqual(run.status, "failed");
+          const child = yield* stateOf(childId);
+          assert.strictEqual(child.status, "blocked");
+          assert.deepStrictEqual(child.block, {
+            reason: "run_ended",
+            threadId: childThread,
+            runId: run.id,
+            runStatus: "failed",
+          });
+          assert.deepStrictEqual(
+            world.provider.started.map(({ threadId }) => threadId),
+            [planner.threadId],
+          );
+          assert.deepStrictEqual(yield* setupLogs(world, childId), ["setup-1.log"]);
+        }),
+      ),
+  );
+
+  it.live(
+    "runs no setup or opening turn for a new worktree whose project setup script cannot start",
+    () =>
+      withProject(passingVerify, (world) =>
+        Effect.gen(function* () {
+          const factory = yield* service;
+          const marker = yield* markerIn(world, "setup-runs");
+          yield* useSetup(world, markingSetup(marker));
+          const { deliveryId } = yield* factory
+            .start({ itemRef: world.itemRef })
+            .pipe(Effect.orDie);
+          const threadId = FactoryThreadEffects.launchThreadId(deliveryId, 1);
+          // The launch's preparation has no run, so only Factory can hold the turn back.
+          const script = yield* failingScript(world, threadId, "openTerminal");
+
+          yield* Deferred.await(script.started);
+          assert.deepStrictEqual(yield* markedRuns(marker), []);
+          const starting = yield* threadProjection(threadId).pipe(Effect.orDie);
+          assert.deepStrictEqual(starting.messages, []);
+          assert.deepStrictEqual(starting.runs, []);
+          yield* Deferred.succeed(script.fail, undefined);
+          yield* drainFactory;
+
+          const state = yield* stateOf(deliveryId);
+          assert.strictEqual(state.status, "blocked");
+          assert.strictEqual(
+            state.block?.reason === "effect_failed" ? state.block.detail : undefined,
+            "Factory could not launch the author thread (FactoryWorkspacePreparationError).",
+          );
+          assert.deepStrictEqual(yield* markedRuns(marker), []);
+          assert.deepStrictEqual(world.provider.started, []);
+          const blocked = yield* threadProjection(threadId).pipe(Effect.orDie);
+          assert.deepStrictEqual(blocked.runs, []);
+          const worktreePath = blocked.thread.worktreePath ?? assert.fail("No worktree.");
+
+          // Resumed by its owner, the launch takes the worktree core recorded, runs setup and
+          // starts the author.
+          world.setupScripts.runForThread = undefined;
+          yield* factory.resume(deliveryId).pipe(Effect.orDie);
+          const author = yield* world.launched(deliveryId);
+          assert.strictEqual(author.threadId, threadId);
+          assert.strictEqual(author.worktreePath, worktreePath);
+          assert.deepStrictEqual(yield* markedRuns(marker), [yield* realPath(worktreePath)]);
+          assert.deepStrictEqual(
+            (yield* threadProjection(threadId).pipe(Effect.orDie)).messages.map(({ id }) => id),
+            [openingMessageId(deliveryId)],
+          );
+        }),
+      ),
+  );
+});
+
+/** Stores a single-item delivery of the world's item as it is once its start issued its launch. */
+const storeLaunching = (world: World, deliveryId: FactoryDeliveryId, branch: string) =>
+  Effect.gen(function* () {
+    const state = advance(queuedDeliveryState({ branch, baseRef: "main" }), {
+      type: "start",
+    }).delivery;
+    const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+    yield* store.insert({ deliveryId, projectId: world.projectId, itemRef: world.itemRef, state });
+    const awaiting = state.awaiting;
+    if (awaiting?.type !== "effect" || awaiting.effect.type !== "launch_thread") {
+      return assert.fail("The start issued no launch.");
+    }
+    const stored = yield* store.get(deliveryId);
+    return { launch: awaiting.effect, delivery: Option.getOrThrow(stored) };
+  }).pipe(Effect.orDie);
+
+describe("Factory setup after a restart", () => {
+  it.live(
+    "prepares the worktree again on a resume after a restart cut the launch short before it",
+    () =>
+      withProject(
+        passingVerify,
+        (world) =>
+          Effect.gen(function* () {
+            const factory = yield* service;
+            const marker = yield* markerIn(world, "setup-runs");
+            yield* useSetup(world, markingSetup(marker));
+            const deliveryId = FactoryDeliveryId.make("delivery-restarted");
+            const branch = "feature/restarted";
+            const branchStart = yield* git(world.root, ["rev-parse", "main"]);
+            yield* storeLaunching(world, deliveryId, branch);
+            // The launch created its thread, without a message, and the server stopped before
+            // the preparation it began recorded a worktree.
+            const threadId = FactoryThreadEffects.launchThreadId(deliveryId, 1);
+            yield* Effect.flatMap(ThreadManagement.ThreadManagementService, (threads) =>
+              threads.dispatch({
+                type: "thread.create",
+                commandId: CommandId.make(`factory-launch:${deliveryId}:1`),
+                threadId,
+                projectId: world.projectId,
+                title: `${world.itemKey}: ${world.itemTitle}`,
+                modelSelection: { instanceId, model: "test-model" },
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch,
+                worktreePath: null,
+                createdBy: "system",
+                creationSource: "server",
+              }),
+            ).pipe(Effect.orDie);
+
+            yield* world.boot(
+              Effect.gen(function* () {
+                // The boot sweep blocks the launch the restart interrupted.
+                const blocked = yield* stateOf(deliveryId);
+                assert.strictEqual(blocked.status, "blocked");
+                assert.strictEqual(blocked.block?.reason, "effect_failed");
+
+                yield* factory.resume(deliveryId).pipe(Effect.orDie);
+                const author = yield* world.launched(deliveryId);
+
+                assert.strictEqual(author.threadId, threadId);
+                assert.strictEqual(
+                  yield* git(author.worktreePath, ["branch", "--show-current"]),
+                  branch,
+                );
+                assert.deepStrictEqual(yield* markedRuns(marker), [
+                  yield* realPath(author.worktreePath),
+                ]);
+                assert.deepStrictEqual(yield* setupLogs(world, deliveryId), ["setup-1.log"]);
+                const thread = yield* threadProjection(threadId).pipe(Effect.orDie);
+                assert.deepStrictEqual(
+                  thread.messages.map(({ id }) => id),
+                  [openingMessageId(deliveryId)],
+                );
+                assert.deepStrictEqual(
+                  thread.runs.map(({ id }) => id),
+                  [author.runId],
+                );
+                assert.strictEqual((yield* stateOf(deliveryId)).baseline, branchStart);
+              }),
+            );
+          }),
+        { manualReactor: true },
+      ),
+  );
+
+  it.live(
+    "takes the opening turn a restart left without its result, with the setup command cleared",
+    () =>
+      withProject(
+        passingVerify,
+        (world) =>
+          Effect.gen(function* () {
+            const factory = yield* service;
+            const effects = yield* FactoryThreadEffects.FactoryThreadEffects;
+            const runner = yield* FactoryVerifyRunner.FactoryVerifyRunner;
+            const marker = yield* markerIn(world, "setup-runs");
+            const setup = markingSetup(marker);
+            yield* useSetup(world, setup);
+            const deliveryId = FactoryDeliveryId.make("delivery-lost");
+            const { delivery, launch } = yield* storeLaunching(world, deliveryId, "feature/lost");
+            // The launch ran its setup and sent the opening turn; the server stopped before its
+            // result was stored, and the owner cleared the setup command meanwhile.
+            const sent = yield* effects.launchThread(delivery, launch, (worktreePath) =>
+              runner.setup({ deliveryId, worktreePath, command: setup, timeoutMinutes: 30 }),
+            );
+            yield* useSetup(world, null);
+
+            yield* world.boot(
+              Effect.gen(function* () {
+                assert.strictEqual((yield* stateOf(deliveryId)).status, "blocked");
+                yield* factory.resume(deliveryId).pipe(Effect.orDie);
+                const author = yield* world.launched(deliveryId);
+
+                // The replay returns that turn's run, queuing or preparing no other.
+                assert.strictEqual(author.threadId, sent.threadId);
+                assert.strictEqual(author.runId, sent.runId);
+                assert.strictEqual(author.worktreePath, sent.worktreePath);
+                const thread = yield* threadProjection(sent.threadId).pipe(Effect.orDie);
+                assert.deepStrictEqual(
+                  thread.runs.map(({ id }) => id),
+                  [sent.runId],
+                );
+                assert.deepStrictEqual(
+                  thread.messages.map(({ id }) => id),
+                  [openingMessageId(deliveryId)],
+                );
+                assert.deepStrictEqual(
+                  world.provider.started.map(({ runId }) => runId),
+                  [sent.runId],
+                );
+                assert.deepStrictEqual(yield* setupLogs(world, deliveryId), ["setup-1.log"]);
+                assert.strictEqual((yield* markedRuns(marker)).length, 1);
+              }),
+            );
+          }).pipe(Effect.provide(threadEffects), Effect.orDie),
+        { manualReactor: true },
+      ),
   );
 });
