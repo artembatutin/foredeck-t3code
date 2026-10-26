@@ -197,9 +197,12 @@ export class FactoryWorker extends Context.Service<
      * commits before it interrupts what its threads run, so a server that stopped in between
      * leaves that work to core's restart continuation, which carries it on in a new run the
      * cancelled delivery never takes; a wake run queued behind another run cannot be interrupted
-     * before it starts. The owner's own turns on the thread are left alone. A failure is logged,
-     * as a cancel's interrupt is. The reactor calls this as such a run goes live, and a cancel for
-     * the runs on the threads its delivery no longer records per role.
+     * before it starts. The owner's own turns on the thread are left alone. A run on a child's
+     * author thread is judged for the child's parent first when the parent's pull request is
+     * linked there, so a cancelled parent stops its rounds' runs while its approved child stays
+     * approved. A failure is logged, as a cancel's interrupt is. The reactor calls this as such a
+     * run goes live, and a cancel for the runs on the threads its delivery no longer records per
+     * role.
      */
     readonly stopCancelledRun: (run: {
       readonly threadId: ThreadId;
@@ -218,8 +221,8 @@ export class FactoryWorker extends Context.Service<
     /**
      * Releases the pull request watch of each delivery whose state still asks for it (see
      * `releaseWatch` there), cancelled ones included: a process that stopped between storing a
-     * cancel and releasing the watch left it on, to wake the author thread to new work, and the
-     * wakes it sent meanwhile untaken. The boot sweep calls this.
+     * cancel and releasing the watch left it on, to wake the thread its pull request is linked to
+     * with new work, and the wakes it sent meanwhile untaken. The boot sweep calls this.
      */
     readonly releaseWatches: Effect.Effect<void, FactoryStoreError>;
     /**
@@ -689,10 +692,11 @@ const make = Effect.gen(function* () {
     }
     // Cancelled: once the cancel is stored, each of the delivery's threads stops what it still
     // runs, so a run's end finds the delivery cancelled. Not only the run it awaited: a review
-    // that blocked on its submissions awaits nothing while the reviewer's turn goes on.
+    // that blocked on its submissions awaits nothing while the reviewer's turn goes on. A parent's
+    // rounds run on its last child's author thread, which only the child records.
     if (next.delivery.status === "cancelled" && before.status !== "cancelled") {
       const awaited = before.awaiting?.type === "run" ? before.awaiting : undefined;
-      const recorded = new Set(Object.values(before.threads));
+      const recorded = new Set([...Object.values(before.threads), followedThread(before)]);
       for (const threadId of recorded) {
         if (threadId === undefined) continue;
         yield* interruptCancelled(
@@ -726,18 +730,24 @@ const make = Effect.gen(function* () {
     return taken ?? released ?? Option.some(stored);
   });
 
-  /** Stops the run live on a cancelled delivery's author thread when it is Factory's. */
+  /**
+   * Stops the run live on the thread a cancelled delivery's pull request is linked to when it is
+   * Factory's (see `followedThread`).
+   */
   const stopTakenWakes = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
     Effect.gen(function* () {
-      const { author } = delivery.state.threads;
-      if (author === undefined) return;
-      const runs = yield* Effect.suspend(() => threads.liveRunsOn([author]));
+      const threadId = followedThread(delivery.state);
+      if (threadId === undefined) return;
+      const runs = yield* Effect.suspend(() => threads.liveRunsOn([threadId]));
       yield* Effect.forEach(runs, stopCancelledRun, { discard: true });
     }).pipe(
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause)
           ? Effect.interrupt
-          : Effect.logWarning("factory could not read a cancelled delivery's author thread", cause),
+          : Effect.logWarning(
+              "factory could not read the thread a cancelled delivery's pull request is linked to",
+              cause,
+            ),
       ),
     );
 
@@ -765,7 +775,7 @@ const make = Effect.gen(function* () {
         return undefined;
       }
       if (Option.isSome(released.value)) {
-        const { startedAt, pullRequest, at, firstAt, wakes } = released.value.value;
+        const { threadId, startedAt, pullRequest, at, firstAt, wakes } = released.value.value;
         if (at !== null) {
           yield* stepLocked(deliveryId, {
             type: "watch.ended",
@@ -774,6 +784,7 @@ const make = Effect.gen(function* () {
             firstAt,
             number: pullRequest.number,
             url: pullRequest.url,
+            threadId,
           });
         }
         for (const wake of wakes) yield* stepLocked(deliveryId, wake);
@@ -1291,13 +1302,26 @@ const make = Effect.gen(function* () {
 
   const stopCancelledRun: FactoryWorker["Service"]["stopCancelledRun"] = (run) =>
     Effect.gen(function* () {
-      const deliveryId = FactoryThreadEffects.launchDeliveryId(run.threadId);
-      if (deliveryId === undefined) return;
-      const delivery = Option.getOrUndefined(yield* deliveries.get(deliveryId));
-      if (delivery?.state.status !== "cancelled") return;
-      const adopted = adoptedRuns(delivery.state);
-      if (!(yield* threads.carriesFactoryTurn(run.threadId, run.runId, adopted))) return;
-      yield* interruptCancelled(delivery, run);
+      const launchedBy = FactoryThreadEffects.launchDeliveryId(run.threadId);
+      if (launchedBy === undefined) return;
+      const launcher = Option.getOrUndefined(yield* deliveries.get(launchedBy));
+      if (launcher === undefined) return;
+      // A parent's pull request is linked to its last child's author thread: the wakes and turns
+      // of its rounds there are the parent's, not the approved child's the thread id names.
+      const parent =
+        launcher.parentId === null
+          ? undefined
+          : Option.getOrUndefined(yield* deliveries.get(launcher.parentId));
+      const owners =
+        parent !== undefined && followedThread(parent.state) === run.threadId
+          ? [parent, launcher]
+          : [launcher];
+      for (const delivery of owners) {
+        if (delivery.state.status !== "cancelled") continue;
+        const adopted = adoptedRuns(delivery.state);
+        if (!(yield* threads.carriesFactoryTurn(run.threadId, run.runId, adopted))) continue;
+        return yield* interruptCancelled(delivery, run);
+      }
     }).pipe(
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause)

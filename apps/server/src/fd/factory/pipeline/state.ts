@@ -597,7 +597,9 @@ export type FactoryEvent =
    * Factory's watch on pull request `number`/`url`, which started at `startedAt`, ended at
    * event-log position `at`, its first watch command being at `firstAt`, as a release of the
    * watch found. Taken in any status: a cancelled delivery then knows which wakes its watch sent,
-   * even when its PR stage's result was lost before the pull request was recorded.
+   * even when its PR stage's result was lost before the pull request was recorded. `threadId` is
+   * the thread that watch was on, which a parent whose PR stage result was lost never recorded
+   * (see `pullRequestThread`); the release reads it from Factory's watch command.
    */
   | {
       readonly type: "watch.ended";
@@ -606,6 +608,7 @@ export type FactoryEvent =
       readonly firstAt: number;
       readonly number: number;
       readonly url: string;
+      readonly threadId?: ThreadId;
     }
   /** The release of Factory's watch is done: it was ended, or found gone or someone else's. */
   | { readonly type: "watch.released" }
@@ -809,8 +812,9 @@ export interface FactoryDeliveryState {
   /**
    * A parent's: the thread its PR stage linked its pull request to, its last child's author's.
    * It has no author thread of its own, so its pull request's feedback wakes there, and its
-   * follow-through rounds' turns go there. Absent until the PR stage reports it, for single items
-   * (theirs is their author's) and children, and for parents stored before it was recorded.
+   * follow-through rounds' turns go there. Absent until the PR stage reports it, or a cancel's
+   * release finds it in the PR stage's watch command when that stage's result was lost; for single
+   * items (theirs is their author's) and children; and for parents stored before it was recorded.
    */
   readonly pullRequestThread?: ThreadId;
   /**

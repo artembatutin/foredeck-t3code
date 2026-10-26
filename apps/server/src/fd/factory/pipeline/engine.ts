@@ -373,8 +373,9 @@ const adoptWake = (delivery: FactoryDeliveryState, runId: RunId): FactoryAdvance
 /**
  * The delivery with its watch marked for release, when a Factory watch command may have started
  * one: once its PR stage watched the pull request, or while that stage's result is outstanding
- * or was lost. A cancelled delivery leaves no watch of its own to wake its author thread to new
- * work; which watch is Factory's the worker reads from the commands' own records.
+ * or was lost. A cancelled delivery leaves no watch of its own to wake the thread its pull request
+ * is linked to with new work (see `followedThread`); which watch is Factory's, and for a parent
+ * whose PR stage result was lost which thread, the worker reads from the commands' own records.
  */
 const releasingWatch = (delivery: FactoryDeliveryState): FactoryDeliveryState => {
   const { awaiting, block } = delivery;
@@ -685,18 +686,24 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
     case "watch.ended": {
       // Bookkeeping of the watch Factory started, in any status: where it ended and on which
       // pull request, and for a delivery whose PR stage result was lost, where its first watch
-      // command was.
+      // command was, and for a parent the thread that command watched, where its wakes arrive.
       const { followThrough } = delivery;
+      const linked =
+        delivery.kind === "parent" && delivery.pullRequestThread === undefined
+          ? event.threadId
+          : undefined;
       if (
         followThrough?.watchStartedAt === event.startedAt &&
         followThrough.heldUntil === event.at &&
         followThrough.heldPullRequest?.number === event.number &&
-        followThrough.heldPullRequest.url === event.url
+        followThrough.heldPullRequest.url === event.url &&
+        linked === undefined
       ) {
         return unchanged(delivery);
       }
       return step({
         ...delivery,
+        ...(linked === undefined ? {} : { pullRequestThread: linked }),
         followThrough: {
           watchedAfter: followThrough?.watchedAfter ?? event.firstAt,
           armedAt: followThrough?.armedAt ?? event.firstAt,

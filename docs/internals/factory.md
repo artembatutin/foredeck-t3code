@@ -579,8 +579,10 @@ the one the thread id names, and the parent takes it only on the thread it recor
 an earlier child's thread changes nothing. The round's run end needs no such routing, since the
 parent's stage attempt names that thread and run and the child's attempts have all finished; the
 worker sends a deletion of that thread to the parent too, since only the child records it.
-Recovery is not wired for parents yet: the boot sweep catches up only single items' wakes, and a
-cancelled parent ends its watch but stops none of the runs its wakes started.
+Recovery and cancels follow the same rule. The boot sweep sends the wakes it finds on that thread
+to the parent. The approved child is never cancelled to stop what runs there: a cancelled parent
+interrupts its rounds' runs on that thread itself, and a run that goes live there later is judged
+for the parent that follows the thread before the child whose launch made it.
 
 A wake is identified by its command, not its text: the run's command receipt is a
 `thread.pull-request-watch.sync`, and the link that command updated names the pull request
@@ -595,16 +597,16 @@ no wake, so they start no round.
 
 Every wake of the pull request on that thread after the delivery's first watch command is the
 delivery's, whatever it reports, and is taken once, by its run: core runs it there whatever
-Factory does, so a single item's cancel stops it as Factory's turn, the last comment-limit wake
-included. The position of that first command is stored and never moves. Moving it to each later
+Factory does, so a cancel stops it as Factory's turn, the last comment-limit wake included. The
+position of that first command is stored and never moves. Moving it to each later
 watch command passed over wakes committed while a PR stage started the watch again but stepped
 after it, since their steps wait for the lock that stage holds. Feedback that comes while the
 delivery runs a stage or waits on its owner waits, and is adopted before the delivery next judges
 the branch after an author turn (a wake queued behind that turn would otherwise work while verify
 and review read the branch), or else once its pull request is open again; a stop the owner asked
 for still holds. A commit such a wake lands during verify or review is still refused by the receipt
-and review checks. The boot sweep reads the author thread's log after the first command, for any
-single item that follows its pull request, to find the wakes that came while no server ran
+and review checks. The boot sweep reads that thread's log after the first command, for any
+delivery that follows its pull request, to find the wakes that came while no server ran
 Factory. A wake can end before the step that adopts it is stored, when no stage attempt named its
 thread for its end to reach, so the worker reads whether an adopted run has ended right after
 storing the step.
@@ -648,8 +650,11 @@ that removed it, at the link update the release recorded, only so their runs are
 one at once, a queued one as it starts, and the owner's own turns never. The pull request counts
 as much as the start: core stamps a watch with its command's millisecond, so a watch on another
 pull request of the thread can start at the same moment, and the release names Factory's even when
-the PR stage's result was lost before the delivery recorded it. Ending a merged pull request's watch at close-out is conditional on
-the watch read the same way.
+the PR stage's result was lost before the delivery recorded it. Such a parent recorded no thread
+either, so the release reads it from the watch command's record, and the parent records it with
+where the watch ended: the wakes there are then its own to stop. Ending a merged pull request's
+watch at close-out is conditional on the watch read the same way, on the thread the PR stage linked
+it to.
 
 ## Each transition posts one Work comment, from the step that stored it
 

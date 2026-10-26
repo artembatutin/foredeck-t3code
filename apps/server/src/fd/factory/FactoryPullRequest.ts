@@ -269,11 +269,14 @@ export class FactoryPullRequest extends Context.Service<
      * started) and its pull request, where it ended (by this or before), where the delivery's first
      * watch command was, and the wakes core committed since, which the worker steps so the
      * cancelled delivery stops what its watch set off. Read on the thread the delivery records its
-     * pull request linked to (see `followedThread`). None when Factory started or holds no watch
-     * there. Fails only when the watch is still on and could not be ended.
+     * pull request linked to (see `followedThread`), or for a parent whose PR stage result was lost
+     * before it recorded one, on the thread its watch commands name, which it reports. None when
+     * Factory started or holds no watch there. Fails only when the watch is still on and could not
+     * be ended.
      */
     readonly release: (delivery: FactoryDeliveryStore.StoredFactoryDelivery) => Effect.Effect<
       Option.Option<{
+        readonly threadId: ThreadId;
         readonly startedAt: string;
         readonly pullRequest: FactoryPullRequestKey;
         readonly at: number | null;
@@ -761,6 +764,22 @@ const make = Effect.gen(function* () {
       return { positions, started };
     });
 
+  /**
+   * The thread the delivery's watch commands watched its pull request on, from the first one core
+   * accepted; none when core accepted none. Every PR stage of a delivery links its pull request to
+   * the same thread, so this is where a PR stage whose result was lost linked it.
+   */
+  const watchedThread = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
+    Effect.gen(function* () {
+      for (let effectId = 1; effectId <= delivery.state.effectsIssued; effectId += 1) {
+        const receipt = Option.getOrUndefined(
+          yield* receipts.getByCommandId(watchCommandId(delivery.deliveryId, effectId)),
+        );
+        if (receipt?.status === "accepted") return receipt.threadId;
+      }
+      return undefined;
+    });
+
   const watch: FactoryPullRequest["Service"]["watch"] = Effect.fn("FactoryPullRequest.watch")(
     function* (delivery, effect, pullRequest, threadId) {
       const { deliveryId, state } = delivery;
@@ -855,7 +874,7 @@ const make = Effect.gen(function* () {
   const release: FactoryPullRequest["Service"]["release"] = Effect.fn("FactoryPullRequest.release")(
     function* (delivery) {
       const { state } = delivery;
-      const threadId = followedThread(state);
+      const threadId = followedThread(state) ?? (yield* watchedThread(delivery));
       if (threadId === undefined) return Option.none();
       const { followThrough } = state;
       const { positions, started } = yield* watchCommands(delivery, threadId);
@@ -892,6 +911,7 @@ const make = Effect.gen(function* () {
         ) ??
         null;
       return Option.some({
+        threadId,
         startedAt,
         pullRequest,
         at,

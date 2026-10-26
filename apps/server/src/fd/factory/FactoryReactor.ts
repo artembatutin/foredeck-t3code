@@ -26,6 +26,7 @@ import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import {
   type FactoryEvent,
   type FactoryThreadEvent,
+  followedThread,
   isTerminal,
   isTerminalRunStatus,
 } from "./pipeline/state.ts";
@@ -186,29 +187,30 @@ const make = Effect.gen(function* () {
     });
 
   /**
-   * The wakes core queued for a delivery's open pull request on its author thread while no server
-   * ran Factory: each run created there since the delivery's first watch command, stepped in order
-   * as the tail would have stepped it. The engine takes each run once, so a sweep run again takes
-   * nothing new. Nothing for a delivery whose pull request is not watched, or no longer open.
+   * The wakes core queued for a delivery's open pull request while no server ran Factory, on the
+   * thread it is linked to (see `followedThread`): each run created there since the delivery's
+   * first watch command, stepped in order as the tail would have stepped it, a parent's through
+   * `takeWake` like the tail's. The engine takes each run once, so a sweep run again takes nothing
+   * new. Nothing for a delivery whose pull request is not watched, or no longer open.
    */
   const catchUpFeedback = (deliveryId: FactoryDeliveryId) =>
     Effect.gen(function* () {
       const delivery = Option.getOrUndefined(yield* deliveries.get(deliveryId));
-      const author = delivery?.state.threads.author;
+      const threadId = delivery === undefined ? undefined : followedThread(delivery.state);
       const followThrough = delivery?.state.followThrough;
       if (
         delivery === undefined ||
         isTerminal(delivery.state) ||
         !followsPullRequest(delivery) ||
-        author === undefined ||
+        threadId === undefined ||
         followThrough === undefined
       ) {
         return;
       }
-      const last = yield* eventSink.latestSequence({ threadId: author });
+      const last = yield* eventSink.latestSequence({ threadId });
       if (last <= followThrough.watchedAfter) return;
       const read = yield* eventSink
-        .stream({ threadId: author, afterSequence: followThrough.watchedAfter })
+        .stream({ threadId, afterSequence: followThrough.watchedAfter })
         .pipe(
           // The log replays every event of the thread up to its last before it goes live.
           Stream.takeUntil((stored) => stored.sequence >= last),
