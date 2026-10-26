@@ -378,8 +378,9 @@ export class FactoryService extends Context.Service<
      * when given, is started with `runtimeModeCeiling` (see `start`); an item a concurrent start
      * took first is refused as active and the walk goes on to the next. Nothing Ready is a result,
      * not an error. A page that cannot be read, reports its listing stale, or lists an item Work
-     * could not read ends the walk there: nothing past it is started, since an item it did not
-     * show could be the first Ready one, and the result says the listing was incomplete. Refused,
+     * could not read, whatever its status or labels, ends the walk there: nothing past it is
+     * started, since an item it did not show could be the first Ready one, and the result says the
+     * listing was incomplete. Refused,
      * with nothing written, for a project not on this environment or without a verify command,
      * and as `start` refuses the item it picked.
      */
@@ -786,14 +787,21 @@ const make = Effect.gen(function* () {
       );
       const incomplete: FactoryStartNextResult = { type: "nothing_ready", incomplete: true };
       for (const source of sources) {
+        // A Markdown source lists each task file it could not read as an item of unknown status
+        // without labels, and its own status and label filters would leave those out unseen. So
+        // it is listed whole and filtered here, as it filters. GitHub and Jira list no such item
+        // (a record they cannot read fails its page), and filter at the source, which spares
+        // reading every closed issue.
+        const filtered = source.kind === "github" || source.kind === "jira";
         let cursor: string | null = null;
         do {
           // A page Work cannot serve is a part of the listing nobody saw, never an empty one.
           const page: Option.Option<WorkListResult> = yield* Effect.option(
             work.listItems(itemReader, {
               sourceId: source.sourceId,
-              statuses: ["todo"],
-              ...(label === undefined ? {} : { labels: [label] }),
+              ...(filtered
+                ? { statuses: ["todo"], ...(label === undefined ? {} : { labels: [label] }) }
+                : {}),
               limit: NEXT_PAGE,
               ...(cursor === null ? {} : { cursor }),
             }),
@@ -804,6 +812,7 @@ const make = Effect.gen(function* () {
             // item may be the first Ready one.
             if (item.invalid !== null) return incomplete;
             if (item.status !== "todo" || item.blocked) continue;
+            if (!filtered && label !== undefined && !item.labels.includes(label)) continue;
             if (active.has(workItemRefString(item.ref))) continue;
             if (yield* hasOpenThread(item.ref)) continue;
             const started = yield* start({

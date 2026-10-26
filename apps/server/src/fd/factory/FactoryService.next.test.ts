@@ -132,11 +132,11 @@ const refOf = (sourceId: WorkSourceId, itemId: string): WorkItemRef => ({
 });
 
 /**
- * The project's two Markdown sources, in the order they were added, and what each lists of its
- * todo items, two to a page:
+ * The project's two Markdown sources, in the order they were added, and what each lists, two to a
+ * page:
  *
  * - tasks: `blocked` (blocked by `inProgress`, labelled auto), `linked` (linked to a thread whose
- *   run has ended, so idle); then the harness's item. `inProgress` is not todo.
+ *   run has ended, so idle); then `inProgress` and the harness's item.
  * - backlog: `later` (labelled later), `auto` (labelled auto); then `autoToo` (labelled auto).
  *
  * Every item but the three of backlog and the harness's is not Ready.
@@ -161,7 +161,7 @@ const seed = (world: World) =>
         labels: "auto",
         blockedBy: "fd-b00002",
       },
-      { id: "fd-b00002", title: "In progress", status: "in_progress", day: 5 },
+      { id: "fd-b00002", title: "In progress", status: "in_progress", day: 3 },
       { id: "fd-b00003", title: "Linked", status: "todo", day: 4 },
     ]);
     yield* writeTasks(world, "backlog", [
@@ -403,6 +403,74 @@ describe("FactoryService.startNext over a listing it cannot read whole", () => {
       { work: faulty(faults) },
     );
   });
+
+  it.live("starts nothing past a task file Work cannot read, labelled or not", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const work = yield* WorkService.WorkService;
+        const tasks = world.itemRef.sourceId;
+        // The harness's item has a delivery, so the first source holds nothing Ready but this.
+        yield* world.start;
+        // A task file Work lists but never reads: a symbolic link, of unknown status and labels,
+        // which a status or label filter would leave out.
+        const unread = path.join(world.root, "tasks", "fd-g00001.md");
+        yield* fileSystem.symlink(path.join(world.root, "README.md"), unread).pipe(Effect.orDie);
+        yield* work.refresh(owner, {}).pipe(Effect.orDie);
+        const listed = yield* work
+          .listItems(owner, { sourceId: tasks, limit: 100 })
+          .pipe(Effect.orDie);
+        assert.deepStrictEqual(
+          listed.items.map(({ ref, status, invalid }) => [ref.itemId, status, invalid?.code]),
+          [
+            [world.itemRef.itemId, "todo", undefined],
+            ["fd-g00001", "unknown", "symlink"],
+          ],
+        );
+        const todo = yield* work
+          .listItems(owner, { sourceId: tasks, statuses: ["todo"], limit: 100 })
+          .pipe(Effect.orDie);
+        assert.lengthOf(todo.items, 1);
+
+        // Nothing comes after it, and it may be the one Ready item.
+        assert.deepStrictEqual(yield* startNext({ projectId: world.projectId }), {
+          type: "nothing_ready",
+          incomplete: true,
+        });
+        // A Ready item of a later source comes after it, with its label or without one.
+        const backlog = yield* work
+          .saveSource(owner, {
+            projectId: world.projectId,
+            label: "Backlog",
+            config: { kind: "markdown", directory: "backlog", autoStart: false },
+          })
+          .pipe(Effect.orDie);
+        yield* writeTasks(world, "backlog", [
+          { id: "fd-c00001", title: "Later", status: "todo", day: 1, labels: "later" },
+        ]);
+        for (const label of [undefined, "later"]) {
+          assert.deepStrictEqual(
+            yield* startNext({
+              projectId: world.projectId,
+              ...(label === undefined ? {} : { label }),
+            }),
+            { type: "nothing_ready", incomplete: true },
+          );
+        }
+        assert.deepStrictEqual(yield* deliveredItems(world), [key(world.itemRef)]);
+
+        // Once the file is gone, the first source is read whole and the later item starts.
+        yield* fileSystem.remove(unread).pipe(Effect.orDie);
+        yield* git(world.root, ["add", "-A"]);
+        yield* git(world.root, [...identity, "commit", "--no-verify", "-m", "docs: drop a link"]);
+        yield* work.refresh(owner, {}).pipe(Effect.orDie);
+        const next = started(yield* startNext({ projectId: world.projectId, label: "later" }));
+        assert.strictEqual(key(next.itemRef), key(refOf(backlog.sourceId, "fd-c00001")));
+        yield* world.launched(next.deliveryId);
+      }),
+    ),
+  );
 
   it.live("starts nothing past an item Work lists but could not read", () =>
     withProject(verifyCommands.passes, (world) =>

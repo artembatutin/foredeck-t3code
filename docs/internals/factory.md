@@ -93,7 +93,11 @@ skipped for the next. A page that fails, a stale page and an item Work lists as 
 the walk as incomplete rather than read on, for the reason a miss proves nothing to
 [child creation](#child-items-are-found-again-before-they-are-created): the item not seen could be
 the first Ready one. A stale page's own items are not taken either, since a stale Markdown listing
-lacks files it never indexed, wherever they would sort.
+lacks files it never indexed, wherever they would sort. Markdown lists a task file it cannot read
+with an unknown status and no labels, and its own status and label filters drop such files
+without marking the page stale, so Factory lists a Markdown source unfiltered and filters it the
+way Markdown does. GitHub and Jira never list such items and keep their filters, which spares
+reading every closed issue.
 
 ## Work never imports Factory
 

@@ -117,10 +117,10 @@ them and add the label to the prompt, as in "call `factory_deliver` with `next: 
 project's id and the label `autopilot`".
 
 When nothing is Ready, nothing starts and the agent is told so; the next run looks again. If
-Factory cannot read a Work source completely, it starts nothing listed after the part it could
-not read and says the list was incomplete; check the source's status in Work. Like any delivery,
-it needs the project's verify command, and its threads never run with broader permissions than the
-task's agent.
+Factory cannot read a Work source completely, or the source lists a task file Work cannot read,
+it starts nothing listed after it and says the list was incomplete; check the source in Work.
+Like any delivery, it needs the project's verify command, and its threads never run with broader
+permissions than the task's agent.
 
 ## Follow a delivery
 
