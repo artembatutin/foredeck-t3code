@@ -1,4 +1,4 @@
-import { FactoryItemSection } from "./fd/factory";
+import { FactoryItemSection, FactoryListScreen } from "./fd/factory";
 import { WorkCommentSheet, WorkItemScreen, WorkListScreen } from "./fd/work-management";
 import { PullRequestGuideStopScreen } from "./features/pull-requests/guide/PullRequestGuideScreen";
 import { PullRequestInlineCommentScreen } from "./features/pull-requests/PullRequestInlineCommentScreen";
@@ -799,6 +799,11 @@ const RootStackConfig = createWorkspaceStackNavigator({
       ),
       linking: "work/:environmentId/:projectId/:sourceId/:itemId",
       options: SOLID_HEADER_OPTIONS,
+    }),
+    FactoryList: createNativeStackScreen({
+      screen: FactoryListScreen,
+      linking: "factory",
+      options: { ...SOLID_HEADER_OPTIONS, title: "Factory" },
     }),
     WorkComment: createNativeStackScreen({
       screen: WorkCommentSheet,

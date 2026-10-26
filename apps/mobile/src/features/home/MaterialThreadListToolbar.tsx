@@ -12,6 +12,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { MenuAction } from "@react-native-menu/menu";
 
 import { AndroidHeaderIconButton } from "../../components/AndroidScreenHeader";
+import { useFactoryHeaderAction } from "../../fd/factory";
 import { useWorkHeaderAction } from "../../fd/work-management";
 import { CompactBrandTitle } from "../../components/CompactBrandTitle";
 import { MaterialFloatingActionButton } from "../../components/MaterialFloatingActionButton";
@@ -38,6 +39,7 @@ export function MaterialThreadListToolbar(props: {
   readonly onRequestVisibility?: () => void;
 }) {
   const workAction = useWorkHeaderAction();
+  const factoryAction = useFactoryHeaderAction();
   const insets = useSafeAreaInsets();
   const navigation = useNavigation();
   const workspace = useWorkspaceTabs();
@@ -137,6 +139,13 @@ export function MaterialThreadListToolbar(props: {
                   accessibilityLabel="Work"
                   icon={{ ios: "checklist", android: "check" }}
                   onPress={workAction.onPress}
+                />
+              ) : null}
+              {factoryAction ? (
+                <AndroidHeaderIconButton
+                  accessibilityLabel="Factory"
+                  icon={{ ios: "hammer", android: "construction" }}
+                  onPress={factoryAction.onPress}
                 />
               ) : null}
               <AndroidHeaderIconButton

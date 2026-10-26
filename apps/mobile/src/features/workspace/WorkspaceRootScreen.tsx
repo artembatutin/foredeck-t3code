@@ -7,6 +7,7 @@ import { SafeAreaInsetsContext, useSafeAreaInsets } from "react-native-safe-area
 import { CompactBrandTitle } from "../../components/CompactBrandTitle";
 import { AndroidScreenHeader } from "../../components/AndroidScreenHeader";
 import { NativeStackScreenOptions } from "../../native/StackHeader";
+import { useFactoryHeaderAction } from "../../fd/factory";
 import { useWorkHeaderAction } from "../../fd/work-management";
 import { withNativeGlassHeaderItem } from "../layout/native-glass-header-items";
 import { NativePrimaryColumnContext } from "../../native/v5-workspace-context";
@@ -56,6 +57,7 @@ function WorkspaceRootTitle(props: {
 function WorkspaceRootContent() {
   const navigation = useNavigation();
   const workAction = useWorkHeaderAction();
+  const factoryAction = useFactoryHeaderAction();
   const { width: windowWidth } = useWindowDimensions();
   const { layout } = useAdaptiveWorkspaceLayout();
   const primaryColumn = use(NativePrimaryColumnContext);
@@ -113,13 +115,14 @@ function WorkspaceRootContent() {
               width,
               sidebarNavigation,
               workAction !== null,
+              factoryAction !== null,
             ]}
             options={{
               title: TAB_TITLES[state.selectedTab],
               headerShown: true,
               unstable_headerLeftItems: () => [],
-              unstable_headerRightItems: () =>
-                workAction === null
+              unstable_headerRightItems: () => [
+                ...(workAction === null
                   ? []
                   : [
                       withNativeGlassHeaderItem({
@@ -130,7 +133,20 @@ function WorkspaceRootContent() {
                         onPress: workAction.onPress,
                         type: "button",
                       }),
-                    ],
+                    ]),
+                ...(factoryAction === null
+                  ? []
+                  : [
+                      withNativeGlassHeaderItem({
+                        accessibilityLabel: "Factory",
+                        icon: { type: "sfSymbol", name: "hammer" } as const,
+                        identifier: "home-factory",
+                        label: "",
+                        onPress: factoryAction.onPress,
+                        type: "button",
+                      }),
+                    ]),
+              ],
               headerTitle: renderHeaderTitle,
             }}
           />
