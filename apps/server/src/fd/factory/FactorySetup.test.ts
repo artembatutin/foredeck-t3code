@@ -19,6 +19,7 @@ import type * as ProcessRunner from "../../processRunner.ts";
 import * as ProjectSetupScriptRunner from "../../project/ProjectSetupScriptRunner.ts";
 import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
+import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkActor, WorkService } from "../work-management/index.ts";
 import { childDeliveryId } from "./FactoryChildren.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
@@ -841,75 +842,216 @@ const storeLaunching = (world: World, deliveryId: FactoryDeliveryId, branch: str
     return { launch: awaiting.effect, delivery: Option.getOrThrow(stored) };
   }).pipe(Effect.orDie);
 
+/**
+ * Stores the delivery awaiting its author's launch and leaves its thread, Git and the thread's
+ * workspace as a restart leaves them partway through that launch's preparation, with the calls
+ * core's preparation makes: the thread created without its message; then, with `git`, the branch
+ * and its worktree created; with `recorded`, the worktree recorded on the thread; and with
+ * `cleanedUp`, the worktree removed again and the thread's workspace cleared, as core does for a
+ * preparation interrupted before it released a run, which keeps the branch. Returns the thread
+ * and the worktree's path.
+ */
+const interruptedLaunch = (
+  world: World,
+  deliveryId: FactoryDeliveryId,
+  branch: string,
+  stage: { readonly git: boolean; readonly recorded: boolean; readonly cleanedUp: boolean },
+) =>
+  Effect.gen(function* () {
+    yield* storeLaunching(world, deliveryId, branch);
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const driver = yield* GitVcsDriver.GitVcsDriver;
+    const launch = `factory-launch:${deliveryId}:1`;
+    const threadId = FactoryThreadEffects.launchThreadId(deliveryId, 1);
+    yield* threads.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make(launch),
+      threadId,
+      projectId: world.projectId,
+      title: `${world.itemKey}: ${world.itemTitle}`,
+      modelSelection: { instanceId, model: "test-model" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch,
+      worktreePath: null,
+      createdBy: "system",
+      creationSource: "server",
+    });
+    if (!stage.git) return { threadId, worktreePath: null };
+    const { worktree } = yield* driver.createWorktree(
+      { cwd: world.root, refName: "main", newRefName: branch, baseRefName: "main", path: null },
+      { worktreesDirectory: "" },
+    );
+    if (stage.recorded) {
+      yield* threads.dispatch({
+        type: "thread.metadata.update",
+        commandId: CommandId.make(`${launch}:workspace`),
+        threadId,
+        branch,
+        worktreePath: worktree.path,
+      });
+    }
+    if (stage.cleanedUp) {
+      yield* driver.removeWorktree({ cwd: world.root, path: worktree.path, force: true });
+      yield* threads.dispatch({
+        type: "thread.metadata.update",
+        commandId: CommandId.make(`${launch}:cancel-workspace`),
+        threadId,
+        worktreePath: null,
+        branch: null,
+      });
+    }
+    return { threadId, worktreePath: worktree.path };
+  }).pipe(Effect.orDie);
+
+/** Moves `main` one commit ahead without touching the checkout, as another push would. */
+const advanceMain = (root: string) =>
+  Effect.gen(function* () {
+    const next = yield* git(root, [
+      ...identity,
+      "commit-tree",
+      "main^{tree}",
+      "-p",
+      "main",
+      "-m",
+      "chore: upstream change",
+    ]);
+    yield* git(root, ["update-ref", "refs/heads/main", next]);
+  });
+
 describe("Factory setup after a restart", () => {
-  it.live(
-    "prepares the worktree again on a resume after a restart cut the launch short before it",
-    () =>
-      withProject(
-        passingVerify,
-        (world) =>
-          Effect.gen(function* () {
-            const factory = yield* service;
-            const marker = yield* markerIn(world, "setup-runs");
-            yield* useSetup(world, markingSetup(marker));
-            const deliveryId = FactoryDeliveryId.make("delivery-restarted");
-            const branch = "feature/restarted";
-            const branchStart = yield* git(world.root, ["rev-parse", "main"]);
-            yield* storeLaunching(world, deliveryId, branch);
-            // The launch created its thread, without a message, and the server stopped before
-            // the preparation it began recorded a worktree.
-            const threadId = FactoryThreadEffects.launchThreadId(deliveryId, 1);
-            yield* Effect.flatMap(ThreadManagement.ThreadManagementService, (threads) =>
-              threads.dispatch({
-                type: "thread.create",
-                commandId: CommandId.make(`factory-launch:${deliveryId}:1`),
-                threadId,
-                projectId: world.projectId,
-                title: `${world.itemKey}: ${world.itemTitle}`,
-                modelSelection: { instanceId, model: "test-model" },
-                runtimeMode: "full-access",
-                interactionMode: "default",
-                branch,
-                worktreePath: null,
-                createdBy: "system",
-                creationSource: "server",
-              }),
-            ).pipe(Effect.orDie);
+  it.live.each([
+    { name: "before Git created anything", git: false, recorded: false, cleanedUp: false },
+    { name: "after Git created the worktree", git: true, recorded: false, cleanedUp: false },
+    {
+      name: "after core's cleanup removed the worktree and kept the branch",
+      git: true,
+      recorded: false,
+      cleanedUp: true,
+    },
+    {
+      name: "after the worktree was recorded and core's cleanup removed it",
+      git: true,
+      recorded: true,
+      cleanedUp: true,
+    },
+  ])("recovers the launch's checkout on a resume when a restart cut it short $name", (stage) =>
+    withProject(
+      passingVerify,
+      (world) =>
+        Effect.gen(function* () {
+          const factory = yield* service;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const marker = yield* markerIn(world, "setup-runs");
+          yield* useSetup(world, markingSetup(marker));
+          const deliveryId = FactoryDeliveryId.make("delivery-restarted");
+          const branch = "feature/restarted";
+          const branchStart = yield* git(world.root, ["rev-parse", "main"]);
+          const left = yield* interruptedLaunch(world, deliveryId, branch, stage);
+          // What the interrupted preparation left in a worktree that survived it.
+          const leftBehind =
+            left.worktreePath !== null && !stage.cleanedUp
+              ? path.join(left.worktreePath, "left-by-preparation.txt")
+              : null;
+          if (leftBehind !== null) yield* fileSystem.writeFileString(leftBehind, "kept\n");
+          // The base ref moves on; a branch the launch created started where it did, and one it
+          // never created starts where the base ref is when it is.
+          yield* advanceMain(world.root);
+          const baseline = stage.git ? branchStart : yield* git(world.root, ["rev-parse", "main"]);
 
-            yield* world.boot(
-              Effect.gen(function* () {
-                // The boot sweep blocks the launch the restart interrupted.
-                const blocked = yield* stateOf(deliveryId);
-                assert.strictEqual(blocked.status, "blocked");
-                assert.strictEqual(blocked.block?.reason, "effect_failed");
+          yield* world.boot(
+            Effect.gen(function* () {
+              // The boot sweep blocks the launch the restart interrupted.
+              const blocked = yield* stateOf(deliveryId);
+              assert.strictEqual(blocked.status, "blocked");
+              assert.strictEqual(blocked.block?.reason, "effect_failed");
 
-                yield* factory.resume(deliveryId).pipe(Effect.orDie);
-                const author = yield* world.launched(deliveryId);
+              yield* factory.resume(deliveryId).pipe(Effect.orDie);
+              const author = yield* world.launched(deliveryId);
 
-                assert.strictEqual(author.threadId, threadId);
+              // The same thread, branch and checkout: the worktree the launch made, or one at its
+              // path. Git names a worktree by its real path.
+              assert.strictEqual(author.threadId, left.threadId);
+              if (left.worktreePath !== null) {
                 assert.strictEqual(
-                  yield* git(author.worktreePath, ["branch", "--show-current"]),
-                  branch,
-                );
-                assert.deepStrictEqual(yield* markedRuns(marker), [
                   yield* realPath(author.worktreePath),
-                ]);
-                assert.deepStrictEqual(yield* setupLogs(world, deliveryId), ["setup-1.log"]);
-                const thread = yield* threadProjection(threadId).pipe(Effect.orDie);
-                assert.deepStrictEqual(
-                  thread.messages.map(({ id }) => id),
-                  [openingMessageId(deliveryId)],
+                  yield* realPath(left.worktreePath),
                 );
-                assert.deepStrictEqual(
-                  thread.runs.map(({ id }) => id),
-                  [author.runId],
-                );
-                assert.strictEqual((yield* stateOf(deliveryId)).baseline, branchStart);
-              }),
-            );
-          }),
-        { manualReactor: true },
-      ),
+              }
+              assert.strictEqual(
+                yield* git(author.worktreePath, ["branch", "--show-current"]),
+                branch,
+              );
+              if (leftBehind !== null) assert.isTrue(yield* world.exists(leftBehind));
+              const thread = yield* threadProjection(left.threadId).pipe(Effect.orDie);
+              assert.strictEqual(thread.thread.worktreePath, author.worktreePath);
+              assert.strictEqual(thread.thread.branch, branch);
+              assert.strictEqual((yield* stateOf(deliveryId)).baseline, baseline);
+              // Setup ran once there, then exactly one opening turn.
+              assert.deepStrictEqual(yield* markedRuns(marker), [
+                yield* realPath(author.worktreePath),
+              ]);
+              assert.deepStrictEqual(yield* setupLogs(world, deliveryId), ["setup-1.log"]);
+              assert.deepStrictEqual(
+                thread.messages.map(({ id }) => id),
+                [openingMessageId(deliveryId)],
+              );
+              assert.deepStrictEqual(
+                thread.runs.map(({ id }) => id),
+                [author.runId],
+              );
+              assert.deepStrictEqual(
+                world.provider.started.map(({ runId }) => runId),
+                [author.runId],
+              );
+            }),
+          );
+        }),
+      { manualReactor: true },
+    ),
+  );
+
+  it.live("refuses to take the project's own checkout for a branch checked out there", () =>
+    withProject(
+      passingVerify,
+      (world) =>
+        Effect.gen(function* () {
+          const factory = yield* service;
+          const marker = yield* markerIn(world, "setup-runs");
+          yield* useSetup(world, markingSetup(marker));
+          const deliveryId = FactoryDeliveryId.make("delivery-restarted");
+          const branch = "feature/restarted";
+          const left = yield* interruptedLaunch(world, deliveryId, branch, {
+            git: false,
+            recorded: false,
+            cleanedUp: false,
+          });
+          // The owner checked the delivery's branch out in the project's checkout meanwhile.
+          yield* git(world.root, ["switch", "-c", branch]);
+
+          yield* world.boot(
+            Effect.gen(function* () {
+              yield* factory.resume(deliveryId).pipe(Effect.orDie);
+              yield* drainFactory;
+
+              const state = yield* stateOf(deliveryId);
+              assert.strictEqual(state.status, "blocked");
+              assert.strictEqual(
+                state.block?.reason === "effect_failed" ? state.block.detail : undefined,
+                "Factory could not launch the author thread (FactoryWorkspacePreparationError).",
+              );
+              const thread = yield* threadProjection(left.threadId).pipe(Effect.orDie);
+              assert.isNull(thread.thread.worktreePath);
+              assert.deepStrictEqual(thread.runs, []);
+              assert.deepStrictEqual(yield* markedRuns(marker), []);
+              assert.deepStrictEqual(world.provider.started, []);
+              assert.strictEqual(yield* git(world.root, ["branch", "--show-current"]), branch);
+            }),
+          );
+        }),
+      { manualReactor: true },
+    ),
   );
 
   it.live(

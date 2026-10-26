@@ -68,17 +68,23 @@ in-memory setup tracker, so the launch waits there until preparation got as far 
 released a run, and blocks when it ended short of that.
 
 A replay must neither run setup nor send the opening turn twice. The opening message decides:
-once it exists the replay runs nothing and returns its run, before it setup runs again. Factory
-sends it under the command id core's own launch would, so a replay that no longer runs setup (its
-command cleared since) replays that command instead of queuing a second turn. Core schedules no
-preparation for a launch it already accepted, so a replay that finds no worktree and none under
-way (a restart cut the preparation short) prepares the thread again under a command of its own;
-a restart after `git worktree add` but before the worktree was recorded leaves a branch that
-preparation cannot create again, as core's own retries cannot. The worker checks that the delivery
-still awaits the launch once setup ends, so a cancel meanwhile sends no turn; one landing after is
-stopped as any cancelled launch's run is. Only author launches run setup, through the verify
-runner with the verify timeout and its log in the delivery's evidence; a failure blocks the
-delivery with fixed text naming how the command ended.
+once it exists the replay runs nothing and returns its run. Factory sends it under the command id
+core's own launch would, so a replay that no longer runs setup (its command cleared since)
+replays that command instead of queuing a second turn. A replay before the turn was sent cannot
+lean on core either: core schedules no preparation for a launch it already accepted, and a
+preparation a restart cut short can leave the delivery's branch with or without its worktree and
+the thread recording neither, since core's cleanup of an interrupted preparation removes the
+worktree, keeps the branch and clears the thread's workspace. Asking core to create the worktree
+again would only collide with that branch. So the replay reconciles with Git: the worktree the
+thread records while it exists, else the one Git has the branch checked out in (never the
+project's own checkout), else one added for the branch, else one created from the base ref, each
+with the settings core's preparation uses. It records that worktree on the thread only while the
+thread's workspace is still as it read it, runs setup and launches into it as into any existing worktree, so
+the branch, its baseline and anything already in the worktree carry over. The worker checks that
+the delivery still awaits the launch once setup ends, so a cancel meanwhile sends no turn; one
+landing after is stopped as any cancelled launch's run is. Only author launches run setup,
+through the verify runner with the verify timeout and its log in the delivery's evidence; a
+failure blocks the delivery with fixed text naming how the command ended.
 
 ## A delivery's launches stay under its starter's mode
 
