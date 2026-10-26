@@ -23,11 +23,16 @@ vi.mock("./state", async () => {
   return {
     factoryEnvironment: {
       supported: () => yes,
+      planning: () => yes,
       deliveries: () => destination.deliveries,
       start: command,
       stop: command,
       resume: command,
       cancel: command,
+      updatePlan: command,
+      approvePlan: command,
+      rejectPlan: command,
+      replan: command,
     },
   };
 });

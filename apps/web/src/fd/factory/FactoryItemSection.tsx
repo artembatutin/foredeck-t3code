@@ -19,13 +19,15 @@ import {
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { useAtomCommand } from "../../state/use-atom-command";
-import { factoryErrorText } from "./deliver";
+import { factoryErrorText, factoryParentDeliverable } from "./deliver";
+import { FactoryPlanGate } from "./FactoryPlanGate";
 import { useFactoryDeliverState, useFactoryStart, useReportOpenWorkItem } from "./hooks";
 import {
   cancelConfirmationTarget,
   factoryItemSection,
   type FactoryReviewLine,
 } from "./itemSection";
+import { factoryPlanGate } from "./planGate";
 import { factoryEnvironment } from "./state";
 
 interface FactoryItemSectionProps {
@@ -35,9 +37,10 @@ interface FactoryItemSectionProps {
 }
 
 /**
- * The Work item detail's Factory section: Deliver, and the item's current delivery with its
- * timeline and controls. Renders nothing on a server without Factory. Mounted by the Work route;
- * while mounted it reports its item as the one the palette's Deliver acts on.
+ * The Work item detail's Factory section: Deliver (as a parent too where the server plans), and
+ * the item's current delivery with its timeline and controls, and its plan while it waits at the
+ * plan gate. Renders nothing on a server without Factory. Mounted by the Work route; while
+ * mounted it reports its item as the one the palette's Deliver acts on.
  */
 export function FactoryItemSection(props: FactoryItemSectionProps) {
   // A pending action, error or start belongs to one destination and item.
@@ -62,6 +65,12 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
     stop: useAtomValue(factoryEnvironment.stop.permissionAtom(environmentId)),
     resume: useAtomValue(factoryEnvironment.resume.permissionAtom(environmentId)),
     cancel: useAtomValue(factoryEnvironment.cancel.permissionAtom(environmentId)),
+  };
+  const planPermitted = {
+    update: useAtomValue(factoryEnvironment.updatePlan.permissionAtom(environmentId)),
+    approve: useAtomValue(factoryEnvironment.approvePlan.permissionAtom(environmentId)),
+    reject: useAtomValue(factoryEnvironment.rejectPlan.permissionAtom(environmentId)),
+    replan: useAtomValue(factoryEnvironment.replan.permissionAtom(environmentId)),
   };
   const start = useFactoryStart();
   const stop = useAtomCommand(factoryEnvironment.stop);
@@ -108,6 +117,17 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
   const delivery = view.delivery;
   const control =
     delivery === null ? null : { environmentId, input: { deliveryId: delivery.deliveryId } };
+  const deliverParent = factoryParentDeliverable({
+    ...destination,
+    environmentId,
+    itemRef: item.ref,
+  });
+  const gate = factoryPlanGate({
+    environmentId,
+    itemRef: item.ref,
+    ...destination,
+    permitted: planPermitted,
+  });
 
   return (
     <section className="space-y-2" aria-label="Factory">
@@ -122,6 +142,17 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
           <span className="text-muted-foreground text-xs">{delivery.stage}</span>
         ) : null}
         <div className="flex-1" />
+        {deliverParent ? (
+          <Button
+            size="xs"
+            variant="outline"
+            disabled={pending !== null}
+            onClick={() => void run("start", () => start(target, "parent"))}
+          >
+            <FactoryIcon />
+            Deliver as parent
+          </Button>
+        ) : null}
         {view.deliver ? (
           <Button
             size="xs"
@@ -189,6 +220,14 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
         </>
       ) : null}
       {error !== null ? <p className="text-destructive text-sm">{error}</p> : null}
+      {gate !== null ? (
+        // A draft belongs to one delivery; another delivery's plan starts a draft of its own.
+        <FactoryPlanGate
+          key={JSON.stringify([gate.destination.environmentId, gate.destination.deliveryId])}
+          gate={gate}
+          itemKey={item.key}
+        />
+      ) : null}
       {deliveriesQuery.error !== null ? (
         <p className="text-destructive text-sm">{deliveriesQuery.error}</p>
       ) : null}

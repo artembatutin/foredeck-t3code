@@ -8,6 +8,7 @@ import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import {
   type FactoryDeliverTarget,
+  type FactoryDeliveryKind,
   factoryErrorText,
   type FactoryStartedDelivery,
   factoryStartRequest,
@@ -36,6 +37,9 @@ export function useFactoryDeliverState(target: FactoryDeliverTarget | null) {
   const supported = useAtomValue(
     environmentId === null ? UNSUPPORTED : factoryEnvironment.supported(environmentId),
   );
+  const planning = useAtomValue(
+    environmentId === null ? UNSUPPORTED : factoryEnvironment.planning(environmentId),
+  );
   const connected = useConnectedEnvironmentIds().some((id) => id === environmentId);
   const startPermitted = useAtomValue(factoryEnvironment.start.permissionAtom(environmentId));
   const deliveriesQuery = useEnvironmentQuery(
@@ -50,6 +54,7 @@ export function useFactoryDeliverState(target: FactoryDeliverTarget | null) {
   return {
     destination: {
       supported,
+      planning,
       connected,
       startPermitted,
       deliveries: deliveriesQuery.data?.deliveries ?? null,
@@ -60,15 +65,19 @@ export function useFactoryDeliverState(target: FactoryDeliverTarget | null) {
 }
 
 /**
- * The one start path of every Deliver entry point. Resolves to null once the delivery started,
- * counted as open until the deliveries list holds it, or to the refusal's fixed text.
+ * The one start path of every Deliver entry point, single or parent. Resolves to null once the
+ * delivery started, counted as open until the deliveries list holds it, or to the refusal's fixed
+ * text.
  */
-export function useFactoryStart(): (target: FactoryDeliverTarget) => Promise<string | null> {
+export function useFactoryStart(): (
+  target: FactoryDeliverTarget,
+  kind?: FactoryDeliveryKind,
+) => Promise<string | null> {
   const start = useAtomCommand(factoryEnvironment.start);
   const setStarted = useAtomSet(startedAtom);
   return useCallback(
-    async (target: FactoryDeliverTarget) => {
-      const result = await start(factoryStartRequest(target));
+    async (target: FactoryDeliverTarget, kind?: FactoryDeliveryKind) => {
+      const result = await start(factoryStartRequest(target, kind));
       if (result._tag === "Failure") return factoryErrorText(result.cause);
       setStarted((started) => recordStarted(started, target.environmentId, result.value));
       return null;
@@ -103,8 +112,8 @@ export function useFactoryPaletteActions() {
   return factoryPaletteActions({
     openItem,
     destination,
-    deliver: async (target) => {
-      const failure = await start(target);
+    deliver: async (target, kind) => {
+      const failure = await start(target, kind);
       if (failure !== null) {
         toastManager.add({
           type: "error",

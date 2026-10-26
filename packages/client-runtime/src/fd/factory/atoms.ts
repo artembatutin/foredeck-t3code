@@ -1,5 +1,5 @@
 import { type EnvironmentId, type ServerConfig, WS_METHODS } from "@t3tools/contracts";
-import type { FactoryDeliveryRefInput } from "@t3tools/contracts/fd/factory";
+import type { FactoryDeliveryRefInput, FactorySupport } from "@t3tools/contracts/fd/factory";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
@@ -29,10 +29,19 @@ interface EnvironmentTarget<Input> {
   readonly input: Input;
 }
 
-/** Whether a session's server advertises Factory, from the config the session connected with. */
-const sessionServesFactory = (session: RpcSession) =>
+/**
+ * What a request needs its destination to serve: Factory, or Factory's planning (the plan gate's
+ * actions and parent starts), which a server from before planning does not serve.
+ */
+type FactoryNeed = "factory" | "planning";
+
+const serves = (support: FactorySupport | undefined, need: FactoryNeed) =>
+  support !== undefined && (need === "factory" || support.planning);
+
+/** Whether a session's server serves `need`, from the config the session connected with. */
+const sessionServes = (session: RpcSession, need: FactoryNeed) =>
   session.initialConfig.pipe(
-    Effect.map((config) => serverFactorySupport(config) !== undefined),
+    Effect.map((config) => serves(serverFactorySupport(config), need)),
     Effect.orElseSucceed(() => false),
   );
 
@@ -42,7 +51,10 @@ const sessionServesFactory = (session: RpcSession) =>
  * of the session that would carry the request: just after a reconnect the view can still hold the
  * previous server's config. On any other environment a read stays idle and a write fails before
  * it is sent, checked when it would go out rather than when it was queued, and the change stream
- * closes when support goes, even while no view reads it.
+ * closes when support goes, even while no view reads it. The plan gate's actions and a parent
+ * start need planning advertised the same way, so on a server from before planning they fail
+ * unsent rather than reach a server that would refuse them, or one that would start the item as
+ * a single delivery.
  *
  * Every read refetches when the environment's Factory epoch moves, so a change made anywhere
  * (another client, an agent, the delivery's own worker) reaches every view without polling.
@@ -53,41 +65,50 @@ export function createFactoryEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
   serverConfigsAtom: Atom.Atom<ReadonlyMap<EnvironmentId, ServerConfig>>,
 ) {
-  /** Whether this client's view of the environment's server config advertises Factory. */
-  const supported = Atom.family((environmentId: EnvironmentId) =>
-    Atom.make(
-      (get) => serverFactorySupport(get(serverConfigsAtom).get(environmentId)) !== undefined,
-    ).pipe(Atom.withLabel(`factory:supported:${environmentId}`)),
-  );
+  /** Whether this client's view of the environment's server config serves `need`. */
+  const viewServes = (need: FactoryNeed) =>
+    Atom.family((environmentId: EnvironmentId) =>
+      Atom.make((get) =>
+        serves(serverFactorySupport(get(serverConfigsAtom).get(environmentId)), need),
+      ).pipe(Atom.withLabel(`factory:${need === "factory" ? "supported" : need}:${environmentId}`)),
+    );
+  const supported = viewServes("factory");
+  const planning = viewServes("planning");
+  const viewed = { factory: supported, planning } as const;
 
-  /** Whether a request may leave now for the environment the running effect targets. */
-  const servedNow = Effect.gen(function* () {
-    const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
-    // Every atom effect runs with its registry in context; the shared helpers do not declare it.
-    const registry = yield* Effect.serviceOption(AtomRegistry.AtomRegistry);
-    if (
-      Option.isNone(registry) ||
-      !registry.value.get(supported(supervisor.target.environmentId))
-    ) {
-      return false;
-    }
-    const session = yield* SubscriptionRef.get(supervisor.session);
-    return Option.isSome(session) && (yield* sessionServesFactory(session.value));
-  });
+  /** Whether a request needing `need` may leave now for the environment the effect targets. */
+  const servedNow = (need: FactoryNeed) =>
+    Effect.gen(function* () {
+      const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
+      // Every atom effect runs with its registry in context; the shared helpers do not declare it.
+      const registry = yield* Effect.serviceOption(AtomRegistry.AtomRegistry);
+      if (
+        Option.isNone(registry) ||
+        !registry.value.get(viewed[need](supervisor.target.environmentId))
+      ) {
+        return false;
+      }
+      const session = yield* SubscriptionRef.get(supervisor.session);
+      return Option.isSome(session) && (yield* sessionServes(session.value, need));
+    });
   /** A read held while the destination does not serve Factory, so it stays idle. */
   const readWhenServed = <A, Err>(
     send: Effect.Effect<A, Err, EnvironmentSupervisor.EnvironmentSupervisor>,
-  ) => Effect.flatMap(servedNow, (served) => (served ? send : Effect.never));
-  /** A write that fails, unsent, while the destination does not serve Factory. */
+  ) => Effect.flatMap(servedNow("factory"), (served) => (served ? send : Effect.never));
+  /** A write that fails, unsent, while the destination does not serve what it needs. */
   const writeWhenServed = <A, Err>(
+    need: FactoryNeed,
     send: Effect.Effect<A, Err, EnvironmentSupervisor.EnvironmentSupervisor>,
   ) =>
     Effect.gen(function* () {
-      if (yield* servedNow) return yield* send;
-      const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
+      if (yield* servedNow(need)) return yield* send;
+      const { environmentId, label } = (yield* EnvironmentSupervisor.EnvironmentSupervisor).target;
       return yield* new EnvironmentRpcUnavailableError({
-        environmentId: supervisor.target.environmentId,
-        message: `${supervisor.target.label} does not offer Factory. Update its server to use Factory.`,
+        environmentId,
+        message:
+          need === "factory"
+            ? `${label} does not offer Factory. Update its server to use Factory.`
+            : `${label} does not offer Factory planning. Update its server to plan deliveries.`,
       });
     });
 
@@ -122,7 +143,7 @@ export function createFactoryEnvironmentAtoms<R, E>(
           ? followStreamInEnvironment(
               environmentId,
               subscribeDynamic(WS_METHODS.factoryDeliveriesSubscribe, (session) =>
-                Effect.flatMap(sessionServesFactory(session), (served) =>
+                Effect.flatMap(sessionServes(session, "factory"), (served) =>
                   served ? Effect.succeed({}) : Effect.never,
                 ),
               ),
@@ -151,19 +172,20 @@ export function createFactoryEnvironmentAtoms<R, E>(
     key: ({ environmentId, input }: EnvironmentTarget<FactoryDeliveryRefInput>) =>
       lane(environmentId, "delivery", input.deliveryId),
   } as const;
-  /** Offers a command only where its grant is held and the destination advertises Factory. */
+  /** Offers a command only where its grant is held and the destination serves what it needs. */
   const whereSupported = <
     Command extends {
       readonly permissionAtom: (environmentId: EnvironmentId | null) => Atom.Atom<boolean>;
     },
   >(
     command: Command,
+    need: FactoryNeed = "factory",
   ) => {
     const available = Atom.family((environmentId: EnvironmentId | null) =>
       Atom.make(
         (get) =>
           environmentId !== null &&
-          get(supported(environmentId)) &&
+          get(viewed[need](environmentId)) &&
           get(command.permissionAtom(environmentId)),
       ),
     );
@@ -176,6 +198,8 @@ export function createFactoryEnvironmentAtoms<R, E>(
 
   return {
     supported,
+    /** Whether this client's view of the environment's server config advertises planning. */
+    planning,
     changes: supportedOnly(
       "factory:changes",
       ({ environmentId }: EnvironmentTarget<Record<string, never>>) => changes(environmentId),
@@ -211,12 +235,20 @@ export function createFactoryEnvironmentAtoms<R, E>(
         refreshTrigger,
       }),
     ),
+    /**
+     * A single start, or with `kind: "parent"` a parent's, which needs planning: offer it only
+     * where `planning` holds. A server from before planning would refuse the kind, and a parent
+     * start must never run as a single one.
+     */
     start: whereSupported(
       createEnvironmentRpcCommand(runtime, {
         label: "environment-data:factory:start",
         tag: WS_METHODS.factoryDeliveriesStart,
         execute: (input) =>
-          writeWhenServed(requestGuarded(WS_METHODS.factoryDeliveriesStart, input)),
+          writeWhenServed(
+            input.kind === "parent" ? "planning" : "factory",
+            requestGuarded(WS_METHODS.factoryDeliveriesStart, input),
+          ),
         scheduler,
         concurrency: {
           mode: "serial",
@@ -230,7 +262,7 @@ export function createFactoryEnvironmentAtoms<R, E>(
         label: "environment-data:factory:stop",
         tag: WS_METHODS.factoryDeliveriesStop,
         execute: (input) =>
-          writeWhenServed(requestGuarded(WS_METHODS.factoryDeliveriesStop, input)),
+          writeWhenServed("factory", requestGuarded(WS_METHODS.factoryDeliveriesStop, input)),
         scheduler,
         concurrency: byDelivery,
       }),
@@ -240,7 +272,7 @@ export function createFactoryEnvironmentAtoms<R, E>(
         label: "environment-data:factory:resume",
         tag: WS_METHODS.factoryDeliveriesResume,
         execute: (input) =>
-          writeWhenServed(requestGuarded(WS_METHODS.factoryDeliveriesResume, input)),
+          writeWhenServed("factory", requestGuarded(WS_METHODS.factoryDeliveriesResume, input)),
         scheduler,
         concurrency: byDelivery,
       }),
@@ -250,7 +282,7 @@ export function createFactoryEnvironmentAtoms<R, E>(
         label: "environment-data:factory:cancel",
         tag: WS_METHODS.factoryDeliveriesCancel,
         execute: (input) =>
-          writeWhenServed(requestGuarded(WS_METHODS.factoryDeliveriesCancel, input)),
+          writeWhenServed("factory", requestGuarded(WS_METHODS.factoryDeliveriesCancel, input)),
         scheduler,
         concurrency: byDelivery,
       }),
@@ -259,13 +291,59 @@ export function createFactoryEnvironmentAtoms<R, E>(
       createEnvironmentRpcCommand(runtime, {
         label: "environment-data:factory:set-settings",
         tag: WS_METHODS.factorySettingsSet,
-        execute: (input) => writeWhenServed(requestGuarded(WS_METHODS.factorySettingsSet, input)),
+        execute: (input) =>
+          writeWhenServed("factory", requestGuarded(WS_METHODS.factorySettingsSet, input)),
         scheduler,
         concurrency: {
           mode: "serial",
           key: ({ environmentId, input }) => lane(environmentId, "settings", input.projectId),
         },
       }),
+    ),
+    /** Stores the owner's edit of the plan a delivery waits on at the plan gate. */
+    updatePlan: whereSupported(
+      createEnvironmentRpcCommand(runtime, {
+        label: "environment-data:factory:update-plan",
+        tag: WS_METHODS.factoryPlanUpdate,
+        execute: (input) =>
+          writeWhenServed("planning", requestGuarded(WS_METHODS.factoryPlanUpdate, input)),
+        scheduler,
+        concurrency: byDelivery,
+      }),
+      "planning",
+    ),
+    approvePlan: whereSupported(
+      createEnvironmentRpcCommand(runtime, {
+        label: "environment-data:factory:approve-plan",
+        tag: WS_METHODS.factoryPlanApprove,
+        execute: (input) =>
+          writeWhenServed("planning", requestGuarded(WS_METHODS.factoryPlanApprove, input)),
+        scheduler,
+        concurrency: byDelivery,
+      }),
+      "planning",
+    ),
+    rejectPlan: whereSupported(
+      createEnvironmentRpcCommand(runtime, {
+        label: "environment-data:factory:reject-plan",
+        tag: WS_METHODS.factoryPlanReject,
+        execute: (input) =>
+          writeWhenServed("planning", requestGuarded(WS_METHODS.factoryPlanReject, input)),
+        scheduler,
+        concurrency: byDelivery,
+      }),
+      "planning",
+    ),
+    replan: whereSupported(
+      createEnvironmentRpcCommand(runtime, {
+        label: "environment-data:factory:replan",
+        tag: WS_METHODS.factoryPlanReplan,
+        execute: (input) =>
+          writeWhenServed("planning", requestGuarded(WS_METHODS.factoryPlanReplan, input)),
+        scheduler,
+        concurrency: byDelivery,
+      }),
+      "planning",
     ),
   };
 }

@@ -3,13 +3,13 @@ import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import { FactoryIcon } from "lucide-react";
 
 import { Button } from "../../components/ui/button";
-import { factoryDeliverable } from "./deliver";
+import { factoryDeliverable, factoryParentDeliverable } from "./deliver";
 import { useFactoryDeliverState, useFactoryStart } from "./hooks";
 
 /**
- * Deliver in the Work start dialog's footer, offered by the shared Deliver rule. The Work route
- * passes it in; the dialog runs it under its pending state, closing on a start and showing the
- * refusal's text otherwise.
+ * Deliver in the Work start dialog's footer, offered by the shared Deliver rule, and Deliver as
+ * parent where the destination plans. The Work route passes it in; the dialog runs it under its
+ * pending state, closing on a start and showing the refusal's text otherwise.
  */
 export function FactoryStartDialogAction({
   environmentId,
@@ -27,16 +27,30 @@ export function FactoryStartDialogAction({
   const target = { environmentId, projectId, itemRef: item.ref };
   const { destination } = useFactoryDeliverState(target);
   const start = useFactoryStart();
-  if (!factoryDeliverable({ ...destination, environmentId, itemRef: item.ref })) return null;
+  const input = { ...destination, environmentId, itemRef: item.ref };
+  if (!factoryDeliverable(input)) return null;
   return (
-    <Button
-      variant="outline"
-      size="sm"
-      disabled={disabled}
-      onClick={() => void run(() => start(target))}
-    >
-      <FactoryIcon />
-      Deliver
-    </Button>
+    <>
+      {factoryParentDeliverable(input) ? (
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={disabled}
+          onClick={() => void run(() => start(target, "parent"))}
+        >
+          <FactoryIcon />
+          Deliver as parent
+        </Button>
+      ) : null}
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={disabled}
+        onClick={() => void run(() => start(target))}
+      >
+        <FactoryIcon />
+        Deliver
+      </Button>
+    </>
   );
 }

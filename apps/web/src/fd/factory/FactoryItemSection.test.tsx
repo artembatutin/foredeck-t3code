@@ -7,7 +7,15 @@ import { act, type ReactNode } from "react";
 import { create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-type Command = "start" | "stop" | "resume" | "cancel";
+type Command =
+  | "start"
+  | "stop"
+  | "resume"
+  | "cancel"
+  | "updatePlan"
+  | "approvePlan"
+  | "rejectPlan"
+  | "replan";
 
 /** What the destination looks like to the section: the atoms it reads and the commands it sent. */
 interface Destination {
@@ -38,11 +46,16 @@ vi.mock("./state", async () => {
   return {
     factoryEnvironment: {
       supported: () => supported,
+      planning: () => supported,
       deliveries: () => destination.get().deliveries,
       start: command("start"),
       stop: command("stop"),
       resume: command("resume"),
       cancel: command("cancel"),
+      updatePlan: command("updatePlan"),
+      approvePlan: command("approvePlan"),
+      rejectPlan: command("rejectPlan"),
+      replan: command("replan"),
     },
   };
 });
@@ -120,6 +133,10 @@ beforeEach(() => {
       stop: keep(true),
       resume: keep(true),
       cancel: keep(true),
+      updatePlan: keep(true),
+      approvePlan: keep(true),
+      rejectPlan: keep(true),
+      replan: keep(true),
     },
     sent: [],
   };

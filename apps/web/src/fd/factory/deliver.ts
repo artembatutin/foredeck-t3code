@@ -14,7 +14,8 @@ const FALLBACK_ERROR_TEXT = "Factory could not complete the request. Try again."
 /**
  * The text a failed Factory command shows: fixed text naming the settings path for a missing
  * verify command, a Factory error's own fixed message otherwise (a newer server's unknown reasons
- * included), and the failure's message for anything else.
+ * included, and the refusal to plan a parent outside a Markdown source), and the failure's message
+ * for anything else.
  */
 export function factoryErrorText(cause: Cause.Cause<unknown>): string {
   const error = Option.getOrNull(Cause.findErrorOption(cause)) as {
@@ -47,11 +48,16 @@ export interface FactoryStartedDelivery {
   readonly delivery: FactoryDelivery;
 }
 
+/** How a Deliver entry point delivers its item: on its own, or as a parent planned first. */
+export type FactoryDeliveryKind = "single" | "parent";
+
 /** What the Deliver rule reads of one item's destination. */
 export interface FactoryDeliverInput {
   readonly environmentId: EnvironmentId;
   readonly itemRef: WorkItemRef;
   readonly supported: boolean;
+  /** Whether the destination advertises planning; absent counts as not. */
+  readonly planning?: boolean;
   readonly connected: boolean;
   /** Whether this session holds the start grant on the destination. */
   readonly startPermitted: boolean;
@@ -115,10 +121,22 @@ export const factoryDeliverable = (input: FactoryDeliverInput): boolean => {
   return current === undefined || isTerminal(current);
 };
 
-/** The start command a Deliver entry point sends for its item. */
+/**
+ * Whether Deliver as parent is offered for an item: where Deliver is, on a destination that
+ * advertises planning. The server refuses an item whose source cannot hold its children, with its
+ * own message.
+ */
+export const factoryParentDeliverable = (input: FactoryDeliverInput): boolean =>
+  input.planning === true && factoryDeliverable(input);
+
+/**
+ * The start command a Deliver entry point sends for its item. A single start names no kind, as
+ * servers from before planning take it.
+ */
 export const factoryStartRequest = (
   target: FactoryDeliverTarget,
+  kind: FactoryDeliveryKind = "single",
 ): { readonly environmentId: EnvironmentId; readonly input: FactoryDeliveryStartInput } => ({
   environmentId: target.environmentId,
-  input: { itemRef: target.itemRef },
+  input: kind === "parent" ? { itemRef: target.itemRef, kind } : { itemRef: target.itemRef },
 });
