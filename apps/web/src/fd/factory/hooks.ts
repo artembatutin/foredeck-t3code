@@ -1,10 +1,15 @@
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
-import { Atom } from "effect/reactivity";
+import { factoryFleet, type FactoryFleetEnvironment } from "@t3tools/client-runtime/fd/factory";
+import type { EnvironmentId } from "@t3tools/contracts";
+import { useNavigate } from "@tanstack/react-router";
+import * as Option from "effect/Option";
+import { AsyncResult, Atom } from "effect/reactivity";
 import { useCallback, useEffect } from "react";
 
 import { toastManager } from "../../components/ui/toast";
 import { useConnectedEnvironmentIds } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
+import { environmentServerConfigsAtom } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import {
   type FactoryDeliverTarget,
@@ -14,7 +19,7 @@ import {
   factoryStartRequest,
   recordStarted,
 } from "./deliver";
-import { type FactoryOpenItem, factoryPaletteActions } from "./palette";
+import { factoryOpenPaletteAction, type FactoryOpenItem, factoryPaletteActions } from "./palette";
 import { factoryEnvironment } from "./state";
 
 /** The deliveries starts in this session returned, shared by every Deliver entry point. */
@@ -30,6 +35,48 @@ const openItemAtom = Atom.make<FactoryOpenItem | null>(null).pipe(
 );
 
 const UNSUPPORTED = Atom.make(false).pipe(Atom.withLabel("factory:unsupported"));
+
+/** Whether any environment's server advertises Factory. */
+const anySupportedAtom = Atom.make((get) =>
+  [...get(environmentServerConfigsAtom).keys()].some((environmentId) =>
+    get(factoryEnvironment.supported(environmentId)),
+  ),
+).pipe(Atom.withLabel("factory:any-supported"));
+
+/**
+ * Every environment's deliveries, read without a project, so each refetches on its environment's
+ * change epoch and stays idle where Factory is not served; and the active ones as the fleet.
+ */
+const fleetAtom = Atom.make((get) => {
+  const environments: Array<FactoryFleetEnvironment> = [];
+  const failed: Array<EnvironmentId> = [];
+  let loading = false;
+  for (const environmentId of [...get(environmentServerConfigsAtom).keys()].toSorted()) {
+    const supported = get(factoryEnvironment.supported(environmentId));
+    if (!supported) continue;
+    const result = get(factoryEnvironment.deliveries({ environmentId, input: {} }));
+    const deliveries = Option.getOrNull(AsyncResult.value(result))?.deliveries ?? null;
+    if (result._tag === "Failure") failed.push(environmentId);
+    else if (deliveries === null) loading = true;
+    environments.push({ environmentId, supported, deliveries });
+  }
+  return {
+    environments: environments.map(({ environmentId }) => environmentId),
+    rows: factoryFleet(environments),
+    loading,
+    failed,
+  };
+}).pipe(Atom.withLabel("factory:fleet"));
+
+/** Whether any environment advertises Factory, for the sidebar's and the palette's entries. */
+export function useFactorySupported(): boolean {
+  return useAtomValue(anySupportedAtom);
+}
+
+/** The Factory view's fleet: active deliveries across environments, needing you first. */
+export function useFactoryFleet() {
+  return useAtomValue(fleetAtom);
+}
 
 /** What the shared Deliver rule reads of a target's destination; idle without a target. */
 export function useFactoryDeliverState(target: FactoryDeliverTarget | null) {
@@ -106,10 +153,18 @@ export function useReportOpenWorkItem(item: FactoryOpenItem) {
 
 /** The command palette's Factory actions; mounted by the palette. */
 export function useFactoryPaletteActions() {
+  const supported = useFactorySupported();
+  const navigate = useNavigate();
   const openItem = useAtomValue(openItemAtom);
   const { destination } = useFactoryDeliverState(openItem);
   const start = useFactoryStart();
-  return factoryPaletteActions({
+  const open = factoryOpenPaletteAction({
+    supported,
+    open: async () => {
+      await navigate({ to: "/factory" });
+    },
+  });
+  const deliver = factoryPaletteActions({
     openItem,
     destination,
     deliver: async (target, kind) => {
@@ -123,4 +178,5 @@ export function useFactoryPaletteActions() {
       }
     },
   });
+  return [...open, ...deliver];
 }

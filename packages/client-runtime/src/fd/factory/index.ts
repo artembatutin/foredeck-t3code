@@ -1,4 +1,5 @@
 export { createFactoryEnvironmentAtoms } from "./atoms.ts";
+export { factoryFleet, type FactoryFleetEnvironment, type FactoryFleetRow } from "./fleet.ts";
 export {
   currentDelivery,
   FACTORY_STAGE_LABELS,

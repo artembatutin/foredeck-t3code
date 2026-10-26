@@ -15,6 +15,24 @@ export interface FactoryOpenItem extends FactoryDeliverTarget {
   readonly key: string;
 }
 
+/** Open Factory, offered only while some environment advertises Factory. */
+export function factoryOpenPaletteAction(input: {
+  readonly supported: boolean;
+  readonly open: () => Promise<void>;
+}): ReadonlyArray<CommandPaletteActionItem> {
+  if (!input.supported) return [];
+  return [
+    {
+      kind: "action",
+      value: "action:factory",
+      searchTerms: ["factory", "deliveries", "pipeline", "needs you", "blocked", "waiting"],
+      title: "Open Factory",
+      icon: <FactoryIcon className={ITEM_ICON_CLASS} />,
+      run: input.open,
+    },
+  ];
+}
+
 /**
  * The palette's Factory actions: Deliver for the item open in the Work page's detail, when the
  * shared Deliver rule allows it on that item's environment, and Deliver as parent where that

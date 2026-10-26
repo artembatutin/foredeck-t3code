@@ -7,6 +7,7 @@ import { useEnvironmentIdentificationMode } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { usePullRequestsSupported } from "../../state/environments";
 import { ForedeckAnchor, ForedeckWordmark } from "~/fd/branding";
+import { FactorySidebarItem } from "~/fd/factory";
 import { WorkSidebarItem } from "~/fd/work-management";
 import {
   resolveEnvironmentIdentificationPillLabel,
@@ -221,6 +222,7 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
             />
           ) : null}
           <WorkSidebarItem />
+          <FactorySidebarItem />
           <SidebarUtilityItem
             icon={<ChartNoAxesColumnIcon />}
             label="Usage"
