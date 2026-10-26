@@ -71,6 +71,13 @@ const run = (delivery: FactoryDeliveryState, ...events: FactoryEvent[]): Factory
 // Effect ids, issued in order: the author launch (1), its settle check (2), verify (3), the
 // reviewer launch (4), record (5) and the PR (6), whose watch's command is at position 100.
 const WATCHED_AFTER = 100;
+const STARTED_AT = "2026-10-24T10:06:00.000Z";
+const watch = (after: number) => ({ after, startedAt: STARTED_AT });
+const watched = (
+  runs: ReadonlyArray<RunId> = [],
+  pending: ReadonlyArray<RunId> = [],
+  watchedAfter = WATCHED_AFTER,
+) => ({ watchedAfter, watchStartedAt: STARTED_AT, runs, pending, watchEnded: false });
 
 /** A single item whose pull request is open and watched, awaiting nothing. */
 const prOpen = run(
@@ -112,12 +119,13 @@ const prOpen = run(
     effectId: 5,
     outcome: { type: "approved", evidencePath: "/a.json" },
   },
-  { type: "pr.opened", effectId: 6, pullRequest, watchedAfter: WATCHED_AFTER },
+  { type: "pr.opened", effectId: 6, pullRequest, watch: watch(WATCHED_AFTER) },
 ).delivery;
 
 const wake = (overrides: Partial<Extract<FactoryEvent, { type: "pr.feedback" }>> = {}) =>
   ({
     type: "pr.feedback",
+    kind: "feedback",
     threadId: author,
     runId: wakeRun,
     number: pullRequest.number,
@@ -151,7 +159,7 @@ describe("Factory engine: adopting a pull request wake", () => {
     // A fix-review round before the pull request left the author's reply to its findings.
     const replied = { ...prOpen, reviewResponse: { threadId: author, runId: authorRun } };
     expect(prOpen.status).toBe("pr_open");
-    expect(prOpen.followThrough).toEqual({ watchedAfter: WATCHED_AFTER, runs: [] });
+    expect(prOpen.followThrough).toEqual(watched());
 
     expect(advance(replied, wake())).toEqual({
       delivery: {
@@ -160,34 +168,46 @@ describe("Factory engine: adopting a pull request wake", () => {
         stage: "follow_through",
         awaiting: { type: "run", threadId: author, runId: wakeRun },
         reviewResponse: null,
-        followThrough: { watchedAfter: WATCHED_AFTER, runs: [wakeRun] },
+        followThrough: watched([wakeRun]),
       },
       effects: [],
     });
   });
 
-  it("takes no wake while the delivery is in any other status", () => {
-    for (const status of [
-      "queued",
-      "running",
-      "stopping",
-      "waiting",
-      "approved",
-      "blocked",
-      "stopped",
-      "done",
-      "cancelled",
-    ] as const) {
+  it("keeps a wake that comes while it runs a stage or waits on its owner, without a round", () => {
+    const later = RunId.make("run-wake-2");
+    for (const state of [
+      adopted,
+      advance(adopted, { type: "stop" }).delivery,
+      { ...prOpen, status: "approved" as const },
+      advance(adopted, wakeEnded("failed")).delivery,
+      { ...prOpen, status: "stopped" as const },
+    ]) {
+      const step = advance(state, wake({ runId: later, sequence: WATCHED_AFTER + 9 }));
+      expect(step.effects).toEqual([]);
+      expect(step.delivery).toEqual({
+        ...state,
+        followThrough: {
+          ...state.followThrough,
+          runs: [...(state.followThrough?.runs ?? []), later],
+          pending: [later],
+        },
+      });
+      // Taken once: the same wake again changes nothing.
+      const again = advance(step.delivery, wake({ runId: later, sequence: WATCHED_AFTER + 9 }));
+      expect(again.delivery).toBe(step.delivery);
+    }
+  });
+
+  it("takes no wake once the delivery is done or cancelled, or closes out its merge", () => {
+    for (const status of ["done", "cancelled"] as const) {
       const state = { ...prOpen, status };
       expect(advance(state, wake()).delivery).toBe(state);
     }
-    // Merged and closing out, it awaits its close-out.
     const closingOut = advance(prOpen, merged).delivery;
     expect(advance(closingOut, wake()).delivery).toBe(closingOut);
-    // Once adopted, it runs: neither this wake again nor a later one is another round.
+    // Its adopted wake again is no second round.
     expect(advance(adopted, wake()).delivery).toBe(adopted);
-    const later = wake({ runId: RunId.make("run-wake-2"), sequence: WATCHED_AFTER + 9 });
-    expect(advance(adopted, later).delivery).toBe(adopted);
   });
 
   it("takes no wake of another thread, another pull request or from before its watch", () => {
@@ -211,7 +231,7 @@ describe("Factory engine: adopting a pull request wake", () => {
       { ...prOpen, kind: "parent" as const },
       { ...prOpen, kind: "child" as const },
       // A run it adopted before is never a round again.
-      { ...prOpen, followThrough: { watchedAfter: WATCHED_AFTER, runs: [wakeRun] } },
+      { ...prOpen, followThrough: watched([wakeRun]) },
     ]) {
       expect(advance(state, wake()).delivery).toBe(state);
     }
@@ -288,7 +308,7 @@ describe("Factory engine: a follow-through round after its run", () => {
       type: "pr.opened",
       effectId: 11,
       pullRequest,
-      watchedAfter: 200,
+      watch: watch(200),
     }).delivery;
     expect(reopened).toEqual({
       ...recording.delivery,
@@ -296,7 +316,7 @@ describe("Factory engine: a follow-through round after its run", () => {
       stage: "pr",
       awaiting: null,
       pullRequest,
-      followThrough: { watchedAfter: 200, runs: [wakeRun] },
+      followThrough: watched([wakeRun], [], 200),
       effectsIssued: 11,
     });
     expect(reopened.threads).toEqual({ author, reviewer: freshReviewer });
@@ -512,7 +532,7 @@ describe("Factory engine: a merge or close during a follow-through round", () =>
     // What the round was doing no longer moves it: not the wake run's end, nor its PR result.
     for (const event of [
       wakeEnded("completed"),
-      { type: "pr.opened", effectId: 11, pullRequest, watchedAfter: 300 } as const,
+      { type: "pr.opened", effectId: 11, pullRequest, watch: watch(300) } as const,
       wake({ runId: RunId.make("run-wake-2"), sequence: 400 }),
     ]) {
       expect(advance(step.delivery, event).delivery).toBe(step.delivery);
@@ -535,5 +555,278 @@ describe("Factory engine: a merge or close during a follow-through round", () =>
       },
       effects: [],
     });
+  });
+});
+
+describe("Factory engine: wakes that come during a round", () => {
+  const later = RunId.make("run-wake-2");
+  const laterWake = wake({ runId: later, sequence: WATCHED_AFTER + 9 });
+
+  it("runs a wake queued behind the round's run before it judges the branch", () => {
+    const queued = advance(adopted, laterWake).delivery;
+    const next = advance(queued, wakeEnded("completed"));
+    expect(next.effects).toEqual([]);
+    expect(next.delivery).toEqual({
+      ...queued,
+      awaiting: { type: "run", threadId: author, runId: later },
+      followThrough: watched([wakeRun, later]),
+    });
+    // Its end, not the first's, has the branch settled.
+    const laterEnded = {
+      type: "run.finished",
+      threadId: author,
+      runId: later,
+      status: "completed",
+    };
+    expect(advance(next.delivery, laterEnded as FactoryEvent).effects).toEqual([
+      { id: 7, type: "check_settle", threadId: author, runId: later },
+    ]);
+  });
+
+  it("adopts a wake that came during review once the pull request is open again", () => {
+    const reviewing = run(
+      adopted,
+      wakeEnded("completed"),
+      { type: "settle.checked", effectId: 7, result: { status: "settled" } },
+      {
+        type: "command.finished",
+        effectId: 8,
+        outcome: { type: "receipt", receipt: receiptFor(fixed) },
+      },
+      {
+        type: "thread.launched",
+        effectId: 9,
+        threadId: freshReviewer,
+        runId: freshReviewRun,
+        worktreePath,
+        baseline: fixed,
+      },
+    ).delivery;
+    const kept = advance(reviewing, laterWake).delivery;
+    expect(kept.awaiting).toEqual(reviewing.awaiting);
+    expect(kept.followThrough).toEqual(watched([wakeRun, later], [later]));
+
+    const republishing = run(
+      kept,
+      {
+        type: "review.submitted",
+        round: 2,
+        threadId: freshReviewer,
+        runId: freshReviewRun,
+        judgment: passed(fixed, 2),
+      },
+      { type: "run.finished", threadId: freshReviewer, runId: freshReviewRun, status: "completed" },
+      {
+        type: "approval.recorded",
+        effectId: 10,
+        outcome: { type: "approved", evidencePath: "/a" },
+      },
+    );
+    expect(republishing.effects).toEqual([{ id: 11, type: "open_pr" }]);
+    const reopened = advance(republishing.delivery, {
+      type: "pr.opened",
+      effectId: 11,
+      pullRequest,
+      watch: watch(200),
+    });
+    expect(reopened.effects).toEqual([]);
+    expect(reopened.delivery).toEqual({
+      ...republishing.delivery,
+      status: "running",
+      stage: "follow_through",
+      awaiting: { type: "run", threadId: author, runId: later },
+      reviewResponse: null,
+      followThrough: watched([wakeRun, later], [], 200),
+    });
+  });
+
+  it("ignores a wake that only reports passing checks, in any status", () => {
+    const notice = wake({ kind: "notice" });
+    for (const state of [prOpen, adopted, { ...prOpen, status: "blocked" as const }]) {
+      expect(advance(state, notice).delivery).toBe(state);
+    }
+  });
+});
+
+describe("Factory engine: a watch core ended", () => {
+  const ended = wake({
+    kind: "ended",
+    runId: RunId.make("run-ended"),
+    sequence: WATCHED_AFTER + 3,
+  });
+
+  it("blocks a delivery waiting on its pull request, and takes the end once", () => {
+    const step = advance(prOpen, ended);
+    expect(step).toEqual({
+      delivery: {
+        ...prOpen,
+        status: "blocked",
+        awaiting: null,
+        block: { reason: "watch_ended" },
+        followThrough: { ...watched(), watchEnded: true },
+      },
+      effects: [],
+    });
+    expect(advance(step.delivery, ended).delivery).toBe(step.delivery);
+    // Its owned runs stay as they were: the end is not a round.
+    expect(step.delivery.followThrough?.runs).toEqual([]);
+  });
+
+  it("lets a running round finish, then blocks instead of waiting on the pull request", () => {
+    const flagged = advance(adopted, ended).delivery;
+    expect(flagged.status).toBe("running");
+    expect(flagged.awaiting).toEqual(adopted.awaiting);
+    expect(flagged.followThrough?.watchEnded).toBe(true);
+    // The worker starts no watch then, so the result carries none.
+    const blockedAtOpen = advance(
+      run(
+        flagged,
+        wakeEnded("completed"),
+        { type: "settle.checked", effectId: 7, result: { status: "settled" } },
+        {
+          type: "command.finished",
+          effectId: 8,
+          outcome: { type: "receipt", receipt: receiptFor(approved) },
+        },
+        {
+          type: "thread.launched",
+          effectId: 9,
+          threadId: freshReviewer,
+          runId: freshReviewRun,
+          worktreePath,
+          baseline: approved,
+        },
+        {
+          type: "review.submitted",
+          round: 2,
+          threadId: freshReviewer,
+          runId: freshReviewRun,
+          judgment: passed(approved, 2),
+        },
+        {
+          type: "run.finished",
+          threadId: freshReviewer,
+          runId: freshReviewRun,
+          status: "completed",
+        },
+        {
+          type: "approval.recorded",
+          effectId: 10,
+          outcome: { type: "approved", evidencePath: "/a" },
+        },
+      ).delivery,
+      { type: "pr.opened", effectId: 11, pullRequest },
+    ).delivery;
+    expect(blockedAtOpen.status).toBe("blocked");
+    expect(blockedAtOpen.block).toEqual({ reason: "watch_ended" });
+    expect(blockedAtOpen.pullRequest).toEqual(pullRequest);
+
+    // A resume is the owner's decision to watch again: the PR stage runs, and its watch counts.
+    const resumed = advance(
+      blockedAtOpen,
+      resume({
+        worktree: {
+          settle: { status: "settled" },
+          commit: { headSha: approved, tree: receiptFor(approved).tree },
+          approvedSha: approved,
+        },
+      }),
+    );
+    expect(resumed.effects).toEqual([{ id: 12, type: "open_pr" }]);
+    expect(resumed.delivery.followThrough?.watchEnded).toBe(false);
+    const reopened = advance(resumed.delivery, {
+      type: "pr.opened",
+      effectId: 12,
+      pullRequest,
+      watch: watch(400),
+    }).delivery;
+    expect(reopened.status).toBe("pr_open");
+    expect(reopened.followThrough).toEqual(watched([wakeRun], [], 400));
+  });
+});
+
+describe("Factory engine: a pull request published whose watch could not start", () => {
+  // The single item from the fixture, at its first PR stage, before `pr.opened`.
+  const opening = run(
+    queuedDeliveryState({ branch: "fd/item-7", baseRef: "main" }),
+    { type: "start" },
+    {
+      type: "thread.launched",
+      effectId: 1,
+      threadId: author,
+      runId: authorRun,
+      worktreePath,
+      baseline: "b".repeat(40),
+    },
+    { type: "run.finished", threadId: author, runId: authorRun, status: "completed" },
+    { type: "settle.checked", effectId: 2, result: { status: "settled" } },
+    {
+      type: "command.finished",
+      effectId: 3,
+      outcome: { type: "receipt", receipt: receiptFor(approved) },
+    },
+    {
+      type: "thread.launched",
+      effectId: 4,
+      threadId: reviewer,
+      runId: reviewRun,
+      worktreePath,
+      baseline: approved,
+    },
+    {
+      type: "review.submitted",
+      round: 1,
+      threadId: reviewer,
+      runId: reviewRun,
+      judgment: passed(approved, 1),
+    },
+    { type: "run.finished", threadId: reviewer, runId: reviewRun, status: "completed" },
+    {
+      type: "approval.recorded",
+      effectId: 5,
+      outcome: { type: "approved", evidencePath: "/a.json" },
+    },
+  ).delivery;
+  const detail =
+    "Factory opened pull request #42 but could not watch it for feedback (OrchestratorDispatchError).";
+  const unwatched = advance(opening, {
+    type: "pr.opened",
+    effectId: 6,
+    pullRequest,
+    watchFailure: detail,
+  }).delivery;
+
+  it("records the pull request and blocks", () => {
+    expect(opening.status).toBe("approved");
+    expect(unwatched).toEqual({
+      ...opening,
+      status: "blocked",
+      awaiting: null,
+      pullRequest,
+      block: { reason: "effect_failed", effect: { id: 6, type: "open_pr" }, detail },
+    });
+    expect(unwatched.followThrough).toBeUndefined();
+  });
+
+  it("takes that pull request's merge or close while blocked", () => {
+    expect(advance(unwatched, closed).delivery.status).toBe("cancelled");
+    const closing = advance(unwatched, merged);
+    expect(closing.effects).toEqual([{ id: 7, type: "close_out" }]);
+    expect(closing.delivery.status).toBe("pr_open");
+  });
+
+  it("resumes into the PR stage with the pull request still recorded", () => {
+    const resumed = advance(
+      unwatched,
+      resume({
+        worktree: {
+          settle: { status: "settled" },
+          commit: { headSha: approved, tree: receiptFor(approved).tree },
+          approvedSha: approved,
+        },
+      }),
+    );
+    expect(resumed.effects).toEqual([{ id: 7, type: "open_pr" }]);
+    expect(resumed.delivery.pullRequest).toEqual(pullRequest);
   });
 });

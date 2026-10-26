@@ -456,7 +456,14 @@ describe("the PR stage", () => {
           },
         ]);
         // Wakes committed after the watch's command are the delivery's to adopt.
-        assert.deepStrictEqual(state.followThrough, { watchedAfter: 2, runs: [] });
+        assert.deepStrictEqual(state.followThrough, {
+          watchedAfter: 2,
+          // The fake thread shell holds no link, so no watch is read back.
+          watchStartedAt: null,
+          runs: [],
+          pending: [],
+          watchEnded: false,
+        });
         // Published the approved commit, which the worktree still holds, clean.
         assert.strictEqual(yield* publishedOf(cwd), reviewed);
         assert.strictEqual(yield* git(cwd, ["rev-parse", "HEAD"]), reviewed);

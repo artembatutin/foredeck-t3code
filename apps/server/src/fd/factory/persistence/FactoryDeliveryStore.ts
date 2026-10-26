@@ -177,6 +177,7 @@ const StoredBlock = Schema.Union([
   Schema.Struct({ reason: Schema.Literal("code_changed"), changes: ReceiptRefusals }),
   Schema.Struct({ reason: Schema.Literal("invalid_submission"), problems: Problems }),
   Schema.Struct({ reason: Schema.Literal("plan_empty"), note: Schema.NullOr(Schema.String) }),
+  Schema.Struct({ reason: Schema.Literal("watch_ended") }),
   Schema.Struct({
     reason: Schema.Literal("record_mismatch"),
     expected: Schema.Struct(StoredCommit),
@@ -273,7 +274,15 @@ const StoredDeliveryState = Schema.Struct({
   // Added with follow-through rounds: absent until a PR stage watches the pull request, and from
   // rows whose pull request opened before, whose feedback nothing adopts.
   followThrough: Schema.optionalKey(
-    Schema.Struct({ watchedAfter: NonNegativeInt, runs: Schema.Array(RunId) }),
+    Schema.Struct({
+      watchedAfter: NonNegativeInt,
+      watchStartedAt: Schema.NullOr(Schema.String).pipe(
+        Schema.withDecodingDefault(Effect.succeed(null)),
+      ),
+      runs: Schema.Array(RunId),
+      pending: Schema.Array(RunId).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+      watchEnded: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+    }),
   ),
   block: Schema.NullOr(StoredBlock),
   // Added with stop after step: rows stored before it name no checkpoint, even when stopped. The

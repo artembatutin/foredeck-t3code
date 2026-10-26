@@ -108,6 +108,7 @@ const everyBlock = {
     problems: ["acceptance[0].paths[0] does not exist in the worktree."],
   },
   plan_empty: { reason: "plan_empty", note: "The export already ships in the settings menu." },
+  watch_ended: { reason: "watch_ended" },
   record_mismatch: {
     reason: "record_mismatch",
     expected: { headSha, tree },

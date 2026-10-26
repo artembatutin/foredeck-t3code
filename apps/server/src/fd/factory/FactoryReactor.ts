@@ -1,6 +1,7 @@
 import type {
   CommandId,
   MessageId,
+  OrchestrationV2ConversationMessage,
   OrchestrationV2StoredEvent,
   RunId,
   ThreadId,
@@ -27,6 +28,8 @@ import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import {
   type FactoryEvent,
   type FactoryThreadEvent,
+  type FactoryWakeKind,
+  isTerminal,
   isTerminalRunStatus,
 } from "./pipeline/state.ts";
 
@@ -180,7 +183,10 @@ const make = Effect.gen(function* () {
   /**
    * The wake a run starts, when core's pull request watch queued it: the run's command is a
    * `thread.pull-request-watch.sync` that stored the wake as the run's message, and the link it
-   * updated on the thread names the pull request. None for any other run, such as a turn the
+   * updated on the thread names the pull request. What it reports is read from what that command
+   * committed: a watch it ended is the watch's end (core could not read the pull request, or
+   * stopped after too many comment-only updates), a notification of completed work reports only
+   * passing checks, and anything else is feedback. None for any other run, such as a turn the
    * owner or Factory sent.
    */
   const wakeOf = (run: RunCreated) =>
@@ -195,7 +201,7 @@ const make = Effect.gen(function* () {
       const events = yield* eventSink
         .readByCommandId({ commandId: run.commandId })
         .pipe(Stream.runCollect);
-      let woke = false;
+      let wake: OrchestrationV2ConversationMessage | undefined;
       let link: ThreadPullRequestLink | undefined;
       for (const { event } of events) {
         if (event.threadId !== run.threadId) continue;
@@ -205,12 +211,19 @@ const make = Effect.gen(function* () {
           event.payload.role === "user" &&
           event.payload.id === run.userMessageId
         ) {
-          woke = true;
+          wake = event.payload;
         }
       }
-      if (!woke || link === undefined) return undefined;
+      if (wake === undefined || link === undefined) return undefined;
+      const kind: FactoryWakeKind =
+        link.watch === undefined
+          ? "ended"
+          : wake.notification?.outcome === "completed"
+            ? "notice"
+            : "feedback";
       return {
         type: "pr.feedback",
+        kind,
         threadId: run.threadId,
         runId: run.runId,
         number: link.number,
@@ -234,18 +247,24 @@ const make = Effect.gen(function* () {
 
   /**
    * The wakes core queued for a delivery's open pull request on its author thread while no server
-   * ran Factory: each run created there since the watch its PR stage started, stepped as the tail
-   * would have stepped it, until the delivery adopts one. Nothing for a delivery that awaits
-   * anything, or whose pull request is not watched.
+   * ran Factory: each run created there since the watch its PR stage started, stepped in order as
+   * the tail would have stepped it. The engine takes each run once, so a sweep run again takes
+   * nothing new. Nothing for a delivery whose pull request is not watched, or no longer open.
    */
   const catchUpFeedback = (deliveryId: FactoryDeliveryId) =>
     Effect.gen(function* () {
-      const awaitsFeedback = (delivery: FactoryDeliveryStore.StoredFactoryDelivery | undefined) =>
-        delivery?.state.status === "pr_open" && delivery.state.awaiting === null;
       const delivery = Option.getOrUndefined(yield* deliveries.get(deliveryId));
       const author = delivery?.state.threads.author;
       const followThrough = delivery?.state.followThrough;
-      if (!awaitsFeedback(delivery) || author === undefined || followThrough === undefined) return;
+      if (
+        delivery === undefined ||
+        isTerminal(delivery.state) ||
+        !followsPullRequest(delivery) ||
+        author === undefined ||
+        followThrough === undefined
+      ) {
+        return;
+      }
       const last = yield* eventSink.latestSequence({ threadId: author });
       if (last <= followThrough.watchedAfter) return;
       const read = yield* eventSink
@@ -257,9 +276,7 @@ const make = Effect.gen(function* () {
         );
       for (const stored of read) {
         const run = runCreated(stored);
-        if (run === undefined) continue;
-        if (!awaitsFeedback(Option.getOrUndefined(yield* deliveries.get(deliveryId)))) return;
-        yield* takeWake(run);
+        if (run !== undefined) yield* takeWake(run);
       }
     });
 
@@ -286,7 +303,7 @@ const make = Effect.gen(function* () {
    * Catches one delivery up with what happened while no server ran it, whatever its status. First
    * what a restart cut short between a parent and its children is completed. One that recorded
    * its open pull request takes its merge or close stored meanwhile, whatever else it awaits, and
-   * one with its pull request open awaiting nothing takes a wake queued for it meanwhile. A
+   * then the wakes queued for that pull request meanwhile, adopting one or keeping it pending. A
    * delivery awaiting a run then gets the run's end or its thread's deletion, as the tail would
    * have handed them on, so a stopping one stops where the run's end leads it. One awaiting an
    * effect lost it with the previous process and blocks, unless what it did is stored (see

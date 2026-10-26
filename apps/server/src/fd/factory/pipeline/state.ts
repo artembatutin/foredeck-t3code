@@ -339,16 +339,49 @@ export interface FactoryOpenedPullRequest {
 export type FactoryPullRequestOutcome = "merged" | "closed";
 
 /**
- * How a single item follows the feedback on its open pull request: the event-log position of the
- * watch its PR stage last started there, after which a wake core queues for that pull request on
- * its author thread is the delivery's to adopt as a follow-through round; and the runs of the
- * wakes it adopted, oldest first, which are Factory's turns when a cancel stops what its threads
- * run.
+ * How a single item follows the feedback on its open pull request, through the watch its PR stage
+ * keeps on the author thread.
  */
 export interface FactoryFollowThrough {
+  /**
+   * The event-log position of the watch command of the delivery's last PR stage: a wake core
+   * queues for its pull request on the author thread after it is the delivery's.
+   */
   readonly watchedAfter: number;
+  /**
+   * When that watch started, as core records it: the watch a cancel ends while it is still on.
+   * Null when it was not read.
+   */
+  readonly watchStartedAt: string | null;
+  /**
+   * The feedback wakes the delivery took as its own, oldest first: those it adopted as rounds and
+   * those pending. They are Factory's turns when a cancel stops what its threads run.
+   */
   readonly runs: ReadonlyArray<RunId>;
+  /**
+   * Of `runs`, the wakes that came while the delivery ran a stage or waited on its owner, oldest
+   * first: each is adopted once the delivery can take it, before its branch is judged or once its
+   * pull request is open again.
+   */
+  readonly pending: ReadonlyArray<RunId>;
+  /**
+   * Set when core's watch ended with a wake (it could not read the pull request, or stopped after
+   * too many comment-only updates): no feedback reaches the delivery any more, so it blocks where
+   * it would wait on its pull request, and only a resume starts the watch again.
+   */
+  readonly watchEnded: boolean;
 }
+
+/**
+ * What a pull request watch's wake reports, as core committed it: feedback to act on (failed
+ * checks, new comments, a conflict), a notice that asks nothing (every check passed), or the end
+ * of the watch (core stopped watching it).
+ */
+export type FactoryWakeKind = "feedback" | "notice" | "ended";
+
+/** The wake runs the delivery took as its own; see `FactoryFollowThrough.runs`. */
+export const adoptedRuns = (delivery: FactoryDeliveryState): ReadonlyArray<RunId> =>
+  delivery.followThrough?.runs ?? [];
 
 /**
  * What a resume of a stopped or blocked delivery found, read under the delivery's lock right
@@ -495,22 +528,26 @@ export type FactoryEvent =
       readonly outcome: FactoryRecordOutcome;
     }
   /**
-   * An `open_pr` result. `watchedAfter` is the event-log position of the watch the worker started
-   * on the pull request, for a single item; absent when it started none.
+   * An `open_pr` result. `watch` is the watch the worker started on a single item's pull request:
+   * its command's event-log position and when it started; absent when it started none.
+   * `watchFailure` is set instead when the watch could not start: the pull request is published
+   * all the same, so it is recorded; the text is bounded and safe to show.
    */
   | {
       readonly type: "pr.opened";
       readonly effectId: number;
       readonly pullRequest: FactoryOpenedPullRequest;
-      readonly watchedAfter?: number;
+      readonly watch?: { readonly after: number; readonly startedAt: string | null };
+      readonly watchFailure?: string;
     }
   /**
    * A pull request watch's wake, as core queued it on the thread a delivery's pull request is
-   * linked to: the wake's run, the pull request it reports on by number and URL, and the event-log
-   * position of the command that queued it.
+   * linked to: the wake's run, what it reports, the pull request it reports on by number and URL,
+   * and the event-log position of the command that queued it.
    */
   | {
       readonly type: "pr.feedback";
+      readonly kind: FactoryWakeKind;
       readonly threadId: ThreadId;
       readonly runId: RunId;
       readonly number: number;
@@ -587,6 +624,8 @@ export type FactoryBlock =
   | { readonly reason: "invalid_submission"; readonly problems: ReadonlyArray<string> }
   /** The round's accepted plan has no tasks: planning ended with the planner's note, if any. */
   | { readonly reason: "plan_empty"; readonly note: string | null }
+  /** Core's watch of the open pull request ended, so its feedback no longer reaches Factory. */
+  | { readonly reason: "watch_ended" }
   /** At record, the worktree no longer held the verified, reviewed commit on a clean tree. */
   | {
       readonly reason: "record_mismatch";

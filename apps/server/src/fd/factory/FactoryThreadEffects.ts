@@ -37,6 +37,7 @@ import * as FactorySettings from "./FactorySettings.ts";
 import type { StoredFactoryDelivery } from "./persistence/FactoryDeliveryStore.ts";
 import { escalateEffort } from "./pipeline/effort.ts";
 import {
+  adoptedRuns,
   type FactoryEffect,
   type FactoryEvent,
   type FactoryTerminalRunStatus,
@@ -284,8 +285,10 @@ export class FactoryThreadEffects extends Context.Service<
     ) => Effect.Effect<Option.Option<FactoryTerminalRunStatus>, FactoryThreadEffectFailure>;
     /**
      * Asks a run of the thread to stop, as the thread's own Stop does, for a delivery that was
-     * cancelled: `runId`, or without one the thread's latest active run. A run that already
-     * ended, a thread running nothing and a deleted thread are left as they are.
+     * cancelled: `runId`, or without one the run the thread is live in, only while it carries on
+     * a turn Factory sent or a wake the delivery took as its own (see `carriesFactoryTurn`): a
+     * turn the owner sent on the thread is theirs. A run that already ended, a thread running
+     * nothing and a deleted thread are left as they are.
      */
     readonly interruptRun: (
       delivery: StoredFactoryDelivery,
@@ -714,6 +717,39 @@ const make = Effect.gen(function* () {
       });
     }).pipe(Effect.provideContext(intakeContext));
 
+  const carriesFactoryTurn: FactoryThreadEffects["Service"]["carriesFactoryTurn"] = (
+    threadId,
+    runId,
+    adopted,
+  ) =>
+    projections.getThreadRecords(threadId, ["runs"]).pipe(
+      Effect.map(({ runs }) => {
+        let run = runs.find((candidate) => candidate.id === runId);
+        // Each continuation names the run it continues; a chain is never longer than the runs.
+        for (let hops = 0; run !== undefined && hops <= runs.length; hops += 1) {
+          if (FACTORY_MESSAGE.test(run.userMessageId) || adopted.includes(run.id)) return true;
+          const continued = run.restartContinuationOfRunId;
+          run =
+            continued === undefined
+              ? undefined
+              : runs.find((candidate) => candidate.id === continued);
+        }
+        return false;
+      }),
+    );
+
+  /**
+   * The run the thread is live in, when it carries on a turn Factory sent or a wake the delivery
+   * took as its own; none when it runs nothing, or runs the owner's turn.
+   */
+  const factoryLiveRun = (delivery: StoredFactoryDelivery, threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const [live] = yield* liveRunsOn([threadId]);
+      if (live === undefined) return undefined;
+      const factory = yield* carriesFactoryTurn(threadId, live.runId, adoptedRuns(delivery.state));
+      return factory ? live.runId : undefined;
+    });
+
   const liveRunsOn: FactoryThreadEffects["Service"]["liveRunsOn"] = (threadIds) =>
     Effect.forEach(threadIds, (threadId) =>
       projections
@@ -801,22 +837,7 @@ const make = Effect.gen(function* () {
               : shell.activeRunId,
           ),
         ),
-    carriesFactoryTurn: (threadId, runId, adopted) =>
-      projections.getThreadRecords(threadId, ["runs"]).pipe(
-        Effect.map(({ runs }) => {
-          let run = runs.find((candidate) => candidate.id === runId);
-          // Each continuation names the run it continues; a chain is never longer than the runs.
-          for (let hops = 0; run !== undefined && hops <= runs.length; hops += 1) {
-            if (FACTORY_MESSAGE.test(run.userMessageId) || adopted.includes(run.id)) return true;
-            const continued = run.restartContinuationOfRunId;
-            run =
-              continued === undefined
-                ? undefined
-                : runs.find((candidate) => candidate.id === continued);
-          }
-          return false;
-        }),
-      ),
+    carriesFactoryTurn,
     liveRunsOn,
     launchedLiveRuns: projections
       .getRecoveryThreadIds("runtime")
@@ -832,19 +853,18 @@ const make = Effect.gen(function* () {
         ),
       ),
     interruptRun: (delivery, { threadId, runId }) =>
-      threads
-        .interruptThread({
+      Effect.gen(function* () {
+        const target = runId ?? (yield* factoryLiveRun(delivery, threadId));
+        if (target === undefined) return;
+        yield* threads.interruptThread({
           projectId: delivery.projectId,
-          // One interrupt per run or thread of the delivery, however often it is asked.
-          commandId: CommandId.make(`factory-cancel:${delivery.deliveryId}:${runId ?? threadId}`),
+          // One interrupt per run of the delivery, however often it is asked.
+          commandId: CommandId.make(`factory-cancel:${delivery.deliveryId}:${target}`),
           threadId,
-          ...(runId === undefined ? {} : { runId }),
+          runId: target,
           reason: "Factory delivery cancelled",
-        })
-        .pipe(
-          Effect.asVoid,
-          Effect.catchTags({ ThreadManagementThreadNotFoundError: () => Effect.void }),
-        ),
+        });
+      }).pipe(Effect.catchTags({ ThreadManagementThreadNotFoundError: () => Effect.void })),
   });
 });
 

@@ -8,6 +8,7 @@ import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as Factory from "./index.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
+import { isTerminalRunStatus } from "./pipeline/state.ts";
 import {
   drainFactory,
   drainOrchestration,
@@ -20,7 +21,14 @@ import {
   withProject,
   type World,
 } from "./testkit/deliveryHarness.ts";
-import { linkOf, openSingle, wakeThread } from "./testkit/followThrough.ts";
+import {
+  awaitedRun,
+  linkOf,
+  openSingle,
+  reviewPasses,
+  wakeThread,
+  watchPullRequest,
+} from "./testkit/followThrough.ts";
 
 /**
  * Follow-through rounds across restarts and cancels, on the server's real stack. With
@@ -268,6 +276,186 @@ describe("Factory follow-through cancelled", () => {
           `The wake run went on as ${stopped}.`,
         );
         assert.strictEqual((yield* stateOf(deliveryId)).status, "cancelled");
+      }),
+    ),
+  );
+});
+
+describe("Factory follow-through: a wake that comes during a round, across restarts", () => {
+  /**
+   * A round adopted by one server, and a second wake queued behind its run while no server runs
+   * Factory, kept pending by the next boot. Returns both runs.
+   */
+  const pendingAcrossBoot = (world: World) =>
+    Effect.gen(function* () {
+      const opened = yield* world.boot(openSingle(world));
+      const { deliveryId, threadId: author } = opened;
+      const first = yield* world.boot(
+        Effect.gen(function* () {
+          const runId = yield* wakeThread(author, yield* linkOf(author, fakePullRequest.number));
+          yield* started(runId);
+          yield* drainFactory;
+          return runId;
+        }),
+      );
+      const second = yield* wakeThread(author, yield* linkOf(author, fakePullRequest.number));
+      yield* drainOrchestration;
+      assert.strictEqual(yield* runStatus(author, second), "queued");
+      yield* world.boot(Effect.void);
+      return { opened, deliveryId, author, first, second };
+    });
+
+  it.live("keeps it as the delivery's own once however often it boots, then runs it", () =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const { deliveryId, author, first, second } = yield* pendingAcrossBoot(world);
+          const kept = yield* stateOf(deliveryId);
+          assert.deepStrictEqual(kept.awaiting, { type: "run", threadId: author, runId: first });
+          assert.deepStrictEqual(kept.followThrough?.runs, [first, second]);
+          assert.deepStrictEqual(kept.followThrough?.pending, [second]);
+
+          yield* world.boot(Effect.void);
+          assert.deepStrictEqual(yield* stateOf(deliveryId), kept);
+
+          // The round waits for it once the first answer ends, then judges the branch once.
+          yield* world.boot(world.endRun(first, "completed"));
+          const waiting = yield* stateOf(deliveryId);
+          assert.deepStrictEqual(waiting.awaiting, {
+            type: "run",
+            threadId: author,
+            runId: second,
+          });
+          assert.deepStrictEqual(waiting.followThrough?.pending, []);
+          yield* world.boot(
+            Effect.gen(function* () {
+              yield* started(second);
+              yield* world.endRun(second, "completed");
+              yield* reviewPasses(world, deliveryId);
+            }),
+          );
+          const reopened = yield* stateOf(deliveryId);
+          assert.strictEqual(reopened.status, "pr_open");
+          assert.deepStrictEqual(reopened.followThrough?.runs, [first, second]);
+        }),
+      { manualReactor: true },
+    ),
+  );
+
+  it.live("stops it as Factory's turn once it starts after a cancel", () =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const { deliveryId, author, first, second } = yield* pendingAcrossBoot(world);
+          yield* world.boot(
+            Effect.gen(function* () {
+              const factory = yield* Factory.FactoryService.FactoryService;
+              // Its provider turn runs, so the stop reaches the provider and the run goes on.
+              assert.strictEqual(yield* runReached(first, ["running", ...ended]), "running");
+              yield* factory.cancel(deliveryId).pipe(Effect.orDie);
+              yield* drainFactory;
+              yield* drainOrchestration;
+              assert.include(yield* cancelledRuns(author, deliveryId), first);
+              assert.include(interruptedTurns(world), providerTurnOf(world, first));
+              // The awaited answer stops (core may end it before its provider reports); the wake
+              // queued behind it then starts, and is stopped too, as Factory's turn.
+              if (!isTerminalRunStatus(yield* runStatus(author, first))) {
+                yield* world.endRun(first, "cancelled");
+              }
+              yield* drainFactory;
+              yield* drainOrchestration;
+              assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), [first, second]);
+              const stopped = yield* runStatus(author, second);
+              assert.isTrue(
+                stopped === "interrupted" ||
+                  interruptedTurns(world).includes(providerTurnOf(world, second)),
+                `The queued wake went on as ${stopped}.`,
+              );
+            }),
+          );
+          assert.strictEqual((yield* stateOf(deliveryId)).status, "cancelled");
+        }),
+      { manualReactor: true },
+    ),
+  );
+});
+
+describe("Factory follow-through cancelled while the owner works on the author thread", () => {
+  it.live("leaves the owner's turn alone when cancelled during the round's review", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const factory = yield* Factory.FactoryService.FactoryService;
+        const { deliveryId, threadId: author } = yield* openSingle(world);
+        const wakeRun = yield* wakeThread(author, yield* linkOf(author, fakePullRequest.number));
+        yield* started(wakeRun);
+        yield* drainFactory;
+        yield* world.endRun(wakeRun, "completed");
+        const reviewer = yield* awaitedRun(deliveryId);
+        assert.strictEqual(yield* runReached(reviewer.runId, ["running", ...ended]), "running");
+        // The owner's own turn runs on the author thread, now idle.
+        const ownerRun = yield* world.ownerTurn(author, "Explain the export format.");
+        assert.strictEqual(yield* runReached(ownerRun, ["running", ...ended]), "running");
+
+        yield* factory.cancel(deliveryId).pipe(Effect.orDie);
+        yield* drainFactory;
+        yield* drainOrchestration;
+        assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), []);
+        assert.deepStrictEqual(yield* cancelledRuns(reviewer.threadId, deliveryId), [
+          reviewer.runId,
+        ]);
+        assert.deepStrictEqual(interruptedTurns(world), [providerTurnOf(world, reviewer.runId)]);
+        assert.strictEqual(yield* runStatus(author, ownerRun), "running");
+        assert.strictEqual(yield* world.endRun(ownerRun, "completed"), "completed");
+      }),
+    ),
+  );
+
+  it.live("leaves it alone with the pull request open again, and ends Factory's watch", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const factory = yield* Factory.FactoryService.FactoryService;
+        const { deliveryId, threadId: author } = yield* openSingle(world);
+        const wakeRun = yield* wakeThread(author, yield* linkOf(author, fakePullRequest.number));
+        yield* started(wakeRun);
+        yield* drainFactory;
+        yield* world.endRun(wakeRun, "completed");
+        yield* reviewPasses(world, deliveryId);
+        assert.strictEqual((yield* stateOf(deliveryId)).status, "pr_open");
+        assert.isDefined((yield* linkOf(author, fakePullRequest.number)).watch);
+        const ownerRun = yield* world.ownerTurn(author, "Explain the export format.");
+        assert.strictEqual(yield* runReached(ownerRun, ["running", ...ended]), "running");
+
+        yield* factory.cancel(deliveryId).pipe(Effect.orDie);
+        yield* drainFactory;
+        yield* drainOrchestration;
+        assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), []);
+        assert.notInclude(interruptedTurns(world), providerTurnOf(world, ownerRun));
+        assert.strictEqual(yield* runStatus(author, ownerRun), "running");
+        // The watch it started would wake the thread to new work: it ends.
+        assert.isUndefined((yield* linkOf(author, fakePullRequest.number)).watch);
+        assert.strictEqual(yield* world.endRun(ownerRun, "completed"), "completed");
+      }),
+    ),
+  );
+
+  it.live("keeps a watch the owner started since on cancel", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const factory = yield* Factory.FactoryService.FactoryService;
+        const { deliveryId, threadId: author } = yield* openSingle(world);
+        const link = yield* linkOf(author, fakePullRequest.number);
+        const factoryWatch = link.watch;
+        // The owner stops Factory's watch and starts one of their own.
+        yield* watchPullRequest(author, link, false);
+        yield* watchPullRequest(author, link);
+        const owners = (yield* linkOf(author, fakePullRequest.number)).watch;
+        assert.notStrictEqual(owners?.startedAt, factoryWatch?.startedAt);
+
+        yield* factory.cancel(deliveryId).pipe(Effect.orDie);
+        yield* drainFactory;
+        assert.deepStrictEqual((yield* linkOf(author, fakePullRequest.number)).watch, owners);
       }),
     ),
   );

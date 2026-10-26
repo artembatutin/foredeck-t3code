@@ -24,12 +24,16 @@ import {
 } from "./testkit/deliveryHarness.ts";
 import {
   awaitedRun,
+  closedComment,
   itemStatus,
   linkOf,
   openSingle,
   passingReview,
   reviewPasses,
+  settleThread,
   syncPullRequest,
+  unsettleThread,
+  type WakeReport,
   wakeThread,
   watchPullRequest,
 } from "./testkit/followThrough.ts";
@@ -53,9 +57,14 @@ const started = (runId: RunId) =>
   });
 
 /** A wake on the thread whose run has started, once Factory has handled what it committed. */
-const wakeStarted = (threadId: ThreadId, number: number, url?: string) =>
+const wakeStarted = (
+  threadId: ThreadId,
+  number: number,
+  url?: string,
+  report: WakeReport = "checks-failed",
+) =>
   Effect.gen(function* () {
-    const runId = yield* wakeThread(threadId, yield* linkOf(threadId, number, url));
+    const runId = yield* wakeThread(threadId, yield* linkOf(threadId, number, url), report);
     yield* started(runId);
     yield* drainFactory;
     return runId;
@@ -96,7 +105,10 @@ describe("Factory follow-through: watching the pull request", () => {
         assert.strictEqual(receipt.commandType, "thread.pull-request.watch");
         assert.deepStrictEqual(state.followThrough, {
           watchedAfter: receipt.resultSequence,
+          watchStartedAt: watch.startedAt,
           runs: [],
+          pending: [],
+          watchEnded: false,
         });
 
         // The PR step taken again changes nothing.
@@ -106,7 +118,7 @@ describe("Factory follow-through: watching the pull request", () => {
             type: "pr.opened",
             effectId: state.effectsIssued,
             pullRequest: state.pullRequest ?? assert.fail("No pull request."),
-            watchedAfter: receipt.resultSequence + 50,
+            watch: { after: receipt.resultSequence + 50, startedAt: watch.startedAt },
           })
           .pipe(Effect.orDie);
         yield* drainFactory;
@@ -173,12 +185,14 @@ describe("Factory follow-through: adopting a wake", () => {
         assert.deepStrictEqual(adopted.followThrough?.runs, [wakeRun]);
         assert.deepStrictEqual((yield* attemptsOf(deliveryId)).at(-1), ["follow_through", null]);
 
-        // A wake that comes while the round runs is no second round.
+        // A wake that comes while the round runs is the delivery's, and waits: no second round.
         const during = yield* wakeThread(author, yield* linkOf(author, link.number));
         yield* drainOrchestration;
         yield* drainFactory;
-        assert.deepStrictEqual(yield* stateOf(deliveryId), adopted);
-        assert.notStrictEqual(during, wakeRun);
+        const kept = yield* stateOf(deliveryId);
+        assert.deepStrictEqual(kept.awaiting, adopted.awaiting);
+        assert.deepStrictEqual(kept.followThrough?.runs, [wakeRun, during]);
+        assert.deepStrictEqual(kept.followThrough?.pending, [during]);
       }),
     ),
   );
@@ -365,5 +379,292 @@ describe("Factory follow-through: what a round refuses", () => {
           assert.strictEqual(world.pullRequestCalls.length, 1);
         }),
       ),
+  );
+});
+
+describe("Factory follow-through: wakes that come during a round", () => {
+  it.live("runs a wake queued behind the round's run before it verifies the branch", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const { deliveryId, threadId: author, worktreePath, state } = yield* openSingle(world);
+        const first = yield* wakeStarted(author, fakePullRequest.number);
+        const second = yield* wakeThread(author, yield* linkOf(author, fakePullRequest.number));
+        yield* drainOrchestration;
+        yield* drainFactory;
+        assert.deepStrictEqual((yield* stateOf(deliveryId)).followThrough?.pending, [second]);
+
+        // The first answer commits a fix; the second wake's run starts after it, and the round
+        // waits for it rather than judging the branch under it.
+        yield* authorCommits(worktreePath, "fix: make the checks pass", "export const x = 2;\n");
+        yield* world.endRun(first, "completed");
+        yield* started(second);
+        yield* drainFactory;
+        const waiting = yield* stateOf(deliveryId);
+        assert.deepStrictEqual(waiting.awaiting, { type: "run", threadId: author, runId: second });
+        assert.strictEqual(waiting.stage, "follow_through");
+        assert.strictEqual(waiting.receipts.length, state.receipts.length);
+        assert.deepStrictEqual(waiting.followThrough?.pending, []);
+
+        // One verify and review cover both answers.
+        yield* world.endRun(second, "completed");
+        assert.strictEqual((yield* stateOf(deliveryId)).receipts.length, state.receipts.length + 1);
+        yield* reviewPasses(world, deliveryId);
+        const reopened = yield* stateOf(deliveryId);
+        assert.strictEqual(reopened.status, "pr_open");
+        assert.deepStrictEqual(reopened.followThrough?.runs, [first, second]);
+        assert.deepStrictEqual(reopened.followThrough?.pending, []);
+        assert.strictEqual(world.pullRequestCalls.length, 2);
+      }),
+    ),
+  );
+
+  it.live("takes a wake that came during review as the next round once the PR is open again", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const { deliveryId, threadId: author, state } = yield* openSingle(world);
+        const first = yield* wakeStarted(author, fakePullRequest.number);
+        yield* world.endRun(first, "completed");
+        const reviewer = yield* awaitedRun(deliveryId);
+
+        // The next wake starts at once on the idle author thread, while the review runs.
+        const second = yield* wakeStarted(author, fakePullRequest.number);
+        const kept = yield* stateOf(deliveryId);
+        assert.deepStrictEqual(kept.awaiting, reviewer);
+        assert.deepStrictEqual(kept.followThrough?.runs, [first, second]);
+        assert.deepStrictEqual(kept.followThrough?.pending, [second]);
+        // Its run ends before the round does, with nothing to hand it to yet.
+        yield* world.endRun(second, "completed");
+        assert.deepStrictEqual((yield* stateOf(deliveryId)).awaiting, reviewer);
+
+        yield* Effect.flatMap(service, (factory) =>
+          factory.submitReview({ threadId: reviewer.threadId, review: passingReview() }),
+        );
+        yield* world.endRun(reviewer.runId, "completed");
+        // Published, then the wake that waited is the next round: its run has ended, so the
+        // branch is settled and verified again at once, and reviewed on a fresh thread.
+        const next = yield* stateOf(deliveryId);
+        assert.strictEqual(world.pullRequestCalls.length, 2);
+        assert.strictEqual(next.stage, "review");
+        assert.strictEqual(next.receipts.length, state.receipts.length + 2);
+        assert.notStrictEqual(next.threads.reviewer, reviewer.threadId);
+        assert.deepStrictEqual(next.followThrough?.pending, []);
+        yield* reviewPasses(world, deliveryId);
+
+        const reopened = yield* stateOf(deliveryId);
+        assert.strictEqual(reopened.status, "pr_open");
+        assert.deepStrictEqual(reopened.followThrough?.runs, [first, second]);
+        assert.strictEqual(world.pullRequestCalls.length, 3);
+        assert.deepStrictEqual(
+          world.pullRequestCalls.map(({ input }) => input.action),
+          ["create_pr", "push", "push"],
+        );
+        const rounds = (yield* attemptsOf(deliveryId)).filter(
+          ([stage]) => stage === "follow_through",
+        );
+        assert.deepStrictEqual(rounds, [
+          ["follow_through", "passed"],
+          ["follow_through", "passed"],
+        ]);
+      }),
+    ),
+  );
+});
+
+describe("Factory follow-through: what a wake reports", () => {
+  it.live("takes new comments as a round, and passing checks as nothing to repair", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const { deliveryId, threadId: author, state } = yield* openSingle(world);
+        const passed = yield* wakeStarted(
+          author,
+          fakePullRequest.number,
+          undefined,
+          "checks-passed",
+        );
+        assert.deepStrictEqual(yield* stateOf(deliveryId), state);
+        yield* world.endRun(passed, "completed");
+        assert.deepStrictEqual(yield* stateOf(deliveryId), state);
+
+        const remarks = yield* wakeStarted(author, fakePullRequest.number, undefined, "remarks");
+        const adopted = yield* stateOf(deliveryId);
+        assert.strictEqual(adopted.status, "running");
+        assert.deepStrictEqual(adopted.awaiting, { type: "run", threadId: author, runId: remarks });
+        assert.deepStrictEqual(adopted.followThrough?.runs, [remarks]);
+      }),
+    ),
+  );
+
+  it.live(
+    "blocks when core stops watching an unreadable pull request; a resume watches again",
+    () =>
+      withProject(verifyCommands.passes, (world) =>
+        Effect.gen(function* () {
+          const { deliveryId, threadId: author, state } = yield* openSingle(world);
+          const before = (yield* linkOf(author, fakePullRequest.number)).watch;
+          const comments = world.commentCalls.length;
+
+          const notice = yield* wakeStarted(
+            author,
+            fakePullRequest.number,
+            undefined,
+            "unreadable",
+          );
+          const blocked = yield* stateOf(deliveryId);
+          assert.strictEqual(blocked.status, "blocked");
+          assert.deepStrictEqual(blocked.block, { reason: "watch_ended" });
+          assert.deepStrictEqual(blocked.followThrough?.runs, []);
+          assert.isUndefined((yield* linkOf(author, fakePullRequest.number)).watch);
+          assert.deepStrictEqual(commentsSince(world, comments), [
+            `Factory is blocked on this item and needs you. The pull request's watch ended, so Factory no longer follows its feedback. Resume or cancel the delivery in Foredeck. Factory delivery ${deliveryId}, update 3.`,
+          ]);
+          yield* world.endRun(notice, "completed");
+          assert.deepStrictEqual(yield* stateOf(deliveryId), blocked);
+          assert.strictEqual(world.pullRequestCalls.length, 1);
+
+          // The owner's resume publishes the same commit again and starts a new watch.
+          yield* Effect.flatMap(service, (factory) => factory.resume(deliveryId)).pipe(
+            Effect.orDie,
+          );
+          yield* drainFactory;
+          const reopened = yield* stateOf(deliveryId);
+          assert.strictEqual(reopened.status, "pr_open");
+          assert.isFalse(reopened.followThrough?.watchEnded);
+          assert.deepStrictEqual(reopened.pullRequest, state.pullRequest);
+          assert.deepStrictEqual(
+            world.pullRequestCalls.map(({ input }) => input.action),
+            ["create_pr", "push"],
+          );
+          const watch = (yield* linkOf(author, fakePullRequest.number)).watch;
+          assert.isDefined(watch);
+          assert.notStrictEqual(watch?.startedAt, before?.startedAt);
+          assert.strictEqual(reopened.followThrough?.watchStartedAt, watch?.startedAt);
+        }),
+      ),
+  );
+
+  it.live("finishes a round when core stops watching during it, then blocks unwatched", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const { deliveryId, threadId: author } = yield* openSingle(world);
+        const first = yield* wakeStarted(author, fakePullRequest.number);
+        yield* world.endRun(first, "completed");
+        const reviewer = yield* awaitedRun(deliveryId);
+
+        // Core stops after too many comment-only updates while the round's review runs.
+        const last = yield* wakeStarted(author, fakePullRequest.number, undefined, "exhausted");
+        const flagged = yield* stateOf(deliveryId);
+        assert.strictEqual(flagged.status, "running");
+        assert.isTrue(flagged.followThrough?.watchEnded);
+        assert.deepStrictEqual(flagged.followThrough?.pending, []);
+        yield* world.endRun(last, "completed");
+
+        yield* Effect.flatMap(service, (factory) =>
+          factory.submitReview({ threadId: reviewer.threadId, review: passingReview() }),
+        );
+        yield* world.endRun(reviewer.runId, "completed");
+        // The round's commit is published, but core's ended watch is not started again.
+        const blocked = yield* stateOf(deliveryId);
+        assert.strictEqual(blocked.status, "blocked");
+        assert.deepStrictEqual(blocked.block, { reason: "watch_ended" });
+        assert.deepStrictEqual(
+          world.pullRequestCalls.map(({ input }) => input.action),
+          ["create_pr", "push"],
+        );
+        assert.isUndefined((yield* linkOf(author, fakePullRequest.number)).watch);
+      }),
+    ),
+  );
+});
+
+describe("Factory follow-through: a pull request whose watch could not start", () => {
+  /** A single item whose PR stage published while its author thread was settled. */
+  const unwatched = (world: World) =>
+    Effect.gen(function* () {
+      const author = yield* world.start;
+      yield* authorCommits(author.worktreePath, "feat: add the export button");
+      yield* world.endRun(author.runId, "completed");
+      const reviewer = yield* awaitedRun(author.deliveryId);
+      yield* Effect.flatMap(service, (factory) =>
+        factory.submitReview({ threadId: reviewer.threadId, review: passingReview() }),
+      );
+      // The owner settles the author thread, which core then refuses to watch from.
+      yield* settleThread(author.threadId);
+      yield* world.endRun(reviewer.runId, "completed");
+      const state = yield* stateOf(author.deliveryId);
+      return { ...author, state };
+    }).pipe(Effect.orDie);
+
+  it.live("records the published pull request and blocks", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const { state } = yield* unwatched(world);
+        assert.strictEqual(state.status, "blocked");
+        assert.deepStrictEqual(state.pullRequest, {
+          ...fakePullRequest,
+          headBranch: state.branch,
+        });
+        assert.deepStrictEqual(state.block, {
+          reason: "effect_failed",
+          effect: { id: state.effectsIssued, type: "open_pr" },
+          detail:
+            "Factory opened pull request #7 but could not watch it for feedback (OrchestratorDispatchError).",
+        });
+        assert.isUndefined(state.followThrough);
+        assert.strictEqual(world.pullRequestCalls.length, 1);
+      }),
+    ),
+  );
+
+  it.live.each([
+    { change: "closed", status: "cancelled" },
+    { change: "merged", status: "done" },
+  ] as const)(
+    "takes that pull request $change on the host, blocked as it is",
+    ({ change, status }) =>
+      withProject(verifyCommands.passes, (world) =>
+        Effect.gen(function* () {
+          const { deliveryId, threadId: author } = yield* unwatched(world);
+          const comments = world.commentCalls.length;
+          yield* syncPullRequest(author, yield* linkOf(author, fakePullRequest.number), change);
+
+          const after = yield* stateOf(deliveryId);
+          assert.strictEqual(after.status, status);
+          assert.strictEqual(after.pullRequest?.outcome, change);
+          assert.strictEqual(world.pullRequestCalls.length, 1);
+          if (change === "closed") {
+            assert.deepStrictEqual(commentsSince(world, comments), [
+              `${closedComment} ${fakePullRequest.url} Factory delivery ${deliveryId}, update 3.`,
+            ]);
+            // Ended: no resume can publish it again.
+            const refused = yield* Effect.flatMap(service, (factory) =>
+              factory.resume(deliveryId),
+            ).pipe(Effect.flip);
+            assert.strictEqual(refused._tag, "FactoryResumeRefusedError");
+          } else {
+            assert.strictEqual(yield* itemStatus(world.itemRef), "done");
+          }
+        }),
+      ),
+  );
+
+  it.live("resumes into a push to the same pull request, never a second one", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const { deliveryId, threadId: author, state } = yield* unwatched(world);
+        yield* unsettleThread(author);
+        yield* Effect.flatMap(service, (factory) => factory.resume(deliveryId)).pipe(Effect.orDie);
+        yield* drainFactory;
+
+        const reopened = yield* stateOf(deliveryId);
+        assert.strictEqual(reopened.status, "pr_open");
+        assert.deepStrictEqual(reopened.pullRequest, state.pullRequest);
+        assert.deepStrictEqual(
+          world.pullRequestCalls.map(({ input }) => input.action),
+          ["create_pr", "push"],
+        );
+        assert.isDefined((yield* linkOf(author, fakePullRequest.number)).watch);
+        assert.isFalse(reopened.followThrough?.watchEnded);
+      }),
+    ),
   );
 });

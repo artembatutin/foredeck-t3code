@@ -209,15 +209,24 @@ export class FactoryPullRequest extends Context.Service<
     /**
      * Starts core's pull request watch on a single item's pull request, on its author thread,
      * linking it there first when it is not linked, and returns the event-log position of that
-     * command. A watch already on keeps going, from where it got to. The command's id derives
-     * from the delivery and the effect, so an effect carried out again starts no second watch.
-     * None for a parent, whose feedback is not followed through yet.
+     * command and when the watch started. A watch already on keeps going, from where it got to.
+     * The command's id derives from the delivery and the effect, so an effect carried out again
+     * starts no second watch. None for a parent, whose feedback is not followed through yet.
      */
     readonly watch: (
       delivery: FactoryDeliveryStore.StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "open_pr" }>,
       pullRequest: FactoryOpenedPullRequest,
-    ) => Effect.Effect<Option.Option<number>, FactoryPullRequestWatchError>;
+    ) => Effect.Effect<
+      Option.Option<{ readonly after: number; readonly startedAt: string | null }>,
+      FactoryPullRequestWatchError
+    >;
+    /**
+     * Ends the watch the delivery's PR stage started on its pull request, when it is still that
+     * watch: one the owner started since is theirs. A cancelled delivery calls this, so the watch
+     * it left starts no more agent work. A failure is logged.
+     */
+    readonly unwatch: (delivery: FactoryDeliveryStore.StoredFactoryDelivery) => Effect.Effect<void>;
     /**
      * Follow-through once the delivery's pull request merged, first part: sets each child item
      * done in plan order for a parent, then the delivery's own item, through Work under a Factory
@@ -581,34 +590,50 @@ const make = Effect.gen(function* () {
         watching: true,
         link: { url, source: "created" },
       });
-      return Option.some(started.sequence);
+      const link = yield* linkOf(author, pullRequest);
+      return Option.some({ after: started.sequence, startedAt: link?.watch?.startedAt ?? null });
     },
   );
 
+  /** The thread's link to the pull request as the projection has it; none when unlinked. */
+  const linkOf = (threadId: ThreadId, pullRequest: FactoryOpenedPullRequest) =>
+    orchestrator
+      .getThreadShell(threadId)
+      .pipe(
+        Effect.map((shell) =>
+          shell?.pullRequests?.find(
+            (candidate) =>
+              candidate.source !== "stack-dismissed" &&
+              candidate.number === pullRequest.number &&
+              candidate.url === pullRequest.url,
+          ),
+        ),
+      );
+
   /**
-   * Ends the watch the PR stage started on the delivery's merged pull request, when it is still
-   * on. A failure is logged: the watch then keeps the worktree, and core's watch ends it later.
+   * Ends the watch on the delivery's pull request on its author thread, when the PR stage started
+   * one and a watch is still on: any watch for a merged pull request, which core's watch would end
+   * too, and otherwise only the very watch the PR stage started. Its command id names the watch,
+   * so ending it again changes nothing. A failure is logged.
    */
-  const endWatch = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
+  const endWatch = (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+    which: "any" | "started",
+  ) =>
     Effect.gen(function* () {
       const { deliveryId, state } = delivery;
       const { author } = state.threads;
-      const { pullRequest } = state;
-      if (state.followThrough === undefined || author === undefined || pullRequest === null) {
-        return;
-      }
-      const shell = yield* projections.getThreadShell(author);
-      const link = shell?.pullRequests?.find(
-        (candidate) =>
-          candidate.source !== "stack-dismissed" &&
-          candidate.number === pullRequest.number &&
-          candidate.url === pullRequest.url,
-      );
-      if (link?.watch === undefined) return;
+      const { pullRequest, followThrough } = state;
+      if (followThrough === undefined || author === undefined || pullRequest === null) return;
+      const link = yield* linkOf(author, pullRequest);
+      const watch = link?.watch;
+      if (link === undefined || watch === undefined) return;
+      if (which === "started" && watch.startedAt !== followThrough.watchStartedAt) return;
       yield* orchestrator.dispatch({
         type: "thread.pull-request.watch",
-        // One per delivery's pull request, so a close-out run again ends nothing new.
-        commandId: CommandId.make(`factory-pr-unwatch:${deliveryId}:${pullRequest.number}`),
+        commandId: CommandId.make(
+          `factory-pr-unwatch:${deliveryId}:${pullRequest.number}:${watch.startedAt}`,
+        ),
         threadId: author,
         host: link.host,
         repository: link.repository,
@@ -619,7 +644,7 @@ const make = Effect.gen(function* () {
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause)
           ? Effect.interrupt
-          : Effect.logWarning("factory could not end a merged pull request's watch", cause),
+          : Effect.logWarning("factory could not end its pull request watch", cause),
       ),
     );
 
@@ -697,7 +722,7 @@ const make = Effect.gen(function* () {
   const closeOutWorktree: FactoryPullRequest["Service"]["closeOutWorktree"] = Effect.fn(
     "FactoryPullRequest.closeOutWorktree",
   )(function* (delivery) {
-    yield* endWatch(delivery);
+    yield* endWatch(delivery, "any");
     const { worktreePath } = delivery.state;
     if (worktreePath === null) return;
     const project = Option.getOrUndefined(
@@ -740,7 +765,13 @@ const make = Effect.gen(function* () {
     }
   });
 
-  return FactoryPullRequest.of({ open, watch, closeOutItems, closeOutWorktree });
+  return FactoryPullRequest.of({
+    open,
+    watch,
+    unwatch: (delivery) => endWatch(delivery, "started"),
+    closeOutItems,
+    closeOutWorktree,
+  });
 });
 
 export const layer = Layer.effect(FactoryPullRequest, make);

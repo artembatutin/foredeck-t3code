@@ -203,6 +203,8 @@ const blockReason = (state: FactoryDeliveryState, block: FactoryBlock): string =
         : `The planner found nothing to plan: ${block.note.replace(/\s+/g, " ")}`;
     case "record_mismatch":
       return `The worktree no longer holds the verified, reviewed commit: ${listed(block.differences.map((difference) => RECORD_DIFFERENCES[difference]))}.`;
+    case "watch_ended":
+      return "The pull request's watch ended, so Factory no longer follows its feedback.";
   }
 };
 

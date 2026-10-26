@@ -119,10 +119,19 @@ comments or the branch starts to conflict, T3 Code wakes that thread, and Factor
 author's answer as a round of the delivery: once the turn ends, the server verifies the branch
 again, a reviewer on a fresh thread reviews it, and Factory records the approval and pushes the
 approved commit to the same pull request. It does this even when the author changed nothing, so
-the pull request only ever holds verified, reviewed commits. Rounds count against the fix and
-review rounds the delivery has left, and a round that fails or runs out of rounds blocks like any
-other; **Resume** verifies and reviews again before pushing. Turns you send on the thread yourself
-are yours and start no round. Feedback on a parent's pull request is not followed yet.
+the pull request only ever holds verified, reviewed commits. Feedback that arrives during a round
+is followed too, once the author is done with the round or the pull request is open again. Checks
+that all pass start no round. Rounds count against the fix and review rounds the delivery has
+left, and a round that fails or runs out of rounds blocks like any other; **Resume** verifies and
+reviews again before pushing. Turns you send on the thread yourself are yours and start no round,
+and cancelling the delivery leaves them running. Feedback on a parent's pull request is not
+followed yet.
+
+If T3 Code stops watching the pull request, because it cannot read it from the host or after too
+many comment-only updates, or cannot start watching it, as on an author thread you settled, the
+delivery blocks: Factory no longer hears of its feedback. **Resume** watches it again; unsettle the
+thread first if you settled it. Cancelling the delivery stops the watch Factory started, but not
+one you started yourself.
 
 ## When the pull request merges or closes
 

@@ -291,15 +291,55 @@ export const syncPullRequest = (
 let wakes = 0;
 
 /**
- * Wakes the thread about the watched pull request of `link`, as core's watch reactor does when
- * its checks fail: one `thread.pull-request-watch.sync` recording the watch's progress and queuing
- * the wake message. Returns the wake's run, which starts at once on an idle thread and otherwise
- * waits behind the thread's run.
+ * What a watch's wake reports, as core's watch reactor sends it: checks that failed, new comments,
+ * every check passing, the watch ending because the pull request could not be read, or ending
+ * after too many comment-only updates (that last wake carries its comments).
  */
-export const wakeThread = (threadId: ThreadId, link: ThreadPullRequestLink) =>
+export type WakeReport = "checks-failed" | "remarks" | "checks-passed" | "unreadable" | "exhausted";
+
+/**
+ * Wakes the thread about the watched pull request of `link`, as core's watch reactor does: one
+ * `thread.pull-request-watch.sync` recording the watch's progress, or ending it, and queuing the
+ * wake message with the notification core gives that report. Returns the wake's run, which starts
+ * at once on an idle thread and otherwise waits behind the thread's run.
+ */
+export const wakeThread = (
+  threadId: ThreadId,
+  link: ThreadPullRequestLink,
+  report: WakeReport = "checks-failed",
+) =>
   Effect.gen(function* () {
     wakes += 1;
     const watch = link.watch ?? assert.fail(`Pull request #${link.number} is not watched.`);
+    const pr = `#${link.number}`;
+    const reports = {
+      "checks-failed": {
+        watch: { ...watch, failedChecks: [...watch.failedChecks, `checks-${wakes}`] },
+        outcome: "failed",
+        summary: `${pr}: checks failed`,
+      },
+      remarks: {
+        watch: { ...watch, remarkIds: [...watch.remarkIds, `remark-${wakes}`], wakes: 1 },
+        outcome: "updated",
+        summary: `${pr}: new comments`,
+      },
+      "checks-passed": {
+        watch: { ...watch, passed: true, passedChecks: ["ci"] },
+        outcome: "completed",
+        summary: `${pr}: checks passed`,
+      },
+      unreadable: {
+        watch: null,
+        outcome: "failed",
+        summary: `${pr}: stopped watching, could not read it`,
+      },
+      exhausted: {
+        watch: null,
+        outcome: "updated",
+        summary: `${pr}: new comments, stopped watching`,
+      },
+    } as const;
+    const { outcome, summary, ...next } = reports[report];
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const result = yield* orchestrator.dispatch({
       type: "thread.pull-request-watch.sync",
@@ -309,15 +349,11 @@ export const wakeThread = (threadId: ThreadId, link: ThreadPullRequestLink) =>
       repository: link.repository,
       number: link.number,
       startedAt: watch.startedAt,
-      watch: { ...watch, failedChecks: [...watch.failedChecks, `checks-${wakes}`] },
+      watch: next.watch,
       wake: {
         messageId: MessageId.make(`message:pr-watch:wake-${wakes}`),
-        text: `Update on pull request #${link.number} (${link.url}): checks failed.`,
-        notification: {
-          source: { kind: "monitor" },
-          outcome: "failed",
-          summary: `#${link.number}: checks failed`,
-        },
+        text: `Update on pull request ${pr} (${link.url}): ${summary}.`,
+        notification: { source: { kind: "monitor" }, outcome, summary },
       },
     });
     const created = result.storedEvents.flatMap(({ event }) =>
@@ -371,6 +407,17 @@ export const threadShell = (threadId: ThreadId) =>
 export const settleThread = (threadId: ThreadId) =>
   Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
     orchestrator.dispatch({ type: "thread.settle", commandId: commandId("settle"), threadId }),
+  ).pipe(Effect.asVoid, Effect.orDie);
+
+/** Unsettles the thread as its owner does. */
+export const unsettleThread = (threadId: ThreadId) =>
+  Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+    orchestrator.dispatch({
+      type: "thread.unsettle",
+      commandId: commandId("unsettle"),
+      threadId,
+      reason: "user",
+    }),
   ).pipe(Effect.asVoid, Effect.orDie);
 
 /**

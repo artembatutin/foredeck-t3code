@@ -1,3 +1,4 @@
+import type { RunId } from "@t3tools/contracts";
 import type { FactoryStageName } from "@t3tools/contracts/fd/factory";
 
 import { standardStages } from "./definitions.ts";
@@ -158,6 +159,10 @@ const resumed = (delivery: FactoryDeliveryState): FactoryDeliveryState => ({
   fixCommitTurns: 0,
   rounds: { fix: 0, review: 0 },
   fingerprints: [],
+  // The owner's resume is the decision to watch the pull request again (see `pr.opened`).
+  ...(delivery.followThrough === undefined
+    ? {}
+    : { followThrough: { ...delivery.followThrough, watchEnded: false } }),
 });
 
 type FactoryResumedWorktree = NonNullable<FactoryResumeCheck["worktree"]>;
@@ -325,6 +330,33 @@ const continueChildren = (delivery: FactoryDeliveryState): FactoryAdvance => {
   return enter(delivery, standardStages.author.name, (current) =>
     issue({ ...current, stage: standardStages.author.name }, { type: "start_child", child }),
   );
+};
+
+/**
+ * A follow-through round answering the wake's run on the author thread: the delivery runs again
+ * and awaits that run. The author's answer to a wake is no fix-review reply, so the round's review
+ * starts on a fresh reviewer thread.
+ */
+const adoptWake = (delivery: FactoryDeliveryState, runId: RunId): FactoryAdvance => {
+  const { author } = delivery.threads;
+  return author === undefined
+    ? unchanged(delivery)
+    : step({
+        ...delivery,
+        status: "running",
+        stage: standardStages.follow_through.name,
+        awaiting: { type: "run", threadId: author, runId },
+        reviewResponse: null,
+      });
+};
+
+/** The oldest pending wake adopted as a round; undefined when none is pending. */
+const adoptPending = (delivery: FactoryDeliveryState): FactoryAdvance | undefined => {
+  const { followThrough } = delivery;
+  const [next, ...rest] = followThrough?.pending ?? [];
+  return followThrough === undefined || next === undefined
+    ? undefined
+    : adoptWake({ ...delivery, followThrough: { ...followThrough, pending: rest } }, next);
 };
 
 /** Whether the delivery blocked closing out its merged pull request. */
@@ -513,11 +545,17 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * nothing. Factory never merges. A merged parent's approved children are done once it is.
  *
  * A single item's PR stage also has the worker watch its pull request on the author thread. A
- * wake core's watch queues there for failed checks or new comments, committed after that watch
- * started, makes a `pr_open` delivery run again: it awaits the wake's run at `follow_through`. A
- * completed run is settled, verified, reviewed and recorded like any author turn, under the
- * task's rounds, limits and fingerprints so far, and the PR stage then publishes the newly
- * approved commit to the same pull request; a run that ends any other way blocks.
+ * wake core's watch queues there for failed checks, new comments or a conflict, committed after
+ * that watch started, makes a `pr_open` delivery run again: it awaits the wake's run at
+ * `follow_through`. One that comes while the delivery runs a stage or waits on its owner is its
+ * own too, and waits: it is adopted before the branch is next judged after an author turn, or
+ * once the pull request is open again. A completed run is settled, verified, reviewed and recorded
+ * like any author turn, under the task's rounds, limits and fingerprints so far, and the PR stage
+ * then publishes the newly approved commit to the same pull request; a run that ends any other
+ * way blocks. A wake that only reports passing checks changes nothing. One that ends the watch
+ * blocks the delivery where it would wait on its pull request, since no feedback reaches it any
+ * more; only a resume watches it again. A pull request published but not watched is recorded,
+ * and the delivery blocks.
  *
  * The owner can stop a running delivery after its step, or cancel any delivery that is not done
  * or cancelled. A stopping delivery still completes the work of its stage (the settle check and
@@ -601,14 +639,13 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
         : step({ ...following, status: "cancelled", awaiting: null });
     }
     case "pr.feedback": {
-      // Only a wake on the open pull request of a single item that awaits nothing else, on its
-      // author thread, committed after the watch its PR stage last started: one that came while
-      // the delivery ran a stage, or before that pull request was published, answers nothing.
+      // Only a wake on the open pull request of a single item, on its author thread, committed
+      // after the watch its PR stage last started (one from before that pull request was
+      // published answers nothing), and each run once.
       const { pullRequest, followThrough } = delivery;
       if (
         delivery.kind !== "single" ||
-        delivery.status !== "pr_open" ||
-        delivery.awaiting !== null ||
+        isTerminal(delivery) ||
         pullRequest === null ||
         pullRequest.outcome !== undefined ||
         pullRequest.number !== event.number ||
@@ -620,16 +657,30 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       ) {
         return unchanged(delivery);
       }
-      return step({
-        ...delivery,
-        status: "running",
-        stage: standardStages.follow_through.name,
-        awaiting: { type: "run", threadId: event.threadId, runId: event.runId },
-        // The author's answer to a wake is no fix-review reply: the round's review starts on a
-        // fresh reviewer thread.
-        reviewResponse: null,
-        followThrough: { ...followThrough, runs: [...followThrough.runs, event.runId] },
-      });
+      // Waiting on its pull request, the delivery takes feedback as a round at once; while it
+      // runs a stage or waits on its owner, the wake is its own and waits for it.
+      const idle = delivery.status === "pr_open" && delivery.awaiting === null;
+      switch (event.kind) {
+        // Every check passed: nothing to repair.
+        case "notice":
+          return unchanged(delivery);
+        // Core stopped watching: the delivery no longer hears of its pull request's feedback,
+        // and does not restart a watch core ended by itself.
+        case "ended": {
+          if (followThrough.watchEnded) return unchanged(delivery);
+          const ended = { ...delivery, followThrough: { ...followThrough, watchEnded: true } };
+          return idle ? blocked(ended, { reason: "watch_ended" }) : step(ended);
+        }
+        case "feedback": {
+          const owned = { ...followThrough, runs: [...followThrough.runs, event.runId] };
+          return idle
+            ? adoptWake({ ...delivery, followThrough: owned }, event.runId)
+            : step({
+                ...delivery,
+                followThrough: { ...owned, pending: [...owned.pending, event.runId] },
+              });
+        }
+      }
     }
     case "parent.done":
       // Its parent's pull request carried its work, and is merged and closed out.
@@ -769,11 +820,16 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
             })
           : concludeReview(delivery, accepted);
       }
-      return issue(delivery, {
-        type: "check_settle",
-        threadId: event.threadId,
-        runId: event.runId,
-      });
+      // A wake queued for the author while it worked runs next: the branch is judged once the
+      // author is done with it.
+      return (
+        adoptPending(delivery) ??
+        issue(delivery, {
+          type: "check_settle",
+          threadId: event.threadId,
+          runId: event.runId,
+        })
+      );
     }
 
     case "thread.deleted":
@@ -905,19 +961,41 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
     }
 
     case "pr.opened": {
-      if (awaitedEffect(delivery, event.effectId, "open_pr") === undefined) {
-        return unchanged(delivery);
+      const open = awaitedEffect(delivery, event.effectId, "open_pr");
+      if (open === undefined) return unchanged(delivery);
+      // Published either way: the pull request is the delivery's, so a resume publishes to it
+      // again rather than open another, and its merge or close is taken.
+      const recorded = { ...delivery, pullRequest: event.pullRequest };
+      if (event.watchFailure !== undefined) {
+        return blocked(recorded, {
+          reason: "effect_failed",
+          effect: open,
+          detail: event.watchFailure,
+        });
       }
-      const { watchedAfter } = event;
-      return step({
-        ...delivery,
+      const { watch } = event;
+      const previous = delivery.followThrough;
+      const next: FactoryDeliveryState = {
+        ...recorded,
         status: "pr_open",
         awaiting: null,
-        pullRequest: event.pullRequest,
-        ...(watchedAfter === undefined
+        ...(watch === undefined
           ? {}
-          : { followThrough: { watchedAfter, runs: delivery.followThrough?.runs ?? [] } }),
-      });
+          : {
+              followThrough: {
+                watchedAfter: watch.after,
+                watchStartedAt: watch.startedAt,
+                runs: previous?.runs ?? [],
+                pending: previous?.pending ?? [],
+                watchEnded: false,
+              },
+            }),
+      };
+      // A watch core ended while a round ran is not started again on its own.
+      if (next.followThrough?.watchEnded === true) {
+        return blocked(next, { reason: "watch_ended" });
+      }
+      return adoptPending(next) ?? step(next);
     }
 
     case "closed_out":

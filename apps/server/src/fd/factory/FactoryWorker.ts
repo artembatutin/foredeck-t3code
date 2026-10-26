@@ -41,6 +41,7 @@ import { failureFingerprint } from "./pipeline/fingerprint.ts";
 import {
   acceptedPlan,
   acceptedReview,
+  adoptedRuns,
   isProceeding,
   isTerminal,
   isTurnEffect,
@@ -276,6 +277,17 @@ const failureDetail = (effect: FactoryEffect, cause: Cause.Cause<unknown>) => {
   const tag = typeof error === "object" && error !== null && "_tag" in error ? error._tag : null;
   const kind = typeof tag === "string" && SAFE_TAG.test(tag) ? tag : "unexpected error";
   return `Factory could not ${describeEffect(effect)} (${kind}).`;
+};
+
+/**
+ * The `pr.opened` text for a pull request published whose watch could not start: what failed and
+ * the failure's tag, never its message (see `failureDetail`).
+ */
+const watchFailureDetail = (number: number, cause: Cause.Cause<unknown>) => {
+  const error = Option.getOrUndefined(Cause.findErrorOption(cause));
+  const tag = typeof error === "object" && error !== null && "_tag" in error ? error._tag : null;
+  const kind = typeof tag === "string" && SAFE_TAG.test(tag) ? tag : "unexpected error";
+  return `Factory opened pull request #${number} but could not watch it for feedback (${kind}).`;
 };
 
 /**
@@ -679,6 +691,16 @@ const make = Effect.gen(function* () {
         );
       }
       yield* stopRetiredRuns(deliveryId, recorded);
+      // The watch its PR stage started would wake the author thread to new work.
+      if (before.followThrough !== undefined) {
+        yield* Effect.suspend(() => pullRequests.unwatch(stored)).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.logWarning("factory could not end a cancelled delivery's watch", cause),
+          ),
+        );
+      }
       // A parent's children go with it, the one it waits for and those it never started, and
       // stop what their threads run; an approved child keeps its approval.
       for (const childId of before.children) yield* cancelChild(childId);
@@ -687,8 +709,51 @@ const make = Effect.gen(function* () {
     if (next.delivery.status === "done" && before.status !== "done") {
       for (const childId of before.children) yield* finishChild(childId);
     }
-    return Option.some(stored);
+    const taken = yield* takeEndedWake(deliveryId, before, next.delivery);
+    return taken ?? Option.some(stored);
   });
+
+  /**
+   * Steps the end of a wake run the step just adopted as a round, when that run has already
+   * ended: the step stored the stage attempt naming its thread, and an end committed before that
+   * found no attempt to reach. One that ends later reaches it as any run's end does. Undefined
+   * when there is nothing to take; a read that fails is logged, and the boot sweep reads the run
+   * again.
+   */
+  // Annotated: it closes the cycle `stepLocked` → `takeEndedWake`.
+  const takeEndedWake = (
+    deliveryId: FactoryDeliveryId,
+    before: FactoryDeliveryState,
+    after: FactoryDeliveryState,
+  ): Effect.Effect<
+    Option.Option<FactoryDeliveryStore.StoredFactoryDelivery> | undefined,
+    FactoryStoreError
+  > =>
+    Effect.gen(function* () {
+      const awaited = after.awaiting;
+      if (
+        awaited?.type !== "run" ||
+        !adoptedRuns(after).includes(awaited.runId) ||
+        (before.awaiting?.type === "run" && before.awaiting.runId === awaited.runId)
+      ) {
+        return undefined;
+      }
+      const ended = yield* Effect.exit(
+        Effect.suspend(() => threads.runEnded(awaited.threadId, awaited.runId)),
+      );
+      if (Exit.isFailure(ended)) {
+        if (Cause.hasInterruptsOnly(ended.cause)) return yield* Effect.interrupt;
+        yield* Effect.logWarning("factory could not read an adopted wake run", ended.cause);
+        return undefined;
+      }
+      if (Option.isNone(ended.value)) return undefined;
+      return yield* stepLocked(deliveryId, {
+        type: "run.finished",
+        threadId: awaited.threadId,
+        runId: awaited.runId,
+        status: ended.value.value,
+      });
+    });
 
   /**
    * Stops what a cancelled delivery's retired threads still run: those its stage attempts name
@@ -954,7 +1019,9 @@ const make = Effect.gen(function* () {
    * Feeds back an opened pull request: starts its watch, then stores the result with the watch's
    * event-log position, both under the delivery's lock and only while the delivery still awaits
    * this effect. A wake committed after the watch started then steps the delivery only once the
-   * pull request is stored, so none falls in between. A watch that cannot start fails the effect.
+   * pull request is stored, so none falls in between. A watch core ended during a round is not
+   * started again here. A watch that cannot start is reported with the pull request, which is
+   * published either way and is recorded.
    */
   const openedPullRequest = (job: Job, event: Extract<FactoryEvent, { type: "pr.opened" }>) => {
     const { deliveryId } = job.delivery;
@@ -973,22 +1040,24 @@ const make = Effect.gen(function* () {
           // Stale: the engine takes nothing of it.
           return yield* stepLocked(deliveryId, event);
         }
+        if (current.state.followThrough?.watchEnded === true) {
+          return yield* stepLocked(deliveryId, event);
+        }
         const watched = yield* Effect.exit(
           Effect.suspend(() => pullRequests.watch(current, effect, event.pullRequest)),
         );
         if (Exit.isFailure(watched)) {
           if (Cause.hasInterruptsOnly(watched.cause)) return yield* Effect.interrupt;
           return yield* stepLocked(deliveryId, {
-            type: "effect.failed",
-            effectId: effect.id,
-            detail: failureDetail(effect, watched.cause),
+            ...event,
+            watchFailure: watchFailureDetail(event.pullRequest.number, watched.cause),
           });
         }
         return yield* stepLocked(
           deliveryId,
           Option.match(watched.value, {
             onNone: () => event,
-            onSome: (watchedAfter) => ({ ...event, watchedAfter }),
+            onSome: (watch) => ({ ...event, watch }),
           }),
         );
       }),
@@ -1154,7 +1223,7 @@ const make = Effect.gen(function* () {
       if (deliveryId === undefined) return;
       const delivery = Option.getOrUndefined(yield* deliveries.get(deliveryId));
       if (delivery?.state.status !== "cancelled") return;
-      const adopted = delivery.state.followThrough?.runs ?? [];
+      const adopted = adoptedRuns(delivery.state);
       if (!(yield* threads.carriesFactoryTurn(run.threadId, run.runId, adopted))) return;
       yield* interruptCancelled(delivery, run);
     }).pipe(
