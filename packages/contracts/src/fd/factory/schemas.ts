@@ -233,7 +233,10 @@ export const FactoryProjectSettings = Schema.Struct({
   verifyCommand: Schema.NullOr(FactoryCommand).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
-  /** Runs before the verify command when set. */
+  /**
+   * When set, runs in the delivery's worktree before each author's first turn (a single item's, or
+   * each child's in the parent's worktree), under the verify timeout. A failure blocks the delivery.
+   */
   setupCommand: Schema.NullOr(FactoryCommand).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),

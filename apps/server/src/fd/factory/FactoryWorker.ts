@@ -70,6 +70,19 @@ class FactoryStageCommandError extends Schema.TaggedError<FactoryStageCommandErr
 }
 
 /**
+ * The delivery stopped awaiting its author's launch while the setup command ran, as a cancel does:
+ * the launch sends no opening turn, and the delivery takes nothing of its failure.
+ */
+class FactoryLaunchWithdrawnError extends Schema.TaggedError<FactoryLaunchWithdrawnError>()(
+  "FactoryLaunchWithdrawnError",
+  { deliveryId: FactoryDeliveryId },
+) {
+  override get message(): string {
+    return `Factory delivery ${this.deliveryId} no longer awaits its author's launch.`;
+  }
+}
+
+/**
  * A parent's child cannot start, or its start be taken, on the parent's branch: its delivery is
  * not stored among the parent's children, it has no worktree to share, which commit it starts from
  * cannot be established (the task before it records no approved commit, or the parent recorded no
@@ -297,10 +310,14 @@ const SAFE_TAG = /^[A-Za-z][A-Za-z0-9]{0,63}$/;
 
 /**
  * The `effect.failed` detail: what failed and the failure's tag. Never its message or cause,
- * which can carry command output or provider text.
+ * which can carry command output or provider text, except a setup failure's message, which is
+ * fixed text naming how the command ended.
  */
 const failureDetail = (effect: FactoryEffect, cause: Cause.Cause<unknown>) => {
   const error = Option.getOrUndefined(Cause.findErrorOption(cause));
+  if (FactoryVerifyRunner.isFactorySetupFailedError(error)) {
+    return `Factory could not ${describeEffect(effect)}. ${error.message}`;
+  }
   const tag = typeof error === "object" && error !== null && "_tag" in error ? error._tag : null;
   const kind = typeof tag === "string" && SAFE_TAG.test(tag) ? tag : "unexpected error";
   return `Factory could not ${describeEffect(effect)} (${kind}).`;
@@ -444,6 +461,40 @@ const make = Effect.gen(function* () {
       });
     });
 
+  /**
+   * What an author's launch runs between core preparing its worktree and its opening turn: the
+   * project's setup command, as the settings read when the launch runs name it, under the verify
+   * timeout, then a check that the delivery still awaits the launch, so a delivery cancelled while
+   * setup ran gets no opening turn. None for any other launch, or without a setup command.
+   */
+  const openingSetup = (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+    effect: Extract<FactoryEffect, { readonly type: "launch_thread" }>,
+  ) =>
+    Effect.gen(function* () {
+      if (effect.role !== "author") return undefined;
+      const { setupCommand, limits } = yield* settings.get(delivery.projectId);
+      if (setupCommand === null) return undefined;
+      const { deliveryId } = delivery;
+      return (worktreePath: string) =>
+        verifyRunner
+          .setup({
+            deliveryId,
+            worktreePath,
+            command: setupCommand,
+            timeoutMinutes: limits.verifyTimeoutMinutes,
+          })
+          .pipe(
+            Effect.andThen(deliveries.get(deliveryId)),
+            Effect.flatMap((current) => {
+              const awaiting = Option.getOrUndefined(current)?.state.awaiting;
+              return awaiting?.type === "effect" && awaiting.effect.id === effect.id
+                ? Effect.void
+                : Effect.fail(new FactoryLaunchWithdrawnError({ deliveryId }));
+            }),
+          );
+    });
+
   /** A failed run's outcome with its failure fingerprint: the end of its log, and its tree. */
   const withFingerprint = (outcome: FactoryCommandOutcome) =>
     outcome.type === "receipt" && receiptFailed(outcome.receipt)
@@ -472,7 +523,8 @@ const make = Effect.gen(function* () {
     });
     switch (effect.type) {
       case "launch_thread":
-        return threads.launchThread(delivery, effect).pipe(
+        return openingSetup(delivery, effect).pipe(
+          Effect.flatMap((beforeOpening) => threads.launchThread(delivery, effect, beforeOpening)),
           Effect.map((launch): FactoryEvent => ({
             type: "thread.launched",
             effectId: effect.id,

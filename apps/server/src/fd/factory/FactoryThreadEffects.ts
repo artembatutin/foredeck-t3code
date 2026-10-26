@@ -8,6 +8,7 @@ import {
   type RunId,
   RuntimeMode,
   ThreadId,
+  type WorktreeSetupSnapshot,
 } from "@t3tools/contracts";
 import { FactoryDeliveryId, FactoryRole } from "@t3tools/contracts/fd/factory";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -25,6 +26,7 @@ import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadMessageIntake from "../../orchestration-v2/ThreadMessageIntake.ts";
+import * as WorktreeSetupTracker from "../../project/WorktreeSetupTracker.ts";
 import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import { getAutoBootstrapThreadModelSelection } from "../../serverRuntimeStartup.ts";
@@ -115,6 +117,19 @@ export class FactoryLaunchWatchEndedError extends Schema.TaggedError<FactoryLaun
   }
 }
 
+/**
+ * A launch made without its opening message ended its workspace preparation without a worktree, or
+ * its thread was deleted first; nothing was run in it and no opening turn was sent.
+ */
+export class FactoryWorkspacePreparationError extends Schema.TaggedError<FactoryWorkspacePreparationError>()(
+  "FactoryWorkspacePreparationError",
+  { threadId: ThreadId },
+) {
+  override get message(): string {
+    return `Factory could not prepare the workspace of thread ${this.threadId}.`;
+  }
+}
+
 /** The delivery records nothing for the turn to act on: no failed receipt, accepted review or baseline. */
 export class FactoryTurnBasisMissingError extends Schema.TaggedError<FactoryTurnBasisMissingError>()(
   "FactoryTurnBasisMissingError",
@@ -185,11 +200,15 @@ export class FactoryThreadEffects extends Context.Service<
     /**
      * Launches the thread with its first turn, linked to the delivery's Work item, and reports
      * it once the launch has recorded the worktree, or has ended the run trying (the path is null
-     * then).
+     * then). With `beforeOpening` (an author's setup), the thread is launched without that turn,
+     * `beforeOpening` runs in its worktree once core has prepared it, and only then is the turn
+     * sent, under the launch's message id; a launch replayed after its turn was sent runs nothing
+     * again and reports that turn's run. A failure of `beforeOpening` fails the launch.
      */
     readonly launchThread: (
       delivery: StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "launch_thread" }>,
+      beforeOpening?: (worktreePath: string) => Effect.Effect<void, FactoryThreadEffectFailure>,
     ) => Effect.Effect<FactoryThreadLaunch, FactoryThreadEffectFailure>;
     /** Sends the turn and reports the run it started on the effect's thread. */
     readonly sendFixCommitTurn: (
@@ -346,6 +365,9 @@ const make = Effect.gen(function* () {
   const git = yield* GitVcsDriver.GitVcsDriver;
   const providers = yield* ProviderRegistry.ProviderRegistry;
   const providerInstances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+  // Where core reports a launch's workspace preparation when it has no run to report it on. The
+  // server always provides it; without it a launch waits on the recorded worktree alone.
+  const setupTracker = yield* Effect.serviceOption(WorktreeSetupTracker.WorktreeSetupTracker);
   const intakeContext = yield* Effect.context<
     ThreadManagement.ThreadManagementService | ServerConfig.ServerConfig | FileSystem.FileSystem
   >();
@@ -498,7 +520,68 @@ const make = Effect.gen(function* () {
       return next.value.worktreePath;
     });
 
-  const launchThread: FactoryThreadEffects["Service"]["launchThread"] = (delivery, effect) =>
+  /** Whether core's preparation got as far as it starts an opening turn's run from. */
+  const releasable = (snapshot: WorktreeSetupSnapshot) =>
+    snapshot.phase === "done" ||
+    snapshot.stages.some(
+      ({ id, status }) => id === "agent" && (status === "running" || status === "done"),
+    );
+
+  // The tracker first: a preparation it shows past the worktree recorded that worktree before.
+  const readRunlessPreparation = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const snapshot = Option.isSome(setupTracker) ? yield* setupTracker.value.get(threadId) : null;
+      const { thread } = yield* projections.getThreadRecords(threadId, []);
+      return { snapshot, worktreePath: thread.worktreePath, deleted: thread.deletedAt !== null };
+    });
+
+  /**
+   * The worktree of a thread launched without a message, once core's preparation got as far as it
+   * would have before starting that message's run: past the project's own setup script, which
+   * clients follow on the setup tracker, as no run reports it. A preparation that ended without a
+   * worktree, a deleted thread, and a replayed launch with none prepared (a replay schedules no
+   * preparation) fail. An existing worktree is recorded with the thread.
+   */
+  const awaitRunlessWorkspace = (threadId: ThreadId, replayed: boolean) =>
+    Effect.gen(function* () {
+      const decide = ({
+        snapshot,
+        worktreePath,
+        deleted,
+      }: Effect.Success<ReturnType<typeof readRunlessPreparation>>) => {
+        if (deleted) return { prepared: false } as const;
+        if (snapshot !== null && !releasable(snapshot)) {
+          return snapshot.phase === "running" ? undefined : ({ prepared: false } as const);
+        }
+        if (worktreePath !== null) return { prepared: true, worktreePath } as const;
+        // Waits only for a preparation this launch scheduled that has not begun yet.
+        return snapshot !== null || replayed ? ({ prepared: false } as const) : undefined;
+      };
+      const afterSequence = yield* threads.getThreadEventSequence(threadId);
+      const first = decide(yield* readRunlessPreparation(threadId));
+      const next =
+        first !== undefined
+          ? Option.some(first)
+          : yield* Stream.merge(
+              threads.streamStoredEventsFrom({ threadId, afterSequence }),
+              Option.isSome(setupTracker) ? setupTracker.value.stream(threadId) : Stream.empty,
+            ).pipe(
+              Stream.mapEffect(() => readRunlessPreparation(threadId)),
+              Stream.map(decide),
+              Stream.filter((decided) => decided !== undefined),
+              Stream.runHead,
+            );
+      if (Option.isNone(next)) return yield* new FactoryLaunchWatchEndedError({ threadId });
+      return next.value.prepared
+        ? next.value.worktreePath
+        : yield* new FactoryWorkspacePreparationError({ threadId });
+    });
+
+  const launchThread: FactoryThreadEffects["Service"]["launchThread"] = (
+    delivery,
+    effect,
+    beforeOpening,
+  ) =>
     Effect.gen(function* () {
       const { role } = effect;
       const { deliveryId, projectId, state } = delivery;
@@ -579,9 +662,11 @@ const make = Effect.gen(function* () {
       const commandId = CommandId.make(`factory-launch:${deliveryId}:${effect.id}`);
       const messageId = launchMessageId(deliveryId, effect.id);
       const threadId = launchThreadId(deliveryId, effect.id);
+      const openingMessage = { messageId, text: opening.text, attachments: [] };
       // Work links the thread to the delivery's item before the launch runs, so a run that ends
       // before the launch returns is recorded on the link; a launch that creates no thread leaves
-      // no link.
+      // no link. Core starts the opening turn's run as soon as it has prepared the workspace, so a
+      // launch with something to run first sends that turn itself afterwards.
       const launch = launches.launch({
         commandId,
         threadId,
@@ -596,7 +681,7 @@ const make = Effect.gen(function* () {
           workspace.type === "worktree"
             ? { type: "worktree", baseRef: workspace.baseRef, branch: workspace.branch }
             : { type: "existing_worktree", worktreePath: workspace.worktreePath },
-        initialMessage: { messageId, text: opening.text, attachments: [] },
+        ...(beforeOpening === undefined ? { initialMessage: openingMessage } : {}),
         createdBy: "system",
         creationSource: "server",
       });
@@ -604,9 +689,26 @@ const make = Effect.gen(function* () {
         { ref: delivery.itemRef, threadId, origin: "factory" },
         launch,
       );
-      const run = launched.projection.runs.find(
-        (candidate) => candidate.userMessageId === messageId,
-      );
+      // A replay after the opening turn was sent finds its run, and runs nothing before it again.
+      const run =
+        launched.projection.runs.find((candidate) => candidate.userMessageId === messageId) ??
+        (beforeOpening === undefined
+          ? undefined
+          : yield* Effect.gen(function* () {
+              yield* beforeOpening(yield* awaitRunlessWorkspace(threadId, launched.resumed));
+              const sent = yield* ThreadMessageIntake.sendToThread({
+                projectId,
+                commandId: CommandId.make(`${commandId}:opening`),
+                threadId,
+                ...openingMessage,
+                modelSelection,
+                // After a turn the owner may have sent meanwhile; never steering it.
+                mode: "queue",
+                createdBy: "system",
+                creationSource: "server",
+              }).pipe(Effect.provideContext(intakeContext));
+              return sent.run;
+            }));
       if (run === undefined) {
         return yield* new FactoryLaunchRunMissingError({ deliveryId, threadId });
       }

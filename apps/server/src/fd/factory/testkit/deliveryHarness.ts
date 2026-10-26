@@ -356,6 +356,18 @@ const factoryOrchestrator = (hooks: {
     ),
   );
 
+/** The process runner, each of whose runs goes through `hooks.around` when set. */
+const hookedProcessRunner = (hooks: World["processes"]) =>
+  Layer.effect(
+    ProcessRunner.ProcessRunner,
+    Effect.map(ProcessRunner.make(), (runner) =>
+      ProcessRunner.ProcessRunner.of({
+        run: (input) =>
+          Effect.suspend(() => hooks.around?.(input, runner.run) ?? runner.run(input)),
+      }),
+    ),
+  );
+
 /** A comment posted through Work, as the Work service received it. */
 export interface CommentCall {
   readonly actor: WorkManagement.WorkActor;
@@ -571,6 +583,7 @@ const makeLayer = (input: {
     before?: ((command: FactoryDispatch) => Effect.Effect<void>) | undefined;
     beforeShell?: ((threadId: ThreadId) => Effect.Effect<void>) | undefined;
   };
+  readonly processes: World["processes"];
   readonly commentCalls: Array<CommentCall>;
   readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
   readonly manualReactor: boolean;
@@ -614,8 +627,10 @@ const makeLayer = (input: {
         ProjectionStore.layer,
         CommandReceiptStore.layer,
         IdAllocator.layer,
-        ProcessRunner.layer,
+        hookedProcessRunner(input.processes),
         GitVcsDriver.layer,
+        // The thread launches' own, which Factory follows a launch without a run on.
+        WorktreeSetupTracker.layer,
       ),
     ),
     Layer.provideMerge(database),
@@ -721,6 +736,19 @@ export interface World {
     before?: ((command: FactoryDispatch) => Effect.Effect<void>) | undefined;
     beforeShell?: ((threadId: ThreadId) => Effect.Effect<void>) | undefined;
   };
+  /**
+   * Runs each process the server's process runner is asked for, such as a verify or setup
+   * command, in its place when set, given the input and the runner's own `run`: a test can hold a
+   * command back, change its input or look around once it ended.
+   */
+  readonly processes: {
+    around?:
+      | ((
+          input: ProcessRunner.ProcessRunInput,
+          run: ProcessRunner.ProcessRunner["Service"]["run"],
+        ) => ReturnType<ProcessRunner.ProcessRunner["Service"]["run"]>)
+      | undefined;
+  };
   /** Every comment posted through Work, in order; the item's own source holds them too. */
   readonly commentCalls: ReadonlyArray<CommentCall>;
   readonly evidenceDir: (deliveryId: FactoryDeliveryId) => string;
@@ -797,6 +825,7 @@ export const withProject = <A, E>(
     const worktreeRemovals: Array<VcsRemoveWorktreeInput> = [];
     const publishHooks: Array<Effect.Effect<void>> = [];
     const factoryDispatch: World["factoryDispatch"] = {};
+    const processes: World["processes"] = {};
     const commentCalls: Array<CommentCall> = [];
 
     return yield* Effect.gen(function* () {
@@ -952,6 +981,7 @@ export const withProject = <A, E>(
         worktreeRemovals,
         publishHooks,
         factoryDispatch,
+        processes,
         commentCalls,
         evidenceDir: (deliveryId) => path.join(t3Home, "userdata", "fd-factory", deliveryId),
         exists: (target) => fileSystem.exists(target).pipe(Effect.orElseSucceed(() => false)),
@@ -972,6 +1002,7 @@ export const withProject = <A, E>(
           worktreeRemovals,
           publishHooks,
           factoryDispatch,
+          processes,
           commentCalls,
           wrapWork: options.work ?? ((service) => service),
           manualReactor: options.manualReactor === true,

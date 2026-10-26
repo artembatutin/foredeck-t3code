@@ -1,7 +1,11 @@
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- the log is hashed as it streams.
 import * as NodeCrypto from "node:crypto";
 
-import { type FactoryDeliveryId, FactoryVerifyReceipt } from "@t3tools/contracts/fd/factory";
+import {
+  type FactoryCommand,
+  type FactoryDeliveryId,
+  FactoryVerifyReceipt,
+} from "@t3tools/contracts/fd/factory";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import type * as Cause from "effect/Cause";
@@ -47,6 +51,37 @@ export class FactoryVerifyShellRequiredError extends Schema.TaggedError<FactoryV
   }
 }
 
+/**
+ * The project's setup command did not succeed, so no author turn was started. The message names
+ * only how it ended; its output stays in its log and the failure in `cause`.
+ */
+export class FactorySetupFailedError extends Schema.TaggedError<FactorySetupFailedError>()(
+  "FactorySetupFailedError",
+  {
+    ending: Schema.Literals(["exited", "timed_out", "signaled", "not_run"]),
+    /** The exit code of a command that exited. */
+    code: Schema.optional(Schema.Number),
+    /** The timeout a command that timed out ran under. */
+    timeoutMinutes: Schema.optional(Schema.Number),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    switch (this.ending) {
+      case "exited":
+        return `The setup command exited with code ${this.code}.`;
+      case "timed_out":
+        return `The setup command did not finish within ${this.timeoutMinutes} minutes.`;
+      case "signaled":
+        return "A signal ended the setup command.";
+      case "not_run":
+        return "Factory could not start the setup command; check its executable.";
+    }
+  }
+}
+
+export const isFactorySetupFailedError = Schema.is(FactorySetupFailedError);
+
 export type FactoryVerifyRunError =
   | FactoryWorktreeMissingError
   | FactoryBranchReadError
@@ -81,7 +116,7 @@ export const verifySettingsHash = (settings: FactoryDeliverySettings): string =>
  * they arrive. A run that ends, fails or times out on a clean tree with HEAD unchanged becomes a
  * receipt, also written as `verify-<n>.json`; the engine decides whether it passed. A tree dirty
  * before or after the run, or a HEAD the command moved, is refused: no receipt, and the log stays
- * for diagnosis.
+ * for diagnosis. The project's setup command runs the same way before an author's first turn.
  */
 export class FactoryVerifyRunner extends Context.Service<
   FactoryVerifyRunner,
@@ -91,6 +126,17 @@ export class FactoryVerifyRunner extends Context.Service<
       readonly worktreePath: string;
       readonly settings: FactoryDeliverySettings;
     }) => Effect.Effect<FactoryCommandOutcome, FactoryVerifyRunError>;
+    /**
+     * Runs the setup command in the worktree, its output streamed into `setup-<n>.log` in the
+     * delivery's evidence folder, under the timeout given (the project's verify timeout). Only an
+     * exit code of 0 succeeds; the tree is left to the author's settle check.
+     */
+    readonly setup: (input: {
+      readonly deliveryId: FactoryDeliveryId;
+      readonly worktreePath: string;
+      readonly command: FactoryCommand;
+      readonly timeoutMinutes: number;
+    }) => Effect.Effect<void, FactorySetupFailedError | FactoryEvidence.FactoryEvidenceError>;
   }
 >()("t3/fd/factory/verify/FactoryVerifyRunner") {}
 
@@ -109,12 +155,15 @@ const make = Effect.gen(function* () {
    * chunk callbacks, never its buffered result, so output written before a timeout, a signal or
    * past the buffered limit stays in the log and nothing is appended twice.
    */
-  const runLogged = (input: {
-    readonly settings: FactoryDeliverySettings;
+  const runLogged = <E>(input: {
     /** The resolved, shell-free executable to run. */
     readonly executable: string;
+    readonly args: ReadonlyArray<string>;
+    readonly timeoutMinutes: number;
     readonly cwd: string;
     readonly logPath: string;
+    /** The error for a command that could not be run or read. */
+    readonly failed: (cause: ProcessRunner.ProcessRunError) => E;
   }) =>
     Effect.gen(function* () {
       const writeFailed = (cause: unknown) =>
@@ -147,9 +196,9 @@ const make = Effect.gen(function* () {
       const result = yield* processRunner
         .run({
           command: input.executable,
-          args: input.settings.verifyCommand.args,
+          args: input.args,
           cwd: input.cwd,
-          timeout: Duration.minutes(input.settings.limits.verifyTimeoutMinutes),
+          timeout: Duration.minutes(input.timeoutMinutes),
           timeoutBehavior: "timedOutResult",
           maxOutputBytes: BUFFERED_OUTPUT_BYTES,
           outputMode: "truncate",
@@ -165,7 +214,7 @@ const make = Effect.gen(function* () {
             // The exit code read fails only when a signal ended the process: a result, not an error.
             cause._tag === "ProcessReadError" && cause.stream === "exitCode"
               ? Effect.succeed({ code: null, timedOut: false })
-              : Effect.fail(new FactoryVerifyCommandError({ path: input.cwd, cause })),
+              : Effect.fail(input.failed(cause)),
           ),
         );
       yield* Queue.end(chunks);
@@ -196,10 +245,12 @@ const make = Effect.gen(function* () {
       const logPath = files.file("log");
       const startedAt = yield* DateTime.now;
       const result = yield* runLogged({
-        settings: input.settings,
         executable: resolved.command,
+        args: input.settings.verifyCommand.args,
+        timeoutMinutes: input.settings.limits.verifyTimeoutMinutes,
         cwd: input.worktreePath,
         logPath,
+        failed: (cause) => new FactoryVerifyCommandError({ path: input.worktreePath, cause }),
       });
       const finishedAt = yield* DateTime.now;
 
@@ -247,6 +298,26 @@ const make = Effect.gen(function* () {
         receipt,
         evidencePath: receiptPath,
       } satisfies FactoryCommandOutcome;
+    }),
+    setup: Effect.fn("FactoryVerifyRunner.setup")(function* (input) {
+      const { command, timeoutMinutes } = input;
+      // A Windows batch script runs only through a shell, which Factory never uses.
+      const resolved = yield* resolveSpawnCommand(command.executable, command.args);
+      if (resolved.shell) return yield* new FactorySetupFailedError({ ending: "not_run" });
+      const files = yield* evidence.nextRun(input.deliveryId, "setup");
+      const { code, timedOut } = yield* runLogged({
+        executable: resolved.command,
+        args: command.args,
+        timeoutMinutes,
+        cwd: input.worktreePath,
+        logPath: files.file("log"),
+        failed: (cause) => new FactorySetupFailedError({ ending: "not_run", cause }),
+      });
+      if (timedOut) {
+        return yield* new FactorySetupFailedError({ ending: "timed_out", timeoutMinutes });
+      }
+      if (code === null) return yield* new FactorySetupFailedError({ ending: "signaled" });
+      if (code !== 0) return yield* new FactorySetupFailedError({ ending: "exited", code });
     }),
   });
 });

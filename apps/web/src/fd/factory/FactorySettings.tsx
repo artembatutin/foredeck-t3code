@@ -169,7 +169,7 @@ function SettingsEditor({
       <CommandEditor
         name="setupCommand"
         title="Setup command"
-        description="Optional. Runs before the verify command."
+        description="Optional. Runs in the delivery's worktree before each author starts."
         command={draft.setupCommand}
         errors={errors}
         disabled={disabled}

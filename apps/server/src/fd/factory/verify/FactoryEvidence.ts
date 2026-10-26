@@ -41,7 +41,7 @@ export class FactoryEvidence extends Context.Service<
      */
     readonly nextRun: (
       deliveryId: FactoryDeliveryId,
-      prefix: "verify" | "review",
+      prefix: "setup" | "verify" | "review",
     ) => Effect.Effect<FactoryEvidenceRun, FactoryEvidenceError>;
     /**
      * The task's `approval-<taskId>.json` path in the delivery's folder, created on demand, or

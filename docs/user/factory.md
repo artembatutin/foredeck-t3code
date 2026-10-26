@@ -17,7 +17,10 @@ use **Factory**:
   owns the project. It decides whether the work passes, so use the command that runs your checks,
   such as your test script. It must leave the checkout as it found it: a run that commits or
   changes files is refused and the delivery blocks.
-- **Setup command** is optional. It can be saved, but deliveries do not run it yet.
+- **Setup command** is optional. It runs in the delivery's worktree before each author starts
+  (for a parent, before each child's author), so use it for what a fresh worktree needs first,
+  such as installing dependencies. It has the verify timeout. If it fails, the delivery blocks
+  before its author starts, and resuming runs it again.
 - **Role models** pick the model for the **Planner**, the **Author** and the **Reviewer** from that
   environment's providers. **Default** uses the project's model, and the planner and the reviewer
   default to the author's. The planner plans an item delivered as a parent.
@@ -28,9 +31,9 @@ Each command is an executable plus its arguments, not a shell line. Enter `npm` 
 and `test` as an argument, each argument in its own field. Pipes, `&&`, variables and wildcards
 are not interpreted, so put several steps in a script and run that.
 
-A running delivery keeps the round limits it started with. The verify command, its timeout and
-the role models are read when each step runs, so a change applies to the delivery's next verify
-or thread.
+A running delivery keeps the round limits it started with. The verify and setup commands, the
+timeout and the role models are read when each step runs, so a change applies to the delivery's
+next verify or thread.
 
 Factory settings are stored on each environment for its own checkout of the project. Changing
 them needs a live connection with the settings permission.

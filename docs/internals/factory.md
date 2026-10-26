@@ -24,10 +24,10 @@ schema (see [`FactoryMigrations.ts`](../../apps/server/src/fd/factory/persistenc
 
 ## Evidence stays out of the repository
 
-Verify logs and receipts go to `<T3 home>/userdata/fd-factory/<deliveryId>/`, the server's state
-directory, through [`FactoryEvidence`](../../apps/server/src/fd/factory/verify/FactoryEvidence.ts).
-In the worktree an agent could edit it, and writing it would dirty the tree a receipt must find
-clean.
+Verify and setup logs and receipts go to `<T3 home>/userdata/fd-factory/<deliveryId>/`, the
+server's state directory, through
+[`FactoryEvidence`](../../apps/server/src/fd/factory/verify/FactoryEvidence.ts). In the worktree an
+agent could edit it, and writing it would dirty the tree a receipt must find clean.
 
 ## One worktree per delivery
 
@@ -53,6 +53,23 @@ it. A reflog that no longer holds the creation, or a first child started elsewhe
 start, and the parent blocks rather than record a later commit as its base. Such a parent takes no
 child's approval before it has that commit either: the engine has it take the child's start again
 first, so a one-child plan cannot leave its children with the base unknown.
+
+## Setup runs before the author's opening turn, which Factory then sends
+
+Core starts a launch's opening turn as soon as its preparation releases the run, so a setup run
+once the launch returned would race the author. With a setup command, an author's launch creates
+the thread without its opening message, runs setup in the worktree core prepared, and only then
+sends that message itself, under the launch's message id
+([`FactoryThreadEffects.ts`](../../apps/server/src/fd/factory/FactoryThreadEffects.ts)). Without a
+run, core reports its preparation only to the in-memory setup tracker, so the launch waits there
+until preparation got as far as it would have released a run, past the project's own setup
+script. A replayed launch schedules no preparation, so one that finds no worktree and nothing
+under way fails rather than wait. The opening message decides what a replay does: once it exists,
+the replay runs nothing and returns its run; before, it runs setup again. The worker checks that
+the delivery still awaits the launch before the message is sent, so a cancel during setup leaves
+no turn; one landing after is stopped as any cancelled launch's run is. Only author launches run
+setup, through the verify runner with the verify timeout, logging to the delivery's evidence; a
+failure blocks the delivery with fixed text naming how the command ended.
 
 ## A delivery's launches stay under its starter's mode
 
