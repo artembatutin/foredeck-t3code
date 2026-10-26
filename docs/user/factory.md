@@ -67,8 +67,8 @@ item instead.
 
 The planner reads the project on the delivery's new branch and worktree without changing it, and
 submits a plan: tasks in order, each with a title, a summary, acceptance criteria and how each
-criterion is tested. A planner that finds nothing to plan blocks the delivery with its note
-saying why. **Resume** asks it to plan again, or cancel the delivery.
+criterion is tested. A planner that finds nothing to plan blocks the delivery, and shows its
+note saying why when it gave one. **Resume** asks it to plan again, or cancel the delivery.
 
 ### Approve the plan
 
@@ -119,11 +119,20 @@ Factory does not change the item's status.
   record or open the pull request. A parent also stops before the plan waits for you, before its
   next child and before it integrates. A problem found before then still blocks it.
 - **Resume** on a delivery that is still **Stopping** takes back the stop: it goes on running from
-  the step under way, with the rounds it has already used. Resuming a **Stopped** or **Blocked**
-  delivery checks its branch again and verifies it before going on, even if nothing changed,
-  unless all that is left is opening the pull request for the commit it approved. It also gets a
-  fresh set of repair rounds within the limits it started with. If you deleted one of its threads,
-  it blocks again; cancel it and deliver the item anew.
+  the step under way, with the rounds it has already used.
+- **Resume** on a **Stopped** or **Blocked** single item or child checks its branch again and
+  verifies it before going on, even if nothing changed, unless all that is left is opening the
+  pull request for the commit it approved. It also gets a fresh set of repair rounds within the
+  limits it started with. If you deleted one of its threads, it blocks again; cancel it and
+  deliver the item anew.
+- **Resume** on a **Stopped** or **Blocked** parent goes on from where it is. Before you approve
+  its plan, a parent stopped where the plan waits for you waits for you again on the same plan,
+  without verifying; otherwise its planner gets a new turn to plan again. If you deleted the
+  planner's thread, it blocks again; cancel it and deliver the item anew. Once its plan is
+  approved, deleted planner or reviewer threads do not hold it back. It creates the child items
+  still missing, keeping those already created, or goes on with the first child not yet approved,
+  and never creates a child twice. After its last child is approved, it integrates again with a
+  fresh verify and a new reviewer on a separate thread, with no repair round.
 - **Cancel delivery** asks first, then interrupts what the delivery's agents are working on and
   ends it. Cancelling a parent also ends its child deliveries not yet approved. Cancelling a child
   ends its parent and the parent's other children not yet approved. Approved children keep their
