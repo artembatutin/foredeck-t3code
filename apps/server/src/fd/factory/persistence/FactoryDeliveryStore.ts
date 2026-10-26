@@ -271,6 +271,9 @@ const StoredDeliveryState = Schema.Struct({
       outcome: Schema.optionalKey(Schema.Literals(["merged", "closed"])),
     }),
   ).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  // Added with parents' follow-through: the thread a parent's pull request is linked to, absent
+  // until its PR stage reports it, and from parents stored before.
+  pullRequestThread: Schema.optionalKey(ThreadId),
   // Added with follow-through rounds: absent until a PR stage watches the pull request, and from
   // rows whose pull request opened before, whose feedback nothing adopts.
   followThrough: Schema.optionalKey(

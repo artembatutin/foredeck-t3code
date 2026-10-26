@@ -339,13 +339,13 @@ export interface FactoryOpenedPullRequest {
 export type FactoryPullRequestOutcome = "merged" | "closed";
 
 /**
- * How a single item follows the feedback on its open pull request, through core's watch on its
- * author thread.
+ * How a delivery follows the feedback on its open pull request, through core's watch on the thread
+ * the pull request is linked to (see `followedThread`).
  */
 export interface FactoryFollowThrough {
   /**
    * The event-log position of the delivery's first watch command: every wake core queues for its
-   * pull request on the author thread after it is the delivery's, taken once by its run. It never
+   * pull request on the followed thread after it is the delivery's, taken once by its run. It never
    * moves, so a wake committed while a later PR stage reads or starts the watch is not passed over.
    */
   readonly watchedAfter: number;
@@ -409,6 +409,23 @@ export interface FactoryWatchState {
   readonly held: string | null;
 }
 
+/**
+ * The thread a delivery's pull request is linked to, where core's watch wakes it with feedback and
+ * a follow-through round's turns go: a single item's author thread, or a parent's last child's
+ * author thread, as its PR stage reported it. None for a child, whose parent's pull request
+ * carries its work, nor for a parent before its PR stage reported one.
+ */
+export const followedThread = (delivery: FactoryDeliveryState): ThreadId | undefined => {
+  switch (delivery.kind) {
+    case "single":
+      return delivery.threads.author;
+    case "parent":
+      return delivery.pullRequestThread;
+    case "child":
+      return undefined;
+  }
+};
+
 /** The wake runs the delivery took as its own; see `FactoryFollowThrough.runs`. */
 export const adoptedRuns = (delivery: FactoryDeliveryState): ReadonlyArray<RunId> =>
   delivery.followThrough?.runs ?? [];
@@ -419,8 +436,9 @@ export const adoptedRuns = (delivery: FactoryDeliveryState): ReadonlyArray<RunId
  */
 export interface FactoryResumeCheck {
   /**
-   * Threads the delivery recorded that have been deleted since, and the thread of an author or
-   * planner launch it never recorded (see `unrecordedAuthorLaunch`) when that was deleted.
+   * Threads the delivery recorded that have been deleted since, a parent's `pullRequestThread`
+   * included, and the thread of an author or planner launch it never recorded (see
+   * `unrecordedAuthorLaunch`) when that was deleted.
    */
   readonly deletedThreads: ReadonlyArray<ThreadId>;
   /** Whether the run of an author launch the delivery never recorded has already ended. */
@@ -430,7 +448,10 @@ export interface FactoryResumeCheck {
    * `unrecordedPlannerLaunch`) has already ended; absent when it has none.
    */
   readonly unrecordedPlannerRunEnded?: boolean;
-  /** The worktree once the author has launched; null before. */
+  /**
+   * The worktree once the author has launched, or once a parent recorded the thread its pull
+   * request is linked to; null before.
+   */
   readonly worktree: {
     readonly settle: FactorySettleResult;
     /** HEAD and its tree; null when they could not be read. */
@@ -558,15 +579,17 @@ export type FactoryEvent =
       readonly outcome: FactoryRecordOutcome;
     }
   /**
-   * An `open_pr` result. `watch` is what the worker found and did about the watch on a single
-   * item's pull request (see `FactoryWatchState`); absent for a parent. `watchFailure` is set
-   * instead when the watch could not start: the pull request is published all the same, so it
-   * is recorded; the text is bounded and safe to show.
+   * An `open_pr` result. `pullRequestThread` is the thread a parent's pull request is linked to,
+   * its last child's author's; a single item's is its author's. `watch` is what the worker found
+   * and did about the watch on the pull request there (see `FactoryWatchState`); absent when it
+   * watches none. `watchFailure` is set instead when the watch could not start: the pull request
+   * is published all the same, so it is recorded; the text is bounded and safe to show.
    */
   | {
       readonly type: "pr.opened";
       readonly effectId: number;
       readonly pullRequest: FactoryOpenedPullRequest;
+      readonly pullRequestThread?: ThreadId;
       readonly watch?: FactoryWatchState;
       readonly watchFailure?: string;
     }
@@ -784,14 +807,21 @@ export interface FactoryDeliveryState {
   /** Set once the PR stage has opened the delivery's pull request. */
   readonly pullRequest: FactoryOpenedPullRequest | null;
   /**
-   * Set once the PR stage has started a watch on a single item's pull request; absent before, for
-   * parents and children, and for deliveries whose pull request opened before follow-through
-   * rounds existed, whose feedback nothing adopts.
+   * A parent's: the thread its PR stage linked its pull request to, its last child's author's.
+   * It has no author thread of its own, so its pull request's feedback wakes there, and its
+   * follow-through rounds' turns go there. Absent until the PR stage reports it, for single items
+   * (theirs is their author's) and children, and for parents stored before it was recorded.
+   */
+  readonly pullRequestThread?: ThreadId;
+  /**
+   * Set once the PR stage has started a watch on the pull request; absent before, for children,
+   * and for deliveries whose pull request opened before follow-through rounds existed, whose
+   * feedback nothing adopts.
    */
   readonly followThrough?: FactoryFollowThrough;
   /**
    * Set by a cancel while the watch a Factory watch command started may still be on, to wake the
-   * author thread to new work: the worker ends it and takes the wakes it sent, then clears this;
+   * followed thread to new work: the worker ends it and takes the wakes it sent, then clears this;
    * the boot sweep finishes it when a stop came first.
    */
   readonly releaseWatch?: true;

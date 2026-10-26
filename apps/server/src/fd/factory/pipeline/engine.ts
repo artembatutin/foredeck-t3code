@@ -1,4 +1,4 @@
-import type { RunId } from "@t3tools/contracts";
+import type { RunId, ThreadId } from "@t3tools/contracts";
 import type { FactoryStageName } from "@t3tools/contracts/fd/factory";
 
 import { standardStages } from "./definitions.ts";
@@ -7,6 +7,7 @@ import {
   acceptedPlan,
   acceptedReview,
   blocked,
+  followedThread,
   isTerminal,
   isTurnEffect,
   issue,
@@ -29,6 +30,7 @@ import type {
   FactoryRepairedStage,
   FactoryResumeCheck,
   FactoryReviewJudgment,
+  FactorySettleResult,
 } from "./state.ts";
 import { stageHandler } from "./stages/registry.ts";
 
@@ -168,6 +170,36 @@ const resumed = (delivery: FactoryDeliveryState): FactoryDeliveryState => ({
 type FactoryResumedWorktree = NonNullable<FactoryResumeCheck["worktree"]>;
 
 /**
+ * Judges a resumed delivery's branch as the resume read it: one that cannot be repaired blocks
+ * again, a repairable one gets one fix-commit turn on `thread` naming the checkpoint, and a settled
+ * one goes on with `settled`.
+ */
+const resumeBranch = (
+  delivery: FactoryDeliveryState,
+  settle: FactorySettleResult,
+  thread: ThreadId,
+  settled: () => FactoryAdvance,
+): FactoryAdvance => {
+  if (settle.status === "unrepairable") {
+    return blocked(delivery, { reason: "unsettled", problems: settle.problems });
+  }
+  if (settle.status === "repairable") {
+    const checkpoint = delivery.checkpoint ?? delivery.stage;
+    // The turn counts as the one fix-commit turn: a branch it leaves unsettled blocks.
+    return issue(
+      { ...resumed(delivery), stage: "repair", fixCommitTurns: FIX_COMMIT_TURNS },
+      {
+        type: "send_fix_commit_turn",
+        threadId: thread,
+        problems: settle.problems,
+        ...(checkpoint === null ? {} : { checkpoint }),
+      },
+    );
+  }
+  return settled();
+};
+
+/**
  * Whether the worktree holds the commit the delivery's task was approved for: HEAD and its tree
  * are the last receipt's, which passed, and the round's accepted review passed it.
  */
@@ -233,25 +265,11 @@ const resume = (delivery: FactoryDeliveryState, check: FactoryResumeCheck): Fact
   const { worktree } = check;
   // The worktree is read whenever the author has launched; without it there is nothing to judge.
   if (worktree === null) return unchanged(delivery);
-  const { settle } = worktree;
-  if (settle.status === "unrepairable") {
-    return blocked(delivery, { reason: "unsettled", problems: settle.problems });
-  }
-  if (settle.status === "repairable") {
-    // The turn counts as the one fix-commit turn: a branch it leaves unsettled blocks.
-    return issue(
-      { ...resumed(delivery), stage: "repair", fixCommitTurns: FIX_COMMIT_TURNS },
-      {
-        type: "send_fix_commit_turn",
-        threadId: author,
-        problems: settle.problems,
-        ...(checkpoint === null ? {} : { checkpoint }),
-      },
-    );
-  }
-  return checkpoint === "pr" && holdsApprovedCommit(delivery, worktree)
-    ? begin({ ...resumed(delivery), status: "approved" }, standardStages.pr)
-    : begin(resumed(delivery), standardStages.verify);
+  return resumeBranch(delivery, worktree.settle, author, () =>
+    checkpoint === "pr" && holdsApprovedCommit(delivery, worktree)
+      ? begin({ ...resumed(delivery), status: "approved" }, standardStages.pr)
+      : begin(resumed(delivery), standardStages.verify),
+  );
 };
 
 /**
@@ -333,20 +351,21 @@ const continueChildren = (delivery: FactoryDeliveryState): FactoryAdvance => {
 };
 
 /**
- * A follow-through round answering the wake's run on the author thread: the delivery runs again
- * and awaits that run. The author's answer to a wake is no fix-review reply, so the round's review
- * starts on a fresh reviewer thread.
+ * A follow-through round answering the wake's run on the thread the pull request is linked to (see
+ * `followedThread`): the delivery runs again and awaits that run. The answer to a wake is no
+ * fix-review reply, so the round's review starts on a fresh reviewer thread, a parent's integrate
+ * reviewer as always.
  */
 const adoptWake = (delivery: FactoryDeliveryState, runId: RunId): FactoryAdvance => {
-  const { author } = delivery.threads;
-  return author === undefined
+  const threadId = followedThread(delivery);
+  return threadId === undefined
     ? unchanged(delivery)
     : step({
         ...delivery,
         // A stop the owner asked for still stops at the round's next boundary.
         status: delivery.status === "stopping" ? "stopping" : "running",
         stage: standardStages.follow_through.name,
-        awaiting: { type: "run", threadId: author, runId },
+        awaiting: { type: "run", threadId, runId },
         reviewResponse: null,
       });
 };
@@ -363,7 +382,8 @@ const releasingWatch = (delivery: FactoryDeliveryState): FactoryDeliveryState =>
     delivery.followThrough !== undefined ||
     (awaiting?.type === "effect" && awaiting.effect.type === "open_pr") ||
     (block?.reason === "effect_failed" && block.effect.type === "open_pr");
-  return delivery.kind === "single" && watched ? { ...delivery, releaseWatch: true } : delivery;
+  // A child opens no pull request; its parent's watch is the parent's to release.
+  return delivery.kind !== "child" && watched ? { ...delivery, releaseWatch: true } : delivery;
 };
 
 /** The oldest pending wake adopted as a round; undefined when none is pending. */
@@ -385,6 +405,7 @@ const closeOutFailed = ({ block }: FactoryDeliveryState) =>
  * its own. Without its children it creates them again, keeping every child it recorded before.
  * With them it never creates one again: it starts the first child that has not reported its
  * approval, or once every one has integrates afresh, with a new verify and a new reviewer.
+ * A parent whose pull request is linked to a thread resumes through `resumeFollowThrough`.
  */
 const resumeApproved = (delivery: FactoryDeliveryState): FactoryAdvance =>
   delivery.children.length === 0
@@ -393,6 +414,28 @@ const resumeApproved = (delivery: FactoryDeliveryState): FactoryAdvance =>
         { type: "create_children" },
       )
     : continueChildren(resumed(delivery));
+
+/**
+ * Picks up a parent that recorded the thread its pull request is linked to, as a single item's
+ * resume picks up its author's work: its follow-through rounds' turns go to that thread, so the
+ * thread's deletion blocks it again, and the branch as the resume read it is judged first (see
+ * `resumeBranch`), with a fix-commit turn there when it is repairable. A settled branch integrates
+ * afresh, with a new verify and a new reviewer, before the PR stage updates its pull request;
+ * never on an earlier receipt, whatever checkpoint the parent stopped or blocked at.
+ */
+const resumeFollowThrough = (
+  delivery: FactoryDeliveryState,
+  check: FactoryResumeCheck,
+  thread: ThreadId,
+): FactoryAdvance => {
+  if (check.deletedThreads.includes(thread)) {
+    return blocked(delivery, { reason: "thread_deleted", threadId: thread });
+  }
+  const { worktree } = check;
+  // The worktree is read once the thread is recorded; without it there is nothing to judge.
+  if (worktree === null) return unchanged(delivery);
+  return resumeBranch(delivery, worktree.settle, thread, () => resumeApproved(delivery));
+};
 
 /**
  * Acts on the round's accepted plan once its run has completed. A plan with tasks enters the plan
@@ -560,21 +603,24 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * taken once, whatever a follow-through round is doing then: a later report of either changes
  * nothing. Factory never merges. A merged parent's approved children are done once it is.
  *
- * A single item's PR stage also has the worker watch its pull request on the author thread. A
+ * The PR stage also has the worker watch the pull request on the thread it is linked to: a single
+ * item's author thread, or a parent's last child's author thread, which the parent records. A
  * wake core's watch queues there for failed checks, new comments or a conflict, committed after
  * that watch started, makes a `pr_open` delivery run again: it awaits the wake's run at
  * `follow_through`. One that comes while the delivery runs a stage or waits on its owner is its
  * own too, and waits: it is adopted before the branch is next judged after an author turn, or
- * once the pull request is open again. A completed run is settled, verified, reviewed and recorded
- * like any author turn, under the task's rounds, limits and fingerprints so far, and the PR stage
- * then publishes the newly approved commit to the same pull request; a run that ends any other
- * way blocks. Every wake of the pull request after the first watch is the delivery's to cancel,
- * taken once by its run; one that only reports passing checks starts no round. One that ends the
- * watch blocks the delivery where it would wait on its pull request, since no feedback reaches it
- * any more; only a resume watches it again, since a PR stage starts no watch over an end it has
- * not taken. A cancel has the watch a Factory command started released, and still takes the
- * wakes that watch sent, only so their runs are stopped. A pull request published but not
- * watched is recorded, and the delivery blocks.
+ * once the pull request is open again. A completed run is settled, with at most one fix-commit
+ * turn on that thread, then verified, reviewed and recorded like any author turn, under the
+ * task's rounds, limits and fingerprints so far, and the PR stage then publishes the newly
+ * approved commit to the same pull request; a run that ends any other way blocks. A parent's
+ * round verifies its whole branch and has a fresh integrate reviewer judge it, with no repair
+ * round, as its integrate does, and records its approval. Every wake of the pull request after
+ * the first watch is the delivery's to cancel, taken once by its run; one that only reports
+ * passing checks starts no round. One that ends the watch blocks the delivery where it would wait
+ * on its pull request, since no feedback reaches it any more; only a resume watches it again,
+ * since a PR stage starts no watch over an end it has not taken. A cancel has the watch a Factory
+ * command started released, and still takes the wakes that watch sent, only so their runs are
+ * stopped. A pull request published but not watched is recorded, and the delivery blocks.
  *
  * The owner can stop a running delivery after its step, or cancel any delivery that is not done
  * or cancelled. A stopping delivery still completes the work of its stage (the settle check and
@@ -584,8 +630,9 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * parent's next child or the stage after its children, it is `stopped` instead. A cancelled
  * delivery awaits nothing, so no later event moves it. Resume undoes a stop that has not yet taken
  * effect, and picks a stopped or blocked delivery up from its checkpoint (see `resume` and, for a
- * parent, `resumePlanning` and `resumeApproved`); a parent past its children integrates again,
- * from a fresh verify. A delivery blocked closing out its merge closes out again.
+ * parent, `resumePlanning`, `resumeApproved` and `resumeFollowThrough`); a parent past its
+ * children integrates again, from a fresh verify. A delivery blocked closing out its merge closes
+ * out again.
  */
 export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
   switch (event.type) {
@@ -619,6 +666,9 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
         return issue({ ...resumed(delivery), status: "pr_open" }, { type: "close_out" });
       }
       if (delivery.kind !== "parent") return resume(delivery, event.check);
+      if (delivery.pullRequestThread !== undefined) {
+        return resumeFollowThrough(delivery, event.check, delivery.pullRequestThread);
+      }
       return delivery.planApproved
         ? resumeApproved(delivery)
         : resumePlanning(delivery, event.check);
@@ -696,12 +746,12 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
         : step({ ...releasingWatch(following), status: "cancelled", awaiting: null });
     }
     case "pr.feedback": {
-      // Only a wake on a single item's author thread, committed after its first watch command
-      // (one from before that pull request was published answers nothing), and each run once.
+      // Only a wake on the thread its pull request is linked to, a single item's author thread or
+      // a parent's last child's author thread, committed after its first watch command (one from
+      // before that pull request was published answers nothing), and each run once.
       const { pullRequest, followThrough } = delivery;
       if (
-        delivery.kind !== "single" ||
-        delivery.threads.author !== event.threadId ||
+        followedThread(delivery) !== event.threadId ||
         followThrough === undefined ||
         event.sequence <= followThrough.watchedAfter ||
         followThrough.runs.includes(event.runId)
@@ -918,7 +968,9 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
     }
 
     case "thread.deleted":
-      return Object.values(delivery.threads).includes(event.threadId)
+      // A parent's follow-through rounds run on the thread its pull request is linked to.
+      return Object.values(delivery.threads).includes(event.threadId) ||
+        followedThread(delivery) === event.threadId
         ? blocked(delivery, { reason: "thread_deleted", threadId: event.threadId })
         : unchanged(delivery);
 
@@ -1049,8 +1101,16 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       const open = awaitedEffect(delivery, event.effectId, "open_pr");
       if (open === undefined) return unchanged(delivery);
       // Published either way: the pull request is the delivery's, so a resume publishes to it
-      // again rather than open another, and its merge or close is taken.
-      const recorded = { ...delivery, pullRequest: event.pullRequest };
+      // again rather than open another, and its merge or close is taken. A parent keeps the
+      // thread it is linked to, where its feedback wakes.
+      const linked = event.pullRequestThread ?? delivery.pullRequestThread;
+      const recorded = {
+        ...delivery,
+        pullRequest: event.pullRequest,
+        ...(delivery.kind === "parent" && linked !== undefined
+          ? { pullRequestThread: linked }
+          : {}),
+      };
       if (event.watchFailure !== undefined) {
         return blocked(recorded, {
           reason: "effect_failed",

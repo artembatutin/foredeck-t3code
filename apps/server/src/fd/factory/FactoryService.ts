@@ -971,18 +971,20 @@ const make = Effect.gen(function* () {
 
   /**
    * What a resume of a stopped or blocked delivery finds: which of its threads are gone and, once
-   * its author has launched, its branch, HEAD and the commit its task was approved for.
+   * its author has launched, its branch, HEAD and the commit its task was approved for. A parent
+   * has no author, but once it recorded the thread its pull request is linked to, its follow-through
+   * rounds' turns go there, and its branch is read as an author's is.
    */
   const resumeCheck = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
     Effect.gen(function* () {
       const { deliveryId, state } = delivery;
-      const recorded = [...new Set(Object.values(state.threads))].filter(
-        (threadId): threadId is ThreadId => threadId !== undefined,
-      );
+      const recorded = [
+        ...new Set([...Object.values(state.threads), state.pullRequestThread]),
+      ].filter((threadId): threadId is ThreadId => threadId !== undefined);
       const gone = yield* Effect.filter(recorded, (threadId) =>
         threads.threadState(threadId).pipe(Effect.map((found) => found !== "present")),
       );
-      if (state.threads.author === undefined) {
+      if (state.threads.author === undefined && state.pullRequestThread === undefined) {
         // An author or planner launch whose result was never recorded is issued again and
         // replays the thread it made, if any; a thread it made and the owner deleted since blocks
         // instead.

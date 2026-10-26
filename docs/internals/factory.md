@@ -441,6 +441,11 @@ Once its plan is approved, a parent launches no thread until its children run, s
 deletion does not hold it: a resume creates the children it lacks, keeping those recorded, or once
 they exist starts the first that has not reported its approval, never creating one again. Past its
 last child it integrates afresh (see [integrate](#integrate-verifies-and-reviews-the-whole-branch-afresh)).
+Once its PR stage reported the thread its pull request is linked to, its last child's author's,
+the parent records it (`pullRequestThread`) and resumes as a single item does on its author's
+thread: a follow-through round's commits there were never judged by a child's settle check, so a
+resume settles the branch first, with a fix-commit turn on that thread when it is repairable, and
+the thread's deletion blocks it. Its resume check reads the branch whenever that thread is recorded.
 
 By owner decision an explicit resume grants a fresh retry allowance: repair rounds, the fix-commit
 turn and failure fingerprints start over, while the limits the delivery started with stay, and so
