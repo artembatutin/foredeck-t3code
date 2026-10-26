@@ -47,7 +47,8 @@ Deliver is offered only on a live connection allowed to run agents, and only whi
 no delivery that is not done or cancelled. Starting fails when the project has no verify command,
 and the message names the settings to change. The project's repository needs at least one commit.
 
-Agents start deliveries with the `factory_deliver` tool, as a single item or a parent, and follow
+Agents start deliveries with the `factory_deliver` tool, as a single item or a parent, or start
+the project's next Ready item (see [Deliver on a schedule](#deliver-on-a-schedule)), and follow
 them with `factory_status`, which reads one delivery or every delivery of an item. Only you decide
 a parent's plan. Agents in plan mode and outside clients you approved as read-only can only read.
 A delivery's threads never run with broader permissions than those of the agent that started it.
@@ -99,6 +100,27 @@ against every child's acceptance criteria. Then Factory opens one pull request f
 that lists each child item with its verified commit and review. A failed verify or a review that
 requires changes blocks the parent with no repair round. Fix the branch if needed, then
 **Resume** to verify and review it again with a new reviewer.
+
+## Deliver on a schedule
+
+Factory can take your Ready items one at a time without you starting each one. Create a scheduled
+task in the project in **Settings → Scheduled tasks**, with a prompt such as:
+
+> Deliver this project's next Ready Work item: call `factory_deliver` with `next: true` and this
+> project's id. Report the delivery it started, or that nothing was Ready.
+
+Each run starts at most one delivery, as a single item: an item Work shows as **Ready**, an
+unblocked `todo` item nobody is working on, that has no delivery in progress. Factory goes through
+the project's Work sources in the order you added them, and through each source's items in the
+order the source lists them, and starts the first such item. To deliver only some items, label
+them and add the label to the prompt, as in "call `factory_deliver` with `next: true`, this
+project's id and the label `autopilot`".
+
+When nothing is Ready, nothing starts and the agent is told so; the next run looks again. If
+Factory cannot read a Work source completely, it starts nothing listed after the part it could
+not read and says the list was incomplete; check the source's status in Work. Like any delivery,
+it needs the project's verify command, and its threads never run with broader permissions than the
+task's agent.
 
 ## Follow a delivery
 
