@@ -11,6 +11,7 @@ import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -38,6 +39,7 @@ import type {
   FactoryDeliveryState,
   FactoryEffect,
   FactoryOpenedPullRequest,
+  FactoryWatchStarted,
 } from "./pipeline/state.ts";
 import {
   type FactoryPullRequestEvidence,
@@ -209,24 +211,24 @@ export class FactoryPullRequest extends Context.Service<
     /**
      * Starts core's pull request watch on a single item's pull request, on its author thread,
      * linking it there first when it is not linked, and returns the event-log position of that
-     * command and when the watch started. A watch already on keeps going, from where it got to.
-     * The command's id derives from the delivery and the effect, so an effect carried out again
-     * starts no second watch. None for a parent, whose feedback is not followed through yet.
+     * command, when the watch on the pull request started, and whether that command started it:
+     * core keeps a watch already on, from where it got to, whoever started it. The command's id
+     * derives from the delivery and the effect, so an effect carried out again starts no second
+     * watch. None for a parent, whose feedback is not followed through yet.
      */
     readonly watch: (
       delivery: FactoryDeliveryStore.StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "open_pr" }>,
       pullRequest: FactoryOpenedPullRequest,
-    ) => Effect.Effect<
-      Option.Option<{ readonly after: number; readonly startedAt: string | null }>,
-      FactoryPullRequestWatchError
-    >;
+    ) => Effect.Effect<Option.Option<FactoryWatchStarted>, FactoryPullRequestWatchError>;
     /**
-     * Ends the watch the delivery's PR stage started on its pull request, when it is still that
-     * watch: one the owner started since is theirs. A cancelled delivery calls this, so the watch
-     * it left starts no more agent work. A failure is logged.
+     * Ends the watch Factory holds on the delivery's pull request (`followThrough.watchStartedAt`)
+     * when it is still on: a watch someone else started is theirs, and one already gone needs
+     * nothing. Its command id names that watch, so ending it again changes nothing.
      */
-    readonly unwatch: (delivery: FactoryDeliveryStore.StoredFactoryDelivery) => Effect.Effect<void>;
+    readonly unwatch: (
+      delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+    ) => Effect.Effect<void, Orchestrator.OrchestratorV2Error>;
     /**
      * Follow-through once the delivery's pull request merged, first part: sets each child item
      * done in plan order for a parent, then the delivery's own item, through Work under a Factory
@@ -582,6 +584,7 @@ const make = Effect.gen(function* () {
       const key = yield* pullRequestKey(author, pullRequest);
       if (key === null) return yield* new FactoryPullRequestUnwatchableError({ deliveryId });
       const { url, ...identity } = key;
+      const before = (yield* linkOf(author, pullRequest))?.watch;
       const started = yield* orchestrator.dispatch({
         type: "thread.pull-request.watch",
         commandId: CommandId.make(`factory-pr-watch:${deliveryId}:${effect.id}`),
@@ -590,8 +593,22 @@ const make = Effect.gen(function* () {
         watching: true,
         link: { url, source: "created" },
       });
-      const link = yield* linkOf(author, pullRequest);
-      return Option.some({ after: started.sequence, startedAt: link?.watch?.startedAt ?? null });
+      const after = (yield* linkOf(author, pullRequest))?.watch;
+      // Core starts a watch at the moment of the command that starts it, which is when the
+      // command's event occurred; a watch it kept started earlier, and was on before.
+      const occurredAt = started.storedEvents.find(
+        ({ event }) => event.type === "thread.pull-request-synced",
+      )?.event.occurredAt;
+      const created =
+        after !== undefined &&
+        after.startedAt !== before?.startedAt &&
+        occurredAt !== undefined &&
+        after.startedAt === DateTime.formatIso(occurredAt);
+      return Option.some({
+        after: started.sequence,
+        startedAt: after?.startedAt ?? null,
+        created,
+      });
     },
   );
 
@@ -611,24 +628,22 @@ const make = Effect.gen(function* () {
       );
 
   /**
-   * Ends the watch on the delivery's pull request on its author thread, when the PR stage started
-   * one and a watch is still on: any watch for a merged pull request, which core's watch would end
-   * too, and otherwise only the very watch the PR stage started. Its command id names the watch,
-   * so ending it again changes nothing. A failure is logged.
+   * Ends the watch on the delivery's pull request on its author thread, when the PR stage watched
+   * it and a watch is still on: any watch for a merged pull request, which core's watch would end
+   * too, and otherwise only the watch Factory holds. Its command id names the watch, so ending it
+   * again changes nothing.
    */
-  const endWatch = (
-    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
-    which: "any" | "started",
-  ) =>
+  const endWatch = (delivery: FactoryDeliveryStore.StoredFactoryDelivery, which: "any" | "held") =>
     Effect.gen(function* () {
       const { deliveryId, state } = delivery;
       const { author } = state.threads;
       const { pullRequest, followThrough } = state;
       if (followThrough === undefined || author === undefined || pullRequest === null) return;
+      if (which === "held" && followThrough.watchStartedAt === null) return;
       const link = yield* linkOf(author, pullRequest);
       const watch = link?.watch;
       if (link === undefined || watch === undefined) return;
-      if (which === "started" && watch.startedAt !== followThrough.watchStartedAt) return;
+      if (which === "held" && watch.startedAt !== followThrough.watchStartedAt) return;
       yield* orchestrator.dispatch({
         type: "thread.pull-request.watch",
         commandId: CommandId.make(
@@ -640,13 +655,7 @@ const make = Effect.gen(function* () {
         number: link.number,
         watching: false,
       });
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause)
-          ? Effect.interrupt
-          : Effect.logWarning("factory could not end its pull request watch", cause),
-      ),
-    );
+    });
 
   /** A merged delivery's items: a parent's children in plan order, then the delivery's own. */
   const finishedItems = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
@@ -722,7 +731,14 @@ const make = Effect.gen(function* () {
   const closeOutWorktree: FactoryPullRequest["Service"]["closeOutWorktree"] = Effect.fn(
     "FactoryPullRequest.closeOutWorktree",
   )(function* (delivery) {
-    yield* endWatch(delivery, "any");
+    // A failure keeps the worktree, since the watch keeps it, and core's watch ends it later.
+    yield* endWatch(delivery, "any").pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("factory could not end a merged pull request's watch", cause),
+      ),
+    );
     const { worktreePath } = delivery.state;
     if (worktreePath === null) return;
     const project = Option.getOrUndefined(
@@ -768,7 +784,7 @@ const make = Effect.gen(function* () {
   return FactoryPullRequest.of({
     open,
     watch,
-    unwatch: (delivery) => endWatch(delivery, "started"),
+    unwatch: (delivery) => endWatch(delivery, "held"),
     closeOutItems,
     closeOutWorktree,
   });

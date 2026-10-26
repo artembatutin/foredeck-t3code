@@ -344,32 +344,45 @@ export type FactoryPullRequestOutcome = "merged" | "closed";
  */
 export interface FactoryFollowThrough {
   /**
-   * The event-log position of the watch command of the delivery's last PR stage: a wake core
-   * queues for its pull request on the author thread after it is the delivery's.
+   * The event-log position of the delivery's first watch command: every wake core queues for its
+   * pull request on the author thread after it is the delivery's, taken once by its run. It never
+   * moves, so a wake committed while a later PR stage starts the watch again is not passed over.
    */
   readonly watchedAfter: number;
   /**
-   * When that watch started, as core records it: the watch a cancel ends while it is still on.
-   * Null when it was not read.
+   * The event-log position of the latest watch command. A wake ending the watch committed before
+   * it means that command started again a watch core had ended.
+   */
+  readonly armedAt: number;
+  /**
+   * The watch Factory's own command started and still holds, by when it started; null when the
+   * watch on the pull request is someone else's or there is none. Only this watch is ever ended.
    */
   readonly watchStartedAt: string | null;
   /**
-   * The feedback wakes the delivery took as its own, oldest first: those it adopted as rounds and
-   * those pending. They are Factory's turns when a cancel stops what its threads run.
+   * Every wake of the pull request the delivery took, oldest first: those it adopted as rounds,
+   * those pending, and notices. Each is taken once, and they are Factory's turns when a cancel
+   * stops what its threads run.
    */
   readonly runs: ReadonlyArray<RunId>;
   /**
-   * Of `runs`, the wakes that came while the delivery ran a stage or waited on its owner, oldest
-   * first: each is adopted once the delivery can take it, before its branch is judged or once its
-   * pull request is open again.
+   * Of `runs`, the feedback that came while the delivery ran a stage or waited on its owner,
+   * oldest first: each is adopted once the delivery can take it, before its branch is judged or
+   * once its pull request is open again.
    */
   readonly pending: ReadonlyArray<RunId>;
   /**
-   * Set when core's watch ended with a wake (it could not read the pull request, or stopped after
-   * too many comment-only updates): no feedback reaches the delivery any more, so it blocks where
-   * it would wait on its pull request, and only a resume starts the watch again.
+   * Set when core's watch ended with a wake (it could not read the pull request, it closed, or
+   * core stopped after too many comment-only updates): no feedback reaches the delivery any more,
+   * so it blocks where it would wait on its pull request, and only a resume starts a watch again.
    */
   readonly watchEnded: boolean;
+  /**
+   * Set while Factory's watch (`watchStartedAt`) must be ended: the delivery was cancelled, or
+   * its watch command started again a watch core had ended. Cleared once it is ended or found
+   * gone; the boot sweep ends it when a stop came first, cancelled deliveries included.
+   */
+  readonly releaseWatch: boolean;
 }
 
 /**
@@ -378,6 +391,13 @@ export interface FactoryFollowThrough {
  * of the watch (core stopped watching it).
  */
 export type FactoryWakeKind = "feedback" | "notice" | "ended";
+
+/** What a watch command left on the pull request; see the `pr.opened` event. */
+export interface FactoryWatchStarted {
+  readonly after: number;
+  readonly startedAt: string | null;
+  readonly created: boolean;
+}
 
 /** The wake runs the delivery took as its own; see `FactoryFollowThrough.runs`. */
 export const adoptedRuns = (delivery: FactoryDeliveryState): ReadonlyArray<RunId> =>
@@ -529,7 +549,8 @@ export type FactoryEvent =
     }
   /**
    * An `open_pr` result. `watch` is the watch the worker started on a single item's pull request:
-   * its command's event-log position and when it started; absent when it started none.
+   * its command's event-log position, when the watch on the pull request started, and whether
+   * that command started it (core keeps a watch already on); absent when it started none.
    * `watchFailure` is set instead when the watch could not start: the pull request is published
    * all the same, so it is recorded; the text is bounded and safe to show.
    */
@@ -537,9 +558,14 @@ export type FactoryEvent =
       readonly type: "pr.opened";
       readonly effectId: number;
       readonly pullRequest: FactoryOpenedPullRequest;
-      readonly watch?: { readonly after: number; readonly startedAt: string | null };
+      readonly watch?: FactoryWatchStarted;
       readonly watchFailure?: string;
     }
+  /**
+   * Factory's watch that started at `startedAt` was ended, or found gone or someone else's, so
+   * it holds none. Taken in any status: a cancelled delivery releases its watch too.
+   */
+  | { readonly type: "watch.released"; readonly startedAt: string | null }
   /**
    * A pull request watch's wake, as core queued it on the thread a delivery's pull request is
    * linked to: the wake's run, what it reports, the pull request it reports on by number and URL,

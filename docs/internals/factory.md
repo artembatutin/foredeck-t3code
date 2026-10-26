@@ -548,42 +548,45 @@ A wake is identified by its command, not its text: the run's command receipt is 
 `thread.pull-request-watch.sync`, and the link that command updated names the pull request
 ([`FactoryReactor.ts`](../../apps/server/src/fd/factory/FactoryReactor.ts)). What it reports is
 read from what that command committed, too. A command that ended the watch is the watch's end:
-core could not read the pull request, or stopped after too many comment-only updates. No feedback
-reaches the delivery after that, so it blocks where it would wait on the pull request, and Factory
-never starts that watch again on its own, which would defeat core's limits; a resume is the owner
-watching it again. A notification of completed work reports only passing checks, which is no
-round. Everything else is feedback.
+core could not read the pull request, it closed, or core stopped after too many comment-only
+updates. No feedback reaches the delivery after that, so it blocks where it would wait on the pull
+request, and Factory never starts that watch again on its own, which would defeat core's limits; a
+resume is the owner watching it again. A notification of completed work reports only passing
+checks, which is no round. Everything else is feedback.
 
-The watch keeps waking the author thread while the delivery runs a stage or waits on its owner,
-and those wakes are the delivery's too: core runs them on its author thread whatever Factory does.
-The delivery records each and adopts it once it can: before it next judges the branch after an
-author turn, since a wake queued behind that turn would otherwise work while verify and review
-read the branch, or else once its pull request is open again. A commit such a wake lands during
-verify or review is still refused by the receipt and review checks. Only a wake committed after
-the watch command of the delivery's last PR stage counts, so one answered before is not taken
-again; the delivery stores that command's event-log position. The worker starts that watch and
-stores the opened pull request in one hold of the delivery's lock, so a wake committed after the
-watch steps the delivery only once the pull request is recorded. The boot sweep reads the author
-thread's log after that position, for any delivery that follows its pull request, to find the
-wakes that came while no server ran Factory; the engine takes each run once. A wake can end before
-the step that adopts it is stored, when no stage attempt named its thread for its end to reach, so
-the worker reads whether an adopted run has ended right after storing the step.
+Every wake of the pull request on the author thread after the delivery's first watch command is
+the delivery's, whatever it reports, and is taken once, by its run: core runs it on the author
+thread whatever Factory does, so a cancel stops it as Factory's turn, the last comment-limit wake
+included. The position of that first command is stored and never moves. Moving it to each later
+watch command passed over wakes committed while a PR stage started the watch again but stepped
+after it, since their steps wait for the lock that stage holds. Feedback that comes while the
+delivery runs a stage or waits on its owner waits, and is adopted before the delivery next judges
+the branch after an author turn (a wake queued behind that turn would otherwise work while verify
+and review read the branch), or else once its pull request is open again; a stop the owner asked
+for still holds. A commit such a wake lands during verify or review is still refused by the receipt
+and review checks. The boot sweep reads the author thread's log after the first command, for any
+delivery that follows its pull request, to find the wakes that came while no server ran Factory. A
+wake can end before the step that adopts it is stored, when no stage attempt named its thread for
+its end to reach, so the worker reads whether an adopted run has ended right after storing the
+step.
 
 A round publishes with a push of the approved commit by its id, never `create_pr` again: the
 stacked action opens a new pull request when the branch has no open one, so a pull request merged
 or closed before core's sync stored it would get a second. The PR stage then starts the watch
 again, which keeps a watch still on and restarts one the agent ended: core's wake text tells the
-agent to unwatch when it hands the work back. A pull request the PR stage published but could not
-watch, as on an author thread its owner settled, is recorded before the delivery blocks, so its
-merge or close is taken and a resume pushes to it rather than opening another.
+agent to unwatch when it hands the work back. The position of that latest command is stored too: a
+watch's end committed before it means the command started again a watch core had ended, and
+Factory ends that watch as soon as the end reaches it. A pull request the PR stage published but
+could not watch, as on an author thread its owner settled, is recorded before the delivery blocks,
+so its merge or close is taken and a resume pushes to it rather than opening another.
 
-The wake's message is core's, so its run would not pass for Factory's turn when a cancel stops
-what the delivery's threads run (see [cancel](#stop-waits-for-a-stage-boundary-cancel-does-not)).
-The delivery therefore records the wakes it took, and they and their restart continuations count
-as Factory's: a wake run queued behind another run cannot be interrupted before it starts, and is
-stopped once it goes live. A cancel also ends the watch the PR stage started, which would wake the
-thread to new work, but only that watch, recognized by when it started: one the owner started
-since is theirs.
+Factory holds only a watch its own command started: core keeps a watch already on, whoever started
+it, so the PR stage records the watch as Factory's only when its command's event is the watch's
+start, and keeps holding an earlier one of its own that the command kept. Only the watch it holds
+is ever ended. A cancel ends it, since it would wake the thread to new work, as does a watch end
+that the latest command passed over. The delivery's state asks for that release in the step that
+decides it, and a later step clears it once the watch is ended or found gone, so a server that
+stopped in between leaves it asked for; the boot sweep then ends it, cancelled deliveries included.
 
 ## Each transition posts one Work comment, from the step that stored it
 

@@ -182,7 +182,7 @@ const fakes = (world: World) =>
       dispatch: (command) =>
         Effect.sync(() => {
           world.dispatched.push(command);
-          return { sequence: world.dispatched.length } as never;
+          return { sequence: world.dispatched.length, storedEvents: [] } as never;
         }),
     }),
     Layer.mock(ProjectService.ProjectService)({ getShell: () => Effect.succeedNone }),
@@ -458,11 +458,13 @@ describe("the PR stage", () => {
         // Wakes committed after the watch's command are the delivery's to adopt.
         assert.deepStrictEqual(state.followThrough, {
           watchedAfter: 2,
-          // The fake thread shell holds no link, so no watch is read back.
+          armedAt: 2,
+          // The fake thread shell holds no link, so no watch is read back as Factory's.
           watchStartedAt: null,
           runs: [],
           pending: [],
           watchEnded: false,
+          releaseWatch: false,
         });
         // Published the approved commit, which the worktree still holds, clean.
         assert.strictEqual(yield* publishedOf(cwd), reviewed);

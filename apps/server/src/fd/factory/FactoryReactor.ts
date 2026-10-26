@@ -247,8 +247,8 @@ const make = Effect.gen(function* () {
 
   /**
    * The wakes core queued for a delivery's open pull request on its author thread while no server
-   * ran Factory: each run created there since the watch its PR stage started, stepped in order as
-   * the tail would have stepped it. The engine takes each run once, so a sweep run again takes
+   * ran Factory: each run created there since the delivery's first watch command, stepped in order
+   * as the tail would have stepped it. The engine takes each run once, so a sweep run again takes
    * nothing new. Nothing for a delivery whose pull request is not watched, or no longer open.
    */
   const catchUpFeedback = (deliveryId: FactoryDeliveryId) =>
@@ -337,12 +337,16 @@ const make = Effect.gen(function* () {
 
   // Comments a previous process recorded and never finished go first, in their order. Work a
   // cancelled delivery's thread carried on after the restart is stopped last, once every
-  // cancellation the restart cut short is complete.
+  // cancellation the restart cut short is complete, and so are the watches such a cancellation
+  // left to end.
   const bootSweep = worker.postUnfinishedComments.pipe(
     Effect.catchCause(logSkipped("factory comment recovery failed")),
     Effect.andThen(deliveries.listActive()),
     Effect.flatMap((active) => Effect.forEach(active, reconcile, { discard: true })),
     Effect.catchCause(logSkipped("factory boot reconcile failed")),
+    Effect.andThen(
+      worker.releaseWatches.pipe(Effect.catchCause(logSkipped("factory watch release failed"))),
+    ),
     Effect.andThen(worker.stopCancelledRuns),
   );
 

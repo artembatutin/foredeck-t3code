@@ -214,6 +214,12 @@ export class FactoryWorker extends Context.Service<
      */
     readonly postUnfinishedComments: Effect.Effect<void, FactoryStoreError>;
     /**
+     * Ends the pull request watch of each delivery whose state still asks for it, cancelled ones
+     * included: a process that stopped between storing a cancel and ending the watch left it on,
+     * to wake the author thread to new work. The boot sweep calls this.
+     */
+    readonly releaseWatches: Effect.Effect<void, FactoryStoreError>;
+    /**
      * Resolves once every queued effect and every step its result fed back have finished, and
      * every Work comment queued has been posted, has failed or was found finished already.
      */
@@ -691,16 +697,6 @@ const make = Effect.gen(function* () {
         );
       }
       yield* stopRetiredRuns(deliveryId, recorded);
-      // The watch its PR stage started would wake the author thread to new work.
-      if (before.followThrough !== undefined) {
-        yield* Effect.suspend(() => pullRequests.unwatch(stored)).pipe(
-          Effect.catchCause((cause) =>
-            Cause.hasInterruptsOnly(cause)
-              ? Effect.interrupt
-              : Effect.logWarning("factory could not end a cancelled delivery's watch", cause),
-          ),
-        );
-      }
       // A parent's children go with it, the one it waits for and those it never started, and
       // stop what their threads run; an approved child keeps its approval.
       for (const childId of before.children) yield* cancelChild(childId);
@@ -709,9 +705,42 @@ const make = Effect.gen(function* () {
     if (next.delivery.status === "done" && before.status !== "done") {
       for (const childId of before.children) yield* finishChild(childId);
     }
+    // The watch Factory holds is to be ended (see `followThrough.releaseWatch`).
+    const released =
+      next.delivery.followThrough?.releaseWatch === true &&
+      before.followThrough?.releaseWatch !== true
+        ? yield* releaseWatch(stored)
+        : undefined;
     const taken = yield* takeEndedWake(deliveryId, before, next.delivery);
-    return taken ?? Option.some(stored);
+    return taken ?? released ?? Option.some(stored);
   });
+
+  /**
+   * Ends the watch the delivery holds, as its state asks, then steps that it holds none. A watch
+   * already gone, or someone else's, needs no ending. A failure is logged and leaves the release
+   * marked, for the next boot sweep. Undefined when nothing was stepped.
+   */
+  // Annotated: it closes the cycle `stepLocked` → `releaseWatch`.
+  const releaseWatch = (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+  ): Effect.Effect<
+    Option.Option<FactoryDeliveryStore.StoredFactoryDelivery> | undefined,
+    FactoryStoreError
+  > =>
+    Effect.gen(function* () {
+      const followThrough = delivery.state.followThrough;
+      if (followThrough?.releaseWatch !== true) return undefined;
+      const ended = yield* Effect.exit(Effect.suspend(() => pullRequests.unwatch(delivery)));
+      if (Exit.isFailure(ended)) {
+        if (Cause.hasInterruptsOnly(ended.cause)) return yield* Effect.interrupt;
+        yield* Effect.logWarning("factory could not end its pull request watch", ended.cause);
+        return undefined;
+      }
+      return yield* stepLocked(delivery.deliveryId, {
+        type: "watch.released",
+        startedAt: followThrough.watchStartedAt,
+      });
+    });
 
   /**
    * Steps the end of a wake run the step just adopted as a round, when that run has already
@@ -1288,6 +1317,17 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const releaseWatches: FactoryWorker["Service"]["releaseWatches"] = Effect.gen(function* () {
+    for (const { deliveryId } of yield* deliveries.listReleasingWatch()) {
+      yield* locks.withLock(
+        deliveryId,
+        Effect.flatMap(deliveries.get(deliveryId), (current) =>
+          Option.isNone(current) ? Effect.void : Effect.asVoid(releaseWatch(current.value)),
+        ),
+      );
+    }
+  });
+
   return FactoryWorker.of({
     step,
     stepWith,
@@ -1298,6 +1338,7 @@ const make = Effect.gen(function* () {
     stopCancelledRun,
     stopCancelledRuns,
     postUnfinishedComments,
+    releaseWatches,
     drain: TxRef.get(outstanding).pipe(
       Effect.flatMap((count) => (count > 0 ? Effect.txRetry : Effect.void)),
       Effect.tx,

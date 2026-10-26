@@ -276,12 +276,14 @@ const StoredDeliveryState = Schema.Struct({
   followThrough: Schema.optionalKey(
     Schema.Struct({
       watchedAfter: NonNegativeInt,
+      armedAt: NonNegativeInt.pipe(Schema.withDecodingDefault(Effect.succeed(0))),
       watchStartedAt: Schema.NullOr(Schema.String).pipe(
         Schema.withDecodingDefault(Effect.succeed(null)),
       ),
       runs: Schema.Array(RunId),
       pending: Schema.Array(RunId).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
       watchEnded: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+      releaseWatch: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
     }),
   ),
   block: Schema.NullOr(StoredBlock),
@@ -387,6 +389,14 @@ export class FactoryDeliveryStore extends Context.Service<
       readonly projectId?: ProjectId;
       readonly itemRef?: WorkItemRef;
     }) => Effect.Effect<ReadonlyArray<StoredFactoryDelivery>, FactoryStoreError>;
+    /**
+     * Deliveries, done and cancelled ones included, that must still end the pull request watch
+     * Factory holds (`followThrough.releaseWatch`), oldest first, for the boot sweep.
+     */
+    readonly listReleasingWatch: () => Effect.Effect<
+      ReadonlyArray<StoredFactoryDelivery>,
+      FactoryStoreError
+    >;
   }
 >()("t3/fd/factory/persistence/FactoryDeliveryStore") {}
 
@@ -401,6 +411,7 @@ const make = Effect.gen(function* () {
       projectId: Schema.optional(ProjectId),
       itemRef: Schema.optional(WorkItemRef),
       activeOnly: Schema.optional(Schema.Boolean),
+      releasingWatch: Schema.optional(Schema.Boolean),
       newestFirst: Schema.optional(Schema.Boolean),
     }),
     Result: DeliveryDbRow,
@@ -423,6 +434,9 @@ const make = Effect.gen(function* () {
           ? []
           : [sql`source_id = ${request.itemRef.sourceId} AND item_id = ${request.itemRef.itemId}`]),
         ...(request.activeOnly === true ? [sql`status NOT IN ('done', 'cancelled')`] : []),
+        ...(request.releasingWatch === true
+          ? [sql`json_extract(state_json, '$.followThrough.releaseWatch') = 1`]
+          : []),
       ])}
       ${
         request.newestFirst === true
@@ -527,6 +541,11 @@ const make = Effect.gen(function* () {
       }).pipe(
         Effect.map((rows) => rows.map(fromRow)),
         Effect.catchTags(FactoryStoreError.catchStorage("deliveries.list")),
+      ),
+    listReleasingWatch: () =>
+      selectDeliveries({ releasingWatch: true }).pipe(
+        Effect.map((rows) => rows.map(fromRow)),
+        Effect.catchTags(FactoryStoreError.catchStorage("deliveries.listReleasingWatch")),
       ),
   });
 });

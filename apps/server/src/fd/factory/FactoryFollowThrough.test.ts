@@ -105,10 +105,13 @@ describe("Factory follow-through: watching the pull request", () => {
         assert.strictEqual(receipt.commandType, "thread.pull-request.watch");
         assert.deepStrictEqual(state.followThrough, {
           watchedAfter: receipt.resultSequence,
+          armedAt: receipt.resultSequence,
+          // Its own command started the watch, so the watch is Factory's.
           watchStartedAt: watch.startedAt,
           runs: [],
           pending: [],
           watchEnded: false,
+          releaseWatch: false,
         });
 
         // The PR step taken again changes nothing.
@@ -118,7 +121,11 @@ describe("Factory follow-through: watching the pull request", () => {
             type: "pr.opened",
             effectId: state.effectsIssued,
             pullRequest: state.pullRequest ?? assert.fail("No pull request."),
-            watch: { after: receipt.resultSequence + 50, startedAt: watch.startedAt },
+            watch: {
+              after: receipt.resultSequence + 50,
+              startedAt: watch.startedAt,
+              created: true,
+            },
           })
           .pipe(Effect.orDie);
         yield* drainFactory;
@@ -228,10 +235,13 @@ describe("Factory follow-through: a round after its run", () => {
         assert.deepStrictEqual(reopened.pullRequest, state.pullRequest);
         assert.strictEqual(reopened.reviews.length, 2);
         assert.deepStrictEqual(reopened.followThrough?.runs, [wakeRun]);
+        // The republish's watch command is later; wakes still count from the first.
+        assert.strictEqual(reopened.followThrough?.watchedAfter, state.followThrough?.watchedAfter);
         assert.isAbove(
-          reopened.followThrough?.watchedAfter ?? 0,
-          state.followThrough?.watchedAfter ?? Number.POSITIVE_INFINITY,
+          reopened.followThrough?.armedAt ?? 0,
+          state.followThrough?.armedAt ?? Number.POSITIVE_INFINITY,
         );
+        assert.strictEqual(reopened.followThrough?.watchStartedAt, watch?.startedAt);
         // Published again by its id: a push to the pull request it opened, never a second one.
         assert.strictEqual(world.pullRequestCalls.length, 2);
         const [, republished] = world.pullRequestCalls;
@@ -470,6 +480,39 @@ describe("Factory follow-through: wakes that come during a round", () => {
   );
 });
 
+describe("Factory follow-through: a stop with a wake pending", () => {
+  it.live("keeps the owner's stop through a wake queued behind the round's run", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const { deliveryId, threadId: author, state } = yield* openSingle(world);
+        const first = yield* wakeStarted(author, fakePullRequest.number);
+        const second = yield* wakeThread(author, yield* linkOf(author, fakePullRequest.number));
+        yield* drainOrchestration;
+        yield* drainFactory;
+        yield* Effect.flatMap(service, (factory) => factory.stop(deliveryId)).pipe(Effect.orDie);
+        assert.strictEqual((yield* stateOf(deliveryId)).status, "stopping");
+
+        // The round waits for the queued wake, still stopping.
+        yield* world.endRun(first, "completed");
+        yield* started(second);
+        yield* drainFactory;
+        const waiting = yield* stateOf(deliveryId);
+        assert.strictEqual(waiting.status, "stopping");
+        assert.deepStrictEqual(waiting.awaiting, { type: "run", threadId: author, runId: second });
+
+        // Its end has the branch settled, and the delivery stops where verify would begin.
+        yield* world.endRun(second, "completed");
+        const stopped = yield* stateOf(deliveryId);
+        assert.strictEqual(stopped.status, "stopped");
+        assert.strictEqual(stopped.checkpoint, "verify");
+        assert.isNull(stopped.awaiting);
+        assert.deepStrictEqual(stopped.receipts, state.receipts);
+        assert.strictEqual(world.pullRequestCalls.length, 1);
+      }),
+    ),
+  );
+});
+
 describe("Factory follow-through: what a wake reports", () => {
   it.live("takes new comments as a round, and passing checks as nothing to repair", () =>
     withProject(verifyCommands.passes, (world) =>
@@ -481,15 +524,23 @@ describe("Factory follow-through: what a wake reports", () => {
           undefined,
           "checks-passed",
         );
-        assert.deepStrictEqual(yield* stateOf(deliveryId), state);
+        // Its run is the delivery's to cancel, and nothing else changes.
+        const noticed = yield* stateOf(deliveryId);
+        assert.deepStrictEqual(noticed, {
+          ...state,
+          followThrough: {
+            ...(state.followThrough ?? assert.fail("Not watched.")),
+            runs: [passed],
+          },
+        });
         yield* world.endRun(passed, "completed");
-        assert.deepStrictEqual(yield* stateOf(deliveryId), state);
+        assert.deepStrictEqual(yield* stateOf(deliveryId), noticed);
 
         const remarks = yield* wakeStarted(author, fakePullRequest.number, undefined, "remarks");
         const adopted = yield* stateOf(deliveryId);
         assert.strictEqual(adopted.status, "running");
         assert.deepStrictEqual(adopted.awaiting, { type: "run", threadId: author, runId: remarks });
-        assert.deepStrictEqual(adopted.followThrough?.runs, [remarks]);
+        assert.deepStrictEqual(adopted.followThrough?.runs, [passed, remarks]);
       }),
     ),
   );
@@ -512,7 +563,10 @@ describe("Factory follow-through: what a wake reports", () => {
           const blocked = yield* stateOf(deliveryId);
           assert.strictEqual(blocked.status, "blocked");
           assert.deepStrictEqual(blocked.block, { reason: "watch_ended" });
-          assert.deepStrictEqual(blocked.followThrough?.runs, []);
+          // The notice's run is the delivery's to cancel; core's watch is gone with it.
+          assert.deepStrictEqual(blocked.followThrough?.runs, [notice]);
+          assert.deepStrictEqual(blocked.followThrough?.pending, []);
+          assert.isNull(blocked.followThrough?.watchStartedAt);
           assert.isUndefined((yield* linkOf(author, fakePullRequest.number)).watch);
           assert.deepStrictEqual(commentsSince(world, comments), [
             `Factory is blocked on this item and needs you. The pull request's watch ended, so Factory no longer follows its feedback. Resume or cancel the delivery in Foredeck. Factory delivery ${deliveryId}, update 3.`,
@@ -555,6 +609,7 @@ describe("Factory follow-through: what a wake reports", () => {
         const flagged = yield* stateOf(deliveryId);
         assert.strictEqual(flagged.status, "running");
         assert.isTrue(flagged.followThrough?.watchEnded);
+        assert.deepStrictEqual(flagged.followThrough?.runs, [first, last]);
         assert.deepStrictEqual(flagged.followThrough?.pending, []);
         yield* world.endRun(last, "completed");
 
@@ -664,6 +719,54 @@ describe("Factory follow-through: a pull request whose watch could not start", (
         );
         assert.isDefined((yield* linkOf(author, fakePullRequest.number)).watch);
         assert.isFalse(reopened.followThrough?.watchEnded);
+      }),
+    ),
+  );
+});
+
+describe("Factory follow-through: a watch the owner started first", () => {
+  it.live("keeps the owner's watch Factory found on, through a resume and a cancel", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        // Published while its author thread was settled, so Factory started no watch.
+        const author = yield* world.start;
+        yield* authorCommits(author.worktreePath, "feat: add the export button");
+        yield* world.endRun(author.runId, "completed");
+        const reviewer = yield* awaitedRun(author.deliveryId);
+        yield* Effect.flatMap(service, (factory) =>
+          factory.submitReview({ threadId: reviewer.threadId, review: passingReview() }),
+        );
+        yield* settleThread(author.threadId);
+        yield* world.endRun(reviewer.runId, "completed");
+        assert.strictEqual((yield* stateOf(author.deliveryId)).status, "blocked");
+
+        // The owner unsettles the thread and watches the pull request before resuming.
+        yield* unsettleThread(author.threadId);
+        const link = yield* linkOf(author.threadId, fakePullRequest.number);
+        yield* watchPullRequest(author.threadId, link);
+        const owners = (yield* linkOf(author.threadId, fakePullRequest.number)).watch;
+        assert.isDefined(owners);
+        yield* Effect.flatMap(service, (factory) => factory.resume(author.deliveryId)).pipe(
+          Effect.orDie,
+        );
+        yield* drainFactory;
+        const reopened = yield* stateOf(author.deliveryId);
+        assert.strictEqual(reopened.status, "pr_open");
+        // Core kept the owner's watch, which Factory follows but does not hold.
+        assert.deepStrictEqual(
+          (yield* linkOf(author.threadId, fakePullRequest.number)).watch,
+          owners,
+        );
+        assert.isNull(reopened.followThrough?.watchStartedAt);
+
+        yield* Effect.flatMap(service, (factory) => factory.cancel(author.deliveryId)).pipe(
+          Effect.orDie,
+        );
+        yield* drainFactory;
+        assert.deepStrictEqual(
+          (yield* linkOf(author.threadId, fakePullRequest.number)).watch,
+          owners,
+        );
       }),
     ),
   );

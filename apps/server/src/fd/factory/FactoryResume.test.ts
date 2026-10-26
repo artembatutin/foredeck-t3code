@@ -229,7 +229,7 @@ const fakes = (world: World) =>
       dispatch: (command) =>
         Effect.sync(() => {
           world.dispatched.push(command);
-          return { sequence: world.dispatched.length } as never;
+          return { sequence: world.dispatched.length, storedEvents: [] } as never;
         }),
     }),
     Layer.mock(ProjectService.ProjectService)({ getShell: () => Effect.succeedNone }),
