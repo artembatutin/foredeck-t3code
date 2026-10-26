@@ -294,11 +294,18 @@ describe("Factory follow-through of a parent: watching its pull request", () => 
 
 describe("Factory follow-through of a parent: a round", () => {
   it.live.each([
-    { name: "a fix the wake's run commits", commits: true },
-    { name: "a HEAD the wake's run left as it was", commits: false },
-  ])(
-    "verifies, integrates and records $name, then pushes it to the same pull request",
-    ({ commits }) =>
+    { wake: "new comments", report: "remarks", answer: "a fix it commits", commits: true },
+    { wake: "new comments", report: "remarks", answer: "an unchanged HEAD", commits: false },
+    { wake: "failed checks", report: "checks-failed", answer: "a fix it commits", commits: true },
+    {
+      wake: "failed checks",
+      report: "checks-failed",
+      answer: "an unchanged HEAD",
+      commits: false,
+    },
+  ] as const)(
+    "after a wake for $wake, verifies, integrates and records $answer, then pushes it to the same pull request",
+    ({ report, commits }) =>
       withProject(verifyCommands.passes, (world) =>
         Effect.gen(function* () {
           const parent = yield* openParent(world);
@@ -308,7 +315,12 @@ describe("Factory follow-through of a parent: a round", () => {
           const watch = (yield* linkOf(last.author, fakePullRequest.number)).watch;
 
           // The wake core queues on the last child's author thread is the parent's round.
-          const wakeRun = yield* wakeStarted(last.author, fakePullRequest.number);
+          const wakeRun = yield* wakeStarted(
+            last.author,
+            fakePullRequest.number,
+            undefined,
+            report,
+          );
           const adopted = yield* stateOf(deliveryId);
           assert.strictEqual(adopted.status, "running");
           assert.strictEqual(adopted.stage, "follow_through");
