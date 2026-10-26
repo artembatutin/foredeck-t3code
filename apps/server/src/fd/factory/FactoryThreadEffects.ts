@@ -250,12 +250,14 @@ export class FactoryThreadEffects extends Context.Service<
     ) => Effect.Effect<RunId | null, ProjectionStore.ProjectionStoreV2Error>;
     /**
      * Whether the run carries on a turn Factory sent on the thread: the run's own message is
-     * Factory's, or the run continues, through a server restart's continuations, a run whose is.
-     * A turn the owner sent on the thread, and its continuations, are not.
+     * Factory's, or it is one of `adopted` (pull request wakes the delivery took as its
+     * follow-through rounds), or the run continues, through a server restart's continuations, a
+     * run that is. A turn the owner sent on the thread, and its continuations, are not.
      */
     readonly carriesFactoryTurn: (
       threadId: ThreadId,
       runId: RunId,
+      adopted: ReadonlyArray<RunId>,
     ) => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
     /**
      * The run each of the threads is live in now, archived or not; a thread running nothing, or
@@ -799,13 +801,13 @@ const make = Effect.gen(function* () {
               : shell.activeRunId,
           ),
         ),
-    carriesFactoryTurn: (threadId, runId) =>
+    carriesFactoryTurn: (threadId, runId, adopted) =>
       projections.getThreadRecords(threadId, ["runs"]).pipe(
         Effect.map(({ runs }) => {
           let run = runs.find((candidate) => candidate.id === runId);
           // Each continuation names the run it continues; a chain is never longer than the runs.
           for (let hops = 0; run !== undefined && hops <= runs.length; hops += 1) {
-            if (FACTORY_MESSAGE.test(run.userMessageId)) return true;
+            if (FACTORY_MESSAGE.test(run.userMessageId) || adopted.includes(run.id)) return true;
             const continued = run.restartContinuationOfRunId;
             run =
               continued === undefined

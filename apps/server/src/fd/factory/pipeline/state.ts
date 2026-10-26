@@ -339,6 +339,18 @@ export interface FactoryOpenedPullRequest {
 export type FactoryPullRequestOutcome = "merged" | "closed";
 
 /**
+ * How a single item follows the feedback on its open pull request: the event-log position of the
+ * watch its PR stage last started there, after which a wake core queues for that pull request on
+ * its author thread is the delivery's to adopt as a follow-through round; and the runs of the
+ * wakes it adopted, oldest first, which are Factory's turns when a cancel stops what its threads
+ * run.
+ */
+export interface FactoryFollowThrough {
+  readonly watchedAfter: number;
+  readonly runs: ReadonlyArray<RunId>;
+}
+
+/**
  * What a resume of a stopped or blocked delivery found, read under the delivery's lock right
  * before the engine decides where it picks up.
  */
@@ -482,11 +494,28 @@ export type FactoryEvent =
       readonly effectId: number;
       readonly outcome: FactoryRecordOutcome;
     }
-  /** An `open_pr` result. */
+  /**
+   * An `open_pr` result. `watchedAfter` is the event-log position of the watch the worker started
+   * on the pull request, for a single item; absent when it started none.
+   */
   | {
       readonly type: "pr.opened";
       readonly effectId: number;
       readonly pullRequest: FactoryOpenedPullRequest;
+      readonly watchedAfter?: number;
+    }
+  /**
+   * A pull request watch's wake, as core queued it on the thread a delivery's pull request is
+   * linked to: the wake's run, the pull request it reports on by number and URL, and the event-log
+   * position of the command that queued it.
+   */
+  | {
+      readonly type: "pr.feedback";
+      readonly threadId: ThreadId;
+      readonly runId: RunId;
+      readonly number: number;
+      readonly url: string;
+      readonly sequence: number;
     }
   /**
    * A pull request left `open`, as core's pull request sync stored it on the thread the delivery's
@@ -666,6 +695,12 @@ export interface FactoryDeliveryState {
   readonly approvedChildren: ReadonlyArray<FactoryDeliveryId>;
   /** Set once the PR stage has opened the delivery's pull request. */
   readonly pullRequest: FactoryOpenedPullRequest | null;
+  /**
+   * Set once the PR stage has started a watch on a single item's pull request; absent before, for
+   * parents and children, and for deliveries whose pull request opened before follow-through
+   * rounds existed, whose feedback nothing adopts.
+   */
+  readonly followThrough?: FactoryFollowThrough;
   /** Set while the delivery is blocked. */
   readonly block: FactoryBlock | null;
   /**

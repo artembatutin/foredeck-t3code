@@ -198,6 +198,8 @@ const fakes = (world: World) =>
 const openedPullRequest = Layer.mock(FactoryPullRequest.FactoryPullRequest)({
   open: () =>
     Effect.succeed({ number: 7, url: "https://github.com/acme/alpha/pull/7", headBranch: branch }),
+  // Follow-through rounds are FactoryFollowThrough.test.ts's; nothing here watches the pull request.
+  watch: () => Effect.succeedNone,
 });
 
 /**

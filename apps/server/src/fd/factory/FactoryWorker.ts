@@ -190,11 +190,13 @@ export class FactoryWorker extends Context.Service<
     ) => Effect.Effect<void, FactoryStoreError>;
     /**
      * Interrupts a live run on a thread of a cancelled delivery when it carries on a turn Factory
-     * sent. A cancel commits before it interrupts what its threads run, so a server that stopped
-     * in between leaves that work to core's restart continuation, which carries it on in a new run
-     * the cancelled delivery never takes. The owner's own turns on the thread are left alone. A
-     * failure is logged, as a cancel's interrupt is. The reactor calls this as such a run goes
-     * live, and a cancel for the runs on the threads its delivery no longer records per role.
+     * sent, or a pull request wake the delivery adopted as a follow-through round. A cancel
+     * commits before it interrupts what its threads run, so a server that stopped in between
+     * leaves that work to core's restart continuation, which carries it on in a new run the
+     * cancelled delivery never takes; a wake run queued behind another run cannot be interrupted
+     * before it starts. The owner's own turns on the thread are left alone. A failure is logged,
+     * as a cancel's interrupt is. The reactor calls this as such a run goes live, and a cancel for
+     * the runs on the threads its delivery no longer records per role.
      */
     readonly stopCancelledRun: (run: {
       readonly threadId: ThreadId;
@@ -551,9 +553,18 @@ const make = Effect.gen(function* () {
       // owner's that the plan is.
       const wanting =
         after.stage === "repair" || (before.stage === "approve_plan" && after.stage === "plan");
+      // A pull request that merged or closed during a follow-through round cuts its stage short.
+      const superseded =
+        before.pullRequest?.outcome === undefined && after.pullRequest?.outcome !== undefined;
       yield* stageRuns.finish({
         ...attemptOf(active),
-        outcome: advanced ? (wanting ? "failed" : "passed") : outcomeOf(after),
+        outcome: advanced
+          ? superseded
+            ? "cancelled"
+            : wanting
+              ? "failed"
+              : "passed"
+          : outcomeOf(after),
         ...(path === undefined ? {} : { evidencePath: path }),
         ...(fingerprint === undefined ? {} : { fingerprint }),
       });
@@ -939,6 +950,51 @@ const make = Effect.gen(function* () {
     );
   };
 
+  /**
+   * Feeds back an opened pull request: starts its watch, then stores the result with the watch's
+   * event-log position, both under the delivery's lock and only while the delivery still awaits
+   * this effect. A wake committed after the watch started then steps the delivery only once the
+   * pull request is stored, so none falls in between. A watch that cannot start fails the effect.
+   */
+  const openedPullRequest = (job: Job, event: Extract<FactoryEvent, { type: "pr.opened" }>) => {
+    const { deliveryId } = job.delivery;
+    const { effect } = job;
+    return locks.withLock(
+      deliveryId,
+      Effect.gen(function* () {
+        const current = Option.getOrUndefined(yield* deliveries.get(deliveryId));
+        const awaiting = current?.state.awaiting;
+        if (
+          current === undefined ||
+          effect.type !== "open_pr" ||
+          awaiting?.type !== "effect" ||
+          awaiting.effect.id !== effect.id
+        ) {
+          // Stale: the engine takes nothing of it.
+          return yield* stepLocked(deliveryId, event);
+        }
+        const watched = yield* Effect.exit(
+          Effect.suspend(() => pullRequests.watch(current, effect, event.pullRequest)),
+        );
+        if (Exit.isFailure(watched)) {
+          if (Cause.hasInterruptsOnly(watched.cause)) return yield* Effect.interrupt;
+          return yield* stepLocked(deliveryId, {
+            type: "effect.failed",
+            effectId: effect.id,
+            detail: failureDetail(effect, watched.cause),
+          });
+        }
+        return yield* stepLocked(
+          deliveryId,
+          Option.match(watched.value, {
+            onNone: () => event,
+            onSome: (watchedAfter) => ({ ...event, watchedAfter }),
+          }),
+        );
+      }),
+    );
+  };
+
   /** The run a launch or turn result names; other results name none. */
   const runOf = (effect: FactoryEffect, event: FactoryEvent) => {
     if (event.type === "thread.launched") return { threadId: event.threadId, runId: event.runId };
@@ -965,6 +1021,7 @@ const make = Effect.gen(function* () {
   const feed = (job: Job, event: FactoryEvent): ReturnType<FactoryWorker["Service"]["step"]> => {
     const { deliveryId } = job.delivery;
     if (event.type === "closed_out") return closeOutWorktree(job, event);
+    if (event.type === "pr.opened") return openedPullRequest(job, event);
     if (event.type === "child.started") {
       // The child runs from its start on, and its approval may be stored before the parent
       // waits for it; the parent then takes it at once.
@@ -1097,7 +1154,8 @@ const make = Effect.gen(function* () {
       if (deliveryId === undefined) return;
       const delivery = Option.getOrUndefined(yield* deliveries.get(deliveryId));
       if (delivery?.state.status !== "cancelled") return;
-      if (!(yield* threads.carriesFactoryTurn(run.threadId, run.runId))) return;
+      const adopted = delivery.state.followThrough?.runs ?? [];
+      if (!(yield* threads.carriesFactoryTurn(run.threadId, run.runId, adopted))) return;
       yield* interruptCancelled(delivery, run);
     }).pipe(
       Effect.catchCause((cause) =>

@@ -247,8 +247,9 @@ describe("Factory engine: merges and closes it does not take", () => {
     }
   });
 
-  it("ignores them in every other status, terminal ones included", () => {
-    for (const status of ["running", "approved", "blocked", "done", "cancelled"] as const) {
+  // A follow-through round takes them in any other status: engine.followThrough.test.ts.
+  it("ignores them once the delivery is done or cancelled", () => {
+    for (const status of ["done", "cancelled"] as const) {
       const state = { ...prOpen, status };
       for (const event of [merged, closed]) {
         const step = advance(state, event);

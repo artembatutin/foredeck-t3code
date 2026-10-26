@@ -112,6 +112,18 @@ from web or desktop.
 Factory's threads are linked to the item but do not offer **Mark done?** or **Back to todo?**.
 Factory does not change the item's status until its pull request merges.
 
+## When the pull request gets feedback
+
+Factory watches a single item's pull request on the author's thread. When a check fails, someone
+comments or the branch starts to conflict, T3 Code wakes that thread, and Factory follows the
+author's answer as a round of the delivery: once the turn ends, the server verifies the branch
+again, a reviewer on a fresh thread reviews it, and Factory records the approval and pushes the
+approved commit to the same pull request. It does this even when the author changed nothing, so
+the pull request only ever holds verified, reviewed commits. Rounds count against the fix and
+review rounds the delivery has left, and a round that fails or runs out of rounds blocks like any
+other; **Resume** verifies and reviews again before pushing. Turns you send on the thread yourself
+are yours and start no round. Feedback on a parent's pull request is not followed yet.
+
 ## When the pull request merges or closes
 
 Factory follows the pull request on the thread it is linked to: the author's thread, or for a
@@ -123,7 +135,8 @@ removed, the delivery blocks; **Resume** tries again. Cancelling the delivery wh
 keeps the worktree.
 
 Closing the pull request without merging cancels the delivery and posts a comment on the item.
-The worktree, branch and commits stay; a parent's approved children keep their approval.
+The worktree, branch and commits stay; a parent's approved children keep their approval. A merge
+or close during a feedback round ends the round the same way.
 
 Factory notices a merge or close made outside the app only while that thread is not settled. A
 thread with an open pull request does not settle on its own; if you settle it yourself, unsettle
@@ -167,8 +180,8 @@ delivery**.
 
 Factory also posts one comment on the Work item each time a delivery becomes blocked or starts
 waiting, so the GitHub issue, Jira issue or task file shows it too. It posts again when a commit
-is approved, when the pull request opens and when it is closed without merging. Factory sends no
-notifications.
+is approved, when the pull request opens or a feedback round updates it, and when it is closed
+without merging. Factory sends no notifications.
 
 Factory refuses to publish a pull request whose text would name an AI tool or credit one as an
 author, and blocks before pushing. The item's title and the verify command appear in the pull

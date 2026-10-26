@@ -509,8 +509,15 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * on the thread it is linked to. A merge of that very pull request enters `follow_through` and
  * issues the close-out (its Work items done, its worktree removed when clean); the delivery stays
  * `pr_open` until that reports and is `done` then. A close without merging cancels it. Either is
- * taken once, and only while the pull request is open: a later report of either changes nothing.
- * Factory never merges. A merged parent's approved children are done once it is.
+ * taken once, whatever a follow-through round is doing then: a later report of either changes
+ * nothing. Factory never merges. A merged parent's approved children are done once it is.
+ *
+ * A single item's PR stage also has the worker watch its pull request on the author thread. A
+ * wake core's watch queues there for failed checks or new comments, committed after that watch
+ * started, makes a `pr_open` delivery run again: it awaits the wake's run at `follow_through`. A
+ * completed run is settled, verified, reviewed and recorded like any author turn, under the
+ * task's rounds, limits and fingerprints so far, and the PR stage then publishes the newly
+ * approved commit to the same pull request; a run that ends any other way blocks.
  *
  * The owner can stop a running delivery after its step, or cancel any delivery that is not done
  * or cancelled. A stopping delivery still completes the work of its stage (the settle check and
@@ -565,10 +572,11 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
     case "pr.merged":
     case "pr.closed": {
       // Only the pull request the delivery opened, and only once: with its outcome recorded, a
-      // later report of either changes nothing.
+      // later report of either changes nothing. Taken in a follow-through round too, whatever it
+      // awaits: what the round would publish no longer matters to a pull request that left open.
       const { pullRequest } = delivery;
       if (
-        delivery.status !== "pr_open" ||
+        isTerminal(delivery) ||
         pullRequest === null ||
         pullRequest.outcome !== undefined ||
         pullRequest.number !== event.number ||
@@ -584,11 +592,44 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
           ...pullRequest,
           outcome: merged ? ("merged" as const) : ("closed" as const),
         },
+        block: null,
+        checkpoint: null,
       };
       // Closed without merging, the delivery ends; its worktree, branch and commits stay.
       return merged
-        ? issue(following, { type: "close_out" })
+        ? issue({ ...following, status: "pr_open" }, { type: "close_out" })
         : step({ ...following, status: "cancelled", awaiting: null });
+    }
+    case "pr.feedback": {
+      // Only a wake on the open pull request of a single item that awaits nothing else, on its
+      // author thread, committed after the watch its PR stage last started: one that came while
+      // the delivery ran a stage, or before that pull request was published, answers nothing.
+      const { pullRequest, followThrough } = delivery;
+      if (
+        delivery.kind !== "single" ||
+        delivery.status !== "pr_open" ||
+        delivery.awaiting !== null ||
+        pullRequest === null ||
+        pullRequest.outcome !== undefined ||
+        pullRequest.number !== event.number ||
+        pullRequest.url !== event.url ||
+        delivery.threads.author !== event.threadId ||
+        followThrough === undefined ||
+        event.sequence <= followThrough.watchedAfter ||
+        followThrough.runs.includes(event.runId)
+      ) {
+        return unchanged(delivery);
+      }
+      return step({
+        ...delivery,
+        status: "running",
+        stage: standardStages.follow_through.name,
+        awaiting: { type: "run", threadId: event.threadId, runId: event.runId },
+        // The author's answer to a wake is no fix-review reply: the round's review starts on a
+        // fresh reviewer thread.
+        reviewResponse: null,
+        followThrough: { ...followThrough, runs: [...followThrough.runs, event.runId] },
+      });
     }
     case "parent.done":
       // Its parent's pull request carried its work, and is merged and closed out.
@@ -863,15 +904,21 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       return blocked(delivery, { reason: "record_mismatch", expected, actual, differences });
     }
 
-    case "pr.opened":
-      return awaitedEffect(delivery, event.effectId, "open_pr") === undefined
-        ? unchanged(delivery)
-        : step({
-            ...delivery,
-            status: "pr_open",
-            awaiting: null,
-            pullRequest: event.pullRequest,
-          });
+    case "pr.opened": {
+      if (awaitedEffect(delivery, event.effectId, "open_pr") === undefined) {
+        return unchanged(delivery);
+      }
+      const { watchedAfter } = event;
+      return step({
+        ...delivery,
+        status: "pr_open",
+        awaiting: null,
+        pullRequest: event.pullRequest,
+        ...(watchedAfter === undefined
+          ? {}
+          : { followThrough: { watchedAfter, runs: delivery.followThrough?.runs ?? [] } }),
+      });
+    }
 
     case "closed_out":
       return awaitedEffect(delivery, event.effectId, "close_out") === undefined

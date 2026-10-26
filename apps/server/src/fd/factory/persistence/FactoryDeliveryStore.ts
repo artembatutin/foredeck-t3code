@@ -270,6 +270,11 @@ const StoredDeliveryState = Schema.Struct({
       outcome: Schema.optionalKey(Schema.Literals(["merged", "closed"])),
     }),
   ).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+  // Added with follow-through rounds: absent until a PR stage watches the pull request, and from
+  // rows whose pull request opened before, whose feedback nothing adopts.
+  followThrough: Schema.optionalKey(
+    Schema.Struct({ watchedAfter: NonNegativeInt, runs: Schema.Array(RunId) }),
+  ),
   block: Schema.NullOr(StoredBlock),
   // Added with stop after step: rows stored before it name no checkpoint, even when stopped. The
   // stop request is the `stopping` status, which every stored row could already hold. A blocked

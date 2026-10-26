@@ -109,6 +109,8 @@ const fakes = (world: World) =>
           url: "https://github.com/acme/alpha/pull/7",
           headBranch: branch,
         }),
+      // Follow-through rounds are FactoryFollowThrough.test.ts's; nothing here watches it.
+      watch: () => Effect.succeedNone,
     }),
   );
 

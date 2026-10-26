@@ -69,8 +69,9 @@ const blockedBody = (reason: string | undefined) =>
  * none for staying in a status or entering any other. A blocked comment gives the block's message,
  * as the delivery's `needsYou` does, and keeps the reason's fixed text when it drops the facts; an
  * approved one the approved commit, the one the last receipt verified, and that its pull request
- * is being opened unless it is a child, whose parent's pull request carries it; a pr_open one the
- * pull request's number and URL, and so does a closed one.
+ * is being opened unless it is a child, whose parent's pull request carries it, or updated after
+ * a follow-through round; a pr_open one the pull request's number and URL, opened or updated, and
+ * so does a closed one.
  */
 export const transitionComment = (
   before: FactoryDeliveryState,
@@ -100,7 +101,12 @@ export const transitionComment = (
       };
     case "approved": {
       const commit = after.receipts.at(-1)?.headSha;
-      const next = after.kind === "child" ? "" : ", and is opening its pull request";
+      const next =
+        after.kind === "child"
+          ? ""
+          : after.pullRequest === null
+            ? ", and is opening its pull request"
+            : ", and is updating its pull request";
       const fixed = `Factory approved this item after verify and review${next}.`;
       return {
         status: "approved",
@@ -118,7 +124,8 @@ export const transitionComment = (
       if (pullRequest === null) {
         return { status: "pr_open", body: "Factory opened a pull request for this item." };
       }
-      const opened = `Factory opened pull request #${pullRequest.number} for this item.`;
+      // A follow-through round publishes to the pull request the delivery recorded before.
+      const opened = `Factory ${before.pullRequest === null ? "opened" : "updated"} pull request #${pullRequest.number} for this item.`;
       return {
         status: "pr_open",
         body: firstPublishable([`${opened} ${pullRequest.url}`], opened),

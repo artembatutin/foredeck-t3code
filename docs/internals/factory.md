@@ -482,9 +482,12 @@ close from the snapshot core's
 author's, or a parent's last child's author's. Merge notifications are not enough, since they
 cover only merges run through the app, while the snapshot covers those and a merge on the host
 alike. The event must name the delivery's pull request by number and URL; the same pull request
-linked to another thread, or another on the author's, changes nothing. The boot sweep reads that
-link from the projection for each `pr_open` delivery, for the reason the tail starts where it does
-(see [the reactor tail](#the-reactor-tail-starts-at-the-sweeps-position)).
+linked to another thread, or another on the author's, changes nothing. It is taken whatever a
+[follow-through round](#follow-through-rounds-are-cores-watch-wakes) is doing, blocked and stopped
+included: a round that went on would publish to a pull request that no longer takes its work. The
+boot sweep reads that link from the projection for each delivery that recorded an open pull
+request, for the reason the tail starts where it does (see
+[the reactor tail](#the-reactor-tail-starts-at-the-sweeps-position)).
 
 The trap is settlement. Core's sync stops reading the links of settled threads. Auto-settlement
 leaves a thread with an open link alone, but its owner can settle it by hand, and a pull request
@@ -516,7 +519,9 @@ checkouts and branch changes. A thread works in its worktree, in the repositorie
 or else in its project's root, which can be the delivery's worktree or a folder inside it. Settled
 threads count too: a thread settles with a background command such as a dev server still
 running, and its provider stops only when core's detach effect runs. A pull request watch counts
-as background work, as it does for core, so a watch still on a thread keeps the worktree. Git's
+as background work, as it does for core, so a watch still on a thread keeps the worktree; the
+removal therefore first ends the watch the PR stage started on the merged pull request, as core's
+watch would end on its next pass, and any other watch still keeps it. Git's
 own refusal covers only uncommitted changes, not an owner's turn that has written nothing yet. A
 turn starting between that check and the removal is not excluded; nothing in core leases a
 delivery's worktree.
@@ -525,6 +530,42 @@ The delivery records how its pull request left `open` (`pullRequest.outcome`), s
 either arriving later is inert, and a close's cancel is told apart from the owner's: only the close
 announces itself on the item. A closed parent cancels as an owner's cancel does, so its approved
 children keep their approvals; a merged parent's approved children are done once it is.
+
+## Follow-through rounds are core's watch wakes
+
+Factory sends no turn for pull request feedback and never asks the host about it. A single item's
+PR stage starts core's watch on its pull request on the author thread, and core's
+[watch reactor](../../apps/server/src/orchestration-v2/PullRequestWatchReactor.ts) queues a wake
+message there for failed checks, new comments or a conflict. Factory adopts that wake's run as a
+follow-through round, then settles, verifies, reviews and records the branch as after any author
+turn. By owner decision a round that left HEAD where it was is verified, reviewed and recorded
+too; its rounds, limits and fingerprints keep counting for the task. Parents are not followed
+through yet: no watch is started for them, since a wake would set their last child's author to
+work outside Factory.
+
+A wake is identified by its command, not its text: the run's command receipt is a
+`thread.pull-request-watch.sync`, and the link that command updated names the pull request
+([`FactoryReactor.ts`](../../apps/server/src/fd/factory/FactoryReactor.ts)). The watch keeps
+waking the thread while the delivery runs a stage, and those wakes are not rounds: the agent
+already works on them, and a commit it lands during review is refused by the review and record
+checks. So a delivery adopts only a wake committed after the watch command of its last PR stage,
+whose event-log position it stores. The worker starts that watch and stores the opened pull
+request in one hold of the delivery's lock, so a wake committed after the watch steps the
+delivery only once it is `pr_open`. The same position lets the boot sweep tell a wake that came
+while no server ran Factory from one a running stage already saw: it reads the author thread's log
+after it.
+
+A round publishes with a push of the approved commit by its id, never `create_pr` again: the
+stacked action opens a new pull request when the branch has no open one, so a pull request merged
+or closed before core's sync stored it would get a second. The PR stage then starts the watch
+again, which keeps a watch still on and restarts one that ended: core's wake text tells the agent
+to unwatch when it hands the work back.
+
+The wake's message is core's, so its run would not pass for Factory's turn when a cancel stops
+what the delivery's threads run (see [cancel](#stop-waits-for-a-stage-boundary-cancel-does-not)).
+The delivery therefore records the runs it adopted, and they and their restart continuations count
+as Factory's: a wake run queued behind the owner's turn cannot be interrupted before it starts,
+and is stopped once it goes live.
 
 ## Each transition posts one Work comment, from the step that stored it
 

@@ -431,7 +431,8 @@ describe("the PR stage", () => {
           { stage: "pr", outcome: "passed" },
         ]);
 
-        // Linked to the author thread as a created pull request, like the action's RPC does.
+        // Linked to the author thread as a created pull request, like the action's RPC does, then
+        // watched there, under a command id derived from the delivery and the effect.
         assert.deepStrictEqual(world.dispatched, [
           {
             type: "thread.pull-request.link",
@@ -443,7 +444,19 @@ describe("the PR stage", () => {
             url: prUrl,
             source: "created",
           },
+          {
+            type: "thread.pull-request.watch",
+            commandId: CommandId.make(`factory-pr-watch:${deliveryId}:6`),
+            threadId: author,
+            host: "github.com",
+            repository: "acme/alpha",
+            number: 7,
+            watching: true,
+            link: { url: prUrl, source: "created" },
+          },
         ]);
+        // Wakes committed after the watch's command are the delivery's to adopt.
+        assert.deepStrictEqual(state.followThrough, { watchedAfter: 2, runs: [] });
         // Published the approved commit, which the worktree still holds, clean.
         assert.strictEqual(yield* publishedOf(cwd), reviewed);
         assert.strictEqual(yield* git(cwd, ["rev-parse", "HEAD"]), reviewed);
@@ -484,7 +497,7 @@ describe("the PR stage", () => {
         assert.strictEqual(world.calls.length, 1);
         assert.deepStrictEqual(
           world.dispatched.map((command) => command.type),
-          ["thread.pull-request.link"],
+          ["thread.pull-request.link", "thread.pull-request.watch"],
         );
       }),
     ),

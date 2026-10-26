@@ -2,6 +2,7 @@ import { assert } from "@effect/vitest";
 import {
   AuthWorkReadScope,
   CommandId,
+  MessageId,
   type PullRequestState,
   type RunId,
   type ThreadId,
@@ -102,7 +103,7 @@ export const passingReview = (criteria = 1) => ({
 });
 
 /** The run the delivery awaits, once its provider turn has started. */
-const awaitedRun = (deliveryId: FactoryDeliveryId) =>
+export const awaitedRun = (deliveryId: FactoryDeliveryId) =>
   Effect.gen(function* () {
     const { awaiting } = yield* stateOf(deliveryId);
     if (awaiting?.type !== "run") return assert.fail("The delivery awaits no run.");
@@ -110,6 +111,17 @@ const awaitedRun = (deliveryId: FactoryDeliveryId) =>
     yield* drainOrchestration;
     return awaiting;
   });
+
+/** The reviewer the delivery awaits passes its commit, and its run completes. */
+export const reviewPasses = (world: World, deliveryId: FactoryDeliveryId) =>
+  Effect.gen(function* () {
+    const reviewer = yield* awaitedRun(deliveryId);
+    yield* Effect.flatMap(service, (factory) =>
+      factory.submitReview({ threadId: reviewer.threadId, review: passingReview() }),
+    );
+    yield* world.endRun(reviewer.runId, "completed");
+    return reviewer.threadId;
+  }).pipe(Effect.orDie);
 
 /** The author commits, verify passes and the reviewer passes it, on the delivery's threads. */
 const authorAndReview = (
@@ -275,6 +287,66 @@ export const syncPullRequest = (
     ).pipe(Effect.orDie);
     if (options.drain !== false) yield* drainFactory;
   });
+
+let wakes = 0;
+
+/**
+ * Wakes the thread about the watched pull request of `link`, as core's watch reactor does when
+ * its checks fail: one `thread.pull-request-watch.sync` recording the watch's progress and queuing
+ * the wake message. Returns the wake's run, which starts at once on an idle thread and otherwise
+ * waits behind the thread's run.
+ */
+export const wakeThread = (threadId: ThreadId, link: ThreadPullRequestLink) =>
+  Effect.gen(function* () {
+    wakes += 1;
+    const watch = link.watch ?? assert.fail(`Pull request #${link.number} is not watched.`);
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const result = yield* orchestrator.dispatch({
+      type: "thread.pull-request-watch.sync",
+      commandId: CommandId.make(`server:pr-watch:${threadId}:wake-${wakes}`),
+      threadId,
+      host: link.host,
+      repository: link.repository,
+      number: link.number,
+      startedAt: watch.startedAt,
+      watch: { ...watch, failedChecks: [...watch.failedChecks, `checks-${wakes}`] },
+      wake: {
+        messageId: MessageId.make(`message:pr-watch:wake-${wakes}`),
+        text: `Update on pull request #${link.number} (${link.url}): checks failed.`,
+        notification: {
+          source: { kind: "monitor" },
+          outcome: "failed",
+          summary: `#${link.number}: checks failed`,
+        },
+      },
+    });
+    const created = result.storedEvents.flatMap(({ event }) =>
+      event.type === "run.created" ? [event.payload.id] : [],
+    );
+    return created[0] ?? assert.fail("The wake queued no run.");
+  }).pipe(Effect.orDie);
+
+/**
+ * Starts or stops a watch of the linked pull request on the thread, as the owner's Watch does,
+ * linking it first when the thread has not.
+ */
+export const watchPullRequest = (
+  threadId: ThreadId,
+  link: Pick<ThreadPullRequestLink, "host" | "repository" | "number" | "url">,
+  watching = true,
+) =>
+  Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+    orchestrator.dispatch({
+      type: "thread.pull-request.watch",
+      commandId: commandId("pr-watch"),
+      threadId,
+      host: link.host,
+      repository: link.repository,
+      number: link.number,
+      watching,
+      link: { url: link.url, source: "manual" },
+    }),
+  ).pipe(Effect.asVoid, Effect.orDie);
 
 /** The item's status as Work reads it. */
 export const itemStatus = (ref: WorkItemRef) =>
