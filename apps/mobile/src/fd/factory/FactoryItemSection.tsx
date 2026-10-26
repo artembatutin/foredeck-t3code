@@ -1,22 +1,31 @@
 import { useAtomValue } from "@effect/atom-react";
-import type { FactoryReviewLine, FactoryThreadTarget } from "@t3tools/client-runtime/fd/factory";
 import {
-  type AtomCommandResult,
-  squashAtomCommandFailure,
-} from "@t3tools/client-runtime/state/runtime";
+  FACTORY_CANCEL_TEXT,
+  type FactoryReviewLine,
+  type FactoryThreadTarget,
+} from "@t3tools/client-runtime/fd/factory";
+import type { AtomCommandResult } from "@t3tools/client-runtime/state/runtime";
 import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import type { FactoryDelivery, FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemSummary } from "@t3tools/contracts/fd/work-management";
 import { useNavigation } from "@react-navigation/native";
 import { useLayoutEffect, useRef, useState } from "react";
-import { Alert, Platform, Pressable, View } from "react-native";
+import { Alert, Platform, View } from "react-native";
 
 import { AppText as Text } from "../../components/AppText";
 import { useAndroidWorkspaceSelection } from "../../features/workspace/useAndroidWorkspaceSelection";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useWorkspaceEnvironments } from "../../state/workspace";
-import { mobileCancelTarget, mobileFactorySection } from "./itemSection";
+import { Control } from "./Control";
+import { FactoryPlanGate } from "./FactoryPlanGate";
+import {
+  factoryCommandError,
+  type MobileCancelConfirmation,
+  mobileCancelTarget,
+  mobileFactorySection,
+} from "./itemSection";
+import { mobilePlanGate } from "./planGate";
 import { factoryEnvironment } from "./state";
 
 interface FactoryItemSectionProps {
@@ -26,9 +35,10 @@ interface FactoryItemSectionProps {
 }
 
 /**
- * The Work item screen's Factory section: the item's current delivery with its timeline and
- * stop, resume and cancel. Renders nothing on a server without Factory or for an item without a
- * delivery. Registered with the Work item screen by the app's Stack.
+ * The Work item screen's Factory section: the item's current delivery with its timeline, stop,
+ * resume and cancel, and its plan while it waits at the plan gate. Renders nothing on a server
+ * without Factory or for an item without a delivery. Registered with the Work item screen by the
+ * app's Stack.
  */
 export function FactoryItemSection(props: FactoryItemSectionProps) {
   // A pending action or error belongs to one destination and item.
@@ -43,15 +53,6 @@ export function FactoryItemSection(props: FactoryItemSectionProps) {
 
 type Action = "stop" | "resume" | "cancel";
 
-/** A failed command's text: a Factory error's own fixed message, or a fallback. */
-function commandError(result: AtomCommandResult<FactoryDelivery, unknown>): string | null {
-  if (result._tag !== "Failure") return null;
-  const error = squashAtomCommandFailure(result);
-  return error instanceof Error && error.message.trim().length > 0
-    ? error.message
-    : "Factory could not complete the request. Try again.";
-}
-
 function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps) {
   const navigation = useNavigation();
   const selectAndroidWorkspace = useAndroidWorkspaceSelection();
@@ -64,20 +65,37 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
     resume: useAtomValue(factoryEnvironment.resume.permissionAtom(environmentId)),
     cancel: useAtomValue(factoryEnvironment.cancel.permissionAtom(environmentId)),
   };
+  const planPermitted = {
+    approve: useAtomValue(factoryEnvironment.approvePlan.permissionAtom(environmentId)),
+    reject: useAtomValue(factoryEnvironment.rejectPlan.permissionAtom(environmentId)),
+    replan: useAtomValue(factoryEnvironment.replan.permissionAtom(environmentId)),
+  };
+  const planning = useAtomValue(factoryEnvironment.planning(environmentId));
   const stop = useAtomCommand(factoryEnvironment.stop);
   const resume = useAtomCommand(factoryEnvironment.resume);
   const cancel = useAtomCommand(factoryEnvironment.cancel);
   const [pending, setPending] = useState<Action | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const connectionState = environments.find(
+    (entry) => entry.environmentId === environmentId,
+  )?.connectionState;
+  const deliveries = deliveriesQuery.data?.deliveries ?? null;
   const view = mobileFactorySection({
     environmentId,
     itemRef: item.ref,
     supported: useAtomValue(factoryEnvironment.supported(environmentId)),
-    connectionState: environments.find((entry) => entry.environmentId === environmentId)
-      ?.connectionState,
-    deliveries: deliveriesQuery.data?.deliveries ?? null,
+    connectionState,
+    deliveries,
     permitted,
+  });
+  const gate = mobilePlanGate({
+    environmentId,
+    itemRef: item.ref,
+    planning,
+    connectionState,
+    deliveries,
+    permitted: planPermitted,
   });
   // The confirmation's press reads the view as it is then, not as it was when the alert opened.
   const latestView = useRef(view);
@@ -98,29 +116,27 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
   ) => {
     setPending(action);
     setError(null);
-    const failure = commandError(await execute());
+    const failure = factoryCommandError(await execute());
     setPending(null);
     if (failure !== null) setError(failure);
   };
   const control = (deliveryId: FactoryDeliveryId) => ({ environmentId, input: { deliveryId } });
 
-  const confirmCancel = (openedFor: FactoryDeliveryId) => {
-    Alert.alert(
-      `Cancel the delivery of ${item.key}?`,
-      "Its agents stop what they are working on and the delivery ends. Its branch, worktree and commits stay; delivering the item again starts on a new branch.",
-      [
-        { text: "Keep it", style: "cancel" },
-        {
-          text: "Cancel delivery",
-          style: "destructive",
-          onPress: () => {
-            const target = mobileCancelTarget(latestView.current, openedFor);
-            if (target === null) return;
-            void run("cancel", () => cancel(control(target)));
-          },
+  // The alert says what cancelling ends for the delivery's family, and the press acts only while
+  // the delivery is still of that family.
+  const confirmCancel = (openedFor: MobileCancelConfirmation) => {
+    Alert.alert(`Cancel the delivery of ${item.key}?`, FACTORY_CANCEL_TEXT[openedFor.family], [
+      { text: "Keep it", style: "cancel" },
+      {
+        text: "Cancel delivery",
+        style: "destructive",
+        onPress: () => {
+          const target = mobileCancelTarget(latestView.current, openedFor);
+          if (target === null) return;
+          void run("cancel", () => cancel(control(target)));
         },
-      ],
-    );
+      },
+    ]);
   };
 
   const openThread = (thread: FactoryThreadTarget) => {
@@ -176,12 +192,20 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
             <Control
               label="Cancel delivery"
               disabled={pending !== null}
-              onPress={() => confirmCancel(view.deliveryId)}
+              onPress={() => confirmCancel({ deliveryId: view.deliveryId, family: view.family })}
             />
           ) : null}
         </View>
       ) : null}
       {error !== null ? <Text className="text-sm text-destructive">{error}</Text> : null}
+      {gate !== null ? (
+        // A note belongs to one delivery; another delivery's plan starts afresh.
+        <FactoryPlanGate
+          key={JSON.stringify([gate.destination.environmentId, gate.destination.deliveryId])}
+          gate={gate}
+          itemKey={item.key}
+        />
+      ) : null}
       {deliveriesQuery.error !== null ? (
         <Text className="text-sm text-destructive">{deliveriesQuery.error}</Text>
       ) : null}
@@ -251,31 +275,5 @@ function ReviewEvidence({ review }: { readonly review: FactoryReviewLine }) {
         <Text className="ps-3 text-xs text-foreground-muted">{review.omitted}</Text>
       ) : null}
     </View>
-  );
-}
-
-function Control({
-  label,
-  disabled = false,
-  onPress,
-}: {
-  label: string;
-  disabled?: boolean;
-  onPress: () => void;
-}) {
-  return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityState={{ disabled }}
-      disabled={disabled}
-      onPress={onPress}
-      className={
-        disabled
-          ? "rounded-full bg-subtle-strong px-3 py-1.5 opacity-40"
-          : "rounded-full bg-subtle-strong px-3 py-1.5 active:opacity-70"
-      }
-    >
-      <Text className="text-sm font-t3-medium text-foreground">{label}</Text>
-    </Pressable>
   );
 }

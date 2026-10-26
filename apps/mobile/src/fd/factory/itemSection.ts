@@ -2,9 +2,14 @@ import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connect
 import {
   cancelConfirmationTarget,
   type FactoryControlPermissions,
+  type FactoryDeliveryFamily,
   factoryDeliveryView,
   type FactoryDeliveryView,
 } from "@t3tools/client-runtime/fd/factory";
+import {
+  type AtomCommandResult,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
 import type { EnvironmentId } from "@t3tools/contracts";
 import type { FactoryDelivery, FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
@@ -29,12 +34,30 @@ export interface MobileFactoryDestination {
 export const mobileFactorySection = (input: MobileFactoryDestination): FactoryDeliveryView | null =>
   factoryDeliveryView({ ...input, connected: input.connectionState === "connected" });
 
+/** What an open cancel confirmation was opened for: a delivery, and what it said cancelling ends. */
+export interface MobileCancelConfirmation {
+  readonly deliveryId: FactoryDeliveryId;
+  readonly family: FactoryDeliveryFamily;
+}
+
 /**
  * What confirming a cancel opened for `openedFor` cancels, read when the owner confirms: that
- * delivery while it is still current and cancellable in `view`, otherwise null and nothing is
- * cancelled. A native alert cannot close itself when the delivery changes, so the press checks.
+ * delivery while it is still current, cancellable and of the family the confirmation described
+ * in `view`, otherwise null and nothing is cancelled. A native alert cannot close itself when the
+ * delivery changes, so the press checks; a parent whose plan was approved meanwhile now has
+ * children its cancel would end, which the alert did not say.
  */
 export const mobileCancelTarget = (
   view: FactoryDeliveryView | null,
-  openedFor: FactoryDeliveryId,
-): FactoryDeliveryId | null => cancelConfirmationTarget(view, openedFor);
+  openedFor: MobileCancelConfirmation,
+): FactoryDeliveryId | null =>
+  view?.family === openedFor.family ? cancelConfirmationTarget(view, openedFor.deliveryId) : null;
+
+/** A failed command's text: a Factory error's own fixed message, or a fallback. */
+export function factoryCommandError(result: AtomCommandResult<unknown, unknown>): string | null {
+  if (result._tag !== "Failure") return null;
+  const error = squashAtomCommandFailure(result);
+  return error instanceof Error && error.message.trim().length > 0
+    ? error.message
+    : "Factory could not complete the request. Try again.";
+}
