@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import type { EnvironmentId } from "@t3tools/contracts";
 import { LegendList } from "@legendapp/list/react-native";
 import { useNavigation } from "@react-navigation/native";
 import { useMemo } from "react";
@@ -11,9 +12,10 @@ import { type MobileFleetRow, mobileFleetRows } from "./fleetList";
 import { factoryFleetAtom } from "./state";
 
 /**
- * Every active delivery across the environments that serve Factory, those that need you first.
- * Each row opens its item's Work item screen, whose Factory section shows the timeline and
- * controls. Registered by the app's Stack.
+ * Every active delivery across the connected environments that serve Factory, those that need
+ * you first; a Factory environment that is not connected is named instead. Each row opens its
+ * item's Work item screen, whose Factory section shows the timeline and controls. Registered by
+ * the app's Stack.
  */
 export function FactoryListScreen() {
   const navigation = useNavigation();
@@ -25,26 +27,34 @@ export function FactoryListScreen() {
     [environments, fleet.environments, projects],
   );
 
+  const labelOf = (environmentId: EnvironmentId) =>
+    environments.find((entry) => entry.environmentId === environmentId)?.environmentLabel ??
+    environmentId;
+  const disconnected = fleet.disconnected.map(labelOf);
+
   if (fleet.environments.length === 0) {
     return (
       <View className="flex-1 items-center justify-center bg-screen p-6">
         <Text className="text-center text-foreground-muted">
-          Connect to a server that offers Factory.
+          {disconnected.length > 0
+            ? `Not connected to ${disconnected.join(", ")}.`
+            : "Connect to a server that offers Factory."}
         </Text>
       </View>
     );
   }
 
-  const failed = fleet.failed.map(
-    (environmentId) =>
-      environments.find((entry) => entry.environmentId === environmentId)?.environmentLabel ??
-      environmentId,
-  );
+  const failed = fleet.failed.map(labelOf);
   return (
     <View className="flex-1 bg-screen">
       {failed.length > 0 ? (
         <Text className="px-4 pt-2 text-sm text-destructive">
           Could not read deliveries on {failed.join(", ")}.
+        </Text>
+      ) : null}
+      {disconnected.length > 0 ? (
+        <Text className="px-4 pt-2 text-sm text-foreground-muted">
+          Not connected to {disconnected.join(", ")}; its deliveries are not shown.
         </Text>
       ) : null}
       <LegendList
