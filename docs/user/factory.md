@@ -47,10 +47,58 @@ Deliver is offered only on a live connection allowed to run agents, and only whi
 no delivery that is not done or cancelled. Starting fails when the project has no verify command,
 and the message names the settings to change. The project's repository needs at least one commit.
 
-Agents start deliveries with the `factory_deliver` tool and follow them with `factory_status`,
-which reads one delivery or every delivery of an item. Agents in plan mode and outside clients you
-approved as read-only can only read. A delivery's threads never run with broader permissions than
-those of the agent that started it.
+Agents start deliveries with the `factory_deliver` tool, as a single item or a parent, and follow
+them with `factory_status`, which reads one delivery or every delivery of an item. Only you decide
+a parent's plan. Agents in plan mode and outside clients you approved as read-only can only read.
+A delivery's threads never run with broader permissions than those of the agent that started it.
+
+## Deliver a parent
+
+Deliver an item as a parent when it is too large for one change. A planner agent splits it into
+tasks, you approve the plan, and Factory delivers each task in turn, all on one branch and one
+pull request.
+
+On web and desktop, use **Deliver as parent** beside **Deliver** in the item's Factory section or
+the **Start a thread** dialog, or **Deliver work item as parent** in the command palette. It is
+offered where Deliver is, when the environment can plan. Only an item from a Markdown source can
+be a parent, because its tasks become task files in that source. An item from any other source,
+such as a GitHub or Jira issue, is refused as a parent and nothing starts; deliver it as a single
+item instead.
+
+The planner reads the project on the delivery's new branch and worktree without changing it, and
+submits a plan: tasks in order, each with a title, a summary, acceptance criteria and how each
+criterion is tested. A planner that finds nothing to plan blocks the delivery with its note
+saying why. **Resume** asks it to plan again, or cancel the delivery.
+
+### Approve the plan
+
+The plan waits for you in the parent item's Factory section, on web, desktop and mobile, as
+**Waiting for you**. You can edit each task's title, summary, acceptance criteria and their tests,
+change the order and remove tasks, then **Save plan**. You cannot add tasks or remove every task.
+If the plan changes while you edit, choose **Keep my edits** or **Use the new plan**.
+
+- **Approve plan** asks first. Save or discard your edits before approving. Factory refuses a
+  plan with a task too long or with characters the source's files cannot hold; edit it and approve
+  again. The plan cannot change after approval.
+- **Reject plan** asks first, then ends the delivery. No child items are created.
+- **Replan** sends the planner a note about what to change. Its new plan waits for you here in
+  place of the old one.
+
+### After approval
+
+Factory creates one child item per task in the parent's source, under the parent and blocked by
+the child before it. They are task files like the ones you write; commit them like any other
+change. Each child is then delivered in plan order, one at a time, on the parent's branch and
+worktree: a new author thread, verify, review and repair rounds, like a single item, and its own
+Factory section on the child item. A child ends **Approved** without a pull request of its own.
+A blocked child holds the parent until you resume or cancel it.
+
+Once the last child is approved, the parent integrates: the server runs the verify command again
+on the whole branch, and a reviewer on a new thread checks every change since the branch started
+against every child's acceptance criteria. Then Factory opens one pull request for the branch
+that lists each child item with its verified commit and review. A failed verify or a review that
+requires changes blocks the parent with no repair round. Fix the branch if needed, then
+**Resume** to verify and review it again with a new reviewer.
 
 ## Follow a delivery
 
@@ -68,7 +116,8 @@ Factory does not change the item's status.
 
 - **Stop after step** lets the current step finish. The delivery shows **Stopping** and becomes
   **Stopped** at the next stage boundary, before it would verify, start a review or repair round,
-  record or open the pull request. A problem found before then still blocks it.
+  record or open the pull request. A parent also stops before the plan waits for you, before its
+  next child and before it integrates. A problem found before then still blocks it.
 - **Resume** on a delivery that is still **Stopping** takes back the stop: it goes on running from
   the step under way, with the rounds it has already used. Resuming a **Stopped** or **Blocked**
   delivery checks its branch again and verifies it before going on, even if nothing changed,
@@ -76,7 +125,9 @@ Factory does not change the item's status.
   fresh set of repair rounds within the limits it started with. If you deleted one of its threads,
   it blocks again; cancel it and deliver the item anew.
 - **Cancel delivery** asks first, then interrupts what the delivery's agents are working on and
-  ends it. The branch, worktree and commits stay. Verification or a pull request the server has
+  ends it. Cancelling a parent also ends its child deliveries not yet approved. Cancelling a child
+  ends its parent and the parent's other children not yet approved. Approved children keep their
+  approval. The branch, worktree and commits stay. Verification or a pull request the server has
   already started finishes, but no longer changes the delivery. Delivering the item again starts
   a new delivery on a branch of its own, named like the first with `-2`, `-3` and so on added.
 

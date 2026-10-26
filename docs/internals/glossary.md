@@ -63,17 +63,17 @@ Terms whose meaning matters across T3 Code. Architecture and lifecycle constrain
 
 ## Factory
 
-| Term                | Meaning                                                                                                                                                              |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Delivery            | One Factory run of one Work item through a pipeline. A parent delivery owns one child delivery per approved planned task.                                            |
-| Pipeline            | Ordered stages with their gates and limits, defined as data.                                                                                                         |
-| Stage kind          | What a stage does: run a role's thread (`agent`), run a server command (`command`), wait at a `gate`, review the whole branch (`integrate`) or handle the PR (`pr`). |
-| Role                | The part a Factory thread plays: `planner`, `author` or `reviewer`. Each role has its own model selection.                                                           |
-| Receipt             | The server's record of one verification command run against one commit and tree.                                                                                     |
-| Approval            | The record that one commit and tree passed verification and review.                                                                                                  |
-| Repair round        | A turn on the author thread that answers a failed verify (`fix-verify`) or a blocking review (`fix-review`), counted against the project's limits.                   |
-| Failure fingerprint | A hash of a failed stage, its log tail or findings to fix, and the tree. The same fingerprint twice in one task stops the repair loop.                               |
-| Stage checkpoint    | The stage a stopped delivery would have begun when it stopped, where a resume continues. Unrelated to a turn's Git checkpoint.                                       |
+| Term                | Meaning                                                                                                                                                                                |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Delivery            | One Factory run of one Work item through a pipeline. A parent delivery owns one child delivery per approved planned task.                                                              |
+| Pipeline            | Ordered stages with their gates and limits, defined as data.                                                                                                                           |
+| Stage kind          | What a stage does: run a role's thread (`agent`), run a server command (`command`), wait at a `gate`, verify and review the whole branch afresh (`integrate`) or handle the PR (`pr`). |
+| Role                | The part a Factory thread plays: `planner`, `author` or `reviewer`. Each role has its own model selection.                                                                             |
+| Receipt             | The server's record of one verification command run against one commit and tree.                                                                                                       |
+| Approval            | The record that one commit and tree passed verification and review.                                                                                                                    |
+| Repair round        | A turn on the author thread that answers a failed verify (`fix-verify`) or a blocking review (`fix-review`), counted against the project's limits.                                     |
+| Failure fingerprint | A hash of a failed stage, its log tail or findings to fix, and the tree. The same fingerprint twice in one task stops the repair loop.                                                 |
+| Stage checkpoint    | The stage a stopped delivery would have begun when it stopped, where a resume continues. Unrelated to a turn's Git checkpoint.                                                         |
 
 ## Composer context
 

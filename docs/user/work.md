@@ -18,7 +18,8 @@ with a reference to the item in the composer. If an item changes while you edit
 its title or description, Work keeps your edit and shows the current version so
 you can reapply your edit or discard it. **Deliver** hands the item to
 [Factory](./factory.md), which takes it through authoring, verification and
-review to one pull request.
+review to one pull request. **Deliver as parent** has Factory plan a Markdown
+task into child tasks first; see [Deliver a parent](./factory.md#deliver-a-parent).
 
 To add a source, open the project's settings and use **Work sources**. In a
 thread, the details panel lists the thread's linked items; use **Link work item**
