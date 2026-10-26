@@ -115,6 +115,7 @@ describe("Factory plan RPC errors", () => {
     wsHandlers({
       factory: FactoryService.FactoryService.of({
         start: () => unexpected,
+        startNext: () => unexpected,
         get: () => unexpected,
         list: () => unexpected,
         listByItem: () => unexpected,
@@ -276,6 +277,7 @@ const plannerThreads = (calls: PlannerCalls, release: Deferred.Deferred<void>) =
       launchState: () => Effect.die("launch read not scripted"),
       threadState: () => Effect.die("thread read not scripted"),
       liveRun: () => Effect.die("live run read not scripted"),
+      openThread: () => Effect.die("open thread read not scripted"),
       carriesFactoryTurn: () => Effect.die("factory turn read not scripted"),
       liveRunsOn: () => Effect.die("live runs read not scripted"),
       launchedLiveRuns: Effect.die("live runs read not scripted"),
@@ -477,6 +479,7 @@ describe("Factory plan RPC authorization", () => {
       const handlers = wsHandlers({
         factory: FactoryService.FactoryService.of({
           start: () => unexpected,
+          startNext: () => unexpected,
           get: () => unexpected,
           list: () => unexpected,
           listByItem: () => unexpected,

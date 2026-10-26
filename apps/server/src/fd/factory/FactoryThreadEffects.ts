@@ -250,6 +250,13 @@ export class FactoryThreadEffects extends Context.Service<
       threadId: ThreadId,
     ) => Effect.Effect<RunId | null, ProjectionStore.ProjectionStoreV2Error>;
     /**
+     * Whether the thread is open as Work counts a linked thread: it exists and is not deleted,
+     * settled or archived, whether it works, waits for input or is idle.
+     */
+    readonly openThread: (
+      threadId: ThreadId,
+    ) => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
+    /**
      * Whether the run carries on a turn Factory sent on the thread: the run's own message is
      * Factory's, or it is one of `adopted` (pull request wakes the delivery took as its
      * follow-through rounds), or the run continues, through a server restart's continuations, a
@@ -835,6 +842,18 @@ const make = Effect.gen(function* () {
             shell === null || shell.deletedAt !== null || shell.archivedAt !== null
               ? null
               : shell.activeRunId,
+          ),
+        ),
+    openThread: (threadId) =>
+      projections
+        .getThreadShell(threadId)
+        .pipe(
+          Effect.map(
+            (shell) =>
+              shell !== null &&
+              shell.deletedAt === null &&
+              shell.settledAt === null &&
+              shell.archivedAt === null,
           ),
         ),
     carriesFactoryTurn,

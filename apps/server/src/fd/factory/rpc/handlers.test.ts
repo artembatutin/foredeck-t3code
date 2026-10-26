@@ -64,6 +64,7 @@ describe("Factory RPC errors", () => {
   ): FactoryService.FactoryService["Service"] =>
     FactoryService.FactoryService.of({
       start: () => unexpected,
+      startNext: () => unexpected,
       get: () => unexpected,
       list: () => unexpected,
       listByItem: () => unexpected,

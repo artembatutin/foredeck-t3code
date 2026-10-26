@@ -158,9 +158,12 @@ describe("factory_deliver declaration", () => {
     const schema = Tool.getJsonSchema(tool) as {
       readonly type?: string;
       readonly required?: ReadonlyArray<string>;
+      readonly properties?: Record<string, unknown>;
     };
     assert.strictEqual(schema.type, "object");
-    assert.deepStrictEqual(schema.required, ["item"]);
+    // The item, or `next` instead (deliverNext.test.ts), so the schema requires neither.
+    assert.deepStrictEqual(schema.required ?? [], []);
+    assert.property(schema.properties, "item");
   });
 });
 

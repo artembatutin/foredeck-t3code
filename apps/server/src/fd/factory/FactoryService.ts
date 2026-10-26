@@ -11,6 +11,7 @@ import {
 import {
   type WorkItemRef,
   workItemRefString,
+  type WorkListResult,
   WorkSourceId,
   WorkSourceKind,
 } from "@t3tools/contracts/fd/work-management";
@@ -329,6 +330,14 @@ export type FactoryDeliveryWithRuns = FactoryDeliveryStore.StoredFactoryDelivery
 };
 
 /**
+ * What `startNext` did: started a delivery of the first Ready item, or found none it could start.
+ * `incomplete` says a source could not be listed whole, so an item it did not show may be Ready.
+ */
+export type FactoryStartNextResult =
+  | { readonly type: "started"; readonly delivery: FactoryDeliveryWithRuns }
+  | { readonly type: "nothing_ready"; readonly incomplete: boolean };
+
+/**
  * Factory's deliveries for transports, MCP tools and scheduled tasks. Each delivery it returns
  * carries the stage attempts of the same moment: a read takes both from one snapshot of the
  * database, and a control reads the attempts of its own step before any later step can store
@@ -360,6 +369,28 @@ export class FactoryService extends Context.Service<
       readonly kind?: Exclude<FactoryDeliveryKind, "child">;
       readonly runtimeModeCeiling?: RuntimeMode;
     }) => Effect.Effect<FactoryDeliveryWithRuns, FactoryStartError>;
+    /**
+     * Starts the project's next Ready item as a single delivery, through `start`, for MCP and
+     * scheduled tasks. Ready is Work's Ready: a todo item that is not blocked and has no open
+     * linked thread (a thread working, waiting for input or idle, or a launch Work has in flight),
+     * and here also no delivery that is not done or cancelled. The first such item in Work's list
+     * order, across the project's sources in order and every page of each, filtered by `label`
+     * when given, is started with `runtimeModeCeiling` (see `start`); an item a concurrent start
+     * took first is refused as active and the walk goes on to the next. Nothing Ready is a result,
+     * not an error. A page that cannot be read, reports its listing stale, or lists an item Work
+     * could not read ends the walk there: nothing past it is started, since an item it did not
+     * show could be the first Ready one, and the result says the listing was incomplete. Refused,
+     * with nothing written, for a project not on this environment or without a verify command,
+     * and as `start` refuses the item it picked.
+     */
+    readonly startNext: (input: {
+      readonly projectId: ProjectId;
+      readonly label?: string;
+      readonly runtimeModeCeiling?: RuntimeMode;
+    }) => Effect.Effect<
+      FactoryStartNextResult,
+      FactoryStartError | ProjectionStore.ProjectionStoreV2Error
+    >;
     readonly get: (
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<Option.Option<FactoryDeliveryWithRuns>, FactoryStoreError>;
@@ -557,6 +588,9 @@ const itemReader: WorkActor = { id: "factory", grants: [AuthWorkReadScope], labe
 /** A single item is its delivery's one task; its approval is `approval-item.json`. */
 const SINGLE_ITEM_TASK = FactoryTaskId.make("item");
 
+/** Every page `startNext` reads holds up to this many items, the most Work serves. */
+const NEXT_PAGE = 100;
+
 const make = Effect.gen(function* () {
   const work = yield* WorkService.WorkService;
   const projects = yield* ProjectStore.ProjectStoreV2;
@@ -715,6 +749,77 @@ const make = Effect.gen(function* () {
         onNone: () => ({ ...queued, stageRuns: [] }),
         onSome: steppedWithRuns,
       });
+    },
+  );
+
+  /**
+   * Whether the item has an open linked thread, as Work's own starts judge one: a launch Work has
+   * in flight, checked before the thread because it holds until the thread exists, or a thread
+   * that is not deleted, settled or archived. A link with neither is a launch that died.
+   */
+  const hasOpenThread = (ref: WorkItemRef) =>
+    Effect.gen(function* () {
+      const { links } = yield* work.listLinks(itemReader, { ref });
+      for (const { threadId } of links) {
+        if ((yield* work.isLaunching(threadId)) || (yield* threads.openThread(threadId))) {
+          return true;
+        }
+      }
+      return false;
+    });
+
+  const startNext: FactoryService["Service"]["startNext"] = Effect.fn("FactoryService.startNext")(
+    function* ({ projectId, label, runtimeModeCeiling }) {
+      if (Option.isNone(yield* projects.get(projectId))) {
+        return yield* new FactoryThreadEffects.FactoryProjectMissingError({ projectId });
+      }
+      // Every start would be refused without one, so a scheduled run hears it even with nothing
+      // Ready.
+      yield* settings.requireDeliverySettings(projectId);
+      const { sources } = yield* work.listSources(itemReader, {
+        projectId,
+        includeDisconnected: false,
+      });
+      // `start` refuses these too; skipping them first saves reading their items and branches.
+      const active = new Set(
+        (yield* deliveries.listActive()).map(({ itemRef }) => workItemRefString(itemRef)),
+      );
+      const incomplete: FactoryStartNextResult = { type: "nothing_ready", incomplete: true };
+      for (const source of sources) {
+        let cursor: string | null = null;
+        do {
+          // A page Work cannot serve is a part of the listing nobody saw, never an empty one.
+          const page: Option.Option<WorkListResult> = yield* Effect.option(
+            work.listItems(itemReader, {
+              sourceId: source.sourceId,
+              statuses: ["todo"],
+              ...(label === undefined ? {} : { labels: [label] }),
+              limit: NEXT_PAGE,
+              ...(cursor === null ? {} : { cursor }),
+            }),
+          );
+          if (Option.isNone(page) || page.value.stale) return incomplete;
+          for (const item of page.value.items) {
+            // Work could not read it whole, so what it lists of the item may be wrong, and the
+            // item may be the first Ready one.
+            if (item.invalid !== null) return incomplete;
+            if (item.status !== "todo" || item.blocked) continue;
+            if (active.has(workItemRefString(item.ref))) continue;
+            if (yield* hasOpenThread(item.ref)) continue;
+            const started = yield* start({
+              itemRef: item.ref,
+              ...(runtimeModeCeiling === undefined ? {} : { runtimeModeCeiling }),
+            }).pipe(
+              Effect.asSome,
+              // A concurrent start took it first; the next Ready item is this call's.
+              Effect.catchTags({ FactoryDeliveryActive: () => Effect.succeedNone }),
+            );
+            if (Option.isSome(started)) return { type: "started", delivery: started.value };
+          }
+          cursor = page.value.nextCursor;
+        } while (cursor !== null);
+      }
+      return { type: "nothing_ready", incomplete: false };
     },
   );
 
@@ -1043,6 +1148,7 @@ const make = Effect.gen(function* () {
 
   return FactoryService.of({
     start,
+    startNext,
     get: (deliveryId) =>
       readWithRuns("service.get", deliveries.get(deliveryId).pipe(Effect.map(Option.toArray))).pipe(
         Effect.map(([delivery]) => Option.fromUndefinedOr(delivery)),

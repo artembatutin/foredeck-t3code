@@ -16,6 +16,7 @@ import * as Schema from "effect/Schema";
 import { requireThreadScope } from "../../../mcp/McpInvocationContext.ts";
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
 import { loadCaller, resolveProjectId } from "../../../mcp/threadAccess.ts";
+import type { ProjectionStoreV2Error } from "../../../orchestration-v2/ProjectionStore.ts";
 import {
   actorFromCaller,
   parseWorkItemReference,
@@ -49,11 +50,11 @@ const storeUnavailable = () =>
     message: "Factory could not read its deliveries. Try again.",
   });
 
+/** Why `factory_deliver` started nothing: a start's refusal, or a thread read for a next call. */
+type DeliverError = FactoryService.FactoryStartError | ProjectionStoreV2Error;
+
 /** A refused start's code: its own for each refusal an agent can act on, else by wire reason. */
-const startCode = (
-  error: FactoryService.FactoryStartError,
-  reason: FactoryErrorReason,
-): FactoryMcpFailure["code"] => {
+const startCode = (error: DeliverError, reason: FactoryErrorReason): FactoryMcpFailure["code"] => {
   switch (error._tag) {
     case "FactoryVerifyCommandMissingError":
       return "not_configured";
@@ -76,10 +77,28 @@ const startCode = (
  * A refused start as an agent hears it, with the fixed text the RPC methods answer with: never
  * what Work, Git or the store reported.
  */
-const startFailure = (error: FactoryService.FactoryStartError) => {
+const startFailure = (error: DeliverError) => {
   const { reason, message } = toFactoryError(error);
   return new FactoryMcpFailure({ code: startCode(error, reason), message });
 };
+
+/** `startFailure`, except that a next call names a project, not an item's. */
+const nextFailure = (error: DeliverError) =>
+  error._tag === "FactoryProjectMissingError"
+    ? new FactoryMcpFailure({
+        code: "project_missing",
+        message: "The project is not on this environment.",
+      })
+    : startFailure(error);
+
+/** What a next call answers when it started nothing. */
+const nothingReady = (incomplete: boolean) => ({
+  nothingReady: true,
+  incomplete,
+  message: incomplete
+    ? "Nothing Ready was started: a Work source of the project could not be listed whole, and Factory never starts an item past one it could not see."
+    : "No Work item of the project is Ready, so nothing was started.",
+});
 
 /** The item a tool names, resolved among its project's sources as `work_read` does. */
 const resolveItem = (params: {
@@ -230,7 +249,7 @@ export const toolLayer = McpToolAccess.toLayer(FactoryToolkit, {
   // runtime mode becomes the delivery's ceiling, which Factory applies at each of its launches.
   factory_deliver: McpToolAccess.startsThreads(
     () => ({}),
-    ({ item, sourceId, projectId, kind }, started) =>
+    ({ item, next, label, sourceId, projectId, kind }, started) =>
       Effect.gen(function* () {
         if (!actorFromCaller(yield* loadCaller()).grants.includes(AuthOrchestrationOperateScope)) {
           return yield* new FactoryMcpFailure({
@@ -239,12 +258,36 @@ export const toolLayer = McpToolAccess.toLayer(FactoryToolkit, {
               "A Factory delivery starts threads, and a plan-mode thread or read-only client only reads.",
           });
         }
+        const exactlyOne = "Pass exactly one of item and next: true.";
+        const service = yield* FactoryService.FactoryService;
+        if (next === true) {
+          if (item !== undefined) return yield* invalidRequest(exactlyOne);
+          if (projectId === undefined) {
+            return yield* invalidRequest("next needs projectId, the project to deliver from.");
+          }
+          if (sourceId !== undefined || kind === "parent") {
+            return yield* invalidRequest(
+              "next delivers a single item from any of the project's sources; pass only projectId and label.",
+            );
+          }
+          const result = yield* service
+            .startNext({
+              projectId,
+              ...(label === undefined ? {} : { label }),
+              runtimeModeCeiling: started.runtimeMode,
+            })
+            .pipe(Effect.mapError(nextFailure));
+          return result.type === "started"
+            ? { delivery: toFactoryDelivery(result.delivery) }
+            : nothingReady(result.incomplete);
+        }
+        if (item === undefined) return yield* invalidRequest(exactlyOne);
+        if (label !== undefined) return yield* invalidRequest("label applies only with next.");
         const itemRef = yield* resolveItem({
           item,
           ...(sourceId === undefined ? {} : { sourceId }),
           ...(projectId === undefined ? {} : { projectId }),
         });
-        const service = yield* FactoryService.FactoryService;
         const delivery = yield* service
           .start({
             itemRef,

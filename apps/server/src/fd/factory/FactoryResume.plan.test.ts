@@ -82,6 +82,7 @@ const scriptedThreads = (world: World) =>
           : Effect.die("only the planner launch is read here"),
       threadState: () => Effect.die("no thread is recorded"),
       liveRun: () => Effect.die("live run read not scripted"),
+      openThread: () => Effect.die("open thread read not scripted"),
       carriesFactoryTurn: () => Effect.die("factory turn read not scripted"),
       liveRunsOn: () => Effect.die("live runs read not scripted"),
       launchedLiveRuns: Effect.die("live runs read not scripted"),

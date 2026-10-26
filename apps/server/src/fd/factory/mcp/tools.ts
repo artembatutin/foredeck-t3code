@@ -1,4 +1,4 @@
-import { OrchestratorMcpFailure, ProjectId } from "@t3tools/contracts";
+import { OrchestratorMcpFailure, ProjectId, TrimmedNonEmptyString } from "@t3tools/contracts";
 import { FactoryMcpFailure, FactoryPlan, FactoryReview } from "@t3tools/contracts/fd/factory";
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/ai";
@@ -54,7 +54,14 @@ const SourceId = Schema.String.check(Schema.isBetweenLength(1, 256)).annotate({
 });
 const TargetProject = ProjectId.annotate({
   description:
-    "Project whose Work sources resolve the item; defaults to the calling thread's project.",
+    "Project whose Work sources resolve the item, by default the calling thread's; with next, the project to start the next Ready item of, which next requires.",
+});
+const NextReady = Schema.Boolean.annotate({
+  description:
+    "true starts the next Ready item of projectId instead of a named item: the first todo item, in Work's list order, that is not blocked and has no open thread or delivery. Pass it instead of item.",
+});
+const ReadyLabel = TrimmedNonEmptyString.check(Schema.isMaxLength(256)).annotate({
+  description: "With next, only items with this label are considered.",
 });
 
 export const FactoryToolkit = Toolkit.make(
@@ -105,9 +112,11 @@ export const FactoryToolkit = Toolkit.make(
   }).annotate(Tool.Readonly, true),
   Tool.make("factory_deliver", {
     description:
-      "Start a Factory delivery of a Work item: an author thread on a new worktree and branch, server-run verification, review and repair rounds, then a pull request. As a parent, a planner thread first plans the item's tasks for the owner to approve. Its threads never run in a broader runtime mode than yours. An item can have one delivery that is not done or cancelled; follow it with factory_status.",
+      "Start a Factory delivery of a Work item: an author thread on a new worktree and branch, server-run verification, review and repair rounds, then a pull request. As a parent, a planner thread first plans the item's tasks for the owner to approve. Its threads never run in a broader runtime mode than yours. An item can have one delivery that is not done or cancelled; follow it with factory_status. Pass exactly one of item and next: true. With next, Factory delivers the project's next Ready item as a single item, optionally only among items with label; when nothing is Ready it starts nothing and answers nothingReady, with incomplete true when a Work source could not be listed whole.",
     parameters: Schema.Struct({
-      item: ItemReference,
+      item: Schema.optionalKey(ItemReference),
+      next: Schema.optionalKey(NextReady),
+      label: Schema.optionalKey(ReadyLabel),
       sourceId: Schema.optionalKey(SourceId),
       projectId: Schema.optionalKey(TargetProject),
       kind: Schema.optionalKey(

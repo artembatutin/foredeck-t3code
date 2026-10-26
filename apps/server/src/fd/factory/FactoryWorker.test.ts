@@ -78,6 +78,7 @@ const scriptedThreads = (script: ThreadScript) =>
         launchState: () => Effect.die("launch read not scripted"),
         threadState: () => Effect.die("thread read not scripted"),
         liveRun: () => Effect.die("live run read not scripted"),
+        openThread: () => Effect.die("open thread read not scripted"),
         carriesFactoryTurn: () => Effect.die("factory turn read not scripted"),
         liveRunsOn: () => Effect.die("live runs read not scripted"),
         launchedLiveRuns: Effect.die("live runs read not scripted"),

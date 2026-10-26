@@ -81,6 +81,20 @@ each tool records only the calling thread's own review or plan, so it checks ins
 caller is the delivery's registered reviewer or planner
 ([`mcp/handlers.ts`](../../apps/server/src/fd/factory/mcp/handlers.ts)).
 
+## The next Ready item is never a guess
+
+`factory_deliver` with `next: true`, which scheduled tasks call, runs `FactoryService.startNext`:
+Work's Ready (todo, unblocked, no open linked thread, where an idle thread and a launch Work holds
+in flight count as open, as Work's own starts judge) and no active delivery. It walks the sources
+in Work's order and each source's pages in turn, not merged by update time as the web list shows
+them, which would need every page of every source before any pick. The first such item goes
+through `start`, whose item lock and active-item index settle a race; a pick refused as active is
+skipped for the next. A page that fails, a stale page and an item Work lists as invalid each end
+the walk as incomplete rather than read on, for the reason a miss proves nothing to
+[child creation](#child-items-are-found-again-before-they-are-created): the item not seen could be
+the first Ready one. A stale page's own items are not taken either, since a stale Markdown listing
+lacks files it never indexed, wherever they would sort.
+
 ## Work never imports Factory
 
 Work decides what to build and Factory decides how, so Work stays complete without Factory: the
