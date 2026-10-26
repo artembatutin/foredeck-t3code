@@ -214,9 +214,10 @@ export class FactoryWorker extends Context.Service<
      */
     readonly postUnfinishedComments: Effect.Effect<void, FactoryStoreError>;
     /**
-     * Ends the pull request watch of each delivery whose state still asks for it, cancelled ones
-     * included: a process that stopped between storing a cancel and ending the watch left it on,
-     * to wake the author thread to new work. The boot sweep calls this.
+     * Releases the pull request watch of each delivery whose state still asks for it (see
+     * `releaseWatch` there), cancelled ones included: a process that stopped between storing a
+     * cancel and releasing the watch left it on, to wake the author thread to new work, and the
+     * wakes it sent meanwhile untaken. The boot sweep calls this.
      */
     readonly releaseWatches: Effect.Effect<void, FactoryStoreError>;
     /**
@@ -705,20 +706,44 @@ const make = Effect.gen(function* () {
     if (next.delivery.status === "done" && before.status !== "done") {
       for (const childId of before.children) yield* finishChild(childId);
     }
-    // The watch Factory holds is to be ended (see `followThrough.releaseWatch`).
+    // Cancelled, a delivery that took a wake its watch sent stops what that wake runs. One still
+    // queued is stopped as it goes live (see `stopCancelledRun`).
+    if (
+      before.status === "cancelled" &&
+      adoptedRuns(next.delivery).length > adoptedRuns(before).length
+    ) {
+      yield* stopTakenWakes(stored);
+    }
+    // The watch is to be released (see `releaseWatch` in the state).
     const released =
-      next.delivery.followThrough?.releaseWatch === true &&
-      before.followThrough?.releaseWatch !== true
+      next.delivery.releaseWatch === true && before.releaseWatch !== true
         ? yield* releaseWatch(stored)
         : undefined;
     const taken = yield* takeEndedWake(deliveryId, before, next.delivery);
     return taken ?? released ?? Option.some(stored);
   });
 
+  /** Stops the run live on a cancelled delivery's author thread when it is Factory's. */
+  const stopTakenWakes = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
+    Effect.gen(function* () {
+      const { author } = delivery.state.threads;
+      if (author === undefined) return;
+      const runs = yield* Effect.suspend(() => threads.liveRunsOn([author]));
+      yield* Effect.forEach(runs, stopCancelledRun, { discard: true });
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("factory could not read a cancelled delivery's author thread", cause),
+      ),
+    );
+
   /**
-   * Ends the watch the delivery holds, as its state asks, then steps that it holds none. A watch
-   * already gone, or someone else's, needs no ending. A failure is logged and leaves the release
-   * marked, for the next boot sweep. Undefined when nothing was stepped.
+   * Releases the watch as the delivery's state asks (see `FactoryPullRequest.release`): ends
+   * Factory's watch while it is still that watch, steps where it ended and the wakes core
+   * committed, so the cancelled delivery stops the runs its watch set off, then steps that the
+   * release is done. A watch someone else started stays. A failure is logged and leaves the
+   * release marked, for the next boot sweep. Undefined when nothing was stepped.
    */
   // Annotated: it closes the cycle `stepLocked` → `releaseWatch`.
   const releaseWatch = (
@@ -728,18 +753,21 @@ const make = Effect.gen(function* () {
     FactoryStoreError
   > =>
     Effect.gen(function* () {
-      const followThrough = delivery.state.followThrough;
-      if (followThrough?.releaseWatch !== true) return undefined;
-      const ended = yield* Effect.exit(Effect.suspend(() => pullRequests.unwatch(delivery)));
-      if (Exit.isFailure(ended)) {
-        if (Cause.hasInterruptsOnly(ended.cause)) return yield* Effect.interrupt;
-        yield* Effect.logWarning("factory could not end its pull request watch", ended.cause);
+      const { deliveryId, state } = delivery;
+      if (state.releaseWatch !== true) return undefined;
+      const released = yield* Effect.exit(Effect.suspend(() => pullRequests.release(delivery)));
+      if (Exit.isFailure(released)) {
+        if (Cause.hasInterruptsOnly(released.cause)) return yield* Effect.interrupt;
+        yield* Effect.logWarning("factory could not end its pull request watch", released.cause);
         return undefined;
       }
-      return yield* stepLocked(delivery.deliveryId, {
-        type: "watch.released",
-        startedAt: followThrough.watchStartedAt,
-      });
+      if (Option.isSome(released.value)) {
+        const { startedAt, at, firstAt, wakes } = released.value.value;
+        if (at !== null)
+          yield* stepLocked(deliveryId, { type: "watch.ended", startedAt, at, firstAt });
+        for (const wake of wakes) yield* stepLocked(deliveryId, wake);
+      }
+      return yield* stepLocked(deliveryId, { type: "watch.released" });
     });
 
   /**
@@ -1045,12 +1073,13 @@ const make = Effect.gen(function* () {
   };
 
   /**
-   * Feeds back an opened pull request: starts its watch, then stores the result with the watch's
-   * event-log position, both under the delivery's lock and only while the delivery still awaits
-   * this effect. A wake committed after the watch started then steps the delivery only once the
-   * pull request is stored, so none falls in between. A watch core ended during a round is not
-   * started again here. A watch that cannot start is reported with the pull request, which is
-   * published either way and is recorded.
+   * Feeds back an opened pull request: has its watch started (see `FactoryPullRequest.watch`),
+   * then stores the result with what that left, and then each wake core committed since the
+   * delivery's first watch command, all under the delivery's lock and only while the delivery
+   * still awaits this effect. A wake committed later steps the delivery only once the pull request
+   * is stored, so none falls in between, and one committed before is taken here, the end of a
+   * watch included. A watch core ended is not started again here. A watch that cannot start is
+   * reported with the pull request, which is published either way and is recorded.
    */
   const openedPullRequest = (job: Job, event: Extract<FactoryEvent, { type: "pr.opened" }>) => {
     const { deliveryId } = job.delivery;
@@ -1069,9 +1098,6 @@ const make = Effect.gen(function* () {
           // Stale: the engine takes nothing of it.
           return yield* stepLocked(deliveryId, event);
         }
-        if (current.state.followThrough?.watchEnded === true) {
-          return yield* stepLocked(deliveryId, event);
-        }
         const watched = yield* Effect.exit(
           Effect.suspend(() => pullRequests.watch(current, effect, event.pullRequest)),
         );
@@ -1082,13 +1108,11 @@ const make = Effect.gen(function* () {
             watchFailure: watchFailureDetail(event.pullRequest.number, watched.cause),
           });
         }
-        return yield* stepLocked(
-          deliveryId,
-          Option.match(watched.value, {
-            onNone: () => event,
-            onSome: (watch) => ({ ...event, watch }),
-          }),
-        );
+        if (Option.isNone(watched.value)) return yield* stepLocked(deliveryId, event);
+        const { watch, wakes } = watched.value.value;
+        let stored = yield* stepLocked(deliveryId, { ...event, watch });
+        for (const wake of wakes) stored = yield* stepLocked(deliveryId, wake);
+        return stored;
       }),
     );
   };

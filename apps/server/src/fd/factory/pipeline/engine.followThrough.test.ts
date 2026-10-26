@@ -11,6 +11,7 @@ import type {
   FactoryOpenedPullRequest,
   FactoryResumeCheck,
   FactoryReviewJudgment,
+  FactoryWatchState,
 } from "./state.ts";
 
 const author = ThreadId.make("thread-author");
@@ -72,9 +73,18 @@ const run = (delivery: FactoryDeliveryState, ...events: FactoryEvent[]): Factory
 // reviewer launch (4), record (5) and the PR (6), whose watch's command is at position 100.
 const WATCHED_AFTER = 100;
 const STARTED_AT = "2026-10-24T10:06:00.000Z";
-/** A watch command's result: its position, and the watch it started at `STARTED_AT`. */
-const watch = (after: number, created = true) => ({ after, startedAt: STARTED_AT, created });
-/** Follow-through after the latest watch command at `armedAt`, holding the watch it started. */
+const OWNERS = "2026-10-24T11:00:00.000Z";
+/**
+ * A PR stage's watch result: the delivery's first watch command at `WATCHED_AFTER`, this stage's
+ * read or command at `at`, and the watch a Factory command started at `STARTED_AT` on.
+ */
+const watch = (at: number, armed = true, held: string | null = STARTED_AT): FactoryWatchState => ({
+  firstAt: WATCHED_AFTER,
+  at,
+  armed,
+  held,
+});
+/** Follow-through after the latest PR stage at `armedAt`, on the watch Factory started. */
 const watched = (
   runs: ReadonlyArray<RunId> = [],
   pending: ReadonlyArray<RunId> = [],
@@ -83,10 +93,10 @@ const watched = (
   watchedAfter: WATCHED_AFTER,
   armedAt,
   watchStartedAt: STARTED_AT as string | null,
+  heldUntil: null as number | null,
   runs,
   pending,
   watchEnded: false,
-  releaseWatch: false,
 });
 
 /** A single item whose pull request is open and watched, awaiting nothing. */
@@ -141,6 +151,9 @@ const wake = (overrides: Partial<Extract<FactoryEvent, { type: "pr.feedback" }>>
     number: pullRequest.number,
     url: pullRequest.url,
     sequence: WATCHED_AFTER + 5,
+    // Sent by the watch Factory started; its sync updated the link just before the run.
+    watchStartedAt: STARTED_AT as string | null,
+    linkSequence: WATCHED_AFTER + 4,
     ...overrides,
   }) satisfies FactoryEvent;
 
@@ -210,11 +223,15 @@ describe("Factory engine: adopting a pull request wake", () => {
     }
   });
 
-  it("takes no wake once the delivery is done or cancelled, or closes out its merge", () => {
-    for (const status of ["done", "cancelled"] as const) {
-      const state = { ...prOpen, status };
-      expect(advance(state, wake()).delivery).toBe(state);
-    }
+  it("takes no wake as a round once the delivery is done or cancelled, or closes out its merge", () => {
+    const done = { ...prOpen, status: "done" as const };
+    expect(advance(done, wake()).delivery).toBe(done);
+    // Cancelled, it only owns the wake, so its run is stopped.
+    const cancelled = { ...prOpen, status: "cancelled" as const };
+    expect(advance(cancelled, wake())).toEqual({
+      delivery: { ...cancelled, followThrough: watched([wakeRun]) },
+      effects: [],
+    });
     const closingOut = advance(prOpen, merged).delivery;
     expect(advance(closingOut, wake()).delivery).toBe(closingOut);
     // Its adopted wake again is no second round.
@@ -563,8 +580,8 @@ describe("Factory engine: a merge or close during a follow-through round", () =>
         awaiting: null,
         block: null,
         checkpoint: null,
-        // The watch Factory started is to be ended with it.
-        followThrough: { ...(state.followThrough ?? watched()), releaseWatch: true },
+        // The watch Factory started is to be released with it.
+        releaseWatch: true,
       },
       effects: [],
     });
@@ -672,13 +689,15 @@ describe("Factory engine: wakes that come during a round", () => {
 });
 
 describe("Factory engine: a watch core ended", () => {
+  const endedRun = RunId.make("run-ended");
+  // Core removed the watch in the sync at 102 that queued the end's run at 103.
   const ended = wake({
     kind: "ended",
-    runId: RunId.make("run-ended"),
+    runId: endedRun,
     sequence: WATCHED_AFTER + 3,
+    watchStartedAt: null,
+    linkSequence: WATCHED_AFTER + 2,
   });
-
-  const endedRun = RunId.make("run-ended");
 
   it("blocks a delivery waiting on its pull request, owns the end's run, and takes it once", () => {
     const step = advance(prOpen, ended);
@@ -688,12 +707,8 @@ describe("Factory engine: a watch core ended", () => {
         status: "blocked",
         awaiting: null,
         block: { reason: "watch_ended" },
-        // The watch Factory started is gone with it; the end's run is Factory's to cancel.
-        followThrough: {
-          ...watched([endedRun]),
-          watchStartedAt: null,
-          watchEnded: true,
-        },
+        // The watch Factory started ended there; the end's run is Factory's to cancel.
+        followThrough: { ...watched([endedRun]), heldUntil: WATCHED_AFTER + 2, watchEnded: true },
       },
       effects: [],
     });
@@ -701,28 +716,25 @@ describe("Factory engine: a watch core ended", () => {
     expect(step.delivery.followThrough?.pending).toEqual([]);
   });
 
-  it("releases the watch it started again when the end was committed before that command", () => {
-    // Republished: the latest watch command is at 200, holding the watch it started.
-    const rearmed = { ...prOpen, followThrough: watched([], [], 200) };
-    const endedBefore = wake({ kind: "ended", runId: endedRun, sequence: 150 });
-    const step = advance(rearmed, endedBefore);
-    expect(step.delivery.status).toBe("blocked");
-    expect(step.delivery.block).toEqual({ reason: "watch_ended" });
-    expect(step.delivery.followThrough).toEqual({
-      ...watched([endedRun], [], 200),
-      watchEnded: true,
-      releaseWatch: true,
-    });
-    // Once the worker ended it, the delivery holds no watch.
-    const released = advance(step.delivery, { type: "watch.released", startedAt: STARTED_AT });
-    expect(released.delivery.followThrough).toEqual({
-      ...watched([endedRun], [], 200),
-      watchStartedAt: null,
-      watchEnded: true,
-    });
-    // A watch someone else started is not Factory's to end.
-    const theirs = { ...prOpen, followThrough: { ...watched([], [], 200), watchStartedAt: null } };
-    expect(advance(theirs, endedBefore).delivery.followThrough?.releaseWatch).toBe(false);
+  it("blocks at a PR stage that started no watch over an end, and only a new watch clears it", () => {
+    const republishing = {
+      ...prOpen,
+      status: "approved" as const,
+      awaiting: { type: "effect" as const, effect: { id: 11, type: "open_pr" as const } },
+      effectsIssued: 11,
+    };
+    const flagged = { ...republishing, followThrough: { ...watched(), watchEnded: true } };
+    const opened = (state: FactoryDeliveryState, result: FactoryWatchState) =>
+      advance(state, { type: "pr.opened", effectId: 11, pullRequest, watch: result }).delivery;
+    // The worker started none over the end it read: the delivery blocks where it would wait.
+    const kept = opened(flagged, watch(200, false, null));
+    expect(kept.status).toBe("blocked");
+    expect(kept.block).toEqual({ reason: "watch_ended" });
+    expect(kept.followThrough?.watchEnded).toBe(true);
+    // With no end taken, a watch already on is followed as it is.
+    expect(opened(republishing, watch(200, false)).status).toBe("pr_open");
+    // A watch this stage started is the owner's resume, and clears the end.
+    expect(opened(flagged, watch(200)).status).toBe("pr_open");
   });
 
   it("lets a running round finish, then blocks instead of waiting on the pull request", () => {
@@ -769,7 +781,8 @@ describe("Factory engine: a watch core ended", () => {
           outcome: { type: "approved", evidencePath: "/a" },
         },
       ).delivery,
-      { type: "pr.opened", effectId: 11, pullRequest },
+      // The worker started no watch over the end it took, and holds none.
+      { type: "pr.opened", effectId: 11, pullRequest, watch: watch(300, false, null) },
     ).delivery;
     expect(blockedAtOpen.status).toBe("blocked");
     expect(blockedAtOpen.block).toEqual({ reason: "watch_ended" });
@@ -898,74 +911,132 @@ describe("Factory engine: wakes and watches across a republish", () => {
     expect(advance(rearmed, wake({ runId: later, sequence: 90 })).delivery).toBe(rearmed);
   });
 
-  it("holds only a watch its own command started", () => {
+  it("takes which watch is Factory's, and its first watch's position, from the PR stage", () => {
     const republishing = {
       ...adopted,
       status: "approved" as const,
       awaiting: { type: "effect" as const, effect: { id: 11, type: "open_pr" as const } },
       effectsIssued: 11,
     };
-    const opened = (
-      watchStarted: {
-        readonly after: number;
-        readonly startedAt: string | null;
-        readonly created: boolean;
-      },
-      held: string | null,
-    ) =>
-      advance(
-        { ...republishing, followThrough: { ...watched([wakeRun]), watchStartedAt: held } },
-        { type: "pr.opened", effectId: 11, pullRequest, watch: watchStarted },
-      ).delivery.followThrough?.watchStartedAt;
-    const owners = "2026-10-24T11:00:00.000Z";
-    // Its own earlier watch, kept, stays its own.
-    expect(opened({ after: 200, startedAt: STARTED_AT, created: false }, STARTED_AT)).toBe(
-      STARTED_AT,
-    );
-    // The owner's watch, which replaced it and which the command kept, stays the owner's.
-    expect(opened({ after: 200, startedAt: owners, created: false }, STARTED_AT)).toBeNull();
-    expect(opened({ after: 200, startedAt: owners, created: false }, null)).toBeNull();
-    // One the command started is Factory's.
-    expect(opened({ after: 200, startedAt: owners, created: true }, null)).toBe(owners);
-    // At the first PR stage, a watch already on is someone else's.
+    const opened = (result: FactoryWatchState) =>
+      advance(republishing, { type: "pr.opened", effectId: 11, pullRequest, watch: result })
+        .delivery.followThrough;
+    expect(opened(watch(200, false))).toEqual(watched([wakeRun], [], 200));
+    // The owner's watch, which the PR stage read on and left, is not Factory's.
+    expect(opened(watch(200, false, null))).toEqual({
+      ...watched([wakeRun], [], 200),
+      watchStartedAt: null,
+    });
+    // A result that was never stored loses no position: the first watch's stays the first.
     const { followThrough: _, ...unwatched } = prOpen;
     const first = advance(
       {
         ...unwatched,
         status: "approved" as const,
-        awaiting: { type: "effect" as const, effect: { id: 6, type: "open_pr" as const } },
+        awaiting: { type: "effect" as const, effect: { id: 13, type: "open_pr" as const } },
+        effectsIssued: 13,
       },
-      {
-        type: "pr.opened",
-        effectId: 6,
-        pullRequest,
-        watch: { after: 100, startedAt: owners, created: false },
-      },
+      { type: "pr.opened", effectId: 13, pullRequest, watch: watch(300, false) },
     ).delivery.followThrough;
-    expect(first).toEqual({ ...watched(), watchStartedAt: null });
+    expect(first).toEqual(watched([], [], 300));
   });
 
-  it("marks the watch it holds for release on cancel, and a close's cancel, never another's", () => {
+  it("marks the watch for release on cancel, and a close's cancel, once a PR stage ran", () => {
     for (const event of [{ type: "cancel" } as const, closed]) {
       const cancelled = advance(adopted, event).delivery;
       expect(cancelled.status).toBe("cancelled");
-      expect(cancelled.followThrough?.releaseWatch).toBe(true);
-      // Released while cancelled: the cancelled delivery holds no watch any more.
-      const released = advance(cancelled, { type: "watch.released", startedAt: STARTED_AT });
-      expect(released.delivery.followThrough).toEqual({
-        ...watched([wakeRun]),
-        watchStartedAt: null,
-      });
-      expect(released.delivery.status).toBe("cancelled");
-      // A release of a watch it does not hold changes nothing.
-      const stale = advance(cancelled, {
-        type: "watch.released",
-        startedAt: "2026-10-24T11:00:00.000Z",
-      });
-      expect(stale.delivery).toBe(cancelled);
+      expect(cancelled.releaseWatch).toBe(true);
+      // Released while cancelled: nothing else changes.
+      const released = advance(cancelled, { type: "watch.released" });
+      const { releaseWatch: _, ...rest } = cancelled;
+      expect(released.delivery).toEqual(rest);
+      expect(advance(released.delivery, { type: "watch.released" }).delivery).toBe(
+        released.delivery,
+      );
     }
-    const theirs = { ...adopted, followThrough: { ...watched([wakeRun]), watchStartedAt: null } };
-    expect(advance(theirs, { type: "cancel" }).delivery.followThrough?.releaseWatch).toBe(false);
+    // A PR stage still outstanding, or one whose result was lost, may have started one.
+    const { followThrough: _, ...unwatched } = prOpen;
+    const effect = { id: 6, type: "open_pr" as const };
+    for (const state of [
+      { ...unwatched, status: "approved" as const, awaiting: { type: "effect" as const, effect } },
+      {
+        ...unwatched,
+        status: "blocked" as const,
+        block: { reason: "effect_failed" as const, effect, detail: "lost" },
+      },
+    ]) {
+      expect(advance(state, { type: "cancel" }).delivery.releaseWatch).toBe(true);
+    }
+    // Before any PR stage, there is nothing to release.
+    const running = { ...unwatched, status: "running" as const };
+    expect(advance(running, { type: "cancel" }).delivery.releaseWatch).toBeUndefined();
+  });
+
+  it("records where the watch Factory started ended, creating follow-through when it was lost", () => {
+    const cancelled = advance(adopted, { type: "cancel" }).delivery;
+    const end = { type: "watch.ended", startedAt: STARTED_AT, at: 250, firstAt: 90 } as const;
+    const step = advance(cancelled, end);
+    expect(step.effects).toEqual([]);
+    expect(step.delivery).toEqual({
+      ...cancelled,
+      followThrough: { ...watched([wakeRun]), heldUntil: 250 },
+    });
+    expect(advance(step.delivery, end).delivery).toBe(step.delivery);
+    // The PR stage's result was never stored: the watch's commands give the positions.
+    const { followThrough: _, ...unwatched } = cancelled;
+    expect(advance(unwatched, end).delivery.followThrough).toEqual({
+      ...watched([], [], 90),
+      watchedAfter: 90,
+      heldUntil: 250,
+    });
+  });
+});
+
+describe("Factory engine: wakes a cancelled delivery takes", () => {
+  const ownerRun = RunId.make("run-owner-wake");
+  const endRun = RunId.make("run-end");
+  const cancelled = advance(adopted, { type: "cancel" }).delivery;
+
+  it("owns a wake the watch Factory started sent, and the end that removed it, nothing more", () => {
+    const later = wake({ runId: ownerRun, sequence: WATCHED_AFTER + 20 });
+    const step = advance(cancelled, later);
+    expect(step).toEqual({
+      delivery: { ...cancelled, followThrough: watched([wakeRun, ownerRun]) },
+      effects: [],
+    });
+    const ended = advance(cancelled, {
+      type: "watch.ended",
+      startedAt: STARTED_AT,
+      at: 300,
+      firstAt: 100,
+    }).delivery;
+    const end = wake({
+      kind: "ended",
+      runId: endRun,
+      sequence: 301,
+      watchStartedAt: null,
+      linkSequence: 300,
+    });
+    expect(advance(ended, end).delivery.followThrough?.runs).toEqual([wakeRun, endRun]);
+    expect(advance(ended, end).delivery.status).toBe("cancelled");
+    // Another watch's wake, another end, or any wake when it started no watch: not its own.
+    for (const [state, event] of [
+      [cancelled, wake({ runId: ownerRun, sequence: 120, watchStartedAt: OWNERS })],
+      [ended, { ...end, linkSequence: 299 }],
+      [cancelled, end],
+      [{ ...cancelled, followThrough: { ...watched([wakeRun]), watchStartedAt: null } }, later],
+    ] as const) {
+      expect(advance(state, event).delivery).toBe(state);
+    }
+  });
+
+  it("owns its watch's wake when the pull request it published was never recorded", () => {
+    const { followThrough: _, ...unwatched } = cancelled;
+    const lost = advance(
+      { ...unwatched, pullRequest: null },
+      { type: "watch.ended", startedAt: STARTED_AT, at: 300, firstAt: 100 },
+    ).delivery;
+    expect(advance(lost, wake()).delivery.followThrough?.runs).toEqual([wakeRun]);
   });
 });
 

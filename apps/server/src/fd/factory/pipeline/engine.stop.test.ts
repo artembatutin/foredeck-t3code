@@ -392,8 +392,18 @@ describe("cancel", () => {
   ];
 
   it.each(cases)("ends a %s delivery, awaiting nothing and issuing nothing", (_, delivery) => {
+    // A PR stage still outstanding may have started a watch, which is to be released with it.
+    const publishing =
+      delivery.awaiting?.type === "effect" && delivery.awaiting.effect.type === "open_pr";
     expect(advance(delivery, cancel)).toEqual({
-      delivery: { ...delivery, status: "cancelled", awaiting: null, block: null, checkpoint: null },
+      delivery: {
+        ...delivery,
+        status: "cancelled",
+        awaiting: null,
+        block: null,
+        checkpoint: null,
+        ...(publishing ? { releaseWatch: true } : {}),
+      },
       effects: [],
     });
   });

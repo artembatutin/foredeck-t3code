@@ -16,7 +16,9 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
+import * as EventSink from "../../../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import { type WorkActor, type WorkDomainError, WorkService } from "../../work-management/index.ts";
 import * as Factory from "../index.ts";
@@ -27,6 +29,7 @@ import {
   ended,
   runReached,
   stateOf,
+  threadProjection,
   type World,
 } from "./deliveryHarness.ts";
 
@@ -392,6 +395,88 @@ export const itemStatus = (ref: WorkItemRef) =>
   );
 
 /** The thread's shell as the projection holds it. */
+/** Waits until the run's provider turn has started, and the effects that started it ran. */
+export const runStarted = (runId: RunId) =>
+  Effect.gen(function* () {
+    assert.strictEqual(yield* runReached(runId, ["starting", ...ended]), "starting");
+    yield* drainOrchestration;
+  });
+
+/** Ends the provider turn of the run while no Factory reactor runs: core finishes the run alone. */
+export const endWhileDown = (world: World, runId: RunId) =>
+  Effect.gen(function* () {
+    const turn =
+      world.provider.started.find((candidate) => candidate.runId === runId) ??
+      assert.fail(`No provider turn started run ${runId}.`);
+    yield* world.provider.endTurn(turn, "completed");
+    yield* runReached(runId, ["waiting", ...ended]);
+    yield* drainOrchestration;
+  });
+
+/** The provider's id of the turn that started the run, as an interrupt of it names it. */
+export const providerTurnOf = (world: World, runId: RunId) => {
+  const turn = world.provider.started.find((candidate) => candidate.runId === runId);
+  return turn === undefined
+    ? assert.fail(`No provider turn started run ${runId}.`)
+    : `provider-turn:${turn.attemptId}`;
+};
+
+export const interruptedTurns = (world: World): ReadonlyArray<string> =>
+  world.provider.interrupted.map(({ providerTurnId }) => providerTurnId);
+
+/**
+ * The runs a Factory cancel sent the thread an interrupt for, from its event log: an interrupt
+ * lands whether the provider is asked to stop the turn or the run ends before its turn started.
+ */
+export const cancelledRuns = (threadId: ThreadId, deliveryId: FactoryDeliveryId) =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const latest = yield* sink.latestSequence({ threadId });
+    const events = yield* sink.stream({ threadId }).pipe(
+      Stream.takeUntil(({ sequence }) => sequence >= latest),
+      Stream.runCollect,
+    );
+    const prefix = `factory-cancel:${deliveryId}:`;
+    return [
+      ...new Set(
+        events.flatMap(({ commandId }) =>
+          commandId?.startsWith(prefix) === true ? [commandId.slice(prefix.length)] : [],
+        ),
+      ),
+    ];
+  }).pipe(Effect.orDie);
+
+let ownerTurns = 0;
+
+/** Queues the owner's own turn on the thread, as the web client does, behind what it runs. */
+export const ownerQueues = (threadId: ThreadId, text: string) =>
+  Effect.gen(function* () {
+    ownerTurns += 1;
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const sent = yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make(`owner-queued-turn:${ownerTurns}`),
+      threadId,
+      messageId: MessageId.make(`owner-queued-turn-message:${ownerTurns}`),
+      text,
+      attachments: [],
+      dispatchMode: { type: "queue_after_active" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* drainOrchestration;
+    const created = sent.storedEvents.flatMap(({ event }) =>
+      event.type === "run.created" ? [event.payload.id] : [],
+    );
+    return created[0] ?? assert.fail("The owner's turn queued no run.");
+  }).pipe(Effect.orDie);
+
+export const runStatus = (threadId: ThreadId, runId: RunId) =>
+  threadProjection(threadId).pipe(
+    Effect.map(({ runs }) => runs.find((run) => run.id === runId)?.status),
+    Effect.orDie,
+  );
+
 export const threadShell = (threadId: ThreadId) =>
   Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
     orchestrator.getThreadShell(threadId),

@@ -280,12 +280,16 @@ const StoredDeliveryState = Schema.Struct({
       watchStartedAt: Schema.NullOr(Schema.String).pipe(
         Schema.withDecodingDefault(Effect.succeed(null)),
       ),
+      heldUntil: Schema.NullOr(NonNegativeInt).pipe(
+        Schema.withDecodingDefault(Effect.succeed(null)),
+      ),
       runs: Schema.Array(RunId),
       pending: Schema.Array(RunId).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
       watchEnded: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
-      releaseWatch: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
     }),
   ),
+  // Set by a cancel while a watch Factory started may be on, until the worker ends it.
+  releaseWatch: Schema.optionalKey(Schema.Literal(true)),
   block: Schema.NullOr(StoredBlock),
   // Added with stop after step: rows stored before it name no checkpoint, even when stopped. The
   // stop request is the `stopping` status, which every stored row could already hold. A blocked
@@ -390,8 +394,8 @@ export class FactoryDeliveryStore extends Context.Service<
       readonly itemRef?: WorkItemRef;
     }) => Effect.Effect<ReadonlyArray<StoredFactoryDelivery>, FactoryStoreError>;
     /**
-     * Deliveries, done and cancelled ones included, that must still end the pull request watch
-     * Factory holds (`followThrough.releaseWatch`), oldest first, for the boot sweep.
+     * Deliveries, cancelled ones included, that must still end the pull request watch a Factory
+     * command started (`releaseWatch`), oldest first, for the boot sweep.
      */
     readonly listReleasingWatch: () => Effect.Effect<
       ReadonlyArray<StoredFactoryDelivery>,
@@ -435,7 +439,7 @@ const make = Effect.gen(function* () {
           : [sql`source_id = ${request.itemRef.sourceId} AND item_id = ${request.itemRef.itemId}`]),
         ...(request.activeOnly === true ? [sql`status NOT IN ('done', 'cancelled')`] : []),
         ...(request.releasingWatch === true
-          ? [sql`json_extract(state_json, '$.followThrough.releaseWatch') = 1`]
+          ? [sql`json_extract(state_json, '$.releaseWatch') = 1`]
           : []),
       ])}
       ${

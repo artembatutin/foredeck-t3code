@@ -108,10 +108,10 @@ describe("Factory follow-through: watching the pull request", () => {
           armedAt: receipt.resultSequence,
           // Its own command started the watch, so the watch is Factory's.
           watchStartedAt: watch.startedAt,
+          heldUntil: null,
           runs: [],
           pending: [],
           watchEnded: false,
-          releaseWatch: false,
         });
 
         // The PR step taken again changes nothing.
@@ -122,9 +122,10 @@ describe("Factory follow-through: watching the pull request", () => {
             effectId: state.effectsIssued,
             pullRequest: state.pullRequest ?? assert.fail("No pull request."),
             watch: {
-              after: receipt.resultSequence + 50,
-              startedAt: watch.startedAt,
-              created: true,
+              firstAt: receipt.resultSequence,
+              at: receipt.resultSequence + 50,
+              armed: true,
+              held: watch.startedAt,
             },
           })
           .pipe(Effect.orDie);
@@ -563,10 +564,12 @@ describe("Factory follow-through: what a wake reports", () => {
           const blocked = yield* stateOf(deliveryId);
           assert.strictEqual(blocked.status, "blocked");
           assert.deepStrictEqual(blocked.block, { reason: "watch_ended" });
-          // The notice's run is the delivery's to cancel; core's watch is gone with it.
+          // The notice's run is the delivery's to cancel; core's watch is gone with it, at the
+          // sync that queued it.
           assert.deepStrictEqual(blocked.followThrough?.runs, [notice]);
           assert.deepStrictEqual(blocked.followThrough?.pending, []);
-          assert.isNull(blocked.followThrough?.watchStartedAt);
+          assert.strictEqual(blocked.followThrough?.watchStartedAt, before?.startedAt);
+          assert.isAbove(blocked.followThrough?.heldUntil ?? 0, state.followThrough?.armedAt ?? 0);
           assert.isUndefined((yield* linkOf(author, fakePullRequest.number)).watch);
           assert.deepStrictEqual(commentsSince(world, comments), [
             `Factory is blocked on this item and needs you. The pull request's watch ended, so Factory no longer follows its feedback. Resume or cancel the delivery in Foredeck. Factory delivery ${deliveryId}, update 3.`,

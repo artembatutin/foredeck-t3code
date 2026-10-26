@@ -572,21 +572,42 @@ step.
 
 A round publishes with a push of the approved commit by its id, never `create_pr` again: the
 stacked action opens a new pull request when the branch has no open one, so a pull request merged
-or closed before core's sync stored it would get a second. The PR stage then starts the watch
-again, which keeps a watch still on and restarts one the agent ended: core's wake text tells the
-agent to unwatch when it hands the work back. The position of that latest command is stored too: a
-watch's end committed before it means the command started again a watch core had ended, and
-Factory ends that watch as soon as the end reaches it. A pull request the PR stage published but
-could not watch, as on an author thread its owner settled, is recorded before the delivery blocks,
-so its merge or close is taken and a resume pushes to it rather than opening another.
+or closed before core's sync stored it would get a second. A pull request the PR stage published
+but could not watch, as on an author thread its owner settled, is recorded before the delivery
+blocks, so its merge or close is taken and a resume pushes to it rather than opening another.
 
-Factory holds only a watch its own command started: core keeps a watch already on, whoever started
-it, so the PR stage records the watch as Factory's only when its command's event is the watch's
-start, and keeps holding an earlier one of its own that the command kept. Only the watch it holds
-is ever ended. A cancel ends it, since it would wake the thread to new work, as does a watch end
-that the latest command passed over. The delivery's state asks for that release in the step that
-decides it, and a later step clears it once the watch is ended or found gone, so a server that
-stopped in between leaves it asked for; the boot sweep then ends it, cancelled deliveries included.
+The PR stage decides about the watch from what core committed, not from what Factory has stepped
+so far ([`FactoryPullRequest.ts`](../../apps/server/src/fd/factory/FactoryPullRequest.ts)). It
+reads the pull request's watch first; while one is on it starts none and follows that one. With
+none on, it reads the wakes committed on the author thread since the delivery's first watch
+command, and an end of the watch among them that the delivery has not taken means it starts none
+either: core can end only a watch that is on, so nothing ends between that read and the command,
+and a watch core ended is never recreated to wake the agent again before Factory hears of the end.
+The stage then stores its result and steps those wakes in order under the same lock, so one
+committed before its command is taken at once, the end included, which blocks the delivery.
+
+Which watch is Factory's is read from durable records, never from reads around the command, so a
+result lost to a restart loses nothing. The watch command's id derives from the delivery and the
+effect, so its receipt is found again, and its stored event shows the watch afterwards. Core starts
+a watch only in such a `thread.pull-request-synced` event, stamped with the command's time, so the
+command started the watch when its start is that time and no earlier event of that type shows it,
+however close the owner's own watch command came. Compaction keeps only each thread's newest
+whole-thread event, so those events can go: a command whose event is gone proves nothing and starts
+no watch of Factory's, and the watch the delivery already holds, judged while the events were
+there, stays Factory's. Only Factory's watch is ever ended.
+
+A cancel marks the watch for release in the step that stores it, as does a close's cancel, once a
+PR stage ran or may have run. The worker then ends Factory's watch with core's
+`thread.pull-request-watch.sync` naming the watch's start and carrying no wake, which core applies
+under the thread's lock only while that watch is on, so a watch the owner put in its place stays. A
+refusal is told from a failure by reading the link again: Factory's watch still on means the command
+failed, and the release stays marked for the next boot sweep, cancelled deliveries included. The
+release then steps where Factory's watch ended and every wake committed since the first watch
+command. A cancelled delivery takes as its own only the wakes that watch sent, named by the watch's
+start on the link their sync updated, and the end that removed it, at the link update the release
+recorded, only so their runs are stopped: a running one at once, a queued one as it starts, and
+the owner's own turns never. Ending a merged pull request's watch at close-out is conditional on
+the watch read the same way.
 
 ## Each transition posts one Work comment, from the step that stored it
 

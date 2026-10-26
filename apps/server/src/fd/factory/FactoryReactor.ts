@@ -1,7 +1,4 @@
 import type {
-  CommandId,
-  MessageId,
-  OrchestrationV2ConversationMessage,
   OrchestrationV2StoredEvent,
   RunId,
   ThreadId,
@@ -24,11 +21,11 @@ import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { launchDeliveryId } from "./FactoryThreadEffects.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
+import { type RunCreated, runCreated, wakeOf } from "./followThrough.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import {
   type FactoryEvent,
   type FactoryThreadEvent,
-  type FactoryWakeKind,
   isTerminal,
   isTerminalRunStatus,
 } from "./pipeline/state.ts";
@@ -75,30 +72,7 @@ interface PullRequestEnded {
 }
 
 /** A run created by a command on a thread a Factory launch made, which may be a watch's wake. */
-interface RunCreated {
-  readonly type: "run.created";
-  readonly threadId: ThreadId;
-  readonly runId: RunId;
-  readonly userMessageId: MessageId;
-  readonly commandId: CommandId;
-  /** The run's creation in the event log. */
-  readonly sequence: number;
-}
-
 type Job = "boot" | FactoryThreadEvent | LiveRun | PullRequestEnded | RunCreated;
-
-/** The stored event as a run created by a command; none for any other event. */
-const runCreated = ({ sequence, commandId, event }: OrchestrationV2StoredEvent) =>
-  event.type === "run.created" && commandId !== null
-    ? ({
-        type: "run.created",
-        threadId: event.payload.threadId,
-        runId: event.payload.id,
-        userMessageId: event.payload.userMessageId,
-        commandId,
-        sequence,
-      } satisfies RunCreated)
-    : undefined;
 
 /**
  * The event a link's stored snapshot makes: its pull request merged or closed, by number and URL.
@@ -180,56 +154,15 @@ const make = Effect.gen(function* () {
       }
     });
 
-  /**
-   * The wake a run starts, when core's pull request watch queued it: the run's command is a
-   * `thread.pull-request-watch.sync` that stored the wake as the run's message, and the link it
-   * updated on the thread names the pull request. What it reports is read from what that command
-   * committed: a watch it ended is the watch's end (core could not read the pull request, or
-   * stopped after too many comment-only updates), a notification of completed work reports only
-   * passing checks, and anything else is feedback. None for any other run, such as a turn the
-   * owner or Factory sent.
-   */
-  const wakeOf = (run: RunCreated) =>
+  /** The wake a run starts, as `wakeOf` judges it from its command's record and events. */
+  const wakeOfRun = (run: RunCreated) =>
     Effect.gen(function* () {
       const receipt = Option.getOrUndefined(yield* receipts.getByCommandId(run.commandId));
-      if (
-        receipt?.commandType !== "thread.pull-request-watch.sync" ||
-        receipt.status !== "accepted"
-      ) {
-        return undefined;
-      }
+      if (receipt?.status !== "accepted") return undefined;
       const events = yield* eventSink
         .readByCommandId({ commandId: run.commandId })
         .pipe(Stream.runCollect);
-      let wake: OrchestrationV2ConversationMessage | undefined;
-      let link: ThreadPullRequestLink | undefined;
-      for (const { event } of events) {
-        if (event.threadId !== run.threadId) continue;
-        if (event.type === "thread.pull-request-link-updated") link = event.payload;
-        if (
-          event.type === "message.updated" &&
-          event.payload.role === "user" &&
-          event.payload.id === run.userMessageId
-        ) {
-          wake = event.payload;
-        }
-      }
-      if (wake === undefined || link === undefined) return undefined;
-      const kind: FactoryWakeKind =
-        link.watch === undefined
-          ? "ended"
-          : wake.notification?.outcome === "completed"
-            ? "notice"
-            : "feedback";
-      return {
-        type: "pr.feedback",
-        kind,
-        threadId: run.threadId,
-        runId: run.runId,
-        number: link.number,
-        url: link.url,
-        sequence: run.sequence,
-      } satisfies FactoryEvent;
+      return wakeOf(run, receipt.commandType, events);
     });
 
   /**
@@ -241,7 +174,7 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const deliveryId = launchDeliveryId(run.threadId);
       if (deliveryId === undefined) return;
-      const wake = yield* wakeOf(run);
+      const wake = yield* wakeOfRun(run);
       if (wake !== undefined) yield* worker.step(deliveryId, wake);
     });
 

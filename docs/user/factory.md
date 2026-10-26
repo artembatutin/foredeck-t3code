@@ -130,8 +130,8 @@ followed yet.
 If T3 Code stops watching the pull request, because it cannot read it from the host or after too
 many comment-only updates, or cannot start watching it, as on an author thread you settled, the
 delivery blocks: Factory no longer hears of its feedback. **Resume** watches it again; unsettle the
-thread first if you settled it. Cancelling the delivery stops the watch Factory started, but not
-one you started yourself.
+thread first if you settled it. Cancelling the delivery stops the watch Factory started and the
+turns it woke the thread for, but not a watch or a turn you started yourself.
 
 ## When the pull request merges or closes
 

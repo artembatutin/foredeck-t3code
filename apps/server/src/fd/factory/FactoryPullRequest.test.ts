@@ -461,10 +461,10 @@ describe("the PR stage", () => {
           armedAt: 2,
           // The fake thread shell holds no link, so no watch is read back as Factory's.
           watchStartedAt: null,
+          heldUntil: null,
           runs: [],
           pending: [],
           watchEnded: false,
-          releaseWatch: false,
         });
         // Published the approved commit, which the worktree still holds, clean.
         assert.strictEqual(yield* publishedOf(cwd), reviewed);

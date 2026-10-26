@@ -113,20 +113,20 @@ describe("Factory's boot sweep of open pull requests", () => {
 
           yield* world.boot(Effect.void);
           const cancelled = yield* stateOf(deliveryId);
-          // Cancelled, then the watch its PR stage started is ended.
+          // Cancelled, then the watch its PR stage started is released where it ended.
           const closed = advance(opened.state, {
             type: "pr.closed",
             number: link.number,
             url: link.url,
           }).delivery;
-          assert.isTrue(closed.followThrough?.releaseWatch);
-          assert.deepStrictEqual(
-            cancelled,
-            advance(closed, {
-              type: "watch.released",
-              startedAt: opened.state.followThrough?.watchStartedAt ?? null,
-            }).delivery,
-          );
+          assert.isTrue(closed.releaseWatch);
+          const { releaseWatch: _, ...rest } = closed;
+          const heldUntil = cancelled.followThrough?.heldUntil ?? assert.fail("Not released.");
+          assert.isAbove(heldUntil, opened.state.followThrough?.armedAt ?? Infinity);
+          assert.deepStrictEqual(cancelled, {
+            ...rest,
+            followThrough: { ...(closed.followThrough ?? assert.fail("Not watched.")), heldUntil },
+          });
           assert.isUndefined((yield* linkOf(author, fakePullRequest.number)).watch);
           assert.strictEqual(cancelled.status, "cancelled");
           assert.deepStrictEqual(

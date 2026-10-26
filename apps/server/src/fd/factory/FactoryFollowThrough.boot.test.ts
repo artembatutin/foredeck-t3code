@@ -1,10 +1,10 @@
 import { assert, describe, it } from "@effect/vitest";
-import { CommandId, MessageId, type RunId, type ThreadId } from "@t3tools/contracts";
+import { CommandId, MessageId } from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import * as Effect from "effect/Effect";
-import * as Stream from "effect/Stream";
+import * as Option from "effect/Option";
 
-import * as EventSink from "../../orchestration-v2/EventSink.ts";
+import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as Factory from "./index.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
@@ -16,7 +16,6 @@ import {
   fakePullRequest,
   runReached,
   stateOf,
-  threadProjection,
   verifyCommands,
   withProject,
   type World,
@@ -25,10 +24,17 @@ import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import { advance } from "./pipeline/engine.ts";
 import {
   awaitedRun,
+  cancelledRuns,
+  endWhileDown,
+  interruptedTurns,
   linkOf,
   openSingle,
+  ownerQueues,
   passingReview,
+  providerTurnOf,
   reviewPasses,
+  runStarted as started,
+  runStatus,
   type WakeReport,
   wakeThread,
   watchPullRequest,
@@ -42,93 +48,12 @@ import {
  * sent, and leaves the owner's own turns on the thread alone. Nothing sleeps or polls.
  */
 
-const started = (runId: RunId) =>
-  Effect.gen(function* () {
-    assert.strictEqual(yield* runReached(runId, ["starting", ...ended]), "starting");
-    yield* drainOrchestration;
-  });
-
-/** Ends the provider turn of the run while no Factory reactor runs: core finishes the run alone. */
-const endWhileDown = (world: World, runId: RunId) =>
-  Effect.gen(function* () {
-    const turn =
-      world.provider.started.find((candidate) => candidate.runId === runId) ??
-      assert.fail(`No provider turn started run ${runId}.`);
-    yield* world.provider.endTurn(turn, "completed");
-    yield* runReached(runId, ["waiting", ...ended]);
-    yield* drainOrchestration;
-  });
-
 const followThroughAttempts = (deliveryId: FactoryDeliveryId) =>
   Effect.flatMap(FactoryStageRunStore.FactoryStageRunStore, (runs) =>
     runs.listByDelivery(deliveryId),
   ).pipe(
     Effect.orDie,
     Effect.map((runs) => runs.filter(({ stage }) => stage === "follow_through")),
-  );
-
-/** The provider's id of the turn that started the run, as an interrupt of it names it. */
-const providerTurnOf = (world: World, runId: RunId) => {
-  const turn = world.provider.started.find((candidate) => candidate.runId === runId);
-  return turn === undefined
-    ? assert.fail(`No provider turn started run ${runId}.`)
-    : `provider-turn:${turn.attemptId}`;
-};
-
-const interruptedTurns = (world: World): ReadonlyArray<string> =>
-  world.provider.interrupted.map(({ providerTurnId }) => providerTurnId);
-
-/**
- * The runs a Factory cancel sent the thread an interrupt for, from its event log: an interrupt
- * lands whether the provider is asked to stop the turn or the run ends before its turn started.
- */
-const cancelledRuns = (threadId: ThreadId, deliveryId: FactoryDeliveryId) =>
-  Effect.gen(function* () {
-    const sink = yield* EventSink.EventSinkV2;
-    const latest = yield* sink.latestSequence({ threadId });
-    const events = yield* sink.stream({ threadId }).pipe(
-      Stream.takeUntil(({ sequence }) => sequence >= latest),
-      Stream.runCollect,
-    );
-    const prefix = `factory-cancel:${deliveryId}:`;
-    return [
-      ...new Set(
-        events.flatMap(({ commandId }) =>
-          commandId?.startsWith(prefix) === true ? [commandId.slice(prefix.length)] : [],
-        ),
-      ),
-    ];
-  }).pipe(Effect.orDie);
-
-let ownerTurns = 0;
-
-/** Queues the owner's own turn on the thread, as the web client does, behind what it runs. */
-const ownerQueues = (threadId: ThreadId, text: string) =>
-  Effect.gen(function* () {
-    ownerTurns += 1;
-    const orchestrator = yield* Orchestrator.OrchestratorV2;
-    const sent = yield* orchestrator.dispatch({
-      type: "message.dispatch",
-      commandId: CommandId.make(`owner-queued-turn:${ownerTurns}`),
-      threadId,
-      messageId: MessageId.make(`owner-queued-turn-message:${ownerTurns}`),
-      text,
-      attachments: [],
-      dispatchMode: { type: "queue_after_active" },
-      createdBy: "user",
-      creationSource: "web",
-    });
-    yield* drainOrchestration;
-    const created = sent.storedEvents.flatMap(({ event }) =>
-      event.type === "run.created" ? [event.payload.id] : [],
-    );
-    return created[0] ?? assert.fail("The owner's turn queued no run.");
-  }).pipe(Effect.orDie);
-
-const runStatus = (threadId: ThreadId, runId: RunId) =>
-  threadProjection(threadId).pipe(
-    Effect.map(({ runs }) => runs.find((run) => run.id === runId)?.status),
-    Effect.orDie,
   );
 
 describe("Factory follow-through across restarts", () => {
@@ -465,12 +390,13 @@ describe("Factory follow-through cancelled while the owner works on the author t
   );
 });
 
-describe("Factory follow-through: wakes committed while a republish starts the watch again", () => {
+describe("Factory follow-through: wakes committed before a republish", () => {
   /**
-   * A round run to its republish with its wake `report` committed first but stepped after: one
-   * server adopts a round and has its review submitted; while no reactor runs, core's watch
-   * commits the wake and the worker, handed the reviewer's end, records, pushes and starts the
-   * watch again. Returns the state that left, and the wake's run.
+   * A round run to its republish with its wake `report` committed first: one server adopts a
+   * round and has its review submitted; while no reactor runs, core's watch commits the wake and
+   * the worker, handed the reviewer's end, records and pushes, and its PR stage reads the watch
+   * and the wakes core committed. Returns the state that left, the wake's run, the watch before
+   * the wake and the PR stage's effect.
    */
   const republishedOverWake = (world: World, report: WakeReport) =>
     Effect.gen(function* () {
@@ -489,6 +415,7 @@ describe("Factory follow-through: wakes committed while a republish starts the w
           return reviewer;
         }),
       );
+      const watch = (yield* linkOf(author, fakePullRequest.number)).watch;
       const wake = yield* wakeThread(author, yield* linkOf(author, fakePullRequest.number), report);
       yield* drainOrchestration;
       yield* endWhileDown(world, reviewer.runId);
@@ -502,76 +429,94 @@ describe("Factory follow-through: wakes committed while a republish starts the w
         .pipe(Effect.orDie);
       yield* worker.drain;
       const republished = yield* stateOf(deliveryId);
-      assert.strictEqual(republished.status, "pr_open");
       assert.deepStrictEqual(
         world.pullRequestCalls.map(({ input }) => input.action),
         ["create_pr", "push"],
       );
-      // The wake has not reached the delivery, and the watch command came after it.
-      assert.notInclude(republished.followThrough?.runs ?? [], wake);
-      return { deliveryId, author, wake, republished };
+      return { deliveryId, author, wake, watch, republished, effectId: republished.effectsIssued };
     });
 
-  it.live("takes feedback committed before the watch command once it reaches the delivery", () =>
+  /** The receipt of the watch command a PR stage's effect would have sent. */
+  const watchCommand = (deliveryId: FactoryDeliveryId, effectId: number) =>
+    Effect.flatMap(CommandReceiptStore.CommandReceiptStoreV2, (receipts) =>
+      receipts.getByCommandId(CommandId.make(`factory-pr-watch:${deliveryId}:${effectId}`)),
+    ).pipe(Effect.orDie);
+
+  it.live("takes feedback committed before the republish as the next round at once", () =>
     withProject(
       verifyCommands.passes,
       (world) =>
         Effect.gen(function* () {
-          const { deliveryId, author, wake, republished } = yield* republishedOverWake(
-            world,
-            "checks-failed",
-          );
-          yield* world.boot(Effect.void);
-          const adopted = yield* stateOf(deliveryId);
-          assert.strictEqual(adopted.status, "running");
-          assert.strictEqual(adopted.stage, "follow_through");
-          assert.deepStrictEqual(adopted.awaiting, { type: "run", threadId: author, runId: wake });
-          assert.include(adopted.followThrough?.runs ?? [], wake);
-          assert.strictEqual(
-            adopted.followThrough?.watchedAfter,
-            republished.followThrough?.watchedAfter,
-          );
+          const { deliveryId, author, wake, watch, republished, effectId } =
+            yield* republishedOverWake(world, "checks-failed");
+          assert.strictEqual(republished.status, "running");
+          assert.strictEqual(republished.stage, "follow_through");
+          assert.deepStrictEqual(republished.awaiting, {
+            type: "run",
+            threadId: author,
+            runId: wake,
+          });
+          assert.include(republished.followThrough?.runs ?? [], wake);
+          // The watch Factory started was on, so the PR stage started none.
+          assert.isTrue(Option.isNone(yield* watchCommand(deliveryId, effectId)));
+          assert.strictEqual(republished.followThrough?.watchStartedAt, watch?.startedAt);
 
           yield* world.boot(Effect.void);
-          assert.deepStrictEqual(yield* stateOf(deliveryId), adopted);
+          assert.deepStrictEqual(yield* stateOf(deliveryId), republished);
         }),
       { manualReactor: true },
     ),
   );
 
-  it.live("ends the watch it started again over a termination, and blocks", () =>
+  it.live("starts no watch over a termination committed before the republish, and blocks", () =>
     withProject(
       verifyCommands.passes,
       (world) =>
         Effect.gen(function* () {
-          const { deliveryId, author, wake, republished } = yield* republishedOverWake(
-            world,
-            "unreadable",
-          );
-          // Core had ended the watch; the republish's command started a new one.
-          const recreated = (yield* linkOf(author, fakePullRequest.number)).watch;
-          assert.isDefined(recreated);
-          assert.strictEqual(republished.followThrough?.watchStartedAt, recreated?.startedAt);
+          const { deliveryId, author, wake, watch, republished, effectId } =
+            yield* republishedOverWake(world, "unreadable");
+          // The republish pushed, read the end core committed, and started no watch over it.
+          assert.strictEqual(republished.status, "blocked");
+          assert.deepStrictEqual(republished.block, { reason: "watch_ended" });
+          assert.include(republished.followThrough?.runs ?? [], wake);
+          assert.isTrue(republished.followThrough?.watchEnded);
+          assert.isTrue(Option.isNone(yield* watchCommand(deliveryId, effectId)));
+          const link = yield* linkOf(author, fakePullRequest.number);
+          assert.isUndefined(link.watch);
+          // So no wake can run: core takes no sync of the watch that ended, and has no other.
+          const refused = yield* Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+            orchestrator.dispatch({
+              type: "thread.pull-request-watch.sync",
+              commandId: CommandId.make("server:pr-watch:after-termination"),
+              threadId: author,
+              host: link.host,
+              repository: link.repository,
+              number: link.number,
+              startedAt: watch?.startedAt ?? assert.fail("Not watched."),
+              watch: watch ?? null,
+              wake: {
+                messageId: MessageId.make("message:pr-watch:after-termination"),
+                text: "Update on pull request #7: checks failed.",
+                notification: {
+                  source: { kind: "monitor" },
+                  outcome: "failed",
+                  summary: "#7: checks failed",
+                },
+              },
+            }),
+          ).pipe(Effect.flip);
+          assert.strictEqual(refused._tag, "OrchestratorDispatchError");
 
           yield* world.boot(Effect.void);
-          const blocked = yield* stateOf(deliveryId);
-          assert.strictEqual(blocked.status, "blocked");
-          assert.deepStrictEqual(blocked.block, { reason: "watch_ended" });
-          assert.include(blocked.followThrough?.runs ?? [], wake);
-          assert.isTrue(blocked.followThrough?.watchEnded);
-          assert.isNull(blocked.followThrough?.watchStartedAt);
-          assert.isFalse(blocked.followThrough?.releaseWatch);
+          assert.deepStrictEqual(yield* stateOf(deliveryId), republished);
           assert.isUndefined((yield* linkOf(author, fakePullRequest.number)).watch);
-
-          yield* world.boot(Effect.void);
-          assert.deepStrictEqual(yield* stateOf(deliveryId), blocked);
         }),
       { manualReactor: true },
     ),
   );
 });
 
-describe("Factory follow-through: a cancel stored before its watch was ended", () => {
+describe("Factory follow-through: a cancel stored before its watch was released", () => {
   it.live.each([
     { watch: "the watch Factory started", owners: false },
     { watch: "a watch the owner started since", owners: true },
@@ -584,22 +529,28 @@ describe("Factory follow-through: a cancel stored before its watch was ended", (
           const opened = yield* world.boot(openSingle(world));
           const { deliveryId, threadId: author } = opened;
           const link = yield* linkOf(author, fakePullRequest.number);
+          const factoryWatch = link.watch ?? assert.fail("Not watched.");
           if (owners) {
             yield* watchPullRequest(author, link, false);
             yield* watchPullRequest(author, link);
           }
           const before = (yield* linkOf(author, fakePullRequest.number)).watch;
-          // A server stored the cancel, then stopped before ending the watch: what it left.
+          // A server stored the cancel, then stopped before releasing the watch: what it left.
           const cancelled = advance(opened.state, { type: "cancel" }).delivery;
-          assert.isTrue(cancelled.followThrough?.releaseWatch);
+          assert.isTrue(cancelled.releaseWatch);
           yield* deliveries.update(deliveryId, cancelled).pipe(Effect.orDie);
           assert.isDefined(before);
 
           yield* world.boot(Effect.void);
           const released = yield* stateOf(deliveryId);
           assert.strictEqual(released.status, "cancelled");
-          assert.isFalse(released.followThrough?.releaseWatch);
-          assert.isNull(released.followThrough?.watchStartedAt);
+          assert.isUndefined(released.releaseWatch);
+          // Where the watch Factory started ended: by the release, or by the owner before it.
+          assert.strictEqual(released.followThrough?.watchStartedAt, factoryWatch.startedAt);
+          assert.isAbove(
+            released.followThrough?.heldUntil ?? 0,
+            opened.state.followThrough?.armedAt ?? 0,
+          );
           const after = (yield* linkOf(author, fakePullRequest.number)).watch;
           if (owners) assert.deepStrictEqual(after, before);
           else assert.isUndefined(after);

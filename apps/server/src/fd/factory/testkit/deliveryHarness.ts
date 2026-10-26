@@ -327,6 +327,29 @@ export interface PullRequestCall {
   readonly branch: string;
 }
 
+/** A command Factory's own services dispatch to the orchestrator. */
+export type FactoryDispatch = Parameters<Orchestrator.OrchestratorV2["Service"]["dispatch"]>[0];
+
+/**
+ * The orchestrator as Factory's services see it: each command runs `hooks.before` first, so a
+ * test can commit something of the owner's between what Factory read and its command.
+ */
+const factoryOrchestrator = (hooks: {
+  before?: ((command: FactoryDispatch) => Effect.Effect<void>) | undefined;
+}) =>
+  Layer.effect(
+    Orchestrator.OrchestratorV2,
+    Effect.map(Orchestrator.OrchestratorV2, (orchestrator) =>
+      Orchestrator.OrchestratorV2.of({
+        ...orchestrator,
+        dispatch: (command) =>
+          Effect.suspend(() => hooks.before?.(command) ?? Effect.void).pipe(
+            Effect.andThen(orchestrator.dispatch(command)),
+          ),
+      }),
+    ),
+  );
+
 /** A comment posted through Work, as the Work service received it. */
 export interface CommentCall {
   readonly actor: WorkManagement.WorkActor;
@@ -381,7 +404,11 @@ const gitWorkflow = GitWorkflow.layer.pipe(
  * HEAD when given none), and reports the pull request open. A worktree removal is recorded, then
  * run by the real git driver.
  */
-const fakePullRequests = (calls: Array<PullRequestCall>, removals: Array<VcsRemoveWorktreeInput>) =>
+const fakePullRequests = (
+  calls: Array<PullRequestCall>,
+  removals: Array<VcsRemoveWorktreeInput>,
+  hooks: Array<Effect.Effect<void>>,
+) =>
   Layer.unwrap(
     Effect.map(GitVcsDriver.GitVcsDriver, (git) => {
       const read = (cwd: string, args: ReadonlyArray<string>) =>
@@ -394,6 +421,7 @@ const fakePullRequests = (calls: Array<PullRequestCall>, removals: Array<VcsRemo
             const head = yield* read(input.cwd, ["rev-parse", "HEAD"]);
             const branch = yield* read(input.cwd, ["branch", "--show-current"]);
             calls.push({ input, head, branch });
+            for (const hook of hooks.splice(0)) yield* hook;
             if (input.expectedHeadSha === undefined) {
               yield* read(input.cwd, ["push", "-u", "origin", `HEAD:refs/heads/${branch}`]);
             } else {
@@ -532,6 +560,10 @@ const makeLayer = (input: {
   readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
   readonly pullRequestCalls: Array<PullRequestCall>;
   readonly worktreeRemovals: Array<VcsRemoveWorktreeInput>;
+  readonly publishHooks: Array<Effect.Effect<void>>;
+  readonly factoryDispatch: {
+    before?: ((command: FactoryDispatch) => Effect.Effect<void>) | undefined;
+  };
   readonly commentCalls: Array<CommentCall>;
   readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
   readonly manualReactor: boolean;
@@ -558,7 +590,10 @@ const makeLayer = (input: {
   );
   return (input.manualReactor ? downReactor : factoryReactor).pipe(
     Layer.provideMerge(Factory.layerLive),
-    Layer.provide(fakePullRequests(input.pullRequestCalls, input.worktreeRemovals)),
+    Layer.provide(factoryOrchestrator(input.factoryDispatch)),
+    Layer.provide(
+      fakePullRequests(input.pullRequestCalls, input.worktreeRemovals, input.publishHooks),
+    ),
     Layer.provide(ProviderRegistryMock.layer()),
     Layer.provide(instances),
     Layer.provideMerge(recordingWork(input.commentCalls, input.wrapWork)),
@@ -666,6 +701,15 @@ export interface World {
   readonly pullRequestCalls: ReadonlyArray<PullRequestCall>;
   /** Every worktree removal Factory asked the Git workflow for, in order. */
   readonly worktreeRemovals: ReadonlyArray<VcsRemoveWorktreeInput>;
+  /**
+   * Effects the fake PR service runs once each, in order, during its next stacked action, while
+   * the PR stage awaits its result.
+   */
+  readonly publishHooks: Array<Effect.Effect<void>>;
+  /** Run before each command Factory's services dispatch to the orchestrator, when set. */
+  readonly factoryDispatch: {
+    before?: ((command: FactoryDispatch) => Effect.Effect<void>) | undefined;
+  };
   /** Every comment posted through Work, in order; the item's own source holds them too. */
   readonly commentCalls: ReadonlyArray<CommentCall>;
   readonly evidenceDir: (deliveryId: FactoryDeliveryId) => string;
@@ -740,6 +784,8 @@ export const withProject = <A, E>(
     const provider = yield* makeFakeProvider;
     const pullRequestCalls: Array<PullRequestCall> = [];
     const worktreeRemovals: Array<VcsRemoveWorktreeInput> = [];
+    const publishHooks: Array<Effect.Effect<void>> = [];
+    const factoryDispatch: World["factoryDispatch"] = {};
     const commentCalls: Array<CommentCall> = [];
 
     return yield* Effect.gen(function* () {
@@ -893,6 +939,8 @@ export const withProject = <A, E>(
         rootStatus,
         pullRequestCalls,
         worktreeRemovals,
+        publishHooks,
+        factoryDispatch,
         commentCalls,
         evidenceDir: (deliveryId) => path.join(t3Home, "userdata", "fd-factory", deliveryId),
         exists: (target) => fileSystem.exists(target).pipe(Effect.orElseSucceed(() => false)),
@@ -911,6 +959,8 @@ export const withProject = <A, E>(
           supportedRuntimeModes: options.supportedRuntimeModes,
           pullRequestCalls,
           worktreeRemovals,
+          publishHooks,
+          factoryDispatch,
           commentCalls,
           wrapWork: options.work ?? ((service) => service),
           manualReactor: options.manualReactor === true,

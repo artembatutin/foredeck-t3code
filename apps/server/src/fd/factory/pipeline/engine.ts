@@ -159,11 +159,10 @@ const resumed = (delivery: FactoryDeliveryState): FactoryDeliveryState => ({
   fixCommitTurns: 0,
   rounds: { fix: 0, review: 0 },
   fingerprints: [],
-  // The owner's resume is the decision to watch the pull request again (see `pr.opened`), and to
-  // keep the watch Factory still holds.
+  // The owner's resume is the decision to watch the pull request again (see `pr.opened`).
   ...(delivery.followThrough === undefined
     ? {}
-    : { followThrough: { ...delivery.followThrough, watchEnded: false, releaseWatch: false } }),
+    : { followThrough: { ...delivery.followThrough, watchEnded: false } }),
 });
 
 type FactoryResumedWorktree = NonNullable<FactoryResumeCheck["worktree"]>;
@@ -353,14 +352,18 @@ const adoptWake = (delivery: FactoryDeliveryState, runId: RunId): FactoryAdvance
 };
 
 /**
- * The delivery with the watch Factory holds marked for release: a cancelled delivery leaves no
- * watch of its own to wake its author thread to new work.
+ * The delivery with its watch marked for release, when a Factory watch command may have started
+ * one: once its PR stage watched the pull request, or while that stage's result is outstanding
+ * or was lost. A cancelled delivery leaves no watch of its own to wake its author thread to new
+ * work; which watch is Factory's the worker reads from the commands' own records.
  */
 const releasingWatch = (delivery: FactoryDeliveryState): FactoryDeliveryState => {
-  const { followThrough } = delivery;
-  return followThrough === undefined || followThrough.watchStartedAt === null
-    ? delivery
-    : { ...delivery, followThrough: { ...followThrough, releaseWatch: true } };
+  const { awaiting, block } = delivery;
+  const watched =
+    delivery.followThrough !== undefined ||
+    (awaiting?.type === "effect" && awaiting.effect.type === "open_pr") ||
+    (block?.reason === "effect_failed" && block.effect.type === "open_pr");
+  return delivery.kind === "single" && watched ? { ...delivery, releaseWatch: true } : delivery;
 };
 
 /** The oldest pending wake adopted as a round; undefined when none is pending. */
@@ -568,9 +571,10 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * way blocks. Every wake of the pull request after the first watch is the delivery's to cancel,
  * taken once by its run; one that only reports passing checks starts no round. One that ends the
  * watch blocks the delivery where it would wait on its pull request, since no feedback reaches it
- * any more; only a resume watches it again, and a watch a later PR stage started again over that
- * end is released. A cancel releases the watch Factory's own command started. A pull request
- * published but not watched is recorded, and the delivery blocks.
+ * any more; only a resume watches it again, since a PR stage starts no watch over an end it has
+ * not taken. A cancel has the watch a Factory command started released, and still takes the
+ * wakes that watch sent, only so their runs are stopped. A pull request published but not
+ * watched is recorded, and the delivery blocks.
  *
  * The owner can stop a running delivery after its step, or cancel any delivery that is not done
  * or cancelled. A stopping delivery still completes the work of its stage (the settle check and
@@ -628,15 +632,33 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
             block: null,
             checkpoint: null,
           });
-    case "watch.released": {
-      // Bookkeeping of a watch Factory held, in any status: the watch is already ended.
+    case "watch.ended": {
+      // Bookkeeping of the watch Factory started, in any status: where it ended, and for a
+      // delivery whose PR stage result was lost, where its first watch command was.
       const { followThrough } = delivery;
-      return followThrough === undefined || followThrough.watchStartedAt !== event.startedAt
-        ? unchanged(delivery)
-        : step({
-            ...delivery,
-            followThrough: { ...followThrough, watchStartedAt: null, releaseWatch: false },
-          });
+      if (
+        followThrough?.watchStartedAt === event.startedAt &&
+        followThrough.heldUntil === event.at
+      ) {
+        return unchanged(delivery);
+      }
+      return step({
+        ...delivery,
+        followThrough: {
+          watchedAfter: followThrough?.watchedAfter ?? event.firstAt,
+          armedAt: followThrough?.armedAt ?? event.firstAt,
+          runs: followThrough?.runs ?? [],
+          pending: followThrough?.pending ?? [],
+          watchEnded: followThrough?.watchEnded ?? false,
+          watchStartedAt: event.startedAt,
+          heldUntil: event.at,
+        },
+      });
+    }
+    case "watch.released": {
+      if (delivery.releaseWatch !== true) return unchanged(delivery);
+      const { releaseWatch: _, ...released } = delivery;
+      return step(released);
     }
     case "pr.merged":
     case "pr.closed": {
@@ -670,17 +692,11 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
         : step({ ...releasingWatch(following), status: "cancelled", awaiting: null });
     }
     case "pr.feedback": {
-      // Only a wake on the open pull request of a single item, on its author thread, committed
-      // after the watch its PR stage last started (one from before that pull request was
-      // published answers nothing), and each run once.
+      // Only a wake on a single item's author thread, committed after its first watch command
+      // (one from before that pull request was published answers nothing), and each run once.
       const { pullRequest, followThrough } = delivery;
       if (
         delivery.kind !== "single" ||
-        isTerminal(delivery) ||
-        pullRequest === null ||
-        pullRequest.outcome !== undefined ||
-        pullRequest.number !== event.number ||
-        pullRequest.url !== event.url ||
         delivery.threads.author !== event.threadId ||
         followThrough === undefined ||
         event.sequence <= followThrough.watchedAfter ||
@@ -691,6 +707,27 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       // Every wake of its pull request is the delivery's own, whatever it reports: a cancel
       // stops its run as Factory's turn.
       const owned = { ...followThrough, runs: [...followThrough.runs, event.runId] };
+      // Cancelled, it takes only the work the watch Factory started set off, to stop it: a wake
+      // that watch sent, or the end that removed it, which name that watch whether or not the
+      // pull request was recorded. Nothing revives the delivery.
+      if (delivery.status === "cancelled") {
+        const started = followThrough.watchStartedAt;
+        const sentByFactory =
+          started !== null &&
+          (event.watchStartedAt === started ||
+            (event.watchStartedAt === null && followThrough.heldUntil === event.linkSequence));
+        return sentByFactory ? step({ ...delivery, followThrough: owned }) : unchanged(delivery);
+      }
+      // Otherwise only a wake of the open pull request it recorded.
+      if (
+        isTerminal(delivery) ||
+        pullRequest === null ||
+        pullRequest.outcome !== undefined ||
+        pullRequest.number !== event.number ||
+        pullRequest.url !== event.url
+      ) {
+        return unchanged(delivery);
+      }
       // Waiting on its pull request, the delivery takes feedback as a round at once; while it
       // runs a stage or waits on its owner, the wake waits for it.
       const idle = delivery.status === "pr_open" && delivery.awaiting === null;
@@ -699,18 +736,15 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
         case "notice":
           return step({ ...delivery, followThrough: owned });
         // Core stopped watching: the delivery no longer hears of its pull request's feedback.
-        // Committed before the latest watch command, the end means that command started again
-        // a watch core had ended, which Factory then ends; after it, the watch is gone.
+        // The watch Factory started, when on, is the one that ended.
         case "ended": {
-          const recreated = event.sequence < followThrough.armedAt;
+          const holding = owned.watchStartedAt !== null && owned.heldUntil === null;
           const ended = {
             ...delivery,
             followThrough: {
               ...owned,
               watchEnded: true,
-              ...(recreated
-                ? { releaseWatch: owned.watchStartedAt !== null }
-                : { watchStartedAt: null, releaseWatch: false }),
+              ...(holding ? { heldUntil: event.linkSequence } : {}),
             },
           };
           return idle ? blocked(ended, { reason: "watch_ended" }) : step(ended);
@@ -1017,16 +1051,6 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       }
       const { watch } = event;
       const previous = delivery.followThrough;
-      // Factory holds the watch its own command started, and still holds an earlier one of its
-      // own the command kept; a watch someone else started is theirs.
-      const held =
-        watch === undefined
-          ? null
-          : watch.created
-            ? watch.startedAt
-            : watch.startedAt !== null && previous?.watchStartedAt === watch.startedAt
-              ? watch.startedAt
-              : null;
       const next: FactoryDeliveryState = {
         ...recorded,
         status: "pr_open",
@@ -1035,17 +1059,18 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
           ? {}
           : {
               followThrough: {
-                watchedAfter: previous?.watchedAfter ?? watch.after,
-                armedAt: watch.after,
-                watchStartedAt: held,
+                watchedAfter: previous?.watchedAfter ?? watch.firstAt,
+                armedAt: watch.at,
+                watchStartedAt: watch.held,
+                heldUntil: null,
                 runs: previous?.runs ?? [],
                 pending: previous?.pending ?? [],
-                watchEnded: false,
-                releaseWatch: false,
+                // Only a watch this stage started clears an end core committed before.
+                watchEnded: watch.armed ? false : (previous?.watchEnded ?? false),
               },
             }),
       };
-      // A watch core ended while a round ran is not started again on its own.
+      // A watch core ended is not started again on its own.
       if (next.followThrough?.watchEnded === true) {
         return blocked(next, { reason: "watch_ended" });
       }
