@@ -68,8 +68,36 @@ export interface FactoryTimelineRow {
   readonly thread: FactoryThreadTarget | null;
 }
 
+/**
+ * A delivery's place in a parent's family, which decides what cancelling it ends: `parent` once
+ * its approved plan has child deliveries, `child` for one of those, and `single` otherwise,
+ * every delivery from a server from before planning included.
+ */
+export type FactoryDeliveryFamily = "single" | "parent" | "child";
+
+export const factoryDeliveryFamily = (
+  delivery: Pick<FactoryDelivery, "parentId" | "childIds">,
+): FactoryDeliveryFamily =>
+  delivery.parentId !== undefined ? "child" : delivery.childIds.length > 0 ? "parent" : "single";
+
+/**
+ * What cancelling a delivery ends, as every surface's cancel confirmation says it. By owner
+ * decision a parent's cancel ends its children that are not approved, and a child's cancel ends
+ * its parent and so the parent's other unapproved children; approved children keep their approval.
+ */
+export const FACTORY_CANCEL_TEXT: Record<FactoryDeliveryFamily, string> = {
+  single:
+    "Its agents stop what they are working on and the delivery ends. Its branch, worktree and commits stay; delivering the item again starts on a new branch.",
+  parent:
+    "Its agents stop what they are working on and the delivery ends, and so does each of its child deliveries not yet approved. Approved children keep their approval. The branch, worktree and commits stay; delivering the item again starts on a new branch.",
+  child:
+    "This delivery is one child of a parent's plan. Cancelling it ends it, its parent and each of the parent's other child deliveries not yet approved, and their agents stop what they are working on. Approved children keep their approval. The shared branch, worktree and commits stay.",
+};
+
 export interface FactoryDeliveryView {
   readonly deliveryId: FactoryDeliveryId;
+  /** What cancelling it ends; see `FACTORY_CANCEL_TEXT`. */
+  readonly family: FactoryDeliveryFamily;
   readonly label: string;
   readonly needsYou: string | undefined;
   readonly stage: string | undefined;
@@ -136,6 +164,7 @@ export function factoryDeliveryView(input: {
   const timeline = factoryTimeline(current);
   return {
     deliveryId: current.deliveryId,
+    family: factoryDeliveryFamily(current),
     label: FACTORY_STATUS_LABELS[current.status],
     needsYou: factoryNeedsYou(current),
     stage: current.stage === undefined ? undefined : FACTORY_STAGE_LABELS[current.stage.name],

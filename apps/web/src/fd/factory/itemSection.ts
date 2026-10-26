@@ -2,6 +2,7 @@ import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   cancelConfirmationTarget as deliveryCancelTarget,
   type FactoryControlPermissions,
+  type FactoryDeliveryFamily,
   factoryDeliveryView,
   type FactoryDeliveryView,
 } from "@t3tools/client-runtime/fd/factory";
@@ -61,8 +62,21 @@ export function factoryItemSection(input: {
   };
 }
 
-/** The delivery an open cancel confirmation cancels; see the shared `cancelConfirmationTarget`. */
+/** A cancel confirmation as it was opened: for one delivery, saying what cancelling it ends. */
+export interface FactoryCancelConfirmation {
+  readonly deliveryId: FactoryDeliveryId;
+  readonly family: FactoryDeliveryFamily;
+}
+
+/**
+ * The delivery an open cancel confirmation cancels; see the shared `cancelConfirmationTarget`. It
+ * also closes once cancelling would end other deliveries than it said, as when a parent's plan
+ * is approved and gives it children while the confirmation is open.
+ */
 export const cancelConfirmationTarget = (
   view: FactoryItemSectionView | null,
-  openedFor: FactoryDeliveryId | null,
-): FactoryDeliveryId | null => deliveryCancelTarget(view?.delivery ?? null, openedFor);
+  openedFor: FactoryCancelConfirmation | null,
+): FactoryDeliveryId | null =>
+  openedFor === null || view?.delivery?.family !== openedFor.family
+    ? null
+    : deliveryCancelTarget(view.delivery, openedFor.deliveryId);

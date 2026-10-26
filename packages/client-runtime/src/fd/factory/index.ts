@@ -44,10 +44,13 @@ export {
 } from "./planDraft.ts";
 export {
   cancelConfirmationTarget,
+  FACTORY_CANCEL_TEXT,
+  factoryDeliveryFamily,
   factoryDeliveryView,
   receiptText,
   reviewText,
   type FactoryControlPermissions,
+  type FactoryDeliveryFamily,
   type FactoryDeliveryView,
   type FactoryEvidenceLine,
   type FactoryReviewLine,

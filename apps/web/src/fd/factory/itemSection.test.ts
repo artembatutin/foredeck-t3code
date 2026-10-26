@@ -441,11 +441,13 @@ describe("controls", () => {
 
 describe("cancelConfirmationTarget", () => {
   const a = FactoryDeliveryId.make("delivery-a");
+  // A's confirmation as opened, saying what cancelling a single delivery ends.
+  const openedForA = { deliveryId: a, family: "single" } as const;
   const running = (id: string, overrides: Partial<FactoryDelivery> = {}) =>
     section({ deliveries: [delivery(id, overrides)] });
 
   it("cancels the delivery the confirmation was opened for while it still offers cancel", () => {
-    expect(cancelConfirmationTarget(running("delivery-a"), a)).toBe(a);
+    expect(cancelConfirmationTarget(running("delivery-a"), openedForA)).toBe(a);
     expect(cancelConfirmationTarget(running("delivery-a"), null)).toBeNull();
   });
 
@@ -459,36 +461,38 @@ describe("cancelConfirmationTarget", () => {
     });
     expect(replaced?.delivery?.deliveryId).toBe("delivery-b");
     expect(replaced?.delivery?.controls.cancel).toBe(true);
-    expect(cancelConfirmationTarget(replaced, a)).toBeNull();
+    expect(cancelConfirmationTarget(replaced, openedForA)).toBeNull();
   });
 
   it("closes when the delivery can no longer be cancelled", () => {
-    expect(cancelConfirmationTarget(running("delivery-a", { status: "done" }), a)).toBeNull();
+    expect(
+      cancelConfirmationTarget(running("delivery-a", { status: "done" }), openedForA),
+    ).toBeNull();
     expect(
       cancelConfirmationTarget(
         section({
           deliveries: [delivery("delivery-a")],
           permitted: { ...ALLOWED, cancel: false },
         }),
-        a,
+        openedForA,
       ),
     ).toBeNull();
     expect(
       cancelConfirmationTarget(
         section({ deliveries: [delivery("delivery-a")], connected: false }),
-        a,
+        openedForA,
       ),
     ).toBeNull();
     expect(
       cancelConfirmationTarget(
         running("delivery-a", { stage: { name: "unknown", kind: "agent" } }),
-        a,
+        openedForA,
       ),
     ).toBeNull();
     expect(
       cancelConfirmationTarget(
         section({ supported: false, deliveries: [delivery("delivery-a")] }),
-        a,
+        openedForA,
       ),
     ).toBeNull();
   });

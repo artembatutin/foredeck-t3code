@@ -137,6 +137,7 @@ describe("factoryDeliveryView", () => {
   it("shows a just-started delivery before any attempt", () => {
     expect(view({ deliveries: [delivery("d3", { status: "queued" })] })).toEqual({
       deliveryId: "d3",
+      family: "single",
       label: "Queued",
       needsYou: undefined,
       stage: undefined,

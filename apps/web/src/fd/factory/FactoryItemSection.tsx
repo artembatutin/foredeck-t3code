@@ -1,7 +1,8 @@
 import { useAtomValue } from "@effect/atom-react";
+import { FACTORY_CANCEL_TEXT } from "@t3tools/client-runtime/fd/factory";
 import type { AtomCommandResult } from "@t3tools/client-runtime/state/runtime";
 import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
-import type { FactoryDelivery, FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
+import type { FactoryDelivery } from "@t3tools/contracts/fd/factory";
 import type { WorkItemSummary } from "@t3tools/contracts/fd/work-management";
 import { useNavigate } from "@tanstack/react-router";
 import { FactoryIcon } from "lucide-react";
@@ -23,6 +24,7 @@ import { factoryErrorText, factoryParentDeliverable } from "./deliver";
 import { FactoryPlanGate } from "./FactoryPlanGate";
 import { useFactoryDeliverState, useFactoryStart, useReportOpenWorkItem } from "./hooks";
 import {
+  type FactoryCancelConfirmation,
   cancelConfirmationTarget,
   factoryItemSection,
   type FactoryReviewLine,
@@ -78,8 +80,8 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
   const cancel = useAtomCommand(factoryEnvironment.cancel);
   const [pending, setPending] = useState<Action | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // The delivery the open cancel confirmation was opened for.
-  const [confirmingCancel, setConfirmingCancel] = useState<FactoryDeliveryId | null>(null);
+  // The delivery the open cancel confirmation was opened for, and what it said cancelling ends.
+  const [confirmingCancel, setConfirmingCancel] = useState<FactoryCancelConfirmation | null>(null);
 
   const view = factoryItemSection({
     environmentId,
@@ -88,8 +90,9 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
     permitted,
   });
   const cancelling = cancelConfirmationTarget(view, confirmingCancel);
-  // Adjusted during render: a confirmation whose delivery was replaced or can no longer be
-  // cancelled closes, and does not come back if that delivery becomes cancellable again.
+  // Adjusted during render: a confirmation whose delivery was replaced, can no longer be
+  // cancelled or would now end other deliveries closes, and does not come back if that delivery
+  // becomes cancellable again.
   if (confirmingCancel !== null && cancelling === null) setConfirmingCancel(null);
   if (view === null) {
     return deliveriesQuery.error === null ? null : (
@@ -210,7 +213,12 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
                   size="xs"
                   variant="ghost"
                   disabled={pending !== null}
-                  onClick={() => setConfirmingCancel(delivery.deliveryId)}
+                  onClick={() =>
+                    setConfirmingCancel({
+                      deliveryId: delivery.deliveryId,
+                      family: delivery.family,
+                    })
+                  }
                 >
                   Cancel delivery
                 </Button>
@@ -293,8 +301,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
           <AlertDialogHeader>
             <AlertDialogTitle>Cancel the delivery of {item.key}?</AlertDialogTitle>
             <AlertDialogDescription>
-              Its agents stop what they are working on and the delivery ends. Its branch, worktree
-              and commits stay; delivering the item again starts on a new branch.
+              {FACTORY_CANCEL_TEXT[confirmingCancel?.family ?? "single"]}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

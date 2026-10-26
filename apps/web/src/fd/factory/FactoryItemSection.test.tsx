@@ -1,4 +1,5 @@
 import { RegistryContext } from "@effect/atom-react";
+import { FACTORY_CANCEL_TEXT } from "@t3tools/client-runtime/fd/factory";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import { type FactoryDelivery, FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
@@ -216,6 +217,53 @@ describe("cancel confirmation", () => {
     await confirmCancel();
     expect(destination.get().sent).toEqual([
       ["cancel", { environmentId, input: { deliveryId: "delivery-b" } }],
+    ]);
+  });
+
+  it.each([
+    ["a delivery on its own", {}, FACTORY_CANCEL_TEXT.single],
+    [
+      "a parent, whose unapproved children end too",
+      { childIds: [FactoryDeliveryId.make("child-1"), FactoryDeliveryId.make("child-2")] },
+      FACTORY_CANCEL_TEXT.parent,
+    ],
+    [
+      "a child, whose parent and unapproved siblings end too",
+      { parentId: FactoryDeliveryId.make("parent-1") },
+      FACTORY_CANCEL_TEXT.child,
+    ],
+  ] as const)("says what cancelling ends for %s", async (_name, family, text) => {
+    await change(
+      destination.get().deliveries,
+      AsyncResult.success({ deliveries: [delivery("delivery-a", family)] }),
+    );
+    await mount();
+    await openCancel();
+    expect(textOf(dialog()!)).toContain(text);
+    await confirmCancel();
+    expect(destination.get().sent).toEqual([
+      ["cancel", { environmentId, input: { deliveryId: "delivery-a" } }],
+    ]);
+  });
+
+  it("closes, sending nothing, when cancelling would end more than it said", async () => {
+    await mount();
+    await openCancel();
+    expect(textOf(dialog()!)).toContain(FACTORY_CANCEL_TEXT.single);
+    // Another client approves the delivery's plan, which gives it child deliveries.
+    await change(
+      destination.get().deliveries,
+      AsyncResult.success({
+        deliveries: [delivery("delivery-a", { childIds: [FactoryDeliveryId.make("child-1")] })],
+      }),
+    );
+    expect(dialog()).toBeUndefined();
+    expect(destination.get().sent).toEqual([]);
+    await openCancel();
+    expect(textOf(dialog()!)).toContain(FACTORY_CANCEL_TEXT.parent);
+    await confirmCancel();
+    expect(destination.get().sent).toEqual([
+      ["cancel", { environmentId, input: { deliveryId: "delivery-a" } }],
     ]);
   });
 
