@@ -283,6 +283,9 @@ const StoredDeliveryState = Schema.Struct({
       heldUntil: Schema.NullOr(NonNegativeInt).pipe(
         Schema.withDecodingDefault(Effect.succeed(null)),
       ),
+      heldPullRequest: Schema.optionalKey(
+        Schema.Struct({ number: PositiveInt, url: Schema.String }),
+      ),
       runs: Schema.Array(RunId),
       pending: Schema.Array(RunId).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
       watchEnded: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),

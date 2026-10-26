@@ -633,12 +633,15 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
             checkpoint: null,
           });
     case "watch.ended": {
-      // Bookkeeping of the watch Factory started, in any status: where it ended, and for a
-      // delivery whose PR stage result was lost, where its first watch command was.
+      // Bookkeeping of the watch Factory started, in any status: where it ended and on which
+      // pull request, and for a delivery whose PR stage result was lost, where its first watch
+      // command was.
       const { followThrough } = delivery;
       if (
         followThrough?.watchStartedAt === event.startedAt &&
-        followThrough.heldUntil === event.at
+        followThrough.heldUntil === event.at &&
+        followThrough.heldPullRequest?.number === event.number &&
+        followThrough.heldPullRequest.url === event.url
       ) {
         return unchanged(delivery);
       }
@@ -652,6 +655,7 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
           watchEnded: followThrough?.watchEnded ?? false,
           watchStartedAt: event.startedAt,
           heldUntil: event.at,
+          heldPullRequest: { number: event.number, url: event.url },
         },
       });
     }
@@ -708,12 +712,17 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       // stops its run as Factory's turn.
       const owned = { ...followThrough, runs: [...followThrough.runs, event.runId] };
       // Cancelled, it takes only the work the watch Factory started set off, to stop it: a wake
-      // that watch sent, or the end that removed it, which name that watch whether or not the
-      // pull request was recorded. Nothing revives the delivery.
+      // that watch sent, or the end that removed it. A watch is its pull request and its start,
+      // since a watch on another pull request of the thread can start at the same moment; the
+      // release names that pull request when the PR stage's result was lost. Nothing revives the
+      // delivery.
       if (delivery.status === "cancelled") {
         const started = followThrough.watchStartedAt;
+        const watched = followThrough.heldPullRequest ?? pullRequest;
         const sentByFactory =
           started !== null &&
+          watched?.number === event.number &&
+          watched.url === event.url &&
           (event.watchStartedAt === started ||
             (event.watchStartedAt === null && followThrough.heldUntil === event.linkSequence));
         return sentByFactory ? step({ ...delivery, followThrough: owned }) : unchanged(delivery);

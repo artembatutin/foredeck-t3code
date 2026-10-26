@@ -602,11 +602,14 @@ PR stage ran or may have run. The worker then ends Factory's watch with core's
 under the thread's lock only while that watch is on, so a watch the owner put in its place stays. A
 refusal is told from a failure by reading the link again: Factory's watch still on means the command
 failed, and the release stays marked for the next boot sweep, cancelled deliveries included. The
-release then steps where Factory's watch ended and every wake committed since the first watch
-command. A cancelled delivery takes as its own only the wakes that watch sent, named by the watch's
-start on the link their sync updated, and the end that removed it, at the link update the release
-recorded, only so their runs are stopped: a running one at once, a queued one as it starts, and
-the owner's own turns never. Ending a merged pull request's watch at close-out is conditional on
+release then steps where Factory's watch ended, on which pull request, and every wake committed
+since the first watch command. A cancelled delivery takes as its own only the wakes that watch
+sent, named by the pull request and the watch's start on the link their sync updated, and the end
+that removed it, at the link update the release recorded, only so their runs are stopped: a running
+one at once, a queued one as it starts, and the owner's own turns never. The pull request counts
+as much as the start: core stamps a watch with its command's millisecond, so a watch on another
+pull request of the thread can start at the same moment, and the release names Factory's even when
+the PR stage's result was lost before the delivery recorded it. Ending a merged pull request's watch at close-out is conditional on
 the watch read the same way.
 
 ## Each transition posts one Work comment, from the step that stored it

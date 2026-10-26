@@ -417,6 +417,65 @@ describe("Factory follow-through: a release racing the owner's watch", () => {
   );
 });
 
+describe("Factory follow-through: another pull request's watch on the author thread", () => {
+  it.live(
+    "leaves a cancelled delivery off the wakes of a watch that started at the same moment",
+    () =>
+      withProject(verifyCommands.passes, (world) =>
+        Effect.gen(function* () {
+          const factory = yield* service;
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const { deliveryId, threadId: author } = yield* openSingle(world);
+          const link = yield* linkOf(author, fakePullRequest.number);
+          const started = link.watch ?? assert.fail("The PR stage started no watch.");
+          // The owner watches another pull request on the author thread. Core stamps a watch with
+          // its command's millisecond, so two commands can start two watches at once; core's own
+          // sync gives that watch Factory's start here.
+          const otherUrl = "https://github.com/acme/alpha/pull/8";
+          yield* watchPullRequest(author, { ...link, number: 8, url: otherUrl });
+          const owners = (yield* linkOf(author, 8, otherUrl)).watch ?? assert.fail("Not watched.");
+          yield* orchestrator
+            .dispatch({
+              type: "thread.pull-request-watch.sync",
+              commandId: CommandId.make("owner-pr-watch:same-start"),
+              threadId: author,
+              host: link.host,
+              repository: link.repository,
+              number: 8,
+              startedAt: owners.startedAt,
+              watch: { ...owners, startedAt: started.startedAt },
+            })
+            .pipe(Effect.orDie);
+          assert.strictEqual(
+            (yield* linkOf(author, 8, otherUrl)).watch?.startedAt,
+            started.startedAt,
+          );
+
+          // The cancel releases Factory's watch only.
+          yield* factory.cancel(deliveryId).pipe(Effect.orDie);
+          yield* drainFactory;
+          assert.isUndefined((yield* linkOf(author, fakePullRequest.number)).watch);
+          assert.strictEqual(
+            (yield* linkOf(author, 8, otherUrl)).watch?.startedAt,
+            started.startedAt,
+          );
+
+          // The other watch wakes the author thread: that turn is the owner's, and goes on.
+          const foreign = yield* wakeThread(author, yield* linkOf(author, 8, otherUrl));
+          yield* runStarted(foreign);
+          assert.strictEqual(yield* runReached(foreign, ["running", ...ended]), "running");
+          yield* drainFactory;
+          yield* drainOrchestration;
+          assert.notInclude((yield* stateOf(deliveryId)).followThrough?.runs ?? [], foreign);
+          assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), []);
+          assert.notInclude(interruptedTurns(world), providerTurnOf(world, foreign));
+          assert.strictEqual(yield* runStatus(author, foreign), "running");
+          assert.strictEqual(yield* world.endRun(foreign, "completed"), "completed");
+        }),
+      ),
+  );
+});
+
 describe("Factory follow-through: a release whose command fails", () => {
   it.live("keeps the release marked while Factory's watch is on, and ends it on the next try", () =>
     withProject(verifyCommands.passes, (world) =>

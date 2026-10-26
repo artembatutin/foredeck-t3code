@@ -360,6 +360,11 @@ export interface FactoryFollowThrough {
   /** Where that watch ended, once Factory knows; null while it is on. */
   readonly heldUntil: number | null;
   /**
+   * The pull request that watch is on, as its release found it; until then, the one the delivery
+   * recorded. A watch on another pull request of the thread can start at the same moment.
+   */
+  readonly heldPullRequest?: { readonly number: number; readonly url: string };
+  /**
    * Every wake of the pull request the delivery took, oldest first: those it adopted as rounds,
    * those pending, notices and ends. Each is taken once, and they are Factory's turns when a
    * cancel stops what its threads run.
@@ -566,15 +571,18 @@ export type FactoryEvent =
       readonly watchFailure?: string;
     }
   /**
-   * The latest watch Factory's watch commands started on the delivery's pull request ended at
-   * event-log position `at`, its first command being at `firstAt`, as a release of the watch
-   * found. Taken in any status: a cancelled delivery then knows which wakes its watch sent.
+   * Factory's watch on pull request `number`/`url`, which started at `startedAt`, ended at
+   * event-log position `at`, its first watch command being at `firstAt`, as a release of the
+   * watch found. Taken in any status: a cancelled delivery then knows which wakes its watch sent,
+   * even when its PR stage's result was lost before the pull request was recorded.
    */
   | {
       readonly type: "watch.ended";
       readonly startedAt: string;
       readonly at: number;
       readonly firstAt: number;
+      readonly number: number;
+      readonly url: string;
     }
   /** The release of Factory's watch is done: it was ended, or found gone or someone else's. */
   | { readonly type: "watch.released" }

@@ -254,14 +254,15 @@ export class FactoryPullRequest extends Context.Service<
      * Ends Factory's watch on the delivery's pull request (see `isFactorys`), as a cancel asks,
      * only while it is that very watch: core checks its start under the thread's lock, so a watch
      * the owner started meanwhile stays. Reports that watch (the one on, else the latest Factory
-     * started), where it ended (by this or before), where the delivery's first watch command was,
-     * and the wakes core committed since, which the worker steps so the cancelled delivery stops
-     * what its watch set off. None when Factory started or holds no watch. Fails only when the
+     * started) and its pull request, where it ended (by this or before), where the delivery's first
+     * watch command was, and the wakes core committed since, which the worker steps so the
+     * cancelled delivery stops what its watch set off. None when Factory started or holds no watch. Fails only when the
      * watch is still on and could not be ended.
      */
     readonly release: (delivery: FactoryDeliveryStore.StoredFactoryDelivery) => Effect.Effect<
       Option.Option<{
         readonly startedAt: string;
+        readonly pullRequest: FactoryPullRequestKey;
         readonly at: number | null;
         readonly firstAt: number;
         readonly wakes: ReadonlyArray<FactoryWakeEvent>;
@@ -870,6 +871,7 @@ const make = Effect.gen(function* () {
         null;
       return Option.some({
         startedAt,
+        pullRequest,
         at,
         firstAt: Math.min(first, positions[0] ?? first),
         wakes: yield* wakesIn(read, pullRequest),

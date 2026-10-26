@@ -762,9 +762,17 @@ const make = Effect.gen(function* () {
         return undefined;
       }
       if (Option.isSome(released.value)) {
-        const { startedAt, at, firstAt, wakes } = released.value.value;
-        if (at !== null)
-          yield* stepLocked(deliveryId, { type: "watch.ended", startedAt, at, firstAt });
+        const { startedAt, pullRequest, at, firstAt, wakes } = released.value.value;
+        if (at !== null) {
+          yield* stepLocked(deliveryId, {
+            type: "watch.ended",
+            startedAt,
+            at,
+            firstAt,
+            number: pullRequest.number,
+            url: pullRequest.url,
+          });
+        }
         for (const wake of wakes) yield* stepLocked(deliveryId, wake);
       }
       return yield* stepLocked(deliveryId, { type: "watch.released" });

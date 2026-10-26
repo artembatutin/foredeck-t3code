@@ -125,7 +125,11 @@ describe("Factory's boot sweep of open pull requests", () => {
           assert.isAbove(heldUntil, opened.state.followThrough?.armedAt ?? Infinity);
           assert.deepStrictEqual(cancelled, {
             ...rest,
-            followThrough: { ...(closed.followThrough ?? assert.fail("Not watched.")), heldUntil },
+            followThrough: {
+              ...(closed.followThrough ?? assert.fail("Not watched.")),
+              heldUntil,
+              heldPullRequest: { number: link.number, url: link.url },
+            },
           });
           assert.isUndefined((yield* linkOf(author, fakePullRequest.number)).watch);
           assert.strictEqual(cancelled.status, "cancelled");

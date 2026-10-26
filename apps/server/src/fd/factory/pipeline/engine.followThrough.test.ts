@@ -157,6 +157,24 @@ const wake = (overrides: Partial<Extract<FactoryEvent, { type: "pr.feedback" }>>
     ...overrides,
   }) satisfies FactoryEvent;
 
+/** The release found Factory's watch on the delivery's pull request ended at `at`. */
+const endFound = ({
+  at,
+  firstAt = WATCHED_AFTER,
+}: {
+  readonly at: number;
+  readonly firstAt?: number;
+}) =>
+  ({
+    type: "watch.ended",
+    startedAt: STARTED_AT,
+    at,
+    firstAt,
+    number: pullRequest.number,
+    url: pullRequest.url,
+  }) satisfies FactoryEvent;
+const heldPullRequest = { number: pullRequest.number, url: pullRequest.url };
+
 const wakeEnded = (status: "completed" | "failed" | "interrupted" | "cancelled") =>
   ({ type: "run.finished", threadId: author, runId: wakeRun, status }) satisfies FactoryEvent;
 const merged: FactoryEvent = { type: "pr.merged", number: 42, url: pullRequest.url };
@@ -974,12 +992,12 @@ describe("Factory engine: wakes and watches across a republish", () => {
 
   it("records where the watch Factory started ended, creating follow-through when it was lost", () => {
     const cancelled = advance(adopted, { type: "cancel" }).delivery;
-    const end = { type: "watch.ended", startedAt: STARTED_AT, at: 250, firstAt: 90 } as const;
+    const end = endFound({ at: 250, firstAt: 90 });
     const step = advance(cancelled, end);
     expect(step.effects).toEqual([]);
     expect(step.delivery).toEqual({
       ...cancelled,
-      followThrough: { ...watched([wakeRun]), heldUntil: 250 },
+      followThrough: { ...watched([wakeRun]), heldUntil: 250, heldPullRequest },
     });
     expect(advance(step.delivery, end).delivery).toBe(step.delivery);
     // The PR stage's result was never stored: the watch's commands give the positions.
@@ -988,6 +1006,7 @@ describe("Factory engine: wakes and watches across a republish", () => {
       ...watched([], [], 90),
       watchedAfter: 90,
       heldUntil: 250,
+      heldPullRequest,
     });
   });
 });
@@ -996,6 +1015,8 @@ describe("Factory engine: wakes a cancelled delivery takes", () => {
   const ownerRun = RunId.make("run-owner-wake");
   const endRun = RunId.make("run-end");
   const cancelled = advance(adopted, { type: "cancel" }).delivery;
+  // A watch the owner started on another pull request of the author thread, at the same moment.
+  const other = { number: 43, url: "https://github.com/acme/alpha/pull/43" };
 
   it("owns a wake the watch Factory started sent, and the end that removed it, nothing more", () => {
     const later = wake({ runId: ownerRun, sequence: WATCHED_AFTER + 20 });
@@ -1004,12 +1025,7 @@ describe("Factory engine: wakes a cancelled delivery takes", () => {
       delivery: { ...cancelled, followThrough: watched([wakeRun, ownerRun]) },
       effects: [],
     });
-    const ended = advance(cancelled, {
-      type: "watch.ended",
-      startedAt: STARTED_AT,
-      at: 300,
-      firstAt: 100,
-    }).delivery;
+    const released = advance(cancelled, endFound({ at: 300 })).delivery;
     const end = wake({
       kind: "ended",
       runId: endRun,
@@ -1017,12 +1033,16 @@ describe("Factory engine: wakes a cancelled delivery takes", () => {
       watchStartedAt: null,
       linkSequence: 300,
     });
-    expect(advance(ended, end).delivery.followThrough?.runs).toEqual([wakeRun, endRun]);
-    expect(advance(ended, end).delivery.status).toBe("cancelled");
-    // Another watch's wake, another end, or any wake when it started no watch: not its own.
+    expect(advance(released, end).delivery.followThrough?.runs).toEqual([wakeRun, endRun]);
+    expect(advance(released, end).delivery.status).toBe("cancelled");
+    // Another watch's wake, another end, or any wake when it started no watch: not its own. A
+    // watch on another pull request is another watch, however it started at the same moment.
     for (const [state, event] of [
       [cancelled, wake({ runId: ownerRun, sequence: 120, watchStartedAt: OWNERS })],
-      [ended, { ...end, linkSequence: 299 }],
+      [cancelled, wake({ runId: ownerRun, sequence: 120, ...other })],
+      [released, wake({ runId: ownerRun, sequence: 320, ...other })],
+      [released, { ...end, linkSequence: 299 }],
+      [released, { ...end, ...other }],
       [cancelled, end],
       [{ ...cancelled, followThrough: { ...watched([wakeRun]), watchStartedAt: null } }, later],
     ] as const) {
@@ -1032,11 +1052,10 @@ describe("Factory engine: wakes a cancelled delivery takes", () => {
 
   it("owns its watch's wake when the pull request it published was never recorded", () => {
     const { followThrough: _, ...unwatched } = cancelled;
-    const lost = advance(
-      { ...unwatched, pullRequest: null },
-      { type: "watch.ended", startedAt: STARTED_AT, at: 300, firstAt: 100 },
-    ).delivery;
+    const lost = advance({ ...unwatched, pullRequest: null }, endFound({ at: 300 })).delivery;
     expect(advance(lost, wake()).delivery.followThrough?.runs).toEqual([wakeRun]);
+    // The release names the pull request, so another one's watch is still not its own.
+    expect(advance(lost, wake(other)).delivery).toBe(lost);
   });
 });
 
