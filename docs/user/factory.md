@@ -136,23 +136,31 @@ Factory does not change the item's status until its pull request merges.
 
 ## When the pull request gets feedback
 
-Factory watches a single item's pull request on the author's thread. When a check fails, someone
-comments or the branch starts to conflict, T3 Code wakes that thread, and Factory follows the
-author's answer as a round of the delivery: once the turn ends, the server verifies the branch
-again, a reviewer on a fresh thread reviews it, and Factory records the approval and pushes the
-approved commit to the same pull request. It does this even when the author changed nothing, so
-the pull request only ever holds verified, reviewed commits. Feedback that arrives during a round
-is followed too, once the author is done with the round or the pull request is open again. Checks
-that all pass start no round. Rounds count against the fix and review rounds the delivery has
-left, and a round that fails or runs out of rounds blocks like any other; **Resume** verifies and
-reviews again before pushing. Turns you send on the thread yourself are yours and start no round,
-and cancelling the delivery leaves them running. Feedback on a parent's pull request is not
-followed yet.
+Factory watches the pull request on the thread it is linked to: the author's thread, or for a
+parent the last child's author's. When a check fails, someone comments or the branch starts to
+conflict, T3 Code wakes that thread, and Factory follows the agent's answer as a round of the
+delivery: once the turn ends, the server verifies the branch again, a reviewer on a fresh thread
+reviews it, and Factory records the approval and pushes the approved commit to the same pull
+request. It does this even when the agent changed nothing, so the pull request only ever holds
+verified, reviewed commits. Feedback that arrives during a round is followed too, once the agent
+is done with the round or the pull request is open again. Checks that all pass start no round.
+A single item's rounds count against the fix and review rounds the delivery has left, and a round
+that fails or runs out of rounds blocks like any other; **Resume** verifies and reviews again
+before pushing. Turns you send on the thread yourself are yours and start no round, and
+cancelling the delivery leaves them running.
+
+For a parent, each round is judged like its integration: the server verifies the whole branch, a
+reviewer on a new thread checks every change since the branch started against every child's
+acceptance criteria, and Factory pushes the approved commit to the parent's one pull request. The
+children stay approved. A failed verify or a review that requires changes blocks the parent with
+no repair round. Fix the branch if needed, then **Resume** to check the branch, verify it and
+review it again with a new reviewer before pushing. If you delete the thread the pull request is
+linked to, the parent blocks, and resuming it blocks again.
 
 If T3 Code stops watching the pull request, because it cannot read it from the host or after too
-many comment-only updates, or cannot start watching it, as on an author thread you settled, the
-delivery blocks: Factory no longer hears of its feedback. **Resume** watches it again; unsettle the
-thread first if you settled it. Cancelling the delivery stops the watch Factory started and the
+many comment-only updates, or cannot start watching it, as on a thread you settled, the delivery
+blocks: Factory no longer hears of its feedback. **Resume** watches it again; unsettle the thread
+first if you settled it. Cancelling the delivery stops the watch Factory started and the
 turns it woke the thread for, but not a watch or a turn you started yourself.
 
 ## When the pull request merges or closes
@@ -209,7 +217,8 @@ a review still requiring changes with no review round left, the same failure aft
 code that changed during review. Fix what it names if needed, then **Resume**, or **Cancel
 delivery**.
 
-To see what needs you everywhere at once, open **Factory** from the sidebar or the command palette.
+To see what needs you everywhere at once, open **Factory** from the sidebar or the command palette
+on web and desktop, or on mobile tap **Factory** in the threads header (iOS) or toolbar (Android).
 It lists the active deliveries of every connected server that offers Factory, across projects, with
 those that need you first and the reason each one waits. A server that offers Factory but is not
 connected is named instead, and its deliveries return once it reconnects. Opening one takes you to
