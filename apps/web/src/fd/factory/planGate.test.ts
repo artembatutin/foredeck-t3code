@@ -24,7 +24,9 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   FACTORY_PLAN_FIELD_REFUSED,
   FACTORY_PLAN_TASK_REFUSED,
+  factoryPlanConfirmed,
   factoryPlanDecision,
+  factoryPlanDraftShowsServerPlan,
   factoryPlanDraftState,
   type FactoryPlanGate,
   factoryPlanGate,
@@ -35,6 +37,7 @@ import {
   factoryPlanTaskErrors,
   factoryReplanRequest,
   followFactoryPlan,
+  settleFactoryPlanSave,
 } from "./planGate";
 
 const environmentId = EnvironmentId.make("env-a");
@@ -68,6 +71,11 @@ const PLAN = decodePlan({
 // The planner's revision after a replan, or another client's saved edit.
 const NEXT = decodePlan({
   tasks: [task("export-csv", "Export CSV files"), task("export-header", "Add a header row")],
+  note: "Two tasks.",
+});
+// A change after NEXT, such as another client's later save.
+const LATER = decodePlan({
+  tasks: [task("export-header", "Add a header row"), task("export-csv", "Export CSV files")],
   note: "Two tasks.",
 });
 
@@ -327,21 +335,89 @@ describe("a plan that changes on the server", () => {
   });
 });
 
+describe("a save that succeeds", () => {
+  const gate = waitingGate();
+  const edited = editFactoryPlanTask(followFactoryPlan(null, gate), CSV, {
+    title: "Export CSV files",
+  });
+  const saved = (() => {
+    const outcome = factoryPlanSave(gate, edited);
+    if (outcome._tag !== "Save") throw new Error("Expected the edit to save.");
+    return outcome.plan;
+  })();
+  const seeing = (plan: FactoryPlan) => waitingGate({ deliveries: [delivery("d1", { plan })] });
+
+  it("shows the saved plan, not approved until the server is seen holding it", () => {
+    expect(saved).toEqual(NEXT);
+    // The refetch the save causes has not arrived: the server is still seen holding PLAN.
+    const settled = settleFactoryPlanSave(gate, PLAN, saved);
+    expect(settled).toEqual(factoryPlanDraft(HERE, NEXT));
+    expect(factoryPlanDraftState(settled)).toBe("unedited");
+    expect(factoryPlanGateActions(gate, settled).approve).toBe(false);
+    expect(factoryPlanDecision(gate, settled, "approve", factoryPlanConfirmed(gate))).toEqual({
+      _tag: "Unavailable",
+    });
+    // The refetch arrives with the saved plan: nothing moves, and approving it is offered.
+    const refetched = seeing(NEXT);
+    const followed = followFactoryPlan(settled, refetched);
+    expect(followed).toBe(settled);
+    expect(factoryPlanGateActions(refetched, followed).approve).toBe(true);
+  });
+
+  it("keeps a newer plan seen while the save was in flight", () => {
+    // While the save was in flight the draft was flagged against a later change.
+    const newer = seeing(LATER);
+    const flagged = followFactoryPlan(edited, newer);
+    expect(factoryPlanDraftState(flagged)).toBe("changed");
+    // The save then succeeds: the draft shows LATER, the plan the server is seen holding, never
+    // the plan the save sent, and only LATER is approved.
+    const settled = settleFactoryPlanSave(newer, PLAN, saved);
+    expect(settled).toEqual(factoryPlanDraft(HERE, LATER));
+    expect(factoryPlanDraftShowsServerPlan(newer, settled)).toBe(true);
+    expect(factoryPlanDecision(newer, settled, "approve", factoryPlanConfirmed(newer))).toEqual({
+      _tag: "Send",
+      request: { environmentId, input: { deliveryId: "d1" } },
+    });
+    // Seen holding the saved plan already: the draft is that plan.
+    expect(settleFactoryPlanSave(seeing(NEXT), PLAN, saved)).toEqual(factoryPlanDraft(HERE, NEXT));
+  });
+});
+
 describe("approve, reject and replan", () => {
   const gate = waitingGate();
   const fresh = followFactoryPlan(null, gate);
   const send = { _tag: "Send", request: { environmentId, input: { deliveryId: "d1" } } };
 
-  it("approve and reject ask first, then send only for the delivery confirmed", () => {
+  const confirmed = factoryPlanConfirmed(gate);
+
+  it("approve and reject ask first, then send only for the delivery and plan confirmed", () => {
+    expect(confirmed).toEqual({ deliveryId: "d1", plan: PLAN });
     for (const decision of ["approve", "reject"] as const) {
       expect(factoryPlanDecision(gate, fresh, decision, null)).toEqual({ _tag: "Confirm" });
-      expect(factoryPlanDecision(gate, fresh, decision, FactoryDeliveryId.make("d1"))).toEqual(
-        send,
-      );
+      expect(factoryPlanDecision(gate, fresh, decision, confirmed)).toEqual(send);
       // Confirmed for a delivery the gate no longer shows: ask again, never send for this one.
-      expect(factoryPlanDecision(gate, fresh, decision, FactoryDeliveryId.make("d0"))).toEqual({
+      expect(
+        factoryPlanDecision(gate, fresh, decision, {
+          ...confirmed,
+          deliveryId: FactoryDeliveryId.make("d0"),
+        }),
+      ).toEqual({ _tag: "Confirm" });
+    }
+  });
+
+  it("asks again when the same delivery's plan changes after the confirmation opened", () => {
+    const changedGate = waitingGate({ deliveries: [delivery("d1", { plan: NEXT })] });
+    // The draft follows the new plan, unedited, so approving it is offered again...
+    const followed = followFactoryPlan(fresh, changedGate);
+    expect(factoryPlanGateActions(changedGate, followed).approve).toBe(true);
+    // ...but not on the confirmation the owner gave for the plan they saw before.
+    for (const decision of ["approve", "reject"] as const) {
+      expect(factoryPlanDecision(changedGate, followed, decision, confirmed)).toEqual({
         _tag: "Confirm",
       });
+      expect(
+        factoryPlanDecision(changedGate, followed, decision, factoryPlanConfirmed(changedGate)),
+      ).toEqual(send);
     }
   });
 
@@ -353,10 +429,15 @@ describe("approve, reject and replan", () => {
       replan: true,
     });
     expect(factoryPlanGateActions(gate, edited).approve).toBe(false);
-    expect(factoryPlanDecision(gate, edited, "approve", FactoryDeliveryId.make("d1"))).toEqual({
+    expect(factoryPlanDecision(gate, edited, "approve", confirmed)).toEqual({
       _tag: "Unavailable",
     });
-    expect(factoryPlanDecision(gate, edited, "reject", FactoryDeliveryId.make("d1"))).toEqual(send);
+    expect(factoryPlanDecision(gate, edited, "reject", confirmed)).toEqual(send);
+    // An unedited draft of a plan other than the one the server is seen holding is not approved.
+    const other = factoryPlanDraft(HERE, NEXT);
+    expect(factoryPlanDraftState(other)).toBe("unedited");
+    expect(factoryPlanDraftShowsServerPlan(gate, other)).toBe(false);
+    expect(factoryPlanGateActions(gate, other).approve).toBe(false);
   });
 
   it.each<[string, Partial<Parameters<typeof factoryPlanGate>[0]>]>([
@@ -370,7 +451,7 @@ describe("approve, reject and replan", () => {
       replan: false,
     });
     for (const decision of ["approve", "reject"] as const) {
-      expect(factoryPlanDecision(offline, fresh, decision, FactoryDeliveryId.make("d1"))).toEqual({
+      expect(factoryPlanDecision(offline, fresh, decision, confirmed)).toEqual({
         _tag: "Unavailable",
       });
     }

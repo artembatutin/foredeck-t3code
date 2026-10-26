@@ -22,6 +22,7 @@ import {
 } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as Cause from "effect/Cause";
+import * as Equal from "effect/Equal";
 import * as Option from "effect/Option";
 
 import { deliveriesWithStarted, factoryErrorText, type FactoryStartedDelivery } from "./deliver";
@@ -96,18 +97,50 @@ export function factoryPlanGate(input: {
 const sameDestination = (left: FactoryPlanDestination, right: FactoryPlanDestination) =>
   left.environmentId === right.environmentId && left.deliveryId === right.deliveryId;
 
+/** The delivery a gate is for and the plan its server was last seen holding. */
+type ObservedPlan = Pick<FactoryPlanGate, "destination" | "plan">;
+
 /**
- * The draft the gate shows once the server holds `gate.plan`: the plan unedited for a gate with
- * no draft yet, or the draft rebased onto it, which follows the plan when unedited and otherwise
- * keeps the edits and flags the change (see `rebaseFactoryPlanDraft`).
+ * The draft the gate shows once the server is seen holding `gate.plan`: the plan unedited for a
+ * gate with no draft yet, or the draft rebased onto it, which follows the plan when unedited and
+ * otherwise keeps the edits and flags the change (see `rebaseFactoryPlanDraft`).
  */
 export const followFactoryPlan = (
   draft: FactoryPlanDraft | null,
-  gate: FactoryPlanGate,
+  gate: ObservedPlan,
 ): FactoryPlanDraft =>
   draft === null || !sameDestination(draft, gate.destination)
     ? factoryPlanDraft(gate.destination, gate.plan)
     : rebaseFactoryPlanDraft(draft, gate.destination, gate.plan);
+
+/**
+ * The draft once a save of `saved`, sent while the server was seen holding `sentOver`, succeeds,
+ * by the plan seen since (`gate.plan`). While that is still `sentOver`, the refetch the save
+ * causes has not arrived: the draft is the saved plan unedited, which the gate does not approve
+ * until the server is seen holding it, and the next plan seen rebases it. A plan seen since is
+ * as new as the save or newer, so the draft follows it, never replacing it with the plan the save
+ * sent.
+ */
+export const settleFactoryPlanSave = (
+  gate: ObservedPlan,
+  sentOver: FactoryPlan,
+  saved: FactoryPlan,
+): FactoryPlanDraft => {
+  const savedDraft = factoryPlanDraft(gate.destination, saved);
+  return Equal.equals(gate.plan, sentOver) ? savedDraft : followFactoryPlan(savedDraft, gate);
+};
+
+/**
+ * Whether the draft shows the plan the server was last seen holding, unedited: the only plan the
+ * gate approves, so the owner approves what they see.
+ */
+export const factoryPlanDraftShowsServerPlan = (
+  gate: ObservedPlan,
+  draft: FactoryPlanDraft,
+): boolean =>
+  sameDestination(draft, gate.destination) &&
+  factoryPlanDraftState(draft) === "unedited" &&
+  Equal.equals(draft.base, gate.plan);
 
 /**
  * `changed`: the server's plan changed under the owner's edits, which they reapply or discard
@@ -172,7 +205,7 @@ export type FactoryPlanDecision = "approve" | "reject";
 
 /** Whether the gate offers each action now. */
 export interface FactoryPlanGateActions {
-  /** Only while the draft shows the server's plan unedited: the owner approves what they see. */
+  /** Only while the draft shows the server's plan (see `factoryPlanDraftShowsServerPlan`). */
   readonly approve: boolean;
   readonly reject: boolean;
   readonly replan: boolean;
@@ -182,12 +215,21 @@ export const factoryPlanGateActions = (
   gate: FactoryPlanGate,
   draft: FactoryPlanDraft,
 ): FactoryPlanGateActions => ({
-  approve:
-    gate.offered.approve &&
-    sameDestination(draft, gate.destination) &&
-    factoryPlanDraftState(draft) === "unedited",
+  approve: gate.offered.approve && factoryPlanDraftShowsServerPlan(gate, draft),
   reject: gate.offered.reject,
   replan: gate.offered.replan,
+});
+
+/** What an open approve or reject confirmation was opened for: a delivery and its plan then. */
+export interface FactoryPlanConfirmed {
+  readonly deliveryId: FactoryDeliveryId;
+  readonly plan: FactoryPlan;
+}
+
+/** The confirmation of a decision on the plan the gate shows now. */
+export const factoryPlanConfirmed = (gate: FactoryPlanGate): FactoryPlanConfirmed => ({
+  deliveryId: gate.destination.deliveryId,
+  plan: gate.plan,
 });
 
 export type FactoryPlanDecisionRequest =
@@ -204,17 +246,24 @@ export type FactoryPlanDecisionRequest =
 
 /**
  * What approving or rejecting does: nothing unless the gate offers it, and otherwise a
- * confirmation first. It is sent only once confirmed for the gate's own delivery, so a
- * confirmation opened for a delivery that has since been replaced never acts on the new one.
+ * confirmation first. It is sent only once confirmed for the gate's own delivery and the plan its
+ * server is seen holding now, so a confirmation opened for a delivery since replaced, or for a
+ * plan since changed, asks again rather than act on what it did not show.
  */
 export const factoryPlanDecision = (
   gate: FactoryPlanGate,
   draft: FactoryPlanDraft,
   decision: FactoryPlanDecision,
-  confirmedFor: FactoryDeliveryId | null,
+  confirmed: FactoryPlanConfirmed | null,
 ): FactoryPlanDecisionRequest => {
   if (!factoryPlanGateActions(gate, draft)[decision]) return { _tag: "Unavailable" };
-  if (confirmedFor !== gate.destination.deliveryId) return { _tag: "Confirm" };
+  if (
+    confirmed === null ||
+    confirmed.deliveryId !== gate.destination.deliveryId ||
+    !Equal.equals(confirmed.plan, gate.plan)
+  ) {
+    return { _tag: "Confirm" };
+  }
   return {
     _tag: "Send",
     request: {

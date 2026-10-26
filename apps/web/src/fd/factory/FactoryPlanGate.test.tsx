@@ -111,7 +111,8 @@ const itemRef = {
   sourceId: WorkSourceId.make("6f9b1c2e-3d4a-4b5c-8d6e-7f8091a2b3c4"),
   itemId: WorkItemId.make("fd-7k3qa2"),
 };
-const plan = Schema.decodeUnknownSync(FactoryPlan)({
+const decodePlan = Schema.decodeUnknownSync(FactoryPlan);
+const plan = decodePlan({
   tasks: ["export-csv", "export-header"].map((id) => ({
     id,
     title: `Task ${id}`,
@@ -194,6 +195,37 @@ const confirm = (label: string) => {
   if (open === undefined) throw new Error("The confirmation is closed.");
   return press(button(open, label));
 };
+/** The planned tasks as shown, in order. */
+const tasks = () =>
+  root()
+    .findAll((node) => node.type === "ol" && node.props["aria-label"] === "Planned tasks")[0]!
+    .findAll((node) => node.type === "li");
+/** The title each planned task shows, in the order shown. */
+const titles = () =>
+  tasks().map((task) => task.findAll((node) => node.type === "input")[0]?.props.value);
+/** The server's plan for delivery d1 changes, as a refetch on the change epoch shows it. */
+const serverHolds = (next: FactoryPlan) =>
+  act(() =>
+    registry.set(
+      destination.get().deliveries,
+      AsyncResult.success({ deliveries: [waiting("d1", { plan: next })] }),
+    ),
+  );
+/** An answer the test settles later, as a response still in flight. */
+const held = () => {
+  let settle: (value: unknown) => void = () => undefined;
+  const answer = new Promise((resolve) => {
+    settle = resolve;
+  });
+  return { answer, settle: (value: unknown) => act(async () => settle(value)) };
+};
+// Another client's later change of the plan: the tasks reordered and retitled.
+const later = decodePlan({
+  tasks: [
+    { ...plan.tasks[1], title: "Write the header first" },
+    { ...plan.tasks[0], title: "Then export CSV" },
+  ],
+});
 
 describe("the plan gate", () => {
   it("approves the plan of the delivery it confirmed, and nothing before", async () => {
@@ -241,7 +273,7 @@ describe("the plan gate", () => {
     };
     await mount();
     // Approve waits for the edits to be saved or discarded.
-    const [, headerTask] = root().findAll((node) => node.type === "li");
+    const [, headerTask] = tasks();
     const [summary] = headerTask!.findAll((node) => node.type === "textarea");
     await act(async () => summary!.props.onChange({ target: { value: "Write the header." } }));
     expect(button(root(), "Approve plan")?.props.disabled).toBe(true);
@@ -261,9 +293,61 @@ describe("the plan gate", () => {
       ],
     ]);
     expect(textOf(root())).toContain("Factory refused the edited plan.");
-    const [csv, header] = root().findAll((node) => node.type === "li");
+    const [csv, header] = tasks();
     expect(textOf(header!)).toContain(FACTORY_PLAN_FIELD_REFUSED);
     expect(textOf(csv!)).not.toContain(FACTORY_PLAN_FIELD_REFUSED);
+  });
+
+  it("keeps a newer plan seen while a save was in flight, and approves only what it shows", async () => {
+    const saving = held();
+    destination.get().answers.updatePlan = saving.answer;
+    await mount();
+    const [csv] = root().findAll((node) => node.type === "input");
+    await act(async () => csv!.props.onChange({ target: { value: "Export CSV files" } }));
+    await press(button(root(), "Save plan"));
+    expect(destination.get().sent.map(([command]) => command)).toEqual(["updatePlan"]);
+    // A later change reaches this client before the save's own response does.
+    await serverHolds(later);
+    await saving.settle({ _tag: "Success", value: undefined });
+    expect(titles()).toEqual(["Write the header first", "Then export CSV"]);
+    await press(button(root(), "Approve plan"));
+    await confirm("Approve plan");
+    expect(destination.get().sent.map(([command]) => command)).toEqual([
+      "updatePlan",
+      "approvePlan",
+    ]);
+  });
+
+  it("shows a saved plan unapproved until the server is seen holding it", async () => {
+    await mount();
+    const [csv] = root().findAll((node) => node.type === "input");
+    await act(async () => csv!.props.onChange({ target: { value: "Export CSV files" } }));
+    await press(button(root(), "Save plan"));
+    // The save answered before the refetch it causes: the edit stays shown, unapproved.
+    expect(titles()).toEqual(["Export CSV files", "Task export-header"]);
+    expect(button(root(), "Approve plan")?.props.disabled).toBe(true);
+    expect(textOf(root())).toContain("Approve once the saved plan has loaded.");
+    const saved = (destination.get().sent[0]![1] as { input: { plan: FactoryPlan } }).input.plan;
+    await serverHolds(decodePlan(saved));
+    expect(titles()).toEqual(["Export CSV files", "Task export-header"]);
+    expect(button(root(), "Approve plan")?.props.disabled).toBe(false);
+    expect(textOf(root())).not.toContain("Approve once the saved plan has loaded.");
+  });
+
+  it("closes an open confirmation, sending nothing, when the same delivery's plan changes", async () => {
+    await mount();
+    await press(button(root(), "Approve plan"));
+    expect(dialog()).toBeDefined();
+    await serverHolds(later);
+    expect(dialog()).toBeUndefined();
+    expect(destination.get().sent).toEqual([]);
+    // Approving the plan now shown takes a confirmation of its own.
+    expect(titles()).toEqual(["Write the header first", "Then export CSV"]);
+    await press(button(root(), "Approve plan"));
+    await confirm("Approve plan");
+    expect(destination.get().sent).toEqual([
+      ["approvePlan", { environmentId, input: { deliveryId: "d1" } }],
+    ]);
   });
 
   it("sends a replan only with a note", async () => {

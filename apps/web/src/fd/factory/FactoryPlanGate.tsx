@@ -15,7 +15,7 @@ import {
   removeFactoryPlanTask,
   removeFactoryTestPlanEntry,
 } from "@t3tools/client-runtime/fd/factory";
-import type { FactoryDeliveryId, FactoryTaskId } from "@t3tools/contracts/fd/factory";
+import type { FactoryTaskId } from "@t3tools/contracts/fd/factory";
 import { ArrowDownIcon, ArrowUpIcon, XIcon } from "lucide-react";
 import { type ReactNode, useState } from "react";
 
@@ -34,6 +34,8 @@ import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { useAtomCommand } from "../../state/use-atom-command";
 import {
+  type FactoryPlanConfirmed,
+  factoryPlanConfirmed,
   type FactoryPlanDecision,
   factoryPlanDecision,
   factoryPlanDraftState,
@@ -45,6 +47,7 @@ import {
   factoryPlanTaskErrors,
   factoryReplanRequest,
   followFactoryPlan,
+  settleFactoryPlanSave,
 } from "./planGate";
 import { factoryEnvironment } from "./state";
 
@@ -56,10 +59,11 @@ type EditDraft = (change: (draft: FactoryPlanDraft) => FactoryPlanDraft) => void
 /**
  * The plan a delivery waits on at the plan gate, editable in a draft pinned to that delivery:
  * task titles, summaries, criteria and test plans, their order and which stay. Save sends the
- * edited plan; approve and reject ask first; replan sends a note to the planner. Nothing applies
- * locally: the view changes when the change epoch refetches the delivery, and a plan changed on
- * the server while the owner edits is flagged for them to keep their edits over it or drop them.
- * The parent keys it by destination, so a draft never outlives its delivery.
+ * edited plan; approve and reject ask first, for the plan shown then; replan sends a note to the
+ * planner. Nothing applies locally: the view changes when the change epoch refetches the
+ * delivery, and a plan changed on the server while the owner edits is flagged for them to keep
+ * their edits over it or drop them. The parent keys it by destination, so a draft never outlives
+ * its delivery.
  */
 export function FactoryPlanGate({
   gate,
@@ -72,51 +76,62 @@ export function FactoryPlanGate({
   const approvePlan = useAtomCommand(factoryEnvironment.approvePlan);
   const rejectPlan = useAtomCommand(factoryEnvironment.rejectPlan);
   const replan = useAtomCommand(factoryEnvironment.replan);
-  // The server plan the draft last followed.
-  const [followed, setFollowed] = useState(gate.plan);
-  const [draft, setDraft] = useState(() => followFactoryPlan(null, gate));
+  // The server plan last seen and the draft following it, kept together so a save completing
+  // later settles against the plan seen by then, not the one its request was sent over.
+  const [held, setHeld] = useState(() => ({
+    followed: gate.plan,
+    draft: followFactoryPlan(null, gate),
+  }));
   const [refusal, setRefusal] = useState<FactoryPlanRefusal | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
-  // The decision an open confirmation asks for, and the delivery it was opened for.
-  const [confirming, setConfirming] = useState<{
-    readonly decision: FactoryPlanDecision;
-    readonly deliveryId: FactoryDeliveryId;
-  } | null>(null);
+  // The decision an open confirmation asks for, and the delivery and plan it was opened for.
+  const [confirming, setConfirming] = useState<
+    (FactoryPlanConfirmed & { readonly decision: FactoryPlanDecision }) | null
+  >(null);
   // The replan note being written; null while replan is closed.
   const [note, setNote] = useState<string | null>(null);
-  if (gate.plan !== followed) {
-    setFollowed(gate.plan);
-    setDraft(followFactoryPlan(draft, gate));
+  if (gate.plan !== held.followed) {
+    setHeld({ followed: gate.plan, draft: followFactoryPlan(held.draft, gate) });
     setRefusal(null);
   }
 
+  const draft = held.draft;
   const state = factoryPlanDraftState(draft);
   const save = factoryPlanSave(gate, draft);
   const actions = factoryPlanGateActions(gate, draft);
-  // Adjusted during render: a confirmation closes once it could no longer send for its delivery.
+  // Adjusted during render: a confirmation closes once it could no longer send for the delivery
+  // and plan it was opened for.
   if (
     confirming !== null &&
-    factoryPlanDecision(gate, draft, confirming.decision, confirming.deliveryId)._tag !== "Send"
+    factoryPlanDecision(gate, draft, confirming.decision, confirming)._tag !== "Send"
   ) {
     setConfirming(null);
   }
   const replanning = note === null ? null : factoryReplanRequest(gate, note);
   const editable = gate.offered.update && pending === null;
   const ownErrors = save._tag === "Invalid" ? save.errors : {};
-  const edit: EditDraft = (change) => setDraft((current) => change(current));
+  const edit: EditDraft = (change) =>
+    setHeld((current) => ({ ...current, draft: change(current.draft) }));
 
   const submit = async () => {
     if (save._tag !== "Save") return;
+    const sentOver = gate.plan;
+    const { destination } = gate;
     setPending("save");
     setRefusal(null);
     const result = await updatePlan(save.request);
     setPending(null);
     if (result._tag === "Failure") setRefusal(factoryPlanRefusal(result.cause));
-    else setDraft(factoryPlanDraft(gate.destination, save.plan));
+    else {
+      setHeld((current) => ({
+        ...current,
+        draft: settleFactoryPlanSave({ destination, plan: current.followed }, sentOver, save.plan),
+      }));
+    }
   };
-  const decide = async (decision: FactoryPlanDecision, deliveryId: FactoryDeliveryId) => {
+  const decide = async (decision: FactoryPlanDecision, confirmed: FactoryPlanConfirmed) => {
     setConfirming(null);
-    const outcome = factoryPlanDecision(gate, draft, decision, deliveryId);
+    const outcome = factoryPlanDecision(gate, draft, decision, confirmed);
     if (outcome._tag !== "Send") return;
     setPending(decision);
     setRefusal(null);
@@ -126,7 +141,7 @@ export function FactoryPlanGate({
   };
   const ask = (decision: FactoryPlanDecision) => {
     if (factoryPlanDecision(gate, draft, decision, null)._tag === "Confirm") {
-      setConfirming({ decision, deliveryId: gate.destination.deliveryId });
+      setConfirming({ decision, ...factoryPlanConfirmed(gate) });
     }
   };
   const sendReplan = async () => {
@@ -246,7 +261,11 @@ export function FactoryPlanGate({
         ) : null}
       </div>
       {offered.approve && !actions.approve ? (
-        <p className="text-muted-foreground text-xs">Save or discard your edits to approve.</p>
+        <p className="text-muted-foreground text-xs">
+          {state === "unedited"
+            ? "Approve once the saved plan has loaded."
+            : "Save or discard your edits to approve."}
+        </p>
       ) : null}
       {!offered.update && !offered.approve && !offered.reject && !offered.replan ? (
         <p className="text-muted-foreground text-xs">
@@ -308,7 +327,7 @@ export function FactoryPlanGate({
               variant={confirming?.decision === "reject" ? "destructive" : "default"}
               disabled={confirming === null || pending !== null}
               onClick={() => {
-                if (confirming !== null) void decide(confirming.decision, confirming.deliveryId);
+                if (confirming !== null) void decide(confirming.decision, confirming);
               }}
             >
               {confirming?.decision === "reject" ? "Reject plan" : "Approve plan"}
