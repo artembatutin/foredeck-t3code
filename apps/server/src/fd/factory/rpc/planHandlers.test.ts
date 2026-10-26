@@ -183,7 +183,11 @@ describe("Factory plan RPC errors", () => {
       name: "an edit the gate refuses",
       actions: {
         updatePlan: failing(
-          new FactoryService.FactoryPlanEditInvalidError({ deliveryId, problems: [secret] }),
+          new FactoryService.FactoryPlanEditInvalidError({
+            deliveryId,
+            problems: [secret],
+            fields: [],
+          }),
         ),
       },
       wire: {
@@ -648,18 +652,27 @@ describe("Factory plan RPCs over the wire", () => {
         const before = yield* deliveries.get(deliveryId);
         const start = yield* epoch;
 
-        const malformedEdits: ReadonlyArray<unknown> = [
-          { tasks: [{ ...first, title: "   " }, second] },
-          { tasks: [{ ...first, risk: "extreme" }, second] },
-          { tasks: [first, { ...second, kind: "perf" }] },
-          { tasks: [{ ...first, acceptance: ["c".repeat(2001)] }] },
-          { tasks: [{ ...first, testPlan: [{ criterion: 1, check: "x", paths: ["../up"] }] }] },
-          { tasks: "export-csv" },
-          { note: "No tasks list." },
-          "Keep the plan as it is.",
-          null,
+        // Each with the fields of the plan its refusal names, by task id and never with text.
+        const malformedEdits: ReadonlyArray<
+          readonly [unknown, ReadonlyArray<{ readonly taskId: string; readonly field?: string }>]
+        > = [
+          [{ tasks: [{ ...first, title: "   " }, second] }, [{ taskId: first.id, field: "title" }]],
+          [{ tasks: [{ ...first, risk: "extreme" }, second] }, [{ taskId: first.id }]],
+          [{ tasks: [first, { ...second, kind: "perf" }] }, [{ taskId: second.id }]],
+          [
+            { tasks: [{ ...first, acceptance: ["c".repeat(2001)] }] },
+            [{ taskId: first.id, field: "acceptance.1" }],
+          ],
+          [
+            { tasks: [{ ...first, testPlan: [{ criterion: 1, check: "x", paths: ["../up"] }] }] },
+            [{ taskId: first.id, field: "testPlan.0.paths" }],
+          ],
+          [{ tasks: "export-csv" }, []],
+          [{ note: "No tasks list." }, []],
+          ["Keep the plan as it is.", []],
+          [null, []],
         ];
-        for (const edited of malformedEdits) {
+        for (const [edited, fields] of malformedEdits) {
           const exit = yield* send(FACTORY_WS_METHODS.factoryPlanUpdate, {
             deliveryId,
             plan: edited,
@@ -669,6 +682,7 @@ describe("Factory plan RPCs over the wire", () => {
             reason: "invalid_request",
             message: editMessage,
             deliveryId,
+            ...(fields.length === 0 ? {} : { fields }),
           });
         }
         for (const note of ["", " \n\t ", "n".repeat(8001)]) {

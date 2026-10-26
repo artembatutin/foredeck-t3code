@@ -38,6 +38,7 @@ export {
   FACTORY_REPLAN_NOTE_MAX_LENGTH,
   FactoryReplanNote,
   FactoryPlanReplanInput,
+  FactoryPlanField,
   FactoryErrorReason,
   FactoryError,
 } from "./schemas.ts";

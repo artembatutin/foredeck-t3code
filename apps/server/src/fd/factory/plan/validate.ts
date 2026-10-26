@@ -20,11 +20,22 @@ export type FactoryPlanProblemRule =
   /** Stands for the problems past the count bound. */
   | "more_problems";
 
+/**
+ * Where a problem is: the task at a position of the submission, and the field of it in the terms
+ * of an owner's plan draft (see `FactoryPlanField`), or the whole task without one.
+ */
+export interface FactoryPlanProblemAt {
+  readonly task: number;
+  readonly field?: string;
+}
+
 /** A problem the planner can correct, so the description says exactly what to fix. */
 export interface FactoryPlanProblem {
   readonly rule: FactoryPlanProblemRule;
   /** At most `MAX_PROBLEM_LENGTH` characters. */
   readonly description: string;
+  /** Absent for a problem of the plan as a whole, such as a duplicate id or a bad note. */
+  readonly at?: FactoryPlanProblemAt;
 }
 
 /**
@@ -58,7 +69,12 @@ const bounded = (text: string) =>
 export const planProblem = (
   rule: FactoryPlanProblemRule,
   description: string,
-): FactoryPlanProblem => ({ rule, description: bounded(description) });
+  at?: FactoryPlanProblemAt,
+): FactoryPlanProblem => ({
+  rule,
+  description: bounded(description),
+  ...(at === undefined ? {} : { at }),
+});
 
 // Every issue at once: the planner gets one corrected retry.
 const decodePlan = Schema.decodeUnknownResult(FactoryPlan, { errors: "all" });
@@ -66,20 +82,51 @@ const formatIssues = SchemaIssue.makeFormatterStandardSchemaV1();
 
 type IssuePath = NonNullable<ReturnType<typeof formatIssues>["issues"][number]["path"]>;
 
+const pathKeys = (path: IssuePath) =>
+  path.map((segment) => (typeof segment === "object" ? segment.key : segment));
+
 /** `tasks[0].testPlan[1].paths[0]`, the field a schema issue is at. */
 const fieldPath = (path: IssuePath) =>
-  path
-    .map((segment) => (typeof segment === "object" ? segment.key : segment))
+  pathKeys(path)
     .map((key, index) =>
       typeof key === "number" ? `[${key}]` : `${index === 0 ? "" : "."}${String(key)}`,
     )
     .join("") || "the plan";
 
+/** The draft field of a task a schema issue is in, from the keys after `tasks[i]`. */
+const draftField = ([field, index, part]: ReadonlyArray<PropertyKey>): string | undefined => {
+  switch (field) {
+    case "title":
+    case "summary":
+      return field;
+    case "acceptance":
+      return typeof index === "number" ? `acceptance.${index + 1}` : "acceptance";
+    case "testPlan":
+      return typeof index === "number" &&
+        (part === "criterion" || part === "check" || part === "paths")
+        ? `testPlan.${index}.${part}`
+        : "testPlan";
+    default:
+      return undefined;
+  }
+};
+
+/** Where a schema issue is, when it is in a task. */
+const issueAt = (path: IssuePath): FactoryPlanProblemAt | undefined => {
+  const [tasks, task, ...rest] = pathKeys(path);
+  if (tasks !== "tasks" || typeof task !== "number") return undefined;
+  const field = draftField(rest);
+  return field === undefined ? { task } : { task, field };
+};
+
 /** What the id and criteria checks read of a task; a field the submission lacks is null. */
 interface TaskOutline {
+  /** The task's position in the submission. */
+  readonly position: number;
   readonly id: string | null;
   readonly criteriaCount: number | null;
-  readonly testCriteria: ReadonlyArray<number> | null;
+  /** The criterion each test plan entry names, with the entry's index. */
+  readonly testCriteria: ReadonlyArray<readonly [criterion: number, entry: number]> | null;
 }
 
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
@@ -92,22 +139,27 @@ const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
  */
 const outlines = (value: unknown): ReadonlyArray<TaskOutline> => {
   if (!isRecord(value) || !Array.isArray(value.tasks)) return [];
-  return value.tasks.filter(isRecord).map((task) => {
+  return value.tasks.flatMap((task: unknown, position) => {
+    if (!isRecord(task)) return [];
     const acceptance = task.acceptance;
     const testPlan = task.testPlan;
-    return {
-      id: typeof task.id === "string" ? task.id : null,
-      criteriaCount: Array.isArray(acceptance) && acceptance.length > 0 ? acceptance.length : null,
-      testCriteria: Array.isArray(testPlan)
-        ? testPlan.flatMap((entry) =>
-            isRecord(entry) &&
-            typeof entry.criterion === "number" &&
-            Number.isInteger(entry.criterion)
-              ? [entry.criterion]
-              : [],
-          )
-        : null,
-    };
+    return [
+      {
+        position,
+        id: typeof task.id === "string" ? task.id : null,
+        criteriaCount:
+          Array.isArray(acceptance) && acceptance.length > 0 ? acceptance.length : null,
+        testCriteria: Array.isArray(testPlan)
+          ? testPlan.flatMap((entry, index) =>
+              isRecord(entry) &&
+              typeof entry.criterion === "number" &&
+              Number.isInteger(entry.criterion)
+                ? [[entry.criterion, index] as const]
+                : [],
+            )
+          : null,
+      },
+    ];
   });
 };
 
@@ -142,23 +194,29 @@ const outlineProblems = (
   tasks.forEach((task, index) => {
     if (task.criteriaCount === null || task.testCriteria === null) return;
     const name = taskName(task, index);
-    const tested = new Set(task.testCriteria);
+    // Each criterion a test plan entry names, at the first entry naming it.
+    const tested = new Map<number, number>();
+    for (const [criterion, entry] of task.testCriteria) {
+      if (!tested.has(criterion)) tested.set(criterion, entry);
+    }
     for (let criterion = 1; criterion <= task.criteriaCount; criterion += 1) {
       if (!tested.has(criterion)) {
         problems.push(
           planProblem(
             "criterion_without_test",
             `${name}: acceptance criterion ${criterion} has no test plan entry; add one naming criterion ${criterion}.`,
+            { task: task.position, field: `acceptance.${criterion}.testPlan` },
           ),
         );
       }
     }
-    for (const criterion of tested) {
+    for (const [criterion, entry] of tested) {
       if (criterion < 1 || criterion > task.criteriaCount) {
         problems.push(
           planProblem(
             "test_criterion_out_of_range",
             `${name}: a test plan entry names criterion ${criterion}, outside 1..${task.criteriaCount}; the task has ${task.criteriaCount} acceptance criteria.`,
+            { task: task.position, field: `testPlan.${entry}.criterion` },
           ),
         );
       }
@@ -195,7 +253,10 @@ export const validatePlan = (
   if (Result.isFailure(decoded)) {
     const issues = formatIssues(decoded.failure.issue).issues;
     for (const issue of issues) {
-      problems.push(planProblem("not_a_plan", `${fieldPath(issue.path ?? [])}: ${issue.message}`));
+      const path = issue.path ?? [];
+      problems.push(
+        planProblem("not_a_plan", `${fieldPath(path)}: ${issue.message}`, issueAt(path)),
+      );
     }
     if (issues.length === 0) problems.push(planProblem("not_a_plan", "The value is not a plan."));
   }

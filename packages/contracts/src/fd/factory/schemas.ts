@@ -560,6 +560,21 @@ export const FactoryDeliveryList = Schema.Struct({
 });
 export type FactoryDeliveryList = typeof FactoryDeliveryList.Type;
 
+/**
+ * A part of a plan a refused plan edit or approval names: a task of the plan by its id, with the
+ * field of it in the terms clients' plan drafts use (`title`, `summary`, `acceptance`,
+ * `acceptance.<n>` for criterion n from 1, `acceptance.<n>.testPlan` for its missing test plan
+ * entry, `testPlan`, and `testPlan.<i>.criterion`, `.check` or `.paths` for the entry at index i
+ * from 0), or without one for the task as a whole. It carries no text: a client says what is
+ * wrong in its own words, beside the error's fixed message, and treats a field it does not know
+ * as the whole task.
+ */
+export const FactoryPlanField = Schema.Struct({
+  taskId: FactoryTaskId,
+  field: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(64))),
+});
+export type FactoryPlanField = typeof FactoryPlanField.Type;
+
 const FACTORY_ERROR_REASONS = [
   "invalid_request",
   "not_found",
@@ -592,4 +607,10 @@ export class FactoryError extends Schema.TaggedError<FactoryError>()("FactoryErr
   message: Schema.String,
   /** The missing or refused delivery, or for `conflict` the item's active one. */
   deliveryId: Schema.optionalKey(FactoryDeliveryId),
+  /**
+   * The parts of the plan a refused plan edit or approval names, each once, when the server can
+   * name any. Absent from other errors and from older servers, and dropped by older clients; an
+   * entry this build cannot read is left out rather than failing the error.
+   */
+  fields: Schema.optionalKey(ForwardCompatibleList(FactoryPlanField)),
 }) {}

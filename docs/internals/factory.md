@@ -207,11 +207,13 @@ stay, and must pass the planner's validator; ids, kinds, likely paths, risk and 
 planner's ([`plan/edit.ts`](../../apps/server/src/fd/factory/plan/edit.ts)). The RPC payloads carry
 the edited plan as any value and the replan note as any string: the RPC server turns a payload
 that fails decoding into a defect before any handler runs, so the server judges both itself and a
-malformed one is refused as `invalid_request` with Factory's fixed text. The edit replaces the
-tasks in the delivery's state while `plan.json` keeps what the planner submitted, so approval
-freezes the state's tasks, stored as the delivery's task rows in the step that approves. A replan
-is a new plan round opened by a turn carrying the owner's note; the gate's attempt it leaves ends
-failed, and the next accepted plan replaces the old.
+malformed one is refused as `invalid_request` with Factory's fixed text. Its `fields` name where
+the problems are, as a recorded task's id and the client draft's field, never what they say: the
+validator's descriptions quote the owner's text, so the client words each field itself. The edit
+replaces the tasks in the delivery's state while `plan.json` keeps what the planner submitted, so
+approval freezes the state's tasks, stored as the delivery's task rows in the step that approves. A
+replan is a new plan round opened by a turn carrying the owner's note; the gate's attempt it leaves
+ends failed, and the next accepted plan replaces the old.
 
 ## Child items are found again before they are created
 

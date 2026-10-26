@@ -4,6 +4,7 @@ import {
   FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
   FactoryDeliveryId,
   FactoryDeliveryStatus,
+  FactoryPlanField,
   FactoryReplanNote,
   FactoryTaskId,
 } from "@t3tools/contracts/fd/factory";
@@ -286,6 +287,8 @@ export class FactoryPlanEditInvalidError extends Schema.TaggedError<FactoryPlanE
     deliveryId: FactoryDeliveryId,
     /** Bounded descriptions of what to correct. */
     problems: Schema.Array(Schema.String),
+    /** The parts of the recorded plan the problems are in, for the owner's client to show. */
+    fields: Schema.Array(FactoryPlanField),
   },
 ) {
   override get message(): string {
@@ -975,6 +978,7 @@ const make = Effect.gen(function* () {
           return yield* new FactoryPlanEditInvalidError({
             deliveryId,
             problems: edit.problems.map((problem) => problem.description),
+            fields: edit.fields,
           });
         }
         return {

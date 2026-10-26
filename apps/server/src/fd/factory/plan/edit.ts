@@ -1,12 +1,23 @@
-import { FactoryPlan, type FactoryPlanTask } from "@t3tools/contracts/fd/factory";
+import {
+  FactoryPlan,
+  type FactoryPlanField,
+  type FactoryPlanTask,
+} from "@t3tools/contracts/fd/factory";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import { cappedProblems, type FactoryPlanProblem, planProblem, validatePlan } from "./validate.ts";
 
-/** An owner's edit the gate takes, or the problems that refuse it. */
+/**
+ * An owner's edit the gate takes, or the problems that refuse it with the parts of the recorded
+ * plan they are in, for the owner's client to show on its fields.
+ */
 export type FactoryPlanEditValidation =
-  | { readonly status: "invalid"; readonly problems: ReadonlyArray<FactoryPlanProblem> }
+  | {
+      readonly status: "invalid";
+      readonly problems: ReadonlyArray<FactoryPlanProblem>;
+      readonly fields: ReadonlyArray<FactoryPlanField>;
+    }
   | { readonly status: "valid"; readonly plan: FactoryPlan };
 
 /** The fields of a task that stay the planner's; an edit changes only the others. */
@@ -27,11 +38,42 @@ const listed = (parts: ReadonlyArray<string>) =>
 
 const decodePlan = Schema.decodeUnknownOption(FactoryPlan);
 
+const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * The parts of the recorded plan the problems are in, each once: the task at a problem's position
+ * in the edit, when it carries the id of a recorded task. A problem in a task the recorded plan
+ * does not have, or of the plan as a whole, names none.
+ */
+const problemFields = (
+  recorded: FactoryPlan,
+  edited: unknown,
+  problems: ReadonlyArray<FactoryPlanProblem>,
+): ReadonlyArray<FactoryPlanField> => {
+  const planned = new Map<string, FactoryPlanTask>(recorded.tasks.map((task) => [task.id, task]));
+  const tasks: ReadonlyArray<unknown> =
+    isRecord(edited) && Array.isArray(edited.tasks) ? edited.tasks : [];
+  const named = new Set<string>();
+  return problems.flatMap(({ at }): ReadonlyArray<FactoryPlanField> => {
+    if (at === undefined) return [];
+    const task = tasks[at.task];
+    const before = isRecord(task) && typeof task.id === "string" ? planned.get(task.id) : undefined;
+    if (before === undefined) return [];
+    const key = JSON.stringify([before.id, at.field ?? null]);
+    if (named.has(key)) return [];
+    named.add(key);
+    return [
+      at.field === undefined ? { taskId: before.id } : { taskId: before.id, field: at.field },
+    ];
+  });
+};
+
 /** What `edited` changes of `recorded` that an edit may not. */
 const editProblems = (recorded: FactoryPlan, edited: FactoryPlan): FactoryPlanProblem[] => {
   const problems: FactoryPlanProblem[] = [];
   const planned = new Map(recorded.tasks.map((task) => [task.id, task]));
-  for (const task of edited.tasks) {
+  for (const [position, task] of edited.tasks.entries()) {
     const before = planned.get(task.id);
     if (before === undefined) {
       problems.push(
@@ -48,6 +90,7 @@ const editProblems = (recorded: FactoryPlan, edited: FactoryPlan): FactoryPlanPr
         planProblem(
           "task_field_changed",
           `Task ${JSON.stringify(task.id)}: an edit cannot change its ${listed(changed.map(([, name]) => name))}.`,
+          { task: position },
         ),
       );
     }
@@ -65,7 +108,7 @@ const editProblems = (recorded: FactoryPlan, edited: FactoryPlan): FactoryPlanPr
  * criteria and test plans, the order of the tasks, and which of them stay. It keeps at least one
  * task, every task is one of the recorded plan's under its id, with its kind, likely paths and
  * risk, and the note stays the planner's. Every problem is reported together; a value that is not
- * a plan has only the validator's.
+ * a plan has only the validator's. The fields are those of the problems reported.
  */
 export const validatePlanEdit = (
   recorded: FactoryPlan,
@@ -89,7 +132,13 @@ export const validatePlanEdit = (
   if (Option.isSome(decoded)) problems.push(...editProblems(recorded, decoded.value));
   // The validator's decode, so the plan stored is the one it judged. A plan it did not pass has
   // a problem listed already.
-  return validation.status === "valid" && problems.length === 0
-    ? { status: "valid", plan: validation.plan }
-    : { status: "invalid", problems: cappedProblems(problems) };
+  if (validation.status === "valid" && problems.length === 0) {
+    return { status: "valid", plan: validation.plan };
+  }
+  const reported = cappedProblems(problems);
+  return {
+    status: "invalid",
+    problems: reported,
+    fields: problemFields(recorded, edited, reported),
+  };
 };

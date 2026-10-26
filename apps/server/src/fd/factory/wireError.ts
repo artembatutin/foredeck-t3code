@@ -93,6 +93,7 @@ export const toFactoryError = (error: FactoryServiceError): FactoryError => {
         message:
           "Factory cannot approve this plan: the parent's Work source cannot hold a task's child item as written, because it is longer than a Work item holds or its title or text holds characters the source's files cannot store. Factory does not cut or change a task's text. Edit the plan, then approve it.",
         deliveryId: error.deliveryId,
+        fields: error.taskIds.map((taskId) => ({ taskId })),
       });
     case "FactoryPlanEditInvalidError":
       return new FactoryError({
@@ -100,6 +101,8 @@ export const toFactoryError = (error: FactoryServiceError): FactoryError => {
         message:
           "Factory refused the edited plan. An edited plan follows the planner's rules: nonblank text within its bounds, and a test plan entry for every criterion. An edit can change task titles, summaries, acceptance criteria and test plans, reorder tasks and remove some; it cannot add tasks, empty the plan, or change task ids, kinds, likely paths, risk or the planner's note.",
         deliveryId: error.deliveryId,
+        // Where the problems are, never their descriptions: those quote the owner's text.
+        ...(error.fields.length === 0 ? {} : { fields: error.fields }),
       });
     case "FactoryReplanNoteInvalidError":
       return new FactoryError({
