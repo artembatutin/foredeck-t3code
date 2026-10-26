@@ -3,7 +3,7 @@ import {
   type FactoryPlanConfirmed,
   type FactoryPlanDecision,
   factoryPlanDecision,
-  factoryPlanDraft,
+  type FactoryPlanDraft,
   type FactoryPlanGate,
   factoryPlanGate,
   type FactoryPlanGateActions,
@@ -30,42 +30,41 @@ export interface MobilePlanGateInput {
   readonly connectionState: EnvironmentConnectionPhase | undefined;
   /** The project's deliveries; null until they load. */
   readonly deliveries: ReadonlyArray<FactoryDelivery> | null;
-  readonly permitted: Omit<FactoryPlanGatePermissions, "update">;
+  readonly permitted: FactoryPlanGatePermissions;
 }
 
 /**
  * The plan gate of the item's current delivery, or null; see the shared `factoryPlanGate`. Its
- * actions are offered only while the environment is connected. The plan shows read-only here, so
- * no edit is offered.
+ * actions, edits included, are offered only while the environment is connected.
  */
 export const mobilePlanGate = (input: MobilePlanGateInput): FactoryPlanGate | null =>
-  factoryPlanGate({
-    ...input,
-    connected: input.connectionState === "connected",
-    permitted: { ...input.permitted, update: false },
-  });
+  factoryPlanGate({ ...input, connected: input.connectionState === "connected" });
 
-/** The plan as the gate shows it: the server's, unedited, so approving approves what shows. */
-const shown = (gate: FactoryPlanGate) => factoryPlanDraft(gate.destination, gate.plan);
-
-/** Which of approve, reject and replan the gate offers now. */
-export const mobilePlanActions = (gate: FactoryPlanGate): FactoryPlanGateActions =>
-  factoryPlanGateActions(gate, shown(gate));
+/**
+ * Which of approve, reject and replan the gate offers now; approve only while `draft` shows the
+ * server's plan unedited, so the owner approves what they see.
+ */
+export const mobilePlanActions = (
+  gate: FactoryPlanGate,
+  draft: FactoryPlanDraft,
+): FactoryPlanGateActions => factoryPlanGateActions(gate, draft);
 
 /**
  * What confirming an approve or reject alert opened for `openedFor` sends, read when the owner
- * presses it: the decision for the gate's own delivery while that is still the delivery the alert
- * was opened for, its server still holds the plan the alert showed and the gate still offers the
- * decision. Otherwise null and nothing is sent. A native alert cannot close itself when the gate
+ * presses it with the gate and draft as they are then: the decision for the gate's own delivery
+ * while that is still the delivery the alert was opened for, its server still holds the plan the
+ * alert showed and the gate still offers the decision (approve only for an unedited draft of that
+ * plan). Otherwise null and nothing is sent. A native alert cannot close itself when the gate
  * changes, so the press checks.
  */
 export const mobilePlanDecisionTarget = (
   gate: FactoryPlanGate | null,
+  draft: FactoryPlanDraft,
   decision: FactoryPlanDecision,
   openedFor: FactoryPlanConfirmed,
 ): { readonly environmentId: EnvironmentId; readonly input: FactoryDeliveryRefInput } | null => {
   if (gate === null) return null;
-  const outcome = factoryPlanDecision(gate, shown(gate), decision, openedFor);
+  const outcome = factoryPlanDecision(gate, draft, decision, openedFor);
   return outcome._tag === "Send" ? outcome.request : null;
 };
 

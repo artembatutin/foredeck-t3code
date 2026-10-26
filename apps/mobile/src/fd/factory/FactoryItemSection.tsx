@@ -66,6 +66,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
     cancel: useAtomValue(factoryEnvironment.cancel.permissionAtom(environmentId)),
   };
   const planPermitted = {
+    update: useAtomValue(factoryEnvironment.updatePlan.permissionAtom(environmentId)),
     approve: useAtomValue(factoryEnvironment.approvePlan.permissionAtom(environmentId)),
     reject: useAtomValue(factoryEnvironment.rejectPlan.permissionAtom(environmentId)),
     replan: useAtomValue(factoryEnvironment.replan.permissionAtom(environmentId)),
@@ -199,7 +200,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
       ) : null}
       {error !== null ? <Text className="text-sm text-destructive">{error}</Text> : null}
       {gate !== null ? (
-        // A note belongs to one delivery; another delivery's plan starts afresh.
+        // A draft and a note belong to one delivery; another delivery's plan starts afresh.
         <FactoryPlanGate
           key={JSON.stringify([gate.destination.environmentId, gate.destination.deliveryId])}
           gate={gate}

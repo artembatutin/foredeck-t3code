@@ -1,4 +1,10 @@
-import { factoryPlanConfirmed } from "@t3tools/client-runtime/fd/factory";
+import {
+  factoryPlanConfirmed,
+  type FactoryPlanConfirmed,
+  type FactoryPlanDecision as Decision,
+  factoryPlanDraft,
+  type FactoryPlanGate,
+} from "@t3tools/client-runtime/fd/factory";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import {
   FACTORY_REPLAN_NOTE_MAX_LENGTH,
@@ -72,6 +78,14 @@ const delivery = (id: string, overrides: Partial<FactoryDelivery> = {}): Factory
 
 const ALL = { approve: true, reject: true, replan: true };
 const NOTHING = { approve: false, reject: false, replan: false };
+const GRANTED = { ...ALL, update: true };
+const NONE_GRANTED = { ...NOTHING, update: false };
+
+// The draft of the plan the gate holds, unedited.
+const shown = (gate: FactoryPlanGate) => factoryPlanDraft(gate.destination, gate.plan);
+const actionsOf = (gate: FactoryPlanGate) => mobilePlanActions(gate, shown(gate));
+const targetOf = (gate: FactoryPlanGate | null, ...rest: [Decision, FactoryPlanConfirmed]) =>
+  mobilePlanDecisionTarget(gate, gate === null ? shown(gateOf()!) : shown(gate), ...rest);
 
 const gateOf = (overrides: Partial<MobilePlanGateInput> = {}) =>
   mobilePlanGate({
@@ -80,7 +94,7 @@ const gateOf = (overrides: Partial<MobilePlanGateInput> = {}) =>
     planning: true,
     connectionState: "connected",
     deliveries: [delivery("d1")],
-    permitted: ALL,
+    permitted: GRANTED,
     ...overrides,
   });
 
@@ -88,8 +102,8 @@ describe("mobilePlanGate", () => {
   it("shows the plan of a delivery waiting at the gate, with every granted action offered", () => {
     const gate = gateOf();
     expect(gate).toMatchObject({ destination: { environmentId, deliveryId: D1 }, plan: PLAN });
-    expect(gate?.offered).toEqual({ update: false, approve: true, reject: true, replan: true });
-    expect(mobilePlanActions(gate!)).toEqual(ALL);
+    expect(gate?.offered).toEqual(GRANTED);
+    expect(actionsOf(gate!)).toEqual(ALL);
   });
 
   it.each(["reconnecting", "connecting", "offline", "error", undefined] as const)(
@@ -97,19 +111,19 @@ describe("mobilePlanGate", () => {
     (connectionState) => {
       const gate = gateOf({ connectionState });
       expect(gate?.plan).toBe(PLAN);
-      expect(mobilePlanActions(gate!)).toEqual(NOTHING);
+      expect(actionsOf(gate!)).toEqual(NOTHING);
     },
   );
 
   it("offers each action only with its grant, and nothing without any", () => {
-    expect(mobilePlanActions(gateOf({ permitted: { ...ALL, approve: false } })!)).toEqual({
+    expect(actionsOf(gateOf({ permitted: { ...GRANTED, approve: false } })!)).toEqual({
       approve: false,
       reject: true,
       replan: true,
     });
-    const gate = gateOf({ permitted: NOTHING });
+    const gate = gateOf({ permitted: NONE_GRANTED });
     expect(gate?.plan).toBe(PLAN);
-    expect(mobilePlanActions(gate!)).toEqual(NOTHING);
+    expect(actionsOf(gate!)).toEqual(NOTHING);
   });
 
   it("shows no gate on a server that does not advertise planning", () => {
@@ -155,7 +169,7 @@ describe("mobilePlanGate", () => {
       deliveries: [delivery("d1", { stage: { name: "approve_plan", kind: "unknown" } })],
     });
     expect(gate?.plan).toBe(PLAN);
-    expect(mobilePlanActions(gate!)).toEqual(NOTHING);
+    expect(actionsOf(gate!)).toEqual(NOTHING);
   });
 });
 
@@ -167,7 +181,7 @@ describe("mobilePlanDecisionTarget", () => {
     (decision) => {
       // Refetched since, as an equal plan the server still holds.
       const now = gateOf({ deliveries: [delivery("d1", { plan: decodePlan(PLAN) })] });
-      expect(mobilePlanDecisionTarget(now, decision, openedFor)).toEqual({
+      expect(targetOf(now, decision, openedFor)).toEqual({
         environmentId,
         input: { deliveryId: D1 },
       });
@@ -179,7 +193,7 @@ describe("mobilePlanDecisionTarget", () => {
     (decision) => {
       const replaced = gateOf({ deliveries: replacedBy() });
       expect(replaced?.destination.deliveryId).toBe(D2);
-      expect(mobilePlanDecisionTarget(replaced, decision, openedFor)).toBeNull();
+      expect(targetOf(replaced, decision, openedFor)).toBeNull();
     },
   );
 
@@ -187,35 +201,31 @@ describe("mobilePlanDecisionTarget", () => {
     "sends no %s once the server's plan changed under the alert",
     (decision) => {
       const changed = gateOf({ deliveries: [delivery("d1", { plan: EDITED })] });
-      expect(mobilePlanDecisionTarget(changed, decision, openedFor)).toBeNull();
+      expect(targetOf(changed, decision, openedFor)).toBeNull();
     },
   );
 
   it.each(["approve", "reject"] as const)(
     "sends no %s once the gate is gone or no longer offers it",
     (decision) => {
-      expect(mobilePlanDecisionTarget(null, decision, openedFor)).toBeNull();
+      expect(targetOf(null, decision, openedFor)).toBeNull();
       expect(
-        mobilePlanDecisionTarget(
+        targetOf(
           gateOf({ deliveries: [delivery("d1", { status: "cancelled" })] }),
           decision,
           openedFor,
         ),
       ).toBeNull();
-      expect(
-        mobilePlanDecisionTarget(gateOf({ connectionState: "reconnecting" }), decision, openedFor),
-      ).toBeNull();
-      expect(
-        mobilePlanDecisionTarget(gateOf({ permitted: NOTHING }), decision, openedFor),
-      ).toBeNull();
-      expect(mobilePlanDecisionTarget(gateOf({ planning: false }), decision, openedFor)).toBeNull();
+      expect(targetOf(gateOf({ connectionState: "reconnecting" }), decision, openedFor)).toBeNull();
+      expect(targetOf(gateOf({ permitted: NONE_GRANTED }), decision, openedFor)).toBeNull();
+      expect(targetOf(gateOf({ planning: false }), decision, openedFor)).toBeNull();
     },
   );
 
   it("sends a decision only it was opened for while its own grant holds", () => {
-    const rejectOnly = gateOf({ permitted: { ...NOTHING, reject: true } });
-    expect(mobilePlanDecisionTarget(rejectOnly, "approve", openedFor)).toBeNull();
-    expect(mobilePlanDecisionTarget(rejectOnly, "reject", openedFor)).not.toBeNull();
+    const rejectOnly = gateOf({ permitted: { ...NONE_GRANTED, reject: true } });
+    expect(targetOf(rejectOnly, "approve", openedFor)).toBeNull();
+    expect(targetOf(rejectOnly, "reject", openedFor)).not.toBeNull();
   });
 });
 
@@ -251,7 +261,7 @@ describe("mobileReplanRequest", () => {
       "Unavailable",
     );
     expect(
-      mobileReplanRequest(gateOf({ permitted: { ...ALL, replan: false } }), D1, note)._tag,
+      mobileReplanRequest(gateOf({ permitted: { ...GRANTED, replan: false } }), D1, note)._tag,
     ).toBe("Unavailable");
   });
 });
