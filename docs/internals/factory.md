@@ -367,9 +367,13 @@ is recorded as failed. Only a running delivery can stop; an approved one is alre
 stage it runs, and a stopping child approved at record has no stage left to stop before.
 
 Cancel ends a delivery whatever it awaits, and by owner decision interrupts what its agents are
-working on, through the thread's own interrupt. Every thread the delivery recorded is asked, not
+working on, through the thread's own interrupt. Every thread the delivery records is asked, not
 only the one whose run it awaits: a review blocked by its submissions awaits nothing while the
-reviewer's turn goes on. A launch or turn being started when the cancel lands reports a run the
+reviewer's turn goes on. So is every thread its stage attempts name that no role records any more:
+a resume after such a block in integrate launches a new reviewer, and the blocked one's turn may
+still run. A run on such a retired thread is interrupted only while it carries on a turn Factory
+sent, judged as for a [restart's continuation](#a-parent-runs-one-child-at-a-time): the owner may
+have taken the thread over. A launch or turn being started when the cancel lands reports a run the
 cancelled delivery never takes, so the worker interrupts that run as well
 ([`FactoryWorker.ts`](../../apps/server/src/fd/factory/FactoryWorker.ts)). The verify command and
 the PR action belong to the server and are not stopped; their results change nothing. The worktree,

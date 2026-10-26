@@ -83,6 +83,7 @@ const scriptedThreads = (world: World) =>
       threadState: () => Effect.die("no thread is recorded"),
       liveRun: () => Effect.die("live run read not scripted"),
       carriesFactoryTurn: () => Effect.die("factory turn read not scripted"),
+      liveRunsOn: () => Effect.die("live runs read not scripted"),
       launchedLiveRuns: Effect.die("live runs read not scripted"),
       runEnded: (_threadId, runId) =>
         Effect.sync(() =>

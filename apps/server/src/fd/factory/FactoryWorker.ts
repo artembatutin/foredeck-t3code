@@ -192,7 +192,7 @@ export class FactoryWorker extends Context.Service<
      * in between leaves that work to core's restart continuation, which carries it on in a new run
      * the cancelled delivery never takes. The owner's own turns on the thread are left alone. A
      * failure is logged, as a cancel's interrupt is. The reactor calls this as such a run goes
-     * live.
+     * live, and a cancel for the runs on the threads its delivery no longer records per role.
      */
     readonly stopCancelledRun: (run: {
       readonly threadId: ThreadId;
@@ -650,19 +650,51 @@ const make = Effect.gen(function* () {
     // that blocked on its submissions awaits nothing while the reviewer's turn goes on.
     if (next.delivery.status === "cancelled" && before.status !== "cancelled") {
       const awaited = before.awaiting?.type === "run" ? before.awaiting : undefined;
-      for (const threadId of new Set(Object.values(before.threads))) {
+      const recorded = new Set(Object.values(before.threads));
+      for (const threadId of recorded) {
         if (threadId === undefined) continue;
         yield* interruptCancelled(
           stored,
           threadId === awaited?.threadId ? { threadId, runId: awaited.runId } : { threadId },
         );
       }
+      yield* stopRetiredRuns(deliveryId, recorded);
       // A parent's children go with it, the one it waits for and those it never started, and
       // stop what their threads run; an approved child keeps its approval.
       for (const childId of before.children) yield* cancelChild(childId);
     }
     return Option.some(stored);
   });
+
+  /**
+   * Stops what a cancelled delivery's retired threads still run: those its stage attempts name
+   * and no role records any more, such as the integrate reviewer a resume replaced while the turn
+   * its invalid submissions blocked went on. Each live run there is stopped as
+   * `stopCancelledRun` stops one, so only while it carries on a turn Factory sent: the owner may
+   * have taken the thread over since. A failure is logged, as a cancel's interrupt is.
+   */
+  const stopRetiredRuns = (
+    deliveryId: FactoryDeliveryId,
+    recorded: ReadonlySet<ThreadId | undefined>,
+  ) =>
+    Effect.gen(function* () {
+      const retired = new Set<ThreadId>();
+      for (const { threadId } of yield* stageRuns.listByDelivery(deliveryId)) {
+        if (threadId !== null && !recorded.has(threadId)) retired.add(threadId);
+      }
+      if (retired.size === 0) return;
+      const runs = yield* Effect.suspend(() => threads.liveRunsOn([...retired]));
+      yield* Effect.forEach(runs, stopCancelledRun, { discard: true });
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning(
+              "factory could not read a cancelled delivery's retired threads",
+              cause,
+            ),
+      ),
+    );
 
   /** Cancels a cancelled parent's child, under the child's lock, unless it was approved. */
   // Annotated: it closes the cycle `stepLocked` → `cancelChild`.

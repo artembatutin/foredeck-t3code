@@ -258,8 +258,18 @@ export class FactoryThreadEffects extends Context.Service<
       runId: RunId,
     ) => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
     /**
-     * The run each thread a Factory launch made is live in now, among the threads core recovery
-     * keeps track of (any with an unfinished run).
+     * The run each of the threads is live in now, archived or not; a thread running nothing, or
+     * deleted, has none.
+     */
+    readonly liveRunsOn: (
+      threadIds: ReadonlyArray<ThreadId>,
+    ) => Effect.Effect<
+      ReadonlyArray<{ readonly threadId: ThreadId; readonly runId: RunId }>,
+      ProjectionStore.ProjectionStoreV2Error
+    >;
+    /**
+     * `liveRunsOn` every thread a Factory launch made, among the threads core recovery keeps
+     * track of (any with an unfinished run).
      */
     readonly launchedLiveRuns: Effect.Effect<
       ReadonlyArray<{ readonly threadId: ThreadId; readonly runId: RunId }>,
@@ -702,6 +712,19 @@ const make = Effect.gen(function* () {
       });
     }).pipe(Effect.provideContext(intakeContext));
 
+  const liveRunsOn: FactoryThreadEffects["Service"]["liveRunsOn"] = (threadIds) =>
+    Effect.forEach(threadIds, (threadId) =>
+      projections
+        .getThreadShell(threadId)
+        .pipe(
+          Effect.map((shell) =>
+            shell === null || shell.deletedAt !== null || shell.activeRunId === null
+              ? []
+              : [{ threadId, runId: shell.activeRunId }],
+          ),
+        ),
+    ).pipe(Effect.map((runs) => runs.flat()));
+
   return FactoryThreadEffects.of({
     launchThread,
     sendFixCommitTurn: (delivery, effect) =>
@@ -792,24 +815,14 @@ const make = Effect.gen(function* () {
           return false;
         }),
       ),
-    launchedLiveRuns: projections.getRecoveryThreadIds("runtime").pipe(
-      Effect.flatMap((threadIds) =>
-        Effect.forEach(
-          threadIds.filter((threadId) => launchDeliveryId(threadId) !== undefined),
-          (threadId) =>
-            projections
-              .getThreadShell(threadId)
-              .pipe(
-                Effect.map((shell) =>
-                  shell === null || shell.deletedAt !== null || shell.activeRunId === null
-                    ? []
-                    : [{ threadId, runId: shell.activeRunId }],
-                ),
-              ),
+    liveRunsOn,
+    launchedLiveRuns: projections
+      .getRecoveryThreadIds("runtime")
+      .pipe(
+        Effect.flatMap((threadIds) =>
+          liveRunsOn(threadIds.filter((threadId) => launchDeliveryId(threadId) !== undefined)),
         ),
       ),
-      Effect.map((runs) => runs.flat()),
-    ),
     runEnded: (threadId, runId) =>
       readThreadRun(threadId, runId).pipe(
         Effect.map(({ status }) =>
