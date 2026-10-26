@@ -21,8 +21,8 @@ import { openParent } from "./testkit/followThrough.ts";
  * A parent's resume once its pull request is linked to its last child's author thread, on the
  * server's real stack: the resume reads the parent's branch as it reads an author's, so a
  * follow-through round's commits are settled before the branch is verified and integrated again.
- * The PR stage does not report the thread yet, so each test records it as that stage would, with
- * a follow-through round's run that failed, and resumes from there.
+ * Each test stores the parent its PR stage left, blocked on a follow-through round's run there
+ * that failed, and resumes from there.
  */
 
 const service = Factory.FactoryService.FactoryService;
@@ -34,10 +34,11 @@ const blockedRound = (world: World) =>
     const parent = yield* openParent(world);
     const [, last] = parent.children;
     if (last === undefined) return assert.fail("The parent has no last child.");
+    // The PR stage recorded the thread it linked the pull request to.
+    assert.strictEqual(parent.state.pullRequestThread, last.author);
     const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
     yield* store.update(parent.deliveryId, {
       ...parent.state,
-      pullRequestThread: last.author,
       status: "blocked",
       stage: "follow_through",
       block: { reason: "run_ended", threadId: last.author, runId: wakeRun, runStatus: "failed" },

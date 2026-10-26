@@ -49,7 +49,7 @@ import { readWorktreeState } from "./git/worktreeState.ts";
 import type { FactoryStoreError } from "./persistence/errors.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
-import { acceptedReview, receiptFailed } from "./pipeline/state.ts";
+import { acceptedReview, followedThread, receiptFailed } from "./pipeline/state.ts";
 import type {
   FactoryDeliveryState,
   FactoryEffect,
@@ -151,8 +151,8 @@ export class FactoryPullRequestNotOpenedError extends Schema.TaggedError<Factory
 }
 
 /**
- * Factory cannot tell which repository the delivery's pull request belongs to, from its URL or its
- * author thread's project, so it cannot watch it there.
+ * Factory cannot tell which repository the delivery's pull request belongs to, from its URL or the
+ * project of the thread it is linked to, so it cannot watch it there.
  */
 export class FactoryPullRequestUnwatchableError extends Schema.TaggedError<FactoryPullRequestUnwatchableError>()(
   "FactoryPullRequestUnwatchableError",
@@ -206,6 +206,16 @@ export type FactoryPullRequestError =
   | GitManagerServiceError;
 
 /**
+ * What the PR stage published: the delivery's pull request and the thread it is linked to, where
+ * core's watch wakes with its feedback. A parent has no author thread, so its pull request is
+ * linked to its last child's author thread.
+ */
+interface FactoryPublishedPullRequest {
+  readonly pullRequest: FactoryOpenedPullRequest;
+  readonly threadId: ThreadId;
+}
+
+/**
  * The PR stages' work. Opens the delivery's pull request from its worktree through the stacked
  * Git action (`create_pr`) with the item's title and a body listing the accepted task and its
  * evidence, then links it to the author thread. A parent's is its one pull request: its body lists
@@ -216,7 +226,7 @@ export type FactoryPullRequestError =
  * that exact commit, so a commit made meanwhile never reaches the remote. An open pull request for
  * the branch is reported as it is, unchanged. A delivery that recorded its pull request already,
  * in a follow-through round, only pushes its newly approved commit to that pull request's branch.
- * A single item's pull request is then watched on its author thread, so its feedback wakes that
+ * The pull request is then watched on the thread it is linked to, so its feedback wakes that
  * thread. Once someone merged it, closes the delivery out.
  */
 export class FactoryPullRequest extends Context.Service<
@@ -225,10 +235,11 @@ export class FactoryPullRequest extends Context.Service<
     readonly open: (
       delivery: FactoryDeliveryStore.StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "open_pr" }>,
-    ) => Effect.Effect<FactoryOpenedPullRequest, FactoryPullRequestError>;
+    ) => Effect.Effect<FactoryPublishedPullRequest, FactoryPullRequestError>;
     /**
-     * Has core watch a single item's pull request on its author thread, and reports what that
-     * left (see `FactoryWatchState`) with the wakes core committed there since the delivery's
+     * Has core watch the pull request on `threadId`, the thread `open` linked it to (a single
+     * item's author thread, a parent's last child's author thread), and reports what that left
+     * (see `FactoryWatchState`) with the wakes core committed there since the delivery's
      * first watch command, in order, which the worker steps after the result. It first reads the
      * pull request's watch, then those wakes, and starts a watch only when none is on and no end
      * core committed is among wakes the delivery has not taken: core can end only a watch that
@@ -237,12 +248,13 @@ export class FactoryPullRequest extends Context.Service<
      * derives from the delivery and the effect, so an effect carried out again starts no second
      * watch. Which watch is Factory's is read from its watch commands' own records and the watch
      * the delivery already holds (see `isFactorys`), so a result that was never stored loses
-     * nothing. None for a parent, whose feedback is not followed through yet.
+     * nothing. None for a child, which opens no pull request.
      */
     readonly watch: (
       delivery: FactoryDeliveryStore.StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "open_pr" }>,
       pullRequest: FactoryOpenedPullRequest,
+      threadId: ThreadId,
     ) => Effect.Effect<
       Option.Option<{
         readonly watch: FactoryWatchState;
@@ -256,8 +268,9 @@ export class FactoryPullRequest extends Context.Service<
      * the owner started meanwhile stays. Reports that watch (the one on, else the latest Factory
      * started) and its pull request, where it ended (by this or before), where the delivery's first
      * watch command was, and the wakes core committed since, which the worker steps so the
-     * cancelled delivery stops what its watch set off. None when Factory started or holds no watch. Fails only when the
-     * watch is still on and could not be ended.
+     * cancelled delivery stops what its watch set off. Read on the thread the delivery records its
+     * pull request linked to (see `followedThread`). None when Factory started or holds no watch
+     * there. Fails only when the watch is still on and could not be ended.
      */
     readonly release: (delivery: FactoryDeliveryStore.StoredFactoryDelivery) => Effect.Effect<
       Option.Option<{
@@ -556,7 +569,14 @@ const make = Effect.gen(function* () {
           { actionId },
         );
         yield* requirePublished(deliveryId, basis);
-        return { number: recorded.number, url: recorded.url, headBranch: recorded.headBranch };
+        return {
+          pullRequest: {
+            number: recorded.number,
+            url: recorded.url,
+            headBranch: recorded.headBranch,
+          },
+          threadId: basis.author,
+        };
       }
 
       const item = yield* work.getItem(reader, { ref: delivery.itemRef });
@@ -621,7 +641,7 @@ const make = Effect.gen(function* () {
       // The action published the approved commit; read back, so a pull request on any other
       // commit is never recorded as the delivery's.
       yield* requirePublished(deliveryId, basis);
-      return opened;
+      return { pullRequest: opened, threadId: basis.author };
     },
   );
 
@@ -692,22 +712,25 @@ const make = Effect.gen(function* () {
     });
 
   /**
-   * The delivery's own watch commands on its author thread, read from their records so a command
-   * whose result was never stored still counts: where each committed, oldest first, and the
-   * watches they started, each with the link it is on (see `watchStartedBy`). Their ids derive
-   * from the delivery and an effect, so every effect the delivery issued is looked up. A watch
-   * starts only in a `thread.pull-request-synced` event, so the thread's events of that type
-   * through the last command tell a watch a command started from one it kept. A command whose
-   * event the log no longer holds proves nothing, and counts as starting none.
+   * The delivery's own watch commands on the thread, read from their records so a command whose
+   * result was never stored still counts: where each committed, oldest first, and the watches
+   * they started, each with the link it is on (see `watchStartedBy`). Their ids derive from the
+   * delivery and an effect, so every effect the delivery issued is looked up. A watch starts only
+   * in a `thread.pull-request-synced` event, so the thread's events of that type through the last
+   * command tell a watch a command started from one it kept. A command whose event the log no
+   * longer holds proves nothing, and counts as starting none.
    */
-  const watchCommands = (delivery: FactoryDeliveryStore.StoredFactoryDelivery, author: ThreadId) =>
+  const watchCommands = (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+    threadId: ThreadId,
+  ) =>
     Effect.gen(function* () {
       const positions: Array<number> = [];
       for (let effectId = 1; effectId <= delivery.state.effectsIssued; effectId += 1) {
         const receipt = Option.getOrUndefined(
           yield* receipts.getByCommandId(watchCommandId(delivery.deliveryId, effectId)),
         );
-        if (receipt?.status === "accepted" && receipt.threadId === author) {
+        if (receipt?.status === "accepted" && receipt.threadId === threadId) {
           positions.push(receipt.resultSequence);
         }
       }
@@ -717,7 +740,7 @@ const make = Effect.gen(function* () {
       const synced = Array.from(
         yield* events
           .read({
-            threadId: author,
+            threadId,
             throughSequence: last,
             eventType: "thread.pull-request-synced",
           })
@@ -739,20 +762,19 @@ const make = Effect.gen(function* () {
     });
 
   const watch: FactoryPullRequest["Service"]["watch"] = Effect.fn("FactoryPullRequest.watch")(
-    function* (delivery, effect, pullRequest) {
+    function* (delivery, effect, pullRequest, threadId) {
       const { deliveryId, state } = delivery;
-      const { author } = state.threads;
-      if (state.kind !== "single" || author === undefined) return Option.none();
-      const key = yield* pullRequestKey(author, pullRequest);
+      if (state.kind === "child") return Option.none();
+      const key = yield* pullRequestKey(threadId, pullRequest);
       if (key === null) return yield* new FactoryPullRequestUnwatchableError({ deliveryId });
       const { followThrough } = state;
       // The watch on the pull request first: core can only end one that is on.
-      const current = (yield* linkOf(author, pullRequest))?.watch?.startedAt ?? null;
-      const commands = yield* watchCommands(delivery, author);
+      const current = (yield* linkOf(threadId, pullRequest))?.watch?.startedAt ?? null;
+      const commands = yield* watchCommands(delivery, threadId);
       const from = followThrough?.watchedAfter ?? commands.positions[0];
-      const latest = yield* events.latestSequence({ threadId: author });
+      const latest = yield* events.latestSequence({ threadId });
       const wakes =
-        from === undefined ? [] : yield* wakesIn(yield* threadEvents(author, from), pullRequest);
+        from === undefined ? [] : yield* wakesIn(yield* threadEvents(threadId, from), pullRequest);
       const taken = followThrough?.runs ?? [];
       const ended =
         followThrough?.watchEnded === true ||
@@ -772,12 +794,12 @@ const make = Effect.gen(function* () {
       const armed = yield* orchestrator.dispatch({
         type: "thread.pull-request.watch",
         commandId: watchCommandId(deliveryId, effect.id),
-        threadId: author,
+        threadId,
         ...identity,
         watching: true,
         link: { url, source: "created" },
       });
-      const now = (yield* linkOf(author, pullRequest))?.watch?.startedAt ?? null;
+      const now = (yield* linkOf(threadId, pullRequest))?.watch?.startedAt ?? null;
       return Option.some({
         watch: {
           firstAt: from ?? armed.sequence,
@@ -785,7 +807,7 @@ const make = Effect.gen(function* () {
           armed: true,
           held: isFactorys(
             state,
-            (yield* watchCommands(delivery, author)).started,
+            (yield* watchCommands(delivery, threadId)).started,
             pullRequest,
             now,
           )
@@ -833,10 +855,10 @@ const make = Effect.gen(function* () {
   const release: FactoryPullRequest["Service"]["release"] = Effect.fn("FactoryPullRequest.release")(
     function* (delivery) {
       const { state } = delivery;
-      const { author } = state.threads;
-      if (state.kind !== "single" || author === undefined) return Option.none();
+      const threadId = followedThread(state);
+      if (threadId === undefined) return Option.none();
       const { followThrough } = state;
-      const { positions, started } = yield* watchCommands(delivery, author);
+      const { positions, started } = yield* watchCommands(delivery, threadId);
       const latest = started.at(-1);
       const held = followThrough?.watchStartedAt ?? null;
       // The pull request Factory's latest watch command started a watch on, else the one recorded.
@@ -844,7 +866,7 @@ const make = Effect.gen(function* () {
       const first = followThrough?.watchedAfter ?? positions[0];
       if (recorded === null || recorded === undefined || first === undefined) return Option.none();
       const pullRequest = { number: recorded.number, url: recorded.url };
-      const link = yield* linkOf(author, pullRequest);
+      const link = yield* linkOf(threadId, pullRequest);
       const current = link?.watch?.startedAt ?? null;
       // A link has one watch: Factory's while it is on, else the latest one Factory started.
       const startedAt = isFactorys(state, started, pullRequest, current)
@@ -854,11 +876,11 @@ const make = Effect.gen(function* () {
       const ended =
         (held === startedAt ? (followThrough?.heldUntil ?? null) : null) ??
         (link !== undefined && current === startedAt
-          ? yield* endWatchStartedAt(author, link, startedAt)
+          ? yield* endWatchStartedAt(threadId, link, startedAt)
           : null);
       // Read after the end, so the log holds it: every wake core committed since the delivery's
       // first watch command, and where that watch stopped being the pull request's.
-      const read = yield* threadEvents(author, first);
+      const read = yield* threadEvents(threadId, first);
       const startedHere = latest?.startedAt === startedAt ? latest.at : undefined;
       const at =
         ended ??
@@ -886,12 +908,12 @@ const make = Effect.gen(function* () {
    */
   const endMergedWatch = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
     Effect.gen(function* () {
-      const { author } = delivery.state.threads;
+      const threadId = followedThread(delivery.state);
       const { pullRequest, followThrough } = delivery.state;
-      if (followThrough === undefined || author === undefined || pullRequest === null) return;
-      const link = yield* linkOf(author, pullRequest);
+      if (followThrough === undefined || threadId === undefined || pullRequest === null) return;
+      const link = yield* linkOf(threadId, pullRequest);
       if (link?.watch === undefined) return;
-      yield* endWatchStartedAt(author, link, link.watch.startedAt);
+      yield* endWatchStartedAt(threadId, link, link.watch.startedAt);
     }).pipe(
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause)

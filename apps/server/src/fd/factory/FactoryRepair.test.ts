@@ -230,7 +230,10 @@ const fakes = (world: World) =>
 /** Pull requests are opened in FactoryPullRequest.test.ts; here an approved delivery's opens. */
 const openedPullRequest = Layer.mock(FactoryPullRequest.FactoryPullRequest)({
   open: () =>
-    Effect.succeed({ number: 7, url: "https://github.com/acme/alpha/pull/7", headBranch: branch }),
+    Effect.succeed({
+      pullRequest: { number: 7, url: "https://github.com/acme/alpha/pull/7", headBranch: branch },
+      threadId: author,
+    }),
   // Follow-through rounds are FactoryFollowThrough.test.ts's; nothing here watches the pull request.
   watch: () => Effect.succeedNone,
 });

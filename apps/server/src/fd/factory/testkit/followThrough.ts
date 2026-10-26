@@ -189,10 +189,11 @@ const twoTaskPlan = {
 };
 
 /**
- * A parent of two children run to its open pull request, which is linked to its last child's
- * author thread. Returns each child's delivery, item and author thread, in plan order.
+ * A parent of two children whose integrate reviewer passed its branch, with that reviewer's run
+ * still going: its end records the approval and runs the PR stage. Returns each child's delivery,
+ * item and author thread, in plan order, and the integrate run.
  */
-export const openParent = (world: World) =>
+export const integratedParent = (world: World) =>
   Effect.gen(function* () {
     const factory = yield* service;
     const planner = yield* world.startWith({ kind: "parent" });
@@ -216,10 +217,25 @@ export const openParent = (world: World) =>
     }
     const integrate = yield* awaitedRun(planner.deliveryId);
     yield* factory.submitReview({ threadId: integrate.threadId, review: passingReview(2) });
+    return {
+      deliveryId: planner.deliveryId,
+      worktreePath: planner.worktreePath,
+      children,
+      integrate,
+    };
+  }).pipe(Effect.orDie);
+
+/**
+ * A parent of two children run to its open pull request, which is linked to its last child's
+ * author thread. Returns each child's delivery, item and author thread, in plan order.
+ */
+export const openParent = (world: World) =>
+  Effect.gen(function* () {
+    const { integrate, ...parent } = yield* integratedParent(world);
     yield* world.endRun(integrate.runId, "completed");
-    const state = yield* stateOf(planner.deliveryId);
+    const state = yield* stateOf(parent.deliveryId);
     assert.strictEqual(state.status, "pr_open");
-    return { deliveryId: planner.deliveryId, worktreePath: planner.worktreePath, children, state };
+    return { ...parent, state };
   }).pipe(Effect.orDie);
 
 /** The thread's link to pull request `number` (at `url`, when given), as the projection has it. */

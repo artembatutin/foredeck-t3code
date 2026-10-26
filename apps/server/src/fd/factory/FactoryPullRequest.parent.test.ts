@@ -624,16 +624,28 @@ describe("a parent's pull request", () => {
         );
         assert.notMatch(input?.prTitle ?? "", FORBIDDEN);
         assert.notMatch(input?.prBody ?? "", FORBIDDEN);
+        // Then watched there, by the watch command its PR effect derives.
+        const lastAuthor = childAuthors[1] ?? assert.fail("No author.");
         assert.deepStrictEqual(world.dispatched, [
           {
             type: "thread.pull-request.link",
             commandId: CommandId.make(`factory-pr-link:${parentId}:8`),
-            threadId: childAuthors[1] ?? assert.fail("No author."),
+            threadId: lastAuthor,
             host: "github.com",
             repository: "acme/alpha",
             number: 7,
             url: prUrl,
             source: "created",
+          },
+          {
+            type: "thread.pull-request.watch",
+            commandId: CommandId.make(`factory-pr-watch:${parentId}:8`),
+            threadId: lastAuthor,
+            host: "github.com",
+            repository: "acme/alpha",
+            number: 7,
+            watching: true,
+            link: { url: prUrl, source: "created" },
           },
         ]);
         assert.strictEqual(yield* publishedOf(cwd), approval.headSha);
@@ -644,6 +656,7 @@ describe("a parent's pull request", () => {
         assert.strictEqual(state.stage, "pr");
         assert.isNull(state.block);
         assert.deepStrictEqual(state.pullRequest, { number: 7, url: prUrl, headBranch: branch });
+        assert.strictEqual(state.pullRequestThread, lastAuthor);
         for (const childId of children) {
           const child = yield* stateOf(childId);
           assert.strictEqual(child.status, "approved");

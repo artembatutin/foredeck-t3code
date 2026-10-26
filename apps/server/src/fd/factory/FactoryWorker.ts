@@ -42,6 +42,7 @@ import {
   acceptedPlan,
   acceptedReview,
   adoptedRuns,
+  followedThread,
   isProceeding,
   isTerminal,
   isTurnEffect,
@@ -151,8 +152,9 @@ export class FactoryWorker extends Context.Service<
     /**
      * Steps the deliveries the event's thread belongs to. A run's end goes to the delivery whose
      * active stage attempt names the thread; a deletion goes to every active delivery that records
-     * the thread, since a delivery keeps its threads after their attempts finish. A delivery whose
-     * launch or turn result naming the thread is being stored gets either.
+     * the thread, since a delivery keeps its threads after their attempts finish, or follows its
+     * pull request there (a parent, on its last child's author thread). A delivery whose launch or
+     * turn result naming the thread is being stored gets either.
      */
     readonly stepThread: (event: FactoryThreadEvent) => Effect.Effect<void, FactoryStoreError>;
     /**
@@ -514,10 +516,11 @@ const make = Effect.gen(function* () {
         );
       case "open_pr":
         return pullRequests.open(delivery, effect).pipe(
-          Effect.map((pullRequest): FactoryEvent => ({
+          Effect.map(({ pullRequest, threadId }): FactoryEvent => ({
             type: "pr.opened",
             effectId: effect.id,
             pullRequest,
+            pullRequestThread: threadId,
           })),
         );
       case "close_out":
@@ -1081,17 +1084,19 @@ const make = Effect.gen(function* () {
   };
 
   /**
-   * Feeds back an opened pull request: has its watch started (see `FactoryPullRequest.watch`),
-   * then stores the result with what that left, and then each wake core committed since the
-   * delivery's first watch command, all under the delivery's lock and only while the delivery
-   * still awaits this effect. A wake committed later steps the delivery only once the pull request
-   * is stored, so none falls in between, and one committed before is taken here, the end of a
-   * watch included. A watch core ended is not started again here. A watch that cannot start is
-   * reported with the pull request, which is published either way and is recorded.
+   * Feeds back an opened pull request: has its watch started on the thread it is linked to (see
+   * `FactoryPullRequest.watch`), then stores the result with what that left, and then each wake
+   * core committed since the delivery's first watch command, all under the delivery's lock and
+   * only while the delivery still awaits this effect. A wake committed later steps the delivery
+   * only once the pull request is stored, so none falls in between, and one committed before is
+   * taken here, the end of a watch included. A watch core ended is not started again here. A
+   * watch that cannot start is reported with the pull request, which is published either way and
+   * is recorded.
    */
   const openedPullRequest = (job: Job, event: Extract<FactoryEvent, { type: "pr.opened" }>) => {
     const { deliveryId } = job.delivery;
     const { effect } = job;
+    const { pullRequest, pullRequestThread } = event;
     return locks.withLock(
       deliveryId,
       Effect.gen(function* () {
@@ -1106,14 +1111,16 @@ const make = Effect.gen(function* () {
           // Stale: the engine takes nothing of it.
           return yield* stepLocked(deliveryId, event);
         }
+        // `open` always names the thread it linked the pull request to.
+        if (pullRequestThread === undefined) return yield* stepLocked(deliveryId, event);
         const watched = yield* Effect.exit(
-          Effect.suspend(() => pullRequests.watch(current, effect, event.pullRequest)),
+          Effect.suspend(() => pullRequests.watch(current, effect, pullRequest, pullRequestThread)),
         );
         if (Exit.isFailure(watched)) {
           if (Cause.hasInterruptsOnly(watched.cause)) return yield* Effect.interrupt;
           return yield* stepLocked(deliveryId, {
             ...event,
-            watchFailure: watchFailureDetail(event.pullRequest.number, watched.cause),
+            watchFailure: watchFailureDetail(pullRequest.number, watched.cause),
           });
         }
         if (Option.isNone(watched.value)) return yield* stepLocked(deliveryId, event);
@@ -1206,7 +1213,11 @@ const make = Effect.gen(function* () {
         return Option.toArray(Option.map(attempt, (run) => run.deliveryId));
       }
       return (yield* deliveries.listActive())
-        .filter(({ state }) => Object.values(state.threads).includes(event.threadId))
+        .filter(
+          ({ state }) =>
+            Object.values(state.threads).includes(event.threadId) ||
+            followedThread(state) === event.threadId,
+        )
         .map((delivery) => delivery.deliveryId);
     });
 

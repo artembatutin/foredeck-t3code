@@ -37,7 +37,8 @@ import {
  * A pull request link that core's sync stored merged or closed on the thread a delivery's open
  * pull request is linked to becomes `pr.merged` or `pr.closed` for that delivery; nothing polls.
  * A run that core's pull request watch queued as a wake on a thread a Factory launch made becomes
- * `pr.feedback` for that delivery, which the engine adopts as a follow-through round or not.
+ * `pr.feedback` for the delivery whose pull request it may be (see `takeWake`), which the engine
+ * adopts as a follow-through round or not.
  * A boot sweep catches up the deliveries that awaited something when the previous server stopped,
  * the pull requests that merged or closed meanwhile and the wakes queued for open ones, and posts
  * the Work comments it recorded and never finished. The tail starts at the event log position
@@ -166,16 +167,22 @@ const make = Effect.gen(function* () {
     });
 
   /**
-   * Steps the delivery whose launch made the run's thread with the wake the run starts, if it
-   * starts one. Stepped whatever the delivery's state as read here: the engine judges it under
-   * the delivery's lock, which the store of its pull request holds while its watch starts.
+   * Steps the delivery whose pull request may be linked to the run's thread with the wake the run
+   * starts, if it starts one. The thread's id names the delivery whose launch made it, which for a
+   * child is the wrong one: a child opens no pull request, and its parent's is linked to its last
+   * child's author thread, so the wake goes to the parent and the approved child is left alone.
+   * The engine takes it only on the thread the delivery follows. Stepped whatever the delivery's
+   * state as read here: the engine judges it under the delivery's lock, which the PR stage holds
+   * from starting the watch until it has stored the pull request and the thread it is linked to.
    */
   const takeWake = (run: RunCreated) =>
     Effect.gen(function* () {
-      const deliveryId = launchDeliveryId(run.threadId);
-      if (deliveryId === undefined) return;
+      const launchedBy = launchDeliveryId(run.threadId);
+      if (launchedBy === undefined) return;
       const wake = yield* wakeOfRun(run);
-      if (wake !== undefined) yield* worker.step(deliveryId, wake);
+      if (wake === undefined) return;
+      const launcher = Option.getOrUndefined(yield* deliveries.get(launchedBy));
+      yield* worker.step(launcher?.parentId ?? launchedBy, wake);
     });
 
   /**
