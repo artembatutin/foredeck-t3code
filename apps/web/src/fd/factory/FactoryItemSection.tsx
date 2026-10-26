@@ -29,7 +29,7 @@ import {
   factoryItemSection,
   type FactoryReviewLine,
 } from "./itemSection";
-import { factoryPlanGate } from "./planGate";
+import { factoryItemPlanGate } from "./planGate";
 import { factoryEnvironment } from "./state";
 
 interface FactoryItemSectionProps {
@@ -125,7 +125,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
     environmentId,
     itemRef: item.ref,
   });
-  const gate = factoryPlanGate({
+  const gate = factoryItemPlanGate({
     environmentId,
     itemRef: item.ref,
     ...destination,

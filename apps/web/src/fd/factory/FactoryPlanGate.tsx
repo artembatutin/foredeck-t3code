@@ -5,15 +5,29 @@ import {
   editFactoryPlanCriterion,
   editFactoryPlanTask,
   editFactoryTestPlanEntry,
+  type FactoryPlanConfirmed,
+  factoryPlanConfirmed,
+  type FactoryPlanDecision,
+  factoryPlanDecision,
   factoryPlanDraft,
   type FactoryPlanDraft,
+  factoryPlanDraftState,
+  type FactoryPlanGate as FactoryPlanGateModel,
+  factoryPlanGateActions,
+  type FactoryPlanRefusal,
+  factoryPlanRefusal,
+  factoryPlanSave,
   type FactoryPlanTaskDraft,
+  factoryPlanTaskErrors,
   type FactoryPlanTaskErrors,
+  factoryReplanRequest,
+  followFactoryPlan,
   moveFactoryPlanTask,
   reapplyFactoryPlanEdits,
   removeFactoryPlanCriterion,
   removeFactoryPlanTask,
   removeFactoryTestPlanEntry,
+  settleFactoryPlanSave,
 } from "@t3tools/client-runtime/fd/factory";
 import type { FactoryTaskId } from "@t3tools/contracts/fd/factory";
 import { ArrowDownIcon, ArrowUpIcon, XIcon } from "lucide-react";
@@ -33,22 +47,7 @@ import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { useAtomCommand } from "../../state/use-atom-command";
-import {
-  type FactoryPlanConfirmed,
-  factoryPlanConfirmed,
-  type FactoryPlanDecision,
-  factoryPlanDecision,
-  factoryPlanDraftState,
-  type FactoryPlanGate as FactoryPlanGateModel,
-  factoryPlanGateActions,
-  type FactoryPlanRefusal,
-  factoryPlanRefusal,
-  factoryPlanSave,
-  factoryPlanTaskErrors,
-  factoryReplanRequest,
-  followFactoryPlan,
-  settleFactoryPlanSave,
-} from "./planGate";
+import { factoryErrorText } from "./deliver";
 import { factoryEnvironment } from "./state";
 
 type Pending = "save" | FactoryPlanDecision | "replan";
@@ -121,7 +120,8 @@ export function FactoryPlanGate({
     setRefusal(null);
     const result = await updatePlan(save.request);
     setPending(null);
-    if (result._tag === "Failure") setRefusal(factoryPlanRefusal(result.cause));
+    if (result._tag === "Failure")
+      setRefusal(factoryPlanRefusal(result.cause, factoryErrorText(result.cause)));
     else {
       setHeld((current) => ({
         ...current,
@@ -137,7 +137,8 @@ export function FactoryPlanGate({
     setRefusal(null);
     const result = await (decision === "approve" ? approvePlan : rejectPlan)(outcome.request);
     setPending(null);
-    if (result._tag === "Failure") setRefusal(factoryPlanRefusal(result.cause));
+    if (result._tag === "Failure")
+      setRefusal(factoryPlanRefusal(result.cause, factoryErrorText(result.cause)));
   };
   const ask = (decision: FactoryPlanDecision) => {
     if (factoryPlanDecision(gate, draft, decision, null)._tag === "Confirm") {
@@ -150,7 +151,8 @@ export function FactoryPlanGate({
     setRefusal(null);
     const result = await replan(replanning.request);
     setPending(null);
-    if (result._tag === "Failure") setRefusal(factoryPlanRefusal(result.cause));
+    if (result._tag === "Failure")
+      setRefusal(factoryPlanRefusal(result.cause, factoryErrorText(result.cause)));
     else setNote(null);
   };
 

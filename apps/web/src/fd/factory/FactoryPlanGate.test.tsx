@@ -102,7 +102,7 @@ vi.mock("../../components/ui/alert-dialog", () => {
   };
 });
 
-import { FACTORY_PLAN_FIELD_REFUSED } from "./planGate";
+import { FACTORY_PLAN_FIELD_REFUSED } from "@t3tools/client-runtime/fd/factory";
 import { FactoryItemSection } from "./FactoryItemSection";
 
 const environmentId = EnvironmentId.make("env-1");
