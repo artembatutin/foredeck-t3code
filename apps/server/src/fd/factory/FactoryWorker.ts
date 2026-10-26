@@ -173,17 +173,18 @@ export class FactoryWorker extends Context.Service<
     /**
      * Recovers what a PR stage whose result a restart lost after its watch command did, for a
      * delivery blocked on that interrupted `open_pr` with no pull request recorded (see
-     * `failInterruptedEffect`): the pull request, the thread it is linked to and Factory's watch
-     * there, as that command's records prove them (see `FactoryPullRequest.recover`), then the
-     * wakes core committed there since. The delivery stays blocked for its owner, but a resume
-     * publishes to that pull request, its merge or close is taken, and a cancel at any stage after
-     * releases that watch. Nothing for any other delivery, or when the records prove nothing; a
-     * read that fails is logged and leaves the delivery blocked as it was. The boot sweep calls
-     * this.
+     * `failInterruptedEffect`), from that command's records (see `FactoryPullRequest.recover`):
+     * the delivery records the pull request, the thread it is linked to and the watch there, and
+     * stays blocked, then takes the wakes core committed there since and the pull request's merge
+     * or close if it left `open`. A resume publishes to that pull request, and a cancel at any
+     * stage after releases Factory's watch. Reports what it found: `unknown` when the records
+     * prove the stage published but not which pull request, so a resume must not publish again;
+     * `none` for any other delivery, or when nothing proves the stage published. A read that
+     * fails fails, and changes nothing. The boot sweep and every resume call this.
      */
     readonly recoverPullRequest: (
       deliveryId: FactoryDeliveryId,
-    ) => Effect.Effect<void, FactoryStoreError>;
+    ) => Effect.Effect<"none" | "unknown" | "recovered", FactoryStoreError>;
     /**
      * Steps a parent with the approval of the child it waits for, once that child is approved;
      * the parent then waits for something else, so the approval is taken once. A parent without a
@@ -1311,21 +1312,20 @@ const make = Effect.gen(function* () {
           block?.reason !== "effect_failed" ||
           block.effect.type !== "open_pr"
         ) {
-          return;
+          return "none" as const;
         }
         const effect = block.effect;
-        const recovered = yield* Effect.exit(
-          Effect.suspend(() => pullRequests.recover(current, effect)),
+        const recovered = yield* Effect.suspend(() => pullRequests.recover(current, effect)).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.fail(
+                  new FactoryStoreError({ operation: "worker.recoverPullRequest", cause }),
+                ),
+          ),
         );
-        if (Exit.isFailure(recovered)) {
-          if (Cause.hasInterruptsOnly(recovered.cause)) return yield* Effect.interrupt;
-          return yield* Effect.logWarning(
-            "factory could not recover a pull request a restart lost",
-            recovered.cause,
-          );
-        }
-        if (Option.isNone(recovered.value)) return;
-        const { pullRequest, threadId, watch, wakes } = recovered.value.value;
+        if (recovered.type !== "recovered") return recovered.type;
+        const { pullRequest, threadId, watch, wakes, outcome } = recovered;
         yield* stepLocked(deliveryId, {
           type: "pr.recovered",
           effectId: effect.id,
@@ -1334,6 +1334,15 @@ const make = Effect.gen(function* () {
           watch,
         });
         for (const wake of wakes) yield* stepLocked(deliveryId, wake);
+        // Merged or closed while no result was stored: taken as the link's sync would have been.
+        if (outcome !== undefined) {
+          yield* stepLocked(deliveryId, {
+            type: outcome === "merged" ? "pr.merged" : "pr.closed",
+            number: pullRequest.number,
+            url: pullRequest.url,
+          });
+        }
+        return "recovered" as const;
       }),
     );
 

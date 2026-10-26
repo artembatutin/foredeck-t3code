@@ -218,7 +218,9 @@ describe("a PR stage result recovered from its watch command", () => {
     });
     expect(resumed.block).toBeNull();
     expect(advance(resumed, { type: "cancel" }).delivery.releaseWatch).toBe(true);
-    // Without the recovery, nothing there would mark it.
+    // Without the recovery, nothing there would mark it: the engine takes such a resume, which
+    // is why `FactoryService.resume` recovers first and refuses when it cannot (see
+    // FactoryFollowThrough.parent.boot.test.ts).
     const unrecovered = advance(blocked, {
       type: "resume",
       check: { deletedThreads: [], unrecordedAuthorRunEnded: false, worktree: null },

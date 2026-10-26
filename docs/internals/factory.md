@@ -637,16 +637,19 @@ whole-thread event, so those events can go: a command whose event is gone proves
 no watch of Factory's, and the watch the delivery already holds, judged while the events were
 there, stays Factory's. Only Factory's watch is ever ended.
 
-The boot sweep therefore recovers such a result as well as blocking on it
-([`FactoryWorker.recoverPullRequest`](../../apps/server/src/fd/factory/FactoryWorker.ts)). The
-command ran only once the stage had published and linked its pull request, so when core accepted
-it and it started Factory's watch, the delivery records the pull request that watch is on, the
-thread it is linked to and the watch, as the result would have, and stays blocked. Blocking alone
-is not enough: a resume clears the block and verifies or integrates again, so a cancel after that
-found no sign a PR stage had run, never released the watch, and left it to wake the thread with new
-work. Recorded, the pull request also takes its merge or close, and a resume pushes to it rather
-than open a second one. A command that kept someone else's watch proves nothing of Factory's, and
-the delivery blocks as before.
+Such a result is recovered from those records, at boot and again by every resume before it is
+decided ([`FactoryWorker.recoverPullRequest`](../../apps/server/src/fd/factory/FactoryWorker.ts)).
+Blocking alone is not enough: a resume clears the block, which is then all that says a PR stage
+ran, so a cancel after it never released the watch, and an integrate after it asked `create_pr`
+again, which opens a second pull request once the first has closed. Core accepting the stage's
+watch command proves the stage published and linked its pull request, since the command runs only
+after that; which pull request is read apart from whose watch is on it, from the event the command
+committed: the link a watch it started is on, else the one link watched then, narrowed when the
+thread watches several to the link the stage's own link command added. The delivery records that
+pull request, the thread and the watch (Factory's only if the command started it), stays blocked,
+and takes the pull request's merge or close if it left `open`. A resume then pushes to it. When the
+records prove a publish but name no pull request, the resume is refused, and when they cannot be
+read it fails, both changing nothing; a cancel still works, releasing the watch from the block.
 
 A cancel marks the watch for release in the step that stores it, as does a close's cancel, once a
 PR stage ran or may have run. The worker then ends Factory's watch with core's

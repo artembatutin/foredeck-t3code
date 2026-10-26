@@ -274,13 +274,9 @@ const make = Effect.gen(function* () {
         if (ended !== null) yield* worker.step(deliveryId, ended);
       }
       // Blocked on a PR stage whose result the restart lost, as the step above may have just
-      // stored or an earlier server did, it records what that stage's watch command proves, then
-      // takes that pull request's merge or close stored meanwhile.
+      // stored or an earlier server did, it records what that stage's watch command proves. A
+      // read that fails is logged; the next boot, and any resume, recovers it again first.
       yield* worker.recoverPullRequest(deliveryId);
-      const recovered = yield* read;
-      if (delivery.state.pullRequest === null && recovered !== undefined) {
-        yield* catchUpPullRequest(recovered);
-      }
     }).pipe(Effect.catchCause(logSkipped("factory delivery reconcile skipped")));
 
   // Comments a previous process recorded and never finished go first, in their order. Work a

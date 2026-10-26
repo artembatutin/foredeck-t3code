@@ -241,6 +241,20 @@ export class FactoryResumeRefusedError extends Schema.TaggedError<FactoryResumeR
   }
 }
 
+/**
+ * The delivery's PR stage published a pull request and started a watch on it, but a server
+ * restart lost which pull request, and its records cannot tell: a resume would publish again and
+ * could open a second one. Nothing changed; a cancel still ends the delivery, keeping its work.
+ */
+export class FactoryPullRequestUnknownError extends Schema.TaggedError<FactoryPullRequestUnknownError>()(
+  "FactoryPullRequestUnknownError",
+  { deliveryId: FactoryDeliveryId },
+) {
+  override get message(): string {
+    return `Factory delivery ${this.deliveryId} published a pull request a server restart lost track of, so it cannot resume.`;
+  }
+}
+
 /** A done or cancelled delivery cannot be cancelled; nothing changed. */
 export class FactoryCancelRefusedError extends Schema.TaggedError<FactoryCancelRefusedError>()(
   "FactoryCancelRefusedError",
@@ -442,13 +456,18 @@ export class FactoryService extends Context.Service<
      * planning resumes into planning, its unrecorded planner launch replayed alike, and a
      * recorded planner asked for its plan again. A resume grants a fresh retry allowance
      * (owner decision): repair rounds and failure fingerprints start over, its limits do not.
-     * Refused, with nothing changed, in any other status.
+     * Refused, with nothing changed, in any other status. A delivery blocked on a PR stage whose
+     * result a restart lost first recovers what that stage published (see
+     * `FactoryWorker.recoverPullRequest`), since the resume clears the only sign it did; a
+     * recovery that cannot read the records fails the resume, and one that proves a pull request
+     * was published but not which refuses it, both with nothing changed.
      */
     readonly resume: (
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<
       FactoryDeliveryWithRuns,
       | FactoryResumeRefusedError
+      | FactoryPullRequestUnknownError
       | FactoryDeliveryNotFoundError
       | FactoryStoreError
       | ProjectionStore.ProjectionStoreV2Error
@@ -1038,6 +1057,13 @@ const make = Effect.gen(function* () {
   // no run end or effect result landing in between.
   const resume: FactoryService["Service"]["resume"] = Effect.fn("FactoryService.resume")(
     function* (deliveryId) {
+      // First, under the delivery's lock, what a PR stage a restart cut short published: the
+      // resume clears its block, which is then all that says the stage ran, and a cancel after
+      // it would leave that stage's watch on. Its records do not change, so what this found
+      // still holds when the resume is decided.
+      if ((yield* worker.recoverPullRequest(deliveryId)) === "unknown") {
+        return yield* new FactoryPullRequestUnknownError({ deliveryId });
+      }
       const stepped = yield* worker.stepWith(deliveryId, (current) =>
         Effect.gen(function* () {
           const { status } = current.state;

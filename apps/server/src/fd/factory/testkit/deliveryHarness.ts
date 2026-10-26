@@ -332,10 +332,12 @@ export type FactoryDispatch = Parameters<Orchestrator.OrchestratorV2["Service"][
 
 /**
  * The orchestrator as Factory's services see it: each command runs `hooks.before` first, so a
- * test can commit something of the owner's between what Factory read and its command.
+ * test can commit something of the owner's between what Factory read and its command, and each
+ * thread shell Factory reads runs `hooks.beforeShell` first, so a test can fail that read.
  */
 const factoryOrchestrator = (hooks: {
   before?: ((command: FactoryDispatch) => Effect.Effect<void>) | undefined;
+  beforeShell?: ((threadId: ThreadId) => Effect.Effect<void>) | undefined;
 }) =>
   Layer.effect(
     Orchestrator.OrchestratorV2,
@@ -345,6 +347,10 @@ const factoryOrchestrator = (hooks: {
         dispatch: (command) =>
           Effect.suspend(() => hooks.before?.(command) ?? Effect.void).pipe(
             Effect.andThen(orchestrator.dispatch(command)),
+          ),
+        getThreadShell: (threadId) =>
+          Effect.suspend(() => hooks.beforeShell?.(threadId) ?? Effect.void).pipe(
+            Effect.andThen(orchestrator.getThreadShell(threadId)),
           ),
       }),
     ),
@@ -563,6 +569,7 @@ const makeLayer = (input: {
   readonly publishHooks: Array<Effect.Effect<void>>;
   readonly factoryDispatch: {
     before?: ((command: FactoryDispatch) => Effect.Effect<void>) | undefined;
+    beforeShell?: ((threadId: ThreadId) => Effect.Effect<void>) | undefined;
   };
   readonly commentCalls: Array<CommentCall>;
   readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
@@ -706,9 +713,13 @@ export interface World {
    * the PR stage awaits its result.
    */
   readonly publishHooks: Array<Effect.Effect<void>>;
-  /** Run before each command Factory's services dispatch to the orchestrator, when set. */
+  /**
+   * Run before each command Factory's services dispatch to the orchestrator (`before`), and before
+   * each thread shell they read from it (`beforeShell`), when set.
+   */
   readonly factoryDispatch: {
     before?: ((command: FactoryDispatch) => Effect.Effect<void>) | undefined;
+    beforeShell?: ((threadId: ThreadId) => Effect.Effect<void>) | undefined;
   };
   /** Every comment posted through Work, in order; the item's own source holds them too. */
   readonly commentCalls: ReadonlyArray<CommentCall>;

@@ -33,16 +33,20 @@ import {
 import {
   awaitedRun,
   cancelledRuns,
+  closedComment,
   endWhileDown,
   integratedParent,
   interruptedTurns,
+  itemStatus,
   linkOf,
+  linkPullRequest,
   openParent,
   ownerQueues,
   passingReview,
   providerTurnOf,
   runStarted,
   runStatus,
+  syncPullRequest,
   wakeThread,
   watchPullRequest,
 } from "./testkit/followThrough.ts";
@@ -195,6 +199,22 @@ const storeCancel = (deliveryId: FactoryDeliveryId) =>
     assert.isTrue(cancelled.releaseWatch);
     yield* store.update(deliveryId, cancelled);
   }).pipe(Effect.orDie);
+
+/**
+ * Has the owner watch the pull request right before the PR stage's watch command, which then
+ * keeps that watch and starts none of Factory's.
+ */
+const ownerWatchesFirst = (world: World) =>
+  Effect.map(Orchestrator.OrchestratorV2, (orchestrator) => {
+    world.factoryDispatch.before = (command) => {
+      if (command.type !== "thread.pull-request.watch") return Effect.void;
+      world.factoryDispatch.before = undefined;
+      const { url } = command.link ?? assert.fail("The watch command links nothing.");
+      return watchPullRequest(command.threadId, { ...command, url }).pipe(
+        Effect.provideService(Orchestrator.OrchestratorV2, orchestrator),
+      );
+    };
+  });
 
 /** Cancels the delivery as its owner does, with a server running Factory. */
 const cancelBooted = (world: World, deliveryId: FactoryDeliveryId) =>
@@ -546,34 +566,206 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
       ),
   );
 
-  it.live("keeps an owner's watch that command found on through a cancel", () =>
+  it.live(
+    "records the pull request an owner-watched stage published, holding none of the owner's watch, and a resume pushes to it",
+    () =>
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const factory = yield* service;
+            yield* ownerWatchesFirst(world);
+            const { deliveryId, last, state, lost } = yield* publishedParent(world);
+            const owners = (yield* linkOf(last.author, fakePullRequest.number)).watch;
+            assert.isDefined(owners);
+            assert.isNull(state.followThrough?.watchStartedAt);
+            const armed = Option.getOrThrow(yield* watchCommand(deliveryId, state.effectsIssued));
+            assert.strictEqual(armed.status, "accepted");
+            yield* losePublish(deliveryId, lost);
+
+            // That command kept the owner's watch, so it proves no watch of Factory's; it still
+            // proves the stage published, and its event names the pull request it watched.
+            yield* world.boot(Effect.void);
+            const blocked = yield* stateOf(deliveryId);
+            assert.strictEqual(blocked.status, "blocked");
+            assert.deepStrictEqual(blocked.pullRequest, {
+              ...fakePullRequest,
+              headBranch: lost.branch,
+            });
+            assert.strictEqual(blocked.pullRequestThread, last.author);
+            assert.isNull(blocked.followThrough?.watchStartedAt);
+            assert.strictEqual(blocked.followThrough?.watchedAfter, armed.resultSequence);
+
+            // Resumed, it publishes to that pull request again: a push, never a second create.
+            yield* world.boot(
+              Effect.gen(function* () {
+                yield* factory.resume(deliveryId).pipe(Effect.orDie);
+                yield* drainFactory;
+              }),
+            );
+            yield* world.boot(
+              Effect.gen(function* () {
+                const reviewer = yield* awaitedRun(deliveryId);
+                yield* factory
+                  .submitReview({ threadId: reviewer.threadId, review: passingReview(2) })
+                  .pipe(Effect.orDie);
+                yield* world.endRun(reviewer.runId, "completed");
+              }),
+            );
+            const reopened = yield* stateOf(deliveryId);
+            assert.strictEqual(reopened.status, "pr_open");
+            assert.deepStrictEqual(
+              world.pullRequestCalls.map(({ input }) => input.action),
+              ["create_pr", "push"],
+            );
+            assert.isNull(reopened.followThrough?.watchStartedAt);
+            assert.deepStrictEqual(
+              (yield* linkOf(last.author, fakePullRequest.number)).watch,
+              owners,
+            );
+
+            // A cancel leaves the owner's watch on.
+            yield* cancelBooted(world, deliveryId);
+            const cancelled = yield* stateOf(deliveryId);
+            assert.strictEqual(cancelled.status, "cancelled");
+            assert.isUndefined(cancelled.releaseWatch);
+            assert.deepStrictEqual(
+              (yield* linkOf(last.author, fakePullRequest.number)).watch,
+              owners,
+            );
+          }),
+        { manualReactor: true },
+      ),
+  );
+
+  it.live.each([{ outcome: "closed" }, { outcome: "merged" }] as const)(
+    "takes the pull request an owner-watched stage published as $outcome while Factory was down, publishing nothing again",
+    ({ outcome }) =>
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            yield* ownerWatchesFirst(world);
+            const parent = yield* publishedParent(world);
+            const { deliveryId, last } = parent;
+            const children = yield* childRows(parent);
+            yield* losePublish(deliveryId, parent.lost);
+
+            // While no server runs Factory, core's sync stores the pull request merged or closed.
+            yield* syncPullRequest(
+              last.author,
+              yield* linkOf(last.author, fakePullRequest.number),
+              outcome,
+              { drain: false },
+            );
+            yield* world.boot(Effect.void);
+            const after = yield* stateOf(deliveryId);
+            assert.strictEqual(after.pullRequest?.outcome, outcome);
+            assert.deepStrictEqual(
+              world.pullRequestCalls.map(({ input }) => input.action),
+              ["create_pr"],
+            );
+            if (outcome === "closed") {
+              // Closed without merging: cancelled, with the one comment that says so, keeping
+              // its work and its children's approvals.
+              assert.strictEqual(after.status, "cancelled");
+              assert.deepStrictEqual(
+                world.commentCalls
+                  .filter(({ input }) => input.body.startsWith(closedComment))
+                  .map(({ input }) => input.ref),
+                [world.itemRef],
+              );
+              assert.isTrue(yield* world.exists(parent.worktreePath));
+              assert.deepStrictEqual(yield* childRows(parent), children);
+            } else {
+              // Merged: closed out, every item done and the clean worktree removed.
+              assert.strictEqual(after.status, "done");
+              for (const ref of [...parent.children.map(({ itemRef }) => itemRef), world.itemRef]) {
+                assert.strictEqual(yield* itemStatus(ref), "done");
+              }
+              assert.deepStrictEqual(world.worktreeRemovals, [
+                { cwd: world.root, path: parent.worktreePath },
+              ]);
+            }
+
+            // Another boot finds nothing more to do.
+            const rows = yield* rowsOf(deliveryId);
+            yield* world.boot(Effect.void);
+            assert.deepStrictEqual(yield* rowsOf(deliveryId), rows);
+            assert.strictEqual(world.pullRequestCalls.length, 1);
+          }),
+        { manualReactor: true },
+      ),
+  );
+});
+
+describe("Factory follow-through of a parent whose lost PR stage watched among other pull requests", () => {
+  it.live.each([
+    { linkedFirst: false, outcome: "records the one its own link command added" },
+    { linkedFirst: true, outcome: "refuses a resume when nothing names which it published" },
+  ])("$outcome, and a cancel keeps the owner's watches", ({ linkedFirst }) =>
     withProject(
       verifyCommands.passes,
       (world) =>
         Effect.gen(function* () {
+          const factory = yield* service;
           const orchestrator = yield* Orchestrator.OrchestratorV2;
-          // The owner watches the pull request right before Factory's watch command, which keeps
-          // that watch; then the PR stage's result is lost.
+          // Just before the PR stage's watch command the owner watches its pull request and
+          // another one there, so that command keeps a watch on a thread watching two. When
+          // the owner linked the pull request just before the stage's link command too, that
+          // command added nothing either.
+          const other = { number: 8, url: "https://github.com/acme/alpha/pull/8" };
+          const owner = (effect: Effect.Effect<void, never, Orchestrator.OrchestratorV2>) =>
+            effect.pipe(Effect.provideService(Orchestrator.OrchestratorV2, orchestrator));
           world.factoryDispatch.before = (command) => {
+            if (command.type === "thread.pull-request.link") {
+              const { host, repository, number, url } = command;
+              return linkedFirst
+                ? owner(linkPullRequest(command.threadId, { host, repository, number, url }))
+                : Effect.void;
+            }
             if (command.type !== "thread.pull-request.watch") return Effect.void;
             world.factoryDispatch.before = undefined;
             const { url } = command.link ?? assert.fail("The watch command links nothing.");
-            return watchPullRequest(command.threadId, { ...command, url }).pipe(
-              Effect.provideService(Orchestrator.OrchestratorV2, orchestrator),
+            const { host, repository } = command;
+            return owner(
+              Effect.gen(function* () {
+                yield* watchPullRequest(command.threadId, { ...command, url });
+                yield* watchPullRequest(command.threadId, { host, repository, ...other });
+              }),
             );
           };
-          const { deliveryId, last, state, lost } = yield* publishedParent(world);
+          const parent = yield* publishedParent(world);
+          const { deliveryId, last, state } = parent;
           const owners = (yield* linkOf(last.author, fakePullRequest.number)).watch;
+          const others = (yield* linkOf(last.author, other.number, other.url)).watch;
           assert.isDefined(owners);
-          assert.isNull(state.followThrough?.watchStartedAt);
+          assert.isDefined(others);
           const armed = Option.getOrThrow(yield* watchCommand(deliveryId, state.effectsIssued));
           assert.strictEqual(armed.status, "accepted");
-          yield* losePublish(deliveryId, lost);
-          // That command started no watch, so its records prove no watch of Factory's: the boot
-          // recovers nothing.
-          yield* world.boot(Effect.void);
-          assert.isNull((yield* stateOf(deliveryId)).pullRequest);
+          yield* losePublish(deliveryId, parent.lost);
 
+          yield* world.boot(Effect.void);
+          const blocked = yield* stateOf(deliveryId);
+          assert.strictEqual(blocked.block?.reason, "effect_failed");
+          if (linkedFirst) {
+            // The stage published, but nothing says which of the watched pull requests: a
+            // resume would publish again, so it is refused, with nothing changed.
+            assert.isNull(blocked.pullRequest);
+            const rows = yield* rowsOf(deliveryId);
+            const refused = yield* world.boot(factory.resume(deliveryId).pipe(Effect.flip));
+            assert.strictEqual(refused._tag, "FactoryPullRequestUnknownError");
+            assert.deepStrictEqual(yield* rowsOf(deliveryId), rows);
+          } else {
+            // The pull request its link command added, holding none of the owner's watch.
+            assert.strictEqual(blocked.pullRequest?.number, fakePullRequest.number);
+            assert.strictEqual(blocked.pullRequest?.url, fakePullRequest.url);
+            assert.strictEqual(blocked.pullRequestThread, last.author);
+            assert.isNull(blocked.followThrough?.watchStartedAt);
+            assert.strictEqual(blocked.followThrough?.watchedAfter, armed.resultSequence);
+          }
+
+          // A cancel ends the delivery, ending none of the owner's watches.
           yield* cancelBooted(world, deliveryId);
           const cancelled = yield* stateOf(deliveryId);
           assert.strictEqual(cancelled.status, "cancelled");
@@ -581,6 +773,100 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
           assert.deepStrictEqual(
             (yield* linkOf(last.author, fakePullRequest.number)).watch,
             owners,
+          );
+          assert.deepStrictEqual(
+            (yield* linkOf(last.author, other.number, other.url)).watch,
+            others,
+          );
+          assert.deepStrictEqual(
+            world.pullRequestCalls.map(({ input }) => input.action),
+            ["create_pr"],
+          );
+        }),
+      { manualReactor: true },
+    ),
+  );
+});
+
+describe("Factory follow-through of a parent whose lost PR stage result cannot be read", () => {
+  it.live.each([
+    { then: "resumes once the records read again", cancel: false },
+    { then: "is cancelled while they cannot, and the next boot ends the watch", cancel: true },
+  ])("refuses a resume while it cannot recover what the stage published, and $then", ({ cancel }) =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const factory = yield* service;
+          const parent = yield* publishedParent(world);
+          const { deliveryId, last } = parent;
+          const watch = (yield* linkOf(last.author, fakePullRequest.number)).watch;
+          if (watch === undefined) return assert.fail("The PR stage started no watch.");
+          yield* losePublish(deliveryId, parent.lost);
+          // Factory cannot read the thread its pull request is linked to for now.
+          const unreadable = { on: true };
+          world.factoryDispatch.beforeShell = (threadId) =>
+            unreadable.on && threadId === last.author
+              ? Effect.die("The database is locked.")
+              : Effect.void;
+
+          // The next boot cannot recover what the stage published, and leaves it blocked.
+          yield* world.boot(Effect.void);
+          const blocked = yield* stateOf(deliveryId);
+          assert.strictEqual(blocked.block?.reason, "effect_failed");
+          assert.isNull(blocked.pullRequest);
+          assert.isUndefined(blocked.followThrough);
+          const rows = yield* rowsOf(deliveryId);
+
+          // A resume recovers first, so it fails as that read does, with nothing changed.
+          const refused = yield* world.boot(factory.resume(deliveryId).pipe(Effect.flip));
+          assert.strictEqual(refused._tag, "FactoryStoreError");
+          assert.deepStrictEqual(yield* rowsOf(deliveryId), rows);
+
+          if (cancel) {
+            // Cancelled meanwhile: the block marks the watch for release, which cannot read the
+            // thread either and stays marked; the next boot that can ends Factory's watch.
+            yield* cancelBooted(world, deliveryId);
+            const marked = yield* stateOf(deliveryId);
+            assert.strictEqual(marked.status, "cancelled");
+            assert.isTrue(marked.releaseWatch);
+            assert.strictEqual(
+              (yield* linkOf(last.author, fakePullRequest.number)).watch?.startedAt,
+              watch.startedAt,
+            );
+            unreadable.on = false;
+            yield* world.boot(Effect.void);
+          } else {
+            // Readable again, a resume records the pull request, its thread and Factory's watch
+            // before it integrates afresh; a cancel during that integrate then ends the watch.
+            unreadable.on = false;
+            yield* world.boot(
+              Effect.gen(function* () {
+                yield* factory.resume(deliveryId).pipe(Effect.orDie);
+                yield* drainFactory;
+              }),
+            );
+            const resumed = yield* stateOf(deliveryId);
+            assert.strictEqual(resumed.status, "running");
+            assert.isNull(resumed.block);
+            assert.strictEqual(resumed.pullRequest?.number, fakePullRequest.number);
+            assert.strictEqual(resumed.pullRequestThread, last.author);
+            assert.strictEqual(resumed.followThrough?.watchStartedAt, watch.startedAt);
+            yield* cancelBooted(world, deliveryId);
+          }
+          const cancelled = yield* stateOf(deliveryId);
+          assert.strictEqual(cancelled.status, "cancelled");
+          assert.isUndefined(cancelled.releaseWatch);
+          assert.strictEqual(cancelled.pullRequestThread, last.author);
+          assert.isUndefined((yield* linkOf(last.author, fakePullRequest.number)).watch);
+
+          // Another boot changes nothing.
+          const settled = yield* rowsOf(deliveryId);
+          yield* world.boot(Effect.void);
+          assert.deepStrictEqual(yield* rowsOf(deliveryId), settled);
+          assert.deepStrictEqual(
+            world.pullRequestCalls.map(({ input }) => input.action),
+            ["create_pr"],
           );
         }),
       { manualReactor: true },

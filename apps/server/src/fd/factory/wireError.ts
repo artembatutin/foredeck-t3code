@@ -23,6 +23,7 @@ export type FactoryServiceError =
   | FactoryService.FactoryDeliveryNotFoundError
   | FactoryService.FactoryStopRefusedError
   | FactoryService.FactoryResumeRefusedError
+  | FactoryService.FactoryPullRequestUnknownError
   | FactoryService.FactoryCancelRefusedError
   | FactoryService.FactoryPlanGateRefusedError
   | FactoryService.FactoryChildItemUncreatableError
@@ -73,6 +74,13 @@ export const toFactoryError = (error: FactoryServiceError): FactoryError => {
       return new FactoryError({
         reason: "refused",
         message: `Only a stopping, stopped or blocked delivery can resume; this one is ${error.status}.`,
+        deliveryId: error.deliveryId,
+      });
+    case "FactoryPullRequestUnknownError":
+      return new FactoryError({
+        reason: "refused",
+        message:
+          "This delivery published a pull request that a server restart lost track of, so resuming could open a second one. Cancel the delivery to keep its work and start over.",
         deliveryId: error.deliveryId,
       });
     case "FactoryCancelRefusedError":
