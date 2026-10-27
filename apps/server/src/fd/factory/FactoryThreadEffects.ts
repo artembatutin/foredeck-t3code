@@ -13,6 +13,7 @@ import {
 } from "@t3tools/contracts";
 import { FactoryDeliveryId, FactoryRole } from "@t3tools/contracts/fd/factory";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import { modelSelectionsEqual } from "@t3tools/shared/model";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -38,7 +39,8 @@ import { readReviewEvidence, reviewBasis } from "./FactoryReview.ts";
 import { FactoryBranchStartError, readBranchCreation } from "./git/branchStart.ts";
 import * as FactorySettings from "./FactorySettings.ts";
 import type { StoredFactoryDelivery } from "./persistence/FactoryDeliveryStore.ts";
-import { escalateEffort } from "./pipeline/effort.ts";
+import * as FactoryTurnSelectionStore from "./persistence/FactoryTurnSelectionStore.ts";
+import { escalateEffort, mechanicalEffort } from "./pipeline/effort.ts";
 import {
   adoptedRuns,
   type FactoryEffect,
@@ -358,6 +360,38 @@ const itemReader = (deliveryId: FactoryDeliveryId): WorkActor => ({
   label: "Factory",
 });
 
+/** Remove only the temporary effort, preserving any other options the owner changed. */
+const restoreMechanicalSelection = (
+  current: ModelSelection,
+  saved: { readonly before: ModelSelection; readonly mechanical: ModelSelection | null },
+): ModelSelection => {
+  const { before, mechanical } = saved;
+  if (
+    mechanical === null ||
+    current.instanceId !== mechanical.instanceId ||
+    current.model !== mechanical.model
+  )
+    return current;
+  if (modelSelectionsEqual(current, mechanical)) return before;
+  // mechanicalEffort changes exactly one option. Its absence in `before` means the default.
+  const changed = mechanical.options?.find(
+    (option) => before.options?.find(({ id }) => id === option.id)?.value !== option.value,
+  );
+  if (
+    changed === undefined ||
+    current.options?.find(({ id }) => id === changed.id)?.value !== changed.value
+  )
+    return current;
+  const original = before.options?.find(({ id }) => id === changed.id);
+  return {
+    ...current,
+    options: [
+      ...(current.options ?? []).filter(({ id }) => id !== changed.id),
+      ...(original === undefined ? [] : [original]),
+    ],
+  };
+};
+
 const make = Effect.gen(function* () {
   const launches = yield* ThreadLaunch.ThreadLaunchService;
   const threads = yield* ThreadManagement.ThreadManagementService;
@@ -365,6 +399,7 @@ const make = Effect.gen(function* () {
   const projects = yield* ProjectStore.ProjectStoreV2;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const factorySettings = yield* FactorySettings.FactorySettings;
+  const turnSelections = yield* FactoryTurnSelectionStore.FactoryTurnSelectionStore;
   const work = yield* WorkService.WorkService;
   const git = yield* GitVcsDriver.GitVcsDriver;
   const providers = yield* ProviderRegistry.ProviderRegistry;
@@ -405,16 +440,65 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  /**
-   * The model selection for a turn of `round` on a thread: the one the thread runs with, so a
-   * model the owner switched it to stays, escalated. None when that leaves it as it is.
-   */
+  // Queued runs persist their selection on the thread. Medium belongs only to the mechanical
+  // turn: use its saved baseline while that selection is still on the thread. An owner change
+  // takes precedence. The store is keyed by thread too, for a parent's last-child follow-through.
+  const beforeMechanical = (threadId: ThreadId, current: ModelSelection) =>
+    Effect.gen(function* () {
+      const saved = yield* turnSelections.latest(threadId);
+      if (Option.isNone(saved)) return current;
+      const restored = restoreMechanicalSelection(current, saved.value);
+      if (restored === current) return current;
+      const { runs } = yield* projections.getThreadRecords(threadId, ["runs"]);
+      const messageId = `factory-fix-commit-message:${saved.value.deliveryId}:${saved.value.effectId}`;
+      const fixed = runs.findIndex((run) => run.userMessageId === messageId);
+      // A recorded selection alone proves no change: dispatch may have failed or still be queued.
+      if (fixed < 0 || runs[fixed]?.status === "queued") return current;
+      // Once a later Factory turn has started, this temporary selection is spent. If the owner
+      // subsequently chooses medium themselves, an old fix-commit must not undo that choice.
+      if (
+        runs
+          .slice(fixed + 1)
+          .some((run) => run.status !== "queued" && FACTORY_MESSAGE.test(run.userMessageId ?? ""))
+      )
+        return current;
+      return restored;
+    });
+
   const turnSelection = (delivery: StoredFactoryDelivery, threadId: ThreadId, round: number) =>
     Effect.gen(function* () {
       const { thread } = yield* projections.getThreadRecords(threadId, []);
+      const before = yield* beforeMechanical(threadId, thread.modelSelection);
       const { highRiskEffort } = yield* factorySettings.get(delivery.projectId);
-      const selection = yield* escalated(delivery, thread.modelSelection, round, highRiskEffort);
+      const selection = yield* escalated(delivery, before, round, highRiskEffort);
       return selection === thread.modelSelection ? undefined : selection;
+    });
+
+  const fixCommitSelection = (
+    delivery: StoredFactoryDelivery,
+    effect: { readonly id: number; readonly threadId: ThreadId },
+  ) =>
+    Effect.gen(function* () {
+      const key = { deliveryId: delivery.deliveryId, effectId: effect.id };
+      const saved = yield* turnSelections.get(key);
+      if (Option.isSome(saved)) return saved.value.mechanical ?? undefined;
+      const { thread } = yield* projections.getThreadRecords(effect.threadId, []);
+      const before = yield* beforeMechanical(effect.threadId, thread.modelSelection);
+      const available = yield* providers.getProviders;
+      const mechanical = mechanicalEffort({
+        selection: before,
+        descriptors: available
+          .find((provider) => provider.instanceId === before.instanceId)
+          ?.models.find((model) => model.slug === before.model)?.capabilities?.optionDescriptors,
+      });
+      yield* turnSelections.record({
+        ...key,
+        threadId: effect.threadId,
+        before,
+        mechanical: mechanical === before ? null : mechanical,
+      });
+      // Read back the winner if the same effect was dispatched concurrently.
+      return (yield* turnSelections.get(key)).pipe(Option.getOrThrow).mechanical ?? undefined;
     });
 
   /**
@@ -923,22 +1007,33 @@ const make = Effect.gen(function* () {
     text: string,
     modelSelection?: ModelSelection,
   ) =>
-    ThreadMessageIntake.sendToThread({
-      projectId: delivery.projectId,
-      commandId: CommandId.make(`factory-${kind}:${delivery.deliveryId}:${effect.id}`),
-      threadId: effect.threadId,
-      messageId: MessageId.make(`factory-${kind}-message:${delivery.deliveryId}:${effect.id}`),
-      text,
-      attachments: [],
-      ...(modelSelection === undefined ? {} : { modelSelection }),
-      // After whatever the thread is still doing; never steering or interrupting it.
-      mode: "queue",
-      createdBy: "system",
-      creationSource: "server",
-    }).pipe(
-      Effect.map((sent) => ({ runId: sent.run.id })),
-      Effect.provideContext(intakeContext),
-    );
+    Effect.gen(function* () {
+      let selection = modelSelection;
+      if (selection === undefined && kind !== "fix-commit") {
+        const saved = yield* turnSelections.latest(effect.threadId);
+        if (Option.isSome(saved) && saved.value.mechanical !== null) {
+          const { thread } = yield* projections.getThreadRecords(effect.threadId, []);
+          const restored = yield* beforeMechanical(effect.threadId, thread.modelSelection);
+          if (restored !== thread.modelSelection) selection = restored;
+        }
+      }
+      return yield* ThreadMessageIntake.sendToThread({
+        projectId: delivery.projectId,
+        commandId: CommandId.make(`factory-${kind}:${delivery.deliveryId}:${effect.id}`),
+        threadId: effect.threadId,
+        messageId: MessageId.make(`factory-${kind}-message:${delivery.deliveryId}:${effect.id}`),
+        text,
+        attachments: [],
+        ...(selection === undefined ? {} : { modelSelection: selection }),
+        // After whatever the thread is still doing; never steering or interrupting it.
+        mode: "queue",
+        createdBy: "system",
+        creationSource: "server",
+      }).pipe(
+        Effect.map((sent) => ({ runId: sent.run.id })),
+        Effect.provideContext(intakeContext),
+      );
+    });
 
   /** The text of the run's last assistant message that has any; null when it has none. */
   const lastAssistantText = (threadId: ThreadId, runId: RunId) =>
@@ -1058,17 +1153,21 @@ const make = Effect.gen(function* () {
   return FactoryThreadEffects.of({
     launchThread,
     sendFixCommitTurn: (delivery, effect) =>
-      sendTurn(
-        delivery,
-        effect,
-        "fix-commit",
-        renderFixCommitPrompt({
-          problems: effect.problems,
-          branch: delivery.state.branch,
-          baseline: delivery.state.baseline,
-          checkpoint: effect.checkpoint ?? null,
-        }),
-      ),
+      Effect.gen(function* () {
+        const selection = yield* fixCommitSelection(delivery, effect);
+        return yield* sendTurn(
+          delivery,
+          effect,
+          "fix-commit",
+          renderFixCommitPrompt({
+            problems: effect.problems,
+            branch: delivery.state.branch,
+            baseline: delivery.state.baseline,
+            checkpoint: effect.checkpoint ?? null,
+          }),
+          selection,
+        );
+      }),
     sendPlanRetryTurn: (delivery, effect) =>
       sendTurn(
         delivery,

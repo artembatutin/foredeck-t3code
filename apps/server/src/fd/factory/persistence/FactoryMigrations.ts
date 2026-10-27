@@ -125,6 +125,21 @@ const FactoryTaskChildClaims = Effect.gen(function* () {
     WHERE plan_json IS NOT NULL AND child_item_id IS NULL`;
 });
 
+const FactoryTurnSelections = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`CREATE TABLE fd_factory_turn_selections (
+    position INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id TEXT NOT NULL REFERENCES fd_factory_deliveries (delivery_id),
+    effect_id INTEGER NOT NULL,
+    thread_id TEXT NOT NULL,
+    before_json TEXT NOT NULL,
+    mechanical_json TEXT,
+    UNIQUE (delivery_id, effect_id)
+  )`;
+  yield* sql`CREATE INDEX fd_factory_turn_selections_thread
+    ON fd_factory_turn_selections (thread_id, position)`;
+});
+
 export const factoryMigrationEntries = [
   [1, "FactorySettings", FactorySettings],
   [2, "FactoryDeliveries", FactoryDeliveries],
@@ -134,6 +149,7 @@ export const factoryMigrationEntries = [
   [6, "FactoryWorkCommentOutcomes", FactoryWorkCommentOutcomes],
   [7, "FactoryTaskChildItems", FactoryTaskChildItems],
   [8, "FactoryTaskChildClaims", FactoryTaskChildClaims],
+  [9, "FactoryTurnSelections", FactoryTurnSelections],
 ] as const;
 
 const run = Migrator.make({});

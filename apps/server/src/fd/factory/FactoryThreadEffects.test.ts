@@ -101,6 +101,8 @@ interface World {
   readonly launches: Array<ThreadLaunch.ThreadLaunchInput>;
   readonly sends: Array<ThreadManagement.ThreadManagementSendInput>;
   readonly runs: Map<RunId, OrchestrationV2RunStatus>;
+  /** An author seeded by the test rather than launched through this fake. */
+  existingAuthor: boolean;
   worktreePath: string | null;
   workspaceRoot: string;
   projectModel: ModelSelection | null;
@@ -164,7 +166,7 @@ const fakes = (world: World) =>
     Layer.mock(ProjectionStore.ProjectionStoreV2)({
       getThreadRecords: ((threadId: ThreadId, _fields: unknown, filter?: { runIds?: RunId[] }) =>
         Effect.gen(function* () {
-          if (world.launches.length === 0 && filter === undefined) {
+          if (world.launches.length === 0 && !world.existingAuthor && filter === undefined) {
             return yield* new ProjectionStore.ProjectionStoreThreadNotFoundError({ threadId });
           }
           if (world.readsUntilFailure === 0) {
@@ -176,7 +178,12 @@ const fakes = (world: World) =>
             return status === undefined ? [] : [{ id, status }];
           });
           return {
-            thread: { id: threadId, worktreePath: world.worktreePath, deletedAt: null },
+            thread: {
+              id: threadId,
+              worktreePath: world.worktreePath,
+              deletedAt: null,
+              modelSelection: authorModel,
+            },
             runs,
           };
         })) as unknown as ProjectionStore.ProjectionStoreV2["Service"]["getThreadRecords"],
@@ -251,6 +258,7 @@ const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) =>
         [firstRun, "running"],
         [fixRun, "running"],
       ]),
+      existingAuthor: false,
       worktreePath: null,
       workspaceRoot: "/nowhere",
       projectModel: null,
@@ -656,6 +664,7 @@ describe("FactoryThreadEffects fix-commit turns", () => {
     withWorld((world) =>
       Effect.gen(function* () {
         const { worktree, main } = yield* makeProject(world);
+        world.existingAuthor = true;
         // Awaiting the settle check (effect 2) after the author's first run.
         yield* insert(
           fold(
@@ -824,6 +833,7 @@ describe("FactoryThreadEffects failures", () => {
     withWorld((world) =>
       Effect.gen(function* () {
         const { worktree, main } = yield* makeProject(world);
+        world.existingAuthor = true;
         world.sendFailure = new Orchestrator.OrchestratorCommandRejectedError({
           commandId: CommandId.make("factory-fix-commit:delivery-1:3"),
           commandType: "message.dispatch",
@@ -942,7 +952,9 @@ describe("FactoryThreadEffects failures", () => {
     withWorld((world) =>
       Effect.gen(function* () {
         const { worktree, main } = yield* makeProject(world);
-        world.readsUntilFailure = 0;
+        world.existingAuthor = true;
+        // Selection is read before sending; the subsequent run read fails.
+        world.readsUntilFailure = 1;
         const before = fold(
           queued,
           { type: "start" },

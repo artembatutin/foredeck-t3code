@@ -167,7 +167,7 @@ when another entry starts importing it.
 
 Clients follow `factory.deliveries.subscribe`, an epoch like Work's refresh epoch, and refetch the
 deliveries and settings they show on each value; the stream itself carries no data. Every Factory
-write therefore runs through `FactoryChanges.transact`
+write that changes client-visible state therefore runs through `FactoryChanges.transact`
 ([`FactoryChanges.ts`](../../apps/server/src/fd/factory/FactoryChanges.ts)), which moves the epoch
 only once the write has committed, so a refetch on the new value reads it. Today the writers are
 the start's insert, the worker's step (stop, resume, cancel, plan and review submissions and the
@@ -389,6 +389,12 @@ author's reply, labelled as claims to check against the code. Turns of later rou
 high-risk tasks raise the effort of the model the thread runs with, only to a value its options
 offer and never below what was chosen
 ([`effort.ts`](../../apps/server/src/fd/factory/pipeline/effort.ts)).
+
+Mechanical fix-commit turns use medium when the model offers it, regardless of risk or round.
+Core persists a queued turn's selection on its thread, so Factory records the selection before
+dispatch and reuses that decision on retries. Later Factory turns start from the saved selection
+when the thread still has the mechanical selection, then apply the usual escalation. A selection
+the owner changed meanwhile stays theirs.
 
 ## Record checks the worktree again
 

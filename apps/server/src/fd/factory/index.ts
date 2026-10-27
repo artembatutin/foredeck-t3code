@@ -18,6 +18,7 @@ import * as FactoryMigrations from "./persistence/FactoryMigrations.ts";
 import * as FactorySettingsStore from "./persistence/FactorySettingsStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
+import * as FactoryTurnSelectionStore from "./persistence/FactoryTurnSelectionStore.ts";
 import * as FactoryWorkCommentStore from "./persistence/FactoryWorkCommentStore.ts";
 import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
@@ -42,6 +43,7 @@ export const layerPersistence = Layer.mergeAll(
   FactorySettingsStore.layer,
   FactoryDeliveryStore.layer,
   FactoryTaskStore.layer,
+  FactoryTurnSelectionStore.layer,
   FactoryStageRunStore.layer,
   FactoryWorkCommentStore.layer,
 ).pipe(Layer.provide(FactoryMigrations.layer));

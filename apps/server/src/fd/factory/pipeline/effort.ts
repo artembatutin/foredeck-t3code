@@ -24,6 +24,24 @@ const isEffortOption = (
 ): descriptor is SelectProviderOptionDescriptor =>
   descriptor.type === "select" && EFFORT_OPTION_IDS.has(descriptor.id);
 
+/** Mechanical commit repairs use medium when offered, regardless of risk or round. */
+export const mechanicalEffort = (input: {
+  readonly selection: ModelSelection;
+  readonly descriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined;
+}): ModelSelection => {
+  const descriptor = input.descriptors?.find(
+    (option) => isEffortOption(option) && option.options.some(({ id }) => id === "medium"),
+  );
+  if (descriptor === undefined) return input.selection;
+  return {
+    ...input.selection,
+    options: [
+      ...(input.selection.options ?? []).filter((option) => option.id !== descriptor.id),
+      { id: descriptor.id, value: "medium" },
+    ],
+  };
+};
+
 /**
  * The model selection for one turn (port of Looper's escalation). Turns of a high-risk task and
  * turns of a second or later round raise the model's effort option to `highRiskEffort` when its

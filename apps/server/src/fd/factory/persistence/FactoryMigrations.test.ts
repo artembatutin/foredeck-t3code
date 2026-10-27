@@ -67,11 +67,13 @@ describe("runFactoryMigrations", () => {
       assert.deepStrictEqual(yield* factoryObjects, [
         ["index", "fd_factory_deliveries_active_item"],
         ["index", "fd_factory_stage_runs_active_thread"],
+        ["index", "fd_factory_turn_selections_thread"],
         ["table", "fd_factory_deliveries"],
         ["table", "fd_factory_migrations"],
         ["table", "fd_factory_settings"],
         ["table", "fd_factory_stage_runs"],
         ["table", "fd_factory_tasks"],
+        ["table", "fd_factory_turn_selections"],
         ["table", "fd_factory_work_comments"],
       ]);
       // The same numeric id names a different migration in each ledger.
