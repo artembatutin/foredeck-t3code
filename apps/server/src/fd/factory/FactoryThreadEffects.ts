@@ -499,8 +499,9 @@ const make = Effect.gen(function* () {
           }
           return false;
         });
-      // A refused or never-dequeued newer intent cannot hide an older applied override.
+      // A refused, never-dequeued or selection-free intent cannot hide an older applied override.
       for (const saved of selections) {
+        if (saved.mechanical === null) continue;
         const messageId = `factory-fix-commit-message:${saved.deliveryId}:${saved.effectId}`;
         const fixed = runs.findIndex((run) => run.userMessageId === messageId);
         if (fixed < 0) continue;
@@ -518,6 +519,12 @@ const make = Effect.gen(function* () {
         for (const run of runs.slice(fixed + 1)) {
           if (
             FACTORY_MESSAGE.test(run.userMessageId ?? "") &&
+            !selections.some(
+              (later) =>
+                later.mechanical === null &&
+                run.userMessageId ===
+                  `factory-fix-commit-message:${later.deliveryId}:${later.effectId}`,
+            ) &&
             (yield* selectionApplied(run, afterSequence))
           )
             return current;

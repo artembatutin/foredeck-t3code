@@ -873,10 +873,15 @@ describe("Factory fix-commit effort", () => {
     ),
   );
 
-  it.live.each(["blocked", "stopped"] as const)(
-    "restores the first applied override after %s Resume queues a cancelled second fix-commit",
-    (pause) =>
-      withProject(
+  it.live.each(
+    (["blocked", "stopped"] as const).flatMap((pause) =>
+      (["cancelled", "no selection"] as const).map((secondTurn) => ({ pause, secondTurn })),
+    ),
+  )(
+    "restores the first applied override after $pause Resume with a second fix-commit: $secondTurn",
+    ({ pause, secondTurn }) => {
+      const descriptors = [effort];
+      return withProject(
         verifyCommands.fails,
         (world) =>
           Effect.gen(function* () {
@@ -917,6 +922,11 @@ describe("Factory fix-commit effort", () => {
               `${author.worktreePath}/export.ts`,
               "more uncommitted work\n",
             );
+            if (secondTurn === "no selection")
+              descriptors.splice(0, 1, {
+                ...effort,
+                options: [{ id: "high", label: "High" }],
+              });
             yield* service.resume(author.deliveryId);
             yield* drainFactory;
             const second = (yield* stateOf(author.deliveryId)).awaiting;
@@ -925,25 +935,40 @@ describe("Factory fix-commit effort", () => {
             const queued = (yield* projection()).runs.find(({ id }) => id === second.runId)!;
             assert.strictEqual(queued.status, "queued");
             assert.deepStrictEqual(queued.modelSelection, atEffort(before, "medium"));
-            yield* threads.dispatch({
-              type: "queued-run.cancel",
-              commandId: CommandId.make("owner-cancel:second-mechanical"),
-              threadId: author.threadId,
-              runId: second.runId,
-            });
-            yield* drainFactory;
-            const cancelled = (yield* projection()).runs.find(({ id }) => id === second.runId)!;
-            assert.strictEqual(cancelled.status, "cancelled");
-            assert.isNull(cancelled.startedAt);
-            assert.isFalse(world.provider.started.some(({ runId }) => runId === second.runId));
-            assert.strictEqual((yield* stateOf(author.deliveryId)).status, "blocked");
+            if (secondTurn === "cancelled") {
+              yield* threads.dispatch({
+                type: "queued-run.cancel",
+                commandId: CommandId.make("owner-cancel:second-mechanical"),
+                threadId: author.threadId,
+                runId: second.runId,
+              });
+              yield* drainFactory;
+              const cancelled = (yield* projection()).runs.find(({ id }) => id === second.runId)!;
+              assert.strictEqual(cancelled.status, "cancelled");
+              assert.isNull(cancelled.startedAt);
+              assert.isFalse(world.provider.started.some(({ runId }) => runId === second.runId));
+              assert.strictEqual((yield* stateOf(author.deliveryId)).status, "blocked");
+            } else {
+              const saved =
+                yield* (yield* FactoryTurnSelectionStore.FactoryTurnSelectionStore).list(
+                  author.threadId,
+                );
+              assert.isNull(saved[0]!.mechanical);
+              assert.deepStrictEqual(saved[0]!.before, before);
+              yield* world.endRun(ownerRun, "completed");
+              const started = (yield* projection()).runs.find(({ id }) => id === second.runId)!;
+              assert.strictEqual(started.status, "running");
+              assert.deepStrictEqual(started.modelSelection, atEffort(before, "medium"));
+            }
             yield* authorCommits(
               author.worktreePath,
               "fix: commit the work",
               "export const x = 2;\n",
             );
-            yield* world.endRun(ownerRun, "completed");
-            yield* service.resume(author.deliveryId);
+            if (secondTurn === "cancelled") {
+              yield* world.endRun(ownerRun, "completed");
+              yield* service.resume(author.deliveryId);
+            } else yield* world.endRun(second.runId, "completed");
             yield* drainFactory;
             yield* drainOrchestration;
             const resumed = yield* stateOf(author.deliveryId);
@@ -964,11 +989,12 @@ describe("Factory fix-commit effort", () => {
           providers: [
             {
               instanceId: integratedInstanceId,
-              models: [{ slug: "test-model", capabilities: { optionDescriptors: [effort] } }],
+              models: [{ slug: "test-model", capabilities: { optionDescriptors: descriptors } }],
             } as unknown as ServerProvider,
           ],
         },
-      ),
+      );
+    },
   );
 
   it.live.each([
@@ -1630,6 +1656,32 @@ describe("Factory fix-commit effort", () => {
         assert.deepStrictEqual(world.sends[0], world.sends[1]);
         assert.isFalse("modelSelection" in world.sends[0]!);
         assert.strictEqual(world.accepted.size, 1);
+      }),
+    ),
+  );
+
+  it.effect("keeps the original effort through repeated fix-commits without modelSelection", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        yield* prepare(world);
+        const delivery = yield* stored;
+        const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
+        yield* threads.sendFixCommitTurn(delivery, fixEffect);
+        assert.deepStrictEqual(world.selection, atEffort(original, "medium"));
+        world.descriptors = [{ ...effort, options: [{ id: "high", label: "High" }] }];
+        for (const id of [4, 5]) {
+          yield* threads.sendFixCommitTurn(delivery, { ...fixEffect, id });
+          assert.isFalse("modelSelection" in world.sends.at(-1)!);
+          assert.deepStrictEqual(world.selection, atEffort(original, "medium"));
+        }
+        yield* threads.sendReviewRetryTurn(delivery, {
+          id: 6,
+          type: "send_review_retry_turn",
+          threadId: author,
+          problems: ["Submit the review again."],
+        });
+        assert.deepStrictEqual(world.sends.at(-1)?.modelSelection, original);
+        assert.deepStrictEqual(world.selection, original);
       }),
     ),
   );
