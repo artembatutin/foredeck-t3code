@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import { ProjectId } from "@t3tools/contracts";
+import { CommandId, ProjectId, ThreadId } from "@t3tools/contracts";
 import { FactoryProjectSettings } from "@t3tools/contracts/fd/factory";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -14,6 +14,7 @@ import * as Work from "../../work-management/index.ts";
 import * as Factory from "../index.ts";
 import * as FactoryMigrations from "./FactoryMigrations.ts";
 import * as FactorySettingsStore from "./FactorySettingsStore.ts";
+import * as FactoryTurnSelectionStore from "./FactoryTurnSelectionStore.ts";
 
 const factoryManifest = FactoryMigrations.factoryMigrationEntries.map(
   ([id, name]) => [id, name] as const,
@@ -78,7 +79,6 @@ describe("runFactoryMigrations", () => {
         ["table", "fd_factory_tasks"],
         ["table", "fd_factory_turn_selections"],
         ["table", "fd_factory_work_comments"],
-        ["trigger", "fd_factory_preserve_selection_history"],
       ]);
       // The same numeric id names a different migration in each ledger.
       assert.deepStrictEqual(
@@ -105,6 +105,55 @@ describe("runFactoryMigrations", () => {
       assert.deepStrictEqual(yield* workLedger, work);
       assert.deepStrictEqual(yield* store.get(alpha), Option.some(settings));
     }).pipe(Effect.provide(FactorySettingsStore.layer.pipe(Layer.provideMerge(coreAndWork)))),
+  );
+
+  it.effect("retires the version-10 trigger without losing its archived owner choices", () =>
+    Effect.gen(function* () {
+      yield* Migrator.make({})({
+        loader: Migrator.fromRecord(
+          Object.fromEntries(
+            FactoryMigrations.factoryMigrationEntries
+              .filter(([id]) => id <= 10)
+              .map(([id, name, migration]) => [`${id}_${name}`, migration]),
+          ),
+        ),
+        table: FactoryMigrations.FACTORY_MIGRATIONS_TABLE,
+      });
+      const sql = yield* SqlClient.SqlClient;
+      // Represents the trigger installed by the interrupted build. No new build installs it.
+      yield* sql`CREATE TRIGGER fd_factory_preserve_selection_history
+          BEFORE DELETE ON orchestration_events BEGIN SELECT 1; END`;
+      const selection = JSON.stringify({ instanceId: "owner-provider", model: "owner-model" });
+      yield* sql`INSERT INTO fd_factory_selection_history
+          (sequence, thread_id, command_id, selection_json)
+          VALUES (42, 'thread', 'owner-command', ${selection})`;
+      const archived = yield* sql`SELECT * FROM fd_factory_selection_history`;
+      const schema = yield* schemaObjects;
+      const core = yield* coreLedger;
+      const work = yield* workLedger;
+      assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), [
+        [11, "FactoryRetireSelectionHistoryTrigger"],
+      ]);
+      assert.deepStrictEqual(
+        yield* schemaObjects,
+        schema.filter(({ name }) => name !== "fd_factory_preserve_selection_history"),
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM fd_factory_selection_history`, archived);
+      const turns = yield* FactoryTurnSelectionStore.FactoryTurnSelectionStore;
+      assert.deepStrictEqual(
+        yield* turns.legacyHistory({ threadId: ThreadId.make("thread"), throughSequence: 42 }),
+        [
+          {
+            sequence: 42,
+            commandId: CommandId.make("owner-command"),
+            selection: JSON.parse(selection),
+          },
+        ],
+      );
+      assert.deepStrictEqual(yield* coreLedger, core);
+      assert.deepStrictEqual(yield* workLedger, work);
+      assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), []);
+    }).pipe(Effect.provide(FactoryTurnSelectionStore.layer.pipe(Layer.provideMerge(coreAndWork)))),
   );
 
   it.effect(
@@ -143,6 +192,7 @@ describe("runFactoryMigrations", () => {
         const work = yield* workLedger;
         assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), [
           [10, "FactorySelectionHistory"],
+          [11, "FactoryRetireSelectionHistoryTrigger"],
         ]);
         assert.deepStrictEqual(yield* sql`SELECT * FROM fd_factory_turn_selections`, saved);
         assert.deepStrictEqual(yield* coreLedger, core);

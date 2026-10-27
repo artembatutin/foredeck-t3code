@@ -525,7 +525,25 @@ const make = Effect.gen(function* () {
         // Keep the preceding selection, including system writes: choosing medium while a
         // mechanical turn is queued changes effort, but editing another option at medium
         // after it starts does not. Only command-bearing changes express owner intent.
-        const changes = yield* turnSelections.history({ threadId, throughSequence });
+        const changes = [...(yield* turnSelections.legacyHistory({ threadId, throughSequence }))];
+        for (const eventType of [
+          "thread.created",
+          "thread.model-selection-updated",
+          "thread.provider-switched",
+        ] as const) {
+          const history = yield* events
+            .read({ threadId, throughSequence, eventType })
+            .pipe(Stream.runCollect);
+          for (const { event, commandId, sequence } of history) {
+            if (
+              event.type === "thread.created" ||
+              event.type === "thread.model-selection-updated" ||
+              event.type === "thread.provider-switched"
+            )
+              changes.push({ selection: event.payload.modelSelection, commandId, sequence });
+          }
+        }
+        changes.sort((left, right) => left.sequence - right.sequence);
         const effortId = saved.mechanical?.options?.find(
           (option) =>
             saved.before.options?.find(({ id }) => id === option.id)?.value !== option.value,

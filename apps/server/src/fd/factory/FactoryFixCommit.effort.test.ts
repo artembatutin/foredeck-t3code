@@ -327,9 +327,13 @@ const prepare = (world: World, risk: "normal" | "high" = "normal") =>
   });
 
 describe("Factory fix-commit effort", () => {
-  it.live.each(["unrelated option", "explicit medium"] as const)(
-    "preserves owner %s intent across public event compaction before restoration",
-    (change) =>
+  it.live.each(
+    (["unrelated option", "explicit medium"] as const).flatMap((change) =>
+      [false, true].map((legacyArchive) => ({ change, legacyArchive })),
+    ),
+  )(
+    "preserves owner $change intent across public event compaction before restoration (legacy archive: $legacyArchive)",
+    ({ change, legacyArchive }) =>
       withProject(
         verifyCommands.fails,
         (world) =>
@@ -378,13 +382,34 @@ describe("Factory fix-commit effort", () => {
                 threadId: author.threadId,
                 visitedAt: DateTime.formatIso(yield* DateTime.now),
               });
+            const events = yield* EventStore.EventStoreV2;
+            const choices = yield* events
+              .read({ threadId: author.threadId, eventType: "thread.model-selection-updated" })
+              .pipe(Stream.runCollect);
+            const sql = yield* SqlClient.SqlClient;
+            if (legacyArchive) {
+              // Fixture for the interrupted build: these events were deleted and only their
+              // selection provenance survived in its archive. No production code copies them.
+              for (const { event, sequence, commandId } of choices) {
+                if (event.type !== "thread.model-selection-updated") continue;
+                yield* sql`INSERT INTO fd_factory_selection_history
+                  (sequence, thread_id, command_id, selection_json)
+                  VALUES (${sequence}, ${author.threadId}, ${commandId},
+                    ${JSON.stringify(event.payload.modelSelection)})`;
+                yield* sql`DELETE FROM orchestration_events WHERE event_id = ${event.id}`;
+              }
+            }
             const compacted = yield* (yield* ProjectionMaintenance.ProjectionMaintenanceV2)
               .compactEventStore;
             assert.isAbove(compacted.deletedEventCount, 0);
-            const remaining = yield* (yield* EventStore.EventStoreV2)
+            const remaining = yield* events
               .read({ threadId: author.threadId, eventType: "thread.model-selection-updated" })
               .pipe(Stream.runCollect);
-            assert.lengthOf(remaining, change === "explicit medium" ? 0 : 1);
+            assert.lengthOf(remaining, legacyArchive ? 0 : change === "explicit medium" ? 4 : 3);
+            assert.lengthOf(
+              yield* sql`SELECT * FROM fd_factory_selection_history`,
+              legacyArchive ? choices.length : 0,
+            );
             yield* authorCommits(author.worktreePath, "fix: commit the work");
             yield* world.endRun(fixing.runId, "completed");
             yield* drainOrchestration;

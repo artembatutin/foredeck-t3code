@@ -142,6 +142,8 @@ const FactoryTurnSelections = Effect.gen(function* () {
 
 const FactorySelectionHistory = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  // Keep the ledger name and archive schema for databases from the pre-retention build.
+  // Fresh databases never install its trigger; core now retains selection events itself.
   yield* sql`CREATE INDEX fd_factory_stage_runs_thread ON fd_factory_stage_runs (thread_id)`;
   yield* sql`CREATE TABLE fd_factory_selection_history (
     sequence INTEGER PRIMARY KEY NOT NULL,
@@ -151,23 +153,12 @@ const FactorySelectionHistory = Effect.gen(function* () {
   )`;
   yield* sql`CREATE INDEX fd_factory_selection_history_thread
     ON fd_factory_selection_history (thread_id, sequence)`;
-  // Compaction keeps only the newest whole-thread event. Preserve selection provenance for
-  // Factory threads atomically with deletion, even while Factory's reactor is stopped.
-  // Keep just the selection and command identity, rather than another whole-thread history.
-  yield* sql`CREATE TRIGGER fd_factory_preserve_selection_history
-    BEFORE DELETE ON orchestration_events
-    WHEN OLD.application_event_version = 2 AND OLD.aggregate_kind = 'thread'
-      AND OLD.event_type IN ('thread.model-selection-updated', 'thread.provider-switched')
-      AND (
-        EXISTS (SELECT 1 FROM fd_factory_stage_runs WHERE thread_id = OLD.stream_id)
-        OR EXISTS (SELECT 1 FROM fd_factory_turn_selections WHERE thread_id = OLD.stream_id)
-      )
-    BEGIN
-      INSERT OR IGNORE INTO fd_factory_selection_history
-        (sequence, thread_id, command_id, selection_json)
-      VALUES (OLD.sequence, OLD.stream_id, OLD.command_id,
-        json_extract(OLD.payload_json, '$.modelSelection'));
-    END`;
+});
+
+const FactoryRetireSelectionHistoryTrigger = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`DROP TRIGGER IF EXISTS fd_factory_preserve_selection_history`;
+  // Already archived rows remain readable for existing overrides; nothing writes new rows.
 });
 
 export const factoryMigrationEntries = [
@@ -181,6 +172,7 @@ export const factoryMigrationEntries = [
   [8, "FactoryTaskChildClaims", FactoryTaskChildClaims],
   [9, "FactoryTurnSelections", FactoryTurnSelections],
   [10, "FactorySelectionHistory", FactorySelectionHistory],
+  [11, "FactoryRetireSelectionHistoryTrigger", FactoryRetireSelectionHistoryTrigger],
 ] as const;
 
 const run = Migrator.make({});

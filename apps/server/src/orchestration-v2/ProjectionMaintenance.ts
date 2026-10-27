@@ -205,7 +205,9 @@ export const layer: Layer.Layer<
     // Thread-state events whose payload is the complete thread: only the
     // newest per thread can influence a replay or an afterSequence catch-up.
     // thread.created stays out — verify derives the expected thread set from
-    // it, and it anchors replay ordering.
+    // it, and it anchors replay ordering. Model-selection and provider changes
+    // also stay: their command provenance records explicit owner choices even
+    // when a later whole-thread snapshot contains the same selection.
     const SUPERSEDABLE_THREAD_EVENT_TYPES = [
       "thread.archived",
       "thread.unarchived",
@@ -223,8 +225,6 @@ export const layer: Layer.Layer<
       "thread.pull-request-synced",
       "thread.runtime-mode-updated",
       "thread.interaction-mode-updated",
-      "thread.model-selection-updated",
-      "thread.provider-switched",
       "thread.visited",
       "thread.marked-unread",
     ];

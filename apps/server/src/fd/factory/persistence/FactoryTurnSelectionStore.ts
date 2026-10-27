@@ -42,8 +42,8 @@ export class FactoryTurnSelectionStore extends Context.Service<
       threadId: ThreadId,
     ) => Effect.Effect<ReadonlyArray<typeof Selection.Type>, FactoryStoreError>;
     readonly record: (selection: typeof Selection.Type) => Effect.Effect<void, FactoryStoreError>;
-    /** Selection provenance includes the rows core event compaction has removed. */
-    readonly history: (
+    /** Frozen archive from migration 10's retired trigger; new history comes from EventStore. */
+    readonly legacyHistory: (
       key: typeof HistoryKey.Type,
     ) => Effect.Effect<ReadonlyArray<typeof SelectionChange.Type>, FactoryStoreError>;
   }
@@ -80,17 +80,10 @@ const make = Effect.gen(function* () {
       ON CONFLICT (delivery_id, effect_id) DO NOTHING
     `,
   });
-  const history = SqlSchema.findAll({
+  const legacyHistory = SqlSchema.findAll({
     Request: HistoryKey,
     Result: SelectionChange,
     execute: ({ threadId, throughSequence }) => sql`
-      SELECT sequence, command_id AS "commandId",
-        json_extract(payload_json, '$.modelSelection') AS selection
-      FROM orchestration_events
-      WHERE application_event_version = 2 AND aggregate_kind = 'thread'
-        AND stream_id = ${threadId} AND sequence <= ${throughSequence}
-        AND event_type IN ('thread.created', 'thread.model-selection-updated', 'thread.provider-switched')
-      UNION ALL
       SELECT sequence, command_id AS "commandId", selection_json AS selection
       FROM fd_factory_selection_history
       WHERE thread_id = ${threadId} AND sequence <= ${throughSequence}
@@ -103,8 +96,10 @@ const make = Effect.gen(function* () {
       list(threadId).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.list"))),
     record: (selection) =>
       record(selection).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.record"))),
-    history: (key) =>
-      history(key).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.history"))),
+    legacyHistory: (key) =>
+      legacyHistory(key).pipe(
+        Effect.catchTags(FactoryStoreError.catchStorage("turns.legacyHistory")),
+      ),
   });
 });
 
