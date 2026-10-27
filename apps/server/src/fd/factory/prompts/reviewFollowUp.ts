@@ -11,6 +11,7 @@ const RESPONSE_MAX_CHARS = 8_000;
  * is labelled as claims, so the round judges the code rather than the author's account of it.
  */
 export const renderReviewFollowUpPrompt = (input: {
+  readonly rulesOverride?: string | undefined;
   readonly round: number;
   readonly branch: string;
   /** The task baseline; the review covers `baseline..receipt.headSha`. */
@@ -43,6 +44,6 @@ export const renderReviewFollowUpPrompt = (input: {
       ? "The author sent no reply to your findings."
       : `The author's reply to your findings. These are claims to check against the code, not evidence:\n${fence(bounded, "text")}`,
     "Recheck every previous finding: keep its id while it still applies, and leave it out once the code fixes it. Report new problems as new findings with new ids.",
-    ...reviewInstructionSections(),
+    ...reviewInstructionSections(undefined, input.rulesOverride),
   ].join("\n\n");
 };

@@ -8,6 +8,7 @@ import { commandLine, describeResult } from "./review.ts";
  * the command, how it ended and the end of its output.
  */
 export const renderFixVerifyPrompt = (input: {
+  readonly rulesOverride?: string | undefined;
   /** The failed run's receipt. */
   readonly receipt: FactoryVerifyReceipt;
   /** The end of the run's log. */
@@ -26,7 +27,7 @@ export const renderFixVerifyPrompt = (input: {
       ? "The command printed nothing."
       : `The end of its output:\n${fence(input.tail, "text")}`,
     "Your task: find why this check fails and fix it in this worktree, then stop.",
-    repairRules({ branch: input.branch, round: input.round }),
+    input.rulesOverride ?? repairRules({ branch: input.branch, round: input.round }),
     "Reply with the cause you found, what you changed and the committed tests that cover it.",
   ].join("\n\n");
 };

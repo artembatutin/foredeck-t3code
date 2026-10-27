@@ -62,6 +62,7 @@ export const itemSections = (item: FactoryAuthorItem, heading: string): Array<st
 export const renderAuthorPrompt = (input: {
   readonly item: FactoryAuthorItem;
   readonly branch: string;
+  readonly rulesOverride?: string | undefined;
 }): string => {
   const { item } = input;
   const sections = itemSections(
@@ -76,7 +77,7 @@ export const renderAuthorPrompt = (input: {
     // The worktree's copy of a Markdown task file is not the canonical one.
     ...(item.locator === undefined ? [] : [`Do not edit \`${item.locator}\` in this worktree.`]),
   ];
-  sections.push(`Rules:\n${rules.map((rule) => `- ${rule}`).join("\n")}`);
+  sections.push(input.rulesOverride ?? `Rules:\n${rules.map((rule) => `- ${rule}`).join("\n")}`);
   sections.push(
     "Finish with a summary that maps each acceptance criterion to the committed test paths that check it, and label anything unverified.",
   );

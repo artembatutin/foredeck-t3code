@@ -66,12 +66,13 @@ const SUBMIT = [
 export const renderPlanPrompt = (input: {
   readonly item: FactoryAuthorItem;
   readonly branch: string;
+  readonly rulesOverride?: string | undefined;
 }): string => {
   const { item } = input;
   const sections = itemSections(item, `Factory plan for Work item ${item.key}: ${item.title}`);
   sections.push(
     `Your task: plan how to deliver this Work item as tasks that Factory builds one after another on branch \`${input.branch}\` in this worktree. The owner approves the plan before any task starts.`,
-    `Rules:\n${RULES.map((rule) => `- ${rule}`).join("\n")}`,
+    input.rulesOverride ?? `Rules:\n${RULES.map((rule) => `- ${rule}`).join("\n")}`,
     SHAPE,
     `${SUBMIT}\n\n${EXAMPLE}`,
   );
@@ -87,6 +88,7 @@ const RESUBMIT =
  * checkpoint and the problems of the plan the delivery blocked on, if any.
  */
 export const renderPlanRetryPrompt = (input: {
+  readonly rulesOverride?: string | undefined;
   readonly problems: ReadonlyArray<string>;
   /** Set on a resume: the checkpoint the delivery resumes from. */
   readonly checkpoint: FactoryStageName | null;
@@ -96,12 +98,14 @@ export const renderPlanRetryPrompt = (input: {
     return [
       `Factory could not accept your plan:\n${problems}`,
       `Correct these problems and submit the whole plan again: ${RESUBMIT} This is the last attempt before the delivery blocks.`,
+      ...(input.rulesOverride === undefined ? [] : [input.rulesOverride]),
     ].join("\n\n");
   }
   return [
     `Factory is resuming this delivery from its \`${input.checkpoint}\` checkpoint and needs your plan again.`,
     ...(problems === "" ? [] : [`Your last plan had these problems:\n${problems}`]),
     `Submit the whole plan again, following the rules of your first message: ${RESUBMIT}`,
+    ...(input.rulesOverride === undefined ? [] : [input.rulesOverride]),
   ].join("\n\n");
 };
 
@@ -109,7 +113,10 @@ export const renderPlanRetryPrompt = (input: {
  * The follow-up an owner's replan sends: the owner's note on the plan the delivery waited on at
  * the gate, quoted as written, and the request for a whole new plan.
  */
-export const renderReplanPrompt = (input: { readonly note: string }): string => {
+export const renderReplanPrompt = (input: {
+  readonly note: string;
+  readonly rulesOverride?: string | undefined;
+}): string => {
   const note = input.note
     .split("\n")
     .map((line) => (line.length === 0 ? ">" : `> ${line}`))
@@ -118,5 +125,6 @@ export const renderReplanPrompt = (input: { readonly note: string }): string => 
     "The owner sent your plan back from Factory's plan gate with this note:",
     note,
     `Plan again as the note asks, following the rules of your first message, and submit the whole plan: ${RESUBMIT}`,
+    ...(input.rulesOverride === undefined ? [] : [input.rulesOverride]),
   ].join("\n\n");
 };

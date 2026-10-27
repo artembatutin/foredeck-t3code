@@ -185,7 +185,25 @@ const fakes = (world: World) =>
           messages: [],
         }))) as unknown as ProjectionStore.ProjectionStoreV2["Service"]["getThreadRecords"],
     }),
-    Layer.mock(ProjectStore.ProjectStoreV2)({}),
+    Layer.mock(ProjectStore.ProjectStoreV2)({
+      get: (id) =>
+        Effect.sync(() =>
+          Option.some({
+            projectId: id,
+            title: "Alpha",
+            workspaceRoot: world.cwd,
+            defaultModelSelection: null,
+            defaultThreadEnvMode: null,
+            autoPull: false,
+            faviconPath: null,
+            projectIcon: null,
+            scripts: [],
+            createdAt: "2026-10-27T00:00:00.000Z",
+            updatedAt: "2026-10-27T00:00:00.000Z",
+            deletedAt: null,
+          }),
+        ),
+    }),
     Layer.mock(WorkService.WorkService)({}),
     Layer.mock(ProviderRegistry.ProviderRegistry)({
       getProviders: Effect.sync(

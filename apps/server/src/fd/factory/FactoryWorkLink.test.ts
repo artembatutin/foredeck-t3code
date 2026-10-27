@@ -120,10 +120,24 @@ const fakes = (world: World) =>
     Layer.mock(ProjectionStore.ProjectionStoreV2)({
       getThreadShell: (threadId) => Effect.sync(() => world.threads.get(threadId) ?? null),
       getThreadRecords: ((threadId: ThreadId) =>
-        Effect.sync(() => ({
-          thread: { id: threadId, worktreePath: world.worktree, deletedAt: null },
-          runs: [{ id: runId, ...world.run }],
-        }))) as unknown as ProjectionStore.ProjectionStoreV2["Service"]["getThreadRecords"],
+        Effect.suspend(() => {
+          if (!world.threads.has(threadId)) {
+            return Effect.fail(
+              new ProjectionStore.ProjectionStoreThreadNotFoundError({ threadId }),
+            );
+          }
+          return Effect.succeed({
+            thread: { id: threadId, worktreePath: world.worktree, deletedAt: null },
+            runs: [
+              {
+                id: runId,
+                userMessageId: world.launches.find((launch) => launch.threadId === threadId)
+                  ?.initialMessage?.messageId,
+                ...world.run,
+              },
+            ],
+          });
+        })) as unknown as ProjectionStore.ProjectionStoreV2["Service"]["getThreadRecords"],
     }),
     Layer.mock(ProjectStore.ProjectStoreV2)({
       get: (id) =>

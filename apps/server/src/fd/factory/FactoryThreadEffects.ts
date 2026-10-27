@@ -13,6 +13,7 @@ import {
   type WorktreeSetupSnapshot,
 } from "@t3tools/contracts";
 import { FactoryDeliveryId, FactoryRole } from "@t3tools/contracts/fd/factory";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { getProviderOptionCurrentValue, modelSelectionsEqual } from "@t3tools/shared/model";
 import * as Context from "effect/Context";
@@ -20,6 +21,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
@@ -57,6 +59,11 @@ import { renderFixCommitPrompt } from "./prompts/fixCommit.ts";
 import { renderFixReviewPrompt } from "./prompts/fixReview.ts";
 import { renderFixVerifyPrompt } from "./prompts/fixVerify.ts";
 import { integrateThreadTitle, renderIntegratePrompt } from "./prompts/integrate.ts";
+import {
+  FactoryPromptOverrideError,
+  type FactoryPromptName,
+  MAX_PROMPT_OVERRIDE_BYTES,
+} from "./prompts/overrides.ts";
 import {
   planThreadTitle,
   renderPlanPrompt,
@@ -432,12 +439,81 @@ const make = Effect.gen(function* () {
   // server always provides it; without it a launch waits on the recorded worktree alone.
   const setupTracker = yield* Effect.serviceOption(WorktreeSetupTracker.WorktreeSetupTracker);
   const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const platform = yield* HostProcess.Platform;
   const exists = (path: string) => fileSystem.exists(path).pipe(Effect.orElseSucceed(() => false));
   const realPath = (path: string) =>
     fileSystem.realPath(path).pipe(Effect.orElseSucceed(() => path));
   const intakeContext = yield* Effect.context<
     ThreadManagement.ThreadManagementService | ServerConfig.ServerConfig | FileSystem.FileSystem
   >();
+
+  /** Read only the canonical checkout, on every send; absence alone selects the built-in rules. */
+  const readOverride = (root: string, prompt: FactoryPromptName) =>
+    Effect.gen(function* () {
+      const invalid = new FactoryPromptOverrideError({ prompt });
+      const segments = [".foredeck", "factory", "prompts", `${prompt}.md`];
+      let current = root;
+      let canonicalRoot: string | undefined;
+      for (const segment of segments) {
+        // A directory entry distinguishes absence from a present but dangling symlink. Once
+        // present, resolution/read failures must not fall back to the built-in prompt.
+        const entries = yield* fileSystem.readDirectory(current).pipe(
+          Effect.catchTags({
+            PlatformError: (cause) =>
+              current === root && cause.reason._tag === "NotFound"
+                ? Effect.succeed<Array<string>>([])
+                : Effect.fail(cause),
+          }),
+        );
+        if (!entries.includes(segment)) return undefined;
+        canonicalRoot ??= yield* fileSystem.realPath(root);
+        current = yield* fileSystem.realPath(path.join(current, segment));
+        const relative = path.relative(canonicalRoot, current);
+        if (
+          relative === ".." ||
+          relative.startsWith(`..${path.sep}`) ||
+          path.isAbsolute(relative)
+        ) {
+          return yield* invalid;
+        }
+      }
+      // Refuse directories and special files before opening (in particular a FIFO must not wait).
+      const info = yield* fileSystem.stat(current);
+      if (info.type !== "File" || info.size > MAX_PROMPT_OVERRIDE_BYTES) return yield* invalid;
+      const file = yield* fileSystem.open(current, { noFollow: platform !== "win32" });
+      const opened = yield* file.stat;
+      if (opened.type !== "File" || opened.size > MAX_PROMPT_OVERRIDE_BYTES) return yield* invalid;
+      const buffer = new Uint8Array(MAX_PROMPT_OVERRIDE_BYTES + 1);
+      let length = 0;
+      while (length < buffer.length) {
+        const bytesRead = yield* file.read(buffer.subarray(length));
+        if (bytesRead === 0) break;
+        length += bytesRead;
+      }
+      if (length > MAX_PROMPT_OVERRIDE_BYTES) return yield* invalid;
+      const text = yield* Effect.try({
+        try: () =>
+          new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+            buffer.subarray(0, length),
+          ),
+        catch: (cause) => new FactoryPromptOverrideError({ prompt, cause }),
+      });
+      if (text.trim().length === 0) return yield* invalid;
+      return text;
+    }).pipe(
+      Effect.scoped,
+      Effect.catchTags({
+        PlatformError: (cause) => Effect.fail(new FactoryPromptOverrideError({ prompt, cause })),
+      }),
+    );
+
+  const projectOverride = (projectId: ProjectId, prompt: FactoryPromptName) =>
+    Effect.gen(function* () {
+      const project = Option.getOrUndefined(yield* projects.get(projectId));
+      if (project === undefined) return yield* new FactoryProjectMissingError({ projectId });
+      return yield* readOverride(project.workspaceRoot, prompt);
+    });
 
   /**
    * `selection` for a turn of `round`, with its effort raised when the task's risk or the round
@@ -1024,6 +1100,16 @@ const make = Effect.gen(function* () {
       const basis = role === "reviewer" ? yield* reviewBasis(delivery) : null;
       const project = Option.getOrUndefined(yield* projects.get(projectId));
       if (project === undefined) return yield* new FactoryProjectMissingError({ projectId });
+      const rulesOverride = yield* readOverride(
+        project.workspaceRoot,
+        role === "reviewer"
+          ? basis?.tasks === null
+            ? "review"
+            : "integrate"
+          : role === "planner"
+            ? "plan"
+            : "author",
+      );
       const resolved = resolveProjectSettings(
         yield* serverSettings.getSettings,
         project.projectId,
@@ -1063,7 +1149,10 @@ const make = Effect.gen(function* () {
         tasks === null
           ? {
               title: reviewThreadTitle(item),
-              text: renderReviewPrompt({ item, branch: state.branch, baseline, receipt }),
+              text: renderReviewPrompt(
+                { item, branch: state.branch, baseline, receipt },
+                rulesOverride,
+              ),
             }
           : {
               title: integrateThreadTitle(item),
@@ -1074,6 +1163,7 @@ const make = Effect.gen(function* () {
                 base: baseline,
                 receipt,
                 tasks,
+                rulesOverride,
               }),
             };
       // Planners and reviewers work in plan mode: they read and judge, and never change the
@@ -1084,12 +1174,12 @@ const make = Effect.gen(function* () {
           : role === "planner"
             ? {
                 title: planThreadTitle(item),
-                text: renderPlanPrompt({ item, branch: state.branch }),
+                text: renderPlanPrompt({ item, branch: state.branch, rulesOverride }),
                 interactionMode: "plan" as const,
               }
             : {
                 title: authorThreadTitle(item),
-                text: renderAuthorPrompt({ item, branch: state.branch }),
+                text: renderAuthorPrompt({ item, branch: state.branch, rulesOverride }),
                 interactionMode: "default" as const,
               };
       // Derived from the effect, so a retried launch replays its receipt instead of starting a
@@ -1278,6 +1368,7 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const { deliveryId, state } = delivery;
       const missing = new FactoryTurnBasisMissingError({ deliveryId, turn: effect.kind });
+      const rulesOverride = yield* projectOverride(delivery.projectId, effect.kind);
       if (effect.kind === "fix-verify") {
         const receipt = state.receipts.at(-1);
         if (receipt === undefined) return yield* missing;
@@ -1287,6 +1378,7 @@ const make = Effect.gen(function* () {
           tail,
           branch: state.branch,
           round: effect.round,
+          rulesOverride,
         });
       }
       const accepted = state.reviews.at(-1);
@@ -1302,6 +1394,7 @@ const make = Effect.gen(function* () {
           .map(({ description }) => description),
         branch: state.branch,
         round: effect.round,
+        rulesOverride,
       });
     }).pipe(Effect.provideContext(intakeContext));
 
@@ -1316,6 +1409,7 @@ const make = Effect.gen(function* () {
       const evidence = yield* readReviewEvidence(previous.evidencePath);
       const response = state.reviewResponse;
       return renderReviewFollowUpPrompt({
+        rulesOverride: yield* projectOverride(delivery.projectId, "review"),
         round: basis.round,
         branch: state.branch,
         baseline: basis.baseline,
@@ -1376,6 +1470,7 @@ const make = Effect.gen(function* () {
     launchThread,
     sendFixCommitTurn: (delivery, effect) =>
       Effect.gen(function* () {
+        const rulesOverride = yield* projectOverride(delivery.projectId, "fix-commit");
         const selection = yield* fixCommitSelection(delivery, effect);
         return yield* sendTurn(
           delivery,
@@ -1386,26 +1481,48 @@ const make = Effect.gen(function* () {
             branch: delivery.state.branch,
             baseline: delivery.state.baseline,
             checkpoint: effect.checkpoint ?? null,
+            rulesOverride,
           }),
           selection,
         );
       }),
     sendPlanRetryTurn: (delivery, effect) =>
-      sendTurn(
-        delivery,
-        effect,
-        "plan-retry",
-        renderPlanRetryPrompt({ problems: effect.problems, checkpoint: effect.checkpoint ?? null }),
-      ),
+      Effect.gen(function* () {
+        const rulesOverride = yield* projectOverride(delivery.projectId, "plan");
+        return yield* sendTurn(
+          delivery,
+          effect,
+          "plan-retry",
+          renderPlanRetryPrompt({
+            problems: effect.problems,
+            checkpoint: effect.checkpoint ?? null,
+            rulesOverride,
+          }),
+        );
+      }),
     sendReplanTurn: (delivery, effect) =>
-      sendTurn(delivery, effect, "replan", renderReplanPrompt({ note: effect.note })),
+      Effect.gen(function* () {
+        const rulesOverride = yield* projectOverride(delivery.projectId, "plan");
+        return yield* sendTurn(
+          delivery,
+          effect,
+          "replan",
+          renderReplanPrompt({ note: effect.note, rulesOverride }),
+        );
+      }),
     sendReviewRetryTurn: (delivery, effect) =>
-      sendTurn(
-        delivery,
-        effect,
-        "review-retry",
-        renderReviewRetryPrompt({ problems: effect.problems }),
-      ),
+      Effect.gen(function* () {
+        const rulesOverride = yield* projectOverride(
+          delivery.projectId,
+          delivery.state.stage === "integrate" ? "integrate" : "review",
+        );
+        return yield* sendTurn(
+          delivery,
+          effect,
+          "review-retry",
+          renderReviewRetryPrompt({ problems: effect.problems, rulesOverride }),
+        );
+      }),
     sendRepairTurn: (delivery, effect) =>
       Effect.gen(function* () {
         const text = yield* repairText(delivery, effect);

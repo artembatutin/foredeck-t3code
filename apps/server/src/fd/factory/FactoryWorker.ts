@@ -36,6 +36,7 @@ import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 import * as FactoryWorkCommentStore from "./persistence/FactoryWorkCommentStore.ts";
 import { transitionComment } from "./pipeline/comments.ts";
+import { isFactoryPromptOverrideError } from "./prompts/overrides.ts";
 import { advance } from "./pipeline/engine.ts";
 import { failureFingerprint } from "./pipeline/fingerprint.ts";
 import {
@@ -311,11 +312,11 @@ const SAFE_TAG = /^[A-Za-z][A-Za-z0-9]{0,63}$/;
 /**
  * The `effect.failed` detail: what failed and the failure's tag. Never its message or cause,
  * which can carry command output or provider text, except a setup failure's message, which is
- * fixed text naming how the command ended.
+ * fixed text naming how the command ended, or a prompt override's message naming only the prompt.
  */
 const failureDetail = (effect: FactoryEffect, cause: Cause.Cause<unknown>) => {
   const error = Option.getOrUndefined(Cause.findErrorOption(cause));
-  if (FactoryVerifyRunner.isFactorySetupFailedError(error)) {
+  if (FactoryVerifyRunner.isFactorySetupFailedError(error) || isFactoryPromptOverrideError(error)) {
     return `Factory could not ${describeEffect(effect)}. ${error.message}`;
   }
   const tag = typeof error === "object" && error !== null && "_tag" in error ? error._tag : null;

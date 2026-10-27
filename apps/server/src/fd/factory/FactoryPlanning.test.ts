@@ -125,12 +125,20 @@ const fakes = (world: World) =>
       streamStoredEventsFrom: () => Stream.empty,
     }),
     Layer.mock(ProjectionStore.ProjectionStoreV2)({
-      getThreadRecords: ((threadId: ThreadId) =>
-        Effect.sync(() => ({
-          thread: { id: threadId, worktreePath: world.worktreePath, deletedAt: null },
-          runs: [{ id: planRun, status: "running" }],
-          messages: world.messages,
-        }))) as unknown as ProjectionStore.ProjectionStoreV2["Service"]["getThreadRecords"],
+      getThreadRecords: ((threadId: ThreadId, fields: ReadonlyArray<string>) =>
+        Effect.suspend(() => {
+          // A first launch has no thread yet. Message-only fallback tests seed one themselves.
+          if (world.launches.length === 0 && fields.includes("runs")) {
+            return Effect.fail(
+              new ProjectionStore.ProjectionStoreThreadNotFoundError({ threadId }),
+            );
+          }
+          return Effect.succeed({
+            thread: { id: threadId, worktreePath: world.worktreePath, deletedAt: null },
+            runs: [{ id: planRun, status: "running" }],
+            messages: world.messages,
+          });
+        })) as unknown as ProjectionStore.ProjectionStoreV2["Service"]["getThreadRecords"],
     }),
     Layer.mock(ProjectStore.ProjectStoreV2)({
       get: (id) =>

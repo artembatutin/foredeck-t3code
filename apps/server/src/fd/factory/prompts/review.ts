@@ -104,20 +104,26 @@ export const verifiedCommitSection = (receipt: FactoryVerifyReceipt) =>
  * Every review round's rules, review fields and way to submit. `criteria` says which criteria the
  * review's `acceptance` covers, and how they are numbered; an item's by default.
  */
-export const reviewInstructionSections = (criteria = ITEM_CRITERIA): ReadonlyArray<string> => [
-  `Rules:\n${RULES.map((rule) => `- ${rule}`).join("\n")}`,
+export const reviewInstructionSections = (
+  criteria = ITEM_CRITERIA,
+  rulesOverride?: string,
+): ReadonlyArray<string> => [
+  rulesOverride ?? `Rules:\n${RULES.map((rule) => `- ${rule}`).join("\n")}`,
   shape(criteria),
   `${SUBMIT}\n\n${EXAMPLE}`,
 ];
 
-export const renderReviewPrompt = (input: FactoryReviewPromptInput): string => {
+export const renderReviewPrompt = (
+  input: FactoryReviewPromptInput,
+  rulesOverride?: string,
+): string => {
   const { item, receipt } = input;
   const range = `${input.baseline}..${receipt.headSha}`;
   const sections = itemSections(item, `Factory review of Work item ${item.key}: ${item.title}`);
   sections.push(
     `Your task: review the work for this item on branch \`${input.branch}\` in this worktree, the commits in \`${range}\` (for example \`git log ${range}\` and \`git diff ${range}\`).`,
     verifiedCommitSection(receipt),
-    ...reviewInstructionSections(),
+    ...reviewInstructionSections(undefined, rulesOverride),
   );
   return sections.join("\n\n");
 };
@@ -125,8 +131,10 @@ export const renderReviewPrompt = (input: FactoryReviewPromptInput): string => {
 /** The one follow-up turn a reviewer gets after an invalid submission. */
 export const renderReviewRetryPrompt = (input: {
   readonly problems: ReadonlyArray<string>;
+  readonly rulesOverride?: string | undefined;
 }): string =>
   [
     `Factory could not accept your review:\n${input.problems.map((problem) => `- ${problem}`).join("\n")}`,
     "Correct these problems and submit the whole review again: call the `factory_submit_review` tool, and end your final message with the same review as JSON in one fenced ```json block. Change no file. This is the last attempt before the delivery blocks.",
+    ...(input.rulesOverride === undefined ? [] : [input.rulesOverride]),
   ].join("\n\n");

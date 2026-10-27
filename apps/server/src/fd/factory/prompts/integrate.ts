@@ -11,6 +11,7 @@ import { reviewInstructionSections, verifiedCommitSection } from "./review.ts";
 
 /** What an integrate reviewer reads: the parent item, its approved tasks and the verified commit. */
 export interface FactoryIntegratePromptInput {
+  readonly rulesOverride?: string | undefined;
   readonly item: FactoryAuthorItem;
   readonly branch: string;
   /** The ref the delivery created its branch from. */
@@ -65,6 +66,7 @@ export const renderIntegratePrompt = (input: FactoryIntegratePromptInput): strin
     `The approved tasks in plan order, with their acceptance criteria numbered across the plan:\n\n${taskSections(tasks).join("\n\n")}`,
     ...reviewInstructionSections(
       `one entry for each criterion numbered above, 1 to ${count}, with that number as its \`criterion\``,
+      input.rulesOverride,
     ),
   );
   return sections.join("\n\n");

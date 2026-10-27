@@ -6,6 +6,7 @@ import type { FactoryStageName } from "@t3tools/contracts/fd/factory";
  * resume sends it before anything else runs, naming the checkpoint the delivery resumes from.
  */
 export const renderFixCommitPrompt = (input: {
+  readonly rulesOverride?: string | undefined;
   readonly problems: ReadonlyArray<string>;
   readonly branch: string;
   /** The task baseline; commits after it are the author's own. */
@@ -24,11 +25,18 @@ export const renderFixCommitPrompt = (input: {
           "Your work so far stays: once the branch settles, Factory verifies and reviews it again, so do not start the task over.",
         ].join("\n\n"),
     [
-      "Fix only these problems, then stop:",
-      `- Work on \`${input.branch}\`: check it out again if the worktree left it, switch to no other branch, and never push or merge.`,
-      "- Commit any remaining changes with a Conventional Commit subject (`type(scope): summary`) and leave the worktree clean.",
+      ...(input.rulesOverride === undefined
+        ? [
+            "Fix only these problems, then stop:",
+            `- Work on \`${input.branch}\`: check it out again if the worktree left it, switch to no other branch, and never push or merge.`,
+            "- Commit any remaining changes with a Conventional Commit subject (`type(scope): summary`) and leave the worktree clean.",
+          ]
+        : [input.rulesOverride]),
+      // Keep the server's immutable task baseline even when the project supplies its own rules.
       `- To repair a commit message or identity, amend or reword only ${own}; never rewrite earlier commits.`,
-      "- Never name an AI agent, model or provider in commits, and add no AI attribution.",
+      ...(input.rulesOverride === undefined
+        ? ["- Never name an AI agent, model or provider in commits, and add no AI attribution."]
+        : []),
     ].join("\n"),
     "Reply with what you changed.",
   ].join("\n\n");
