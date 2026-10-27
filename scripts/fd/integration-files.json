@@ -327,6 +327,7 @@
     "packages/provider-core/package.json": "Exports the shared Foredeck repository-context formatter used by provider adapters.",
     "packages/provider-muse/src/server/adapter.test.ts": "Verifies a native turn receives both independent roots while retaining the primary process directory.",
     "packages/provider-muse/src/server/adapter.ts": "Sends all participating canonical workspace roots in each native turn and supplies named repository context.",
+    "packages/provider-pi/src/server/adapter.ts": "Reports the bound native session identity and current thinking level in the existing read-only thread snapshot payload, so temporary effort overrides can restore the actual inherited effort.",
     "packages/provider-opencode/src/server/adapter.test.ts": "Verifies repository grants preserve shell/edit approval and cannot interpret literal wildcard directory names as broader grants.",
     "packages/provider-opencode/src/server/adapter.ts": "Adds repository-scoped directory permissions and context to native sessions, rejecting external-server execution for local repository sets.",
     "packages/provider-opencode/src/server/driver.ts": "Advertises multi-repository support only for a local v2 server configuration.",

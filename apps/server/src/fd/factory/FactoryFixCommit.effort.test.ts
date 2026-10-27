@@ -2,9 +2,11 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
+  EventId,
   MessageId,
   type ModelSelection,
   ProjectId,
+  ProviderDriverKind,
   type ProviderOptionDescriptor,
   ProviderInstanceId,
   RunId,
@@ -24,8 +26,10 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../../config.ts";
+import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
+import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
@@ -49,6 +53,7 @@ import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
+import * as FactoryTurnSelectionStore from "./persistence/FactoryTurnSelectionStore.ts";
 import { advance } from "./pipeline/engine.ts";
 import { type FactoryEffect, queuedDeliveryState } from "./pipeline/state.ts";
 import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
@@ -95,6 +100,33 @@ const atEffort = (selection: ModelSelection, value: string): ModelSelection => (
     { id: "effort", value },
   ],
 });
+const piCatalog = (catalogDefault?: string) =>
+  [
+    {
+      instanceId: integratedInstanceId,
+      driver: ProviderDriverKind.make("pi"),
+      models: [
+        {
+          slug: "test/reasoning",
+          capabilities: {
+            optionDescriptors: [
+              {
+                id: "thinking",
+                label: "Thinking",
+                type: "select",
+                ...(catalogDefault === "medium" ? { currentValue: catalogDefault } : {}),
+                options: ["low", "medium", "high"].map((id) => ({
+                  id,
+                  label: id,
+                  ...(catalogDefault === "low" && id === catalogDefault ? { isDefault: true } : {}),
+                })),
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ] as unknown as ReadonlyArray<ServerProvider>;
 type Send = ThreadManagement.ThreadManagementSendInput;
 const runOf = (send: Send) => RunId.make(`run:${send.messageId}`);
 const fixEffect: Extract<FactoryEffect, { type: "send_fix_commit_turn" }> = {
@@ -782,9 +814,43 @@ describe("Factory fix-commit effort", () => {
       ),
   );
 
-  it.live(
-    "restores inherited high thinking on a concrete Pi model through the provider boundary",
-    () =>
+  it.live.each([
+    { name: "no advertised default", loaded: true, catalogDefault: undefined, owner: null },
+    {
+      name: "no advertised default in an inactive session",
+      loaded: false,
+      catalogDefault: undefined,
+      owner: null,
+    },
+    {
+      name: "a catalog default different from the inactive session",
+      loaded: false,
+      catalogDefault: "low",
+      owner: null,
+    },
+    {
+      name: "a catalog currentValue different from the active session",
+      loaded: true,
+      catalogDefault: "medium",
+      owner: null,
+    },
+    {
+      name: "an inactive session without a native reference",
+      loaded: false,
+      catalogDefault: undefined,
+      owner: null,
+    },
+    { name: "an owner model change", loaded: true, catalogDefault: undefined, owner: "model" },
+    { name: "an owner effort change", loaded: true, catalogDefault: undefined, owner: "effort" },
+    {
+      name: "an owner unrelated option change",
+      loaded: true,
+      catalogDefault: undefined,
+      owner: "option",
+    },
+  ] as const)(
+    "restores inherited Pi effort after medium fix-commit with $name",
+    ({ name, loaded, catalogDefault, owner }) =>
       withProject(
         verifyCommands.fails,
         (world) =>
@@ -798,20 +864,126 @@ describe("Factory fix-commit effort", () => {
               threadId: author.threadId,
               modelSelection: before,
             });
-            const pi = yield* makePiEffort(author.threadId, before);
+            const context =
+              yield* (yield* ProjectionStore.ProjectionStoreV2).getThreadProviderContext(
+                author.threadId,
+                before.instanceId,
+              );
+            const providerSessionId = context.providerThreads[0]!.providerSessionId!;
+            const pi = yield* makePiEffort(author.threadId, before, { loaded, providerSessionId });
+            const sink = yield* EventSink.EventSinkV2;
+            world.provider.threadLoads.ensure = (input) =>
+              pi.runtime.ensureThread(input).pipe(
+                // The real adapter publishes this native binding on its event stream. This
+                // harness uses a recording turn driver, so persist that provider event here.
+                Effect.tap((providerThread) =>
+                  sink
+                    .write({
+                      events: [
+                        {
+                          type: "provider-thread.updated",
+                          id: EventId.make(`test-loaded:${input.threadId}`),
+                          threadId: input.threadId,
+                          occurredAt: providerThread.updatedAt,
+                          payload: providerThread,
+                        },
+                      ],
+                    })
+                    .pipe(Effect.orDie),
+                ),
+              );
+            world.provider.threadLoads.resume = pi.runtime.resumeThread;
+            world.provider.threadLoads.snapshot = pi.runtime.readThreadSnapshot;
+            const service = yield* FactoryService.FactoryService;
+            if (!loaded) yield* service.stop(author.deliveryId);
             assert.strictEqual(pi.thinking(), "high");
             assert.deepStrictEqual(pi.levels(), []);
             const fs = yield* FileSystem.FileSystem;
-            yield* fs.writeFileString(`${author.worktreePath}/export.ts`, "uncommitted work\n");
+            if (loaded)
+              yield* fs.writeFileString(`${author.worktreePath}/export.ts`, "uncommitted work\n");
+            else yield* authorCommits(author.worktreePath, "fix: prepare before stopping");
             yield* world.endRun(author.runId, "completed");
+            if (!loaded) {
+              assert.strictEqual((yield* stateOf(author.deliveryId)).status, "stopped");
+              const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+              yield* sessions.close(providerSessionId);
+              assert.isTrue(Option.isNone(yield* sessions.get(providerSessionId)));
+              if (name === "an inactive session without a native reference") {
+                yield* (yield* EventSink.EventSinkV2).write({
+                  events: [
+                    {
+                      type: "provider-thread.updated",
+                      id: EventId.make("test-native-reference-cleared"),
+                      occurredAt: yield* DateTime.now,
+                      threadId: author.threadId,
+                      payload: { ...context.providerThreads[0]!, nativeThreadRef: null },
+                    },
+                  ],
+                });
+              }
+              yield* fs.writeFileString(`${author.worktreePath}/export.ts`, "uncommitted work\n");
+              yield* service.resume(author.deliveryId);
+              yield* drainFactory;
+            }
             yield* drainOrchestration;
-            const fixing = (yield* stateOf(author.deliveryId)).awaiting;
-            if (fixing?.type !== "run") return assert.fail("No mechanical turn started.");
+            const fixingState = yield* stateOf(author.deliveryId);
+            const fixing = fixingState.awaiting;
+            if (fixing?.type !== "run") return assert.fail(JSON.stringify(fixingState.block));
             const mechanical = world.provider.started.find(({ runId }) => runId === fixing.runId)!;
+            assert.isDefined(mechanical);
+            assert.deepStrictEqual(pi.levels(), []);
             yield* pi.run(mechanical);
             assert.strictEqual(pi.thinking(), "medium");
             assert.deepStrictEqual(pi.levels(), ["medium"]);
-            yield* authorCommits(author.worktreePath, "fix: commit the work");
+            const requests = pi.requests.map((request) => request["type"]);
+            assert.isBelow(requests.indexOf("get_state"), requests.indexOf("set_thinking_level"));
+            assert.strictEqual(requests.filter((type) => type === "prompt").length, 1);
+            const selections = yield* FactoryTurnSelectionStore.FactoryTurnSelectionStore;
+            const saved = (yield* selections.list(author.threadId))[0]!;
+            assert.deepStrictEqual(saved.before.options, [{ id: "thinking", value: "high" }]);
+            const effects = yield* FactoryThreadEffects.FactoryThreadEffects.pipe(
+              Effect.provide(
+                FactoryThreadEffects.layer.pipe(
+                  Layer.provide(
+                    Layer.mergeAll(
+                      Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+                      Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({}),
+                    ),
+                  ),
+                ),
+              ),
+            );
+            const replay = yield* effects.sendFixCommitTurn(
+              Option.getOrThrow(
+                yield* (yield* FactoryDeliveryStore.FactoryDeliveryStore).get(author.deliveryId),
+              ),
+              { ...fixEffect, id: saved.effectId, threadId: author.threadId },
+            );
+            assert.strictEqual(replay.runId, fixing.runId);
+            assert.lengthOf(world.provider.started, 2);
+            assert.lengthOf(pi.requests, requests.length);
+            const ownerSelection: ModelSelection | undefined =
+              owner === "model"
+                ? { ...before, model: "test/other" }
+                : owner === "effort"
+                  ? { ...before, options: [{ id: "thinking", value: "low" }] }
+                  : owner === "option"
+                    ? {
+                        ...before,
+                        options: [
+                          { id: "thinking", value: "medium" },
+                          { id: "fastMode", value: true },
+                        ],
+                      }
+                    : undefined;
+            if (ownerSelection !== undefined)
+              yield* threads.dispatch({
+                type: "thread.model-selection.set",
+                commandId: CommandId.make("owner-selection:after-mechanical"),
+                threadId: author.threadId,
+                modelSelection: ownerSelection,
+              });
+            yield* commit(author.worktreePath);
             yield* world.endRun(fixing.runId, "completed");
             yield* drainOrchestration;
             const resumed = yield* stateOf(author.deliveryId);
@@ -819,24 +991,105 @@ describe("Factory fix-commit effort", () => {
             assert.deepStrictEqual(resumed.rounds, { fix: 1, review: 0 });
             const repair = world.provider.started.at(-1)!;
             assert.notStrictEqual(repair.runId, fixing.runId);
+            assert.deepStrictEqual(
+              repair.modelSelection,
+              owner === "model" || owner === "effort"
+                ? ownerSelection
+                : {
+                    ...before,
+                    options: [
+                      ...(owner === "option" ? [{ id: "fastMode", value: true }] : []),
+                      { id: "thinking", value: "high" },
+                    ],
+                  },
+            );
+            if (owner === "model") return;
             yield* pi.run(repair);
-            assert.strictEqual(pi.thinking(), "high");
-            assert.deepStrictEqual(pi.levels(), ["medium", "high"]);
+            assert.strictEqual(pi.thinking(), owner === "effort" ? "low" : "high");
+            assert.deepStrictEqual(pi.levels(), ["medium", owner === "effort" ? "low" : "high"]);
           }).pipe(Effect.provide(piEffortLayer), Effect.scoped),
-        {
-          providers: [
-            {
-              instanceId: integratedInstanceId,
-              models: [
-                {
-                  slug: "test/reasoning",
-                  capabilities: { optionDescriptors: [{ ...effort, id: "thinking" }] },
-                },
-              ],
-            } as unknown as ServerProvider,
-          ],
-        },
+        { providers: piCatalog(catalogDefault) },
       ),
+  );
+
+  it.live.each([
+    "read failure",
+    "missing effort",
+    "unknown effort",
+    "different native session",
+    "load failure",
+  ] as const)("blocks before imposing medium on inherited native thinking with %s", (failure) =>
+    withProject(
+      verifyCommands.fails,
+      (world) =>
+        Effect.gen(function* () {
+          const author = yield* world.start;
+          const threads = yield* ThreadManagement.ThreadManagementService;
+          const before = { instanceId: integratedInstanceId, model: "test/reasoning" };
+          yield* threads.dispatch({
+            type: "thread.model-selection.set",
+            commandId: CommandId.make("owner-selection:pi-inherited"),
+            threadId: author.threadId,
+            modelSelection: before,
+          });
+          const context =
+            yield* (yield* ProjectionStore.ProjectionStoreV2).getThreadProviderContext(
+              author.threadId,
+              before.instanceId,
+            );
+          const providerThread = context.providerThreads[0]!;
+          const pi = yield* makePiEffort(author.threadId, before, {
+            loaded: false,
+            providerSessionId: providerThread.providerSessionId!,
+          });
+          world.provider.threadLoads.resume =
+            failure === "load failure"
+              ? () =>
+                  Effect.fail(
+                    new ProviderAdapter.ProviderAdapterResumeThreadError({
+                      driver: pi.runtime.driver,
+                      providerSessionId: pi.runtime.providerSessionId,
+                      providerThreadId: providerThread.id,
+                    }),
+                  )
+              : pi.runtime.resumeThread;
+          world.provider.threadLoads.snapshot = (input) =>
+            Effect.suspend(() => {
+              if (failure === "read failure") pi.state.failRead = true;
+              if (failure === "missing effort") pi.state.thinking = undefined;
+              if (failure === "unknown effort") pi.state.thinking = "unavailable";
+              if (failure === "different native session")
+                pi.state.nativeId = "native:another-thread";
+              return pi.runtime.readThreadSnapshot(input);
+            });
+          yield* (yield* FileSystem.FileSystem).writeFileString(
+            `${author.worktreePath}/export.ts`,
+            "uncommitted work\n",
+          );
+          yield* world.endRun(author.runId, "completed");
+          yield* drainOrchestration;
+          const state = yield* stateOf(author.deliveryId);
+          assert.strictEqual(state.status, "blocked");
+          assert.strictEqual(state.block?.reason, "effect_failed");
+          assert.lengthOf(world.provider.started, 1);
+          assert.deepStrictEqual(pi.levels(), []);
+          assert.isFalse(pi.requests.some((request) => request["type"] === "prompt"));
+          assert.deepStrictEqual(
+            (yield* threads.getProjectThread({
+              projectId: world.projectId,
+              threadId: author.threadId,
+            })).thread.modelSelection,
+            before,
+          );
+          assert.lengthOf(
+            yield* (yield* FactoryTurnSelectionStore.FactoryTurnSelectionStore).list(
+              author.threadId,
+            ),
+            0,
+          );
+        }).pipe(Effect.provide(piEffortLayer), Effect.scoped),
+      { providers: piCatalog() },
+    ),
   );
 
   it.effect.each(["immediate", "dequeued"] as const)(

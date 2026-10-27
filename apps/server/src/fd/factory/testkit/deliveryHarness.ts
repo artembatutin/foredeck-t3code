@@ -141,6 +141,9 @@ const makeFakeProvider = Effect.gen(function* () {
   const interrupted: Array<ProviderAdapter.ProviderAdapterV2InterruptInput> = [];
   const threadLoads: {
     before?: (() => Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>) | undefined;
+    ensure?: ProviderAdapter.ProviderAdapterV2SessionRuntime["ensureThread"];
+    resume?: ProviderAdapter.ProviderAdapterV2SessionRuntime["resumeThread"];
+    snapshot?: ProviderAdapter.ProviderAdapterV2SessionRuntime["readThreadSnapshot"];
   } = {};
   const providerTurnId = (turn: ProviderAdapter.ProviderAdapterV2TurnInput) =>
     ProviderTurnId.make(`provider-turn:${turn.attemptId}`);
@@ -187,31 +190,44 @@ const makeFakeProvider = Effect.gen(function* () {
             lastError: null,
           },
           events: Stream.fromQueue(events),
-          ensureThread: ({ threadId }) =>
+          ensureThread: (ensureInput) =>
             Effect.suspend(() => threadLoads.before?.() ?? Effect.void).pipe(
               Effect.andThen(
-                Effect.succeed({
-                  id: ProviderThreadId.make(`provider-thread:${threadId}`),
-                  driver,
-                  providerInstanceId: instanceId,
-                  providerSessionId: input.providerSessionId,
-                  appThreadId: threadId,
-                  ownerNodeId: null,
-                  nativeThreadRef: { driver, nativeId: `native:${threadId}`, strength: "strong" },
-                  nativeConversationHeadRef: null,
-                  status: "idle",
-                  firstRunOrdinal: null,
-                  lastRunOrdinal: null,
-                  handoffIds: [],
-                  forkedFrom: null,
-                  createdAt: now,
-                  updatedAt: now,
-                } satisfies OrchestrationV2ProviderThread),
+                Effect.suspend(
+                  () =>
+                    threadLoads.ensure?.(ensureInput) ??
+                    Effect.succeed({
+                      id: ProviderThreadId.make(`provider-thread:${ensureInput.threadId}`),
+                      driver,
+                      providerInstanceId: instanceId,
+                      providerSessionId: input.providerSessionId,
+                      appThreadId: ensureInput.threadId,
+                      ownerNodeId: null,
+                      nativeThreadRef: {
+                        driver,
+                        nativeId: `native:${ensureInput.threadId}`,
+                        strength: "strong",
+                      },
+                      nativeConversationHeadRef: null,
+                      status: "idle",
+                      firstRunOrdinal: null,
+                      lastRunOrdinal: null,
+                      handoffIds: [],
+                      forkedFrom: null,
+                      createdAt: now,
+                      updatedAt: now,
+                    } satisfies OrchestrationV2ProviderThread),
+                ),
               ),
             ),
-          resumeThread: ({ providerThread }) =>
+          resumeThread: (resumeInput) =>
             Effect.suspend(() => threadLoads.before?.() ?? Effect.void).pipe(
-              Effect.as(providerThread),
+              Effect.andThen(
+                Effect.suspend(
+                  () =>
+                    threadLoads.resume?.(resumeInput) ?? Effect.succeed(resumeInput.providerThread),
+                ),
+              ),
             ),
           startTurn: (turn) =>
             Effect.gen(function* () {
@@ -226,7 +242,8 @@ const makeFakeProvider = Effect.gen(function* () {
           // The turn goes on until the test ends it, as a provider still finishing it would.
           interruptTurn: (input) => Effect.sync(() => void interrupted.push(input)),
           respondToRuntimeRequest: () => Effect.void,
-          readThreadSnapshot: () => Effect.die("unused"),
+          readThreadSnapshot: (input) =>
+            Effect.suspend(() => threadLoads.snapshot?.(input) ?? Effect.die("unused")),
           rollbackThread: () => Effect.die("unused"),
           forkThread: () => Effect.die("unused"),
         };

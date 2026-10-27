@@ -2955,6 +2955,8 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 "Pi snapshot requested for a thread this session does not host",
               );
             }
+            const stateData = yield* request({ type: "get_state" });
+            const nativeThreadId = recordString(stateData, "sessionFile");
             // get_messages is Pi's active-branch view. get_entries returns the
             // whole session tree, including abandoned branches after /tree or
             // fork, which would leak discarded conversation into handoffs.
@@ -3001,6 +3003,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               providerTurns: [],
               messages,
               runtimeRequests: [],
+              providerPayload: {
+                nativeThreadId,
+                thinkingLevel: recordString(stateData, "thinkingLevel"),
+              },
             };
           }).pipe(
             Effect.mapError(

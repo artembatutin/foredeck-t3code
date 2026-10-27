@@ -1,5 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { type ModelSelection, ProviderSessionId, type ThreadId } from "@t3tools/contracts";
+import type { ModelSelection, ProviderSessionId, ThreadId } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -26,10 +26,15 @@ export const piEffortLayer = Layer.mergeAll(
 export const makePiEffort = Effect.fnUntraced(function* (
   threadId: ThreadId,
   selection: ModelSelection,
+  options: { readonly loaded: boolean; readonly providerSessionId: ProviderSessionId },
 ) {
   const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done>();
   const requests: Array<Record<string, unknown>> = [];
-  let thinking = "high";
+  const state: { thinking: string | undefined; nativeId: string; failRead: boolean } = {
+    thinking: "high",
+    nativeId: `native:${threadId}`,
+    failRead: false,
+  };
   let buffer = "";
   const json = Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown));
   const emit = (record: Record<string, unknown>) =>
@@ -55,13 +60,13 @@ export const makePiEffort = Effect.fnUntraced(function* (
               const record = yield* decode(buffer.slice(0, newline)).pipe(Effect.orDie);
               buffer = buffer.slice(newline + 1);
               requests.push(record);
-              if (record["type"] === "set_thinking_level") thinking = String(record["level"]);
+              if (record["type"] === "set_thinking_level") state.thinking = String(record["level"]);
               if (typeof record["id"] !== "string") continue;
               const data =
                 record["type"] === "get_state"
                   ? {
-                      sessionFile: "/fake/pi/session.jsonl",
-                      thinkingLevel: thinking,
+                      sessionFile: state.nativeId,
+                      thinkingLevel: state.thinking,
                       model: { provider: "test", id: "reasoning", reasoning: true },
                       isStreaming: false,
                     }
@@ -76,7 +81,7 @@ export const makePiEffort = Effect.fnUntraced(function* (
                 type: "response",
                 id: record["id"],
                 command: record["type"],
-                success: true,
+                success: !(state.failRead && record["type"] === "get_state"),
                 data,
               });
             }
@@ -107,15 +112,12 @@ export const makePiEffort = Effect.fnUntraced(function* (
   } as const;
   const runtime = yield* adapter.openSession({
     threadId,
-    providerSessionId: ProviderSessionId.make("mechanical-pi-session"),
+    providerSessionId: options.providerSessionId,
     modelSelection: selection,
     runtimePolicy,
   });
-  const providerThread = yield* runtime.ensureThread({
-    threadId,
-    modelSelection: selection,
-    runtimePolicy,
-  });
+  if (options.loaded)
+    yield* runtime.ensureThread({ threadId, modelSelection: selection, runtimePolicy });
   const terminals = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
   yield* runtime.events.pipe(
     Stream.filter((event) => event.type === "turn.terminal"),
@@ -123,14 +125,17 @@ export const makePiEffort = Effect.fnUntraced(function* (
     Effect.forkScoped,
   );
   return {
-    thinking: () => thinking,
+    runtime,
+    state,
+    requests,
+    thinking: () => state.thinking,
     levels: () =>
       requests
         .filter((record) => record["type"] === "set_thinking_level")
         .map((record) => record["level"]),
     run: (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
       Effect.gen(function* () {
-        yield* runtime.startTurn({ ...input, providerThread, runtimePolicy });
+        yield* runtime.startTurn({ ...input, runtimePolicy });
         yield* emit({ type: "agent_start" });
         yield* emit({ type: "agent_end", messages: [], willRetry: false });
         yield* emit({ type: "agent_settled" });

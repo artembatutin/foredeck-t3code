@@ -2,6 +2,8 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import * as RuntimePolicy from "../../orchestration-v2/RuntimePolicy.ts";
+import { RepositorySet } from "../multirepo/index.ts";
 import * as FactoryChildren from "./FactoryChildren.ts";
 import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
@@ -62,7 +64,11 @@ export const layerLive = FactoryService.layer.pipe(
   Layer.provideMerge(FactoryWorker.layer),
   Layer.provide(
     Layer.mergeAll(
-      FactoryThreadEffects.layer,
+      FactoryThreadEffects.layer.pipe(
+        Layer.provide(
+          RuntimePolicy.layerFromProjectStore.pipe(Layer.provide(RepositorySet.layerDefault)),
+        ),
+      ),
       FactoryVerifyRunner.layer,
       FactoryPlanning.layer,
       FactoryReview.layer,

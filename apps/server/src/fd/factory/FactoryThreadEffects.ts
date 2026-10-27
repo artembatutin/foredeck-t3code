@@ -27,6 +27,8 @@ import type * as ServerConfig from "../../config.ts";
 import * as EventStore from "../../orchestration-v2/EventStore.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
+import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
+import * as RuntimePolicy from "../../orchestration-v2/RuntimePolicy.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadMessageIntake from "../../orchestration-v2/ThreadMessageIntake.ts";
@@ -145,6 +147,16 @@ export class FactoryTurnBasisMissingError extends Schema.TaggedError<FactoryTurn
 ) {
   override get message(): string {
     return `Factory delivery ${this.deliveryId} records nothing for its ${this.turn} turn to act on.`;
+  }
+}
+
+/** A native inherited effort must be known before a temporary override can be sent safely. */
+export class FactoryMechanicalEffortUnavailableError extends Schema.TaggedError<FactoryMechanicalEffortUnavailableError>()(
+  "FactoryMechanicalEffortUnavailableError",
+  { threadId: ThreadId, cause: Schema.optional(Schema.Defect()) },
+) {
+  override get message(): string {
+    return `Factory could not read the current effort of thread ${this.threadId}.`;
   }
 }
 
@@ -332,6 +344,12 @@ export class FactoryThreadEffects extends Context.Service<
 >()("t3/fd/factory/FactoryThreadEffects") {}
 
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const decodeNativeThinking = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    nativeThreadId: Schema.String,
+    thinkingLevel: Schema.Literals(["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+  }),
+);
 
 /** Runtime modes from the narrowest to the broadest. */
 const runtimeModeRank: Record<RuntimeMode, number> = {
@@ -407,6 +425,9 @@ const make = Effect.gen(function* () {
   const git = yield* GitVcsDriver.GitVcsDriver;
   const providers = yield* ProviderRegistry.ProviderRegistry;
   const providerInstances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+  // Core owns this manager. A missing runtime capability fails only a turn that needs it.
+  const sessions = yield* Effect.serviceOption(ProviderSessionManager.ProviderSessionManagerV2);
+  const runtimePolicy = yield* Effect.serviceOption(RuntimePolicy.RuntimePolicyV2);
   // Where core reports a launch's workspace preparation when it has no run to report it on. The
   // server always provides it; without it a launch waits on the recorded worktree alone.
   const setupTracker = yield* Effect.serviceOption(WorktreeSetupTracker.WorktreeSetupTracker);
@@ -559,6 +580,87 @@ const make = Effect.gen(function* () {
       return selection === thread.modelSelection ? undefined : selection;
     });
 
+  const nativeThinking = Effect.fnUntraced(function* (threadId: ThreadId, before: ModelSelection) {
+    if (Option.isNone(sessions) || Option.isNone(runtimePolicy))
+      return yield* new FactoryMechanicalEffortUnavailableError({ threadId });
+    const context = yield* projections.getThreadProviderContext(threadId, before.instanceId);
+    const providerThread = context.providerThreads.find(
+      (candidate) =>
+        candidate.appThreadId === threadId &&
+        candidate.providerInstanceId === before.instanceId &&
+        candidate.ownerNodeId === null &&
+        candidate.id === context.thread.activeProviderThreadId,
+    );
+    if (
+      context.thread.deletedAt !== null ||
+      providerThread === undefined ||
+      providerThread.providerSessionId === null
+    )
+      return yield* new FactoryMechanicalEffortUnavailableError({ threadId });
+    const policy = yield* runtimePolicy.value.resolve({
+      thread: context.thread,
+      modelSelection: before,
+    });
+    const live = yield* sessions.value.get(providerThread.providerSessionId);
+    const existingSession = context.providerSessions.find(
+      ({ id }) => id === providerThread.providerSessionId,
+    );
+    const session = Option.isSome(live)
+      ? live.value
+      : yield* sessions.value.open({
+          threadId,
+          providerSessionId: providerThread.providerSessionId,
+          modelSelection: before,
+          runtimePolicy: policy,
+          ...(existingSession === undefined ? {} : { resumeFromSession: existingSession }),
+          ...(providerThread.nativeThreadRef?.nativeId == null
+            ? {}
+            : { initialNativeThreadId: providerThread.nativeThreadRef.nativeId }),
+          ...(providerThread.nativeMetadata?.itemIdentityVersion === undefined
+            ? {}
+            : {
+                initialProviderItemIdentityVersion:
+                  providerThread.nativeMetadata.itemIdentityVersion,
+              }),
+        });
+    // The managed runtime may be resident but unloaded. Resume binds the original native
+    // session without applying selection or starting an agent turn; core skips an exact load.
+    const loaded =
+      providerThread.nativeThreadRef === null
+        ? yield* session.ensureThread({
+            threadId,
+            modelSelection: before,
+            runtimePolicy: policy,
+            providerSessionId: providerThread.providerSessionId,
+            existingProviderThread: providerThread,
+          })
+        : yield* session.resumeThread({
+            threadId,
+            providerThread,
+            modelSelection: before,
+            runtimePolicy: policy,
+          });
+    if (
+      loaded.id !== providerThread.id ||
+      loaded.appThreadId !== threadId ||
+      loaded.providerSessionId !== providerThread.providerSessionId ||
+      loaded.providerInstanceId !== before.instanceId ||
+      (providerThread.nativeThreadRef !== null &&
+        loaded.nativeThreadRef?.nativeId !== providerThread.nativeThreadRef.nativeId)
+    )
+      return yield* new FactoryMechanicalEffortUnavailableError({ threadId });
+    const snapshot = yield* session.readThreadSnapshot({ providerThread: loaded });
+    const payload = yield* decodeNativeThinking(snapshot.providerPayload).pipe(
+      Effect.mapError((cause) => new FactoryMechanicalEffortUnavailableError({ threadId, cause })),
+    );
+    if (
+      snapshot.providerThread.id !== loaded.id ||
+      payload.nativeThreadId !== loaded.nativeThreadRef?.nativeId
+    )
+      return yield* new FactoryMechanicalEffortUnavailableError({ threadId });
+    return payload.thinkingLevel;
+  });
+
   const fixCommitSelection = (
     delivery: StoredFactoryDelivery,
     effect: { readonly id: number; readonly threadId: ThreadId },
@@ -570,9 +672,9 @@ const make = Effect.gen(function* () {
       const { thread } = yield* projections.getThreadRecords(effect.threadId, []);
       const before = yield* beforeMechanical(effect.threadId, thread.modelSelection);
       const available = yield* providers.getProviders;
-      const descriptors = available
-        .find((provider) => provider.instanceId === before.instanceId)
-        ?.models.find((model) => model.slug === before.model)?.capabilities?.optionDescriptors;
+      const provider = available.find((provider) => provider.instanceId === before.instanceId);
+      const descriptors = provider?.models.find((model) => model.slug === before.model)
+        ?.capabilities?.optionDescriptors;
       const mechanical = mechanicalEffort({ selection: before, descriptors });
       const inherited = descriptors?.find(
         (option) =>
@@ -581,9 +683,12 @@ const make = Effect.gen(function* () {
           mechanical.options?.some(({ id, value }) => id === option.id && value === "medium") &&
           !before.options?.some(({ id }) => id === option.id),
       );
-      const defaultValue = getProviderOptionCurrentValue(inherited);
-      // Omission can retain a provider's last explicit effort (Pi). Save the advertised
-      // effective default before applying medium so restoration actively resets that provider.
+      const defaultValue =
+        provider?.driver === "pi" && inherited?.id === "thinking"
+          ? yield* nativeThinking(effect.threadId, before)
+          : getProviderOptionCurrentValue(inherited);
+      // Pi retains omitted thinking on concrete models. Its catalog default cannot tell us
+      // the native session's current level; persist that level before imposing medium.
       const effectiveBefore =
         inherited !== undefined && typeof defaultValue === "string"
           ? {
