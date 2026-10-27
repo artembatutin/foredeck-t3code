@@ -163,19 +163,22 @@ const fakes = (world: World) =>
     }),
     Layer.mock(ProjectionStore.ProjectionStoreV2)({
       getThreadRecords: ((threadId: ThreadId, _fields: unknown, filter?: { runIds?: RunId[] }) =>
-        Effect.suspend(() => {
+        Effect.gen(function* () {
+          if (world.launches.length === 0 && filter === undefined) {
+            return yield* new ProjectionStore.ProjectionStoreThreadNotFoundError({ threadId });
+          }
           if (world.readsUntilFailure === 0) {
-            return Effect.fail(new ProjectionStore.ProjectionStoreReadError({ threadId }));
+            return yield* new ProjectionStore.ProjectionStoreReadError({ threadId });
           }
           if (world.readsUntilFailure !== null) world.readsUntilFailure -= 1;
           const runs = (filter?.runIds ?? []).flatMap((id) => {
             const status = world.runs.get(id);
             return status === undefined ? [] : [{ id, status }];
           });
-          return Effect.succeed({
+          return {
             thread: { id: threadId, worktreePath: world.worktreePath, deletedAt: null },
             runs,
-          });
+          };
         })) as unknown as ProjectionStore.ProjectionStoreV2["Service"]["getThreadRecords"],
     }),
     Layer.mock(ProjectStore.ProjectStoreV2)({

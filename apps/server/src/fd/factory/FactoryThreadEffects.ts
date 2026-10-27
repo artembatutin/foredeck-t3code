@@ -696,11 +696,11 @@ const make = Effect.gen(function* () {
       return worktreePath;
     });
 
-  /** Whether the thread exists with its opening turn, the run of `messageId`. */
+  /** Whether an existing thread has its opening turn; undefined when no thread exists yet. */
   const openingSent = (threadId: ThreadId, messageId: MessageId) =>
     projections.getThreadRecords(threadId, ["runs"]).pipe(
       Effect.map(({ runs }) => runs.some((run) => run.userMessageId === messageId)),
-      Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed(false) }),
+      Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.void }),
     );
 
   const launchThread: FactoryThreadEffects["Service"]["launchThread"] = (
@@ -817,8 +817,11 @@ const make = Effect.gen(function* () {
       ) {
         yield* beforeOpening(workspace.worktreePath);
       }
+      // An existing thread without its opening still needs recovery if setup was cleared since
+      // the runless launch. A fresh unconfigured launch keeps core's with-message path.
       const runless =
-        workspace.type === "worktree" && beforeOpening !== undefined
+        workspace.type === "worktree" &&
+        (beforeOpening !== undefined || (yield* openingSent(threadId, messageId)) === false)
           ? { workspace, setup: beforeOpening }
           : undefined;
       // Work links the thread to the delivery's item before the launch runs, so a run that ends
@@ -850,7 +853,8 @@ const make = Effect.gen(function* () {
           ? undefined
           : !launched.resumed
             ? yield* Effect.gen(function* () {
-                yield* runless.setup(yield* awaitRunlessWorkspace(threadId));
+                const worktreePath = yield* awaitRunlessWorkspace(threadId);
+                if (runless.setup !== undefined) yield* runless.setup(worktreePath);
                 return (yield* sendOpening).run;
               })
             : // A replay without the turn takes the worktree as the preparation left it, runs
@@ -875,7 +879,7 @@ const make = Effect.gen(function* () {
                   },
                   commandId,
                 });
-                yield* runless.setup(worktreePath);
+                if (runless.setup !== undefined) yield* runless.setup(worktreePath);
                 // Releasing through the same still-running core preparation would leave the new
                 // run waiting behind its async observer. It already handed off this workspace.
                 if (prepared) return (yield* sendOpening).run;
