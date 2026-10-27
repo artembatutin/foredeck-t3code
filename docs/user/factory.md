@@ -3,8 +3,8 @@
 Factory delivers a [Work](./work.md) item for you. A delivery runs an author agent on a new
 branch and worktree, verifies its commits by running the project's verify command on the server,
 has a reviewer agent on a fresh, separate thread check the verified commit, and sends failed
-checks or blocking findings back to the author as repair rounds. A repair that leaves the same
-failure ends the repairs early. Once a commit passes verify and review, Factory records its
+checks or blocking findings back to the author as repair rounds. A repeated failure on the same
+tree ends the repairs early. Once a commit passes verify and review, Factory records its
 approval and opens one pull request for the branch. Factory never merges it; merging is up to
 you.
 
@@ -17,15 +17,26 @@ use **Factory**:
   owns the project. It decides whether the work passes, so use the command that runs your checks,
   such as your test script. It must leave the checkout as it found it: a run that commits or
   changes files is refused and the delivery blocks.
-- **Setup command** is optional. It runs in the delivery's worktree before each author starts
-  (for a parent, before each child's author), so use it for what a fresh worktree needs first,
-  such as installing dependencies. It has the verify timeout. If it fails, the delivery blocks
-  before its author starts, and resuming runs it again.
+- **Setup command** is optional. It runs in the prepared delivery worktree before the first
+  author turn of a single item or each child of a parent. Use it for what the author needs first,
+  such as installing dependencies. It uses the verify timeout. A nonzero exit, signal, timeout or
+  failure to start blocks the delivery before that turn; fix the problem and **Resume** to retry.
+  It does not run for planning, review, repairs or pull request feedback rounds. Setup logs stay
+  with the delivery's evidence under T3 home; setup does not produce a verify receipt.
 - **Role models** pick the model for the **Planner**, the **Author** and the **Reviewer** from that
   environment's providers. **Default** uses the project's model, and the planner and the reviewer
   default to the author's. The planner plans an item delivered as a parent.
 - **Limits** set how many **Fix rounds** and **Review rounds** a delivery may spend, and the
   **Verify timeout** in minutes.
+- **Blocking severities** choose which review findings require a fix, even when the review's
+  verdict passes. **High** is selected by default; select any combination of High, Medium and
+  Low, including none. A changes-required verdict, an unverified acceptance criterion or missing
+  evidence still requires changes regardless of that selection.
+- **High-risk effort** is the effort value used for high-risk tasks and second or later repair
+  and review rounds, when the model offers it. It defaults to `xhigh`; enter a nonblank value
+  of at most 64 characters that your model supports. Escalation never lowers a higher effort
+  you chose. Mechanical fix-commit turns use `medium` when offered; that temporary choice does
+  not become the effort for later turns.
 
 Each command is an executable plus its arguments, not a shell line. Enter `npm` as the executable
 and `test` as an argument, each argument in its own field. Pipes, `&&`, variables and wildcards
@@ -33,10 +44,31 @@ are not interpreted, so put several steps in a script and run that.
 
 A running delivery keeps the round limits it started with. The verify and setup commands, the
 timeout and the role models are read when each step runs, so a change applies to the delivery's
-next verify or thread.
+next verify or thread. Blocking severities are read when a review is judged, so you can change
+them while the reviewer works. High-risk effort is read for each applicable turn.
 
 Factory settings are stored on each environment for its own checkout of the project. Changing
 them needs a live connection with the settings permission.
+
+## Customize prompts
+
+To replace a prompt's rules, put a Markdown file in
+`.foredeck/factory/prompts/` in the project's checkout on its environment. Factory reads this
+canonical checkout, even while a delivery works on its separate worktree. A file changed only
+in the delivery worktree has no effect until it reaches the project's checkout.
+
+The seven names are `plan.md`, `author.md`, `review.md`, `fix-verify.md`, `fix-review.md`,
+`fix-commit.md` and `integrate.md`. `review.md` also supplies the rules for later review rounds;
+`integrate.md` controls the whole-branch review of a parent independently. Factory reads the
+applicable file again for each new launch or turn, including retries and replanning.
+
+Only the rules change. Item, branch, commit, receipt, findings and failure facts, the required
+plan and review fields, and submission and reply instructions stay fixed. The server's
+validation, verification and approval checks still apply.
+
+A missing file uses the built-in rules. An existing override must be a readable, nonblank UTF-8
+file of at most 64 KiB, with any symlinks staying inside the canonical checkout. An unusable file
+blocks the delivery with the prompt's name; fix or remove that file and **Resume**.
 
 ## Start a delivery
 
@@ -103,6 +135,22 @@ against every child's acceptance criteria. Then Factory opens one pull request f
 that lists each child item with its verified commit and review. A failed verify or a review that
 requires changes blocks the parent with no repair round. Fix the branch if needed, then
 **Resume** to verify and review it again with a new reviewer.
+
+## Migrate a Looper goal
+
+Factory replaces Looper's goal delivery with a parent Work item:
+
+1. Add a [Markdown source in Work](./work.md#open-work) to the project if it does not have one.
+2. Create a parent item in that source and put the Looper goal text in its description, including
+   its requirements, constraints and acceptance criteria. Set the project's Factory verify
+   command, and its setup command if the authors need one.
+3. Open the item on web or desktop and choose **Deliver as parent**. Factory starts a planner
+   on the parent's new branch and worktree.
+4. Review the proposed tasks, edit or replan as needed, then **Approve plan**. Factory creates
+   the child items and delivers them in order on one branch, then verifies and reviews the whole
+   branch and opens one pull request. You decide when to merge it.
+
+This starts a new Factory delivery; it does not import Looper's runtime state or approvals.
 
 ## Deliver on a schedule
 

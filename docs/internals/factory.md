@@ -56,16 +56,17 @@ first, so a one-child plan cannot leave its children with the base unknown.
 
 ## Setup runs before the author's opening turn
 
-Core starts a launch's opening turn as soon as its preparation releases the run, and fails that
-run when preparation fails, starting the project's own setup script included, so setup must come
-before the launch hands core that turn
-([`FactoryThreadEffects.ts`](../../apps/server/src/fd/factory/FactoryThreadEffects.ts)). A child's
-author launches into the parent's worktree, which exists already: setup runs there first, and the
-launch is then an ordinary one, with core's gate intact. A single item's worktree exists only once
-its launch prepared it, so that launch creates the thread without its opening message and Factory
-sends the message itself after setup. With no run, core reports that preparation only to the
-in-memory setup tracker, so the launch waits there until preparation got as far as it would have
-released a run, and blocks when it ended short of that.
+Factory setup belongs between worktree preparation and the author's opening turn: before
+preparation there is no checkout to set up, and after releasing the opening run the author could
+already use an unprepared checkout. Core starts that run as soon as preparation releases it and
+fails it when preparation fails, including failure to start the project's own setup script.
+[`FactoryWorker`](../../apps/server/src/fd/factory/FactoryWorker.ts) therefore supplies setup only
+for author launches, and
+[`FactoryThreadEffects`](../../apps/server/src/fd/factory/FactoryThreadEffects.ts) places it before
+the opening message. A child's author uses the parent's existing worktree, so Factory runs setup
+there before the ordinary launch, leaving core's preparation gate intact. A single item's launch
+creates the worktree without an opening message; Factory waits for readiness through the setup
+tracker, blocks if preparation ended short, then runs setup and sends the message itself.
 
 A replay must neither run setup nor send the opening turn twice. The opening message decides:
 once it exists the replay runs nothing and returns its run. Factory sends it under the command id
@@ -87,7 +88,28 @@ restart it launches into the recovered worktree through core's ordinary gate. Th
 the delivery still awaits the launch once setup ends, so a cancel meanwhile sends no turn; one
 landing after is stopped as any cancelled launch's run is. Only author launches run setup,
 through the verify runner with the verify timeout and its log in the delivery's evidence; a
-failure blocks the delivery with fixed text naming how the command ended.
+failure blocks the delivery with fixed text naming how the command ended. Setup deliberately
+creates no verification receipt: it prepares the author's workspace, rather than judging a clean
+commit ([`FactoryVerifyRunner.ts`](../../apps/server/src/fd/factory/verify/FactoryVerifyRunner.ts)).
+
+## Prompt rules come from the canonical checkout
+
+The delivery worktree is the code being judged, so letting it supply prompt overrides would let
+the author change the next review's rules. Every launch and follow-up instead reads the applicable
+`.foredeck/factory/prompts/<name>.md` from `ProjectStore.workspaceRoot`, the same canonical
+checkout Work uses. It is read again rather than frozen in the delivery, so the owner can repair
+an unusable override and resume without starting over. Later reviews read `review.md` again;
+integrate reads its own `integrate.md`. Files present only in the delivery worktree have no say.
+See [`FactoryThreadEffects.ts`](../../apps/server/src/fd/factory/FactoryThreadEffects.ts) and
+[Work's canonical checkout](./work-management.md#canonical-checkout).
+
+An override replaces only a renderer's rules section; server-owned facts, structured fields and
+submission instructions stay in the renderer. Missing files preserve the built-in text exactly.
+Present but unusable files fail the effect instead of silently falling back: the reader checks
+canonical containment, regular-file type, the 64 KiB bound, UTF-8 and nonblank text. The error
+names only the prompt, never its contents
+([`overrides.ts`](../../apps/server/src/fd/factory/prompts/overrides.ts)). This changes agent
+instructions, not the server's plan, review or receipt validators.
 
 ## A delivery's launches stay under its starter's mode
 
@@ -378,9 +400,9 @@ raising them makes older clients leave out the reviews that use the room.
 A failed verify or a blocking review becomes a repair turn on the author thread, then the branch is
 settled and verified again. Each kind counts against its own limit, and a delivery keeps the limits
 it started with, so changing the settings never moves a loop already running. A failure's
-fingerprint hashes the stage, the log tail or the findings to fix, and the tree: a repair that left
-the tree as it was, or changed it without changing the failure, stops the loop as a repeated
-failure even with rounds left, because another round would face the same thing (see
+fingerprint hashes the stage, the log tail or the findings to fix, and the tree. Seeing the same
+failure on the same tree again in the current retry allowance stops the loop even with rounds
+left; a changed tree has a different fingerprint (see
 [`fingerprint.ts`](../../apps/server/src/fd/factory/pipeline/fingerprint.ts)).
 
 Only the first review round runs on a fresh thread that never sees the author's account. After a
@@ -390,11 +412,19 @@ high-risk tasks raise the effort of the model the thread runs with, only to a va
 offer and never below what was chosen
 ([`effort.ts`](../../apps/server/src/fd/factory/pipeline/effort.ts)).
 
-Mechanical fix-commit turns use medium when the model offers it, regardless of risk or round.
-Core persists a queued turn's selection on its thread, so Factory records the selection before
-dispatch and reuses that decision on retries. Later Factory turns start from the saved selection
-when the thread still has the mechanical selection, then apply the usual escalation. A selection
-the owner changed meanwhile stays theirs.
+Mechanical fix-commit turns use medium when offered, regardless of risk or round. Core persists
+a turn's selection on its thread when the run starts, including a queued run, so sending medium
+without a restoration baseline would silently lower later author and repair turns. Factory
+records the pre-mechanical selection and the mechanical decision before dispatch in
+[`FactoryTurnSelectionStore`](../../apps/server/src/fd/factory/persistence/FactoryTurnSelectionStore.ts)
+and reuses them on retries. Later turns restore the normal selection before applying escalation,
+only when durable run and selection history proves the temporary override was applied and the
+owner has not chosen a different model or effort. Unrelated owner option changes survive; a
+never-started turn does not claim to have changed effort. Equality with medium alone cannot
+distinguish an override from an owner's deliberate choice. That history therefore survives core
+compaction; inherited native effort is read before overriding it rather than guessed from catalog
+defaults ([`FactoryThreadEffects.ts`](../../apps/server/src/fd/factory/FactoryThreadEffects.ts),
+[`ProjectionMaintenance.ts`](../../apps/server/src/orchestration-v2/ProjectionMaintenance.ts)).
 
 ## Record checks the worktree again
 

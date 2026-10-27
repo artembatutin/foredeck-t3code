@@ -88,9 +88,11 @@ one instead of creating a second.
 ## Factory
 
 Open the project's settings and use **Factory** to set the verify command a
-[Factory](./factory.md) delivery checks its work with, an optional setup command that runs in the
-delivery's worktree before each author starts, the author and reviewer models, and the round
-limits and verify timeout. A project needs a verify command before its items can be delivered.
+[Factory](./factory.md) delivery checks its work with, the optional setup command, the planner,
+author and reviewer models, the fix and review round limits, the verify timeout, blocking review
+severities and high-risk effort. Setup runs in the prepared delivery worktree before the first
+author turn of a single item or each child of a parent; a failure blocks before that turn and
+**Resume** retries it. A project needs a verify command before its items can be delivered.
 Commands are an executable and its arguments, not a shell line. Each environment keeps its own
 Factory settings for its checkout of the project.
 

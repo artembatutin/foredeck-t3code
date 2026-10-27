@@ -63,17 +63,32 @@ Terms whose meaning matters across T3 Code. Architecture and lifecycle constrain
 
 ## Factory
 
-| Term                | Meaning                                                                                                                                                                                |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Delivery            | One Factory run of one Work item through a pipeline. A parent delivery owns one child delivery per approved planned task.                                                              |
-| Pipeline            | Ordered stages with their gates and limits, defined as data.                                                                                                                           |
-| Stage kind          | What a stage does: run a role's thread (`agent`), run a server command (`command`), wait at a `gate`, verify and review the whole branch afresh (`integrate`) or handle the PR (`pr`). |
-| Role                | The part a Factory thread plays: `planner`, `author` or `reviewer`. Each role has its own model selection.                                                                             |
-| Receipt             | The server's record of one verification command run against one commit and tree.                                                                                                       |
-| Approval            | The record that one commit and tree passed verification and review.                                                                                                                    |
-| Repair round        | A turn on the author thread that answers a failed verify (`fix-verify`) or a blocking review (`fix-review`), counted against the project's limits.                                     |
-| Failure fingerprint | A hash of a failed stage, its log tail or findings to fix, and the tree. The same fingerprint twice in one task stops the repair loop.                                                 |
-| Stage checkpoint    | The stage a stopped delivery would have begun when it stopped, where a resume continues. Unrelated to a turn's Git checkpoint.                                                         |
+| Term                 | Meaning                                                                                                                                                                                |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Delivery             | One Factory run of one Work item through a pipeline. A parent delivery owns one child delivery per approved planned task.                                                              |
+| Parent delivery      | A delivery that plans a Markdown Work item into tasks, runs their child deliveries in order on one branch, then integrates them for one pull request.                                  |
+| Child delivery       | The delivery of one approved task of a parent. It shares the parent's worktree and branch and ends approved without publishing its own pull request.                                   |
+| Planned task         | One unit of an approved plan, with a stable id, acceptance criteria, a test plan and risk. Its `lastReviewedSha` records the commit approved for it.                                   |
+| Pipeline             | Ordered stages with their gates and limits, defined as data.                                                                                                                           |
+| Stage                | A named step of a delivery, such as `author`, `verify`, `review` or `record`. A stage can have several attempts.                                                                       |
+| Stage kind           | What a stage does: run a role's thread (`agent`), run a server command (`command`), wait at a `gate`, verify and review the whole branch afresh (`integrate`) or handle the PR (`pr`). |
+| Stage attempt        | One recorded execution of a stage, with its thread or run when applicable, outcome and evidence reference. Resume preserves earlier attempts.                                          |
+| Role / role profile  | A thread's part (`planner`, `author` or `reviewer`) and the model selection used for that part: provider instance, model and options.                                                  |
+| Plan gate            | The `approve_plan` stage where the owner may edit, approve, reject or request a new plan. Approval freezes the tasks before their child items are created.                             |
+| Canonical checkout   | The project's `workspaceRoot`, where Work reads Markdown sources and Factory reads prompt overrides; separate from a delivery's worktree.                                              |
+| Prompt override      | A project file that replaces one prompt's rules while leaving its server-owned facts, structured fields and submission instructions fixed.                                             |
+| Task baseline        | The commit from which settle checks and task reviews judge new work. Initially the branch creation commit; later children start from the previous child's approved commit.             |
+| Settle check         | The branch check after an author or repair turn and on resume: expected branch, clean worktree, baseline ancestry, new commits and commit message and identity policy.                 |
+| Fix-commit turn      | The single mechanical author turn allowed to repair a settle check before blocking; it uses medium effort when supported.                                                              |
+| Receipt              | The server's record of one verification command run against one commit and tree.                                                                                                       |
+| Approval             | The record that one commit and tree passed verification and review.                                                                                                                    |
+| Blocking severity    | A finding severity in the project's `blockingSeverities`, requiring changes even with a passing verdict. High is the default; other review blockers apply independently.               |
+| High-risk effort     | The project's `highRiskEffort` target for high-risk tasks and later repair or review rounds, applied only when offered and never to lower an existing effort.                          |
+| Review round         | One review of a verified commit. The first uses a fresh reviewer thread; later rounds on that thread check the prior findings and the author's repair claims.                          |
+| Repair round         | A turn on the author thread that answers a failed verify (`fix-verify`) or a blocking review (`fix-review`), counted against the delivery's saved limits.                              |
+| Failure fingerprint  | A hash of a failed stage, its log tail or findings to fix, and the tree. Repeating a fingerprint stops repairs; explicit resume from stopped or blocked clears that tracking.          |
+| Follow-through round | A pull request feedback wake on the linked author thread that Factory adopts, followed by settle, fresh verify, review, record and a push to the same pull request.                    |
+| Stage checkpoint     | The stage a stopped delivery would have begun when it stopped, where a resume continues. Unrelated to a turn's Git checkpoint.                                                         |
 
 ## Composer context
 
