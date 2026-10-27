@@ -224,6 +224,7 @@ describe("rebaseFactorySettingsDraft", () => {
     ...encode(POPULATED),
     verifyCommand: { executable: "vp", args: ["test", "run"] },
     blockingSeverities: ["high", "medium", "low"],
+    pipelineId: "new-pipeline",
   });
 
   it("replaces an unedited draft with the new server value", () => {
@@ -238,8 +239,9 @@ describe("rebaseFactorySettingsDraft", () => {
     const rebased = rebaseFactorySettingsDraft(edited, v2);
     expect(rebased.limits.maxFixRounds).toBe("7");
     expect(rebased.verifyCommand).toStrictEqual(edited.verifyCommand);
+    expect(rebased.blockingSeverities).toStrictEqual(edited.blockingSeverities);
     // The fields the form does not edit follow the server, so saving never reverts them.
-    expect(valid(rebased).blockingSeverities).toStrictEqual(["high", "medium", "low"]);
+    expect(valid(rebased).pipelineId).toBe("new-pipeline");
     // Discard is the server's current value as a fresh draft.
     expect(valid(factorySettingsDraft(v2))).toStrictEqual(v2);
   });

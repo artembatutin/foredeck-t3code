@@ -8,6 +8,7 @@ export const FACTORY_SETTINGS_BOUNDS = {
   executableLength: 1024,
   argLength: 8192,
   argCount: 256,
+  highRiskEffortLength: 64,
 } as const;
 
 /** A command as the form edits it: the executable and each argument on its own, never a shell line. */
@@ -22,8 +23,7 @@ export type FactoryCommandName = "verifyCommand" | "setupCommand";
 
 /**
  * Project settings as the Factory form edits them. Limits hold the text their inputs hold.
- * `base` is the server value the draft keeps the fields it does not edit from (blocking
- * severities, high-risk effort, pipeline).
+ * `base` is the server value the draft keeps the fields it does not edit from (pipeline).
  */
 export interface FactorySettingsDraft {
   readonly base: FactoryProjectSettings;
@@ -31,11 +31,14 @@ export interface FactorySettingsDraft {
   readonly setupCommand: FactoryCommandDraft;
   readonly roles: FactoryProjectSettings["roles"];
   readonly limits: Readonly<Record<FactoryLimitName, string>>;
+  readonly blockingSeverities: FactoryProjectSettings["blockingSeverities"];
+  readonly highRiskEffort: string;
 }
 
 export type FactorySettingsField =
   | `${FactoryCommandName}.executable`
   | `${FactoryCommandName}.args`
+  | "highRiskEffort"
   | `limits.${FactoryLimitName}`;
 
 export type FactorySettingsErrors = Partial<Record<FactorySettingsField, string>>;
@@ -55,6 +58,8 @@ export const factorySettingsDraft = (settings: FactoryProjectSettings): FactoryS
   verifyCommand: commandDraft(settings.verifyCommand),
   setupCommand: commandDraft(settings.setupCommand),
   roles: settings.roles,
+  blockingSeverities: [...settings.blockingSeverities],
+  highRiskEffort: settings.highRiskEffort,
   limits: {
     maxFixRounds: String(settings.limits.maxFixRounds),
     maxReviewRounds: String(settings.limits.maxReviewRounds),
@@ -114,6 +119,15 @@ export const factorySettingsFromDraft = (
   const errors: FactorySettingsErrors = {};
   const verifyCommand = commandFromDraft("verifyCommand", draft.verifyCommand, errors);
   const setupCommand = commandFromDraft("setupCommand", draft.setupCommand, errors);
+  const highRiskEffort = draft.highRiskEffort.trim();
+  if (highRiskEffort.length === 0) {
+    errors.highRiskEffort = "Enter an effort value.";
+  } else if (highRiskEffort.length > FACTORY_SETTINGS_BOUNDS.highRiskEffortLength) {
+    errors.highRiskEffort = `Use at most ${FACTORY_SETTINGS_BOUNDS.highRiskEffortLength} characters.`;
+  }
+  const blockingSeverities = (["high", "medium", "low"] as const).filter((severity) =>
+    draft.blockingSeverities.includes(severity),
+  );
   const { rounds, verifyTimeoutMinutes } = FACTORY_SETTINGS_BOUNDS;
   const limits = {
     maxFixRounds: limitFromDraft("maxFixRounds", draft.limits.maxFixRounds, rounds, errors),
@@ -133,7 +147,15 @@ export const factorySettingsFromDraft = (
   if (Object.keys(errors).length > 0) return { _tag: "Invalid", errors };
   return {
     _tag: "Valid",
-    settings: { ...draft.base, verifyCommand, setupCommand, roles: draft.roles, limits },
+    settings: {
+      ...draft.base,
+      verifyCommand,
+      setupCommand,
+      roles: draft.roles,
+      limits,
+      blockingSeverities,
+      highRiskEffort,
+    },
   };
 };
 
@@ -156,6 +178,12 @@ export const factorySettingsDraftEdited = (draft: FactorySettingsDraft): boolean
   return (
     !sameCommand(draft.verifyCommand, unedited.verifyCommand) ||
     !sameCommand(draft.setupCommand, unedited.setupCommand) ||
+    draft.highRiskEffort !== unedited.highRiskEffort ||
+    (["high", "medium", "low"] as const).some(
+      (severity) =>
+        draft.blockingSeverities.includes(severity) !==
+        unedited.blockingSeverities.includes(severity),
+    ) ||
     (["planner", "author", "reviewer"] as const).some(
       (role) => !sameSelection(draft.roles[role], unedited.roles[role]),
     ) ||

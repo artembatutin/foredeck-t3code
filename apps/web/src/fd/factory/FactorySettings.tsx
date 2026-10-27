@@ -18,6 +18,7 @@ import { useState } from "react";
 
 import { SettingsSection } from "../../components/settings/settingsLayout";
 import { Button } from "../../components/ui/button";
+import { Checkbox } from "../../components/ui/checkbox";
 import { Input } from "../../components/ui/input";
 import {
   Select,
@@ -54,7 +55,7 @@ const LIMITS: ReadonlyArray<{ readonly limit: FactoryLimitName; readonly label: 
 
 /**
  * Factory settings of one project member on its owning environment: verify and setup commands,
- * role models and limits. Renders nothing on a server without Factory, and shows the values
+ * role models, limits and review policy. Renders nothing on a server without Factory, and shows the values
  * read-only without a live connection holding settings:write.
  */
 export function FactorySettings({
@@ -251,6 +252,49 @@ function SettingsEditor({
           A delivery keeps the limits it started with.
         </p>
       </div>
+      <fieldset className="space-y-2" disabled={disabled}>
+        <legend className="font-medium text-sm">Blocking severities</legend>
+        <p className="text-muted-foreground text-xs">
+          Findings at these severities require a fix even when the review verdict passes.
+        </p>
+        <div className="flex gap-4">
+          {(["high", "medium", "low"] as const).map((severity) => (
+            <label key={severity} className="flex items-center gap-2 text-xs">
+              <Checkbox
+                aria-label={`${severity} blocks review`}
+                disabled={disabled}
+                checked={draft.blockingSeverities.includes(severity)}
+                onCheckedChange={(checked) =>
+                  setDraft({
+                    ...draft,
+                    blockingSeverities: checked
+                      ? [...draft.blockingSeverities, severity]
+                      : draft.blockingSeverities.filter((value) => value !== severity),
+                  })
+                }
+              />
+              {severity === "high" ? "High" : severity === "medium" ? "Medium" : "Low"}
+            </label>
+          ))}
+        </div>
+      </fieldset>
+      <label className="block space-y-1 text-xs">
+        <span className="text-muted-foreground">High-risk effort</span>
+        <Input
+          size="sm"
+          aria-label="High-risk effort"
+          aria-invalid={errors.highRiskEffort !== undefined}
+          disabled={disabled}
+          value={draft.highRiskEffort}
+          onChange={(event) => setDraft({ ...draft, highRiskEffort: event.target.value })}
+        />
+        <span className="block text-muted-foreground">
+          Used for high-risk tasks and later rounds when the model offers it; never lowers effort.
+        </span>
+        {errors.highRiskEffort ? (
+          <span className="block text-destructive">{errors.highRiskEffort}</span>
+        ) : null}
+      </label>
       {error ? <p className="text-destructive text-xs">{error}</p> : null}
       {editable ? (
         <div className="flex gap-2">
