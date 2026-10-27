@@ -41,6 +41,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
@@ -496,7 +497,7 @@ const threadLaunch = (setupScripts: World["setupScripts"]) =>
       Layer.mergeAll(
         WorktreeSetupTracker.layer,
         Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({ get: () => Effect.succeed(null) }),
-        Layer.mock(TerminalManager.TerminalManager)({}),
+        Layer.mock(TerminalManager.TerminalManager)({ close: () => Effect.void }),
         // No project here is the Scratch project, so no thread gets a folder of its own.
         Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
           namedProjectsRoot: "/nowhere",
@@ -794,6 +795,10 @@ export interface World {
    * on; otherwise one reactor runs throughout, and this runs `body` as it is.
    */
   readonly boot: <A, E>(body: Effect.Effect<A, E, Services>) => Effect.Effect<A, E, Services>;
+  /** A fresh core launch service and tracker, closed before returning to inspect shutdown. */
+  readonly launchScope: <A, E>(
+    body: Effect.Effect<A, E, Services | Scope.Scope>,
+  ) => Effect.Effect<A, E, Services>;
   /**
    * Sends the owner's own turn on the thread, as the web client does, and returns its run once
    * the provider has started it.
@@ -1014,6 +1019,14 @@ export const withProject = <A, E>(
         startWith,
         launched,
         boot,
+        launchScope: (body) =>
+          body.pipe(
+            Effect.provide(
+              threadLaunch(setupScripts).pipe(Layer.provideMerge(WorktreeSetupTracker.layer)),
+              { local: true },
+            ),
+            Effect.scoped,
+          ),
         ownerTurn,
         ownerThreadAt,
         endRun,

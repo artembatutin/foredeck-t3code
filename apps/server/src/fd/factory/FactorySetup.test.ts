@@ -9,6 +9,7 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -17,6 +18,7 @@ import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import type * as ProcessRunner from "../../processRunner.ts";
 import * as ProjectSetupScriptRunner from "../../project/ProjectSetupScriptRunner.ts";
+import * as WorktreeSetupTracker from "../../project/WorktreeSetupTracker.ts";
 import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
@@ -1104,6 +1106,398 @@ describe("Factory setup after a restart", () => {
               }),
             );
           }).pipe(Effect.provide(threadEffects), Effect.orDie),
+        { manualReactor: true },
+      ),
+  );
+});
+
+/** Core's setup shell starts now; its completion stays pending until the test releases it. */
+const heldScript = (world: World, async: boolean) =>
+  Effect.gen(function* () {
+    const started = yield* Deferred.make<void>();
+    const completion =
+      yield* Deferred.make<ProjectSetupScriptRunner.ProjectSetupScriptCompletion>();
+    const interrupted = yield* Deferred.make<void>();
+    world.setupScripts.runForThread = (input) =>
+      Deferred.succeed(started, undefined).pipe(
+        Effect.as({
+          status: "started" as const,
+          scriptId: "setup",
+          scriptName: "Project setup",
+          scriptCommand: "setup",
+          terminalId: "setup-terminal",
+          cwd: input.worktreePath,
+          async,
+          completion: Deferred.await(completion).pipe(
+            Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+          ),
+        }),
+      );
+    return { started, completion, interrupted };
+  });
+
+describe("Factory setup at core's readiness handoff", () => {
+  it.live(
+    "retains the author's checkout and uncommitted work on shutdown during async core setup",
+    () =>
+      withProject(
+        passingVerify,
+        (world) =>
+          Effect.gen(function* () {
+            const fs = yield* FileSystem.FileSystem;
+            const path = yield* Path.Path;
+            const script = yield* heldScript(world, true);
+            const deliveryId = FactoryDeliveryId.make("delivery-handoff");
+            const { delivery, launch } = yield* storeLaunching(
+              world,
+              deliveryId,
+              "feature/handoff",
+            );
+            const author = yield* world.launchScope(
+              Effect.gen(function* () {
+                const effects = yield* FactoryThreadEffects.FactoryThreadEffects;
+                const runner = yield* FactoryVerifyRunner.FactoryVerifyRunner;
+                const result = yield* effects.launchThread(delivery, launch, (worktreePath) =>
+                  runner.setup({
+                    deliveryId,
+                    worktreePath,
+                    command: passingVerify,
+                    timeoutMinutes: 30,
+                  }),
+                );
+                assert.strictEqual(
+                  yield* runReached(result.runId, ["starting", ...ended]),
+                  "starting",
+                );
+                yield* drainOrchestration;
+                assert.deepStrictEqual(
+                  world.provider.started.map(({ runId }) => runId),
+                  [result.runId],
+                );
+                yield* fs.writeFileString(
+                  path.join(result.worktreePath ?? assert.fail("No checkout"), "author-work.txt"),
+                  "keep me",
+                );
+                const tracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
+                const snapshot = yield* tracker.get(result.threadId);
+                assert.strictEqual(snapshot?.phase, "running");
+                assert.strictEqual(
+                  snapshot?.stages.find(({ id }) => id === "agent")?.status,
+                  "done",
+                );
+                assert.isFalse(yield* Deferred.isDone(script.completion));
+                return {
+                  ...result,
+                  worktreePath: result.worktreePath ?? assert.fail("No checkout"),
+                };
+              }).pipe(Effect.provide(threadEffects, { local: true }), Effect.orDie),
+            );
+            assert.isTrue(yield* Deferred.isDone(script.interrupted));
+            assert.isTrue(yield* world.exists(author.worktreePath));
+            assert.strictEqual(
+              yield* fs.readFileString(path.join(author.worktreePath, "author-work.txt")),
+              "keep me",
+            );
+            assert.strictEqual(
+              (yield* threadProjection(author.threadId).pipe(Effect.orDie)).thread.worktreePath,
+              author.worktreePath,
+            );
+            assert.strictEqual(
+              yield* git(author.worktreePath, ["branch", "--show-current"]),
+              "feature/handoff",
+            );
+            assert.isFalse(yield* Deferred.isDone(script.completion));
+          }),
+        { manualReactor: true },
+      ),
+  );
+
+  it.live("cleans a checkout interrupted before synchronous core setup releases readiness", () =>
+    withProject(
+      passingVerify,
+      (world) =>
+        Effect.gen(function* () {
+          const script = yield* heldScript(world, false);
+          const deliveryId = FactoryDeliveryId.make("delivery-pre-ready");
+          const { delivery, launch } = yield* storeLaunching(
+            world,
+            deliveryId,
+            "feature/pre-ready",
+          );
+          const prepared = yield* world.launchScope(
+            Effect.gen(function* () {
+              const effects = yield* FactoryThreadEffects.FactoryThreadEffects;
+              const fiber = yield* effects
+                .launchThread(delivery, launch, () => Effect.void)
+                .pipe(Effect.forkScoped);
+              yield* Deferred.await(script.started);
+              const threadId = FactoryThreadEffects.launchThreadId(deliveryId, 1);
+              const thread = yield* threadProjection(threadId);
+              assert.deepStrictEqual(thread.runs, []);
+              assert.deepStrictEqual(world.provider.started, []);
+              yield* Fiber.interrupt(fiber);
+              return {
+                threadId,
+                worktreePath: thread.thread.worktreePath ?? assert.fail("No checkout"),
+              };
+            }).pipe(Effect.provide(threadEffects, { local: true }), Effect.orDie),
+          );
+          assert.isFalse(yield* world.exists(prepared.worktreePath));
+          assert.isNull(
+            (yield* threadProjection(prepared.threadId).pipe(Effect.orDie)).thread.worktreePath,
+          );
+          assert.deepStrictEqual(world.provider.started, []);
+        }),
+      { manualReactor: true },
+    ),
+  );
+
+  it.live("holds Factory setup and the opening turn until synchronous core setup completes", () =>
+    withProject(passingVerify, (world) =>
+      Effect.gen(function* () {
+        const script = yield* heldScript(world, false);
+        const marker = yield* markerIn(world, "setup-runs");
+        yield* useSetup(world, markingSetup(marker));
+        const factory = yield* service;
+        const { deliveryId } = yield* factory.start({ itemRef: world.itemRef }).pipe(Effect.orDie);
+        yield* Deferred.await(script.started);
+        assert.deepStrictEqual(yield* markedRuns(marker), []);
+        assert.deepStrictEqual(world.provider.started, []);
+        yield* Deferred.succeed(script.completion, { exitCode: 0, durationMs: 1 });
+        const author = yield* world.launched(deliveryId);
+        assert.deepStrictEqual(yield* markedRuns(marker), [yield* realPath(author.worktreePath)]);
+      }),
+    ),
+  );
+
+  it.live(
+    "retries failed Factory setup under its timeout while async core setup is still pending",
+    () =>
+      withProject(passingVerify, (world) =>
+        Effect.gen(function* () {
+          const script = yield* heldScript(world, true);
+          const failing = node("process.exit(3)");
+          yield* useSetup(world, failing);
+          const timeouts: Array<Duration.Input | undefined> = [];
+          world.processes.around = (input, run) => {
+            if (isRun(input, failing)) timeouts.push(input.timeout);
+            return run(input);
+          };
+          const factory = yield* service;
+          const { deliveryId } = yield* factory
+            .start({ itemRef: world.itemRef })
+            .pipe(Effect.orDie);
+          yield* drainFactory;
+          assert.strictEqual((yield* stateOf(deliveryId)).status, "blocked");
+          yield* factory.resume(deliveryId).pipe(Effect.orDie);
+          yield* drainFactory;
+          assert.strictEqual((yield* stateOf(deliveryId)).status, "blocked");
+          assert.strictEqual(timeouts.length, 2);
+          assert.isTrue(
+            timeouts.every((timeout) =>
+              Duration.equals(Duration.fromInputUnsafe(timeout ?? 0), Duration.minutes(30)),
+            ),
+          );
+          const marker = yield* markerIn(world, "setup-runs");
+          yield* useSetup(world, markingSetup(marker));
+          yield* factory.resume(deliveryId).pipe(Effect.orDie);
+          const author = yield* world.launched(deliveryId);
+          assert.deepStrictEqual(yield* markedRuns(marker), [yield* realPath(author.worktreePath)]);
+          assert.deepStrictEqual(
+            world.provider.started.map(({ runId }) => runId),
+            [author.runId],
+          );
+          assert.deepStrictEqual(yield* setupLogs(world, deliveryId), [
+            "setup-1.log",
+            "setup-2.log",
+            "setup-3.log",
+          ]);
+          assert.isFalse(yield* Deferred.isDone(script.completion));
+        }),
+      ),
+  );
+});
+
+describe("Factory stranded-thread recovery guards", () => {
+  it.live.each([false, true])(
+    "preserves an owner-used thread before recovery mutates its checkout (recorded: %s)",
+    (recorded) =>
+      withProject(
+        passingVerify,
+        (world) =>
+          Effect.gen(function* () {
+            const factory = yield* service;
+            const fs = yield* FileSystem.FileSystem;
+            const path = yield* Path.Path;
+            const marker = yield* markerIn(world, "setup-runs");
+            yield* useSetup(world, markingSetup(marker));
+            const deliveryId = FactoryDeliveryId.make("delivery-owner-used");
+            const left = yield* interruptedLaunch(world, deliveryId, "feature/owner-used", {
+              git: true,
+              recorded,
+              cleanedUp: false,
+            });
+            const file = path.join(left.worktreePath!, "owner-work.txt");
+            yield* fs.writeFileString(file, "keep owner work");
+            const ownerRun = yield* world.ownerTurn(left.threadId, "Keep working on my task");
+            yield* runReached(ownerRun, ["running", ...ended]);
+            const before = yield* threadProjection(left.threadId).pipe(Effect.orDie);
+            yield* world.boot(
+              Effect.gen(function* () {
+                yield* factory.resume(deliveryId).pipe(Effect.orDie);
+                yield* drainFactory;
+                yield* drainOrchestration;
+                assert.strictEqual((yield* stateOf(deliveryId)).status, "blocked");
+                const after = yield* threadProjection(left.threadId).pipe(Effect.orDie);
+                assert.strictEqual(after.thread.worktreePath, before.thread.worktreePath);
+                assert.strictEqual(after.thread.branch, before.thread.branch);
+                assert.strictEqual(
+                  after.thread.activeProviderThreadId,
+                  before.thread.activeProviderThreadId,
+                );
+                assert.deepStrictEqual(after.messages, before.messages);
+                assert.deepStrictEqual(
+                  after.runs.map(({ id }) => id),
+                  [ownerRun],
+                );
+                assert.deepStrictEqual(world.provider.interrupted, []);
+                assert.strictEqual(after.runs.find(({ id }) => id === ownerRun)?.status, "running");
+                assert.deepStrictEqual(yield* setupLogs(world, deliveryId), []);
+                assert.deepStrictEqual(yield* markedRuns(marker), []);
+                assert.strictEqual(yield* fs.readFileString(file), "keep owner work");
+              }),
+            );
+          }),
+        { manualReactor: true },
+      ),
+  );
+
+  it.live("atomically refuses recovery when an owner sends a turn after the empty read", () =>
+    withProject(
+      passingVerify,
+      (world) =>
+        Effect.gen(function* () {
+          const marker = yield* markerIn(world, "setup-runs");
+          const deliveryId = FactoryDeliveryId.make("delivery-owner-race");
+          const left = yield* interruptedLaunch(world, deliveryId, "feature/owner-race", {
+            git: true,
+            recorded: false,
+            cleanedUp: false,
+          });
+          const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+          const delivery = Option.getOrThrow(yield* store.get(deliveryId));
+          const awaiting = delivery.state.awaiting;
+          if (awaiting?.type !== "effect" || awaiting.effect.type !== "launch_thread")
+            return assert.fail("No launch");
+          const launch = awaiting.effect;
+          const threads = yield* ThreadManagement.ThreadManagementService;
+          const ownerContext =
+            yield* Effect.context<Effect.Services<ReturnType<typeof world.ownerTurn>>>();
+          const ownerRun = yield* Deferred.make<import("@t3tools/contracts").RunId>();
+          const guardedThreads = Layer.succeed(ThreadManagement.ThreadManagementService, {
+            ...threads,
+            dispatch: (command) =>
+              command.type === "thread.metadata.update" && command.expectedEmpty === true
+                ? world.ownerTurn(left.threadId, "My task").pipe(
+                    Effect.provideContext(ownerContext),
+                    Effect.tap((run) => Deferred.succeed(ownerRun, run)),
+                    Effect.andThen(threads.dispatch(command)),
+                  )
+                : threads.dispatch(command),
+          });
+          const failure = yield* Effect.gen(function* () {
+            const effects = yield* FactoryThreadEffects.FactoryThreadEffects;
+            const runner = yield* FactoryVerifyRunner.FactoryVerifyRunner;
+            return yield* effects
+              .launchThread(delivery, launch, (worktreePath) =>
+                runner.setup({
+                  deliveryId,
+                  worktreePath,
+                  command: markingSetup(marker),
+                  timeoutMinutes: 30,
+                }),
+              )
+              .pipe(Effect.flip);
+          }).pipe(
+            Effect.provide(threadEffects.pipe(Layer.provide(guardedThreads)), { local: true }),
+          );
+          assert.strictEqual(failure._tag, "OrchestratorDispatchError");
+          const runId = yield* Deferred.await(ownerRun);
+          yield* runReached(runId, ["running", ...ended]);
+          const after = yield* threadProjection(left.threadId).pipe(Effect.orDie);
+          assert.isNull(after.thread.worktreePath);
+          assert.strictEqual(after.runs.find(({ id }) => id === runId)?.status, "running");
+          assert.strictEqual(after.messages.length, 1);
+          assert.deepStrictEqual(yield* markedRuns(marker), []);
+          assert.deepStrictEqual(yield* setupLogs(world, deliveryId), []);
+          assert.isTrue(yield* world.exists(left.worktreePath!));
+        }).pipe(Effect.orDie),
+      { manualReactor: true },
+    ),
+  );
+
+  it.live.each(["primary", "foreign"] as const)(
+    "refuses a present recorded path redirected to the %s checkout before setup",
+    (target) =>
+      withProject(
+        passingVerify,
+        (world) =>
+          Effect.gen(function* () {
+            const factory = yield* service;
+            const fs = yield* FileSystem.FileSystem;
+            const path = yield* Path.Path;
+            const marker = yield* markerIn(world, "setup-runs");
+            yield* useSetup(world, markingSetup(marker));
+            const deliveryId = FactoryDeliveryId.make("delivery-redirected");
+            const left = yield* interruptedLaunch(world, deliveryId, "feature/original", {
+              git: true,
+              recorded: true,
+              cleanedUp: false,
+            });
+            const redirected =
+              target === "primary" ? world.root : path.join(world.t3Home, "foreign-checkout");
+            if (target === "foreign")
+              yield* git(world.root, [
+                "worktree",
+                "add",
+                "-b",
+                "feature/foreign",
+                redirected,
+                "main",
+              ]);
+            yield* fs.writeFileString(
+              path.join(left.worktreePath!, "original-work.txt"),
+              "original",
+            );
+            yield* fs.writeFileString(path.join(redirected, "owner-work.txt"), "owner");
+            const threads = yield* ThreadManagement.ThreadManagementService;
+            yield* threads.dispatch({
+              type: "thread.metadata.update",
+              commandId: CommandId.make("owner-redirect"),
+              threadId: left.threadId,
+              worktreePath: redirected,
+            });
+            yield* world.boot(
+              Effect.gen(function* () {
+                yield* factory.resume(deliveryId).pipe(Effect.orDie);
+                yield* drainFactory;
+                assert.strictEqual((yield* stateOf(deliveryId)).status, "blocked");
+                const after = yield* threadProjection(left.threadId).pipe(Effect.orDie);
+                assert.strictEqual(after.thread.worktreePath, redirected);
+                assert.deepStrictEqual(after.runs, []);
+                assert.deepStrictEqual(yield* markedRuns(marker), []);
+                assert.deepStrictEqual(yield* setupLogs(world, deliveryId), []);
+                assert.strictEqual(
+                  yield* fs.readFileString(path.join(left.worktreePath!, "original-work.txt")),
+                  "original",
+                );
+                assert.strictEqual(
+                  yield* fs.readFileString(path.join(redirected, "owner-work.txt")),
+                  "owner",
+                );
+              }),
+            );
+          }),
         { manualReactor: true },
       ),
   );

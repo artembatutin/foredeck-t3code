@@ -75,12 +75,15 @@ lean on core either: core schedules no preparation for a launch it already accep
 preparation a restart cut short can leave the delivery's branch with or without its worktree and
 the thread recording neither, since core's cleanup of an interrupted preparation removes the
 worktree, keeps the branch and clears the thread's workspace. Asking core to create the worktree
-again would only collide with that branch. So the replay reconciles with Git: the worktree the
-thread records while it exists, else the one Git has the branch checked out in (never the
-project's own checkout), else one added for the branch, else one created from the base ref, each
-with the settings core's preparation uses. It records that worktree on the thread only while the
-thread's workspace is still as it read it, runs setup and launches into it as into any existing worktree, so
-the branch, its baseline and anything already in the worktree carry over. The worker checks that
+again would only collide with that branch. So the replay reconciles with Git: an existing recorded
+worktree must match Git's checkout of the original branch, never the project's own checkout.
+Otherwise it adopts that branch's checkout, attaches the retained branch or creates it from the
+base ref. Recovery refuses owner-used threads before setup or checkout changes, using core's
+atomic empty-thread and expected-path guards. The branch, its baseline and existing work carry
+over. Core hands off a message-less launch's workspace before publishing agent readiness, so
+shutdown cannot remove it while asynchronous project setup is still observed. A replay at that
+readiness sends the opening turn after Factory setup without waiting for the observer; after a
+restart it launches into the recovered worktree through core's ordinary gate. The worker checks that
 the delivery still awaits the launch once setup ends, so a cancel meanwhile sends no turn; one
 landing after is stopped as any cancelled launch's run is. Only author launches run setup,
 through the verify runner with the verify timeout and its log in the delivery's evidence; a

@@ -619,9 +619,9 @@ const make = Effect.gen(function* () {
    * preparation, and one a restart cut short can leave the delivery's branch with or without its
    * worktree and the thread recording neither (core's cleanup of an interrupted preparation removes
    * the worktree and keeps the branch), so asking core again would only collide with that branch.
-   * The worktree the thread records stands while it exists; else the one Git has the branch
-   * checked out in, never the project's own checkout; else one added for the branch; else one
-   * created from the base ref as the preparation would have. Each comes from the settings core's
+   * An existing recorded worktree must match Git's checkout of the original branch, never the
+   * project's own checkout. Without one, reuse Git's checkout, attach the retained branch, or
+   * create from the base ref as the preparation would have. Each comes from the settings core's
    * preparation uses, and the thread records it only while its workspace is still as read here.
    */
   const recoverWorktree = (input: {
@@ -636,20 +636,40 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const { threadId, root, branch } = input;
       const afterSequence = yield* threads.getThreadEventSequence(threadId);
-      const { thread } = yield* projections.getThreadRecords(threadId, []);
-      if (thread.deletedAt !== null)
+      const { thread, runs } = yield* projections.getThreadRecords(threadId, ["runs"]);
+      if (
+        thread.deletedAt !== null ||
+        runs.length > 0 ||
+        (yield* projections.getMessageCount(threadId)) > 0
+      )
         return yield* new FactoryWorkspacePreparationError({ threadId });
       const recorded = thread.worktreePath;
-      if (recorded !== null && (yield* exists(recorded))) return recorded;
+      // Core checks actual message count and runs atomically, including messages outside a
+      // bounded projection. Refuse owner-used threads before any checkout mutation or setup.
+      yield* threads.dispatch({
+        type: "thread.metadata.update",
+        commandId: CommandId.make(`${input.commandId}:recover:${afterSequence}`),
+        threadId,
+        expectedEmpty: true,
+        expectedWorktreePath: recorded,
+      });
       const checkedOut = yield* branchWorktree(root, branch);
+      const recordedExists = recorded !== null && (yield* exists(recorded));
       if (
         checkedOut.worktreePath !== null &&
         (yield* realPath(checkedOut.worktreePath)) === (yield* realPath(root))
       ) {
         return yield* new FactoryWorkspacePreparationError({ threadId });
       }
+      if (
+        recordedExists &&
+        (checkedOut.worktreePath === null ||
+          (yield* realPath(recorded)) !== (yield* realPath(checkedOut.worktreePath)))
+      ) {
+        return yield* new FactoryWorkspacePreparationError({ threadId });
+      }
       const worktreePath =
-        checkedOut.worktreePath ??
+        (recordedExists ? recorded : checkedOut.worktreePath) ??
         (yield* git.createWorktree(
           checkedOut.exists
             ? { cwd: root, refName: branch, path: null }
@@ -670,6 +690,7 @@ const make = Effect.gen(function* () {
           branch,
           worktreePath,
           expectedWorktreePath: recorded,
+          expectedEmpty: true,
         });
       }
       return worktreePath;
@@ -834,11 +855,13 @@ const make = Effect.gen(function* () {
               })
             : // A replay without the turn takes the worktree as the preparation left it, runs
               // setup there and launches into it as into any existing worktree, so core starts
-              // the turn once it has prepared the workspace. A preparation still under way here
-              // ends first, so Git is read as it leaves it.
+              // the turn once it has prepared the workspace. A preparation already at readiness
+              // has handed off the workspace, even while it observes async setup completion.
               yield* Effect.gen(function* () {
-                yield* awaitPreparation(threadId, ({ snapshot }) =>
-                  snapshot?.phase === "running" ? undefined : true,
+                const prepared = yield* awaitPreparation(threadId, ({ snapshot }) =>
+                  snapshot?.phase === "running" && !releasable(snapshot)
+                    ? undefined
+                    : snapshot !== null && releasable(snapshot),
                 );
                 const { branch, baseRef } = runless.workspace;
                 const worktreePath = yield* recoverWorktree({
@@ -853,6 +876,9 @@ const make = Effect.gen(function* () {
                   commandId,
                 });
                 yield* runless.setup(worktreePath);
+                // Releasing through the same still-running core preparation would leave the new
+                // run waiting behind its async observer. It already handed off this workspace.
+                if (prepared) return (yield* sendOpening).run;
                 const relaunched = yield* launches.launch({
                   ...launchInput,
                   workspaceStrategy: { type: "existing_worktree", worktreePath, branch },

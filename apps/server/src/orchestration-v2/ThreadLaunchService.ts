@@ -370,7 +370,7 @@ const make = Effect.gen(function* () {
     let createdWorktreePath: string | null = null;
     let setupTerminalId: string | null = null;
     let workspaceRecorded = false;
-    let runReleased = false;
+    let workspaceReleased = false;
     if (input.workspaceStrategy.type === "worktree") {
       yield* setupTracker.begin({
         threadId,
@@ -676,7 +676,16 @@ const make = Effect.gen(function* () {
       } else {
         yield* setupTracker.stageStatus(threadId, "setup-script", "skipped");
       }
-      yield* setupTracker.markUncancellable(threadId);
+      yield* setupTracker.markUncancellable(threadId).pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            // A caller of a message-less launch takes the prepared workspace at agent readiness.
+            // Hand it off before publishing that readiness, even while async setup is observed.
+            if (runId === null) workspaceReleased = true;
+          }),
+        ),
+        Effect.uninterruptible,
+      );
       yield* setupTracker.stageStatus(threadId, "agent", "running");
       if (runId !== null) {
         yield* threads
@@ -690,7 +699,7 @@ const make = Effect.gen(function* () {
             Effect.mapError(mapError(input, "release-run", threadId)),
             Effect.tap(() =>
               Effect.sync(() => {
-                runReleased = true;
+                workspaceReleased = true;
               }),
             ),
             Effect.uninterruptible,
@@ -715,7 +724,7 @@ const make = Effect.gen(function* () {
           if (
             tracked &&
             createdWorktreePath &&
-            ((cancelled && !runReleased) || !workspaceRecorded)
+            ((cancelled && !workspaceReleased) || !workspaceRecorded)
           ) {
             const removedPath = createdWorktreePath;
             // The thread forgets the worktree only once it is gone; a failed
