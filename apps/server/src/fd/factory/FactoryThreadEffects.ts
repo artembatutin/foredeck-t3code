@@ -498,34 +498,48 @@ const make = Effect.gen(function* () {
           )
             return current;
         }
-        // Core's dequeue writes system events without a command receipt. Public owner
-        // selection commands have one; retain their payload even when dequeue overwrote it.
+        // Keep the preceding selection, including system writes: choosing medium while a
+        // mechanical turn is queued changes effort, but editing another option at medium
+        // after it starts does not. Only command-bearing changes express owner intent.
         const changes = yield* Effect.forEach(
-          ["thread.model-selection-updated", "thread.provider-switched"] as const,
+          ["thread.created", "thread.model-selection-updated", "thread.provider-switched"] as const,
           (eventType) =>
             events
               .read({
                 threadId,
-                afterSequence: sent.at(-1)?.sequence ?? 0,
                 throughSequence,
                 eventType,
               })
               .pipe(Stream.runCollect),
         );
+        const effortId = saved.mechanical?.options?.find(
+          (option) =>
+            saved.before.options?.find(({ id }) => id === option.id)?.value !== option.value,
+        )?.id;
+        let preceding = saved.before;
         let ownerSelection: ModelSelection | undefined;
         let ownerEffort = false;
-        for (const { event, commandId } of changes
+        for (const { event, commandId, sequence } of changes
           .flat()
           .toSorted((a, b) => a.sequence - b.sequence)) {
           if (
-            commandId === null ||
-            (event.type !== "thread.model-selection-updated" &&
-              event.type !== "thread.provider-switched")
+            event.type !== "thread.created" &&
+            event.type !== "thread.model-selection-updated" &&
+            event.type !== "thread.provider-switched"
           )
             continue;
-          ownerSelection = event.payload.modelSelection;
-          if (restoreMechanicalSelection(ownerSelection, saved) === ownerSelection)
-            ownerEffort = true;
+          const selection = event.payload.modelSelection;
+          if (sequence > (sent.at(-1)?.sequence ?? 0) && commandId !== null) {
+            ownerSelection = selection;
+            if (
+              selection.instanceId !== preceding.instanceId ||
+              selection.model !== preceding.model ||
+              selection.options?.find(({ id }) => id === effortId)?.value !==
+                preceding.options?.find(({ id }) => id === effortId)?.value
+            )
+              ownerEffort = true;
+          }
+          preceding = selection;
         }
         return ownerSelection === undefined
           ? restoreMechanicalSelection(current, saved)

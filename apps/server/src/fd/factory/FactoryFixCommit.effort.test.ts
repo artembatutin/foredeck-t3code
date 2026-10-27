@@ -680,7 +680,13 @@ describe("Factory fix-commit effort", () => {
       ),
   );
 
-  it.live.each(["model", "effort", "effort round-trip", "unrelated option"] as const)(
+  it.live.each([
+    "model",
+    "effort",
+    "direct high-to-medium effort",
+    "effort round-trip",
+    "unrelated option",
+  ] as const)(
     "recovers an owner %s selection made after mechanical enqueue and before dequeue",
     (change) =>
       withProject(
@@ -724,12 +730,13 @@ describe("Factory fix-commit effort", () => {
               (yield* projection()).runs.find(({ id }) => id === fixing.runId)?.status,
               "queued",
             );
+            assert.deepStrictEqual((yield* projection()).thread.modelSelection, before);
             const selected =
               change === "model"
                 ? { ...atEffort(before, "low"), model: "owner-model" }
                 : change === "effort"
                   ? atEffort(before, "low")
-                  : change === "effort round-trip"
+                  : change === "effort round-trip" || change === "direct high-to-medium effort"
                     ? atEffort(before, "medium")
                     : {
                         ...before,
@@ -740,6 +747,10 @@ describe("Factory fix-commit effort", () => {
                       };
             if (change === "effort round-trip") yield* select(atEffort(before, "low"));
             yield* select(selected);
+            if (change === "direct high-to-medium effort") {
+              assert.strictEqual(selections, 2);
+              assert.deepStrictEqual((yield* projection()).thread.modelSelection, selected);
+            }
             yield* world.endRun(owner.run.id, "completed");
             yield* drainOrchestration;
             // Core applies the queued mechanical selection over the owner's newer choice.
