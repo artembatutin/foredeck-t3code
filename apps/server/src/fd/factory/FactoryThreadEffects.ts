@@ -23,6 +23,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import type * as ServerConfig from "../../config.ts";
+import * as EventStore from "../../orchestration-v2/EventStore.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
@@ -400,6 +401,7 @@ const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const factorySettings = yield* FactorySettings.FactorySettings;
   const turnSelections = yield* FactoryTurnSelectionStore.FactoryTurnSelectionStore;
+  const events = yield* EventStore.EventStoreV2;
   const work = yield* WorkService.WorkService;
   const git = yield* GitVcsDriver.GitVcsDriver;
   const providers = yield* ProviderRegistry.ProviderRegistry;
@@ -462,6 +464,39 @@ const make = Effect.gen(function* () {
           .some((run) => run.status !== "queued" && FACTORY_MESSAGE.test(run.userMessageId ?? ""))
       )
         return current;
+      // Equality alone loses an owner's change away from and back to medium. Selection events
+      // after this send retain that intent; unrelated option edits still restore only effort.
+      const sent = yield* events
+        .readByCommandId({
+          commandId: CommandId.make(
+            `factory-fix-commit:${saved.value.deliveryId}:${saved.value.effectId}`,
+          ),
+        })
+        .pipe(Stream.runLast);
+      const throughSequence = yield* events.latestSequence({ threadId });
+      for (const eventType of [
+        "thread.model-selection-updated",
+        "thread.provider-switched",
+      ] as const) {
+        const changed = yield* events
+          .read({
+            threadId,
+            afterSequence: Option.isSome(sent) ? sent.value.sequence : 0,
+            throughSequence,
+            eventType,
+          })
+          .pipe(
+            Stream.filter(
+              ({ event }) =>
+                (event.type === "thread.model-selection-updated" ||
+                  event.type === "thread.provider-switched") &&
+                restoreMechanicalSelection(event.payload.modelSelection, saved.value) ===
+                  event.payload.modelSelection,
+            ),
+            Stream.runHead,
+          );
+        if (Option.isSome(changed)) return current;
+      }
       return restored;
     });
 
@@ -1271,4 +1306,4 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(FactoryThreadEffects, make);
+export const layer = Layer.effect(FactoryThreadEffects, make).pipe(Layer.provide(EventStore.layer));

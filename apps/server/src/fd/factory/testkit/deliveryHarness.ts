@@ -590,6 +590,7 @@ const providerInstances = (supportedRuntimeModes: ReadonlyArray<RuntimeMode> | u
 const makeLayer = (input: {
   readonly provider: FakeProvider;
   readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
+  readonly providers: ReadonlyArray<ServerProvider> | undefined;
   readonly pullRequestCalls: Array<PullRequestCall>;
   readonly worktreeRemovals: Array<VcsRemoveWorktreeInput>;
   readonly publishHooks: Array<Effect.Effect<void>>;
@@ -629,7 +630,7 @@ const makeLayer = (input: {
     Layer.provide(
       fakePullRequests(input.pullRequestCalls, input.worktreeRemovals, input.publishHooks),
     ),
-    Layer.provide(ProviderRegistryMock.layer()),
+    Layer.provide(ProviderRegistryMock.layer(input.providers)),
     Layer.provide(instances),
     Layer.provideMerge(recordingWork(input.commentCalls, input.wrapWork)),
     Layer.provideMerge(threadLaunch(input.setupScripts)),
@@ -835,6 +836,8 @@ export const withProject = <A, E>(
     readonly limits?: { readonly maxFixRounds?: number; readonly maxReviewRounds?: number };
     /** The runtime modes the provider advertises; none, so it runs any, when absent. */
     readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
+    /** Model options Factory can select for its turns. */
+    readonly providers?: ReadonlyArray<ServerProvider>;
     /** Wraps the Work service the server runs with, to fail some of its calls. */
     readonly work?: (service: WorkServiceShape) => WorkServiceShape;
     /** Factory's reactor runs only inside `world.boot`; see there. */
@@ -1036,6 +1039,7 @@ export const withProject = <A, E>(
         makeLayer({
           provider,
           supportedRuntimeModes: options.supportedRuntimeModes,
+          providers: options.providers,
           pullRequestCalls,
           worktreeRemovals,
           publishHooks,

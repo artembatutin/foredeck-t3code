@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
+  CommandId,
   type ModelSelection,
   ProjectId,
   type ProviderOptionDescriptor,
@@ -48,6 +49,14 @@ import { advance } from "./pipeline/engine.ts";
 import { type FactoryEffect, queuedDeliveryState } from "./pipeline/state.ts";
 import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
+import {
+  authorCommits,
+  drainOrchestration,
+  instanceId as integratedInstanceId,
+  stateOf,
+  verifyCommands,
+  withProject,
+} from "./testkit/deliveryHarness.ts";
 
 const projectId = ProjectId.make("project-mechanical");
 const deliveryId = FactoryDeliveryId.make("delivery-mechanical");
@@ -55,14 +64,14 @@ const author = ThreadId.make("author-mechanical");
 const authorRun = RunId.make("author-run");
 const instanceId = ProviderInstanceId.make("test-provider");
 const branch = "feature/mechanical";
-const original: ModelSelection = {
+const original = {
   instanceId,
   model: "author-model",
   options: [
     { id: "effort", value: "high" },
     { id: "fastMode", value: true },
   ],
-};
+} satisfies ModelSelection;
 const effort: ProviderOptionDescriptor = {
   id: "effort",
   label: "Effort",
@@ -276,6 +285,98 @@ const prepare = (world: World, risk: "normal" | "high" = "normal") =>
   });
 
 describe("Factory fix-commit effort", () => {
+  it.live.each(["effort", "unrelated option"] as const)(
+    "honors public owner %s changes during verification before another Factory turn",
+    (change) =>
+      withProject(
+        verifyCommands.fails,
+        (world) =>
+          Effect.gen(function* () {
+            const author = yield* world.start;
+            const threads = yield* ThreadManagement.ThreadManagementService;
+            const projection = () =>
+              threads
+                .getProjectThread({ projectId: world.projectId, threadId: author.threadId })
+                .pipe(Effect.orDie);
+            const before = {
+              ...(yield* projection()).thread.modelSelection,
+              options: original.options,
+            };
+            let selections = 0;
+            const select = (selection: ModelSelection) =>
+              threads
+                .dispatch({
+                  type: "thread.model-selection.set",
+                  commandId: CommandId.make(`owner-selection:${++selections}`),
+                  threadId: author.threadId,
+                  modelSelection: selection,
+                })
+                .pipe(Effect.orDie);
+            yield* select(before);
+            const fs = yield* FileSystem.FileSystem;
+            yield* fs.writeFileString(`${author.worktreePath}/export.ts`, "uncommitted work\n");
+            yield* world.endRun(author.runId, "completed");
+            yield* drainOrchestration;
+            const fixing = (yield* stateOf(author.deliveryId)).awaiting;
+            if (fixing?.type !== "run") return assert.fail("No mechanical turn started.");
+            assert.deepStrictEqual(
+              (yield* projection()).thread.modelSelection,
+              atEffort(before, "medium"),
+            );
+            yield* authorCommits(author.worktreePath, "fix: commit the work");
+            let verified = false;
+            world.processes.around = (input, run) =>
+              Effect.gen(function* () {
+                assert.isFalse(verified);
+                verified = true;
+                const during = yield* projection();
+                assert.strictEqual(during.runs.length, 2);
+                assert.strictEqual(during.runs.at(-1)?.status, "completed");
+                if (change === "effort") {
+                  yield* select(atEffort(before, "high"));
+                  yield* select(atEffort(before, "medium"));
+                } else {
+                  yield* select({
+                    ...before,
+                    options: [
+                      { id: "effort", value: "medium" },
+                      { id: "fastMode", value: false },
+                    ],
+                  });
+                }
+                assert.strictEqual((yield* projection()).runs.length, 2);
+                return yield* run(input);
+              });
+            yield* world.endRun(fixing.runId, "completed");
+            yield* drainOrchestration;
+            assert.isTrue(verified);
+            const next = yield* projection();
+            assert.strictEqual(next.runs.length, 3);
+            assert.strictEqual((yield* stateOf(author.deliveryId)).rounds.fix, 1);
+            const expected =
+              change === "effort"
+                ? atEffort(before, "medium")
+                : {
+                    ...before,
+                    options: [
+                      { id: "fastMode", value: false },
+                      { id: "effort", value: "high" },
+                    ],
+                  };
+            assert.deepStrictEqual(next.thread.modelSelection, expected);
+            assert.deepStrictEqual(next.runs.at(-1)?.modelSelection, expected);
+          }),
+        {
+          providers: [
+            {
+              instanceId: integratedInstanceId,
+              models: [{ slug: "test-model", capabilities: { optionDescriptors: [effort] } }],
+            } as unknown as ServerProvider,
+          ],
+        },
+      ),
+  );
+
   it.effect.each(["normal", "high"] as const)(
     "uses medium for a %s-risk author's unsettled branch, irrespective of earlier rounds",
     (risk) =>
