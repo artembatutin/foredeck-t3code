@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
+  MessageId,
   type ModelSelection,
   ProjectId,
   type ProviderOptionDescriptor,
@@ -462,6 +463,110 @@ describe("Factory fix-commit effort", () => {
           assert.strictEqual(active.status, "running");
           assert.deepStrictEqual(next.thread.modelSelection, before);
           assert.deepStrictEqual(active.modelSelection, before);
+        }),
+      {
+        providers: [
+          {
+            instanceId: integratedInstanceId,
+            models: [{ slug: "test-model", capabilities: { optionDescriptors: [effort] } }],
+          } as unknown as ServerProvider,
+        ],
+      },
+    ),
+  );
+
+  it.live("keeps owner effort after cancelling a queued fix-commit and publicly resuming", () =>
+    withProject(
+      verifyCommands.fails,
+      (world) =>
+        Effect.gen(function* () {
+          const author = yield* world.start;
+          const threads = yield* ThreadManagement.ThreadManagementService;
+          const projection = () =>
+            threads
+              .getProjectThread({ projectId: world.projectId, threadId: author.threadId })
+              .pipe(Effect.orDie);
+          const before = {
+            ...(yield* projection()).thread.modelSelection,
+            options: original.options,
+          };
+          yield* threads.dispatch({
+            type: "thread.model-selection.set",
+            commandId: CommandId.make("owner-selection:high"),
+            threadId: author.threadId,
+            modelSelection: before,
+          });
+          const fs = yield* FileSystem.FileSystem;
+          yield* fs.writeFileString(`${author.worktreePath}/export.ts`, "uncommitted work\n");
+          // The owner's queued turn starts before Factory sends its mechanical fix-commit.
+          const ownerTurn = yield* threads.sendToThread({
+            projectId: world.projectId,
+            commandId: CommandId.make("owner-turn:before-fix-commit"),
+            threadId: author.threadId,
+            messageId: MessageId.make("owner-message:before-fix-commit"),
+            text: "Owner work before fix-commit",
+            attachments: [],
+            mode: "queue",
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const ownerRun = ownerTurn.run.id;
+          yield* world.endRun(author.runId, "completed");
+          const queued = (yield* stateOf(author.deliveryId)).awaiting;
+          if (queued?.type !== "run") return assert.fail("No mechanical turn queued.");
+          const pending = yield* projection();
+          const mechanical = pending.runs.find(({ id }) => id === queued.runId)!;
+          assert.strictEqual(mechanical.status, "queued");
+          assert.isNull(mechanical.startedAt);
+          assert.deepStrictEqual(mechanical.modelSelection, atEffort(before, "medium"));
+          assert.deepStrictEqual(pending.thread.modelSelection, before);
+          yield* threads.dispatch({
+            type: "queued-run.cancel",
+            commandId: CommandId.make("owner-cancel:mechanical"),
+            threadId: author.threadId,
+            runId: queued.runId,
+          });
+          yield* drainFactory;
+          const cancelled = (yield* projection()).runs.find(({ id }) => id === queued.runId)!;
+          assert.strictEqual(cancelled.status, "cancelled");
+          assert.isNull(cancelled.startedAt);
+          assert.isFalse(world.provider.started.some(({ runId }) => runId === queued.runId));
+          const blocked = yield* stateOf(author.deliveryId);
+          assert.strictEqual(blocked.status, "blocked");
+          assert.strictEqual(blocked.block?.reason, "run_ended");
+          assert.lengthOf(blocked.receipts, 0);
+          const selected = atEffort(before, "medium");
+          yield* threads.dispatch({
+            type: "thread.model-selection.set",
+            commandId: CommandId.make("owner-selection:medium"),
+            threadId: author.threadId,
+            modelSelection: selected,
+          });
+          const owned = yield* projection();
+          assert.lengthOf(owned.runs, 3);
+          assert.strictEqual(owned.runs.find(({ id }) => id === ownerRun)?.status, "running");
+          assert.deepStrictEqual(owned.thread.modelSelection, selected);
+          assert.deepStrictEqual(world.provider.interrupted, []);
+          yield* authorCommits(author.worktreePath, "fix: commit the work");
+          yield* world.endRun(ownerRun, "completed");
+          const service = yield* FactoryService.FactoryService;
+          yield* service.resume(author.deliveryId);
+          yield* drainFactory;
+          yield* drainOrchestration;
+          const resumed = yield* stateOf(author.deliveryId);
+          assert.strictEqual(resumed.risk, "normal");
+          assert.deepStrictEqual(resumed.rounds, { fix: 1, review: 0 });
+          assert.lengthOf(resumed.receipts, 1);
+          assert.strictEqual(resumed.receipts[0]?.code, 3);
+          if (resumed.awaiting?.type !== "run") return assert.fail("No resumed repair started.");
+          const resumedRunId = resumed.awaiting.runId;
+          assert.notStrictEqual(resumedRunId, queued.runId);
+          const next = yield* projection();
+          assert.lengthOf(next.runs, 4);
+          const active = next.runs.find(({ id }) => id === resumedRunId)!;
+          assert.strictEqual(active.status, "running");
+          assert.deepStrictEqual(next.thread.modelSelection, selected);
+          assert.deepStrictEqual(active.modelSelection, selected);
         }),
       {
         providers: [

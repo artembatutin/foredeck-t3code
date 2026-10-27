@@ -454,8 +454,9 @@ const make = Effect.gen(function* () {
       const { runs } = yield* projections.getThreadRecords(threadId, ["runs"]);
       const messageId = `factory-fix-commit-message:${saved.value.deliveryId}:${saved.value.effectId}`;
       const fixed = runs.findIndex((run) => run.userMessageId === messageId);
-      // A recorded selection alone proves no change: dispatch may have failed or still be queued.
-      if (fixed < 0 || runs[fixed]?.status === "queued") return current;
+      // A recorded selection alone proves no change: the turn may still be queued or have been
+      // cancelled before starting, without ever applying its requested selection.
+      if (fixed < 0 || runs[fixed]?.startedAt === null) return current;
       // Once a later Factory turn has started, this temporary selection is spent. Cancelling
       // a queued turn leaves startedAt null and never applies its selection. If the owner
       // subsequently chooses medium themselves, an old fix-commit must not undo that choice.
