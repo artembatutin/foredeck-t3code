@@ -14,7 +14,7 @@ import {
 } from "@t3tools/contracts";
 import { FactoryDeliveryId, FactoryRole } from "@t3tools/contracts/fd/factory";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
-import { modelSelectionsEqual } from "@t3tools/shared/model";
+import { getProviderOptionCurrentValue, modelSelectionsEqual } from "@t3tools/shared/model";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -448,32 +448,20 @@ const make = Effect.gen(function* () {
   // takes precedence. The store is keyed by thread too, for a parent's last-child follow-through.
   const beforeMechanical = (threadId: ThreadId, current: ModelSelection) =>
     Effect.gen(function* () {
-      const saved = yield* turnSelections.latest(threadId);
-      if (Option.isNone(saved)) return current;
-      const restored = restoreMechanicalSelection(current, saved.value);
-      if (restored === current) return current;
+      const selections = yield* turnSelections.list(threadId);
+      if (selections.length === 0) return current;
       const { runs } = yield* projections.getThreadRecords(threadId, ["runs"]);
-      const messageId = `factory-fix-commit-message:${saved.value.deliveryId}:${saved.value.effectId}`;
-      const fixed = runs.findIndex((run) => run.userMessageId === messageId);
-      if (fixed < 0) return current;
-      const sent = yield* events
-        .readByCommandId({
-          commandId: CommandId.make(
-            `factory-fix-commit:${saved.value.deliveryId}:${saved.value.effectId}`,
-          ),
-        })
-        .pipe(Stream.runCollect);
       const throughSequence = yield* events.latestSequence({ threadId });
       // Core applies selection on entering `starting`, before provider startup sets startedAt.
       // Its persisted transition distinguishes a startup failure from a never-dequeued cancel.
-      const selectionApplied = (run: OrchestrationV2Run) =>
+      const selectionApplied = (run: OrchestrationV2Run, afterSequence: number) =>
         Effect.gen(function* () {
           if (run.startedAt !== null) return true;
           for (const eventType of ["run.created", "run.updated"] as const) {
             const starting = yield* events
               .read({
                 threadId,
-                afterSequence: (sent[0]?.sequence ?? 1) - 1,
+                afterSequence,
                 throughSequence,
                 eventType,
               })
@@ -490,38 +478,62 @@ const make = Effect.gen(function* () {
           }
           return false;
         });
-      if (!(yield* selectionApplied(runs[fixed]!))) return current;
-      // A later Factory turn that applied selection spends this override, even if startup fails.
-      for (const run of runs.slice(fixed + 1)) {
-        if (FACTORY_MESSAGE.test(run.userMessageId ?? "") && (yield* selectionApplied(run)))
-          return current;
-      }
-      // Equality alone loses an owner's change away from and back to medium. Selection events
-      // after this send retain that intent; unrelated option edits still restore only effort.
-      for (const eventType of [
-        "thread.model-selection-updated",
-        "thread.provider-switched",
-      ] as const) {
-        const changed = yield* events
-          .read({
-            threadId,
-            afterSequence: sent.at(-1)?.sequence ?? 0,
-            throughSequence,
-            eventType,
+      // A refused or never-dequeued newer intent cannot hide an older applied override.
+      for (const saved of selections) {
+        const messageId = `factory-fix-commit-message:${saved.deliveryId}:${saved.effectId}`;
+        const fixed = runs.findIndex((run) => run.userMessageId === messageId);
+        if (fixed < 0) continue;
+        const sent = yield* events
+          .readByCommandId({
+            commandId: CommandId.make(`factory-fix-commit:${saved.deliveryId}:${saved.effectId}`),
           })
-          .pipe(
-            Stream.filter(
-              ({ event }) =>
-                (event.type === "thread.model-selection-updated" ||
-                  event.type === "thread.provider-switched") &&
-                restoreMechanicalSelection(event.payload.modelSelection, saved.value) ===
-                  event.payload.modelSelection,
-            ),
-            Stream.runHead,
-          );
-        if (Option.isSome(changed)) return current;
+          .pipe(Stream.runCollect);
+        const afterSequence = (sent[0]?.sequence ?? 1) - 1;
+        if (!(yield* selectionApplied(runs[fixed]!, afterSequence))) continue;
+        // A later Factory turn that applied selection spends this override, even if startup fails.
+        for (const run of runs.slice(fixed + 1)) {
+          if (
+            FACTORY_MESSAGE.test(run.userMessageId ?? "") &&
+            (yield* selectionApplied(run, afterSequence))
+          )
+            return current;
+        }
+        // Core's dequeue writes system events without a command receipt. Public owner
+        // selection commands have one; retain their payload even when dequeue overwrote it.
+        const changes = yield* Effect.forEach(
+          ["thread.model-selection-updated", "thread.provider-switched"] as const,
+          (eventType) =>
+            events
+              .read({
+                threadId,
+                afterSequence: sent.at(-1)?.sequence ?? 0,
+                throughSequence,
+                eventType,
+              })
+              .pipe(Stream.runCollect),
+        );
+        let ownerSelection: ModelSelection | undefined;
+        let ownerEffort = false;
+        for (const { event, commandId } of changes
+          .flat()
+          .toSorted((a, b) => a.sequence - b.sequence)) {
+          if (
+            commandId === null ||
+            (event.type !== "thread.model-selection-updated" &&
+              event.type !== "thread.provider-switched")
+          )
+            continue;
+          ownerSelection = event.payload.modelSelection;
+          if (restoreMechanicalSelection(ownerSelection, saved) === ownerSelection)
+            ownerEffort = true;
+        }
+        return ownerSelection === undefined
+          ? restoreMechanicalSelection(current, saved)
+          : ownerEffort
+            ? ownerSelection
+            : restoreMechanicalSelection(ownerSelection, saved);
       }
-      return restored;
+      return current;
     });
 
   const turnSelection = (delivery: StoredFactoryDelivery, threadId: ThreadId, round: number) =>
@@ -544,16 +556,31 @@ const make = Effect.gen(function* () {
       const { thread } = yield* projections.getThreadRecords(effect.threadId, []);
       const before = yield* beforeMechanical(effect.threadId, thread.modelSelection);
       const available = yield* providers.getProviders;
-      const mechanical = mechanicalEffort({
-        selection: before,
-        descriptors: available
-          .find((provider) => provider.instanceId === before.instanceId)
-          ?.models.find((model) => model.slug === before.model)?.capabilities?.optionDescriptors,
-      });
+      const descriptors = available
+        .find((provider) => provider.instanceId === before.instanceId)
+        ?.models.find((model) => model.slug === before.model)?.capabilities?.optionDescriptors;
+      const mechanical = mechanicalEffort({ selection: before, descriptors });
+      const inherited = descriptors?.find(
+        (option) =>
+          option.type === "select" &&
+          mechanical !== before &&
+          mechanical.options?.some(({ id, value }) => id === option.id && value === "medium") &&
+          !before.options?.some(({ id }) => id === option.id),
+      );
+      const defaultValue = getProviderOptionCurrentValue(inherited);
+      // Omission can retain a provider's last explicit effort (Pi). Save the advertised
+      // effective default before applying medium so restoration actively resets that provider.
+      const effectiveBefore =
+        inherited !== undefined && typeof defaultValue === "string"
+          ? {
+              ...before,
+              options: [...(before.options ?? []), { id: inherited.id, value: defaultValue }],
+            }
+          : before;
       yield* turnSelections.record({
         ...key,
         threadId: effect.threadId,
-        before,
+        before: effectiveBefore,
         mechanical: mechanical === before ? null : mechanical,
       });
       // Read back the winner if the same effect was dispatched concurrently.
@@ -1069,12 +1096,9 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       let selection = modelSelection;
       if (selection === undefined && kind !== "fix-commit") {
-        const saved = yield* turnSelections.latest(effect.threadId);
-        if (Option.isSome(saved) && saved.value.mechanical !== null) {
-          const { thread } = yield* projections.getThreadRecords(effect.threadId, []);
-          const restored = yield* beforeMechanical(effect.threadId, thread.modelSelection);
-          if (restored !== thread.modelSelection) selection = restored;
-        }
+        const { thread } = yield* projections.getThreadRecords(effect.threadId, []);
+        const restored = yield* beforeMechanical(effect.threadId, thread.modelSelection);
+        if (restored !== thread.modelSelection) selection = restored;
       }
       return yield* ThreadMessageIntake.sendToThread({
         projectId: delivery.projectId,

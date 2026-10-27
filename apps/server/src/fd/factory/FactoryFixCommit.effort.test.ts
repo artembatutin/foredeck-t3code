@@ -62,6 +62,7 @@ import {
   verifyCommands,
   withProject,
 } from "./testkit/deliveryHarness.ts";
+import { makePiEffort, piEffortLayer } from "./testkit/piEffort.ts";
 
 const projectId = ProjectId.make("project-mechanical");
 const deliveryId = FactoryDeliveryId.make("delivery-mechanical");
@@ -581,6 +582,252 @@ describe("Factory fix-commit effort", () => {
     ),
   );
 
+  it.live.each(["blocked", "stopped"] as const)(
+    "restores the first applied override after %s Resume queues a cancelled second fix-commit",
+    (pause) =>
+      withProject(
+        verifyCommands.fails,
+        (world) =>
+          Effect.gen(function* () {
+            const author = yield* world.start;
+            const threads = yield* ThreadManagement.ThreadManagementService;
+            const service = yield* FactoryService.FactoryService;
+            const projection = () =>
+              threads.getProjectThread({ projectId: world.projectId, threadId: author.threadId });
+            const before = {
+              ...(yield* projection()).thread.modelSelection,
+              options: original.options,
+            };
+            yield* threads.dispatch({
+              type: "thread.model-selection.set",
+              commandId: CommandId.make("owner-selection:high"),
+              threadId: author.threadId,
+              modelSelection: before,
+            });
+            const fs = yield* FileSystem.FileSystem;
+            yield* fs.writeFileString(`${author.worktreePath}/export.ts`, "uncommitted work\n");
+            yield* world.endRun(author.runId, "completed");
+            const first = (yield* stateOf(author.deliveryId)).awaiting;
+            if (first?.type !== "run") return assert.fail("No first fix-commit started.");
+            yield* drainOrchestration;
+            assert.deepStrictEqual(
+              (yield* projection()).thread.modelSelection,
+              atEffort(before, "medium"),
+            );
+            if (pause === "stopped") {
+              yield* service.stop(author.deliveryId);
+              yield* authorCommits(author.worktreePath, "fix: commit the first work");
+            }
+            // Blocked settlement or graceful Stop leaves the override applied.
+            yield* world.endRun(first.runId, "completed");
+            assert.strictEqual((yield* stateOf(author.deliveryId)).status, pause);
+            const ownerRun = yield* world.ownerTurn(author.threadId, "Owner work before Resume");
+            yield* fs.writeFileString(
+              `${author.worktreePath}/export.ts`,
+              "more uncommitted work\n",
+            );
+            yield* service.resume(author.deliveryId);
+            yield* drainFactory;
+            const second = (yield* stateOf(author.deliveryId)).awaiting;
+            if (second?.type !== "run") return assert.fail("No second fix-commit queued.");
+            assert.notStrictEqual(second.runId, first.runId);
+            const queued = (yield* projection()).runs.find(({ id }) => id === second.runId)!;
+            assert.strictEqual(queued.status, "queued");
+            assert.deepStrictEqual(queued.modelSelection, atEffort(before, "medium"));
+            yield* threads.dispatch({
+              type: "queued-run.cancel",
+              commandId: CommandId.make("owner-cancel:second-mechanical"),
+              threadId: author.threadId,
+              runId: second.runId,
+            });
+            yield* drainFactory;
+            const cancelled = (yield* projection()).runs.find(({ id }) => id === second.runId)!;
+            assert.strictEqual(cancelled.status, "cancelled");
+            assert.isNull(cancelled.startedAt);
+            assert.isFalse(world.provider.started.some(({ runId }) => runId === second.runId));
+            assert.strictEqual((yield* stateOf(author.deliveryId)).status, "blocked");
+            yield* authorCommits(
+              author.worktreePath,
+              "fix: commit the work",
+              "export const x = 2;\n",
+            );
+            yield* world.endRun(ownerRun, "completed");
+            yield* service.resume(author.deliveryId);
+            yield* drainFactory;
+            yield* drainOrchestration;
+            const resumed = yield* stateOf(author.deliveryId);
+            assert.strictEqual(resumed.risk, "normal");
+            assert.deepStrictEqual(resumed.rounds, { fix: 1, review: 0 });
+            assert.strictEqual(resumed.receipts.at(-1)?.code, 3);
+            if (resumed.awaiting?.type !== "run") return assert.fail("No normal repair started.");
+            const next = yield* projection();
+            assert.deepStrictEqual(next.thread.modelSelection, before);
+            const resumedRunId = resumed.awaiting.runId;
+            assert.deepStrictEqual(
+              next.runs.find(({ id }) => id === resumedRunId)?.modelSelection,
+              before,
+            );
+            assert.deepStrictEqual(world.provider.started.at(-1)?.modelSelection, before);
+          }),
+        {
+          providers: [
+            {
+              instanceId: integratedInstanceId,
+              models: [{ slug: "test-model", capabilities: { optionDescriptors: [effort] } }],
+            } as unknown as ServerProvider,
+          ],
+        },
+      ),
+  );
+
+  it.live.each(["model", "effort", "effort round-trip", "unrelated option"] as const)(
+    "recovers an owner %s selection made after mechanical enqueue and before dequeue",
+    (change) =>
+      withProject(
+        verifyCommands.fails,
+        (world) =>
+          Effect.gen(function* () {
+            const author = yield* world.start;
+            const threads = yield* ThreadManagement.ThreadManagementService;
+            const projection = () =>
+              threads.getProjectThread({ projectId: world.projectId, threadId: author.threadId });
+            const before = {
+              ...(yield* projection()).thread.modelSelection,
+              options: original.options,
+            };
+            let selections = 0;
+            const select = (modelSelection: ModelSelection) =>
+              threads.dispatch({
+                type: "thread.model-selection.set",
+                commandId: CommandId.make(`owner-selection:${++selections}`),
+                threadId: author.threadId,
+                modelSelection,
+              });
+            yield* select(before);
+            const fs = yield* FileSystem.FileSystem;
+            yield* fs.writeFileString(`${author.worktreePath}/export.ts`, "uncommitted work\n");
+            const owner = yield* threads.sendToThread({
+              projectId: world.projectId,
+              commandId: CommandId.make("owner-turn:before-mechanical"),
+              threadId: author.threadId,
+              messageId: MessageId.make("owner-message:before-mechanical"),
+              text: "Owner work before fix-commit",
+              attachments: [],
+              mode: "queue",
+              createdBy: "user",
+              creationSource: "web",
+            });
+            yield* world.endRun(author.runId, "completed");
+            const fixing = (yield* stateOf(author.deliveryId)).awaiting;
+            if (fixing?.type !== "run") return assert.fail("No mechanical turn queued.");
+            assert.strictEqual(
+              (yield* projection()).runs.find(({ id }) => id === fixing.runId)?.status,
+              "queued",
+            );
+            const selected =
+              change === "model"
+                ? { ...atEffort(before, "low"), model: "owner-model" }
+                : change === "effort"
+                  ? atEffort(before, "low")
+                  : change === "effort round-trip"
+                    ? atEffort(before, "medium")
+                    : {
+                        ...before,
+                        options: [
+                          { id: "effort", value: "high" },
+                          { id: "fastMode", value: false },
+                        ],
+                      };
+            if (change === "effort round-trip") yield* select(atEffort(before, "low"));
+            yield* select(selected);
+            yield* world.endRun(owner.run.id, "completed");
+            yield* drainOrchestration;
+            // Core applies the queued mechanical selection over the owner's newer choice.
+            assert.deepStrictEqual(
+              (yield* projection()).thread.modelSelection,
+              atEffort(before, "medium"),
+            );
+            yield* authorCommits(author.worktreePath, "fix: commit the work");
+            yield* world.endRun(fixing.runId, "completed");
+            yield* drainOrchestration;
+            const resumed = yield* stateOf(author.deliveryId);
+            assert.deepStrictEqual(resumed.rounds, { fix: 1, review: 0 });
+            const next = yield* projection();
+            assert.deepStrictEqual(next.thread.modelSelection, selected);
+            assert.deepStrictEqual(next.runs.at(-1)?.modelSelection, selected);
+            assert.deepStrictEqual(world.provider.started.at(-1)?.modelSelection, selected);
+          }),
+        {
+          providers: [
+            {
+              instanceId: integratedInstanceId,
+              models: ["test-model", "owner-model"].map((slug) => ({
+                slug,
+                capabilities: { optionDescriptors: [effort] },
+              })),
+            } as unknown as ServerProvider,
+          ],
+        },
+      ),
+  );
+
+  it.live(
+    "restores inherited high thinking on a concrete Pi model through the provider boundary",
+    () =>
+      withProject(
+        verifyCommands.fails,
+        (world) =>
+          Effect.gen(function* () {
+            const author = yield* world.start;
+            const threads = yield* ThreadManagement.ThreadManagementService;
+            const before = { instanceId: integratedInstanceId, model: "test/reasoning" };
+            yield* threads.dispatch({
+              type: "thread.model-selection.set",
+              commandId: CommandId.make("owner-selection:pi-default-thinking"),
+              threadId: author.threadId,
+              modelSelection: before,
+            });
+            const pi = yield* makePiEffort(author.threadId, before);
+            assert.strictEqual(pi.thinking(), "high");
+            assert.deepStrictEqual(pi.levels(), []);
+            const fs = yield* FileSystem.FileSystem;
+            yield* fs.writeFileString(`${author.worktreePath}/export.ts`, "uncommitted work\n");
+            yield* world.endRun(author.runId, "completed");
+            yield* drainOrchestration;
+            const fixing = (yield* stateOf(author.deliveryId)).awaiting;
+            if (fixing?.type !== "run") return assert.fail("No mechanical turn started.");
+            const mechanical = world.provider.started.find(({ runId }) => runId === fixing.runId)!;
+            yield* pi.run(mechanical);
+            assert.strictEqual(pi.thinking(), "medium");
+            assert.deepStrictEqual(pi.levels(), ["medium"]);
+            yield* authorCommits(author.worktreePath, "fix: commit the work");
+            yield* world.endRun(fixing.runId, "completed");
+            yield* drainOrchestration;
+            const resumed = yield* stateOf(author.deliveryId);
+            assert.strictEqual(resumed.risk, "normal");
+            assert.deepStrictEqual(resumed.rounds, { fix: 1, review: 0 });
+            const repair = world.provider.started.at(-1)!;
+            assert.notStrictEqual(repair.runId, fixing.runId);
+            yield* pi.run(repair);
+            assert.strictEqual(pi.thinking(), "high");
+            assert.deepStrictEqual(pi.levels(), ["medium", "high"]);
+          }).pipe(Effect.provide(piEffortLayer), Effect.scoped),
+        {
+          providers: [
+            {
+              instanceId: integratedInstanceId,
+              models: [
+                {
+                  slug: "test/reasoning",
+                  capabilities: { optionDescriptors: [{ ...effort, id: "thinking" }] },
+                },
+              ],
+            } as unknown as ServerProvider,
+          ],
+        },
+      ),
+  );
+
   it.effect.each(["immediate", "dequeued"] as const)(
     "restores effort after %s fix-commit startup fails and public Resume requests a repair",
     (start) =>
@@ -752,12 +999,42 @@ describe("Factory fix-commit effort", () => {
           assert.deepStrictEqual((yield* stored).state.rounds, { fix: 1, review: 0 });
           assert.deepStrictEqual(
             world.sends[1]!.modelSelection,
-            risk === "high" ? atEffort(before, "xhigh") : before,
+            risk === "high"
+              ? atEffort(before, "xhigh")
+              : value === undefined
+                ? atEffort(before, "high")
+                : before,
           );
           assert.deepStrictEqual(
             world.selection,
-            risk === "high" ? atEffort(before, "xhigh") : before,
+            risk === "high"
+              ? atEffort(before, "xhigh")
+              : value === undefined
+                ? atEffort(before, "high")
+                : before,
           );
+        }),
+      ),
+  );
+
+  it.effect.each([undefined, "low"])(
+    "captures the omitted effort with currentValue=%s before the model catalog changes",
+    (currentValue) =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const before = { ...original, options: [{ id: "fastMode", value: true }] };
+          world.selection = before;
+          world.descriptors = [
+            { ...effort, ...(currentValue === undefined ? {} : { currentValue }) },
+          ];
+          yield* prepare(world);
+          yield* endRun(authorRun);
+          assert.deepStrictEqual(world.selection, atEffort(before, "medium"));
+          // Restoration must use the original effective value, independently of the current catalog.
+          world.descriptors = [{ ...effort, currentValue: "medium" }];
+          yield* commit(world.cwd);
+          yield* endRun(runOf(world.sends[0]!));
+          assert.deepStrictEqual(world.selection, atEffort(before, currentValue ?? "high"));
         }),
       ),
   );

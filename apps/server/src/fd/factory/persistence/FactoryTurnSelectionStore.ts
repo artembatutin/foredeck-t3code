@@ -26,9 +26,9 @@ export class FactoryTurnSelectionStore extends Context.Service<
       key: typeof Key.Type,
     ) => Effect.Effect<Option.Option<typeof Selection.Type>, FactoryStoreError>;
     /** A thread can be shared by a child and its parent's follow-through. */
-    readonly latest: (
+    readonly list: (
       threadId: ThreadId,
-    ) => Effect.Effect<Option.Option<typeof Selection.Type>, FactoryStoreError>;
+    ) => Effect.Effect<ReadonlyArray<typeof Selection.Type>, FactoryStoreError>;
     readonly record: (selection: typeof Selection.Type) => Effect.Effect<void, FactoryStoreError>;
   }
 >()("t3/fd/factory/persistence/FactoryTurnSelectionStore") {}
@@ -36,18 +36,22 @@ export class FactoryTurnSelectionStore extends Context.Service<
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const select = SqlSchema.findOneOption({
-    Request: Schema.Union([Key, Schema.Struct({ threadId: ThreadId })]),
+    Request: Key,
     Result: Selection,
     execute: (key) => sql`
       SELECT delivery_id AS "deliveryId", effect_id AS "effectId", thread_id AS "threadId",
         before_json AS before, mechanical_json AS mechanical
       FROM fd_factory_turn_selections
-      WHERE ${
-        "threadId" in key
-          ? sql`thread_id = ${key.threadId}`
-          : sql`delivery_id = ${key.deliveryId} AND effect_id = ${key.effectId}`
-      }
-      ORDER BY position DESC LIMIT 1
+      WHERE delivery_id = ${key.deliveryId} AND effect_id = ${key.effectId}
+    `,
+  });
+  const list = SqlSchema.findAll({
+    Request: ThreadId,
+    Result: Selection,
+    execute: (threadId) => sql`
+      SELECT delivery_id AS "deliveryId", effect_id AS "effectId", thread_id AS "threadId",
+        before_json AS before, mechanical_json AS mechanical
+      FROM fd_factory_turn_selections WHERE thread_id = ${threadId} ORDER BY position DESC
     `,
   });
   const record = SqlSchema.void({
@@ -62,8 +66,8 @@ const make = Effect.gen(function* () {
   });
   return FactoryTurnSelectionStore.of({
     get: (key) => select(key).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.get"))),
-    latest: (threadId) =>
-      select({ threadId }).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.latest"))),
+    list: (threadId) =>
+      list(threadId).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.list"))),
     record: (selection) =>
       record(selection).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.record"))),
   });
