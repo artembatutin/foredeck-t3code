@@ -124,6 +124,16 @@ export const makePiEffort = Effect.fnUntraced(function* (
     Stream.runForEach((event) => Queue.offer(terminals, event)),
     Effect.forkScoped,
   );
+  const start = (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+    runtime
+      .startTurn({ ...input, runtimePolicy })
+      .pipe(Effect.andThen(emit({ type: "agent_start" })));
+  const end = () =>
+    Effect.gen(function* () {
+      yield* emit({ type: "agent_end", messages: [], willRetry: false });
+      yield* emit({ type: "agent_settled" });
+      yield* Queue.take(terminals);
+    });
   return {
     runtime,
     state,
@@ -133,13 +143,9 @@ export const makePiEffort = Effect.fnUntraced(function* (
       requests
         .filter((record) => record["type"] === "set_thinking_level")
         .map((record) => record["level"]),
+    start,
+    end,
     run: (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
-      Effect.gen(function* () {
-        yield* runtime.startTurn({ ...input, runtimePolicy });
-        yield* emit({ type: "agent_start" });
-        yield* emit({ type: "agent_end", messages: [], willRetry: false });
-        yield* emit({ type: "agent_settled" });
-        yield* Queue.take(terminals);
-      }),
+      start(input).pipe(Effect.andThen(end())),
   };
 });

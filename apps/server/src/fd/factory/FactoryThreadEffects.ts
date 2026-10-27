@@ -504,9 +504,12 @@ const make = Effect.gen(function* () {
         const messageId = `factory-fix-commit-message:${saved.deliveryId}:${saved.effectId}`;
         const fixed = runs.findIndex((run) => run.userMessageId === messageId);
         if (fixed < 0) continue;
+        const mechanicalCommandId = CommandId.make(
+          `factory-fix-commit:${saved.deliveryId}:${saved.effectId}`,
+        );
         const sent = yield* events
           .readByCommandId({
-            commandId: CommandId.make(`factory-fix-commit:${saved.deliveryId}:${saved.effectId}`),
+            commandId: mechanicalCommandId,
           })
           .pipe(Stream.runCollect);
         const afterSequence = (sent[0]?.sequence ?? 1) - 1;
@@ -522,17 +525,7 @@ const make = Effect.gen(function* () {
         // Keep the preceding selection, including system writes: choosing medium while a
         // mechanical turn is queued changes effort, but editing another option at medium
         // after it starts does not. Only command-bearing changes express owner intent.
-        const changes = yield* Effect.forEach(
-          ["thread.created", "thread.model-selection-updated", "thread.provider-switched"] as const,
-          (eventType) =>
-            events
-              .read({
-                threadId,
-                throughSequence,
-                eventType,
-              })
-              .pipe(Stream.runCollect),
-        );
+        const changes = yield* turnSelections.history({ threadId, throughSequence });
         const effortId = saved.mechanical?.options?.find(
           (option) =>
             saved.before.options?.find(({ id }) => id === option.id)?.value !== option.value,
@@ -540,17 +533,12 @@ const make = Effect.gen(function* () {
         let preceding = saved.before;
         let ownerSelection: ModelSelection | undefined;
         let ownerEffort = false;
-        for (const { event, commandId, sequence } of changes
-          .flat()
-          .toSorted((a, b) => a.sequence - b.sequence)) {
+        for (const { selection, commandId, sequence } of changes) {
           if (
-            event.type !== "thread.created" &&
-            event.type !== "thread.model-selection-updated" &&
-            event.type !== "thread.provider-switched"
-          )
-            continue;
-          const selection = event.payload.modelSelection;
-          if (sequence > (sent.at(-1)?.sequence ?? 0) && commandId !== null) {
+            sequence > (sent.at(-1)?.sequence ?? 0) &&
+            commandId !== null &&
+            commandId !== mechanicalCommandId
+          ) {
             ownerSelection = selection;
             if (
               selection.instanceId !== preceding.instanceId ||
@@ -623,23 +611,27 @@ const make = Effect.gen(function* () {
                   providerThread.nativeMetadata.itemIdentityVersion,
               }),
         });
-    // The managed runtime may be resident but unloaded. Resume binds the original native
-    // session without applying selection or starting an agent turn; core skips an exact load.
+    // An active bound thread already hosts the native session. Re-registering it can fail
+    // when an owner changed selection since loading it. Inactive runtimes still need loading.
     const loaded =
-      providerThread.nativeThreadRef === null
-        ? yield* session.ensureThread({
-            threadId,
-            modelSelection: before,
-            runtimePolicy: policy,
-            providerSessionId: providerThread.providerSessionId,
-            existingProviderThread: providerThread,
-          })
-        : yield* session.resumeThread({
-            threadId,
-            providerThread,
-            modelSelection: before,
-            runtimePolicy: policy,
-          });
+      Option.isSome(live) &&
+      providerThread.status === "active" &&
+      providerThread.nativeThreadRef !== null
+        ? providerThread
+        : providerThread.nativeThreadRef === null
+          ? yield* session.ensureThread({
+              threadId,
+              modelSelection: before,
+              runtimePolicy: policy,
+              providerSessionId: providerThread.providerSessionId,
+              existingProviderThread: providerThread,
+            })
+          : yield* session.resumeThread({
+              threadId,
+              providerThread,
+              modelSelection: before,
+              runtimePolicy: policy,
+            });
     if (
       loaded.id !== providerThread.id ||
       loaded.appThreadId !== threadId ||
@@ -655,6 +647,9 @@ const make = Effect.gen(function* () {
     );
     if (
       snapshot.providerThread.id !== loaded.id ||
+      snapshot.providerThread.appThreadId !== threadId ||
+      snapshot.providerThread.providerSessionId !== providerThread.providerSessionId ||
+      snapshot.providerThread.providerInstanceId !== before.instanceId ||
       payload.nativeThreadId !== loaded.nativeThreadRef?.nativeId
     )
       return yield* new FactoryMechanicalEffortUnavailableError({ threadId });

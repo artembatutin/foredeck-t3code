@@ -1,4 +1,10 @@
-import { ModelSelection, PositiveInt, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  ModelSelection,
+  NonNegativeInt,
+  PositiveInt,
+  ThreadId,
+} from "@t3tools/contracts";
 import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -17,6 +23,12 @@ const Selection = Schema.Struct({
   before: Schema.fromJsonString(ModelSelection),
   mechanical: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
 });
+const HistoryKey = Schema.Struct({ threadId: ThreadId, throughSequence: NonNegativeInt });
+const SelectionChange = Schema.Struct({
+  sequence: NonNegativeInt,
+  commandId: Schema.NullOr(CommandId),
+  selection: Schema.fromJsonString(ModelSelection),
+});
 
 /** A fix-commit's selection is decided before dispatch and survives an uncertain send/restart. */
 export class FactoryTurnSelectionStore extends Context.Service<
@@ -30,6 +42,10 @@ export class FactoryTurnSelectionStore extends Context.Service<
       threadId: ThreadId,
     ) => Effect.Effect<ReadonlyArray<typeof Selection.Type>, FactoryStoreError>;
     readonly record: (selection: typeof Selection.Type) => Effect.Effect<void, FactoryStoreError>;
+    /** Selection provenance includes the rows core event compaction has removed. */
+    readonly history: (
+      key: typeof HistoryKey.Type,
+    ) => Effect.Effect<ReadonlyArray<typeof SelectionChange.Type>, FactoryStoreError>;
   }
 >()("t3/fd/factory/persistence/FactoryTurnSelectionStore") {}
 
@@ -64,12 +80,31 @@ const make = Effect.gen(function* () {
       ON CONFLICT (delivery_id, effect_id) DO NOTHING
     `,
   });
+  const history = SqlSchema.findAll({
+    Request: HistoryKey,
+    Result: SelectionChange,
+    execute: ({ threadId, throughSequence }) => sql`
+      SELECT sequence, command_id AS "commandId",
+        json_extract(payload_json, '$.modelSelection') AS selection
+      FROM orchestration_events
+      WHERE application_event_version = 2 AND aggregate_kind = 'thread'
+        AND stream_id = ${threadId} AND sequence <= ${throughSequence}
+        AND event_type IN ('thread.created', 'thread.model-selection-updated', 'thread.provider-switched')
+      UNION ALL
+      SELECT sequence, command_id AS "commandId", selection_json AS selection
+      FROM fd_factory_selection_history
+      WHERE thread_id = ${threadId} AND sequence <= ${throughSequence}
+      ORDER BY sequence
+    `,
+  });
   return FactoryTurnSelectionStore.of({
     get: (key) => select(key).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.get"))),
     list: (threadId) =>
       list(threadId).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.list"))),
     record: (selection) =>
       record(selection).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.record"))),
+    history: (key) =>
+      history(key).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.history"))),
   });
 });
 

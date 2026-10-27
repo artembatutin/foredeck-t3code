@@ -66,15 +66,19 @@ describe("runFactoryMigrations", () => {
       assert.deepStrictEqual(yield* factoryLedger, factoryManifest);
       assert.deepStrictEqual(yield* factoryObjects, [
         ["index", "fd_factory_deliveries_active_item"],
+        ["index", "fd_factory_selection_history_thread"],
         ["index", "fd_factory_stage_runs_active_thread"],
+        ["index", "fd_factory_stage_runs_thread"],
         ["index", "fd_factory_turn_selections_thread"],
         ["table", "fd_factory_deliveries"],
         ["table", "fd_factory_migrations"],
+        ["table", "fd_factory_selection_history"],
         ["table", "fd_factory_settings"],
         ["table", "fd_factory_stage_runs"],
         ["table", "fd_factory_tasks"],
         ["table", "fd_factory_turn_selections"],
         ["table", "fd_factory_work_comments"],
+        ["trigger", "fd_factory_preserve_selection_history"],
       ]);
       // The same numeric id names a different migration in each ledger.
       assert.deepStrictEqual(
@@ -101,6 +105,50 @@ describe("runFactoryMigrations", () => {
       assert.deepStrictEqual(yield* workLedger, work);
       assert.deepStrictEqual(yield* store.get(alpha), Option.some(settings));
     }).pipe(Effect.provide(FactorySettingsStore.layer.pipe(Layer.provideMerge(coreAndWork)))),
+  );
+
+  it.effect(
+    "adds selection provenance to a version-9 database without changing saved decisions",
+    () =>
+      Effect.gen(function* () {
+        yield* Migrator.make({})({
+          loader: Migrator.fromRecord(
+            Object.fromEntries(
+              FactoryMigrations.factoryMigrationEntries
+                .filter(([id]) => id <= 9)
+                .map(([id, name, migration]) => [`${id}_${name}`, migration]),
+            ),
+          ),
+          table: FactoryMigrations.FACTORY_MIGRATIONS_TABLE,
+        });
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`INSERT INTO fd_factory_deliveries
+        (delivery_id, project_id, source_id, item_id, status, state_json, created_at, updated_at)
+        VALUES ('delivery', 'project', 'source', 'item', 'stopped', '{}', 'before', 'before')`;
+        const before = JSON.stringify({
+          instanceId: "provider",
+          model: "model",
+          options: [{ id: "effort", value: "high" }],
+        });
+        const mechanical = JSON.stringify({
+          instanceId: "provider",
+          model: "model",
+          options: [{ id: "effort", value: "medium" }],
+        });
+        yield* sql`INSERT INTO fd_factory_turn_selections
+        (delivery_id, effect_id, thread_id, before_json, mechanical_json)
+        VALUES ('delivery', 3, 'thread', ${before}, ${mechanical})`;
+        const saved = yield* sql`SELECT * FROM fd_factory_turn_selections`;
+        const core = yield* coreLedger;
+        const work = yield* workLedger;
+        assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), [
+          [10, "FactorySelectionHistory"],
+        ]);
+        assert.deepStrictEqual(yield* sql`SELECT * FROM fd_factory_turn_selections`, saved);
+        assert.deepStrictEqual(yield* coreLedger, core);
+        assert.deepStrictEqual(yield* workLedger, work);
+        assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), []);
+      }).pipe(Effect.provide(coreAndWork)),
   );
 });
 

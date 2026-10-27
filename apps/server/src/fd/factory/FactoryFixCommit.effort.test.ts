@@ -22,11 +22,14 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../../config.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
+import * as EventStore from "../../orchestration-v2/EventStore.ts";
+import * as ProjectionMaintenance from "../../orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
@@ -324,6 +327,237 @@ const prepare = (world: World, risk: "normal" | "high" = "normal") =>
   });
 
 describe("Factory fix-commit effort", () => {
+  it.live.each(["unrelated option", "explicit medium"] as const)(
+    "preserves owner %s intent across public event compaction before restoration",
+    (change) =>
+      withProject(
+        verifyCommands.fails,
+        (world) =>
+          Effect.gen(function* () {
+            const author = yield* world.start;
+            const threads = yield* ThreadManagement.ThreadManagementService;
+            const projection = () =>
+              threads.getProjectThread({ projectId: world.projectId, threadId: author.threadId });
+            const before = {
+              ...(yield* projection()).thread.modelSelection,
+              options: original.options,
+            };
+            let selections = 0;
+            const select = (modelSelection: ModelSelection) =>
+              threads.dispatch({
+                type: "thread.model-selection.set",
+                commandId: CommandId.make(`owner-compacted-selection:${++selections}`),
+                threadId: author.threadId,
+                modelSelection,
+              });
+            yield* select(before);
+            const fs = yield* FileSystem.FileSystem;
+            yield* fs.writeFileString(`${author.worktreePath}/export.ts`, "uncommitted work\n");
+            yield* world.endRun(author.runId, "completed");
+            yield* drainOrchestration;
+            const fixing = (yield* stateOf(author.deliveryId)).awaiting;
+            if (fixing?.type !== "run") return assert.fail("No mechanical turn started.");
+            assert.deepStrictEqual(
+              (yield* projection()).thread.modelSelection,
+              atEffort(before, "medium"),
+            );
+            // Choosing effort away and back is intentional even when the final value is the
+            // same as Factory's temporary value. An option-only change inherits that value.
+            if (change === "explicit medium") yield* select(atEffort(before, "high"));
+            yield* select({
+              ...before,
+              options: [
+                { id: "effort", value: "medium" },
+                { id: "fastMode", value: false },
+              ],
+            });
+            if (change === "explicit medium")
+              yield* threads.dispatch({
+                type: "thread.visit",
+                commandId: CommandId.make("owner-visit:before-compaction"),
+                threadId: author.threadId,
+                visitedAt: DateTime.formatIso(yield* DateTime.now),
+              });
+            const compacted = yield* (yield* ProjectionMaintenance.ProjectionMaintenanceV2)
+              .compactEventStore;
+            assert.isAbove(compacted.deletedEventCount, 0);
+            const remaining = yield* (yield* EventStore.EventStoreV2)
+              .read({ threadId: author.threadId, eventType: "thread.model-selection-updated" })
+              .pipe(Stream.runCollect);
+            assert.lengthOf(remaining, change === "explicit medium" ? 0 : 1);
+            yield* authorCommits(author.worktreePath, "fix: commit the work");
+            yield* world.endRun(fixing.runId, "completed");
+            yield* drainOrchestration;
+            const state = yield* stateOf(author.deliveryId);
+            assert.strictEqual(state.risk, "normal");
+            assert.deepStrictEqual(state.rounds, { fix: 1, review: 0 });
+            const expected = {
+              ...before,
+              options:
+                change === "explicit medium"
+                  ? [
+                      { id: "effort", value: "medium" },
+                      { id: "fastMode", value: false },
+                    ]
+                  : [
+                      { id: "fastMode", value: false },
+                      { id: "effort", value: "high" },
+                    ],
+            };
+            const next = yield* projection();
+            assert.deepStrictEqual(next.thread.modelSelection, expected);
+            assert.deepStrictEqual(next.runs.at(-1)?.modelSelection, expected);
+            assert.deepStrictEqual(world.provider.started.at(-1)?.modelSelection, expected);
+          }).pipe(
+            Effect.provide(ProjectionMaintenance.layer.pipe(Layer.provideMerge(EventStore.layer))),
+          ),
+        {
+          providers: [
+            {
+              instanceId: integratedInstanceId,
+              models: [{ slug: "test-model", capabilities: { optionDescriptors: [effort] } }],
+            } as unknown as ServerProvider,
+          ],
+        },
+      ),
+  );
+
+  it.live.each(["valid snapshot", "read failure", "different native session"] as const)(
+    "captures inherited effort while a real Pi owner turn is active with a different loaded selection: %s",
+    (snapshotState) =>
+      withProject(
+        verifyCommands.fails,
+        (world) =>
+          Effect.gen(function* () {
+            const author = yield* world.start;
+            const service = yield* FactoryService.FactoryService;
+            yield* service.stop(author.deliveryId);
+            yield* authorCommits(author.worktreePath, "fix: prepare before stopping");
+            yield* world.endRun(author.runId, "completed");
+            assert.strictEqual((yield* stateOf(author.deliveryId)).status, "stopped");
+            const threads = yield* ThreadManagement.ThreadManagementService;
+            const projection = () =>
+              threads.getProjectThread({ projectId: world.projectId, threadId: author.threadId });
+            const before = { instanceId: integratedInstanceId, model: "test/reasoning" };
+            const low = { ...before, options: [{ id: "thinking", value: "low" }] };
+            yield* threads.dispatch({
+              type: "thread.model-selection.set",
+              commandId: CommandId.make("owner-selection:explicit-low"),
+              threadId: author.threadId,
+              modelSelection: low,
+            });
+            const context =
+              yield* (yield* ProjectionStore.ProjectionStoreV2).getThreadProviderContext(
+                author.threadId,
+                before.instanceId,
+              );
+            const providerThread = context.providerThreads[0]!;
+            const pi = yield* makePiEffort(author.threadId, low, {
+              loaded: false,
+              providerSessionId: providerThread.providerSessionId!,
+            });
+            world.provider.threadLoads.resume = pi.runtime.resumeThread;
+            world.provider.threadLoads.snapshot = pi.runtime.readThreadSnapshot;
+            // The public owner send loads the real adapter through the shared manager with low.
+            const ownerRun = yield* world.ownerTurn(author.threadId, "Owner work before Resume");
+            const owner = world.provider.started.find(({ runId }) => runId === ownerRun)!;
+            assert.deepStrictEqual(owner.modelSelection, low);
+            yield* pi.start(owner);
+            assert.strictEqual(pi.thinking(), "low");
+            const active = yield* pi.runtime.readThreadSnapshot({
+              providerThread: owner.providerThread,
+            });
+            assert.strictEqual(active.providerThread.status, "active");
+            // Persist the adapter's public binding event, as production's ingestor does.
+            yield* (yield* EventSink.EventSinkV2).write({
+              events: [
+                {
+                  type: "provider-thread.updated",
+                  id: EventId.make("test-active-owner-binding"),
+                  threadId: author.threadId,
+                  occurredAt: active.providerThread.updatedAt,
+                  payload: active.providerThread,
+                },
+              ],
+            });
+            yield* threads.dispatch({
+              type: "thread.model-selection.set",
+              commandId: CommandId.make("owner-selection:inherited-while-active"),
+              threadId: author.threadId,
+              modelSelection: before,
+            });
+            yield* (yield* FileSystem.FileSystem).writeFileString(
+              `${author.worktreePath}/export.ts`,
+              "uncommitted work\n",
+            );
+            const requestCount = pi.requests.length;
+            if (snapshotState === "read failure") pi.state.failRead = true;
+            if (snapshotState === "different native session")
+              pi.state.nativeId = "native:another-thread";
+            yield* service.resume(author.deliveryId);
+            yield* drainFactory;
+            const fixingState = yield* stateOf(author.deliveryId);
+            if (snapshotState !== "valid snapshot") {
+              assert.strictEqual(fixingState.status, "blocked");
+              assert.strictEqual(fixingState.block?.reason, "effect_failed");
+              assert.strictEqual((yield* projection()).runs.at(-1)?.id, ownerRun);
+              assert.strictEqual((yield* projection()).runs.at(-1)?.status, "running");
+              assert.deepStrictEqual(pi.levels(), ["low"]);
+              assert.isFalse(
+                pi.requests
+                  .slice(requestCount)
+                  .some((request) => request["type"] === "switch_session"),
+              );
+              assert.lengthOf(
+                yield* (yield* FactoryTurnSelectionStore.FactoryTurnSelectionStore).list(
+                  author.threadId,
+                ),
+                0,
+              );
+              return;
+            }
+            if (fixingState.awaiting?.type !== "run")
+              return assert.fail(JSON.stringify(fixingState.block));
+            const fixing = fixingState.awaiting;
+            const queued = (yield* projection()).runs.find(({ id }) => id === fixing.runId)!;
+            assert.strictEqual(queued.status, "queued");
+            assert.strictEqual(
+              (yield* projection()).runs.find(({ id }) => id === ownerRun)?.status,
+              "running",
+            );
+            assert.deepStrictEqual(queued.modelSelection, {
+              ...before,
+              options: [{ id: "thinking", value: "medium" }],
+            });
+            assert.deepStrictEqual(
+              pi.requests.slice(requestCount).map((request) => request["type"]),
+              ["get_state", "get_messages"],
+            );
+            assert.deepStrictEqual(
+              (yield* (yield* FactoryTurnSelectionStore.FactoryTurnSelectionStore).list(
+                author.threadId,
+              ))[0]!.before,
+              low,
+            );
+            yield* pi.end();
+            yield* world.endRun(ownerRun, "completed");
+            const mechanical = world.provider.started.find(({ runId }) => runId === fixing.runId)!;
+            yield* pi.run(mechanical);
+            assert.strictEqual(pi.thinking(), "medium");
+            yield* commit(author.worktreePath);
+            yield* world.endRun(fixing.runId, "completed");
+            yield* drainOrchestration;
+            const repair = world.provider.started.at(-1)!;
+            assert.notStrictEqual(repair.runId, fixing.runId);
+            assert.deepStrictEqual(repair.modelSelection, low);
+            yield* pi.run(repair);
+            assert.strictEqual(pi.thinking(), "low");
+            assert.deepStrictEqual(pi.levels(), ["low", "medium", "low"]);
+          }).pipe(Effect.provide(piEffortLayer), Effect.scoped),
+        { providers: piCatalog() },
+      ),
+  );
+
   it.live.each(["effort", "unrelated option"] as const)(
     "honors public owner %s changes during verification before another Factory turn",
     (change) =>
@@ -716,15 +950,20 @@ describe("Factory fix-commit effort", () => {
     "model",
     "effort",
     "direct high-to-medium effort",
+    "direct high-to-medium effort across compaction",
     "effort round-trip",
     "unrelated option",
   ] as const)(
     "recovers an owner %s selection made after mechanical enqueue and before dequeue",
-    (change) =>
+    (scenario) =>
       withProject(
         verifyCommands.fails,
         (world) =>
           Effect.gen(function* () {
+            const change =
+              scenario === "direct high-to-medium effort across compaction"
+                ? "direct high-to-medium effort"
+                : scenario;
             const author = yield* world.start;
             const threads = yield* ThreadManagement.ThreadManagementService;
             const projection = () =>
@@ -783,6 +1022,13 @@ describe("Factory fix-commit effort", () => {
               assert.strictEqual(selections, 2);
               assert.deepStrictEqual((yield* projection()).thread.modelSelection, selected);
             }
+            if (scenario === "direct high-to-medium effort across compaction")
+              yield* Effect.flatMap(
+                ProjectionMaintenance.ProjectionMaintenanceV2,
+                (maintenance) => maintenance.compactEventStore,
+              ).pipe(
+                Effect.provide(ProjectionMaintenance.layer.pipe(Layer.provide(EventStore.layer))),
+              );
             yield* world.endRun(owner.run.id, "completed");
             yield* drainOrchestration;
             // Core applies the queued mechanical selection over the owner's newer choice.
