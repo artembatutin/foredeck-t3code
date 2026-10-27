@@ -3,6 +3,7 @@ import {
   CommandId,
   MessageId,
   type ModelSelection,
+  type OrchestrationV2Run,
   ProjectId,
   ProviderInstanceId,
   type RunId,
@@ -454,28 +455,49 @@ const make = Effect.gen(function* () {
       const { runs } = yield* projections.getThreadRecords(threadId, ["runs"]);
       const messageId = `factory-fix-commit-message:${saved.value.deliveryId}:${saved.value.effectId}`;
       const fixed = runs.findIndex((run) => run.userMessageId === messageId);
-      // A recorded selection alone proves no change: the turn may still be queued or have been
-      // cancelled before starting, without ever applying its requested selection.
-      if (fixed < 0 || runs[fixed]?.startedAt === null) return current;
-      // Once a later Factory turn has started, this temporary selection is spent. Cancelling
-      // a queued turn leaves startedAt null and never applies its selection. If the owner
-      // subsequently chooses medium themselves, an old fix-commit must not undo that choice.
-      if (
-        runs
-          .slice(fixed + 1)
-          .some((run) => run.startedAt !== null && FACTORY_MESSAGE.test(run.userMessageId ?? ""))
-      )
-        return current;
-      // Equality alone loses an owner's change away from and back to medium. Selection events
-      // after this send retain that intent; unrelated option edits still restore only effort.
+      if (fixed < 0) return current;
       const sent = yield* events
         .readByCommandId({
           commandId: CommandId.make(
             `factory-fix-commit:${saved.value.deliveryId}:${saved.value.effectId}`,
           ),
         })
-        .pipe(Stream.runLast);
+        .pipe(Stream.runCollect);
       const throughSequence = yield* events.latestSequence({ threadId });
+      // Core applies selection on entering `starting`, before provider startup sets startedAt.
+      // Its persisted transition distinguishes a startup failure from a never-dequeued cancel.
+      const selectionApplied = (run: OrchestrationV2Run) =>
+        Effect.gen(function* () {
+          if (run.startedAt !== null) return true;
+          for (const eventType of ["run.created", "run.updated"] as const) {
+            const starting = yield* events
+              .read({
+                threadId,
+                afterSequence: (sent[0]?.sequence ?? 1) - 1,
+                throughSequence,
+                eventType,
+              })
+              .pipe(
+                Stream.filter(
+                  ({ event }) =>
+                    (event.type === "run.created" || event.type === "run.updated") &&
+                    event.payload.id === run.id &&
+                    event.payload.status === "starting",
+                ),
+                Stream.runHead,
+              );
+            if (Option.isSome(starting)) return true;
+          }
+          return false;
+        });
+      if (!(yield* selectionApplied(runs[fixed]!))) return current;
+      // A later Factory turn that applied selection spends this override, even if startup fails.
+      for (const run of runs.slice(fixed + 1)) {
+        if (FACTORY_MESSAGE.test(run.userMessageId ?? "") && (yield* selectionApplied(run)))
+          return current;
+      }
+      // Equality alone loses an owner's change away from and back to medium. Selection events
+      // after this send retain that intent; unrelated option edits still restore only effort.
       for (const eventType of [
         "thread.model-selection-updated",
         "thread.provider-switched",
@@ -483,7 +505,7 @@ const make = Effect.gen(function* () {
         const changed = yield* events
           .read({
             threadId,
-            afterSequence: Option.isSome(sent) ? sent.value.sequence : 0,
+            afterSequence: sent.at(-1)?.sequence ?? 0,
             throughSequence,
             eventType,
           })

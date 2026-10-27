@@ -13,6 +13,7 @@ import {
 } from "@t3tools/contracts";
 import { FactoryDeliveryId, FactoryProjectSettings } from "@t3tools/contracts/fd/factory";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -20,6 +21,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../../config.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
@@ -577,6 +579,111 @@ describe("Factory fix-commit effort", () => {
         ],
       },
     ),
+  );
+
+  it.effect.each(["immediate", "dequeued"] as const)(
+    "restores effort after %s fix-commit startup fails and public Resume requests a repair",
+    (start) =>
+      withProject(
+        verifyCommands.fails,
+        (world) =>
+          Effect.gen(function* () {
+            const author = yield* world.start;
+            const threads = yield* ThreadManagement.ThreadManagementService;
+            const projection = () =>
+              threads
+                .getProjectThread({ projectId: world.projectId, threadId: author.threadId })
+                .pipe(Effect.orDie);
+            const before = {
+              ...(yield* projection()).thread.modelSelection,
+              options: original.options,
+            };
+            yield* threads.dispatch({
+              type: "thread.model-selection.set",
+              commandId: CommandId.make("owner-selection:high"),
+              threadId: author.threadId,
+              modelSelection: before,
+            });
+            const fs = yield* FileSystem.FileSystem;
+            yield* fs.writeFileString(`${author.worktreePath}/export.ts`, "uncommitted work\n");
+            const ownerTurn =
+              start === "dequeued"
+                ? yield* threads.sendToThread({
+                    projectId: world.projectId,
+                    commandId: CommandId.make("owner-turn:before-fix-commit"),
+                    threadId: author.threadId,
+                    messageId: MessageId.make("owner-message:before-fix-commit"),
+                    text: "Owner work before fix-commit",
+                    attachments: [],
+                    mode: "queue",
+                    createdBy: "user",
+                    creationSource: "web",
+                  })
+                : undefined;
+            yield* world.endRun(author.runId, "completed");
+            const fixing = (yield* stateOf(author.deliveryId)).awaiting;
+            if (fixing?.type !== "run") return assert.fail("No mechanical turn requested.");
+            if (ownerTurn !== undefined) {
+              const queued = (yield* projection()).runs.find(({ id }) => id === fixing.runId)!;
+              assert.strictEqual(queued.status, "queued");
+              assert.isNull(queued.startedAt);
+              assert.deepStrictEqual((yield* projection()).thread.modelSelection, before);
+            }
+            world.provider.threadLoads.before = () =>
+              Effect.fail(
+                new ProviderAdapter.ProviderAdapterEnsureThreadError({
+                  driver: world.provider.adapter.driver,
+                  threadId: author.threadId,
+                }),
+              );
+            if (ownerTurn !== undefined) yield* world.endRun(ownerTurn.run.id, "completed");
+            yield* drainOrchestration;
+            // Exhaust core's four scheduled startup retries without waiting on wall time.
+            for (let retry = 0; retry < 4; retry++) {
+              yield* TestClock.adjust("1 minute");
+              yield* drainOrchestration;
+            }
+            yield* drainFactory;
+            const failed = yield* projection();
+            const mechanical = failed.runs.find(({ id }) => id === fixing.runId)!;
+            assert.strictEqual(mechanical.status, "failed");
+            assert.isNull(mechanical.startedAt);
+            assert.deepStrictEqual(mechanical.modelSelection, atEffort(before, "medium"));
+            assert.deepStrictEqual(failed.thread.modelSelection, atEffort(before, "medium"));
+            assert.isFalse(world.provider.started.some(({ runId }) => runId === fixing.runId));
+            const blocked = yield* stateOf(author.deliveryId);
+            assert.strictEqual(blocked.status, "blocked");
+            assert.strictEqual(blocked.block?.reason, "run_ended");
+            assert.lengthOf(blocked.receipts, 0);
+            world.provider.threadLoads.before = undefined;
+            yield* authorCommits(author.worktreePath, "fix: commit the work");
+            const service = yield* FactoryService.FactoryService;
+            yield* service.resume(author.deliveryId);
+            yield* drainFactory;
+            yield* drainOrchestration;
+            const resumed = yield* stateOf(author.deliveryId);
+            assert.strictEqual(resumed.risk, "normal");
+            assert.deepStrictEqual(resumed.rounds, { fix: 1, review: 0 });
+            assert.lengthOf(resumed.receipts, 1);
+            assert.strictEqual(resumed.receipts[0]?.code, 3);
+            if (resumed.awaiting?.type !== "run") return assert.fail("No resumed repair started.");
+            const resumedRunId = resumed.awaiting.runId;
+            assert.notStrictEqual(resumedRunId, fixing.runId);
+            const next = yield* projection();
+            const active = next.runs.find(({ id }) => id === resumedRunId)!;
+            assert.strictEqual(active.status, "running");
+            assert.deepStrictEqual(next.thread.modelSelection, before);
+            assert.deepStrictEqual(active.modelSelection, before);
+          }),
+        {
+          providers: [
+            {
+              instanceId: integratedInstanceId,
+              models: [{ slug: "test-model", capabilities: { optionDescriptors: [effort] } }],
+            } as unknown as ServerProvider,
+          ],
+        },
+      ),
   );
 
   it.effect.each(["normal", "high"] as const)(

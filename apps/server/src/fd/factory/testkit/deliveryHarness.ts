@@ -8,6 +8,7 @@ import {
   type GitRunStackedActionInput,
   type GitRunStackedActionResult,
   MessageId,
+  type OrchestrationV2ProviderThread,
   type OrchestrationV2RunStatus,
   ProjectId,
   ProviderDriverKind,
@@ -138,6 +139,9 @@ const makeFakeProvider = Effect.gen(function* () {
   const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
   const started: Array<ProviderAdapter.ProviderAdapterV2TurnInput> = [];
   const interrupted: Array<ProviderAdapter.ProviderAdapterV2InterruptInput> = [];
+  const threadLoads: {
+    before?: (() => Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>) | undefined;
+  } = {};
   const providerTurnId = (turn: ProviderAdapter.ProviderAdapterV2TurnInput) =>
     ProviderTurnId.make(`provider-turn:${turn.attemptId}`);
   const providerTurn = (
@@ -184,24 +188,31 @@ const makeFakeProvider = Effect.gen(function* () {
           },
           events: Stream.fromQueue(events),
           ensureThread: ({ threadId }) =>
-            Effect.succeed({
-              id: ProviderThreadId.make(`provider-thread:${threadId}`),
-              driver,
-              providerInstanceId: instanceId,
-              providerSessionId: input.providerSessionId,
-              appThreadId: threadId,
-              ownerNodeId: null,
-              nativeThreadRef: { driver, nativeId: `native:${threadId}`, strength: "strong" },
-              nativeConversationHeadRef: null,
-              status: "idle",
-              firstRunOrdinal: null,
-              lastRunOrdinal: null,
-              handoffIds: [],
-              forkedFrom: null,
-              createdAt: now,
-              updatedAt: now,
-            }),
-          resumeThread: ({ providerThread }) => Effect.succeed(providerThread),
+            Effect.suspend(() => threadLoads.before?.() ?? Effect.void).pipe(
+              Effect.andThen(
+                Effect.succeed({
+                  id: ProviderThreadId.make(`provider-thread:${threadId}`),
+                  driver,
+                  providerInstanceId: instanceId,
+                  providerSessionId: input.providerSessionId,
+                  appThreadId: threadId,
+                  ownerNodeId: null,
+                  nativeThreadRef: { driver, nativeId: `native:${threadId}`, strength: "strong" },
+                  nativeConversationHeadRef: null,
+                  status: "idle",
+                  firstRunOrdinal: null,
+                  lastRunOrdinal: null,
+                  handoffIds: [],
+                  forkedFrom: null,
+                  createdAt: now,
+                  updatedAt: now,
+                } satisfies OrchestrationV2ProviderThread),
+              ),
+            ),
+          resumeThread: ({ providerThread }) =>
+            Effect.suspend(() => threadLoads.before?.() ?? Effect.void).pipe(
+              Effect.as(providerThread),
+            ),
           startTurn: (turn) =>
             Effect.gen(function* () {
               started.push(turn);
@@ -316,7 +327,7 @@ const makeFakeProvider = Effect.gen(function* () {
       });
     });
 
-  return { adapter, started, interrupted, endTurn, say, startCommand };
+  return { adapter, started, interrupted, threadLoads, endTurn, say, startCommand };
 });
 
 type FakeProvider = Effect.Success<typeof makeFakeProvider>;
