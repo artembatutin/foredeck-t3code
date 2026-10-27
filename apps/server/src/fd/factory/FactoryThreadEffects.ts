@@ -456,12 +456,13 @@ const make = Effect.gen(function* () {
       const fixed = runs.findIndex((run) => run.userMessageId === messageId);
       // A recorded selection alone proves no change: dispatch may have failed or still be queued.
       if (fixed < 0 || runs[fixed]?.status === "queued") return current;
-      // Once a later Factory turn has started, this temporary selection is spent. If the owner
+      // Once a later Factory turn has started, this temporary selection is spent. Cancelling
+      // a queued turn leaves startedAt null and never applies its selection. If the owner
       // subsequently chooses medium themselves, an old fix-commit must not undo that choice.
       if (
         runs
           .slice(fixed + 1)
-          .some((run) => run.status !== "queued" && FACTORY_MESSAGE.test(run.userMessageId ?? ""))
+          .some((run) => run.startedAt !== null && FACTORY_MESSAGE.test(run.userMessageId ?? ""))
       )
         return current;
       // Equality alone loses an owner's change away from and back to medium. Selection events

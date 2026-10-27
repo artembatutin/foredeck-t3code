@@ -12,6 +12,7 @@ import {
 } from "@t3tools/contracts";
 import { FactoryDeliveryId, FactoryProjectSettings } from "@t3tools/contracts/fd/factory";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -51,6 +52,7 @@ import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 import {
   authorCommits,
+  drainFactory,
   drainOrchestration,
   instanceId as integratedInstanceId,
   stateOf,
@@ -139,6 +141,7 @@ const fakes = (world: World) =>
             id: runOf(send),
             userMessageId: send.messageId,
             status: "running",
+            startedAt: DateTime.makeUnsafe("2026-01-01T00:00:00Z"),
           })),
           messages: [],
         }))) as unknown as ProjectionStore.ProjectionStoreV2["Service"]["getThreadRecords"],
@@ -375,6 +378,100 @@ describe("Factory fix-commit effort", () => {
           ],
         },
       ),
+  );
+
+  it.live("restores effort after cancelling a queued restoration turn and publicly resuming", () =>
+    withProject(
+      verifyCommands.fails,
+      (world) =>
+        Effect.gen(function* () {
+          const author = yield* world.start;
+          const threads = yield* ThreadManagement.ThreadManagementService;
+          const projection = () =>
+            threads
+              .getProjectThread({ projectId: world.projectId, threadId: author.threadId })
+              .pipe(Effect.orDie);
+          const before = {
+            ...(yield* projection()).thread.modelSelection,
+            options: original.options,
+          };
+          yield* threads.dispatch({
+            type: "thread.model-selection.set",
+            commandId: CommandId.make("owner-selection:high"),
+            threadId: author.threadId,
+            modelSelection: before,
+          });
+          const fs = yield* FileSystem.FileSystem;
+          yield* fs.writeFileString(`${author.worktreePath}/export.ts`, "uncommitted work\n");
+          yield* world.endRun(author.runId, "completed");
+          yield* drainOrchestration;
+          const fixing = (yield* stateOf(author.deliveryId)).awaiting;
+          if (fixing?.type !== "run") return assert.fail("No mechanical turn started.");
+          assert.deepStrictEqual(
+            (yield* projection()).thread.modelSelection,
+            atEffort(before, "medium"),
+          );
+          yield* authorCommits(author.worktreePath, "fix: commit the work");
+          const context =
+            yield* Effect.context<Effect.Services<ReturnType<typeof world.ownerTurn>>>();
+          let ownerRun: RunId | undefined;
+          world.processes.around = (input, run) =>
+            Effect.gen(function* () {
+              ownerRun = yield* world.ownerTurn(author.threadId, "Owner work during verification");
+              return yield* run(input);
+            }).pipe(Effect.provideContext(context));
+          yield* world.endRun(fixing.runId, "completed");
+          world.processes.around = undefined;
+          const queued = (yield* stateOf(author.deliveryId)).awaiting;
+          if (queued?.type !== "run") return assert.fail("No restoration turn queued.");
+          const pending = yield* projection();
+          const repair = pending.runs.find(({ id }) => id === queued.runId)!;
+          assert.strictEqual(repair.status, "queued");
+          assert.isNull(repair.startedAt);
+          assert.deepStrictEqual(repair.modelSelection, before);
+          assert.deepStrictEqual(pending.thread.modelSelection, atEffort(before, "medium"));
+          yield* threads.dispatch({
+            type: "queued-run.cancel",
+            commandId: CommandId.make("owner-cancel:restoration"),
+            threadId: author.threadId,
+            runId: queued.runId,
+          });
+          yield* drainFactory;
+          const cancelled = (yield* projection()).runs.find(({ id }) => id === queued.runId)!;
+          assert.strictEqual(cancelled.status, "cancelled");
+          assert.isNull(cancelled.startedAt);
+          assert.isFalse(world.provider.started.some(({ runId }) => runId === queued.runId));
+          const blocked = yield* stateOf(author.deliveryId);
+          assert.strictEqual(blocked.status, "blocked");
+          assert.strictEqual(blocked.block?.reason, "run_ended");
+          if (ownerRun === undefined) return assert.fail("No owner turn started.");
+          yield* world.endRun(ownerRun, "completed");
+          const service = yield* FactoryService.FactoryService;
+          yield* service.resume(author.deliveryId);
+          yield* drainFactory;
+          yield* drainOrchestration;
+          const resumed = yield* stateOf(author.deliveryId);
+          assert.strictEqual(resumed.risk, "normal");
+          assert.deepStrictEqual(resumed.rounds, { fix: 1, review: 0 });
+          assert.lengthOf(resumed.receipts, 2);
+          if (resumed.awaiting?.type !== "run") return assert.fail("No resumed repair started.");
+          const resumedRunId = resumed.awaiting.runId;
+          assert.notStrictEqual(resumedRunId, queued.runId);
+          const next = yield* projection();
+          const active = next.runs.find(({ id }) => id === resumedRunId)!;
+          assert.strictEqual(active.status, "running");
+          assert.deepStrictEqual(next.thread.modelSelection, before);
+          assert.deepStrictEqual(active.modelSelection, before);
+        }),
+      {
+        providers: [
+          {
+            instanceId: integratedInstanceId,
+            models: [{ slug: "test-model", capabilities: { optionDescriptors: [effort] } }],
+          } as unknown as ServerProvider,
+        ],
+      },
+    ),
   );
 
   it.effect.each(["normal", "high"] as const)(
