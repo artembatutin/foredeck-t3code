@@ -1,8 +1,15 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import { CommandAvailability, WindowsShellEnvironment } from "@t3tools/shared/shell";
+import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
+import {
+  CommandAvailability,
+  SpawnExecutableResolution,
+  WindowsShellEnvironment,
+} from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Observe the existing synchronous shell probe without launching the user's login shell.
 import * as NodeChildProcess from "node:child_process";
 import * as NodeOS from "node:os";
@@ -94,6 +101,46 @@ effectIt.effect("hydrates PATH when the desktop handoff is absent", () =>
         assert.equal(probe.mock.calls.length, 1);
         assert.equal(env.PATH, "/opt/tools/bin:/usr/bin");
       }),
+    (probe) => Effect.sync(() => probe.mockRestore()),
+  ),
+);
+
+effectIt.effect("recovers npm before provider creation after an unprepared desktop handoff", () =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => vi.spyOn(NodeChildProcess, "execFileSync")),
+    (probe) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-path-recovery-",
+        });
+        const npm = path.join(directory, "npm");
+        yield* fileSystem.writeFileString(npm, "#!/bin/sh\nexit 0\n");
+        yield* fileSystem.chmod(npm, 0o755);
+        const env: NodeJS.ProcessEnv = { SHELL: "/bin/zsh", PATH: path.join(directory, "missing") };
+        probe.mockReturnValue(`__T3CODE_ENV_PATH_START__\n${directory}\n__T3CODE_ENV_PATH_END__\n`);
+        const resolveExecutable = yield* SpawnExecutableResolution;
+        assert.isUndefined(resolveExecutable("npm", "darwin", env));
+
+        yield* fixPath({ shellEnvironmentPrepared: false }).pipe(
+          Effect.provideService(HostProcess.Platform, "darwin"),
+          Effect.provideService(HostProcess.Environment, env),
+        );
+
+        const inherited = yield* mergeProviderInstanceEnvironment(
+          [{ name: "CUSTOM", value: "retained", sensitive: false }],
+          env,
+        );
+        assert.equal(resolveExecutable("npm", "darwin", inherited), npm);
+        assert.equal(inherited.CUSTOM, "retained");
+        const overridden = yield* mergeProviderInstanceEnvironment(
+          [{ name: "PATH", value: "/explicit/bin", sensitive: false }],
+          env,
+        );
+        assert.equal(overridden.PATH, "/explicit/bin");
+        assert.equal(probe.mock.calls.length, 1);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
     (probe) => Effect.sync(() => probe.mockRestore()),
   ),
 );

@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as PlatformError from "effect/PlatformError";
@@ -9,6 +10,7 @@ import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import * as TestClock from "effect/testing/TestClock";
 import * as NodeOS from "node:os";
 import { vi } from "vite-plus/test";
 
@@ -33,14 +35,18 @@ function envOutput(values: Readonly<Record<string, string>>): string {
     .join("\n");
 }
 
-function makeProcess(output: string, exitCode = 0): ChildProcessSpawner.ChildProcessHandle {
+function makeProcess(
+  output: string,
+  exitCode: number | null = 0,
+): ChildProcessSpawner.ChildProcessHandle {
   const stdout = output.length === 0 ? Stream.empty : Stream.make(textEncoder.encode(output));
   return ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(123),
     stdout,
     stderr: Stream.empty,
     all: stdout,
-    exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(exitCode)),
+    exitCode:
+      exitCode === null ? Effect.never : Effect.succeed(ChildProcessSpawner.ExitCode(exitCode)),
     isRunning: Effect.succeed(false),
     kill: () => Effect.void,
     stdin: Sink.drain,
@@ -74,8 +80,9 @@ function runShellEnvironment(input: {
   readonly userShell?: string;
   readonly handler: (
     command: ChildProcess.Command,
-  ) => string | { output: string; exitCode: number };
+  ) => string | { output: string; exitCode: number | null };
   readonly failure?: PlatformError.PlatformError;
+  readonly repeat?: boolean;
 }) {
   const layerEnvironment = Layer.succeed(
     DesktopEnvironment.DesktopEnvironment,
@@ -98,7 +105,9 @@ function runShellEnvironment(input: {
 
   const program = Effect.gen(function* () {
     const shellEnvironment = yield* DesktopShellEnvironment.DesktopShellEnvironment;
-    yield* shellEnvironment.installIntoProcess;
+    const prepared = yield* shellEnvironment.installIntoProcess;
+    if (input.repeat) assert.equal(yield* shellEnvironment.installIntoProcess, prepared);
+    return prepared;
   }).pipe(
     Effect.provide(
       DesktopShellEnvironment.layer.pipe(
@@ -120,6 +129,82 @@ function runShellEnvironment(input: {
 }
 
 describe("DesktopShellEnvironment", () => {
+  it.effect("caches successful login-shell hydration for the backend handoff", () =>
+    Effect.gen(function* () {
+      let probes = 0;
+      const env = { SHELL: "/bin/zsh", PATH: "/usr/bin" };
+      const prepared = yield* runShellEnvironment({
+        env,
+        platform: "darwin",
+        repeat: true,
+        handler: () => {
+          probes++;
+          return envOutput({ PATH: "/opt/homebrew/bin:/usr/bin" });
+        },
+      });
+      assert.isTrue(prepared);
+      assert.equal(probes, 1);
+      assert.equal(env.PATH, "/opt/homebrew/bin:/usr/bin");
+    }),
+  );
+
+  it.effect(
+    "hands a timed-out login shell to the backend even when launchctl supplies a PATH",
+    () =>
+      Effect.gen(function* () {
+        const commands: string[] = [];
+        const env = { SHELL: "/bin/zsh", PATH: "/usr/bin" };
+        const pending = yield* runShellEnvironment({
+          env,
+          platform: "darwin",
+          repeat: true,
+          handler: (command) => {
+            if (command._tag !== "StandardCommand") return "";
+            commands.push(command.command);
+            return command.command === "/bin/launchctl"
+              ? "/fallback/bin"
+              : { output: "", exitCode: null };
+          },
+        }).pipe(Effect.forkChild);
+        yield* TestClock.adjust("5 seconds");
+        assert.isFalse(yield* Fiber.join(pending));
+        assert.deepEqual(commands, ["/bin/zsh", "/bin/launchctl"]);
+        assert.equal(env.PATH, "/fallback/bin:/usr/bin");
+      }).pipe(Effect.provide(Logger.layer([]))),
+  );
+
+  it.effect.each([0, 1])(
+    "leaves empty or failed POSIX hydration unprepared after exit %s",
+    (exitCode) =>
+      Effect.gen(function* () {
+        let probes = 0;
+        const prepared = yield* runShellEnvironment({
+          env: { SHELL: "/bin/bash", PATH: "/usr/bin" },
+          platform: "linux",
+          repeat: true,
+          handler: () => {
+            probes++;
+            return { output: exitCode === 0 ? "" : envOutput({ PATH: "/failed/bin" }), exitCode };
+          },
+        });
+        assert.isFalse(prepared);
+        assert.equal(probes, 1);
+      }).pipe(Effect.provide(Logger.layer([]))),
+  );
+
+  it.effect("does not mark a whitespace-only login PATH prepared", () =>
+    Effect.gen(function* () {
+      const env = { SHELL: "/bin/bash", PATH: "/usr/bin" };
+      const prepared = yield* runShellEnvironment({
+        env,
+        platform: "linux",
+        handler: () => envOutput({ PATH: "   " }),
+      });
+      assert.isFalse(prepared);
+      assert.equal(env.PATH, "/usr/bin");
+    }),
+  );
+
   it.effect("rejects PATH output from a failed shell and tries the next candidate", () =>
     Effect.gen(function* () {
       const env: NodeJS.ProcessEnv = { SHELL: "/bin/failing", PATH: "/usr/bin" };

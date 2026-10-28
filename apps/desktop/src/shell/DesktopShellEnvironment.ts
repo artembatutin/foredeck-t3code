@@ -64,7 +64,7 @@ export class DesktopShellEnvironmentCommandTimeoutError extends Schema.TaggedErr
 export class DesktopShellEnvironment extends Context.Service<
   DesktopShellEnvironment,
   {
-    readonly installIntoProcess: Effect.Effect<void>;
+    readonly installIntoProcess: Effect.Effect<boolean>;
   }
 >()("@t3tools/desktop/shell/DesktopShellEnvironment") {}
 
@@ -401,7 +401,7 @@ const installPosixEnvironment = Effect.fn("desktop.shellEnvironment.installPosix
   function* (
     config: ShellEnvironmentConfig,
   ): Effect.fn.Return<
-    void,
+    boolean,
     never,
     ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem
   > {
@@ -413,15 +413,16 @@ const installPosixEnvironment = Effect.fn("desktop.shellEnvironment.installPosix
         shellEnvironment,
         yield* readLoginShellEnvironment(shell, LOGIN_SHELL_ENV_NAMES),
       );
-      if (shellEnvironment.PATH) break;
+      if (Option.isSome(trimNonEmpty(shellEnvironment.PATH))) break;
     }
 
+    const shellPath = trimNonEmpty(shellEnvironment.PATH);
     const launchctlPath =
-      config.platform === "darwin" && !shellEnvironment.PATH
+      config.platform === "darwin" && Option.isNone(shellPath)
         ? yield* readLaunchctlPath
         : Option.none<string>();
     const mergedPath = mergePaths(config.platform, [
-      trimNonEmpty(shellEnvironment.PATH).pipe(Option.orElse(() => launchctlPath)),
+      shellPath.pipe(Option.orElse(() => launchctlPath)),
       readEnvPath(config.env),
     ]);
 
@@ -509,19 +510,25 @@ const installPosixEnvironment = Effect.fn("desktop.shellEnvironment.installPosix
         }
       }
     }
+    // A launchctl or inherited PATH is useful fallback, not a successful login-shell read.
+    return Option.isSome(shellPath);
   },
 );
 
 const installShellEnvironment = (
   config: ShellEnvironmentConfig,
-): Effect.Effect<void, never, ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem> => {
+): Effect.Effect<
+  boolean,
+  never,
+  ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem
+> => {
   if (config.platform === "win32") {
-    return installWindowsEnvironment(config);
+    return installWindowsEnvironment(config).pipe(Effect.as(true));
   }
   if (config.platform === "darwin" || config.platform === "linux") {
     return installPosixEnvironment(config);
   }
-  return Effect.void;
+  return Effect.succeed(true);
 };
 
 /** @public Service construction is part of the canonical Effect module API. */
@@ -529,7 +536,7 @@ export const make = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const fileSystem = yield* FileSystem.FileSystem;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  const installIntoProcess: DesktopShellEnvironment["Service"]["installIntoProcess"] =
+  const installIntoProcess = yield* Effect.cached(
     installShellEnvironment({
       env: process.env,
       platform: environment.platform,
@@ -537,7 +544,8 @@ export const make = Effect.gen(function* () {
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       Effect.withSpan("desktop.shellEnvironment.installIntoProcess"),
-    );
+    ),
+  );
 
   return DesktopShellEnvironment.of({ installIntoProcess });
 });

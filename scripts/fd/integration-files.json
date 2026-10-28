@@ -1,5 +1,11 @@
 {
   "integrationFiles": {
+    "apps/desktop/src/shell/DesktopShellEnvironment.ts": "Reports and caches actual login-shell PATH hydration through the existing desktop service so a failed startup probe does not suppress backend recovery; shared startup correctness belongs with its existing owner rather than a duplicate fd hydrator.",
+    "apps/desktop/src/shell/DesktopShellEnvironment.test.ts": "Verifies cached successful hydration and bounded timeout, failure and empty-PATH outcomes for the desktop-to-backend handoff without executing user profiles.",
+    "apps/desktop/src/backend/DesktopBackendConfiguration.ts": "Passes the existing shell service's actual hydration outcome to the native backend bootstrap so only failed desktop hydration uses the existing backend recovery path; WSL keeps its separate environment.",
+    "apps/desktop/src/backend/DesktopBackendConfiguration.test.ts": "Verifies both hydration outcomes in the real native backend bootstrap and keeps the WSL handoff absent, while supplying the existing shell service to the configuration harness.",
+    "apps/desktop/src/main.ts": "Shares one cached desktop shell-environment service between application startup and backend configuration in the existing layer composition.",
+    "apps/server/src/os-jank.test.ts": "Verifies the existing backend hydration recovers npm for an unprepared desktop handoff before provider environments are created and preserves explicit provider PATH overrides; production recovery remains unchanged.",
     "apps/desktop/package.json": "Sets the packaged desktop display name to foredeck-t3 through Electron\u2019s existing productName metadata; package and application identifiers stay compatible.",
     "apps/desktop/scripts/electron-launcher.mjs": "Connects the existing development app bundle to Foredeck icon assets and foredeck-t3 display names; bumps its cache version so bundles refresh. Declares microphone access for the development app's local assistant voice recording.",
     "apps/desktop/scripts/electron-launcher.test.mjs": "Verifies both desktop launcher modes use Foredeck macOS artwork.",
