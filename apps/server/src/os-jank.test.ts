@@ -105,44 +105,51 @@ effectIt.effect("hydrates PATH when the desktop handoff is absent", () =>
   ),
 );
 
-effectIt.effect("recovers npm before provider creation after an unprepared desktop handoff", () =>
-  Effect.acquireUseRelease(
-    Effect.sync(() => vi.spyOn(NodeChildProcess, "execFileSync")),
-    (probe) =>
-      Effect.gen(function* () {
-        const fileSystem = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const directory = yield* fileSystem.makeTempDirectoryScoped({
-          prefix: "t3-path-recovery-",
-        });
-        const npm = path.join(directory, "npm");
-        yield* fileSystem.writeFileString(npm, "#!/bin/sh\nexit 0\n");
-        yield* fileSystem.chmod(npm, 0o755);
-        const env: NodeJS.ProcessEnv = { SHELL: "/bin/zsh", PATH: path.join(directory, "missing") };
-        probe.mockReturnValue(`__T3CODE_ENV_PATH_START__\n${directory}\n__T3CODE_ENV_PATH_END__\n`);
-        const resolveExecutable = yield* SpawnExecutableResolution;
-        assert.isUndefined(resolveExecutable("npm", "darwin", env));
+effectIt.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+  "recovers npm before provider creation after an unprepared desktop handoff",
+  () =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => vi.spyOn(NodeChildProcess, "execFileSync")),
+      (probe) =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const directory = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3-path-recovery-",
+          });
+          const npm = path.join(directory, "npm");
+          yield* fileSystem.writeFileString(npm, "#!/bin/sh\nexit 0\n");
+          yield* fileSystem.chmod(npm, 0o755);
+          const env: NodeJS.ProcessEnv = {
+            SHELL: "/bin/zsh",
+            PATH: path.join(directory, "missing"),
+          };
+          probe.mockReturnValue(
+            `__T3CODE_ENV_PATH_START__\n${directory}\n__T3CODE_ENV_PATH_END__\n`,
+          );
+          const resolveExecutable = yield* SpawnExecutableResolution;
+          assert.isUndefined(resolveExecutable("npm", "darwin", env));
 
-        yield* fixPath({ shellEnvironmentPrepared: false }).pipe(
-          Effect.provideService(HostProcess.Platform, "darwin"),
-          Effect.provideService(HostProcess.Environment, env),
-        );
+          yield* fixPath({ shellEnvironmentPrepared: false }).pipe(
+            Effect.provideService(HostProcess.Platform, "darwin"),
+            Effect.provideService(HostProcess.Environment, env),
+          );
 
-        const inherited = yield* mergeProviderInstanceEnvironment(
-          [{ name: "CUSTOM", value: "retained", sensitive: false }],
-          env,
-        );
-        assert.equal(resolveExecutable("npm", "darwin", inherited), npm);
-        assert.equal(inherited.CUSTOM, "retained");
-        const overridden = yield* mergeProviderInstanceEnvironment(
-          [{ name: "PATH", value: "/explicit/bin", sensitive: false }],
-          env,
-        );
-        assert.equal(overridden.PATH, "/explicit/bin");
-        assert.equal(probe.mock.calls.length, 1);
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-    (probe) => Effect.sync(() => probe.mockRestore()),
-  ),
+          const inherited = yield* mergeProviderInstanceEnvironment(
+            [{ name: "CUSTOM", value: "retained", sensitive: false }],
+            env,
+          );
+          assert.equal(resolveExecutable("npm", "darwin", inherited), npm);
+          assert.equal(inherited.CUSTOM, "retained");
+          const overridden = yield* mergeProviderInstanceEnvironment(
+            [{ name: "PATH", value: "/explicit/bin", sensitive: false }],
+            env,
+          );
+          assert.equal(overridden.PATH, "/explicit/bin");
+          assert.equal(probe.mock.calls.length, 1);
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      (probe) => Effect.sync(() => probe.mockRestore()),
+    ),
 );
 
 effectIt.effect("keeps mise's PATH record with the login shell PATH", () =>
