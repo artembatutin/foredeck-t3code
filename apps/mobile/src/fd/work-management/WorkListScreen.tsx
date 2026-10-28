@@ -22,15 +22,19 @@ import {
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
 import { Atom } from "effect/reactivity";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
-import { Pressable, RefreshControl, View } from "react-native";
+import { ActivityIndicator, Pressable, RefreshControl, View } from "react-native";
 
+import { SymbolView } from "../../components/AppSymbol";
 import { AppText as Text, AppTextInput } from "../../components/AppText";
-import { ControlPillMenu } from "../../components/ControlPill";
+import { EmptyState } from "../../components/EmptyState";
+import { ErrorBanner } from "../../components/ErrorBanner";
+import { ListFilterMenu } from "../../features/workspace/ListFilterMenu";
+import { relativeTime } from "../../lib/time";
 import { useProjects, useThreadShells } from "../../state/entities";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { CreateWorkItemForm } from "./CreateWorkItemForm";
-import { STATUS_LABELS, WorkRepairNotice } from "./shared";
+import { STATUS_LABELS, STATUS_SYMBOLS, WorkRepairNotice } from "./shared";
 import {
   useReadableWorkEnvironments,
   useWorkSupport,
@@ -204,30 +208,57 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
   );
   const creatable = sources.filter((source) => source.capabilities.create);
 
+  const openItem = useCallback(
+    (row: Row) =>
+      project !== undefined &&
+      navigation.navigate("WorkItem", {
+        environmentId: project.environmentId,
+        projectId: project.id,
+        sourceId: row.item.ref.sourceId,
+        itemId: row.item.ref.itemId,
+      }),
+    [navigation, project],
+  );
+
   if (support.size === 0) {
     return (
-      <View className="flex-1 items-center justify-center bg-screen p-6">
-        <Text className="text-center text-foreground-muted">
-          Connect to a server that offers Work.
-        </Text>
+      <View className="flex-1 justify-center bg-screen">
+        <EmptyState
+          variant="plain"
+          title="Work isn't available"
+          detail="Connect to a server that offers Work to browse its items here."
+        />
       </View>
     );
   }
   if (readable.length === 0) return <WorkRepairNotice />;
+  if (project === undefined) {
+    return (
+      <View className="flex-1 justify-center bg-screen">
+        <EmptyState
+          variant="plain"
+          title="No projects"
+          detail="Add a project on a server that offers Work to see its items here."
+        />
+      </View>
+    );
+  }
 
+  const viewLabel = WORK_VIEWS.find((entry) => entry.value === view)?.label ?? "Ready";
   return (
     <View className="flex-1 bg-screen">
-      <View className="flex-row flex-wrap items-center gap-2 px-4 py-2">
+      <View className="flex-row flex-wrap items-center gap-2 px-4 pt-2 pb-3">
         {projects.length > 1 ? (
-          <ControlPillMenu
+          <ListFilterMenu
+            label={project.title}
             accessibilityLabel="Choose a project"
             actions={projects.map((entry) => ({
               id: `${entry.environmentId}\u0000${entry.id}`,
               title: entry.title,
               state: entry === project ? ("on" as const) : ("off" as const),
             }))}
-            onPressAction={({ nativeEvent }) => {
-              const [environmentId, projectId] = nativeEvent.event.split("\u0000");
+            onSelect={(event) => {
+              const [environmentId, projectId] = event.split("\u0000");
               if (environmentId && projectId) {
                 setSelected({
                   environmentId: environmentId as EnvironmentId,
@@ -235,42 +266,55 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
                 });
               }
             }}
-          >
-            <Pill label={project?.title ?? "Project"} />
-          </ControlPillMenu>
+          />
         ) : null}
-        <ControlPillMenu
+        <ListFilterMenu
+          label={viewLabel}
           accessibilityLabel="Choose a view"
+          active={view !== "ready"}
           actions={WORK_VIEWS.map((entry) => ({
             id: entry.value,
             title: entry.label,
             state: entry.value === view ? ("on" as const) : ("off" as const),
           }))}
-          onPressAction={({ nativeEvent }) => {
-            const next = WORK_VIEWS.find((entry) => entry.value === nativeEvent.event);
+          onSelect={(event) => {
+            const next = WORK_VIEWS.find((entry) => entry.value === event);
             if (next) setView(next.value);
           }}
-        >
-          <Pill label={WORK_VIEWS.find((entry) => entry.value === view)?.label ?? "Ready"} />
-        </ControlPillMenu>
+        />
         {canCreate && creatable.length > 0 ? (
-          <Pressable accessibilityRole="button" onPress={() => setCreating((open) => !open)}>
-            <Pill label={creating ? "Close" : "New item"} />
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={creating ? "Close the new item form" : "New item"}
+            hitSlop={6}
+            className="h-8 flex-row items-center gap-1.5 rounded-full bg-subtle px-3 active:opacity-70"
+            onPress={() => setCreating((open) => !open)}
+          >
+            <SymbolView
+              name={creating ? "xmark" : "plus"}
+              size={13}
+              tintColorClassName="accent-icon-muted"
+            />
+            <Text className="text-sm font-t3-medium text-foreground-muted">
+              {creating ? "Close" : "New item"}
+            </Text>
           </Pressable>
         ) : null}
       </View>
       <View className="px-4 pb-2">
         <AppTextInput
           accessibilityLabel="Search work"
-          className="min-h-10 rounded-xl bg-card px-3 text-base text-foreground"
-          placeholder="Search"
+          className="h-12 min-h-12 rounded-[24px] px-4 py-0 text-base leading-snug"
+          placeholder="Search work"
           value={query}
           autoCapitalize="none"
+          autoCorrect={false}
+          clearButtonMode="while-editing"
           returnKeyType="search"
           onChangeText={setQuery}
         />
       </View>
-      {creating && project !== undefined ? (
+      {creating ? (
         <CreateWorkItemForm
           environmentId={project.environmentId}
           sources={creatable}
@@ -287,21 +331,36 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
         />
       ) : null}
       {failures.length > 0 ? (
-        <Text className="px-4 text-sm text-destructive">Could not read {failures.join(", ")}.</Text>
+        <View className="px-4 pb-2">
+          <ErrorBanner message={`Couldn't read ${failures.join(", ")}. Pull to try again.`} />
+        </View>
       ) : null}
-      {sources.length === 0 && sourcesQuery.data !== null ? (
-        <View className="flex-1 items-center justify-center p-6">
-          <Text className="text-center text-foreground-muted">
-            This project has no Work sources. Add one in the project's settings.
-          </Text>
+      {sourcesQuery.error !== null && sourcesQuery.data === null ? (
+        <View className="flex-1 justify-center">
+          <EmptyState
+            variant="plain"
+            title="Couldn't load Work sources"
+            detail={sourcesQuery.error}
+            actionLabel="Try again"
+            onAction={refreshSources}
+          />
+        </View>
+      ) : sources.length === 0 && sourcesQuery.data !== null ? (
+        <View className="flex-1 justify-center">
+          <EmptyState
+            variant="plain"
+            title="No Work sources"
+            detail="Add a Markdown folder, GitHub repository or Jira project in this project's settings."
+          />
         </View>
       ) : (
         <LegendList
           className="flex-1"
-          contentContainerStyle={{ paddingBottom: 32, paddingHorizontal: 16 }}
+          contentContainerStyle={{ paddingBottom: 32 }}
           contentInsetAdjustmentBehavior="automatic"
           data={rows}
-          estimatedItemSize={88}
+          // One title line measures about 66pt, two about 86pt.
+          estimatedItemSize={76}
           keyExtractor={(row) => row.key}
           recycleItems
           itemsAreEqual={(left, right) =>
@@ -310,10 +369,22 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
             left.running === right.running
           }
           ListEmptyComponent={
-            pending ? null : (
-              <Text className="py-8 text-center text-foreground-muted">
-                {hasMore ? "Nothing here yet. Scroll to load more." : "Nothing here."}
-              </Text>
+            pending || sourcesQuery.data === null ? (
+              <View className="items-center py-12">
+                <ActivityIndicator colorClassName="accent-icon" accessibilityLabel="Loading work" />
+              </View>
+            ) : (
+              <EmptyState
+                variant="plain"
+                title={term.length > 0 ? "No results" : `Nothing ${viewLabel.toLowerCase()}`}
+                detail={
+                  hasMore
+                    ? "Nothing matched in the items loaded so far. Scroll to load more."
+                    : term.length > 0
+                      ? "No items match your search in this view."
+                      : "Choose another view to see more items."
+                }
+              />
             )
           }
           onEndReached={() => {
@@ -321,66 +392,106 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
           }}
           onEndReachedThreshold={0.5}
           ListFooterComponent={
-            hasMore ? (
-              <Pressable
-                accessibilityRole="button"
-                disabled={pending}
-                className="items-center py-4 active:opacity-70"
-                onPress={loadMore}
-              >
-                <Text className="text-sm text-foreground-muted">
-                  {pending ? "Loading…" : "Load more"}
-                </Text>
-              </Pressable>
+            hasMore && rows.length > 0 ? (
+              pending ? (
+                <View className="items-center py-5">
+                  <ActivityIndicator
+                    colorClassName="accent-icon"
+                    accessibilityLabel="Loading more work"
+                  />
+                </View>
+              ) : (
+                <Pressable
+                  accessibilityRole="button"
+                  className="items-center py-4 active:opacity-70"
+                  onPress={loadMore}
+                >
+                  <Text className="text-sm font-t3-medium text-link">Load more</Text>
+                </Pressable>
+              )
             ) : null
           }
           refreshControl={
             <RefreshControl refreshing={pending && rows.length > 0} onRefresh={refresh} />
           }
-          renderItem={({ item: row }) => (
-            <Pressable
-              accessibilityRole="button"
-              className="gap-1 border-b border-separator py-3 active:opacity-70"
-              onPress={() =>
-                project !== undefined &&
-                navigation.navigate("WorkItem", {
-                  environmentId: project.environmentId,
-                  projectId: project.id,
-                  sourceId: row.item.ref.sourceId,
-                  itemId: row.item.ref.itemId,
-                })
-              }
-            >
-              <View className="flex-row items-center gap-2">
-                <Text className="text-xs text-foreground-muted">{row.item.key}</Text>
-                <Text className="text-xs text-foreground-muted">
-                  {row.item.nativeStatus?.name ?? STATUS_LABELS[row.item.status]}
-                </Text>
-                {row.item.blocked ? <Text className="text-xs text-warning">Blocked</Text> : null}
-                {row.running ? (
-                  <Text className="text-xs text-primary">{RUN_STATE_LABELS[row.running]}</Text>
-                ) : null}
-              </View>
-              <Text className="text-base text-foreground" numberOfLines={2}>
-                {row.item.title}
-              </Text>
-              {row.item.labels.length > 0 ? (
-                <Text className="text-xs text-foreground-muted" numberOfLines={1}>
-                  {row.item.labels.slice(0, 3).join(" · ")}
-                </Text>
-              ) : null}
-            </Pressable>
-          )}
+          renderItem={({ item: row }) => <WorkListRow row={row} onPress={openItem} />}
         />
       )}
     </View>
   );
 }
 
-function Pill({ label }: { label: string }) {
+/** One item, in the pull request list's row geometry: meta line, title, labels. */
+function WorkListRow({ row, onPress }: { row: Row; onPress: (row: Row) => void }) {
+  const { item } = row;
+  const status = item.nativeStatus?.name ?? STATUS_LABELS[item.status];
+  const symbol = STATUS_SYMBOLS[item.status];
   return (
-    <View className="rounded-full bg-subtle-strong px-3 py-1.5">
-      <Text className="text-sm font-t3-medium text-foreground">{label}</Text>
-    </View>
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={[
+        item.key,
+        item.title,
+        status,
+        item.blocked ? "blocked" : null,
+        row.running ? RUN_STATE_LABELS[row.running] : null,
+        row.source.label,
+      ]
+        .filter(Boolean)
+        .join(", ")}
+      className="flex-row gap-3 px-4 active:bg-row-hover"
+      onPress={() => onPress(row)}
+    >
+      <View className="pt-2.5">
+        <SymbolView name={symbol.icon} size={20} tintColorClassName={symbol.tint} />
+      </View>
+      <View className="min-w-0 flex-1 gap-1 border-b border-border-subtle py-2.5">
+        <View className="flex-row items-center gap-1.5">
+          <Text className="min-w-0 flex-1 text-xs text-foreground-muted" numberOfLines={1}>
+            {item.key} <Text className="text-foreground-tertiary">· {status}</Text>
+          </Text>
+          {item.blocked ? (
+            <Text className="text-2xs font-t3-medium text-warning">Blocked</Text>
+          ) : null}
+          {row.running ? (
+            <Text className="text-2xs font-t3-medium text-primary-text">
+              {RUN_STATE_LABELS[row.running]}
+            </Text>
+          ) : null}
+          {item.updatedAt ? (
+            <Text className="text-2xs tabular-nums text-foreground-tertiary">
+              {relativeTime(item.updatedAt)}
+            </Text>
+          ) : null}
+        </View>
+        <Text
+          className="text-base leading-5 font-t3-medium text-foreground"
+          numberOfLines={2}
+          ellipsizeMode="tail"
+        >
+          {item.title}
+        </Text>
+        {item.labels.length > 0 ? (
+          <View className="flex-row items-center gap-1">
+            {item.labels.slice(0, 3).map((label) => (
+              <View
+                key={label}
+                className="min-w-0 shrink rounded-md bg-subtle px-1.5 py-0.5"
+                style={{ maxWidth: 140 }}
+              >
+                <Text className="text-2xs font-t3-medium text-foreground-muted" numberOfLines={1}>
+                  {label}
+                </Text>
+              </View>
+            ))}
+            {item.labels.length > 3 ? (
+              <Text className="shrink-0 text-2xs text-foreground-tertiary">
+                +{item.labels.length - 3}
+              </Text>
+            ) : null}
+          </View>
+        ) : null}
+      </View>
+    </Pressable>
   );
 }

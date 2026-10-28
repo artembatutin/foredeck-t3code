@@ -38,13 +38,26 @@ import type {
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { type StaticScreenProps, useNavigation } from "@react-navigation/native";
 import { type ComponentType, useCallback, useLayoutEffect, useMemo, useState } from "react";
-import { Alert, Linking, Pressable, RefreshControl, ScrollView, View } from "react-native";
+import {
+  ActivityIndicator,
+  Alert,
+  Linking,
+  Pressable,
+  RefreshControl,
+  ScrollView,
+  View,
+} from "react-native";
 
+import { SymbolView } from "../../components/AppSymbol";
 import { AppText as Text, AppTextInput } from "../../components/AppText";
-import { ControlPillMenu } from "../../components/ControlPill";
+import { EmptyState } from "../../components/EmptyState";
+import { ErrorBanner } from "../../components/ErrorBanner";
+import { ListRow } from "../../components/ListRow";
+import { ListFilterMenu } from "../../features/workspace/ListFilterMenu";
 import { useMarkdownPreviewStyles } from "../../features/files/FileMarkdownPreview";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
+import { relativeTime } from "../../lib/time";
 import { SelectableMarkdownText } from "../../native/SelectableMarkdownText";
 import {
   createNewTaskDraft,
@@ -57,7 +70,7 @@ import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { mobileStartInput, parseStatusActionId, statusActionId } from "./actions";
 import { AssigneeEditor, PriorityControl, RelationshipEditor } from "./WorkItemFields";
-import { Action, Chip, STATUS_LABELS } from "./shared";
+import { Action, Chip, SectionTitle, STATUS_LABELS, STATUS_SYMBOLS } from "./shared";
 import { useWorkWritable, workCommands, workEnvironment } from "./state";
 import { useOpenWorkThread } from "./useOpenWorkThread";
 
@@ -73,8 +86,6 @@ const MODES: ReadonlyArray<{ readonly value: WorkThreadMode; readonly label: str
   { value: "plan", label: "Plan" },
   { value: "scope", label: "Scope" },
 ];
-
-const INPUT_CLASS = "rounded-xl bg-card px-3 py-2 text-base text-foreground";
 
 /**
  * A section another feature adds to the item screen, below its linked threads. The app's Stack
@@ -121,15 +132,29 @@ export function WorkItemScreen({
 
   if (ref === undefined) {
     return (
-      <View className="flex-1 items-center justify-center bg-screen p-6">
-        <Text className="text-foreground-muted">This link does not name a Work item.</Text>
+      <View className="flex-1 justify-center bg-screen">
+        <EmptyState
+          variant="plain"
+          title="Work item not found"
+          detail="This link does not name a Work item."
+        />
       </View>
     );
   }
   if (item === null) {
     return (
-      <View className="flex-1 items-center justify-center bg-screen p-6">
-        <Text className="text-foreground-muted">{query.error ?? "Loading…"}</Text>
+      <View className="flex-1 justify-center bg-screen">
+        {query.error === null ? (
+          <ActivityIndicator colorClassName="accent-icon" accessibilityLabel="Loading work item" />
+        ) : (
+          <EmptyState
+            variant="plain"
+            title="Couldn't load this item"
+            detail={query.error}
+            actionLabel="Try again"
+            onAction={refreshQuery}
+          />
+        )}
       </View>
     );
   }
@@ -376,7 +401,15 @@ function LoadedItem({
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
     >
       <View className="gap-1">
-        <Text className="text-xs text-foreground-muted">{item.key}</Text>
+        <Text className="text-xs text-foreground-muted">
+          {item.key}
+          {item.updatedAt ? (
+            <Text className="text-foreground-tertiary">
+              {" "}
+              · Updated {relativeTime(item.updatedAt)} ago
+            </Text>
+          ) : null}
+        </Text>
         {titleDraft !== null ? (
           <DraftEditor
             label="Title"
@@ -387,7 +420,7 @@ function LoadedItem({
             onSave={() => void saveDraft(titleDraft, setTitleDraft)}
           />
         ) : (
-          <Text selectable className="text-lg font-t3-bold text-foreground">
+          <Text selectable className="text-xl leading-7 font-t3-bold text-foreground">
             {item.title}
           </Text>
         )}
@@ -395,7 +428,7 @@ function LoadedItem({
           <Text className="text-sm text-warning">Read-only: {item.invalid.message}</Text>
         ) : null}
         {can("title") && titleDraft === null ? (
-          <View className="flex-row">
+          <View className="flex-row pt-1">
             <Action
               label="Edit title"
               onPress={() => setTitleDraft(beginWorkDraft("title", item))}
@@ -405,26 +438,35 @@ function LoadedItem({
       </View>
 
       <View className="flex-row flex-wrap items-center gap-2">
-        <ControlPillMenu
-          accessibilityLabel="Change status"
-          actions={writable ? statusActions : []}
-          onPressAction={({ nativeEvent }) => {
-            const choice = parseStatusActionId(nativeEvent.event);
-            if (!writable || choice === null) return;
-            if ("transitionId" in choice) void changeStatus(choice);
-            else confirmStatus(choice.status);
-          }}
-        >
+        {writable ? (
+          <ListFilterMenu
+            label={item.nativeStatus?.name ?? STATUS_LABELS[item.status]}
+            accessibilityLabel="Change status"
+            actions={statusActions}
+            onSelect={(event) => {
+              const choice = parseStatusActionId(event);
+              if (choice === null) return;
+              if ("transitionId" in choice) void changeStatus(choice);
+              else confirmStatus(choice.status);
+            }}
+          />
+        ) : (
           <Chip label={item.nativeStatus?.name ?? STATUS_LABELS[item.status]} />
-        </ControlPillMenu>
-        {item.blocked ? <Chip label="Blocked" /> : null}
+        )}
+        {item.blocked ? <Chip label="Blocked" tone="warning" /> : null}
         {can("priority") ? (
           <PriorityControl item={item} update={update} />
         ) : item.priority ? (
           <Chip label={`${item.priority} priority`} />
         ) : null}
         {can("assignee") ? (
-          <Pressable accessibilityRole="button" onPress={() => setAssigning((open) => !open)}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`Assignee: ${item.assignee?.label ?? "Unassigned"}`}
+            hitSlop={6}
+            className="active:opacity-70"
+            onPress={() => setAssigning((open) => !open)}
+          >
             <Chip label={item.assignee?.label ?? "Unassigned"} />
           </Pressable>
         ) : item.assignee ? (
@@ -441,35 +483,37 @@ function LoadedItem({
       ) : null}
 
       {notice ? (
-        <View className="flex-row items-center gap-2 rounded-xl bg-card p-3">
-          <Text className="flex-1 text-sm text-foreground">{notice.message}</Text>
+        <View className="flex-row items-center gap-2 rounded-2xl border border-border bg-card px-3.5 py-2">
+          <Text className="flex-1 text-sm font-t3-medium text-foreground">{notice.message}</Text>
           {notice.undo !== null && canWrite ? (
             <Action label="Undo" onPress={() => void runUndo(notice.undo!)} />
           ) : null}
         </View>
       ) : null}
 
-      <View className="flex-row flex-wrap gap-2">
+      <View className="flex-row flex-wrap items-center gap-2">
         {openLink ? (
           <Action
             label="Continue thread"
+            primary
             onPress={() => openThread(environmentId, openLink.threadId)}
           />
         ) : null}
         {canStart ? (
-          <ControlPillMenu
+          <ListFilterMenu
+            label={openLink ? "Start another" : "Start thread"}
             accessibilityLabel="Start a thread"
+            active={openLink === undefined}
             actions={MODES.map((mode) => ({ id: mode.value, title: mode.label }))}
-            onPressAction={({ nativeEvent }) => {
-              const mode = MODES.find((entry) => entry.value === nativeEvent.event);
+            onSelect={(event) => {
+              const mode = MODES.find((entry) => entry.value === event);
               if (mode) void startThread(mode.value, openLink !== undefined);
             }}
-          >
-            <Chip label={openLink ? "Start another" : "Start thread"} />
-          </ControlPillMenu>
+          />
         ) : null}
         {canStart ? (
-          <ControlPillMenu
+          <ListFilterMenu
+            label={workspace === "root" ? "Project checkout" : "New worktree"}
             accessibilityLabel="Choose where the thread works"
             actions={[
               {
@@ -484,14 +528,10 @@ function LoadedItem({
                 attributes: { disabled: sharedCheckouts },
               },
             ]}
-            onPressAction={({ nativeEvent }) => {
-              if (nativeEvent.event === "root" || nativeEvent.event === "worktree") {
-                setWorkspaceChoice(nativeEvent.event);
-              }
+            onSelect={(event) => {
+              if (event === "root" || event === "worktree") setWorkspaceChoice(event);
             }}
-          >
-            <Chip label={workspace === "root" ? "Project checkout" : "New worktree"} />
-          </ControlPillMenu>
+          />
         ) : null}
         <Action label="Attach to draft" onPress={() => void attachToDraft()} />
         {canLink ? (
@@ -525,7 +565,7 @@ function LoadedItem({
         </Text>
       ) : null}
 
-      {error ? <Text className="text-sm text-destructive">{error}</Text> : null}
+      {error ? <ErrorBanner message={error} /> : null}
 
       {linking ? (
         <ThreadLinkPicker
@@ -538,56 +578,65 @@ function LoadedItem({
 
       {item.links.length > 0 ? (
         <View className="gap-2">
-          <Text className="text-sm font-t3-medium text-foreground">Linked threads</Text>
-          {item.links.map((link) => {
-            const shell = shellById.get(link.threadId);
-            const prompts = linkPrompts(link, item);
-            return (
-              <View key={link.threadId} className="gap-1 rounded-xl bg-card p-3">
-                <Pressable onPress={() => openThread(environmentId, link.threadId)}>
-                  <Text className="text-base text-foreground" numberOfLines={1}>
-                    {shell?.title ?? link.threadId}
-                  </Text>
-                  <Text className="text-xs text-foreground-muted">
-                    {RUN_STATE_LABELS[runStateOf(shell)]}
-                    {link.run ? ` · last run ${link.run.status}` : ""}
-                  </Text>
-                </Pressable>
-                {changedSinceLink(link, item) ? (
-                  <Text className="text-xs text-foreground-muted">
-                    Changed since the thread started.
-                  </Text>
-                ) : null}
-                <View className="flex-row flex-wrap gap-2">
-                  {canLink ? (
-                    <Action
-                      label="Unlink"
-                      onPress={() => void changeLink(link.threadId, "unlink")}
-                    />
-                  ) : null}
-                  {changedSinceLink(link, item) ? (
-                    <Action label="Send update to thread" onPress={() => void sendUpdate(link)} />
-                  ) : null}
-                  {writable && prompts.backToTodo ? (
-                    <Action
-                      label="Back to todo?"
-                      onPress={() =>
-                        void changeStatus({ status: "todo" }, `${item.key} is back to To do`)
-                      }
-                    />
-                  ) : null}
-                  {writable && prompts.markDone && item.capabilities.statuses.includes("done") ? (
-                    <Action
-                      label={`Mark ${item.key} done?`}
-                      onPress={() =>
-                        void changeStatus({ status: "done" }, `${item.key} marked done`)
-                      }
-                    />
+          <SectionTitle>Linked threads</SectionTitle>
+          <View className="overflow-hidden rounded-[24px] border-continuous bg-grouped-card android:rounded-[28px]">
+            {item.links.map((link, index) => {
+              const shell = shellById.get(link.threadId);
+              const prompts = linkPrompts(link, item);
+              const changed = changedSinceLink(link, item);
+              const actions =
+                canLink ||
+                changed ||
+                (writable && prompts.backToTodo) ||
+                (writable && prompts.markDone && item.capabilities.statuses.includes("done"));
+              return (
+                <View
+                  key={link.threadId}
+                  className={index === 0 ? undefined : "border-t border-border-subtle"}
+                >
+                  <ListRow
+                    label={shell?.title ?? link.threadId}
+                    description={`${RUN_STATE_LABELS[runStateOf(shell)]}${link.run ? ` · last run ${link.run.status}` : ""}${changed ? " · changed since the thread started" : ""}`}
+                    onPress={() => openThread(environmentId, link.threadId)}
+                  />
+                  {actions ? (
+                    <View className="flex-row flex-wrap gap-2 px-4 pb-3">
+                      {changed ? (
+                        <Action
+                          label="Send update to thread"
+                          onPress={() => void sendUpdate(link)}
+                        />
+                      ) : null}
+                      {writable && prompts.backToTodo ? (
+                        <Action
+                          label="Back to todo?"
+                          onPress={() =>
+                            void changeStatus({ status: "todo" }, `${item.key} is back to To do`)
+                          }
+                        />
+                      ) : null}
+                      {writable &&
+                      prompts.markDone &&
+                      item.capabilities.statuses.includes("done") ? (
+                        <Action
+                          label={`Mark ${item.key} done?`}
+                          onPress={() =>
+                            void changeStatus({ status: "done" }, `${item.key} marked done`)
+                          }
+                        />
+                      ) : null}
+                      {canLink ? (
+                        <Action
+                          label="Unlink"
+                          onPress={() => void changeLink(link.threadId, "unlink")}
+                        />
+                      ) : null}
+                    </View>
                   ) : null}
                 </View>
-              </View>
-            );
-          })}
+              );
+            })}
+          </View>
         </View>
       ) : null}
 
@@ -596,15 +645,18 @@ function LoadedItem({
       ) : null}
 
       <View className="gap-2">
-        <View className="flex-row items-center gap-2">
-          <Text className="flex-1 text-sm font-t3-medium text-foreground">Description</Text>
-          {can("body") &&
-          item.bodyFidelity === "exact" &&
-          !item.bodyTruncated &&
-          bodyDraft === null ? (
-            <Action label="Edit" onPress={() => setBodyDraft(beginWorkDraft("body", item))} />
-          ) : null}
-        </View>
+        <SectionTitle
+          trailing={
+            can("body") &&
+            item.bodyFidelity === "exact" &&
+            !item.bodyTruncated &&
+            bodyDraft === null ? (
+              <Action label="Edit" onPress={() => setBodyDraft(beginWorkDraft("body", item))} />
+            ) : null
+          }
+        >
+          Description
+        </SectionTitle>
         {item.bodyFidelity === "lossy" ? (
           <Text className="text-xs text-foreground-muted">
             Some content is only shown in the source.
@@ -632,15 +684,24 @@ function LoadedItem({
       </View>
 
       {item.labels.length > 0 ? (
-        <Text className="text-xs text-foreground-muted">Labels: {item.labels.join(", ")}</Text>
+        <View className="gap-2">
+          <SectionTitle>Labels</SectionTitle>
+          <View className="flex-row flex-wrap gap-1.5">
+            {item.labels.map((label) => (
+              <View key={label} className="rounded-md bg-subtle px-2 py-1">
+                <Text className="text-xs font-t3-medium text-foreground-muted">{label}</Text>
+              </View>
+            ))}
+          </View>
+        </View>
       ) : null}
       {item.parent ||
       item.blockedBy.length > 0 ||
       item.children.length > 0 ||
       can("parent") ||
       can("blockedBy") ? (
-        <View className="gap-1">
-          <Text className="text-sm font-t3-medium text-foreground">Relationships</Text>
+        <View className="gap-2">
+          <SectionTitle>Relationships</SectionTitle>
           {can("parent") ? (
             <RelationshipEditor item={item} field="parent" update={update} />
           ) : item.parent ? (
@@ -652,22 +713,41 @@ function LoadedItem({
             <Text className="text-sm text-foreground">Blocked by: {item.blockedBy.join(", ")}</Text>
           ) : null}
           {item.children.map((child) => (
-            <Text key={child.itemId} className="text-sm text-foreground">
-              {child.key} {child.title} · {STATUS_LABELS[child.status]}
-            </Text>
+            <View
+              key={child.itemId}
+              className="flex-row items-center gap-2"
+              accessibilityLabel={`${child.key}, ${child.title}, ${STATUS_LABELS[child.status]}`}
+            >
+              <SymbolView
+                name={STATUS_SYMBOLS[child.status].icon}
+                size={16}
+                tintColorClassName={STATUS_SYMBOLS[child.status].tint}
+              />
+              <Text className="text-xs text-foreground-muted">{child.key}</Text>
+              <Text className="min-w-0 flex-1 text-sm text-foreground" numberOfLines={1}>
+                {child.title}
+              </Text>
+            </View>
           ))}
         </View>
       ) : null}
 
       <View className="gap-2">
-        <Text className="text-sm font-t3-medium text-foreground">Comments</Text>
+        <SectionTitle>Comments</SectionTitle>
         {item.comments.length === 0 ? (
           <Text className="text-sm text-foreground-muted">No comments yet.</Text>
         ) : (
-          item.comments.map((comment) => (
-            <View key={comment.id} className="gap-0.5">
-              <Text className="text-xs text-foreground-muted">
+          item.comments.map((comment, index) => (
+            <View
+              key={comment.id}
+              className={index === 0 ? "gap-1" : "gap-1 border-t border-border-subtle pt-3"}
+            >
+              <Text className="text-xs font-t3-medium text-foreground-muted">
                 {comment.author?.label ?? "Unknown"}
+                <Text className="font-sans text-foreground-tertiary">
+                  {" "}
+                  · {relativeTime(comment.createdAt)} ago
+                </Text>
               </Text>
               <SelectableMarkdownText
                 markdown={comment.body}
@@ -708,7 +788,7 @@ function DraftEditor({
     <View className="gap-2">
       <AppTextInput
         accessibilityLabel={label}
-        className={multiline ? `${INPUT_CLASS} min-h-32` : INPUT_CLASS}
+        className={multiline ? "min-h-32" : undefined}
         multiline={multiline}
         textAlignVertical={multiline ? "top" : "center"}
         value={draft.value}
@@ -717,7 +797,7 @@ function DraftEditor({
         }
       />
       {draft.conflict !== null ? (
-        <View className="gap-1 rounded-xl bg-card p-3">
+        <View className="gap-2 rounded-2xl border border-border bg-card px-3.5 py-3">
           <Text className="text-sm font-t3-medium text-foreground">
             {item.key} changed while you were editing.
           </Text>
@@ -741,7 +821,7 @@ function DraftEditor({
         </View>
       ) : null}
       <View className="flex-row gap-2">
-        <Action label="Save" disabled={draft.conflict !== null} onPress={onSave} />
+        <Action label="Save" primary disabled={draft.conflict !== null} onPress={onSave} />
         <Action label="Cancel" onPress={() => onChange(() => null)} />
       </View>
     </View>
@@ -767,26 +847,27 @@ function ThreadLinkPicker({
     [environmentId, linked, projectId, query, shells],
   );
   return (
-    <View className="gap-2 rounded-xl bg-subtle p-3">
+    <View className="gap-1 overflow-hidden rounded-[24px] bg-grouped-card p-3">
       <AppTextInput
         accessibilityLabel="Search threads"
-        className={INPUT_CLASS}
         placeholder="Search threads"
         value={query}
         autoFocus
         onChangeText={setQuery}
       />
       {candidates.length === 0 ? (
-        <Text className="text-sm text-foreground-muted">No matching threads.</Text>
+        <Text className="px-1 py-2 text-sm text-foreground-muted">No matching threads.</Text>
       ) : (
         candidates.map((shell) => (
           <Pressable
             key={shell.id}
             accessibilityRole="button"
-            className="py-2 active:opacity-70"
+            accessibilityLabel={`Link ${shell.title}`}
+            className="flex-row items-center gap-2 rounded-xl px-1 py-2.5 active:bg-row-hover"
             onPress={() => onLink(shell.id)}
           >
-            <Text className="text-base text-foreground" numberOfLines={1}>
+            <SymbolView name="link" size={15} tintColorClassName="accent-icon-muted" />
+            <Text className="min-w-0 flex-1 text-base text-foreground" numberOfLines={1}>
               {shell.title}
             </Text>
           </Pressable>

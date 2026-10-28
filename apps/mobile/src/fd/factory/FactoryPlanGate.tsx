@@ -25,8 +25,10 @@ import { useLayoutEffect, useRef, useState } from "react";
 import { Alert, View } from "react-native";
 
 import { AppText as Text, AppTextInput } from "../../components/AppText";
+import { ErrorBanner } from "../../components/ErrorBanner";
+import { StatusPill } from "../../components/StatusPill";
 import { useAtomCommand } from "../../state/use-atom-command";
-import { Control } from "./Control";
+import { Control, SectionTitle } from "./Control";
 import {
   changeMobilePlanEdit,
   followMobilePlanEdit,
@@ -44,8 +46,8 @@ type Pending = "save" | FactoryPlanDecision | "replan";
 /** Edits one draft: each control passes the change it makes to the draft as it then stands. */
 type EditDraft = (change: (draft: FactoryPlanDraft) => FactoryPlanDraft) => void;
 
-const INPUT_CLASS = "min-h-10 rounded-xl bg-subtle px-3 py-2 text-base text-foreground";
-const NOTE_CLASS = "min-h-24 rounded-xl bg-card px-3 py-2 text-base text-foreground";
+// The plan stacks many fields, so they sit a little shorter than a form's.
+const INPUT_CLASS = "min-h-11 py-2.5";
 
 /**
  * The plan a delivery waits on at the plan gate, editable in a draft pinned to that delivery:
@@ -161,20 +163,23 @@ export function FactoryPlanGate({
   const tasks = draft.tasks;
   return (
     <View className="gap-2" accessibilityLabel="Plan">
-      <View className="flex-row flex-wrap items-center gap-2">
-        <Text className="text-sm font-t3-medium text-foreground">Plan</Text>
-        <Text className="text-xs text-foreground-muted">
-          {tasks.length} {tasks.length === 1 ? "task" : "tasks"}, delivered in this order
-        </Text>
-      </View>
+      <SectionTitle
+        trailing={
+          <Text className="text-xs text-foreground-muted">
+            {tasks.length} {tasks.length === 1 ? "task" : "tasks"}, delivered in this order
+          </Text>
+        }
+      >
+        Plan
+      </SectionTitle>
       {draft.base.note !== undefined ? (
         <Text selectable className="text-xs text-foreground-muted">
           {draft.base.note}
         </Text>
       ) : null}
       {state === "changed" ? (
-        <View className="gap-2">
-          <Text className="text-sm text-warning">
+        <View className="gap-2 rounded-2xl bg-warning px-3.5 py-3">
+          <Text className="text-sm font-t3-medium text-warning-foreground">
             The plan changed while you were editing it. Keep your edits over the new plan, or use
             the new plan as it is.
           </Text>
@@ -204,12 +209,8 @@ export function FactoryPlanGate({
           edit={edit}
         />
       ))}
-      {save._tag === "Empty" ? (
-        <Text className="text-sm text-destructive">{save.message}</Text>
-      ) : null}
-      {refusal !== null ? (
-        <Text className="text-sm text-destructive">{refusal.message}</Text>
-      ) : null}
+      {save._tag === "Empty" ? <ErrorBanner message={save.message} /> : null}
+      {refusal !== null ? <ErrorBanner message={refusal.message} /> : null}
       {offered.update || offered.approve || actions.reject || actions.replan ? (
         <View className="flex-row flex-wrap gap-2">
           {offered.update ? (
@@ -229,6 +230,7 @@ export function FactoryPlanGate({
           {offered.approve ? (
             <Control
               label="Approve plan"
+              primary
               disabled={pending !== null || !actions.approve}
               onPress={() => confirm("approve")}
             />
@@ -264,7 +266,7 @@ export function FactoryPlanGate({
         <View className="gap-2">
           <AppTextInput
             accessibilityLabel="What the planner should change"
-            className={NOTE_CLASS}
+            className="min-h-24"
             placeholder="What should the planner change?"
             multiline
             textAlignVertical="top"
@@ -273,11 +275,12 @@ export function FactoryPlanGate({
             onChangeText={setNote}
           />
           {replanning._tag === "Invalid" && note.trim().length > 0 ? (
-            <Text className="text-sm text-destructive">{replanning.message}</Text>
+            <ErrorBanner message={replanning.message} />
           ) : null}
           <View className="flex-row flex-wrap gap-2">
             <Control
               label={pending === "replan" ? "Sending…" : "Send to planner"}
+              primary
               disabled={pending !== null || replanning._tag !== "Send"}
               onPress={() => void sendReplan()}
             />
@@ -323,12 +326,17 @@ function PlanTask({
     entry.criterion >= 1 && entry.criterion <= criteria ? [] : [index],
   );
   return (
-    <View className="gap-2 rounded-xl bg-card p-3">
+    <View className="gap-2 rounded-[24px] bg-grouped-card p-4 android:rounded-[28px]">
       <View className="flex-row flex-wrap items-center gap-2">
-        <Text className="text-xs text-foreground-muted">Task {number}</Text>
+        <Text className="text-sm font-t3-semibold text-foreground">Task {number}</Text>
         <Text className="text-xs text-foreground-muted">{task.base.kind}</Text>
         {task.base.risk === "high" ? (
-          <Text className="text-xs font-t3-medium text-warning">High risk</Text>
+          <StatusPill
+            label="High risk"
+            size="compact"
+            pillClassName="bg-warning"
+            textClassName="text-warning-foreground"
+          />
         ) : null}
       </View>
       {editable ? (
@@ -369,14 +377,18 @@ function PlanTask({
         onChangeText={(summary) => edit((draft) => editFactoryPlanTask(draft, id, { summary }))}
       />
       <FieldError message={errors.summary} />
-      <Text className="text-xs text-foreground-muted">Acceptance criteria and their tests</Text>
+      <Text className="pt-1 text-sm font-t3-medium text-foreground-muted">
+        Acceptance criteria and their tests
+      </Text>
       {task.acceptance.map((text, index) => {
         const criterion = index + 1;
         return (
           // Criteria are numbered by position, and test plan entries name them by it.
           // oxlint-disable-next-line react/no-array-index-key -- a criterion is its position
           <View key={index} className="gap-1">
-            <Text className="text-xs text-foreground">Criterion {criterion}</Text>
+            <Text className="px-1 text-xs font-t3-medium text-foreground">
+              Criterion {criterion}
+            </Text>
             <AppTextInput
               accessibilityLabel={`Criterion ${criterion} of task ${number}`}
               className={INPUT_CLASS}

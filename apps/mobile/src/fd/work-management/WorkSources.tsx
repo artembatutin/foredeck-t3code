@@ -6,15 +6,21 @@ import type {
   WorkSourceConfig,
   WorkSourceKind,
 } from "@t3tools/contracts/fd/work-management";
-import { useState } from "react";
-import { Pressable, Switch, View } from "react-native";
+import { type ReactNode, useState } from "react";
+import { View } from "react-native";
 
 import { AppText as Text, AppTextInput } from "../../components/AppText";
+import { ErrorBanner } from "../../components/ErrorBanner";
+import { ListRowLayout } from "../../components/ListRowLayout";
 import { ListSection } from "../../components/ListSection";
+import { RowPressable } from "../../components/RowPressable";
+import { SegmentedControl } from "../../components/SegmentedControl";
+import { StatusPill } from "../../components/StatusPill";
+import { ThemedSwitch } from "../../components/ThemedSwitch";
 import { useEnvironmentQuery } from "../../state/query";
 import { useEnvironmentScope } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
-import { workCommandError } from "./shared";
+import { Action, workCommandError } from "./shared";
 import { useWorkWritable, workCommands, workEnvironment } from "./state";
 
 const KIND_LABELS: Record<WorkSourceKind, string> = {
@@ -23,31 +29,13 @@ const KIND_LABELS: Record<WorkSourceKind, string> = {
   jira: "Jira",
 };
 
-const INPUT_CLASS = "min-h-11 rounded-xl bg-card px-3 text-base text-foreground";
-
-function Action({
-  label,
-  disabled = false,
-  onPress,
-}: {
-  label: string;
-  disabled?: boolean;
-  onPress: () => void;
-}) {
+/** A labelled form field, as the settings forms show them. */
+function Field({ label, children }: { readonly label: string; readonly children: ReactNode }) {
   return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityState={{ disabled }}
-      disabled={disabled}
-      onPress={onPress}
-      className={
-        disabled
-          ? "rounded-full bg-subtle-strong px-4 py-2 opacity-40"
-          : "rounded-full bg-subtle-strong px-4 py-2 active:opacity-70"
-      }
-    >
-      <Text className="text-sm font-t3-medium text-foreground">{label}</Text>
-    </Pressable>
+    <View className="gap-1.5">
+      <Text className="px-1 text-sm font-t3-medium text-foreground-muted">{label}</Text>
+      {children}
+    </View>
   );
 }
 
@@ -62,15 +50,14 @@ export function WorkSources(props: {
   if (support === undefined) return null;
   return (
     <ListSection title={`Work sources · ${props.environmentLabel}`}>
-      <View className="gap-3 p-4">
-        {readable ? (
-          <Editor project={props.project} kinds={[...support.sourceKinds]} />
-        ) : (
-          <Text className="text-sm text-foreground-muted">
-            This device was paired before Work existed. Pair it again to manage Work sources.
-          </Text>
-        )}
-      </View>
+      {readable ? (
+        <Editor project={props.project} kinds={[...support.sourceKinds]} />
+      ) : (
+        <ListRowLayout
+          label="Can't manage Work sources"
+          description="This device was paired before Work existed. Pair it again to manage Work sources."
+        />
+      )}
     </ListSection>
   );
 }
@@ -118,106 +105,153 @@ function Editor({
 
   return (
     <>
-      {sources.map((source) => (
-        <View key={source.sourceId} className="gap-2">
-          <Text className="text-sm font-t3-medium text-foreground">
-            {source.label} · {KIND_LABELS[source.kind]}
-            {source.state === "disconnected" ? " · disconnected" : ""}
-          </Text>
-          <Text className="text-xs text-foreground-muted">
-            {source.identity}
-            {source.state === "active" && source.health.status !== "ok"
-              ? ` · ${source.health.message ?? source.health.status.replaceAll("_", " ")}`
-              : ""}
-          </Text>
-          <View className="flex-row flex-wrap gap-2">
-            {source.state === "active" ? (
-              <Action
-                label="Test"
-                disabled={!permitted}
-                onPress={async () => {
-                  const result = await test({
-                    environmentId,
-                    input: {
-                      projectId: project.id,
-                      sourceId: source.sourceId,
-                      config: source.config,
-                    },
-                  });
-                  setMessage(
-                    result._tag === "Success"
-                      ? result.value.ok
-                        ? "Connection works."
-                        : (result.value.message ?? "The source could not be read.")
-                      : workCommandError(result),
-                  );
-                }}
-              />
-            ) : null}
-            {source.kind === "jira" && source.state === "active" ? (
-              <Action
-                label={source.credential.configured ? "Replace token" : "Set token"}
-                disabled={!permitted}
-                onPress={() =>
-                  setReplacing((current) => (current === source.sourceId ? null : source.sourceId))
-                }
-              />
-            ) : null}
-            {source.kind === "jira" && source.credential.configured && source.state === "active" ? (
-              <Action
-                label="Remove token"
-                disabled={!permitted}
-                onPress={async () =>
-                  report(
-                    await save({
-                      environmentId,
-                      input: {
-                        sourceId: source.sourceId,
-                        projectId: project.id,
-                        label: source.label,
-                        config: source.config,
-                        credential: "clear",
-                        expectedVersion: source.version,
-                      },
-                    }),
-                    "Token removed for every source on this site and account.",
-                  )
-                }
-              />
-            ) : null}
-            <Action
-              label={source.state === "active" ? "Disconnect" : "Restore"}
-              disabled={!permitted}
-              onPress={() => void toggle(source)}
-            />
-          </View>
-          {source.config.kind === "jira" && source.state === "active" ? (
-            <Text className="text-xs text-foreground-muted">
-              The token is shared by every Jira source for {source.config.email} on{" "}
-              {source.config.siteUrl}; replacing or removing it applies to all of them.
-            </Text>
-          ) : null}
-          {replacing === source.sourceId && permitted ? (
-            <ReplaceToken
-              project={project}
-              source={source}
-              onDone={(result) => {
-                setReplacing(null);
-                if (result !== null) setMessage(result);
-              }}
-            />
-          ) : null}
+      {query.error !== null && query.data === null ? (
+        <View className="p-4">
+          <ErrorBanner message={query.error} />
         </View>
-      ))}
-      {message ? <Text className="text-xs text-foreground-muted">{message}</Text> : null}
+      ) : sources.length === 0 && query.data !== null ? (
+        <ListRowLayout
+          label="No Work sources"
+          description="Add a Markdown folder, GitHub repository or Jira project to read its items."
+        />
+      ) : null}
+      {sources.map((source, index) => {
+        const unhealthy = source.state === "active" && source.health.status !== "ok";
+        return (
+          <View
+            key={source.sourceId}
+            className={index === 0 ? undefined : "border-t border-border-subtle"}
+          >
+            <ListRowLayout
+              label={source.label}
+              description={`${KIND_LABELS[source.kind]} · ${source.identity}${unhealthy ? ` · ${source.health.message ?? source.health.status.replaceAll("_", " ")}` : ""}`}
+              disabled={source.state === "disconnected"}
+              accessory={
+                source.state === "disconnected" ? (
+                  <StatusPill
+                    label="Disconnected"
+                    pillClassName="bg-subtle"
+                    textClassName="text-foreground-secondary"
+                    size="compact"
+                  />
+                ) : unhealthy ? (
+                  <StatusPill
+                    label="Needs attention"
+                    pillClassName="bg-warning"
+                    textClassName="text-warning-foreground"
+                    size="compact"
+                  />
+                ) : null
+              }
+            />
+            <View className="gap-2 px-4 pb-3">
+              <View className="flex-row flex-wrap gap-2">
+                {source.state === "active" ? (
+                  <Action
+                    label="Test"
+                    disabled={!permitted}
+                    onPress={async () => {
+                      const result = await test({
+                        environmentId,
+                        input: {
+                          projectId: project.id,
+                          sourceId: source.sourceId,
+                          config: source.config,
+                        },
+                      });
+                      setMessage(
+                        result._tag === "Success"
+                          ? result.value.ok
+                            ? "Connection works."
+                            : (result.value.message ?? "The source could not be read.")
+                          : workCommandError(result),
+                      );
+                    }}
+                  />
+                ) : null}
+                {source.kind === "jira" && source.state === "active" ? (
+                  <Action
+                    label={source.credential.configured ? "Replace token" : "Set token"}
+                    disabled={!permitted}
+                    onPress={() =>
+                      setReplacing((current) =>
+                        current === source.sourceId ? null : source.sourceId,
+                      )
+                    }
+                  />
+                ) : null}
+                {source.kind === "jira" &&
+                source.credential.configured &&
+                source.state === "active" ? (
+                  <Action
+                    label="Remove token"
+                    disabled={!permitted}
+                    onPress={async () =>
+                      report(
+                        await save({
+                          environmentId,
+                          input: {
+                            sourceId: source.sourceId,
+                            projectId: project.id,
+                            label: source.label,
+                            config: source.config,
+                            credential: "clear",
+                            expectedVersion: source.version,
+                          },
+                        }),
+                        "Token removed for every source on this site and account.",
+                      )
+                    }
+                  />
+                ) : null}
+                <Action
+                  label={source.state === "active" ? "Disconnect" : "Restore"}
+                  disabled={!permitted}
+                  onPress={() => void toggle(source)}
+                />
+              </View>
+              {source.config.kind === "jira" && source.state === "active" ? (
+                <Text className="text-xs text-foreground-muted">
+                  The token is shared by every Jira source for {source.config.email} on{" "}
+                  {source.config.siteUrl}; replacing or removing it applies to all of them.
+                </Text>
+              ) : null}
+              {replacing === source.sourceId && permitted ? (
+                <ReplaceToken
+                  project={project}
+                  source={source}
+                  onDone={(result) => {
+                    setReplacing(null);
+                    if (result !== null) setMessage(result);
+                  }}
+                />
+              ) : null}
+            </View>
+          </View>
+        );
+      })}
+      {message ? (
+        <Text className="border-t border-border-subtle px-4 py-3 text-sm text-foreground-muted">
+          {message}
+        </Text>
+      ) : null}
       {!permitted ? (
-        <Text className="text-sm text-foreground-muted">
+        <Text className="border-t border-border-subtle px-4 py-3 text-sm text-foreground-muted">
           Changing Work sources needs a live connection with the settings permission.
         </Text>
       ) : adding ? (
-        <AddSource project={project} kinds={kinds} onDone={() => setAdding(false)} />
+        <View className="border-t border-border-subtle">
+          <AddSource project={project} kinds={kinds} onDone={() => setAdding(false)} />
+        </View>
       ) : (
-        <Action label="Add source" onPress={() => setAdding(true)} />
+        <RowPressable
+          accessibilityRole="button"
+          accessibilityLabel="Add source"
+          className="border-t border-border-subtle bg-grouped-card"
+          onPress={() => setAdding(true)}
+        >
+          <ListRowLayout icon="plus" label="Add source" />
+        </RowPressable>
       )}
     </>
   );
@@ -289,99 +323,114 @@ function AddSource({
   };
 
   return (
-    <View className="gap-2 rounded-xl bg-subtle p-3">
+    <View className="gap-3 p-4">
       {kinds.length > 1 ? (
-        <View className="flex-row flex-wrap gap-2">
-          {kinds.map((entry) => (
-            <Action
-              key={entry}
-              label={entry === kind ? `• ${KIND_LABELS[entry]}` : KIND_LABELS[entry]}
-              onPress={() => setKind(entry)}
-            />
-          ))}
-        </View>
+        <SegmentedControl
+          options={kinds.map((entry) => ({ value: entry, label: KIND_LABELS[entry] }))}
+          selected={kind}
+          onSelect={setKind}
+        />
       ) : null}
       {kind === "markdown" ? (
         <>
-          <AppTextInput
-            accessibilityLabel="Task folder"
-            className={INPUT_CLASS}
-            value={directory}
-            autoCapitalize="none"
-            onChangeText={setDirectory}
-          />
-          <View className="flex-row items-center justify-between">
-            <Text className="text-sm text-foreground">Mark as in progress on start</Text>
-            <Switch value={autoStart} onValueChange={setAutoStart} />
+          <Field label="Task folder">
+            <AppTextInput
+              accessibilityLabel="Task folder"
+              value={directory}
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={setDirectory}
+            />
+          </Field>
+          <View className="flex-row items-center gap-3 px-1">
+            <Text className="flex-1 text-base text-foreground">Mark as in progress on start</Text>
+            <ThemedSwitch
+              accessibilityLabel="Mark as in progress on start"
+              value={autoStart}
+              onValueChange={setAutoStart}
+            />
           </View>
         </>
       ) : null}
       {kind === "github" ? (
         <>
-          <AppTextInput
-            accessibilityLabel="Owner"
-            className={INPUT_CLASS}
-            value={owner}
-            autoCapitalize="none"
-            placeholder="owner"
-            onChangeText={setOwner}
-          />
-          <AppTextInput
-            accessibilityLabel="Repository"
-            className={INPUT_CLASS}
-            value={name}
-            autoCapitalize="none"
-            placeholder="repository"
-            onChangeText={setName}
-          />
+          <Field label="Owner">
+            <AppTextInput
+              accessibilityLabel="Owner"
+              value={owner}
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="owner"
+              onChangeText={setOwner}
+            />
+          </Field>
+          <Field label="Repository">
+            <AppTextInput
+              accessibilityLabel="Repository"
+              value={name}
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="repository"
+              onChangeText={setName}
+            />
+          </Field>
         </>
       ) : null}
       {kind === "jira" ? (
         <>
-          <AppTextInput
-            accessibilityLabel="Jira site"
-            className={INPUT_CLASS}
-            value={siteUrl}
-            autoCapitalize="none"
-            placeholder="https://your-site.atlassian.net"
-            onChangeText={setSiteUrl}
-          />
-          <AppTextInput
-            accessibilityLabel="Project key"
-            className={INPUT_CLASS}
-            value={projectKey}
-            autoCapitalize="characters"
-            placeholder="PROJ"
-            onChangeText={setProjectKey}
-          />
-          <AppTextInput
-            accessibilityLabel="Atlassian email"
-            className={INPUT_CLASS}
-            value={email}
-            autoCapitalize="none"
-            keyboardType="email-address"
-            placeholder="you@company.com"
-            onChangeText={setEmail}
-          />
-          <AppTextInput
-            accessibilityLabel="API token"
-            className={INPUT_CLASS}
-            value={token}
-            secureTextEntry
-            autoCapitalize="none"
-            placeholder="Unscoped API token"
-            onChangeText={setToken}
-          />
+          <Field label="Jira site">
+            <AppTextInput
+              accessibilityLabel="Jira site"
+              value={siteUrl}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="url"
+              placeholder="https://your-site.atlassian.net"
+              onChangeText={setSiteUrl}
+            />
+          </Field>
+          <Field label="Project key">
+            <AppTextInput
+              accessibilityLabel="Project key"
+              value={projectKey}
+              autoCapitalize="characters"
+              autoCorrect={false}
+              placeholder="PROJ"
+              onChangeText={setProjectKey}
+            />
+          </Field>
+          <Field label="Atlassian email">
+            <AppTextInput
+              accessibilityLabel="Atlassian email"
+              value={email}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="email-address"
+              placeholder="you@company.com"
+              onChangeText={setEmail}
+            />
+          </Field>
+          <Field label="API token">
+            <AppTextInput
+              accessibilityLabel="API token"
+              value={token}
+              secureTextEntry
+              autoCapitalize="none"
+              placeholder="Unscoped API token"
+              onChangeText={setToken}
+            />
+          </Field>
         </>
       ) : null}
-      {error ? <Text className="text-sm text-destructive">{error}</Text> : null}
-      <View className="flex-row gap-2">
+      {error ? <ErrorBanner message={error} /> : null}
+      <View className="flex-row justify-end gap-2">
+        <Action label="Cancel" disabled={pending} onPress={onDone} />
         <Action
-          label={pending ? "Adding…" : "Add"}
+          label={pending ? "Adding…" : "Add source"}
+          primary
           disabled={pending || config === null}
           onPress={() => void submit()}
         />
-        <Action label="Cancel" disabled={pending} onPress={onDone} />
       </View>
     </View>
   );
@@ -427,24 +476,26 @@ function ReplaceToken({
     else setError(workCommandError(result));
   };
   return (
-    <View className="gap-2 rounded-xl bg-subtle p-3">
-      <AppTextInput
-        accessibilityLabel="New API token"
-        className={INPUT_CLASS}
-        value={token}
-        secureTextEntry
-        autoCapitalize="none"
-        placeholder="New API token"
-        onChangeText={setToken}
-      />
-      {error ? <Text className="text-sm text-destructive">{error}</Text> : null}
-      <View className="flex-row gap-2">
+    <View className="gap-3 pt-1">
+      <Field label="New API token">
+        <AppTextInput
+          accessibilityLabel="New API token"
+          value={token}
+          secureTextEntry
+          autoCapitalize="none"
+          placeholder="Unscoped API token"
+          onChangeText={setToken}
+        />
+      </Field>
+      {error ? <ErrorBanner message={error} /> : null}
+      <View className="flex-row justify-end gap-2">
+        <Action label="Cancel" disabled={pending} onPress={() => onDone(null)} />
         <Action
           label={pending ? "Testing…" : "Save token"}
+          primary
           disabled={pending || token.trim().length === 0}
           onPress={() => void submit()}
         />
-        <Action label="Cancel" disabled={pending} onPress={() => onDone(null)} />
       </View>
     </View>
   );

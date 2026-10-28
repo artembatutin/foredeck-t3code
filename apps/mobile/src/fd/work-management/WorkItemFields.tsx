@@ -15,16 +15,16 @@ import type {
 import { useEffect, useState } from "react";
 import { Pressable, View } from "react-native";
 
+import { SymbolView } from "../../components/AppSymbol";
 import { AppText as Text, AppTextInput } from "../../components/AppText";
-import { ControlPillMenu } from "../../components/ControlPill";
+import { ErrorBanner } from "../../components/ErrorBanner";
+import { ListFilterMenu } from "../../features/workspace/ListFilterMenu";
 import { useEnvironmentQuery } from "../../state/query";
-import { Action, Chip } from "./shared";
+import { Action } from "./shared";
 import { workEnvironment } from "./state";
 
 type FieldPatch = Omit<WorkItemPatch, "ref">;
 type Update = (patch: FieldPatch) => Promise<WorkWriteOutcome<unknown>>;
-
-const INPUT_CLASS = "rounded-xl bg-card px-3 py-2 text-base text-foreground";
 
 const PRIORITIES: ReadonlyArray<{ readonly value: WorkPriority | "none"; readonly label: string }> =
   [
@@ -38,21 +38,20 @@ const PRIORITIES: ReadonlyArray<{ readonly value: WorkPriority | "none"; readonl
 export function PriorityControl({ item, update }: { item: WorkItemDetail; update: Update }) {
   const current = item.priority ?? "none";
   return (
-    <ControlPillMenu
+    <ListFilterMenu
+      label={item.priority === null ? "No priority" : `${item.priority} priority`}
       accessibilityLabel="Change priority"
       actions={PRIORITIES.map((entry) => ({
         id: entry.value,
         title: entry.label,
         state: entry.value === current ? ("on" as const) : ("off" as const),
       }))}
-      onPressAction={({ nativeEvent }) => {
-        const next = PRIORITIES.find((entry) => entry.value === nativeEvent.event)?.value;
+      onSelect={(event) => {
+        const next = PRIORITIES.find((entry) => entry.value === event)?.value;
         if (next === undefined || next === current) return;
         void update({ priority: next === "none" ? null : next });
       }}
-    >
-      <Chip label={item.priority === null ? "No priority" : `${item.priority} priority`} />
-    </ControlPillMenu>
+    />
   );
 }
 
@@ -91,10 +90,9 @@ export function AssigneeEditor({
   };
   const freeText = search.trim();
   return (
-    <View className="gap-2 rounded-xl bg-subtle p-3">
+    <View className="gap-1 rounded-[24px] bg-grouped-card p-3">
       <AppTextInput
         accessibilityLabel="Find a person"
-        className={INPUT_CLASS}
         placeholder={item.capabilities.people ? "Find a person" : "Assignee"}
         value={search}
         autoFocus
@@ -105,10 +103,16 @@ export function AssigneeEditor({
           <Pressable
             key={person.id}
             accessibilityRole="button"
-            className="py-2 active:opacity-70"
+            accessibilityLabel={`Assign to ${person.label}`}
+            className="flex-row items-center gap-2 rounded-xl px-1 py-2.5 active:bg-row-hover"
             onPress={() => void choose(person.id)}
           >
-            <Text className="text-base text-foreground" numberOfLines={1}>
+            <SymbolView
+              name="person.crop.circle"
+              size={16}
+              tintColorClassName="accent-icon-muted"
+            />
+            <Text className="min-w-0 flex-1 text-base text-foreground" numberOfLines={1}>
               {person.label}
             </Text>
           </Pressable>
@@ -116,10 +120,8 @@ export function AssigneeEditor({
       ) : freeText.length > 0 ? (
         <Action label={`Assign to ${freeText}`} onPress={() => void choose(freeText)} />
       ) : null}
-      {item.capabilities.people && people.error ? (
-        <Text className="text-xs text-destructive">{people.error}</Text>
-      ) : null}
-      <View className="flex-row gap-2">
+      {item.capabilities.people && people.error ? <ErrorBanner message={people.error} /> : null}
+      <View className="flex-row gap-2 pt-1">
         {item.assignee !== null ? (
           <Action label="Unassign" onPress={() => void choose(null)} />
         ) : null}
@@ -165,7 +167,8 @@ export function RelationshipEditor({
     return (
       <View className="flex-row items-center gap-2">
         <Text className="flex-1 text-sm text-foreground">
-          {label}: {current.length === 0 ? "none" : current}
+          <Text className="text-foreground-muted">{label}: </Text>
+          {current.length === 0 ? "none" : current}
         </Text>
         <Action label="Edit" onPress={() => setDraft(beginWorkRelationshipDraft(item, field))} />
       </View>
@@ -176,15 +179,14 @@ export function RelationshipEditor({
     <View className="gap-2">
       <AppTextInput
         accessibilityLabel={label}
-        className={INPUT_CLASS}
         placeholder={field === "parent" ? "Item id" : "Item ids, comma-separated"}
         value={draft.value}
         autoFocus
         onChangeText={(value) => setDraft({ ...draft, value })}
       />
-      {invalid ? <Text className="text-xs text-destructive">{invalid}</Text> : null}
+      {invalid ? <ErrorBanner message={invalid} /> : null}
       {conflict ? (
-        <View className="gap-1 rounded-xl bg-card p-3">
+        <View className="gap-2 rounded-2xl border border-border bg-card px-3.5 py-3">
           <Text className="text-sm text-foreground">
             {item.key} changed while you were editing.{" "}
             {newer ? `Now: ${current.length === 0 ? "none" : current}` : "Loading it…"}
@@ -203,7 +205,7 @@ export function RelationshipEditor({
         </View>
       ) : null}
       <View className="flex-row gap-2">
-        <Action label="Save" disabled={conflict} onPress={() => void save()} />
+        <Action label="Save" primary disabled={conflict} onPress={() => void save()} />
         <Action label="Cancel" onPress={close} />
       </View>
     </View>

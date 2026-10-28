@@ -2,11 +2,12 @@ import type { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import { useNavigation } from "@react-navigation/native";
 import { Pressable, View } from "react-native";
 
+import { SymbolView } from "../../components/AppSymbol";
 import { AppText as Text } from "../../components/AppText";
 import { ControlPillMenu } from "../../components/ControlPill";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
-import { STATUS_LABELS } from "./shared";
+import { STATUS_LABELS, STATUS_SYMBOLS } from "./shared";
 import { useWorkReadable, useWorkWritable, workCommands, workEnvironment } from "./state";
 
 /** The Work items linked to a thread, above its feed; nothing without Work access. */
@@ -56,7 +57,9 @@ function LinkedWorkItems(props: {
         >
           <Pressable
             accessibilityRole="button"
-            className="rounded-full bg-subtle-strong px-3 py-1 active:opacity-70"
+            accessibilityLabel={`Work item ${link.snapshot.key}, ${STATUS_LABELS[link.snapshot.status]}`}
+            hitSlop={4}
+            className="h-7 max-w-full flex-row items-center gap-1.5 rounded-full bg-subtle px-2.5 active:opacity-70"
             onPress={() =>
               navigation.navigate("WorkItem", {
                 environmentId: props.environmentId,
@@ -66,8 +69,17 @@ function LinkedWorkItems(props: {
               })
             }
           >
-            <Text className="text-xs text-foreground" numberOfLines={1}>
-              {link.snapshot.key} · {STATUS_LABELS[link.snapshot.status]}
+            <SymbolView
+              name={STATUS_SYMBOLS[link.snapshot.status].icon}
+              size={13}
+              tintColorClassName={STATUS_SYMBOLS[link.snapshot.status].tint}
+            />
+            <Text className="shrink text-xs font-t3-medium text-foreground-muted" numberOfLines={1}>
+              {link.snapshot.key}
+              <Text className="text-foreground-tertiary">
+                {" "}
+                · {STATUS_LABELS[link.snapshot.status]}
+              </Text>
             </Text>
           </Pressable>
         </ControlPillMenu>

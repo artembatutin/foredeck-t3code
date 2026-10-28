@@ -13,11 +13,14 @@ import { useLayoutEffect, useRef, useState } from "react";
 import { Alert, Platform, View } from "react-native";
 
 import { AppText as Text } from "../../components/AppText";
+import { ErrorBanner } from "../../components/ErrorBanner";
+import { StatusPill } from "../../components/StatusPill";
 import { useAndroidWorkspaceSelection } from "../../features/workspace/useAndroidWorkspaceSelection";
+import { relativeTime } from "../../lib/time";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useWorkspaceEnvironments } from "../../state/workspace";
-import { Control } from "./Control";
+import { Control, SectionTitle } from "./Control";
 import { FactoryPlanGate } from "./FactoryPlanGate";
 import {
   factoryCommandError,
@@ -106,7 +109,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
 
   if (view === null) {
     return deliveriesQuery.error === null ? null : (
-      <Text className="text-sm text-destructive">{deliveriesQuery.error}</Text>
+      <ErrorBanner message={`Couldn't read Factory deliveries: ${deliveriesQuery.error}`} />
     );
   }
 
@@ -149,28 +152,39 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
   const { controls } = view;
   return (
     <View className="gap-2" accessibilityLabel="Factory">
-      <View className="flex-row flex-wrap items-center gap-2">
-        <Text className="text-sm font-t3-medium text-foreground">Factory</Text>
-        <View className="rounded-full bg-subtle-strong px-3 py-1">
-          <Text
-            className={
-              view.needsYou === undefined
-                ? "text-xs font-t3-medium text-foreground"
-                : "text-xs font-t3-medium text-warning"
-            }
-          >
-            {view.label}
-          </Text>
-        </View>
-        {view.stage !== undefined ? (
-          <Text className="text-xs text-foreground-muted">{view.stage}</Text>
-        ) : null}
-      </View>
+      <SectionTitle
+        trailing={
+          <>
+            <StatusPill
+              label={view.label}
+              size="compact"
+              pillClassName={view.needsYou === undefined ? "bg-subtle" : "bg-warning"}
+              textClassName={
+                view.needsYou === undefined
+                  ? "text-foreground-secondary"
+                  : "text-warning-foreground"
+              }
+            />
+            {view.stage !== undefined ? (
+              <Text className="text-xs text-foreground-muted">{view.stage}</Text>
+            ) : null}
+          </>
+        }
+      >
+        Factory
+      </SectionTitle>
       {view.needsYou !== undefined ? (
-        <Text className="text-sm text-warning">{view.needsYou}</Text>
+        <View className="rounded-2xl bg-warning px-3.5 py-3">
+          <Text className="text-sm font-t3-medium text-warning-foreground">{view.needsYou}</Text>
+        </View>
       ) : null}
       <Text className="text-xs text-foreground-muted">
-        {view.branch === undefined ? "" : `${view.branch} · `}
+        {view.branch === undefined ? null : (
+          <Text selectable className="font-mono text-foreground">
+            {view.branch}
+            {" · "}
+          </Text>
+        )}
         Fix rounds {view.rounds.fix} · Review rounds {view.rounds.review}
       </Text>
       {controls.stop || controls.resume || controls.cancel ? (
@@ -198,7 +212,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
           ) : null}
         </View>
       ) : null}
-      {error !== null ? <Text className="text-sm text-destructive">{error}</Text> : null}
+      {error !== null ? <ErrorBanner message={error} /> : null}
       {gate !== null ? (
         // A draft and a note belong to one delivery; another delivery's plan starts afresh.
         <FactoryPlanGate
@@ -207,39 +221,56 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
           itemKey={item.key}
         />
       ) : null}
-      {deliveriesQuery.error !== null ? (
-        <Text className="text-sm text-destructive">{deliveriesQuery.error}</Text>
-      ) : null}
-      {view.timeline.map(({ thread, ...row }) => (
-        <View key={row.key} className="gap-0.5 rounded-xl bg-card p-3">
-          <View className="flex-row items-center gap-2">
-            <Text className="text-sm font-t3-medium text-foreground">{row.stage}</Text>
-            {row.round !== null ? (
-              <Text className="text-xs text-foreground-muted">Round {row.round}</Text>
-            ) : null}
-            <Text className="flex-1 text-xs text-foreground-muted">{row.outcome}</Text>
-            {thread !== null ? (
-              <Control label="Open thread" onPress={() => openThread(thread)} />
-            ) : null}
-          </View>
-          {row.startedAt !== undefined ? (
-            <Text className="text-xs text-foreground-muted">
-              Started {new Date(row.startedAt).toLocaleString()}
-            </Text>
-          ) : null}
-          {row.receipts.map((receipt) => (
-            <Text key={receipt.key} className="text-xs text-foreground">
-              Verify: {receipt.text}
-            </Text>
-          ))}
-          {row.reviews.map((review) => (
-            <ReviewEvidence key={review.key} review={review} />
+      {deliveriesQuery.error !== null ? <ErrorBanner message={deliveriesQuery.error} /> : null}
+      {view.timeline.length > 0 ? (
+        <View className="overflow-hidden rounded-[24px] border-continuous bg-grouped-card android:rounded-[28px]">
+          {view.timeline.map(({ thread, ...row }, index) => (
+            <View
+              key={row.key}
+              className={
+                index === 0 ? "gap-1 px-4 py-3" : "gap-1 border-t border-border-subtle px-4 py-3"
+              }
+            >
+              <View className="flex-row items-center gap-2">
+                <View className="min-w-0 flex-1 gap-0.5">
+                  <Text className="text-base font-t3-medium text-foreground">
+                    {row.stage}
+                    {row.round !== null ? (
+                      <Text className="text-sm font-sans text-foreground-muted">
+                        {" "}
+                        · Round {row.round}
+                      </Text>
+                    ) : null}
+                  </Text>
+                  <Text className="text-sm text-foreground-muted">
+                    {row.outcome}
+                    {row.startedAt !== undefined ? (
+                      <Text className="text-foreground-tertiary">
+                        {" "}
+                        · started {relativeTime(row.startedAt)} ago
+                      </Text>
+                    ) : null}
+                  </Text>
+                </View>
+                {thread !== null ? (
+                  <Control label="Open thread" onPress={() => openThread(thread)} />
+                ) : null}
+              </View>
+              {row.receipts.map((receipt) => (
+                <Text key={receipt.key} className="text-xs text-foreground">
+                  Verify: {receipt.text}
+                </Text>
+              ))}
+              {row.reviews.map((review) => (
+                <ReviewEvidence key={review.key} review={review} />
+              ))}
+            </View>
           ))}
         </View>
-      ))}
+      ) : null}
       {view.receipts.length > 0 || view.reviews.length > 0 ? (
-        <View className="gap-0.5 rounded-xl bg-card p-3">
-          <Text className="text-xs text-foreground-muted">Receipts and reviews</Text>
+        <View className="gap-1 rounded-[24px] bg-grouped-card px-4 py-3 android:rounded-[28px]">
+          <Text className="text-sm font-t3-medium text-foreground-muted">Receipts and reviews</Text>
           {view.receipts.map((receipt) => (
             <Text key={receipt.key} className="text-xs text-foreground">
               Verify: {receipt.text}
