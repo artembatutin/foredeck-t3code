@@ -487,6 +487,27 @@ export class FactoryService extends Context.Service<
       FactoryCancelRefusedError | FactoryDeliveryNotFoundError | FactoryStoreError
     >;
     /**
+     * Runs an effect that waits for admission (see `FactoryAdmission`), once, for whoever admits
+     * it: only while the delivery awaits effect `effectId`, it is marked waiting and no job of the
+     * delivery is in flight, all read under the delivery's lock. Its job is counted, the mark
+     * cleared and the job queued; it asks the admission port again before it runs. `stale`,
+     * changing nothing, otherwise.
+     */
+    readonly redispatch: (
+      deliveryId: FactoryDeliveryId,
+      effectId: number,
+    ) => Effect.Effect<"dispatched" | "stale", FactoryStoreError>;
+    /**
+     * Makes sure an awaited effect waits marked for admission, never running anything: `deferred`
+     * once it is marked, storing the mark when the effect has neither mark nor job (a deferral
+     * whose mark could not be stored); `running` while a job of the delivery is in flight;
+     * `stale` when the delivery does not await effect `effectId`.
+     */
+    readonly ensureDeferred: (
+      deliveryId: FactoryDeliveryId,
+      effectId: number,
+    ) => Effect.Effect<"deferred" | "running" | "stale", FactoryStoreError>;
+    /**
      * The owner's edit of the plan a parent waits on at the plan gate: `plan`, any value as it
      * arrived, replaces it, and the delivery waits on. The edit is judged under the delivery's
      * lock by the planner's plan validator and the edit rules (see `validatePlanEdit`): it may
@@ -1200,6 +1221,8 @@ const make = Effect.gen(function* () {
     stop,
     resume,
     cancel,
+    redispatch: worker.redispatch,
+    ensureDeferred: worker.ensureDeferred,
     updatePlan,
     approvePlan,
     rejectPlan,

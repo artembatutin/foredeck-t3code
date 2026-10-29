@@ -597,6 +597,21 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
     : undefined;
 };
 
+/** The id of the effect the delivery awaits; undefined while it awaits anything else. */
+const awaitedEffectId = ({ awaiting }: FactoryDeliveryState) =>
+  awaiting?.type === "effect" ? awaiting.effect.id : undefined;
+
+/**
+ * Drops an admission mark that no longer names the effect the delivery awaits. A step that changes
+ * nothing keeps the very same state.
+ */
+const keepAdmissionWait = (next: FactoryAdvance): FactoryAdvance => {
+  const { admissionWait, ...rest } = next.delivery;
+  return admissionWait === undefined || awaitedEffectId(next.delivery) === admissionWait.effectId
+    ? next
+    : { ...next, delivery: rest };
+};
+
 /**
  * Folds one event into a delivery and returns the effects the worker must carry out. Pure: no
  * services, I/O or clock, and the input is never mutated, so a delivery's events replay to the
@@ -673,9 +688,35 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * parent, `resumePlanning`, `resumeApproved` and `resumeFollowThrough`); a parent past its
  * children integrates again, from a fresh verify. A delivery blocked closing out its merge closes
  * out again.
+ *
+ * An effect the delivery awaits can wait for admission (see `FactoryAdmission`):
+ * `admission.deferred` marks it, and `admission.granted` clears the mark before a redispatch runs
+ * it. The mark names only the effect the delivery awaits, so it goes whenever the delivery awaits
+ * anything else: another effect it issues, a block, a cancel.
  */
-export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
+export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance =>
+  keepAdmissionWait(fold(delivery, event));
+
+/** `advance`'s step, before `keepAdmissionWait`. */
+const fold = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
   switch (event.type) {
+    // Bookkeeping of the effect the delivery awaits, whatever its status: only that effect's
+    // admission mark changes, and an event naming any other effect changes nothing.
+    case "admission.deferred":
+      return awaitedEffectId(delivery) !== event.effectId ||
+        delivery.admissionWait?.effectId === event.effectId
+        ? unchanged(delivery)
+        : step({ ...delivery, admissionWait: { effectId: event.effectId } });
+    case "admission.granted": {
+      if (
+        awaitedEffectId(delivery) !== event.effectId ||
+        delivery.admissionWait?.effectId !== event.effectId
+      ) {
+        return unchanged(delivery);
+      }
+      const { admissionWait: _, ...granted } = delivery;
+      return step(granted);
+    }
     case "start": {
       if (delivery.status !== "queued") return unchanged(delivery);
       const started = {

@@ -33,8 +33,10 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
+import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import { FetchHttpClient } from "effect/http";
 import * as Layer from "effect/Layer";
@@ -42,7 +44,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
-import type * as Scope from "effect/Scope";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
@@ -51,6 +53,7 @@ import * as GitManager from "../../../git/GitManager.ts";
 import * as GitWorkflow from "../../../git/GitWorkflowService.ts";
 import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
+import * as EffectOutbox from "../../../orchestration-v2/EffectOutbox.ts";
 import * as EffectWorker from "../../../orchestration-v2/EffectWorker.ts";
 import * as EventSink from "../../../orchestration-v2/EventSink.ts";
 import * as LegacyV1ThreadImporter from "../../../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
@@ -58,6 +61,7 @@ import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../../orchestration-v2/ProjectStore.ts";
 import * as ProviderAdapterRegistry from "../../../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ProviderRuntimeRecoveryService from "../../../orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import * as RuntimePolicy from "../../../orchestration-v2/RuntimePolicy.ts";
 import * as ProviderReplayHarness from "../../../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts";
@@ -609,13 +613,8 @@ const providerInstances = (supportedRuntimeModes: ReadonlyArray<RuntimeMode> | u
   });
 };
 
-/**
- * The server's orchestration stack around the fake provider, on one in-memory database, with the
- * project root and T3 home in temp folders. Turns run under the server's runtime policy, which
- * runs a mode the provider does not advertise as one it does. Factory opens pull requests through
- * the fake PR service. Effects run only when the test drains the worker.
- */
-const makeLayer = (input: {
+/** What the server's layers are built from. */
+interface ServerInput {
   readonly provider: FakeProvider;
   readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
   readonly providers: ReadonlyArray<ServerProvider> | undefined;
@@ -631,20 +630,30 @@ const makeLayer = (input: {
   readonly commentCalls: Array<CommentCall>;
   readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
   readonly manualReactor: boolean;
+  readonly admission: typeof Factory.FactoryAdmission.FactoryAdmission.Service | undefined;
   readonly root: string;
   readonly t3Home: string;
-}) => {
-  const database = SqlitePersistence.layerMemory;
+  /** The harness's one database, already built: every build of the server shares it. */
+  readonly database: Layer.Layer<Layer.Success<typeof SqlitePersistence.layerMemory>>;
+}
+
+/**
+ * The server's orchestration stack around the fake provider, on the harness's database, with the
+ * project root and T3 home in temp folders: everything Factory runs on. Turns run under the
+ * server's runtime policy, which runs a mode the provider does not advertise as one it does.
+ * Effects run only when the test drains the worker.
+ */
+const coreLayer = (input: ServerInput) => {
+  const { database } = input;
   const serverConfig = ServerConfig.layerTest(input.root, input.t3Home);
-  const instances = providerInstances(input.supportedRuntimeModes);
   const runtimePolicy = RuntimePolicy.layerFromProjectStore.pipe(
     Layer.provide(RepositorySet.layerDefault),
-    Layer.provide(instances),
+    Layer.provide(providerInstances(input.supportedRuntimeModes)),
     Layer.provide(ProjectStore.layer),
     Layer.provide(database),
     Layer.provide(serverConfig),
     Layer.provide(NodeServices.layer),
-    // The database is the harness's own, memoized: its build fails the test before this would.
+    // The database is the harness's own, already built, so it never fails this build.
     Layer.orDie,
   );
   const orchestration = ProviderReplayHarness.layerWithRegistry(
@@ -652,15 +661,7 @@ const makeLayer = (input: {
     ProviderAdapterRegistry.layerSingle(input.provider.adapter),
     { databaseLayer: database, runEffectWorker: false, runtimePolicyLayer: runtimePolicy },
   );
-  return (input.manualReactor ? downReactor : factoryReactor).pipe(
-    Layer.provideMerge(Factory.layerLive),
-    Layer.provide(factoryOrchestrator(input.factoryDispatch)),
-    Layer.provide(
-      fakePullRequests(input.pullRequestCalls, input.worktreeRemovals, input.publishHooks),
-    ),
-    Layer.provide(ProviderRegistryMock.layer(input.providers)),
-    Layer.provide(instances),
-    Layer.provideMerge(recordingWork(input.commentCalls, input.wrapWork)),
+  return recordingWork(input.commentCalls, input.wrapWork).pipe(
     Layer.provideMerge(threadLaunch(input.setupScripts)),
     Layer.provideMerge(projectService),
     Layer.provideMerge(ThreadManagement.layer),
@@ -683,6 +684,75 @@ const makeLayer = (input: {
     Layer.provideMerge(VcsProcess.layer),
   );
 };
+
+/**
+ * Factory and its reactor over the core services, opening pull requests through the fake PR
+ * service, with the admission port given (Factory's default otherwise).
+ */
+const factoryLayer = (input: ServerInput) =>
+  (input.manualReactor ? downReactor : factoryReactor).pipe(
+    Layer.provideMerge(Factory.layerLive),
+    Layer.provide(factoryOrchestrator(input.factoryDispatch)),
+    Layer.provide(
+      fakePullRequests(input.pullRequestCalls, input.worktreeRemovals, input.publishHooks),
+    ),
+    Layer.provide(ProviderRegistryMock.layer(input.providers)),
+    Layer.provide(providerInstances(input.supportedRuntimeModes)),
+    Layer.provide(
+      input.admission === undefined
+        ? Layer.empty
+        : Layer.succeed(Factory.FactoryAdmission.FactoryAdmission, input.admission),
+    ),
+  );
+
+/**
+ * Core's startup recovery, in the order the server runs it before anything else (see
+ * `serverRuntimeStartup`): the provider runtime's recovery, then the orchestrator's delegated
+ * tasks.
+ */
+const recoverCore = Effect.gen(function* () {
+  const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+  yield* recovery.recover;
+  const orchestrator = yield* Orchestrator.OrchestratorV2;
+  yield* orchestrator.recoverDelegatedTasks;
+}).pipe(
+  Effect.provide(ProviderRuntimeRecoveryService.layer.pipe(Layer.provide(EffectOutbox.layer))),
+  Effect.orDie,
+);
+
+/**
+ * The server on the harness's database: the core services and Factory, each built in a scope of
+ * its own under `parent`. `restart` closes Factory's, and with `orchestration` the core's too,
+ * then builds them anew over the same database, as a new server process would: lanes, locks,
+ * jobs, reactors, sessions and every other in-memory state go with the closed scopes. A rebuilt
+ * core runs core's startup recovery before Factory is built over it.
+ */
+const makeServer = (input: ServerInput, parent: Scope.Scope) =>
+  Effect.gen(function* () {
+    const build = <ROut, E, RIn>(layer: Layer.Layer<ROut, E, RIn>) =>
+      Effect.gen(function* () {
+        const scope = yield* Scope.fork(parent, "sequential");
+        const context = yield* Layer.buildWithMemoMap(layer, Layer.makeMemoMapUnsafe(), scope);
+        return { scope, context };
+      });
+    const buildFactory = (core: Context.Context<Layer.Success<ReturnType<typeof coreLayer>>>) =>
+      build(factoryLayer(input).pipe(Layer.provide(Layer.succeedContext(core))));
+    let core = yield* build(coreLayer(input));
+    let factory = yield* buildFactory(core.context);
+    return {
+      context: () => Context.merge(core.context, factory.context),
+      restart: (orchestration: boolean) =>
+        Effect.gen(function* () {
+          yield* Scope.close(factory.scope, Exit.void);
+          if (orchestration) {
+            yield* Scope.close(core.scope, Exit.void);
+            core = yield* build(coreLayer(input));
+            yield* recoverCore.pipe(Effect.provideContext(core.context));
+          }
+          factory = yield* buildFactory(core.context);
+        }).pipe(Effect.orDie),
+    };
+  });
 
 export const git = (cwd: string, args: ReadonlyArray<string>) =>
   Effect.flatMap(GitVcsDriver.GitVcsDriver, (driver) =>
@@ -743,7 +813,10 @@ export const threadProjection = (threadId: ThreadId) =>
   );
 
 /** What a test body runs with: the server layers and the platform. */
-type Services = Layer.Success<ReturnType<typeof makeLayer>> | NodeServices.NodeServices;
+type Services =
+  | Layer.Success<ReturnType<typeof coreLayer>>
+  | Layer.Success<ReturnType<typeof factoryLayer>>
+  | NodeServices.NodeServices;
 
 /** A started delivery whose first thread's (the author's, or a parent's planner's) turn runs. */
 interface StartedAuthor {
@@ -824,6 +897,18 @@ export interface World {
    * on; otherwise one reactor runs throughout, and this runs `body` as it is.
    */
   readonly boot: <A, E>(body: Effect.Effect<A, E, Services>) => Effect.Effect<A, E, Services>;
+  /**
+   * Runs `body` on a server restarted over the same database: Factory's services (its worker,
+   * service and reactor) are closed and built anew, dropping their lanes, locks, jobs and other
+   * in-memory state, and with `orchestration` so is the orchestration runtime with every service
+   * above it, which runs core's startup recovery first. A rebuilt Factory's reactor runs its boot
+   * sweep as any boot does (with `manualReactor`, inside `world.boot`). The services in effect
+   * before are closed, so everything that runs after the restart belongs in `body`.
+   */
+  readonly rebuild: <A, E>(
+    body: Effect.Effect<A, E, Services>,
+    options?: { readonly orchestration?: boolean },
+  ) => Effect.Effect<A, E, Services>;
   /** A fresh core launch service and tracker, closed before returning to inspect shutdown. */
   readonly launchScope: <A, E>(
     body: Effect.Effect<A, E, Services | Scope.Scope>,
@@ -870,6 +955,8 @@ export const withProject = <A, E>(
     readonly work?: (service: WorkServiceShape) => WorkServiceShape;
     /** Factory's reactor runs only inside `world.boot`; see there. */
     readonly manualReactor?: boolean;
+    /** The admission port Factory is built with, rebuilds included; its default otherwise. */
+    readonly admission?: typeof Factory.FactoryAdmission.FactoryAdmission.Service;
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -887,6 +974,28 @@ export const withProject = <A, E>(
     const processes: World["processes"] = {};
     const setupScripts: World["setupScripts"] = {};
     const commentCalls: Array<CommentCall> = [];
+    const server = yield* makeServer(
+      {
+        provider,
+        supportedRuntimeModes: options.supportedRuntimeModes,
+        providers: options.providers,
+        pullRequestCalls,
+        worktreeRemovals,
+        publishHooks,
+        factoryDispatch,
+        processes,
+        setupScripts,
+        commentCalls,
+        wrapWork: options.work ?? ((service) => service),
+        manualReactor: options.manualReactor === true,
+        admission: options.admission,
+        root,
+        t3Home,
+        // One database for every build of the server, as a T3 home keeps across restarts.
+        database: Layer.succeedContext(yield* Layer.build(SqlitePersistence.layerMemory)),
+      },
+      yield* Effect.scope,
+    );
 
     return yield* Effect.gen(function* () {
       // The project's remote: a bare repository the fake PR service pushes to.
@@ -928,7 +1037,6 @@ export const withProject = <A, E>(
         }),
       );
 
-      const service = yield* Factory.FactoryService.FactoryService;
       const launched: World["launched"] = (deliveryId) =>
         Effect.gen(function* () {
           yield* drainFactory;
@@ -944,7 +1052,9 @@ export const withProject = <A, E>(
           return { deliveryId, threadId: awaiting.threadId, runId: awaiting.runId, worktreePath };
         }).pipe(Effect.orDie);
       const startWith: World["startWith"] = (options) =>
-        service.start({ ...options, itemRef: item.ref }).pipe(
+        Effect.flatMap(Factory.FactoryService.FactoryService, (service) =>
+          service.start({ ...options, itemRef: item.ref }),
+        ).pipe(
           Effect.orDie,
           Effect.flatMap(({ deliveryId }) => launched(deliveryId)),
         );
@@ -989,7 +1099,7 @@ export const withProject = <A, E>(
         Effect.gen(function* () {
           ownerTurns += 1;
           const ownerProject = ProjectId.make(`project-owner-${ownerTurns}`);
-          yield* projects.create({
+          yield* (yield* ProjectService.ProjectService).create({
             commandId: CommandId.make(`create-owner-project:${ownerTurns}`),
             projectId: ownerProject,
             title: `Owner ${ownerTurns}`,
@@ -1027,6 +1137,13 @@ export const withProject = <A, E>(
               return yield* body;
             }).pipe(Effect.provide(FactoryReactor.layer), Effect.scoped);
 
+      const rebuild: World["rebuild"] = (after, rebuildOptions) =>
+        server
+          .restart(rebuildOptions?.orchestration === true)
+          .pipe(
+            Effect.andThen(Effect.suspend(() => Effect.provideContext(after, server.context()))),
+          );
+
       const rootStatus = yield* git(root, ["status", "--porcelain=v1", "--untracked-files=all"]);
       return yield* body({
         provider,
@@ -1050,6 +1167,7 @@ export const withProject = <A, E>(
         startWith,
         launched,
         boot,
+        rebuild,
         launchScope: (body) =>
           body.pipe(
             Effect.provide(
@@ -1062,26 +1180,7 @@ export const withProject = <A, E>(
         ownerThreadAt,
         endRun,
       });
-    }).pipe(
-      Effect.provide(
-        makeLayer({
-          provider,
-          supportedRuntimeModes: options.supportedRuntimeModes,
-          providers: options.providers,
-          pullRequestCalls,
-          worktreeRemovals,
-          publishHooks,
-          factoryDispatch,
-          processes,
-          setupScripts,
-          commentCalls,
-          wrapWork: options.work ?? ((service) => service),
-          manualReactor: options.manualReactor === true,
-          root,
-          t3Home,
-        }),
-      ),
-    );
+    }).pipe(Effect.provideContext(server.context()));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 /** Commits `export.ts` with `text` in the worktree, as the author agent would during its turn. */

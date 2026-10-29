@@ -28,6 +28,7 @@ import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 // Factory modules above enter that cycle where native ESM can initialize it (entry.test.ts).
 import * as RuntimeLayer from "../../orchestration-v2/runtimeLayer.ts";
 
+export * as FactoryAdmission from "./FactoryAdmission.ts";
 export * as FactoryReactor from "./FactoryReactor.ts";
 export * as FactoryService from "./FactoryService.ts";
 export * as FactorySettings from "./FactorySettings.ts";

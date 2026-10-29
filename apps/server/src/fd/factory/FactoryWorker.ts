@@ -19,6 +19,7 @@ import * as Scope from "effect/Scope";
 import * as TxRef from "effect/TxRef";
 
 import type * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
+import * as FactoryAdmission from "./FactoryAdmission.ts";
 import * as FactoryChanges from "./FactoryChanges.ts";
 import * as FactoryChildren from "./FactoryChildren.ts";
 import * as FactoryPlanning from "./FactoryPlanning.ts";
@@ -126,6 +127,10 @@ class FactoryChildStartError extends Schema.TaggedError<FactoryChildStartError>(
  * cancels its parent, so its unfinished siblings too (owner decision). A parent done once its
  * merged pull request is closed out makes its approved children done. A parent's lock is taken
  * before its children's, never while one of theirs is held.
+ *
+ * Before each effect but a close-out, the worker asks the admission port (see
+ * `FactoryAdmission`), and runs the effect only once admitted. A deferred effect stays awaited and
+ * marked, with no job, until a redispatch queues one; a refused one fails, blocking the delivery.
  */
 export class FactoryWorker extends Context.Service<
   FactoryWorker,
@@ -172,11 +177,14 @@ export class FactoryWorker extends Context.Service<
      */
     readonly stepThread: (event: FactoryThreadEvent) => Effect.Effect<void, FactoryStoreError>;
     /**
-     * Blocks a delivery that awaits an effect this process never queued, whatever its status: the
-     * queue that held it ended with an earlier server process. Nothing is re-run. A child's start
-     * is stored before its parent takes the result, though, so a parent awaiting the start of a
-     * child that started takes that start, then the child's approval if it is stored. Any other
-     * delivery is left as it is; an unknown one returns none.
+     * Blocks a delivery that awaits an effect no job of this process runs, whatever its status:
+     * the queue that held it ended with an earlier server process. Nothing is re-run. An effect
+     * waiting for admission (see `FactoryAdmission`) keeps waiting for its redispatch, marked; one
+     * stored unmarked is marked when the admission port still holds its deferral (a mark that
+     * could not be stored), and blocks when the port holds none or cannot be read. A child's
+     * start is stored before its parent takes the result, though, so a parent awaiting the start
+     * of a child that started takes that start, then the child's approval if it is stored. Any
+     * other delivery is left as it is; an unknown one returns none.
      */
     readonly failInterruptedEffect: (
       deliveryId: FactoryDeliveryId,
@@ -199,6 +207,27 @@ export class FactoryWorker extends Context.Service<
     readonly recoverPullRequest: (
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<"none" | "unknown" | "recovered", FactoryStoreError>;
+    /**
+     * Runs the awaited effect `effectId` that waits for admission, once: under the delivery's
+     * lock, and only while the delivery awaits it, it is marked waiting and no job of the
+     * delivery is in flight. The job is counted, the mark cleared (`admission.granted`) and the
+     * job queued; it asks the admission port again before it runs. `stale`, changing nothing, for
+     * any other effect or an unknown delivery.
+     */
+    readonly redispatch: (
+      deliveryId: FactoryDeliveryId,
+      effectId: number,
+    ) => Effect.Effect<"dispatched" | "stale", FactoryStoreError>;
+    /**
+     * Makes sure the awaited effect `effectId` waits marked for admission, under the delivery's
+     * lock and never running anything: `deferred` once it is marked, marking it when it has no
+     * mark and no job (a mark the worker could not store); `running` while a job of the delivery
+     * is in flight; `stale` when the delivery does not await it or is unknown.
+     */
+    readonly ensureDeferred: (
+      deliveryId: FactoryDeliveryId,
+      effectId: number,
+    ) => Effect.Effect<"deferred" | "running" | "stale", FactoryStoreError>;
     /**
      * Steps a parent with the approval of the child it waits for, once that child is approved;
      * the parent then waits for something else, so the approval is taken once. A parent without a
@@ -262,10 +291,14 @@ export class FactoryWorker extends Context.Service<
   }
 >()("t3/fd/factory/FactoryWorker") {}
 
-/** An effect to carry out, with the delivery as stored when it was issued. */
+/**
+ * An effect to carry out, with the delivery as stored when it was queued. It counts as in flight
+ * for its delivery from before it is queued until `release`, which only its first call does.
+ */
 interface Job {
   readonly delivery: FactoryDeliveryStore.StoredFactoryDelivery;
   readonly effect: FactoryEffect;
+  readonly release: Effect.Effect<void>;
 }
 
 type CommentJob = Parameters<FactoryWorkComments.FactoryWorkComments["Service"]["post"]>[0];
@@ -412,6 +445,7 @@ const make = Effect.gen(function* () {
   const commentStore = yield* FactoryWorkCommentStore.FactoryWorkCommentStore;
   const poster = yield* FactoryWorkComments.FactoryWorkComments;
   const changes = yield* FactoryChanges.FactoryChanges;
+  const admission = yield* FactoryAdmission.FactoryAdmission;
   const gitContext = yield* Effect.context<FileSystem.FileSystem | GitVcsDriver.GitVcsDriver>();
   const scope = yield* Effect.scope;
   const locks = yield* KeyedLock.make<FactoryDeliveryId>();
@@ -430,6 +464,26 @@ const make = Effect.gen(function* () {
   // Runs after every lane's finalizer: effects dropped at shutdown never finish, and a drain
   // must not wait for them.
   yield* Effect.addFinalizer(() => TxRef.set(outstanding, 0));
+  // Each delivery's jobs, counted from before they are queued until each ends (see `Job`). An
+  // awaited effect with none has no job of this process to run it: it waits for admission, or a
+  // restart lost its job. Read and changed under the delivery's lock, but for a job's release
+  // when it ends after feeding its result back.
+  const jobs = new Map<FactoryDeliveryId, number>();
+  const inFlight = (deliveryId: FactoryDeliveryId) => jobs.get(deliveryId) ?? 0;
+
+  /** Counts a job of the delivery as in flight, returning the job's `release`. */
+  const countJob = (deliveryId: FactoryDeliveryId) =>
+    Effect.sync(() => {
+      jobs.set(deliveryId, inFlight(deliveryId) + 1);
+      let released = false;
+      return Effect.sync(() => {
+        if (released) return;
+        released = true;
+        const left = inFlight(deliveryId) - 1;
+        if (left > 0) jobs.set(deliveryId, left);
+        else jobs.delete(deliveryId);
+      });
+    });
   // Work comments post on one lane of their own, in the order they were recorded: a slow or
   // failing Work source never holds up a delivery. Each is counted until it is done. The poster
   // claims each before posting it, so one queued twice (live, and by a boot sweep) posts once:
@@ -749,12 +803,8 @@ const make = Effect.gen(function* () {
     if (Option.isNone(recorded)) return Option.none();
     const { delivery: stored, announced } = recorded.value;
     // Queued only now: an effect never starts before the state that issued it is stored.
-    if (next.effects.length > 0) {
-      const lane = yield* laneFor(deliveryId);
-      for (const effect of next.effects) {
-        yield* TxRef.update(outstanding, (count) => count + 1);
-        yield* lane.enqueue({ delivery: stored, effect });
-      }
+    for (const effect of next.effects) {
+      yield* queueJob({ delivery: stored, effect, release: yield* countJob(deliveryId) });
     }
     if (Option.isSome(announced)) {
       yield* queueComment({ itemRef: stored.itemRef, comment: announced.value });
@@ -1314,14 +1364,15 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const current = yield* deliveries.get(deliveryId);
         if (Option.isNone(current)) return current;
-        const { awaiting } = current.value.state;
-        // A delivery gets a lane when this process queues its first effect, so with one the
-        // awaited effect is still queued or running here, or has already fed its result back.
-        if (awaiting?.type !== "effect" || lanes.has(deliveryId)) return current;
+        const { awaiting, admissionWait } = current.value.state;
+        // A job of this process still has the awaited effect queued or running.
+        if (awaiting?.type !== "effect" || inFlight(deliveryId) > 0) return current;
+        const { effect } = awaiting;
+        // Marked, it waits for admission, which a redispatch gives it.
+        if (admissionWait?.effectId === effect.id) return current;
         // A child's start is stored before its parent's result: one that took place is the
         // result, as the effect itself would take it, and the child's approval stored since
         // follows it.
-        const { effect } = awaiting;
         if (effect.type === "start_child") {
           const child = yield* deliveries.get(effect.child);
           if (Option.isSome(child) && child.value.state.status !== "queued") {
@@ -1345,11 +1396,79 @@ const make = Effect.gen(function* () {
             return yield* deliveries.get(deliveryId);
           }
         }
+        // Deferred before the restart, its mark may not have been stored: it waits marked while
+        // the admission port still holds its deferral. A close-out is never deferred.
+        const deferred =
+          effect.type !== "close_out" &&
+          (yield* admission
+            .deferredDemand({
+              root: current.value.parentId ?? deliveryId,
+              deliveryId,
+              effectId: effect.id,
+            })
+            .pipe(
+              Effect.catchCause((cause) =>
+                Cause.hasInterruptsOnly(cause)
+                  ? Effect.interrupt
+                  : Effect.logWarning(
+                      "factory could not read whether an interrupted effect was deferred",
+                      cause,
+                    ).pipe(Effect.as(false)),
+              ),
+            ));
+        if (deferred) {
+          return yield* stepLocked(deliveryId, { type: "admission.deferred", effectId: effect.id });
+        }
         return yield* stepLocked(deliveryId, {
           type: "effect.failed",
-          effectId: awaiting.effect.id,
-          detail: `Factory could not ${describeEffect(awaiting.effect)}: a server restart interrupted it.`,
+          effectId: effect.id,
+          detail: `Factory could not ${describeEffect(effect)}: a server restart interrupted it.`,
         });
+      }),
+    );
+
+  const redispatch: FactoryWorker["Service"]["redispatch"] = (deliveryId, effectId) =>
+    locks.withLock(
+      deliveryId,
+      Effect.gen(function* () {
+        const current = Option.getOrUndefined(yield* deliveries.get(deliveryId));
+        const awaiting = current?.state.awaiting;
+        if (
+          awaiting?.type !== "effect" ||
+          awaiting.effect.id !== effectId ||
+          current?.state.admissionWait?.effectId !== effectId ||
+          inFlight(deliveryId) > 0
+        ) {
+          return "stale" as const;
+        }
+        // Counted before the mark goes, so the effect never reads as unmarked with no job.
+        const release = yield* countJob(deliveryId);
+        const granted = yield* stepLocked(deliveryId, { type: "admission.granted", effectId }).pipe(
+          Effect.onError(() => release),
+        );
+        if (Option.isNone(granted)) {
+          yield* release;
+          return "stale" as const;
+        }
+        yield* queueJob({ delivery: granted.value, effect: awaiting.effect, release });
+        return "dispatched" as const;
+      }),
+    );
+
+  const ensureDeferred: FactoryWorker["Service"]["ensureDeferred"] = (deliveryId, effectId) =>
+    locks.withLock(
+      deliveryId,
+      Effect.gen(function* () {
+        const current = Option.getOrUndefined(yield* deliveries.get(deliveryId));
+        const awaiting = current?.state.awaiting;
+        if (awaiting?.type !== "effect" || awaiting.effect.id !== effectId) {
+          return "stale" as const;
+        }
+        if (inFlight(deliveryId) > 0) return "running" as const;
+        if (current?.state.admissionWait?.effectId !== effectId) {
+          yield* stepLocked(deliveryId, { type: "admission.deferred", effectId });
+        }
+        return "deferred" as const;
       }),
     );
 
@@ -1458,12 +1577,72 @@ const make = Effect.gen(function* () {
   );
 
   /**
-   * Runs an effect and feeds its result back. Suspended, so an executor that throws while
-   * building its effect fails the effect like any other failure. Interruption (shutdown) feeds
-   * nothing.
+   * What the admission port decides for the job's effect. A close-out is never asked: it only
+   * finishes what the owner's merge began.
+   */
+  const admit = ({ delivery, effect }: Job) =>
+    effect.type === "close_out"
+      ? Effect.succeed<FactoryAdmission.FactoryAdmissionDecision>({ type: "proceed" })
+      : admission.enter({
+          root: delivery.parentId ?? delivery.deliveryId,
+          deliveryId: delivery.deliveryId,
+          effectId: effect.id,
+          effectType: effect.type,
+          fresh: FactoryAdmission.isFreshEffect(effect.type),
+        });
+
+  /** A refused effect's failure: what Factory did not do, then the refusal's fixed text. */
+  const refused = (
+    effect: FactoryEffect,
+    category: FactoryAdmission.FactoryAdmissionRefusal,
+  ): FactoryEvent => ({
+    type: "effect.failed",
+    effectId: effect.id,
+    detail: `Factory did not ${describeEffect(effect)}. ${FactoryAdmission.admissionRefusalText[category]}`,
+  });
+
+  /**
+   * Leaves the job's effect waiting for admission, running nothing: under the delivery's lock it
+   * steps `admission.deferred` and releases the job, so whoever takes the lock next finds the
+   * effect marked with no job in flight. A mark that cannot be stored is logged and leaves the
+   * effect awaited, unmarked and without a job: `ensureDeferred` marks it later, and only a marked
+   * effect is ever redispatched.
+   */
+  // Annotated: it closes the cycle `stepLocked` → lane → `runJob` → `defer`.
+  const defer = (job: Job): Effect.Effect<void> => {
+    const { deliveryId } = job.delivery;
+    return locks.withLock(
+      deliveryId,
+      stepLocked(deliveryId, { type: "admission.deferred", effectId: job.effect.id }).pipe(
+        Effect.asVoid,
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.interrupt
+            : Effect.logWarning("factory could not mark an effect waiting for admission", cause),
+        ),
+        Effect.ensuring(job.release),
+      ),
+    );
+  };
+
+  /**
+   * Runs an effect once the admission port admits it, and feeds its result back. A refusal is fed
+   * back as the effect's failure, and a deferral feeds nothing (see `defer`). Suspended, so an
+   * executor that throws while building its effect fails the effect like any other failure, as
+   * does a port that cannot decide. Interruption (shutdown) feeds nothing.
    */
   const runJob = (job: Job) =>
-    Effect.suspend(() => execute(job)).pipe(
+    Effect.suspend(() => admit(job)).pipe(
+      Effect.flatMap((decision) => {
+        switch (decision.type) {
+          case "proceed":
+            return Effect.suspend(() => execute(job));
+          case "refuse":
+            return Effect.succeed(refused(job.effect, decision.category));
+          case "defer":
+            return Effect.as(defer(job), undefined);
+        }
+      }),
       Effect.catchCause((cause) =>
         Cause.hasInterruptsOnly(cause)
           ? Effect.interrupt
@@ -1473,9 +1652,18 @@ const make = Effect.gen(function* () {
               detail: failureDetail(job.effect, cause),
             }),
       ),
-      Effect.flatMap((event) => feed(job, event)),
+      Effect.flatMap((event) => (event === undefined ? Effect.void : feed(job, event))),
+      Effect.ensuring(job.release),
       Effect.ensuring(TxRef.update(outstanding, (count) => count - 1)),
     );
+
+  /** Queues a counted job on its delivery's lane; called only under the delivery's lock. */
+  const queueJob = (job: Job) =>
+    Effect.gen(function* () {
+      const lane = yield* laneFor(job.delivery.deliveryId);
+      yield* TxRef.update(outstanding, (count) => count + 1);
+      yield* lane.enqueue(job);
+    });
 
   // Called only under the delivery's lock, so a delivery never gets two lanes.
   const laneFor = (deliveryId: FactoryDeliveryId) =>
@@ -1516,6 +1704,8 @@ const make = Effect.gen(function* () {
     stepWith,
     stepThread,
     failInterruptedEffect,
+    redispatch,
+    ensureDeferred,
     recoverPullRequest,
     takeChildApproval,
     finishFamily,

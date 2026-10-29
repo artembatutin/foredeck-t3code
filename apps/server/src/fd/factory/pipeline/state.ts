@@ -671,7 +671,14 @@ export type FactoryEvent =
   /** A parent's child reports that it ended approved at record. */
   | { readonly type: "child.approved"; readonly deliveryId: FactoryDeliveryId }
   /** The worker could not carry out the effect; `detail` is bounded and safe to show. */
-  | { readonly type: "effect.failed"; readonly effectId: number; readonly detail: string };
+  | { readonly type: "effect.failed"; readonly effectId: number; readonly detail: string }
+  /**
+   * The awaited effect waits for admission (see `FactoryAdmission`): its job ended without
+   * running it, and only a redispatch runs it.
+   */
+  | { readonly type: "admission.deferred"; readonly effectId: number }
+  /** The awaited effect that waited for admission is admitted; its redispatched job runs it. */
+  | { readonly type: "admission.granted"; readonly effectId: number };
 
 /** The events the reactor observes on a thread; they name the thread, not the delivery. */
 export type FactoryThreadEvent = Extract<
@@ -844,6 +851,13 @@ export interface FactoryDeliveryState {
    * the boot sweep finishes it when a stop came first.
    */
   readonly releaseWatch?: true;
+  /**
+   * Set while the effect the delivery awaits waits for admission (see `FactoryAdmission`): no job
+   * runs it until a redispatch, which clears this first. It names only the awaited effect, so it
+   * goes once the delivery awaits anything else, as when it issues another effect or is
+   * cancelled. Absent from rows stored before admission existed.
+   */
+  readonly admissionWait?: { readonly effectId: number };
   /** Set while the delivery is blocked. */
   readonly block: FactoryBlock | null;
   /**
