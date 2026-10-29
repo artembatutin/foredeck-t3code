@@ -5,6 +5,7 @@ import * as Ref from "effect/Ref";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
 
@@ -50,18 +51,29 @@ function delegatedCompletionRetryKey(
   return `${request.threadId}:${completion.parentRunId}:${completion.generation}:${completion.messageId}`;
 }
 
+const nativeRetryKey = (
+  request: ProviderContinuationRequests.ProviderContinuationRequest,
+  messageId: string,
+): string => `native:${request.threadId}:${request.providerThreadId}:${messageId}`;
+
 /**
  * Drains ProviderContinuationRequests and dispatches an internal
  * message.dispatch per request so the wake turn buffered by the adapter is
  * ingested as a normal run. Delegated completions are durable mailbox offers:
  * the orchestrator selects native steering or queued delivery under its thread
  * lock. Adapter-buffered continuations still queue behind active work.
+ *
+ * Each turn first asks the automatic turn gate. A completion it holds back
+ * stays open on its cohort for a later offer. A native wake's buffered output
+ * lives only in its adapter, so the gate may keep its dispatch to run later; a
+ * wake the gate could not decide is offered again under the same message id.
  */
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const ids = yield* IdAllocator.IdAllocatorV2;
     const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
     const threads = yield* ThreadManagementService.ThreadManagementService;
+    const gate = yield* AutomaticTurnGate.AutomaticTurnGate;
     const retryAttempts = yield* Ref.make(new Map<string, number>());
 
     const clearRetryAttempt = (key: string) =>
@@ -80,6 +92,22 @@ export const layer = Layer.effectDiscard(
         return [Math.min(100 * 2 ** Math.min(attempt, 6), 5_000), updated] as const;
       });
 
+    const dropArchived = (request: ProviderContinuationRequests.ProviderContinuationRequest) =>
+      Effect.gen(function* () {
+        yield* Effect.logInfo("orchestration-v2.provider-continuation.thread-archived", {
+          threadId: request.threadId,
+          providerThreadId: request.providerThreadId,
+        });
+        // No continuation turn will start to clear the adapter's sticky offer.
+        if (request.clearIfCurrent !== undefined) {
+          yield* request.clearIfCurrent();
+        } else if (request.dispatchIfCurrent !== undefined) {
+          // Backward compatibility for request producers without an explicit
+          // drop callback.
+          yield* request.dispatchIfCurrent(Effect.void);
+        }
+      });
+
     const dispatchContinuation = Effect.fn("ProviderContinuationService.dispatchContinuation")(
       function* (request: ProviderContinuationRequests.ProviderContinuationRequest) {
         const projection = yield* threads.getThreadRecords(
@@ -93,23 +121,12 @@ export const layer = Layer.effectDiscard(
           },
         );
         if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null) {
-          yield* Effect.logInfo("orchestration-v2.provider-continuation.thread-archived", {
-            threadId: request.threadId,
-            providerThreadId: request.providerThreadId,
-          });
           if (request.delegatedCompletion !== undefined) {
             yield* clearRetryAttempt(
               delegatedCompletionRetryKey(request, request.delegatedCompletion),
             );
           }
-          // No continuation turn will start to clear the adapter's sticky offer.
-          if (request.clearIfCurrent !== undefined) {
-            yield* request.clearIfCurrent();
-          } else if (request.dispatchIfCurrent !== undefined) {
-            // Backward compatibility for request producers without an explicit
-            // drop callback.
-            yield* request.dispatchIfCurrent(Effect.void);
-          }
+          yield* dropArchived(request);
           return;
         }
         if (request.delegatedCompletion !== undefined) {
@@ -126,7 +143,7 @@ export const layer = Layer.effectDiscard(
             fixtureName: "delegated-completion",
             commandName: "dispatch",
           });
-          yield* threads
+          const dispatch = threads
             .dispatch({
               type: "message.dispatch",
               commandId,
@@ -197,11 +214,28 @@ export const layer = Layer.effectDiscard(
                   ),
               }),
             );
+          // Held back, the delivery stays open on its cohort for a later offer
+          // (the boot recovery, an acceptance or a wake-policy change).
+          yield* gate.admit(
+            {
+              kind: "delegated_completion",
+              threadId: request.threadId,
+              messageId: delivery.messageId,
+              key: `${request.delegatedCompletion.parentRunId}:${delivery.generation}:${delivery.messageId}`,
+              parentRunId: request.delegatedCompletion.parentRunId,
+              generation: delivery.generation,
+              providerThreadId: request.providerThreadId,
+              driver: request.driver,
+              origin: "offer",
+            },
+            dispatch,
+          );
           yield* clearRetryAttempt(retryKey);
           return;
         }
         // The ordinal is display metadata only: allocate.message appends a
         // random UUID, so a stale projection read here cannot collide ids.
+        // Allocated once: a re-offer after an undecided consult carries it.
         const messageId =
           request.messageId ??
           (yield* ids.allocate.message({
@@ -209,7 +243,7 @@ export const layer = Layer.effectDiscard(
             ordinal: projection.messages.length + 1,
           }));
         const commandId = CommandId.make(`provider-continuation:${messageId}`);
-        const dispatch = threads.dispatch({
+        const plainDispatch = threads.dispatch({
           type: "message.dispatch",
           commandId,
           threadId: request.threadId,
@@ -250,19 +284,70 @@ export const layer = Layer.effectDiscard(
               request.clearIfCurrent !== undefined ? request.clearIfCurrent() : Effect.void,
             ),
           );
-        if (request.dispatchIfCurrent === undefined) {
-          yield* dispatch.pipe(
+        // The gate may run this later, so it checks the thread again first.
+        const dispatch = Effect.gen(function* () {
+          const current = yield* threads.getThreadRecords(request.threadId, []);
+          if (current.thread.archivedAt !== null || current.thread.deletedAt !== null) {
+            yield* dropArchived(request);
+            return;
+          }
+          if (request.dispatchIfCurrent === undefined) {
+            yield* plainDispatch.pipe(
+              Effect.catchTags({
+                ThreadManagementProviderInstanceDisabledError: logInstanceDisabled,
+              }),
+            );
+            return;
+          }
+          yield* request.dispatchIfCurrent(plainDispatch).pipe(
             Effect.catchTags({
               ThreadManagementProviderInstanceDisabledError: logInstanceDisabled,
             }),
           );
-          return;
-        }
-        yield* request.dispatchIfCurrent(dispatch).pipe(
-          Effect.catchTags({
-            ThreadManagementProviderInstanceDisabledError: logInstanceDisabled,
-          }),
-        );
+        });
+        const retryKey = nativeRetryKey(request, messageId);
+        const clearIfCurrent = request.clearIfCurrent;
+        const decided = yield* gate
+          .hand(
+            {
+              kind: "background_wake",
+              threadId: request.threadId,
+              messageId,
+              key: messageId,
+              providerThreadId: request.providerThreadId,
+              driver: request.driver,
+              clearable: clearIfCurrent !== undefined,
+            },
+            dispatch,
+            clearIfCurrent === undefined ? {} : { drop: Effect.suspend(() => clearIfCurrent()) },
+          )
+          .pipe(
+            Effect.as(true),
+            // Undecided: the adapter's offer stays as it is, and the same wake
+            // is offered again after the next backoff step.
+            Effect.catchTags({
+              AutomaticTurnDecisionError: (error) =>
+                Effect.gen(function* () {
+                  const retryDelay = yield* nextRetryDelay(retryKey);
+                  yield* Effect.logWarning(
+                    "orchestration-v2.provider-continuation.wake-undecided",
+                    {
+                      threadId: request.threadId,
+                      providerThreadId: request.providerThreadId,
+                      stage: error.stage,
+                      retryDelay,
+                    },
+                  );
+                  yield* Effect.sleep(`${retryDelay} millis`).pipe(
+                    Effect.andThen(requests.offer({ ...request, messageId })),
+                    Effect.forkScoped,
+                  );
+                  return false;
+                }),
+            }),
+            Effect.onError(() => clearRetryAttempt(retryKey)),
+          );
+        if (decided) yield* clearRetryAttempt(retryKey);
       },
     );
 

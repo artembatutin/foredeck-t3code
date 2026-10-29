@@ -20,6 +20,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 
@@ -43,6 +44,9 @@ import * as RuntimeLayer from "./runtimeLayer.ts";
 import * as ProviderTurnStartServiceTestkit from "./ProviderTurnStartService.testkit.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
+import * as ProviderContinuationService from "./ProviderContinuationService.ts";
 
 const layerPlatformTest = Layer.merge(
   NodeServices.layer,
@@ -935,6 +939,118 @@ const seedRestartCancelledChild = (input: {
 it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
   "subagent follow-ups",
   (it) => {
+    it.effect("a held-back completion steer is dispatched once by a later offer", () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("thread:held-steer");
+        const runId = RunId.make("run:held-steer");
+        const taskId = NodeId.make("node:held-steer-task");
+        const messageId = MessageId.make(`message:delegated-delivery:${threadId}`);
+        const steeredRunId = RunId.make("run:held-steer-steered");
+        yield* seedParentWithTerminalTask({
+          threadId,
+          projectId: ProjectId.make("project:held-steer"),
+          runId,
+          rootNodeId: NodeId.make("node:held-steer-root"),
+          taskId,
+          deliveryState: "claimed",
+          completionWake: "always",
+          deliveryTaskIds: [taskId],
+          now,
+        });
+        // The steer reached a turn that completed first, and the gate held its follow-up back:
+        // the delivery stays an undelivered mailbox steer on that run.
+        yield* eventSink.write({
+          commandId: reconcileCommandId("held-steer"),
+          events: [
+            runEvent({
+              threadId,
+              runId: steeredRunId,
+              ordinal: 2,
+              status: "completed",
+              now,
+              providerThreadId: parentProviderThreadId(threadId),
+              userMessageId: MessageId.make("message:held-steer-user"),
+            }),
+            {
+              id: EventId.make("event:held-steer-message"),
+              type: "message.updated",
+              threadId,
+              runId: steeredRunId,
+              occurredAt: now,
+              payload: {
+                id: messageId,
+                threadId,
+                runId: steeredRunId,
+                nodeId: null,
+                role: "user",
+                text: `Delegated task ${taskId} reached a terminal state.`,
+                attachments: [],
+                streaming: false,
+                createdBy: "agent",
+                creationSource: "server",
+                createdAt: now,
+                updatedAt: now,
+                delegatedCompletion: { parentRunId: runId, generation: 1, taskIds: [taskId] },
+              },
+            },
+          ],
+        });
+
+        const consults = yield* Queue.unbounded<AutomaticTurnGate.AutomaticTurn>();
+        const gate = AutomaticTurnGate.AutomaticTurnGate.of({
+          admit: (turn, dispatch) =>
+            Effect.map(dispatch, AutomaticTurnGate.ran).pipe(
+              Effect.tap(() => Queue.offer(consults, turn)),
+            ),
+          hand: (turn) =>
+            Queue.offer(consults, turn).pipe(Effect.as(AutomaticTurnGate.notNow("declined"))),
+        });
+        const completion = {
+          threadId,
+          providerThreadId: parentProviderThreadId(threadId),
+          driver,
+          detail: null,
+          delivery: "message_text" as const,
+          delegatedCompletion: { parentRunId: runId, generation: 1, messageId },
+        };
+        yield* Effect.gen(function* () {
+          yield* requests.offer(completion);
+          yield* requests.offer(completion);
+          // The worker takes offers in order, so once this wake is consulted both are done.
+          yield* requests.offer({
+            threadId,
+            providerThreadId: parentProviderThreadId(threadId),
+            driver,
+            detail: null,
+            messageId: MessageId.make("message:held-steer-marker"),
+          });
+          const delivered = yield* Queue.take(consults);
+          assert.equal(delivered.kind, "delegated_completion");
+          assert.equal(delivered.messageId, messageId);
+          assert.equal((yield* Queue.take(consults)).kind, "background_wake");
+        }).pipe(
+          Effect.provide(
+            ProviderContinuationService.layer.pipe(
+              Layer.provide(
+                Layer.mergeAll(
+                  IdAllocator.layer,
+                  Layer.succeed(AutomaticTurnGate.AutomaticTurnGate, gate),
+                ),
+              ),
+            ),
+          ),
+        );
+        const runs = (yield* orchestrator.getThreadProjection(threadId)).runs.filter(
+          (run) => run.userMessageId === messageId,
+        );
+        assert.lengthOf(runs, 1);
+      }),
+    );
+
     const outcomes = [
       "completed",
       "failed",

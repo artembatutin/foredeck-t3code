@@ -1,3 +1,7 @@
+// Loads before ThreadManagementService: the fork's assistant role, which CodexAdapterV2 imports,
+// reaches the MCP services that import ThreadManagementService back. Entered there first, that
+// cycle runs OrchestratorMcpService before ThreadManagementService has defined its errors.
+import "./Adapters/CodexAdapterV2.ts";
 import { assert, describe, it } from "@effect/vitest";
 import {
   MessageId,
@@ -23,6 +27,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
 import * as ProviderContinuationService from "./ProviderContinuationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 
@@ -94,18 +99,107 @@ const makeGuard = Effect.fnUntraced(function* (completed?: Deferred.Deferred<voi
 function layerTest(input: {
   readonly dispatched: Queue.Queue<unknown>;
   readonly getThreadRecords: () => Effect.Effect<OrchestrationV2ThreadProjection>;
+  readonly dispatch?: ThreadManagementService.ThreadManagementService["Service"]["dispatch"];
+  readonly gate?: (typeof AutomaticTurnGate.AutomaticTurnGate)["Service"];
 }) {
   const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
     getThreadRecords: input.getThreadRecords,
-    dispatch: (command) => Queue.offer(input.dispatched, command).pipe(Effect.as({} as never)),
+    dispatch:
+      input.dispatch ??
+      ((command) => Queue.offer(input.dispatched, command).pipe(Effect.as({} as never))),
   });
   const layerWorker = ProviderContinuationService.layer.pipe(
     Layer.provide(
-      Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
+      Layer.mergeAll(
+        IdAllocator.layer,
+        ProviderContinuationRequests.layer,
+        layerThreads,
+        input.gate === undefined
+          ? Layer.empty
+          : Layer.succeed(AutomaticTurnGate.AutomaticTurnGate, input.gate),
+      ),
     ),
   );
   return Layer.merge(ProviderContinuationRequests.layer, layerWorker);
 }
+
+/** Lets every runnable fiber run, so a retry has scheduled its backoff before time moves. */
+const settle = Effect.forEach(Array.from({ length: 5 }), () => Effect.yieldNow, { discard: true });
+
+type Step = "error" | "admit" | "deferred" | "declined";
+
+/**
+ * A gate that answers consults with `script` in order, its last step from then on, and offers
+ * each consult on `consults`. An admitted turn's dispatch runs inline.
+ */
+const scriptedGate = (
+  consults: Queue.Queue<AutomaticTurnGate.AutomaticTurn>,
+  script: ReadonlyArray<Step>,
+) => {
+  let index = 0;
+  const decide = <A, E, R>(
+    turn: AutomaticTurnGate.AutomaticTurn,
+    dispatch: Effect.Effect<A, E, R>,
+  ) =>
+    Effect.gen(function* () {
+      const step = script[Math.min(index, script.length - 1)]!;
+      index += 1;
+      yield* Queue.offer(consults, turn);
+      if (step === "admit") return AutomaticTurnGate.ran(yield* dispatch);
+      if (step === "error") {
+        return yield* new AutomaticTurnGate.AutomaticTurnDecisionError({
+          kind: turn.kind,
+          thread: turn.threadId,
+          stage: "record",
+          cause: new Error("the turn could not be recorded"),
+        });
+      }
+      return AutomaticTurnGate.notNow(step);
+    });
+  return AutomaticTurnGate.AutomaticTurnGate.of({
+    admit: (turn, dispatch) => decide(turn, dispatch),
+    hand: (turn, dispatch) => decide(turn, dispatch),
+  });
+};
+
+interface Kept {
+  readonly turn: AutomaticTurnGate.BackgroundWakeTurn;
+  readonly dispatch: Effect.Effect<void>;
+  readonly drop: Effect.Effect<void> | undefined;
+}
+
+/** A gate that keeps every native wake's dispatch and drop for the test to run. */
+const keepingGate = (kept: Queue.Queue<Kept>) =>
+  AutomaticTurnGate.AutomaticTurnGate.of({
+    admit: () => Effect.die("only native wakes are kept"),
+    hand: (turn, dispatch, options) =>
+      Queue.offer(kept, {
+        turn,
+        dispatch: Effect.asVoid(Effect.orDie(dispatch)),
+        drop: options.drop,
+      }).pipe(Effect.as(AutomaticTurnGate.notNow("deferred"))),
+  });
+
+/** An adapter's sticky offer: current until cleared, counting each callback. */
+const makeOffer = Effect.fnUntraced(function* () {
+  const current = yield* Ref.make(true);
+  const dispatchCalls = yield* Ref.make(0);
+  const clearCalls = yield* Ref.make(0);
+  const dispatchIfCurrent = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Ref.update(dispatchCalls, (count) => count + 1).pipe(
+      Effect.andThen(Ref.get(current)),
+      Effect.flatMap((isCurrent) =>
+        isCurrent ? Effect.asSome(effect) : Effect.succeed(Option.none<A>()),
+      ),
+    );
+  const clearIfCurrent = () =>
+    Ref.update(clearCalls, (count) => count + 1).pipe(Effect.andThen(Ref.set(current, false)));
+  return {
+    dispatchIfCurrent,
+    clearIfCurrent,
+    calls: Effect.all({ dispatch: Ref.get(dispatchCalls), clear: Ref.get(clearCalls) }),
+  };
+});
 
 describe("ProviderContinuationService", () => {
   it.effect("recovers an unaccepted persisted steer using the same delivery identity", () =>
@@ -1020,6 +1114,311 @@ describe("ProviderContinuationService", () => {
                   archivedAt: DateTime.makeUnsafe("2026-07-20T00:00:00.000Z"),
                 },
               }),
+          }),
+        ),
+        Effect.scoped,
+      );
+    });
+  });
+
+  it.effect("a held-back completion leaves its cohort open and forgets its retry backoff", () => {
+    return Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      const consults = yield* Queue.unbounded<AutomaticTurnGate.AutomaticTurn>();
+      const completion = {
+        threadId,
+        providerThreadId,
+        driver,
+        detail: null,
+        delivery: "message_text" as const,
+        delegatedCompletion: { parentRunId, generation: 1, messageId: delegatedMessageId },
+      };
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        // Undecided, then held back: the retry ends there, dispatching nothing.
+        yield* requests.offer(completion);
+        const turn = yield* Queue.take(consults);
+        assert.deepEqual(turn, {
+          kind: "delegated_completion",
+          threadId,
+          messageId: delegatedMessageId,
+          key: `${parentRunId}:1:${delegatedMessageId}`,
+          parentRunId,
+          generation: 1,
+          providerThreadId,
+          driver,
+          origin: "offer",
+        });
+        yield* settle;
+        yield* TestClock.adjust("100 millis");
+        assert.equal((yield* Queue.take(consults)).kind, "delegated_completion");
+        yield* settle;
+        yield* TestClock.adjust("1 hour");
+        yield* settle;
+        assert.isTrue(Option.isNone(yield* Queue.poll(consults)));
+        assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
+
+        // A later offer starts the backoff over: its retry comes after the first step again.
+        yield* requests.offer(completion);
+        yield* Queue.take(consults);
+        yield* settle;
+        yield* TestClock.adjust("100 millis");
+        yield* Queue.take(consults);
+        yield* settle;
+        const command = (yield* Queue.take(dispatched)) as { readonly messageId: MessageId };
+        assert.equal(command.messageId, delegatedMessageId);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () => Effect.succeed(delegatedProjection()),
+            gate: scriptedGate(consults, ["error", "deferred", "error", "admit"]),
+          }),
+        ),
+        Effect.scoped,
+      );
+    });
+  });
+
+  it.effect("retries an undecided completion with backoff and dispatches it once", () => {
+    return Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      const consults = yield* Queue.unbounded<AutomaticTurnGate.AutomaticTurn>();
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer({
+          threadId,
+          providerThreadId,
+          driver,
+          detail: null,
+          delivery: "message_text",
+          delegatedCompletion: { parentRunId, generation: 1, messageId: delegatedMessageId },
+        });
+        for (const delay of [100, 200]) {
+          yield* Queue.take(consults);
+          yield* settle;
+          assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
+          yield* TestClock.adjust(`${delay - 1} millis`);
+          yield* settle;
+          assert.isTrue(Option.isNone(yield* Queue.poll(consults)));
+          yield* TestClock.adjust("1 millis");
+        }
+        yield* Queue.take(consults);
+        const command = (yield* Queue.take(dispatched)) as { readonly messageId: MessageId };
+        assert.equal(command.messageId, delegatedMessageId);
+        yield* settle;
+        assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () => Effect.succeed(delegatedProjection()),
+            gate: scriptedGate(consults, ["error", "error", "admit"]),
+          }),
+        ),
+        Effect.scoped,
+      );
+    });
+  });
+
+  it.effect.each([
+    ["callback-free", false],
+    ["callback-bearing", true],
+  ] as const)("keeps a %s native wake until the gate runs or drops it", ([_shape, callbacks]) => {
+    return Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      const kept = yield* Queue.unbounded<Kept>();
+      const archived = yield* Ref.make(false);
+      const offer = yield* makeOffer();
+      const wake = callbacks
+        ? {
+            ...request(offer.dispatchIfCurrent),
+            clearIfCurrent: offer.clearIfCurrent,
+          }
+        : request();
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer(wake);
+        const first = yield* Queue.take(kept);
+        assert.deepEqual(first.turn, {
+          kind: "background_wake",
+          threadId,
+          messageId: first.turn.messageId,
+          key: first.turn.messageId,
+          providerThreadId,
+          driver,
+          clearable: callbacks,
+        });
+        assert.equal(first.drop === undefined, !callbacks);
+        // Kept: no run, and the adapter's offer stays as it was.
+        yield* settle;
+        assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
+        assert.deepEqual(yield* offer.calls, { dispatch: 0, clear: 0 });
+
+        // Run later while the offer is current, it dispatches once under the kept id.
+        yield* first.dispatch;
+        const command = (yield* Queue.take(dispatched)) as { readonly messageId: MessageId };
+        assert.equal(command.messageId, first.turn.messageId);
+
+        // Archived meanwhile, a kept wake starts nothing.
+        yield* requests.offer(wake);
+        const second = yield* Queue.take(kept);
+        yield* Ref.set(archived, true);
+        yield* second.dispatch;
+        yield* Ref.set(archived, false);
+        assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
+
+        if (callbacks) {
+          // Dropping clears the adapter's offer, after which a kept dispatch starts nothing.
+          yield* requests.offer(wake);
+          const third = yield* Queue.take(kept);
+          const clearsBefore = (yield* offer.calls).clear;
+          yield* third.drop!;
+          assert.equal((yield* offer.calls).clear, clearsBefore + 1);
+          yield* third.dispatch;
+          assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
+        }
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () =>
+              Ref.get(archived).pipe(
+                Effect.map((isArchived) =>
+                  isArchived
+                    ? ({
+                        ...projection,
+                        thread: {
+                          ...projection.thread,
+                          archivedAt: DateTime.makeUnsafe("2026-10-29T00:00:00.000Z"),
+                        },
+                      } as OrchestrationV2ThreadProjection)
+                    : projection,
+                ),
+              ),
+            gate: keepingGate(kept),
+          }),
+        ),
+        Effect.scoped,
+      );
+    });
+  });
+
+  it.effect.each(
+    (["callback-free", "callback-bearing"] as const).flatMap((shape) =>
+      (["admit", "deferred"] as const).map((decided) => [shape, decided] as const),
+    ),
+  )(
+    "re-offers an undecided %s native wake under its id until it is decided (%s)",
+    ([shape, decided]) => {
+      return Effect.gen(function* () {
+        const dispatched = yield* Queue.unbounded<unknown>();
+        const consults = yield* Queue.unbounded<AutomaticTurnGate.AutomaticTurn>();
+        const offer = yield* makeOffer();
+        const wake =
+          shape === "callback-bearing"
+            ? { ...request(offer.dispatchIfCurrent), clearIfCurrent: offer.clearIfCurrent }
+            : request();
+        yield* Effect.gen(function* () {
+          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          yield* requests.offer(wake);
+          const first = yield* Queue.take(consults);
+          for (const delay of [100, 200, 400]) {
+            yield* settle;
+            assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
+            assert.deepEqual(yield* offer.calls, { dispatch: 0, clear: 0 });
+            yield* TestClock.adjust(`${delay - 1} millis`);
+            yield* settle;
+            assert.isTrue(Option.isNone(yield* Queue.poll(consults)));
+            yield* TestClock.adjust("1 millis");
+            assert.equal((yield* Queue.take(consults)).messageId, first.messageId);
+          }
+          yield* settle;
+          if (decided === "admit") {
+            const command = (yield* Queue.take(dispatched)) as { readonly messageId: MessageId };
+            assert.equal(command.messageId, first.messageId);
+            assert.deepEqual(yield* offer.calls, {
+              dispatch: shape === "callback-bearing" ? 1 : 0,
+              clear: 0,
+            });
+          } else {
+            assert.deepEqual(yield* offer.calls, { dispatch: 0, clear: 0 });
+          }
+          assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
+
+          // Decided, the wake's backoff is forgotten: undecided again, it retries after one step.
+          yield* requests.offer({ ...wake, messageId: first.messageId });
+          yield* Queue.take(consults);
+          yield* settle;
+          yield* TestClock.adjust("100 millis");
+          assert.equal((yield* Queue.take(consults)).messageId, first.messageId);
+        }).pipe(
+          Effect.provide(
+            layerTest({
+              dispatched,
+              getThreadRecords: () => Effect.succeed(projection),
+              gate: scriptedGate(consults, ["error", "error", "error", decided, "error"]),
+            }),
+          ),
+          Effect.scoped,
+        );
+      });
+    },
+  );
+
+  it.effect("keeps instance-disabled and retry handling on admitted turns", () => {
+    return Effect.gen(function* () {
+      const consults = yield* Queue.unbounded<AutomaticTurnGate.AutomaticTurn>();
+      const dispatched = yield* Queue.unbounded<unknown>();
+      const offer = yield* makeOffer();
+      const attempts = yield* Ref.make(0);
+      const disabled = new ThreadManagementService.ThreadManagementProviderInstanceDisabledError({
+        projectId: ProjectId.make("project-provider-continuation-disabled"),
+        instanceId: ProviderInstanceId.make("instance-provider-continuation-disabled"),
+      });
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        // An admitted native wake on a disabled instance clears the adapter's offer.
+        yield* requests.offer({
+          ...request(offer.dispatchIfCurrent),
+          clearIfCurrent: offer.clearIfCurrent,
+        });
+        yield* Queue.take(consults);
+        yield* settle;
+        assert.deepEqual(yield* offer.calls, { dispatch: 1, clear: 1 });
+
+        // An admitted completion whose dispatch fails is retried and lands once.
+        yield* requests.offer({
+          threadId,
+          providerThreadId,
+          driver,
+          detail: null,
+          delivery: "message_text",
+          delegatedCompletion: { parentRunId, generation: 1, messageId: delegatedMessageId },
+        });
+        yield* Queue.take(consults);
+        yield* settle;
+        assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
+        yield* TestClock.adjust("100 millis");
+        yield* Queue.take(consults);
+        const command = (yield* Queue.take(dispatched)) as { readonly messageId: MessageId };
+        assert.equal(command.messageId, delegatedMessageId);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () => Effect.succeed(delegatedProjection()),
+            dispatch: (command) =>
+              command.type === "message.dispatch" && command.delegatedCompletion === undefined
+                ? Effect.fail(disabled)
+                : Ref.getAndUpdate(attempts, (count) => count + 1).pipe(
+                    Effect.flatMap((attempt) =>
+                      attempt === 0
+                        ? Effect.fail(new Error("simulated transient dispatch failure") as never)
+                        : Queue.offer(dispatched, command).pipe(Effect.as({} as never)),
+                    ),
+                  ),
+            gate: scriptedGate(consults, ["admit"]),
           }),
         ),
         Effect.scoped,

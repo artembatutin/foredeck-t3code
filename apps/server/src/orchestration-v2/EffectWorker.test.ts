@@ -1,7 +1,12 @@
-import { assert, it } from "@effect/vitest";
+import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
+  MessageId,
   NodeId,
+  type OrchestrationV2ThreadProjection,
+  ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
@@ -20,6 +25,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as TestClock from "effect/testing/TestClock";
 
+import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EffectWorker from "./EffectWorker.ts";
@@ -83,6 +89,8 @@ function layerExecutorFor(input: {
   readonly threads?: Partial<ThreadManagementService.ThreadManagementService["Service"]>;
   readonly continueAfterRestart?: boolean;
   readonly interrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"];
+  readonly steer?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["steer"];
+  readonly gate?: (typeof AutomaticTurnGate.AutomaticTurnGate)["Service"];
 }) {
   const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
   const layerDependencies = Layer.mergeAll(
@@ -90,7 +98,7 @@ function layerExecutorFor(input: {
       ProviderTurnControlService.ProviderTurnControlServiceV2,
       ProviderTurnControlService.ProviderTurnControlServiceV2.of({
         interrupt: input.interrupt ?? (() => Effect.void),
-        steer: () => Effect.void,
+        steer: input.steer ?? (() => Effect.void),
         interruptAndAwaitTerminal: (request) =>
           record(
             request.replacementProviderSessionId === undefined
@@ -156,6 +164,9 @@ function layerExecutorFor(input: {
         ServerSettings.layerTest(
           input.continueAfterRestart === true ? { continueThreadsAfterServerUpdate: true } : {},
         ),
+        input.gate === undefined
+          ? Layer.empty
+          : Layer.succeed(AutomaticTurnGate.AutomaticTurnGate, input.gate),
       ),
     ),
   );
@@ -907,3 +918,331 @@ it.effect.each(["confirmed", "unconfirmed", "failed"] as const)(
       );
     }),
 );
+
+/** A gate that records each consult and answers `answer`, or fails undecided. */
+type DispatchedCommand = Parameters<
+  ThreadManagementService.ThreadManagementService["Service"]["dispatch"]
+>[0];
+
+const answeringGate = (
+  consults: Array<AutomaticTurnGate.AutomaticTurn>,
+  answer: "admit" | "deferred" | "declined" | "error",
+) =>
+  AutomaticTurnGate.AutomaticTurnGate.of({
+    admit: (turn, dispatch) =>
+      Effect.gen(function* () {
+        consults.push(turn);
+        if (answer === "admit") return AutomaticTurnGate.ran(yield* dispatch);
+        if (answer === "error") {
+          return yield* new AutomaticTurnGate.AutomaticTurnDecisionError({
+            kind: turn.kind,
+            thread: turn.threadId,
+            stage: "record",
+            cause: new Error("the turn could not be recorded"),
+          });
+        }
+        return AutomaticTurnGate.notNow(answer);
+      }),
+    hand: () => Effect.die("no native wake in these tests"),
+  });
+
+const outboxEffect = (
+  now: string,
+  request: EffectOutbox.OrchestrationEffectV2["request"],
+  attemptCount = 1,
+): EffectOutbox.OrchestrationEffectV2 => ({
+  id: `effect:gated:${request.type}`,
+  commandId: CommandId.make(`command:gated:${request.type}`),
+  threadId,
+  request,
+  status: "running",
+  attemptCount,
+  availableAt: now,
+  leaseOwner: "test-worker",
+  leaseExpiresAt: now,
+  createdAt: now,
+  updatedAt: now,
+  completedAt: null,
+  lastError: null,
+});
+
+it.effect("retries an undecided restart continuation, then declines it with recovery", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const instanceId = ProviderInstanceId.make("codex");
+    const driver = ProviderDriverKind.make("codex");
+    const sessionId = ProviderSessionId.make("session:gated-restart");
+    // A run the restart cut while its provider turn was still running.
+    const projection = {
+      thread: {
+        id: threadId,
+        projectId: ProjectId.make("project:gated-restart"),
+        providerInstanceId: instanceId,
+        archivedAt: null,
+        deletedAt: null,
+      },
+      runs: [
+        {
+          id: runId,
+          ordinal: 1,
+          providerInstanceId: instanceId,
+          modelSelection: { instanceId, model: "gpt-6" },
+          providerThreadId,
+          activeAttemptId: attemptId,
+          status: "cancelled",
+        },
+      ],
+      providerThreads: [
+        {
+          id: providerThreadId,
+          appThreadId: threadId,
+          ownerNodeId: null,
+          driver,
+          providerInstanceId: instanceId,
+          providerSessionId: sessionId,
+          nativeThreadRef: { driver, nativeId: "native-thread", strength: "strong" },
+          status: "active",
+        },
+      ],
+      providerSessions: [
+        { id: sessionId, driver, providerInstanceId: instanceId, status: "running" },
+      ],
+      providerTurns: [
+        { id: providerTurnId, providerThreadId, runAttemptId: attemptId, status: "running" },
+      ],
+      runtimeRequests: [],
+      attempts: [],
+      messages: [],
+      turnItems: [],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const consults: Array<AutomaticTurnGate.AutomaticTurn> = [];
+    const commands: Array<DispatchedCommand> = [];
+    const recovered: Array<ThreadId> = [];
+    const settlements: Array<string> = [];
+    const layerExecutor = layerExecutorFor({
+      events: yield* Ref.make<ReadonlyArray<string>>([]),
+      continueAfterRestart: true,
+      gate: answeringGate(consults, "error"),
+      threads: {
+        getThreadRecords: () => Effect.succeed(projection),
+        dispatch: (command) =>
+          Effect.sync(() => commands.push(command)).pipe(Effect.as({} as never)),
+        recoverDelegatedTask: (childThreadId) => Effect.sync(() => recovered.push(childThreadId)),
+      },
+    });
+    const runAttempt = (attemptCount: number) => {
+      const claimed = outboxEffect(
+        now,
+        { type: "provider-runtime.continue", sourceRunId: runId },
+        attemptCount,
+      );
+      const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+        claimNext: () => Effect.succeed(Option.some(claimed)),
+        get: () => Effect.succeed(Option.some(claimed)),
+        awaitCancellation: () => Effect.never,
+        clearCancellation: () => Effect.void,
+        retry: () => Effect.sync(() => settlements.push("retry")).pipe(Effect.as(true)),
+        fail: () => Effect.sync(() => settlements.push("fail")).pipe(Effect.as(true)),
+        succeed: () => Effect.sync(() => settlements.push("succeed")).pipe(Effect.as(true)),
+      });
+      return EffectWorker.OrchestrationEffectWorkerV2.pipe(
+        Effect.flatMap((worker) => worker.runOnce),
+        Effect.provide(
+          EffectWorker.layerWithOptions({ workerId: "test-worker", maxAttempts: 5 }).pipe(
+            Layer.provide(Layer.merge(layerOutbox, layerExecutor)),
+          ),
+        ),
+      );
+    };
+
+    yield* runAttempt(1);
+    assert.deepEqual(settlements, ["retry"]);
+    assert.deepEqual(recovered, []);
+    yield* runAttempt(5);
+    assert.deepEqual(settlements, ["retry", "fail"]);
+    assert.deepEqual(recovered, [threadId]);
+    assert.deepEqual(commands, []);
+    assert.lengthOf(consults, 2);
+    assert.isFalse((consults[0] as AutomaticTurnGate.RestartContinuationTurn).settled);
+  }),
+);
+
+describe("steer follow-ups", () => {
+  const steerThreadId = threadId;
+  const completedRunId = RunId.make("run:steer-target");
+  const parentRunId = RunId.make("run:steer-parent");
+  const driver = ProviderDriverKind.make("codex");
+  const steerFailed = () =>
+    new ProviderTurnControlService.ProviderTurnControlError({
+      threadId: steerThreadId,
+      operation: "steer",
+      providerTurnId,
+      turnCompleted: true,
+    });
+  const steerEffect = (now: string, messageId: MessageId) =>
+    outboxEffect(now, {
+      type: "provider-turn.steer",
+      providerSessionId: oldSessionId,
+      providerThreadId,
+      providerTurnId,
+      messageId,
+    });
+  const projectionWith = (message: Record<string, unknown>) =>
+    ({
+      thread: { id: steerThreadId, archivedAt: null, deletedAt: null },
+      messages: [
+        {
+          text: "Look at the failing test too.",
+          attachments: [],
+          runId: completedRunId,
+          ...message,
+        },
+      ],
+      runs: [
+        {
+          id: completedRunId,
+          status: "completed",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6" },
+        },
+      ],
+      providerThreads: [{ id: providerThreadId, driver }],
+    }) as unknown as OrchestrationV2ThreadProjection;
+
+  it.effect.each(["deferred", "declined"] as const)(
+    "a held-back completion steer (%s) leaves its mailbox steer undelivered",
+    (reason) =>
+      Effect.gen(function* () {
+        const now = DateTime.formatIso(yield* DateTime.now);
+        const messageId = MessageId.make("message:completion-steer");
+        const consults: Array<AutomaticTurnGate.AutomaticTurn> = [];
+        const commands: Array<DispatchedCommand> = [];
+        const layer = layerExecutorFor({
+          events: yield* Ref.make<ReadonlyArray<string>>([]),
+          gate: answeringGate(consults, reason),
+          steer: () => steerFailed(),
+          threads: {
+            getThreadRecords: () =>
+              Effect.succeed(
+                projectionWith({
+                  id: messageId,
+                  createdBy: "agent",
+                  creationSource: "server",
+                  delegatedCompletion: { parentRunId, generation: 3, taskIds: [] },
+                }),
+              ),
+            dispatch: (command) =>
+              Effect.sync(() => commands.push(command)).pipe(Effect.as({} as never)),
+          },
+        });
+        yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(
+          Effect.flatMap((executor) => executor.execute(steerEffect(now, messageId))),
+          Effect.provide(layer),
+        );
+        assert.deepEqual(consults, [
+          {
+            kind: "delegated_completion",
+            threadId: steerThreadId,
+            messageId,
+            key: `${parentRunId}:3:${messageId}`,
+            parentRunId,
+            generation: 3,
+            providerThreadId,
+            driver,
+            origin: "steer",
+          },
+        ]);
+        assert.deepEqual(commands, []);
+      }),
+  );
+
+  it.effect("an admitted completion steer follows up pinned to its run", () =>
+    Effect.gen(function* () {
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const messageId = MessageId.make("message:completion-steer-admitted");
+      const consults: Array<AutomaticTurnGate.AutomaticTurn> = [];
+      const commands: Array<DispatchedCommand> = [];
+      const layer = layerExecutorFor({
+        events: yield* Ref.make<ReadonlyArray<string>>([]),
+        gate: answeringGate(consults, "admit"),
+        steer: () => steerFailed(),
+        threads: {
+          getThreadRecords: () =>
+            Effect.succeed(
+              projectionWith({
+                id: messageId,
+                createdBy: "agent",
+                creationSource: "server",
+                delegatedCompletion: { parentRunId, generation: 1, taskIds: [] },
+              }),
+            ),
+          dispatch: (command) =>
+            Effect.sync(() => commands.push(command)).pipe(Effect.as({} as never)),
+        },
+      });
+      yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(
+        Effect.flatMap((executor) => executor.execute(steerEffect(now, messageId))),
+        Effect.provide(layer),
+      );
+      assert.lengthOf(consults, 1);
+      assert.lengthOf(commands, 1);
+      const followUp = commands[0]!;
+      assert.equal(followUp.type, "message.dispatch");
+      if (followUp.type !== "message.dispatch") return;
+      assert.equal(followUp.messageId, messageId);
+      assert.deepEqual(followUp.dispatchMode, { type: "queue_after_active" });
+      assert.deepEqual(followUp.delegatedCompletion, { parentRunId, generation: 1, taskIds: [] });
+    }),
+  );
+
+  it.effect.each([
+    ["an owner", { createdBy: "user", creationSource: "web" }],
+    [
+      "an agent",
+      {
+        createdBy: "agent",
+        creationSource: "mcp",
+        senderThreadId: ThreadId.make("thread:steer-sender"),
+      },
+    ],
+  ] as const)("%s steer follows up inline without asking the gate", ([_who, source]) =>
+    Effect.gen(function* () {
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const messageId = MessageId.make(`message:steer:${source.creationSource}`);
+      const consults: Array<AutomaticTurnGate.AutomaticTurn> = [];
+      const commands: Array<DispatchedCommand> = [];
+      const execute = EffectWorker.OrchestrationEffectExecutorV2.pipe(
+        Effect.flatMap((executor) => executor.execute(steerEffect(now, messageId))),
+        Effect.provide(
+          layerExecutorFor({
+            events: yield* Ref.make<ReadonlyArray<string>>([]),
+            gate: answeringGate(consults, "declined"),
+            steer: () => steerFailed(),
+            threads: {
+              getThreadRecords: () => Effect.succeed(projectionWith({ id: messageId, ...source })),
+              dispatch: (command) =>
+                Effect.sync(() => commands.push(command)).pipe(Effect.as({} as never)),
+            },
+          }),
+        ),
+      );
+      yield* execute;
+      yield* execute;
+      assert.deepEqual(consults, []);
+      // A replay sends the same command, whose receipt makes it create nothing.
+      assert.lengthOf(commands, 2);
+      assert.deepEqual(commands[1], commands[0]);
+      const followUp = commands[0]!;
+      assert.equal(followUp.type, "message.dispatch");
+      if (followUp.type !== "message.dispatch") return;
+      assert.equal(followUp.commandId, `command:steer-follow-up:effect:gated:provider-turn.steer`);
+      assert.equal(followUp.messageId, messageId);
+      assert.equal(followUp.createdBy, source.createdBy);
+      assert.equal(followUp.creationSource, source.creationSource);
+      assert.equal(
+        followUp.senderThreadId,
+        "senderThreadId" in source ? source.senderThreadId : undefined,
+      );
+      assert.deepEqual(followUp.dispatchMode, { type: "start_immediately" });
+    }),
+  );
+});

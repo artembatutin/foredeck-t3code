@@ -24,6 +24,7 @@ import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
 import * as DelegatedTaskQuestionReactor from "./DelegatedTaskQuestionReactor.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -959,4 +960,279 @@ it.effect("wakes the parent once when its delegated task asks a question", () =>
       childThreadId: task.childThreadId!,
     });
   }).pipe(Effect.provide(DelegatedTaskQuestionReactor.layer.pipe(Layer.provideMerge(layerTest)))),
+);
+
+/**
+ * A parent whose run delegated a task to a child thread, and a question the child asks. The
+ * question is written as `status`, with `capability`, and the child's run then `childRun`.
+ */
+const seedQuestion = (input: {
+  readonly name: string;
+  readonly status?: "pending" | "resolved" | "cancelled" | "expired";
+  readonly capability?: "live" | "message";
+  readonly childRun?: "running" | "completed";
+}) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const parentThreadId = ThreadId.make(`thread:redeliver-${input.name}`);
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make(`create-redeliver-${input.name}`),
+      threadId: parentThreadId,
+      projectId: ProjectId.make("project:redeliver"),
+      title: "Parent",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make(`start-redeliver-${input.name}`),
+      threadId: parentThreadId,
+      messageId: MessageId.make(`message:redeliver-${input.name}`),
+      text: "Delegate the research",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const parentRun = (yield* projections.getThreadProjection(parentThreadId)).runs[0]!;
+    yield* orchestrator.dispatch({
+      type: "delegated_task.request",
+      commandId: CommandId.make(`delegate-redeliver-${input.name}`),
+      parentThreadId,
+      parentRunId: parentRun.id,
+      parentNodeId: parentRun.rootNodeId!,
+      task: "Research the sources",
+      completionWake: "settled_only",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdBy: "agent",
+      creationSource: "mcp",
+    });
+    const task = (yield* projections.getThreadProjection(parentThreadId)).subagents[0]!;
+    const childThreadId = task.childThreadId!;
+    const childRun = (yield* projections.getThreadRecords(childThreadId, ["runs"])).runs[0]!;
+    const now = yield* DateTime.now;
+    const requestId = RuntimeRequestId.make(`request:redeliver-${input.name}`);
+    yield* eventSink.write({
+      events: [
+        {
+          id: EventId.make(`event:redeliver-${input.name}`),
+          type: "runtime-request.updated",
+          threadId: childThreadId,
+          runId: childRun.id,
+          occurredAt: now,
+          payload: {
+            id: requestId,
+            nodeId: childRun.rootNodeId!,
+            providerTurnId: null,
+            nativeRequestRef: null,
+            kind: "user_input",
+            status: input.status ?? "pending",
+            responseCapability:
+              input.capability === "live"
+                ? { type: "live", providerSessionId: ProviderSessionId.make("session:redeliver") }
+                : { type: "message" },
+            createdAt: now,
+            resolvedAt: (input.status ?? "pending") === "pending" ? null : now,
+          },
+        },
+        ...(input.childRun === "completed"
+          ? [
+              {
+                id: EventId.make(`event:redeliver-child-completed-${input.name}`),
+                type: "run.updated" as const,
+                threadId: childThreadId,
+                runId: childRun.id,
+                occurredAt: now,
+                payload: { ...childRun, status: "completed" as const, completedAt: now },
+              },
+            ]
+          : []),
+      ],
+    });
+    const wakes = Effect.map(
+      projections.getThreadRecords(parentThreadId, ["messages"]),
+      ({ messages }) => messages.filter((message) => message.notification !== undefined),
+    );
+    return { parentThreadId, parentRun, task, childThreadId, childRun, requestId, wakes };
+  });
+
+/** The reactor, built over `gate`, and every turn it presented there. */
+const reactorWith = (answer: "admit" | "deferred" | "declined") =>
+  Effect.gen(function* () {
+    const consults: Array<AutomaticTurnGate.AutomaticTurn> = [];
+    const reactor = yield* DelegatedTaskQuestionReactor.DelegatedTaskQuestionReactor.pipe(
+      Effect.provide(
+        DelegatedTaskQuestionReactor.layer.pipe(
+          Layer.provide(
+            Layer.succeed(
+              AutomaticTurnGate.AutomaticTurnGate,
+              AutomaticTurnGate.AutomaticTurnGate.of({
+                admit: (turn, dispatch) =>
+                  Effect.sync(() => consults.push(turn)).pipe(
+                    Effect.andThen(
+                      answer === "admit"
+                        ? Effect.map(dispatch, AutomaticTurnGate.ran)
+                        : Effect.succeed(AutomaticTurnGate.notNow(answer)),
+                    ),
+                  ),
+                hand: () => Effect.die("a question wake hands no native wake"),
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+    return { reactor, consults };
+  });
+
+it.effect("a held-back question wake dispatches nothing, and redelivery delivers it once", () =>
+  Effect.gen(function* () {
+    const seeded = yield* seedQuestion({ name: "held", childRun: "completed" });
+    const held = yield* reactorWith("deferred");
+    const eventSink = yield* EventSink.EventSinkV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const request = (yield* projections.getRuntimeRequest(seeded.childThreadId, seeded.requestId))!;
+    const now = yield* DateTime.now;
+    const event = {
+      id: EventId.make("event:redeliver-held-again"),
+      type: "runtime-request.updated",
+      threadId: seeded.childThreadId,
+      runId: seeded.childRun.id,
+      occurredAt: now,
+      payload: request,
+    } satisfies OrchestrationV2DomainEvent;
+    yield* eventSink.write({ events: [event] });
+    yield* held.reactor.handle(event);
+    const expected: AutomaticTurnGate.DelegatedQuestionTurn = {
+      kind: "delegated_question",
+      threadId: seeded.parentThreadId,
+      messageId: MessageId.make(
+        `message:delegated-task-question:${seeded.parentThreadId}:${seeded.requestId}`,
+      ),
+      key: `${seeded.childThreadId}:${seeded.requestId}`,
+      childThreadId: seeded.childThreadId,
+      requestId: seeded.requestId,
+      taskId: seeded.task.id,
+      delegatingRunId: seeded.parentRun.id,
+    };
+    assert.deepEqual(held.consults, [expected]);
+    assert.deepEqual(yield* seeded.wakes, []);
+    assert.equal(
+      yield* held.reactor.redeliver({
+        childThreadId: seeded.childThreadId,
+        requestId: seeded.requestId,
+      }),
+      "deferred",
+    );
+    assert.deepEqual(yield* seeded.wakes, []);
+
+    // Redelivered once admitted, the message-capable question of the finished child wakes the
+    // parent once, however often it is redelivered.
+    const admitted = yield* reactorWith("admit");
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      assert.equal(
+        yield* admitted.reactor.redeliver({
+          childThreadId: seeded.childThreadId,
+          requestId: seeded.requestId,
+        }),
+        "dispatched",
+      );
+    }
+    assert.deepEqual(admitted.consults, [expected, expected]);
+    const wakes = yield* seeded.wakes;
+    assert.deepEqual(
+      wakes.map((message) => message.id),
+      [expected.messageId],
+    );
+    assert.include(wakes[0]?.text, "asked a question and is still working");
+    const wakeRuns = (yield* projections.getThreadRecords(seeded.parentThreadId, [
+      "runs",
+    ])).runs.filter((run) => run.userMessageId === expected.messageId);
+    assert.lengthOf(wakeRuns, 1);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect.each([
+  "answered",
+  "dismissed",
+  "expired",
+  "missing task",
+  "archived parent",
+  "deleted parent",
+  "blocking wait",
+] as const)("redelivery is moot for a question whose wake no longer applies: %s", (reason) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const name = reason.replace(" ", "-");
+    const seeded = yield* seedQuestion({
+      name,
+      ...(reason === "answered"
+        ? { status: "resolved" as const }
+        : reason === "dismissed"
+          ? { status: "cancelled" as const }
+          : reason === "expired"
+            ? { status: "expired" as const }
+            : {}),
+      // A live question while the delegating run waits on its task is that wait's to deliver.
+      ...(reason === "blocking wait" ? { capability: "live" as const } : {}),
+    });
+    const now = yield* DateTime.now;
+    if (reason === "missing task") {
+      // The child's latest run answers a task its parent no longer lists.
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make("event:redeliver-orphan-run"),
+            type: "run.updated",
+            threadId: seeded.childThreadId,
+            runId: RunId.make("run:redeliver-orphan"),
+            occurredAt: now,
+            payload: {
+              ...seeded.childRun,
+              id: RunId.make("run:redeliver-orphan"),
+              ordinal: seeded.childRun.ordinal + 1,
+              delegatedTaskId: NodeId.make("node:redeliver-missing-task"),
+            },
+          },
+        ],
+      });
+    }
+    if (reason === "archived parent") {
+      yield* orchestrator.dispatch({
+        type: "thread.archive",
+        commandId: CommandId.make("archive-redeliver-parent"),
+        threadId: seeded.parentThreadId,
+      });
+    }
+    if (reason === "deleted parent") {
+      yield* orchestrator.dispatch({
+        type: "thread.delete",
+        commandId: CommandId.make("delete-redeliver-parent"),
+        threadId: seeded.parentThreadId,
+      });
+    }
+    const { reactor, consults } = yield* reactorWith("admit");
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      assert.equal(
+        yield* reactor.redeliver({
+          childThreadId: seeded.childThreadId,
+          requestId: seeded.requestId,
+        }),
+        "moot",
+      );
+    }
+    assert.deepEqual(consults, []);
+    assert.deepEqual(yield* seeded.wakes, []);
+  }).pipe(Effect.provide(layerTest)),
 );

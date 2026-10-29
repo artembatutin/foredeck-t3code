@@ -1,9 +1,13 @@
 import {
   CommandId,
   MessageId,
+  type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2Subagent,
+  type RunId,
+  type RuntimeRequestId,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -14,6 +18,7 @@ import * as Stream from "effect/Stream";
 import { reportLabel } from "@t3tools/provider-core/server/notification";
 
 import { forkParked } from "../serverActivation.ts";
+import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
@@ -21,36 +26,54 @@ import * as ProjectionStore from "./ProjectionStore.ts";
  * Wakes the parent of an app-owned delegated task when the task asks a question. The question
  * blocks the task until someone answers it, and the user rarely watches child threads, so the
  * parent agent is told to answer it or to ask the user. Only questions are routed: approvals
- * cannot be answered through the pending request tools.
+ * cannot be answered through the pending request tools. A wake runs only once the automatic
+ * turn gate admits it; one it holds back is delivered later through `redeliver`.
  */
 export class DelegatedTaskQuestionReactor extends Context.Service<
   DelegatedTaskQuestionReactor,
   {
     readonly start: () => Effect.Effect<void, never, Scope.Scope>;
     readonly handle: (event: OrchestrationV2DomainEvent) => Effect.Effect<void>;
+    /**
+     * Wakes the parent for a question the gate held back, re-reading it as `handle` does:
+     * `moot` when the question no longer needs one (answered, dismissed or expired, its task
+     * gone, its parent archived or deleted, or a blocking wait delivering it itself). The wake's
+     * command id makes a repeat dispatch nothing new.
+     */
+    readonly redeliver: (input: {
+      readonly childThreadId: ThreadId;
+      readonly requestId: RuntimeRequestId;
+    }) => Effect.Effect<
+      "dispatched" | "deferred" | "moot",
+      | ProjectionStore.ProjectionStoreV2Error
+      | Orchestrator.OrchestratorV2Error
+      | AutomaticTurnGate.AutomaticTurnDecisionError
+    >;
   }
 >()("t3/orchestration-v2/DelegatedTaskQuestionReactor") {}
 
 const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const gate = yield* AutomaticTurnGate.AutomaticTurnGate;
 
   const wakeParent = Effect.fnUntraced(function* (
     task: OrchestrationV2Subagent,
     request: OrchestrationV2RuntimeRequest,
   ) {
-    if (task.childThreadId === null) return;
+    if (task.childThreadId === null) return undefined;
     const key = `${task.threadId}:${request.id}`;
     const label = reportLabel(task.title?.trim() || task.prompt);
     const situation =
       request.responseCapability.type === "message"
         ? `Delegated task ${task.id} asked a question and is still working.`
         : `Delegated task ${task.id} is blocked on a question and cannot continue until it is answered.`;
-    yield* engine.dispatch({
+    const messageId = MessageId.make(`message:delegated-task-question:${key}`);
+    const wake = engine.dispatch({
       type: "message.dispatch",
       commandId: CommandId.make(`server:delegated-task-question:${key}`),
       threadId: task.threadId,
-      messageId: MessageId.make(`message:delegated-task-question:${key}`),
+      messageId,
       text: `${situation} Read it with t3_pending_request_read using threadId ${task.childThreadId} and requestId ${request.id}. Answer it with t3_pending_request_respond when the answer follows from the task or the user's instructions; otherwise ask the user, then answer it. If it is no longer pending, it was answered or dismissed.`,
       notification: {
         source: { kind: "delegated_task", taskIds: [task.id], childThreadId: task.childThreadId },
@@ -62,7 +85,86 @@ const make = Effect.gen(function* () {
       createdBy: "agent",
       creationSource: "server",
     });
+    return yield* gate.admit(
+      {
+        kind: "delegated_question",
+        threadId: task.threadId,
+        messageId,
+        key: `${task.childThreadId}:${request.id}`,
+        childThreadId: task.childThreadId,
+        requestId: request.id,
+        taskId: task.id,
+        delegatingRunId: task.runId,
+      },
+      wake,
+    );
   });
+
+  /**
+   * The app-owned task whose pending question on `child` wakes the parent: the task of the run
+   * the request's event names, or else of the child's latest run. None while the parent is
+   * archived or deleted, or while a blocking delegate_task wait delivers the question itself.
+   */
+  const questionTask = Effect.fnUntraced(function* (
+    child: OrchestrationV2AppThread,
+    parentThreadId: ThreadId,
+    runId: RunId | undefined,
+    responseCapability: OrchestrationV2RuntimeRequest["responseCapability"],
+  ) {
+    const parent = yield* projections.getThreadRecords(parentThreadId, ["subagents", "runs"]);
+    const { runs } = yield* projections.getThreadRecords(child.id, ["runs"]);
+    const run =
+      runs.find((run) => run.id === runId) ?? runs.toSorted((a, b) => b.ordinal - a.ordinal)[0];
+    const taskId =
+      run?.delegatedTaskId ??
+      (child.forkedFrom?.type === "node" ? child.forkedFrom.nodeId : undefined);
+    const task = parent.subagents.find(
+      (candidate) => candidate.origin === "app_owned" && candidate.id === taskId,
+    );
+    if (
+      task === undefined ||
+      parent.thread.archivedAt !== null ||
+      parent.thread.deletedAt !== null
+    ) {
+      return undefined;
+    }
+    // A blocking delegate_task wait delivers the question itself.
+    if (
+      task.completionWake === "settled_only" &&
+      responseCapability.type === "live" &&
+      parent.runs.some(
+        (run) =>
+          run.id === task.runId &&
+          (run.status === "preparing" || run.status === "starting" || run.status === "running"),
+      )
+    ) {
+      return undefined;
+    }
+    return task;
+  });
+
+  const redeliver: DelegatedTaskQuestionReactor["Service"]["redeliver"] = (input) =>
+    Effect.gen(function* () {
+      const child = yield* projections.getThread(input.childThreadId);
+      const parentThreadId = child.lineage.parentThreadId;
+      if (parentThreadId === null) return "moot";
+      const request = yield* projections.getRuntimeRequest(child.id, input.requestId);
+      if (request?.kind !== "user_input" || request.status !== "pending") return "moot";
+      const task = yield* questionTask(
+        child,
+        parentThreadId,
+        undefined,
+        request.responseCapability,
+      );
+      if (task === undefined) return "moot";
+      const outcome = yield* wakeParent(task, request);
+      // A declined wake never runs, like one no longer needed.
+      return outcome?._tag === "Ran"
+        ? "dispatched"
+        : outcome?.reason === "deferred"
+          ? "deferred"
+          : "moot";
+    });
 
   const handle: DelegatedTaskQuestionReactor["Service"]["handle"] = (event) =>
     Effect.gen(function* () {
@@ -130,36 +232,13 @@ const make = Effect.gen(function* () {
         }
         return;
       }
-      const parent = yield* projections.getThreadRecords(parentThreadId, ["subagents", "runs"]);
-      const { runs } = yield* projections.getThreadRecords(child.id, ["runs"]);
-      const run =
-        runs.find((run) => run.id === event.runId) ??
-        runs.toSorted((a, b) => b.ordinal - a.ordinal)[0];
-      const taskId =
-        run?.delegatedTaskId ??
-        (child.forkedFrom?.type === "node" ? child.forkedFrom.nodeId : undefined);
-      const task = parent.subagents.find(
-        (candidate) => candidate.origin === "app_owned" && candidate.id === taskId,
+      const task = yield* questionTask(
+        child,
+        parentThreadId,
+        event.runId,
+        event.payload.responseCapability,
       );
-      if (
-        task === undefined ||
-        parent.thread.archivedAt !== null ||
-        parent.thread.deletedAt !== null
-      ) {
-        return;
-      }
-      // A blocking delegate_task wait delivers the question itself.
-      if (
-        task.completionWake === "settled_only" &&
-        event.payload.responseCapability.type === "live" &&
-        parent.runs.some(
-          (run) =>
-            run.id === task.runId &&
-            (run.status === "preparing" || run.status === "starting" || run.status === "running"),
-        )
-      ) {
-        return;
-      }
+      if (task === undefined) return;
       yield* wakeParent(task, request);
     }).pipe(
       Effect.catchCause((cause) =>
@@ -179,7 +258,7 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  return { start, handle } satisfies DelegatedTaskQuestionReactor["Service"];
+  return { start, handle, redeliver } satisfies DelegatedTaskQuestionReactor["Service"];
 });
 
 export const layer = Layer.effect(DelegatedTaskQuestionReactor, make);
