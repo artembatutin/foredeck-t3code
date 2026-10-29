@@ -30,6 +30,7 @@ import {
 } from "../../orchestration-v2/DispatchModeLimit.ts";
 import * as Projects from "../../project/ProjectService.ts";
 import * as Git from "../../vcs/GitVcsDriver.ts";
+import * as HandoffMigrations from "./handoffMigrations.ts";
 import * as Looper from "./Looper.ts";
 import * as PortfolioStore from "./PortfolioStore.ts";
 import * as Portfolio from "./portfolio.ts";
@@ -921,7 +922,13 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(ProjectAssistant, make).pipe(Layer.provide(PortfolioStore.layer));
+/**
+ * Assistant persistence on the core-migrated SQL client. The `fd_assistant_migrations` ledger
+ * migrates first, so no assistant store is ever built against an older schema. server.ts also
+ * mounts it with core, Work and Factory persistence; one build shares the one instance.
+ */
+export const layerPersistence = PortfolioStore.layer.pipe(Layer.provide(HandoffMigrations.layer));
+export const layer = Layer.effect(ProjectAssistant, make).pipe(Layer.provide(layerPersistence));
 export const layerLive = layer.pipe(
   Layer.provide(Looper.layer.pipe(Layer.provide(ProcessRunner.layer))),
 );

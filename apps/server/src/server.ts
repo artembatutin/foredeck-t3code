@@ -612,6 +612,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   Layer.provideMerge(layerGit),
   Layer.provideMerge(layerVcs),
   Layer.provideMerge(Layer.mergeAll(layerTerminal, layerPreview, layerDevice)),
+  Layer.provideMerge(ProjectAssistant.layerPersistence),
   Layer.provideMerge(Factory.layerPersistence),
   Layer.provideMerge(layerPersistence),
   // Both read a user-owned file out of the state directory and stream changes
