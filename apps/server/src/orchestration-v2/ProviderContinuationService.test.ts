@@ -197,6 +197,8 @@ const makeOffer = Effect.fnUntraced(function* () {
   return {
     dispatchIfCurrent,
     clearIfCurrent,
+    /** Makes the offer current again, as an adapter's next buffered wake does. */
+    rearm: Ref.set(current, true),
     calls: Effect.all({ dispatch: Ref.get(dispatchCalls), clear: Ref.get(clearCalls) }),
   };
 });
@@ -1228,7 +1230,7 @@ describe("ProviderContinuationService", () => {
     return Effect.gen(function* () {
       const dispatched = yield* Queue.unbounded<unknown>();
       const kept = yield* Queue.unbounded<Kept>();
-      const archived = yield* Ref.make(false);
+      const thread = yield* Ref.make<"live" | "archived" | "deleted">("live");
       const offer = yield* makeOffer();
       const wake = callbacks
         ? {
@@ -1260,16 +1262,22 @@ describe("ProviderContinuationService", () => {
         const command = (yield* Queue.take(dispatched)) as { readonly messageId: MessageId };
         assert.equal(command.messageId, first.turn.messageId);
 
-        // Archived meanwhile, a kept wake starts nothing.
-        yield* requests.offer(wake);
-        const second = yield* Queue.take(kept);
-        yield* Ref.set(archived, true);
-        yield* second.dispatch;
-        yield* Ref.set(archived, false);
-        assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
+        // Archived or deleted meanwhile, a kept wake starts nothing and lets the offer go.
+        for (const barrier of ["archived", "deleted"] as const) {
+          yield* offer.rearm;
+          yield* requests.offer(wake);
+          const later = yield* Queue.take(kept);
+          const clearsBefore = (yield* offer.calls).clear;
+          yield* Ref.set(thread, barrier);
+          yield* later.dispatch;
+          yield* Ref.set(thread, "live");
+          assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
+          assert.equal((yield* offer.calls).clear, clearsBefore + (callbacks ? 1 : 0));
+        }
 
         if (callbacks) {
           // Dropping clears the adapter's offer, after which a kept dispatch starts nothing.
+          yield* offer.rearm;
           yield* requests.offer(wake);
           const third = yield* Queue.take(kept);
           const clearsBefore = (yield* offer.calls).clear;
@@ -1283,17 +1291,19 @@ describe("ProviderContinuationService", () => {
           layerTest({
             dispatched,
             getThreadRecords: () =>
-              Ref.get(archived).pipe(
-                Effect.map((isArchived) =>
-                  isArchived
-                    ? ({
+              Ref.get(thread).pipe(
+                Effect.map((state) =>
+                  state === "live"
+                    ? projection
+                    : ({
                         ...projection,
                         thread: {
                           ...projection.thread,
-                          archivedAt: DateTime.makeUnsafe("2026-10-29T00:00:00.000Z"),
+                          [state === "archived" ? "archivedAt" : "deletedAt"]: DateTime.makeUnsafe(
+                            "2026-10-29T00:00:00.000Z",
+                          ),
                         },
-                      } as OrchestrationV2ThreadProjection)
-                    : projection,
+                      } as OrchestrationV2ThreadProjection),
                 ),
               ),
             gate: keepingGate(kept),

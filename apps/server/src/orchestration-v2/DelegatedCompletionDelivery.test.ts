@@ -22,6 +22,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
 
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
@@ -46,6 +47,7 @@ import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAda
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
+import * as EffectWorker from "./EffectWorker.ts";
 import * as ProviderContinuationService from "./ProviderContinuationService.ts";
 
 const layerPlatformTest = Layer.merge(
@@ -2077,3 +2079,93 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
     }),
   );
 });
+
+it.effect.each([
+  ["cut", "cancelled"],
+  ["settled", "interrupted"],
+] as const)(
+  "an undecided continuation of a %s child holds it through the outbox's retries, then recovers it",
+  ([source, recoveredStatus]) =>
+    Effect.gen(function* () {
+      const consults: Array<AutomaticTurnGate.AutomaticTurn> = [];
+      // A gate that can never decide, as when the manager's tables cannot be read.
+      const gate = AutomaticTurnGate.AutomaticTurnGate.of({
+        admit: (turn) =>
+          Effect.gen(function* () {
+            consults.push(turn);
+            return yield* new AutomaticTurnGate.AutomaticTurnDecisionError({
+              kind: turn.kind,
+              thread: turn.threadId,
+              stage: "read",
+              cause: new Error("the manager could not be read"),
+            });
+          }),
+        hand: () => Effect.die("a restart continuation hands no native wake"),
+      });
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make(`thread:undecided-${source}-parent`);
+        const runId = RunId.make(`run:undecided-${source}-parent`);
+        const rootNodeId = NodeId.make(`node:undecided-${source}-parent-root`);
+        yield* seedParentWithTerminalTask({
+          threadId,
+          projectId: ProjectId.make(`project:undecided-${source}`),
+          runId,
+          rootNodeId,
+          taskId: NodeId.make(`node:undecided-${source}-parent-settled`),
+          deliveryState: "delivered",
+          now,
+        });
+        const child = yield* seedRestartCancelledChild({
+          parentThreadId: threadId,
+          projectId: ProjectId.make(`project:undecided-${source}`),
+          parentRunId: runId,
+          rootNodeId,
+          name: `undecided-${source}-child`,
+          completionWake: "always",
+          continuationPending: true,
+          ...(source === "settled"
+            ? {
+                runStatus: "completed" as const,
+                lostWork: [{ kind: "monitor" as const, label: "Watch CI run 42" }],
+              }
+            : {}),
+          now,
+        });
+        yield* orchestrator.recoverDelegatedTasks;
+        const task = Effect.map(orchestrator.getThreadProjection(threadId), (projection) =>
+          projection.subagents.find((row) => row.id === child.taskId),
+        );
+
+        // Each failed attempt is retried after the outbox's backoff, the child still waiting.
+        for (const backoff of [100, 200, 400, 800]) {
+          assert.isTrue(yield* worker.runOnce);
+          assert.equal((yield* task)?.status, "running");
+          assert.isTrue(yield* orchestrator.delegatedTaskResultPending(child.childThreadId));
+          assert.isFalse(yield* worker.runOnce);
+          yield* TestClock.adjust(`${backoff} millis`);
+        }
+        // The last attempt declines the continuation and gives the parent the child's result.
+        assert.isTrue(yield* worker.runOnce);
+        assert.isFalse(yield* worker.runOnce);
+        const recovered = yield* task;
+        assert.equal(recovered?.status, recoveredStatus);
+        assert.equal(recovered?.completionDelivery?.state, "claimed");
+        assert.isFalse(yield* orchestrator.delegatedTaskResultPending(child.childThreadId));
+        // No continuation turn ever started on the child.
+        assert.lengthOf((yield* orchestrator.getThreadProjection(child.childThreadId)).runs, 1);
+      }).pipe(
+        Effect.provide(
+          layerTest.pipe(Layer.provide(Layer.succeed(AutomaticTurnGate.AutomaticTurnGate, gate))),
+        ),
+      );
+      assert.lengthOf(consults, 5);
+      assert.isTrue(
+        consults.every(
+          (turn) => turn.kind === "restart_continuation" && turn.settled === (source === "settled"),
+        ),
+      );
+    }),
+);

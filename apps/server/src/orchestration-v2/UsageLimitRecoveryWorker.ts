@@ -74,7 +74,9 @@ export function limitRecoveryCommand(
 
 /**
  * Turns off the armed recovery whose resume the automatic turn gate declined for good, under
- * the same identity. The thread keeps its usage-limit failure for its owner to continue.
+ * that resume's identity. The recovery's request is part of it: an owner who arms the same run
+ * and reset again arms a new recovery, and a decline of that one must disarm it too rather than
+ * replay the first disarm's receipt. The thread keeps its usage-limit failure for its owner.
  */
 function limitDisarmCommand(
   thread: ProjectionStore.ProjectionLimitRecoveryCandidate,
@@ -84,7 +86,7 @@ function limitDisarmCommand(
   return {
     type: "thread.metadata.update",
     commandId: CommandId.make(
-      `limit-disarm:${thread.id}:${recovery.runId}:${Date.parse(recovery.resetAt)}`,
+      `limit-disarm:${thread.id}:${recovery.runId}:${Date.parse(recovery.resetAt)}:${recovery.requestId ?? "legacy"}`,
     ),
     threadId: thread.id,
     limitRecovery: {

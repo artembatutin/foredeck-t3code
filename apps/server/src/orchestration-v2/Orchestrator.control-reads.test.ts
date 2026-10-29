@@ -971,6 +971,8 @@ const seedQuestion = (input: {
   readonly status?: "pending" | "resolved" | "cancelled" | "expired";
   readonly capability?: "live" | "message";
   readonly childRun?: "running" | "completed";
+  /** The node the question names; by default the child run's root. */
+  readonly nodeId?: NodeId;
 }) =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -1032,7 +1034,7 @@ const seedQuestion = (input: {
           occurredAt: now,
           payload: {
             id: requestId,
-            nodeId: childRun.rootNodeId!,
+            nodeId: input.nodeId ?? childRun.rootNodeId!,
             providerTurnId: null,
             nativeRequestRef: null,
             kind: "user_input",
@@ -1162,6 +1164,90 @@ it.effect("a held-back question wake dispatches nothing, and redelivery delivers
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect("redelivers a question for the task it was asked in, not a later follow-up's", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const seeded = yield* seedQuestion({ name: "followed-up", childRun: "completed" });
+    const now = yield* DateTime.now;
+    const request = (yield* projections.getRuntimeRequest(seeded.childThreadId, seeded.requestId))!;
+    const asked = {
+      id: EventId.make("event:redeliver-followed-up-asked"),
+      type: "runtime-request.updated",
+      threadId: seeded.childThreadId,
+      runId: seeded.childRun.id,
+      occurredAt: now,
+      payload: request,
+    } satisfies OrchestrationV2DomainEvent;
+    // The live tail holds the question back, for the task the child was delegated for.
+    const held = yield* reactorWith("deferred");
+    yield* held.reactor.handle(asked);
+    assert.lengthOf(held.consults, 1);
+    assert.equal(
+      (held.consults[0] as AutomaticTurnGate.DelegatedQuestionTurn).taskId,
+      seeded.task.id,
+    );
+
+    // The task publishes its result, and the owner then sends the child a follow-up, which
+    // becomes a task of its own on the child's latest run.
+    yield* eventSink.write({
+      events: [
+        {
+          id: EventId.make("event:redeliver-followed-up-task-completed"),
+          type: "subagent.updated",
+          threadId: seeded.parentThreadId,
+          occurredAt: now,
+          payload: {
+            ...seeded.task,
+            status: "completed",
+            result: "Sources researched.",
+            completedAt: now,
+          },
+        },
+      ],
+    });
+    const followUpMessageId = MessageId.make("message:redeliver-followed-up-followup");
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("redeliver-followed-up-followup"),
+      threadId: seeded.childThreadId,
+      messageId: followUpMessageId,
+      text: "Check the sources again",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const followUp = (yield* projections.getThreadRecords(seeded.childThreadId, [
+      "runs",
+    ])).runs.find((run) => run.userMessageId === followUpMessageId)!;
+    assert.isDefined(followUp.delegatedTaskId);
+    assert.notEqual(followUp.delegatedTaskId, seeded.task.id);
+    assert.isAbove(followUp.ordinal, seeded.childRun.ordinal);
+
+    // Redelivered, the question keeps the task and delegating run it was presented with.
+    const admitted = yield* reactorWith("admit");
+    assert.equal(
+      yield* admitted.reactor.redeliver({
+        childThreadId: seeded.childThreadId,
+        requestId: seeded.requestId,
+      }),
+      "dispatched",
+    );
+    assert.deepEqual(admitted.consults, held.consults);
+    assert.equal(
+      (admitted.consults[0] as AutomaticTurnGate.DelegatedQuestionTurn).delegatingRunId,
+      seeded.parentRun.id,
+    );
+    const wakes = yield* seeded.wakes;
+    assert.deepEqual(
+      wakes.map((message) => message.notification?.source),
+      [{ kind: "delegated_task", taskIds: [seeded.task.id], childThreadId: seeded.childThreadId }],
+    );
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect.each([
   "answered",
   "dismissed",
@@ -1170,6 +1256,7 @@ it.effect.each([
   "archived parent",
   "deleted parent",
   "blocking wait",
+  "untraceable run",
 ] as const)("redelivery is moot for a question whose wake no longer applies: %s", (reason) =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -1186,22 +1273,24 @@ it.effect.each([
             : {}),
       // A live question while the delegating run waits on its task is that wait's to deliver.
       ...(reason === "blocking wait" ? { capability: "live" as const } : {}),
+      // No node of the child ties the question to the run it was asked in.
+      ...(reason === "untraceable run"
+        ? { nodeId: NodeId.make("node:redeliver-untraceable") }
+        : {}),
     });
     const now = yield* DateTime.now;
     if (reason === "missing task") {
-      // The child's latest run answers a task its parent no longer lists.
+      // The run the question was asked in answers a task its parent no longer lists.
       yield* eventSink.write({
         events: [
           {
             id: EventId.make("event:redeliver-orphan-run"),
             type: "run.updated",
             threadId: seeded.childThreadId,
-            runId: RunId.make("run:redeliver-orphan"),
+            runId: seeded.childRun.id,
             occurredAt: now,
             payload: {
               ...seeded.childRun,
-              id: RunId.make("run:redeliver-orphan"),
-              ordinal: seeded.childRun.ordinal + 1,
               delegatedTaskId: NodeId.make("node:redeliver-missing-task"),
             },
           },

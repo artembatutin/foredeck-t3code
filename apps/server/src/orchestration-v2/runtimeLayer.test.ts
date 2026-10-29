@@ -6251,7 +6251,36 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
             resetAt,
             autoResume: false,
             snooze: false,
-            requestId: CommandId.make(`limit-disarm:${threadId}:${run.id}:${Date.parse(resetAt)}`),
+            requestId: CommandId.make(`limit-disarm:${identity}`),
+          },
+          runs: 1,
+        });
+
+        // The owner arms the same run and reset again: a new recovery, whose own decline
+        // disarms it in turn instead of replaying the first disarm.
+        yield* orchestrator.dispatch({
+          type: "thread.metadata.update",
+          commandId: CommandId.make("recovery:rearm:gated"),
+          threadId,
+          limitRecovery: { runId: run.id, resetAt, autoResume: true },
+        });
+        yield* sweep;
+        yield* sweep;
+        const rearmed = `${threadId}:${run.id}:${Date.parse(resetAt)}:recovery:rearm:gated`;
+        assert.deepEqual(consults.slice(3), [
+          {
+            ...resume,
+            messageId: MessageId.make(`limit-resume:${rearmed}`),
+            key: `limit-resume:${rearmed}`,
+          },
+        ]);
+        assert.deepEqual(yield* current, {
+          recovery: {
+            runId: run.id,
+            resetAt,
+            autoResume: false,
+            snooze: false,
+            requestId: CommandId.make(`limit-disarm:${rearmed}`),
           },
           runs: 1,
         });

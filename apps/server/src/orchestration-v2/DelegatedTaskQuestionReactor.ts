@@ -3,9 +3,9 @@ import {
   MessageId,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2Run,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2Subagent,
-  type RunId,
   type RuntimeRequestId,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -35,10 +35,11 @@ export class DelegatedTaskQuestionReactor extends Context.Service<
     readonly start: () => Effect.Effect<void, never, Scope.Scope>;
     readonly handle: (event: OrchestrationV2DomainEvent) => Effect.Effect<void>;
     /**
-     * Wakes the parent for a question the gate held back, re-reading it as `handle` does:
-     * `moot` when the question no longer needs one (answered, dismissed or expired, its task
-     * gone, its parent archived or deleted, or a blocking wait delivering it itself). The wake's
-     * command id makes a repeat dispatch nothing new.
+     * Wakes the parent for a question the gate held back, re-reading it as `handle` does, for
+     * the task of the run the question was asked in: `moot` when the question no longer needs
+     * one (answered, dismissed or expired, its task gone, its parent archived or deleted, a
+     * blocking wait delivering it itself, or no run traceable from it). The wake's command id
+     * makes a repeat dispatch nothing new.
      */
     readonly redeliver: (input: {
       readonly childThreadId: ThreadId;
@@ -101,20 +102,18 @@ const make = Effect.gen(function* () {
   });
 
   /**
-   * The app-owned task whose pending question on `child` wakes the parent: the task of the run
-   * the request's event names, or else of the child's latest run. None while the parent is
-   * archived or deleted, or while a blocking delegate_task wait delivers the question itself.
+   * The app-owned task whose pending question, asked during `run` of `child`, wakes the parent:
+   * the task that run answers, or for a run naming none the task the child was delegated for.
+   * None while the parent is archived or deleted, or while a blocking delegate_task wait
+   * delivers the question itself.
    */
   const questionTask = Effect.fnUntraced(function* (
     child: OrchestrationV2AppThread,
     parentThreadId: ThreadId,
-    runId: RunId | undefined,
+    run: OrchestrationV2Run | undefined,
     responseCapability: OrchestrationV2RuntimeRequest["responseCapability"],
   ) {
     const parent = yield* projections.getThreadRecords(parentThreadId, ["subagents", "runs"]);
-    const { runs } = yield* projections.getThreadRecords(child.id, ["runs"]);
-    const run =
-      runs.find((run) => run.id === runId) ?? runs.toSorted((a, b) => b.ordinal - a.ordinal)[0];
     const taskId =
       run?.delegatedTaskId ??
       (child.forkedFrom?.type === "node" ? child.forkedFrom.nodeId : undefined);
@@ -148,14 +147,18 @@ const make = Effect.gen(function* () {
       const child = yield* projections.getThread(input.childThreadId);
       const parentThreadId = child.lineage.parentThreadId;
       if (parentThreadId === null) return "moot";
-      const request = yield* projections.getRuntimeRequest(child.id, input.requestId);
-      if (request?.kind !== "user_input" || request.status !== "pending") return "moot";
-      const task = yield* questionTask(
-        child,
-        parentThreadId,
-        undefined,
-        request.responseCapability,
+      const { request, node } = yield* projections.getRuntimeResponseContext(
+        child.id,
+        input.requestId,
       );
+      if (request?.kind !== "user_input" || request.status !== "pending") return "moot";
+      // The run the question was asked in, through the request's own node: a later follow-up in
+      // the same child conversation answers a task of its own. A question no node ties to a run
+      // cannot be attributed, so it wakes nothing rather than a guessed task's parent.
+      const { runs } = yield* projections.getThreadRecords(child.id, ["runs"]);
+      const run = runs.find((candidate) => candidate.id === node?.runId);
+      if (run === undefined) return "moot";
+      const task = yield* questionTask(child, parentThreadId, run, request.responseCapability);
       if (task === undefined) return "moot";
       const outcome = yield* wakeParent(task, request);
       // A declined wake never runs, like one no longer needed.
@@ -232,10 +235,14 @@ const make = Effect.gen(function* () {
         }
         return;
       }
+      const { runs } = yield* projections.getThreadRecords(child.id, ["runs"]);
+      const run =
+        runs.find((run) => run.id === event.runId) ??
+        runs.toSorted((a, b) => b.ordinal - a.ordinal)[0];
       const task = yield* questionTask(
         child,
         parentThreadId,
-        event.runId,
+        run,
         event.payload.responseCapability,
       );
       if (task === undefined) return;
