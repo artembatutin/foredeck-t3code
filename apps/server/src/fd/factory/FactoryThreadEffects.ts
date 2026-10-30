@@ -192,6 +192,17 @@ const launchMessageId = (deliveryId: FactoryDeliveryId, effectId: number) =>
 /** Every message Factory sends: a launch's first message, or a turn's (see `sendTurn`). */
 const FACTORY_MESSAGE = /^factory-[a-z-]+-message:/;
 
+const FACTORY_MESSAGE_DELIVERY = /^factory-[a-z-]+-message:(.+):\d+$/;
+
+/**
+ * The delivery that sent the message, when Factory sent it: each id names the delivery and the
+ * effect it was sent for. None for any other message.
+ */
+export const factoryMessageDeliveryId = (messageId: MessageId) => {
+  const deliveryId = FACTORY_MESSAGE_DELIVERY.exec(messageId)?.[1];
+  return deliveryId === undefined ? undefined : FactoryDeliveryId.make(deliveryId);
+};
+
 /**
  * What became of a launch: it made no thread, made one that was deleted since, or made one whose
  * run is unfinished (or not created yet) or has ended.

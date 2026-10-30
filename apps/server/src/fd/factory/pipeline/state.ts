@@ -426,6 +426,65 @@ export const followedThread = (delivery: FactoryDeliveryState): ThreadId | undef
   }
 };
 
+/**
+ * A pull request watch's wake as its delivery is judged against it: the thread it wakes, the pull
+ * request its sync names and the watch that sent it. The engine judges the wake's run once
+ * committed; the automatic turn gate judges a wake before its sync is dispatched, which comes
+ * after every event committed so far.
+ */
+export interface FactoryPullRequestWake {
+  readonly threadId: ThreadId;
+  readonly number: number;
+  readonly url: string;
+  /** Where the wake's run was created in the event log; none before its sync committed. */
+  readonly sequence?: number;
+  /** When the watch that sent it started; null once its committed sync shows the watch ended. */
+  readonly watchStartedAt: string | null;
+  /** Where its sync updated the link; none before it committed. */
+  readonly linkSequence?: number;
+}
+
+/**
+ * Whether the wake is the delivery's own: on the thread its pull request is linked to (see
+ * `followedThread`), after its first watch command (one from before that pull request was
+ * published answers nothing), and of the open pull request it recorded, by number and URL. A
+ * cancelled delivery owns only the work the watch Factory started set off: a wake of that watch,
+ * by its pull request and start, since a watch on another pull request of the thread can start at
+ * the same moment, or the end that removed it, at the link update its release recorded. Whether
+ * the delivery already took the wake is the engine's to judge (`followThrough.runs`).
+ */
+export const ownsWake = (delivery: FactoryDeliveryState, wake: FactoryPullRequestWake) => {
+  const { pullRequest, followThrough } = delivery;
+  if (
+    followedThread(delivery) !== wake.threadId ||
+    followThrough === undefined ||
+    (wake.sequence !== undefined && wake.sequence <= followThrough.watchedAfter)
+  ) {
+    return false;
+  }
+  if (delivery.status === "cancelled") {
+    const started = followThrough.watchStartedAt;
+    // The release names the watch's pull request when the PR stage's result was lost.
+    const watched = followThrough.heldPullRequest ?? pullRequest;
+    return (
+      started !== null &&
+      watched?.number === wake.number &&
+      watched.url === wake.url &&
+      (wake.watchStartedAt === started ||
+        (wake.watchStartedAt === null &&
+          wake.linkSequence !== undefined &&
+          followThrough.heldUntil === wake.linkSequence))
+    );
+  }
+  return (
+    !isTerminal(delivery) &&
+    pullRequest !== null &&
+    pullRequest.outcome === undefined &&
+    pullRequest.number === wake.number &&
+    pullRequest.url === wake.url
+  );
+};
+
 /** The wake runs the delivery took as its own; see `FactoryFollowThrough.runs`. */
 export const adoptedRuns = (delivery: FactoryDeliveryState): ReadonlyArray<RunId> =>
   delivery.followThrough?.runs ?? [];

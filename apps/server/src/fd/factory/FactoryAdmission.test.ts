@@ -35,6 +35,7 @@ const recordingPort = () => {
     decide: (entry: Entry) => Effect.Effect<Decision, FactoryAdmission.FactoryAdmissionReadError>;
   } = { decide: () => Effect.succeed(proceed) };
   const port: typeof FactoryAdmission.FactoryAdmission.Service = {
+    ...FactoryAdmission.FactoryAdmission.defaultValue(),
     management: () => Effect.succeed("active"),
     enter: (entry) =>
       Effect.suspend(() => {

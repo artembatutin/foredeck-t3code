@@ -30,6 +30,7 @@ import {
 import type { WorkCommentInput, WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
@@ -52,6 +53,7 @@ import * as ServerConfig from "../../../config.ts";
 import * as GitManager from "../../../git/GitManager.ts";
 import * as GitWorkflow from "../../../git/GitWorkflowService.ts";
 import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
+import * as AutomaticTurnGate from "../../../orchestration-v2/AutomaticTurnGate.ts";
 import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
 import * as EffectOutbox from "../../../orchestration-v2/EffectOutbox.ts";
 import * as EffectWorker from "../../../orchestration-v2/EffectWorker.ts";
@@ -363,6 +365,31 @@ export interface PullRequestCall {
 /** A command Factory's own services dispatch to the orchestrator. */
 export type FactoryDispatch = Parameters<Orchestrator.OrchestratorV2["Service"]["dispatch"]>[0];
 
+/** An interrupt Factory asks a thread for, as it asks core's thread management. */
+export type FactoryInterrupt = Parameters<
+  ThreadManagement.ThreadManagementService["Service"]["interruptThread"]
+>[0];
+
+/**
+ * Core's thread management as Factory's services see it: each interrupt they ask for runs
+ * `hooks.beforeInterrupt` first, so a test can refuse it as core would refuse one.
+ */
+const factoryThreads = (hooks: {
+  beforeInterrupt?: ((input: FactoryInterrupt) => Effect.Effect<void>) | undefined;
+}) =>
+  Layer.effect(
+    ThreadManagement.ThreadManagementService,
+    Effect.map(ThreadManagement.ThreadManagementService, (threads) =>
+      ThreadManagement.ThreadManagementService.of({
+        ...threads,
+        interruptThread: (input) =>
+          Effect.suspend(() => hooks.beforeInterrupt?.(input) ?? Effect.void).pipe(
+            Effect.andThen(threads.interruptThread(input)),
+          ),
+      }),
+    ),
+  );
+
 /**
  * The orchestrator as Factory's services see it: each command runs `hooks.before` first, so a
  * test can commit something of the owner's between what Factory read and its command, and each
@@ -621,21 +648,39 @@ interface ServerInput {
   readonly pullRequestCalls: Array<PullRequestCall>;
   readonly worktreeRemovals: Array<VcsRemoveWorktreeInput>;
   readonly publishHooks: Array<Effect.Effect<void>>;
-  readonly factoryDispatch: {
-    before?: ((command: FactoryDispatch) => Effect.Effect<void>) | undefined;
-    beforeShell?: ((threadId: ThreadId) => Effect.Effect<void>) | undefined;
-  };
+  readonly factoryDispatch: World["factoryDispatch"];
   readonly processes: World["processes"];
   readonly setupScripts: World["setupScripts"];
   readonly commentCalls: Array<CommentCall>;
   readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
   readonly manualReactor: boolean;
   readonly admission: typeof Factory.FactoryAdmission.FactoryAdmission.Service | undefined;
+  readonly automaticTurnGate: boolean;
   readonly root: string;
   readonly t3Home: string;
   /** The harness's one database, already built: every build of the server shares it. */
   readonly database: Layer.Layer<Layer.Success<typeof SqlitePersistence.layerMemory>>;
 }
+
+/** Takes Factory's gate and installs it nowhere: core's producers keep the default inline gate. */
+const inertGateInstaller = Layer.succeed(
+  AutomaticTurnGate.AutomaticTurnGateInstaller,
+  AutomaticTurnGate.AutomaticTurnGateInstaller.of({ install: () => Effect.void }),
+);
+
+/**
+ * With `on`, the one installable automatic turn gate the server provides beneath its runtime, so
+ * core's producers here (restart continuations and the continuation worker's native wakes and
+ * delegated completions) consult the gate Factory installs; and the continuation requests queue
+ * those offers go through, which the adapters and the worker share. Otherwise Factory installs its
+ * gate nowhere.
+ */
+const automaticTurnGate = (
+  on: boolean,
+): Layer.Layer<AutomaticTurnGate.AutomaticTurnGateInstaller> =>
+  on
+    ? Layer.merge(AutomaticTurnGate.layerInstallable, ProviderContinuationRequests.layer)
+    : inertGateInstaller;
 
 /**
  * The server's orchestration stack around the fake provider, on the harness's database, with the
@@ -659,7 +704,12 @@ const coreLayer = (input: ServerInput) => {
   const orchestration = ProviderReplayHarness.layerWithRegistry(
     { name: "factory-delivery" },
     ProviderAdapterRegistry.layerSingle(input.provider.adapter),
-    { databaseLayer: database, runEffectWorker: false, runtimePolicyLayer: runtimePolicy },
+    {
+      databaseLayer: database,
+      runEffectWorker: false,
+      runtimePolicyLayer: runtimePolicy,
+      runContinuationWorker: input.automaticTurnGate,
+    },
   );
   return recordingWork(input.commentCalls, input.wrapWork).pipe(
     Layer.provideMerge(threadLaunch(input.setupScripts)),
@@ -682,6 +732,7 @@ const coreLayer = (input: ServerInput) => {
     Layer.provideMerge(ServerSettings.layerTest()),
     Layer.provideMerge(serverConfig),
     Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(automaticTurnGate(input.automaticTurnGate)),
   );
 };
 
@@ -693,6 +744,7 @@ const factoryLayer = (input: ServerInput) =>
   (input.manualReactor ? downReactor : factoryReactor).pipe(
     Layer.provideMerge(Factory.layerLive),
     Layer.provide(factoryOrchestrator(input.factoryDispatch)),
+    Layer.provide(factoryThreads(input.factoryDispatch)),
     Layer.provide(
       fakePullRequests(input.pullRequestCalls, input.worktreeRemovals, input.publishHooks),
     ),
@@ -846,12 +898,14 @@ export interface World {
    */
   readonly publishHooks: Array<Effect.Effect<void>>;
   /**
-   * Run before each command Factory's services dispatch to the orchestrator (`before`), and before
-   * each thread shell they read from it (`beforeShell`), when set.
+   * Run before each command Factory's services dispatch to the orchestrator (`before`), before
+   * each thread shell they read from it (`beforeShell`), and before each interrupt they ask a
+   * thread for (`beforeInterrupt`), when set.
    */
   readonly factoryDispatch: {
     before?: ((command: FactoryDispatch) => Effect.Effect<void>) | undefined;
     beforeShell?: ((threadId: ThreadId) => Effect.Effect<void>) | undefined;
+    beforeInterrupt?: ((input: FactoryInterrupt) => Effect.Effect<void>) | undefined;
   };
   /**
    * Runs each process the server's process runner is asked for, such as a verify or setup
@@ -957,6 +1011,11 @@ export const withProject = <A, E>(
     readonly manualReactor?: boolean;
     /** The admission port Factory is built with, rebuilds included; its default otherwise. */
     readonly admission?: typeof Factory.FactoryAdmission.FactoryAdmission.Service;
+    /**
+     * Gives core's producers the installable automatic turn gate Factory installs, as the server
+     * does (see `automaticTurnGate`); without it they run every automatic turn inline.
+     */
+    readonly automaticTurnGate?: boolean;
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -989,6 +1048,7 @@ export const withProject = <A, E>(
         wrapWork: options.work ?? ((service) => service),
         manualReactor: options.manualReactor === true,
         admission: options.admission,
+        automaticTurnGate: options.automaticTurnGate === true,
         root,
         t3Home,
         // One database for every build of the server, as a T3 home keeps across restarts.

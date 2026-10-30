@@ -229,6 +229,11 @@ export class FactoryWorker extends Context.Service<
       effectId: number,
     ) => Effect.Effect<"deferred" | "running" | "stale", FactoryStoreError>;
     /**
+     * How many of the delivery's jobs this process has queued or running (see `Job`), read
+     * without the delivery's lock: an effect counts from before it is queued until it ends.
+     */
+    readonly jobsInFlight: (deliveryId: FactoryDeliveryId) => Effect.Effect<number>;
+    /**
      * Steps a parent with the approval of the child it waits for, once that child is approved;
      * the parent then waits for something else, so the approval is taken once. A parent without a
      * recorded branch start takes that child's start again first (see `advance`). Any other
@@ -1706,6 +1711,7 @@ const make = Effect.gen(function* () {
     failInterruptedEffect,
     redispatch,
     ensureDeferred,
+    jobsInFlight: (deliveryId) => Effect.sync(() => inFlight(deliveryId)),
     recoverPullRequest,
     takeChildApproval,
     finishFamily,

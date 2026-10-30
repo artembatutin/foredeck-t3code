@@ -37,6 +37,7 @@ import {
   WorkService,
   workBranchName,
 } from "../work-management/index.ts";
+import * as FactoryActivity from "./FactoryActivity.ts";
 import * as FactoryChanges from "./FactoryChanges.ts";
 import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryReview from "./FactoryReview.ts";
@@ -508,6 +509,25 @@ export class FactoryService extends Context.Service<
       effectId: number,
     ) => Effect.Effect<"deferred" | "running" | "stale", FactoryStoreError>;
     /**
+     * The root delivery whose family the thread belongs to, read-only: a thread a Factory launch
+     * made belongs to that delivery's root (a child's to its parent), and a thread delegated from
+     * a family thread, an app-owned task's or a provider-native mirror, to its parent's family, at
+     * most eight levels down. Null for any other thread. Fails when a record cannot be read or the
+     * lineage goes deeper.
+     */
+    readonly familyRoot: (
+      threadId: ThreadId,
+    ) => Effect.Effect<FactoryDeliveryId | null, FactoryActivity.FactoryOwnershipReadError>;
+    /**
+     * What the root delivery's family is doing, read-only (see `FactoryActivity`): its phase,
+     * whether work Factory cannot show to be the owner's is under way or about to start on its
+     * threads, whether an effect waits for admission, what its runs wait for, and whether any of
+     * that could not be read. An unknown delivery is `missing`.
+     */
+    readonly activity: (
+      root: FactoryDeliveryId,
+    ) => Effect.Effect<FactoryActivity.FactoryActivityReport, FactoryStoreError>;
+    /**
      * The owner's edit of the plan a parent waits on at the plan gate: `plan`, any value as it
      * arrived, replaces it, and the delivery waits on. The edit is judged under the delivery's
      * lock by the planner's plan validator and the edit rules (see `validatePlanEdit`): it may
@@ -645,6 +665,7 @@ const make = Effect.gen(function* () {
   const reviews = yield* FactoryReview.FactoryReview;
   const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
   const changes = yield* FactoryChanges.FactoryChanges;
+  const activity = yield* FactoryActivity.FactoryActivity;
   const sql = yield* SqlClient.SqlClient;
   const crypto = yield* Crypto.Crypto;
   const gitContext = yield* Effect.context<FileSystem.FileSystem | GitVcsDriver.GitVcsDriver>();
@@ -1223,6 +1244,9 @@ const make = Effect.gen(function* () {
     cancel,
     redispatch: worker.redispatch,
     ensureDeferred: worker.ensureDeferred,
+    familyRoot: (threadId) =>
+      activity.family(threadId).pipe(Effect.map((family) => family?.root ?? null)),
+    activity: activity.activity,
     updatePlan,
     approvePlan,
     rejectPlan,
@@ -1233,4 +1257,5 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(FactoryService, make);
+/** The service, reading its family's activity through its own readers (see `FactoryActivity`). */
+export const layer = Layer.effect(FactoryService, make).pipe(Layer.provide(FactoryActivity.layer));

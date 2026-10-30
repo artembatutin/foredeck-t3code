@@ -96,6 +96,7 @@ const markFailingStore = (world: World) =>
 const fakes = (world: World) =>
   Layer.mergeAll(
     Layer.succeed(FactoryAdmission.FactoryAdmission, {
+      ...FactoryAdmission.FactoryAdmission.defaultValue(),
       management: () => Effect.succeed("active"),
       enter: () => Effect.suspend(() => world.decide()),
       deferredDemand: () => Effect.succeed(true),
@@ -306,6 +307,7 @@ const restartPort = () => {
     demand: Effect.Effect<boolean, FactoryAdmission.FactoryAdmissionReadError>;
   } = { decide: defer, demand: Effect.succeed(true) };
   const port: typeof FactoryAdmission.FactoryAdmission.Service = {
+    ...FactoryAdmission.FactoryAdmission.defaultValue(),
     management: () => Effect.succeed("active"),
     enter: () => Effect.sync(() => control.decide),
     deferredDemand: ({ effectId }) =>

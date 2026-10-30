@@ -3,6 +3,13 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
+import {
+  type AutomaticTurn,
+  type AutomaticTurnDecisionError,
+  type AutomaticTurnOutcome,
+  type BackgroundWakeTurn,
+  ran,
+} from "../../orchestration-v2/AutomaticTurnGate.ts";
 import type { FactoryEffect } from "./pipeline/state.ts";
 
 /**
@@ -93,6 +100,33 @@ export const admissionRefusalText: Readonly<Record<FactoryAdmissionRefusal, stri
     "The project assistant assignment for this delivery has ended. Retry the assignment for a new delivery.",
 };
 
+/**
+ * A turn core would start on its own on a family thread of a managed root, which Factory could not
+ * show to be its owner's (see `FactoryAutomaticTurns`): `factory` when it carries on Factory's own
+ * work, `unknown` when nothing shows whose it is. `retired` when the root's management has ended
+ * or is ending. The turn is presented as the gate was given it: `admit` runs `dispatch` inline or
+ * not at all, `hand` (a native wake, whose output exists only in memory) may also keep `dispatch`,
+ * which needs nothing more, to run later, or `drop` it, which clears the adapter's offer and exists
+ * only when the offer can be cleared.
+ */
+export type FactoryAutomaticTurn<A, E, R> = {
+  readonly root: FactoryDeliveryId;
+  readonly provenance: "factory" | "unknown";
+  readonly management: Exclude<FactoryManagement, "never">;
+} & (
+  | {
+      readonly via: "admit";
+      readonly turn: Exclude<AutomaticTurn, BackgroundWakeTurn>;
+      readonly dispatch: Effect.Effect<A, E, R>;
+    }
+  | {
+      readonly via: "hand";
+      readonly turn: BackgroundWakeTurn;
+      readonly dispatch: Effect.Effect<A, E>;
+      readonly drop?: Effect.Effect<void>;
+    }
+);
+
 const proceed: FactoryAdmissionDecision = { type: "proceed" };
 
 /**
@@ -101,10 +135,12 @@ const proceed: FactoryAdmissionDecision = { type: "proceed" };
  * the effect as waiting (`admissionWait`) and runs nothing until a redispatch; a refusal blocks
  * the delivery with the category's text. After a restart the boot sweep asks `deferredDemand`
  * whether an awaited effect stored without that mark was deferred, and blocks it when not.
- * Factory imports nothing of its manager: one is provided where Factory is built.
+ * Factory imports nothing of its manager: one is provided where Factory is built. Automatic turns
+ * on a managed root's family threads that Factory cannot show to be the owner's reach
+ * `automaticTurn`, which decides whether and when they run.
  *
- * The default manages nothing: every root is `never`, every effect proceeds and nothing was
- * deferred, so Factory runs as it does without a manager.
+ * The default manages nothing: every root is `never`, every effect proceeds, nothing was deferred
+ * and every automatic turn runs inline, so Factory runs as it does without a manager.
  */
 export class FactoryAdmission extends Context.Reference<{
   readonly management: (
@@ -118,10 +154,14 @@ export class FactoryAdmission extends Context.Reference<{
     readonly deliveryId: FactoryDeliveryId;
     readonly effectId: number;
   }) => Effect.Effect<boolean, FactoryAdmissionReadError>;
+  readonly automaticTurn: <A, E, R>(
+    turn: FactoryAutomaticTurn<A, E, R>,
+  ) => Effect.Effect<AutomaticTurnOutcome<A>, E | AutomaticTurnDecisionError, R>;
 }>("t3/fd/factory/FactoryAdmission", {
   defaultValue: () => ({
     management: () => Effect.succeed("never"),
     enter: () => Effect.succeed(proceed),
     deferredDemand: () => Effect.succeed(false),
+    automaticTurn: (turn) => Effect.map(turn.dispatch, ran),
   }),
 }) {}

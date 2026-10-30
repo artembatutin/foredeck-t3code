@@ -10,6 +10,7 @@ import * as StorageCleanup from "./storageCleanup.ts";
 import * as PullRequestSyncReactor from "./orchestration-v2/PullRequestSyncReactor.ts";
 import * as PullRequestWatchReactor from "./orchestration-v2/PullRequestWatchReactor.ts";
 import * as DelegatedTaskQuestionReactor from "./orchestration-v2/DelegatedTaskQuestionReactor.ts";
+import * as AutomaticTurnGate from "./orchestration-v2/AutomaticTurnGate.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeHttp from "node:http";
 
@@ -603,6 +604,9 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   Layer.provideMerge(Factory.layerLive),
   Layer.provideMerge(WorkManagement.layerLive),
   Layer.provideMerge(layerOrchestrationApplication),
+  // One gate for every automatic turn producer, in the runtime and in the reactors above it.
+  // Factory installs its implementation while its layers build; consults before then wait.
+  Layer.provideMerge(AutomaticTurnGate.layerInstallable),
   Layer.provideMerge(RuntimeLayer.layerEventInfrastructure),
   Layer.provideMerge(Layer.merge(ProjectStore.layer, ThreadSearch.layer)),
   Layer.provideMerge(layerServerSettings),

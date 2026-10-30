@@ -12,6 +12,7 @@ import {
   isTurnEffect,
   issue,
   nextChild,
+  ownsWake,
   planAtGate,
   receiptFailed,
   runsStages,
@@ -847,14 +848,13 @@ const fold = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvan
         : step({ ...releasingWatch(following), status: "cancelled", awaiting: null });
     }
     case "pr.feedback": {
-      // Only a wake on the thread its pull request is linked to, a single item's author thread or
-      // a parent's last child's author thread, committed after its first watch command (one from
-      // before that pull request was published answers nothing), and each run once.
-      const { pullRequest, followThrough } = delivery;
+      // Only a wake of its own (see `ownsWake`), each run once: on the thread its pull request is
+      // linked to, after its first watch command, and of its open pull request, or once cancelled
+      // only what the watch Factory started set off.
+      const { followThrough } = delivery;
       if (
-        followedThread(delivery) !== event.threadId ||
         followThrough === undefined ||
-        event.sequence <= followThrough.watchedAfter ||
+        !ownsWake(delivery, event) ||
         followThrough.runs.includes(event.runId)
       ) {
         return unchanged(delivery);
@@ -862,32 +862,8 @@ const fold = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvan
       // Every wake of its pull request is the delivery's own, whatever it reports: a cancel
       // stops its run as Factory's turn.
       const owned = { ...followThrough, runs: [...followThrough.runs, event.runId] };
-      // Cancelled, it takes only the work the watch Factory started set off, to stop it: a wake
-      // that watch sent, or the end that removed it. A watch is its pull request and its start,
-      // since a watch on another pull request of the thread can start at the same moment; the
-      // release names that pull request when the PR stage's result was lost. Nothing revives the
-      // delivery.
-      if (delivery.status === "cancelled") {
-        const started = followThrough.watchStartedAt;
-        const watched = followThrough.heldPullRequest ?? pullRequest;
-        const sentByFactory =
-          started !== null &&
-          watched?.number === event.number &&
-          watched.url === event.url &&
-          (event.watchStartedAt === started ||
-            (event.watchStartedAt === null && followThrough.heldUntil === event.linkSequence));
-        return sentByFactory ? step({ ...delivery, followThrough: owned }) : unchanged(delivery);
-      }
-      // Otherwise only a wake of the open pull request it recorded.
-      if (
-        isTerminal(delivery) ||
-        pullRequest === null ||
-        pullRequest.outcome !== undefined ||
-        pullRequest.number !== event.number ||
-        pullRequest.url !== event.url
-      ) {
-        return unchanged(delivery);
-      }
+      // Cancelled, it takes such a wake only to stop its run; nothing revives the delivery.
+      if (delivery.status === "cancelled") return step({ ...delivery, followThrough: owned });
       // Waiting on its pull request, the delivery takes feedback as a round at once; while it
       // runs a stage or waits on its owner, the wake waits for it.
       const idle = delivery.status === "pr_open" && delivery.awaiting === null;

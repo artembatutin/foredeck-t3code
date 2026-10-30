@@ -8,15 +8,19 @@ import {
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
 import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
+import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -25,6 +29,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ServerConfig from "../../config.ts";
 import * as GitWorkflow from "../../git/GitWorkflowService.ts";
+import * as AutomaticTurnGate from "../../orchestration-v2/AutomaticTurnGate.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
@@ -39,6 +44,8 @@ import * as ServerActivation from "../../serverActivation.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as Work from "../work-management/index.ts";
+import * as FactoryAdmission from "./FactoryAdmission.ts";
+import { launchThreadId } from "./FactoryThreadEffects.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryMigrations from "./persistence/FactoryMigrations.ts";
@@ -132,15 +139,18 @@ const serverServices = Layer.mergeAll(
 
 /**
  * Factory as server.ts composes it: the worker layer over `layerLive`, beside the orchestration
- * runtime's event sink (the orchestrator commits through it), behind the server's activation.
+ * runtime's event sink (the orchestrator commits through it), behind the server's activation, over
+ * the installable automatic turn gate (`factoryLayers` provides the server's one).
  */
-const factoryLayers = (activation: Deferred.Deferred<void>) =>
+const factoryLayersOverGate = (activation: Deferred.Deferred<void>) =>
   Factory.workerLayer.pipe(
     Layer.provideMerge(Factory.layerLive),
     Layer.provideMerge(RuntimeLayer.layerEventSink),
     Layer.provide(serverServices),
     Layer.provide(Layer.succeed(ServerActivation.ServerActivation, Deferred.await(activation))),
   );
+const factoryLayers = (activation: Deferred.Deferred<void>) =>
+  factoryLayersOverGate(activation).pipe(Layer.provideMerge(AutomaticTurnGate.layerInstallable));
 
 /** Core and Work persistence, which server.ts migrates before Factory's ledger. */
 const corePersistence = <E, R>(sqlite: Layer.Layer<SqlClient.SqlClient, E, R>) =>
@@ -360,6 +370,102 @@ describe("Factory server layers", () => {
         assert.strictEqual((yield* seededAttempt)?.outcome, "blocked");
       }),
     ),
+  );
+
+  it.effect(
+    "install Factory's gate into the server's one, which a consult made before waits for",
+    () =>
+      Effect.gen(function* () {
+        const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+        yield* deliveries.insert({ deliveryId, projectId, itemRef, state: awaitingRun });
+        const reached: Array<{
+          readonly root: FactoryDeliveryId;
+          readonly provenance: string;
+          readonly management: string;
+          readonly kind: string;
+        }> = [];
+        const port: typeof FactoryAdmission.FactoryAdmission.Service = {
+          ...FactoryAdmission.FactoryAdmission.defaultValue(),
+          management: () => Effect.succeed("active"),
+          automaticTurn: (turn) =>
+            Effect.sync(() =>
+              reached.push({
+                root: turn.root,
+                provenance: turn.provenance,
+                management: turn.management,
+                kind: turn.turn.kind,
+              }),
+            ).pipe(Effect.as(AutomaticTurnGate.notNow("deferred"))),
+        };
+        // The server's one gate, built beneath the runtime before Factory's layers.
+        const gateContext = yield* Layer.build(AutomaticTurnGate.layerInstallable);
+        const gate = Context.get(gateContext, AutomaticTurnGate.AutomaticTurnGate);
+        const dispatched: Array<string> = [];
+        const messageId = MessageId.make("message-native-wake");
+        const consult = yield* gate
+          .hand(
+            {
+              kind: "background_wake",
+              threadId: launchThreadId(deliveryId, 1),
+              messageId,
+              key: messageId,
+              providerThreadId: ProviderThreadId.make("provider-thread-author"),
+              driver: ProviderDriverKind.make("codex"),
+              clearable: false,
+            },
+            Effect.sync(() => void dispatched.push("dispatched")),
+            {},
+          )
+          .pipe(Effect.forkScoped);
+        // Until Factory installs its gate, the consult decides and dispatches nothing.
+        for (let turn = 0; turn < 50; turn += 1) yield* Effect.yieldNow;
+        assert.deepStrictEqual(reached, []);
+        const activation = yield* Deferred.make<void>();
+        yield* Effect.gen(function* () {
+          yield* Factory.FactoryService.FactoryService;
+          // Installed while Factory's layers built: the waiting consult reaches Factory's gate,
+          // which finds the thread a managed root's and nothing showing whose its wake is.
+          assert.deepStrictEqual(yield* Fiber.join(consult), AutomaticTurnGate.notNow("deferred"));
+          assert.deepStrictEqual(reached, [
+            {
+              root: deliveryId,
+              provenance: "unknown",
+              management: "active",
+              kind: "background_wake",
+            },
+          ]);
+          assert.deepStrictEqual(dispatched, []);
+          const sql = yield* SqlClient.SqlClient;
+          assert.deepStrictEqual(
+            yield* sql`SELECT thread_id, message_id, root_delivery_id, class
+            FROM fd_factory_automatic_turns`,
+            [
+              {
+                thread_id: launchThreadId(deliveryId, 1),
+                message_id: messageId,
+                root_delivery_id: deliveryId,
+                class: "unknown",
+              },
+            ],
+          );
+        }).pipe(
+          Effect.provide(
+            factoryLayersOverGate(activation).pipe(
+              Layer.provide(Layer.succeedContext(gateContext)),
+              Layer.provide(Layer.succeed(FactoryAdmission.FactoryAdmission, port)),
+            ),
+            { local: true },
+          ),
+        );
+      }).pipe(
+        Effect.provide(
+          Factory.layerPersistence.pipe(
+            Layer.provideMerge(corePersistence(SqlitePersistence.layerMemory)),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+        Effect.scoped,
+      ),
   );
 
   it.effect("re-run Factory's ledger on the same database file and keep a delivery readable", () =>

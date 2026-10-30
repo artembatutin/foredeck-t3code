@@ -7,6 +7,9 @@ import { assert, it } from "@effect/vitest";
 // imports, and every Factory module another entry might import first.
 it.each([
   "index.ts",
+  "FactoryAutomaticTurns.ts",
+  "FactoryActivity.ts",
+  "FactoryOwnership.ts",
   "FactoryChildren.ts",
   "FactoryPlanning.ts",
   "FactoryPullRequest.ts",
