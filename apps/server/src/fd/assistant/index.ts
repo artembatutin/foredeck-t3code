@@ -32,6 +32,7 @@ export { default as assistantDispatchMigration } from "./dispatchMigration.ts";
 
 export * as ProjectAssistant from "./ProjectAssistant.ts";
 export * as HandoffBackend from "./handoffBackend.ts";
+export * as HandoffAdmission from "./HandoffAdmission.ts";
 export * as WorkCapture from "./WorkCapture.ts";
 export { AssistantToolkit, toolLayer as assistantToolLayer } from "./tools.ts";
 

@@ -11,6 +11,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import type { Caller } from "../../mcp/threadAccess.ts";
+import type { Demand } from "./HandoffAdmission.ts";
 
 /** An active Work source of a project, which an idea can be captured in. */
 export interface HandoffSource {
@@ -146,4 +147,37 @@ export class HandoffBackend extends Context.Reference<{
     create: () => unavailable("create"),
     update: () => unavailable("update"),
   }),
+}) {}
+
+/** A reserved automatic turn could not be handed back to its producer; the lease ends it. */
+export class HandoffRedeliveryError extends Schema.TaggedError<HandoffRedeliveryError>()(
+  "HandoffRedeliveryError",
+  {
+    kind: Schema.Literals(["delegated_question", "delegated_completion", "background_wake"]),
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `The project assistant could not redeliver a reserved ${this.kind}.`;
+  }
+}
+
+/**
+ * How the assistant hands a turn it reserved a slot for back to the producer holding it, without
+ * importing core's producers: the bridge feature provides it where the server is composed. A
+ * question goes through its reactor, which presents it to the gate again (`moot` once it needs no
+ * answer, and the reservation is gone); a completion is offered again on the continuation
+ * worker's shared queue; a native wake runs the dispatch the gate kept, or is `lost` when none is
+ * kept here. A pull request wake or usage-limit resume needs nothing: its producer presents it
+ * again by itself. The default redelivers nothing, so a reservation waits for its lease.
+ */
+export class HandoffRedelivery extends Context.Reference<{
+  readonly redeliver: (
+    demand: Demand,
+  ) => Effect.Effect<
+    "dispatched" | "offered" | "deferred" | "moot" | "lost" | "none",
+    HandoffRedeliveryError
+  >;
+}>("t3/fd/assistant/HandoffRedelivery", {
+  defaultValue: () => ({ redeliver: () => Effect.succeed("none") }),
 }) {}

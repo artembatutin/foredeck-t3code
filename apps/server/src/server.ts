@@ -1,4 +1,4 @@
-import { ProjectAssistant } from "./fd/assistant/index.ts";
+import { HandoffAdmission, ProjectAssistant } from "./fd/assistant/index.ts";
 import * as AssistantHandoff from "./fd/assistant-handoff/index.ts";
 import * as WorkManagement from "./fd/work-management/index.ts";
 import * as Factory from "./fd/factory/index.ts";
@@ -554,6 +554,18 @@ const layerProviderInstallationRefresh = Layer.effectDiscard(
   }),
 );
 
+/**
+ * The assistant's admission of the Factory roots it manages and its Work port, with the bridge's
+ * Factory admission port and redelivery of turns the assistant reserved a slot for, through a
+ * question reactor and the runtime's shared continuation queue. The assistant imports neither
+ * Work nor Factory.
+ */
+const layerAssistantHandoff = AssistantHandoff.layerAdmission.pipe(
+  Layer.provide(DelegatedTaskQuestionReactor.layer.pipe(Layer.provide(ProjectionStoreV2.layer))),
+  Layer.provideMerge(AssistantHandoff.layerBackend),
+  Layer.provideMerge(HandoffAdmission.layerLive),
+);
+
 const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   AgentAwarenessRelay.layer,
   // Asks T3 Connect to deliver webhooks it held while this environment was offline.
@@ -602,9 +614,10 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
 ).pipe(
   // Core Services
   Layer.provideMerge(ProjectAssistant.layerLive),
-  // The assistant's Work port, beneath the assistant that captures through it.
-  Layer.provideMerge(AssistantHandoff.layerBackend),
   Layer.provideMerge(Factory.layerLive),
+  // Beneath the assistant, which captures through its Work port, and Factory, which asks its
+  // admission port before a managed root's work runs.
+  Layer.provideMerge(layerAssistantHandoff),
   Layer.provideMerge(WorkManagement.layerLive),
   Layer.provideMerge(layerOrchestrationApplication),
   // One gate for every automatic turn producer, in the runtime and in the reactors above it.

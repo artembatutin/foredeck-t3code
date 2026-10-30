@@ -268,7 +268,29 @@ export type AssignmentEvent = { readonly note?: string } & (
   | { readonly type: "retry" }
   | { readonly type: "complete"; readonly evidence: ReadonlyArray<string> }
   | { readonly type: "cancel" }
+  | {
+      readonly type: "mirror";
+      readonly to: MirroredState;
+      readonly evidence?: ReadonlyArray<string>;
+    }
 );
+
+/**
+ * The states a Factory delivery's assignment shows, which `mirror` moves it into. Its assignment
+ * is a projection of the delivery Factory runs, so it moves where the delivery is rather than by
+ * the moves an ordinary worker's assignment takes; only the project assistant's admission of a
+ * managed root writes it.
+ */
+export const MIRRORED_STATES = [
+  "running",
+  "needs-input",
+  "stopping",
+  "stopped",
+  "failed",
+  "completed",
+  "cancelled",
+] as const satisfies ReadonlyArray<AssignmentState>;
+export type MirroredState = (typeof MIRRORED_STATES)[number];
 export type AssignmentEventType = AssignmentEvent["type"];
 
 const AssignmentRejectionReason = Schema.Literals([
@@ -344,6 +366,18 @@ const MOVES: {
     from: ["draft", "queued", "stopped", "failed", "awaiting-verification"],
     to: "cancelled",
   },
+  // `to` is the event's own, for a Factory delivery's assignment that has not ended.
+  mirror: {
+    from: [
+      "queued",
+      "launching",
+      "launch-uncertain",
+      "running",
+      "needs-input",
+      "stopping",
+      "stopped",
+    ],
+  },
 };
 
 function appendNote(progress: ReadonlyArray<ProgressNote>, note: string | undefined, at: string) {
@@ -393,7 +427,7 @@ export function transitionAssignment(
 
   const next: Assignment = {
     ...assignment,
-    state: move.to ?? assignment.state,
+    state: event.type === "mirror" ? event.to : (move.to ?? assignment.state),
     progress: appendNote(assignment.progress, event.note, context.at),
     updatedAt: context.at,
   };
@@ -412,6 +446,11 @@ export function transitionAssignment(
     case "complete": {
       const evidence = [...assignment.evidence, ...normalizeList(event.evidence)];
       if (evidence.length === 0) return reject("missing-evidence");
+      return Result.succeed({ ...next, evidence });
+    }
+    case "mirror": {
+      const evidence = [...assignment.evidence, ...normalizeList(event.evidence ?? [])];
+      if (event.to === "completed" && evidence.length === 0) return reject("missing-evidence");
       return Result.succeed({ ...next, evidence });
     }
     case "resume":

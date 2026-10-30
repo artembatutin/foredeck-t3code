@@ -56,6 +56,7 @@ import * as GitWorkflow from "../../../git/GitWorkflowService.ts";
 import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as AutomaticTurnGate from "../../../orchestration-v2/AutomaticTurnGate.ts";
 import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
+import * as DelegatedTaskQuestionReactor from "../../../orchestration-v2/DelegatedTaskQuestionReactor.ts";
 import * as EffectOutbox from "../../../orchestration-v2/EffectOutbox.ts";
 import * as EffectWorker from "../../../orchestration-v2/EffectWorker.ts";
 import * as EventSink from "../../../orchestration-v2/EventSink.ts";
@@ -90,7 +91,7 @@ import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../../../workspace/WorkspacePaths.ts";
-import { ProjectAssistant } from "../../assistant/index.ts";
+import { HandoffAdmission, ProjectAssistant } from "../../assistant/index.ts";
 import * as AssistantHandoff from "../../assistant-handoff/index.ts";
 import { RepositorySet } from "../../multirepo/index.ts";
 import * as WorkManagement from "../../work-management/index.ts";
@@ -699,6 +700,7 @@ interface ServerInput {
   readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
   readonly manualReactor: boolean;
   readonly admission: typeof Factory.FactoryAdmission.FactoryAdmission.Service | undefined;
+  readonly handoff: HandoffOption | undefined;
   readonly automaticTurnGate: boolean;
   readonly root: string;
   readonly t3Home: string;
@@ -780,11 +782,38 @@ const coreLayer = (input: ServerInput) => {
   );
 };
 
+/** How a world runs the project assistant's admission beneath Factory; see `withProject`. */
+export interface HandoffOption {
+  /** Where the admission path stops for the test, provided beneath the admission service. */
+  readonly probe?: typeof HandoffAdmission.HandoffAdmissionProbe.Service;
+}
+
+/**
+ * The project assistant's admission of the roots it manages, its Work port, and the bridge's
+ * admission port and turn redelivery, as the server composes them beneath Factory, with the probe
+ * given. Built in Factory's scope, so a rebuild is a new admission instance as a new process's.
+ */
+const handoffLayer = (input: ServerInput) =>
+  AssistantHandoff.layerAdmission.pipe(
+    Layer.provide(DelegatedTaskQuestionReactor.layer),
+    Layer.provideMerge(AssistantHandoff.layerBackend),
+    Layer.provideMerge(
+      HandoffAdmission.layerLive.pipe(
+        Layer.provide(
+          input.handoff?.probe === undefined
+            ? Layer.empty
+            : Layer.succeed(HandoffAdmission.HandoffAdmissionProbe, input.handoff.probe),
+        ),
+      ),
+    ),
+  );
+
 /**
  * Factory and its reactor over the core services, opening pull requests through the fake PR
- * service, with the admission port given (Factory's default otherwise).
+ * service, with the admission port given: the assistant's, through `handoff`, with the handoff
+ * option; Factory's default otherwise.
  */
-const factoryLayer = (input: ServerInput) =>
+const factoryLayer = (input: ServerInput, handoff: ReturnType<typeof handoffLayer>) =>
   (input.manualReactor ? downReactor : factoryReactor).pipe(
     Layer.provideMerge(Factory.layerLive),
     Layer.provide(factoryOrchestrator(input.factoryDispatch)),
@@ -795,9 +824,11 @@ const factoryLayer = (input: ServerInput) =>
     Layer.provide(ProviderRegistryMock.layer(input.providers)),
     Layer.provide(providerInstances(input.supportedRuntimeModes)),
     Layer.provide(
-      input.admission === undefined
-        ? Layer.empty
-        : Layer.succeed(Factory.FactoryAdmission.FactoryAdmission, input.admission),
+      input.handoff !== undefined
+        ? handoff
+        : input.admission === undefined
+          ? Layer.empty
+          : Layer.succeed(Factory.FactoryAdmission.FactoryAdmission, input.admission),
     ),
   );
 
@@ -841,9 +872,12 @@ const makeServer = (input: ServerInput, parent: Scope.Scope) =>
         const context = yield* Layer.buildWithMemoMap(layer, Layer.makeMemoMapUnsafe(), scope);
         return { scope, context };
       });
+    // One layer object, so each build shares one admission instance between Factory's port, the
+    // assistant and the test.
+    const handoff = handoffLayer(input);
     const buildFactory = (core: Context.Context<Layer.Success<ReturnType<typeof coreLayer>>>) =>
       build(
-        Layer.merge(factoryLayer(input), assistantLayer).pipe(
+        Layer.mergeAll(factoryLayer(input, handoff), assistantLayer, handoff).pipe(
           Layer.provide(Layer.succeedContext(core)),
         ),
       );
@@ -927,6 +961,7 @@ type Services =
   | Layer.Success<ReturnType<typeof coreLayer>>
   | Layer.Success<ReturnType<typeof factoryLayer>>
   | Layer.Success<typeof assistantLayer>
+  | Layer.Success<ReturnType<typeof handoffLayer>>
   | NodeServices.NodeServices;
 
 /** A started delivery whose first thread's (the author's, or a parent's planner's) turn runs. */
@@ -1071,6 +1106,11 @@ export const withProject = <A, E>(
     /** The admission port Factory is built with, rebuilds included; its default otherwise. */
     readonly admission?: typeof Factory.FactoryAdmission.FactoryAdmission.Service;
     /**
+     * Builds Factory over the project assistant's admission, as the server does (see
+     * `handoffLayer`), in place of `admission`.
+     */
+    readonly handoff?: HandoffOption;
+    /**
      * Gives core's producers the installable automatic turn gate Factory installs, as the server
      * does (see `automaticTurnGate`); without it they run every automatic turn inline.
      */
@@ -1107,6 +1147,7 @@ export const withProject = <A, E>(
         wrapWork: options.work ?? ((service) => service),
         manualReactor: options.manualReactor === true,
         admission: options.admission,
+        handoff: options.handoff,
         automaticTurnGate: options.automaticTurnGate === true,
         root,
         t3Home,
