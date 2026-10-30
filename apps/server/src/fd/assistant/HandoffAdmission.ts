@@ -586,6 +586,14 @@ export class HandoffAdmission extends Context.Service<
     ) => Effect.Effect<"dropped" | "kept", HandoffAdmissionError>;
     /** Every demand of the root, oldest position first. */
     readonly demands: (root: string) => Effect.Effect<ReadonlyArray<Demand>, HandoffAdmissionError>;
+    /** How many of the root's turns were declined or lost, and the newest `limit` notices. */
+    readonly dispositions: (
+      root: string,
+      limit: number,
+    ) => Effect.Effect<
+      { readonly count: number; readonly notices: ReadonlyArray<string> },
+      HandoffAdmissionError
+    >;
     /**
      * The release pass's reading of the root's admissions (note 6.4, steps 1 and 2): the held
      * slot's `entry_seq` first, then each row. A row dispatching from this instance is busy;
@@ -824,6 +832,13 @@ const endedNotice = (kind: WakeKind, thread: string) => {
 
 const lostNotice = (thread: string) =>
   `Background work on ${thread} finished while it waited for a project assistant slot, and the server restarted before it could continue. Its provider output is gone; open the thread and ask the agent to check that work.`;
+
+/** What a disposition tells the owner: the notice it was recorded with. */
+const dispositionNotice = (
+  kind: WakeKind,
+  thread: string,
+  outcome: "declined_ended" | "lost_on_restart",
+) => (outcome === "lost_on_restart" ? lostNotice(thread) : endedNotice(kind, thread));
 
 export const parkedNotice = (root: string) =>
   `Stopped before Factory started delivery ${root}. Nothing runs and no project assistant slot is held. Resume waits for a slot and starts this same delivery; cancel ends it.`;
@@ -1509,10 +1524,7 @@ const make = Effect.gen(function* () {
               : "unavailable",
         recorded_at: yield* now,
       })}`;
-      yield* notice(
-        root.assignment_id,
-        outcome === "lost_on_restart" ? lostNotice(threadId) : endedNotice(identity.kind, threadId),
-      );
+      yield* notice(root.assignment_id, dispositionNotice(identity.kind, threadId, outcome));
       return true;
     });
 
@@ -2707,6 +2719,22 @@ const make = Effect.gen(function* () {
       failed("read", root),
     );
 
+  const dispositions: HandoffAdmission["Service"]["dispositions"] = (root, limit) =>
+    sql<{
+      readonly total: number;
+      readonly kind: WakeKind;
+      readonly thread_id: string;
+      readonly outcome: "declined_ended" | "lost_on_restart";
+    }>`SELECT COUNT(*) OVER () AS total, kind, thread_id, outcome
+      FROM fd_assistant_dispositions WHERE root_delivery_id = ${root}
+      ORDER BY recorded_at DESC, kind, wake_key LIMIT ${limit}`.pipe(
+      Effect.map((rows) => ({
+        count: rows[0]?.total ?? 0,
+        notices: rows.map((row) => dispositionNotice(row.kind, row.thread_id, row.outcome)),
+      })),
+      failed("read", root),
+    );
+
   const settleAdmissions: HandoffAdmission["Service"]["settleAdmissions"] = (root, runState) =>
     Effect.gen(function* () {
       yield* flushUnmarked;
@@ -3066,6 +3094,7 @@ const make = Effect.gen(function* () {
     claim,
     claimOrdinary,
     factoryAssignment,
+    dispositions,
     createLink,
     captureInUse,
     setControl,

@@ -3,8 +3,10 @@ export { factoryFleet, type FactoryFleetEnvironment, type FactoryFleetRow } from
 export { createFactoryFleetAtom, type FactoryFleetState } from "./fleetAtom.ts";
 export {
   currentDelivery,
+  FACTORY_CAPACITY_WAIT_NOTE,
   FACTORY_STAGE_LABELS,
   FACTORY_STATUS_LABELS,
+  factoryCapacityNote,
   factoryControls,
   factoryNeedsYou,
   factoryReviewNotes,

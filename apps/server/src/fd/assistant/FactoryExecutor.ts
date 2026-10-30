@@ -3,6 +3,7 @@ import {
   type ProviderInteractionMode,
   RuntimeRequestId,
   type RuntimeMode,
+  ThreadId,
 } from "@t3tools/contracts";
 import { workItemRefString } from "@t3tools/contracts/fd/work-management";
 import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
@@ -82,6 +83,9 @@ const demandNotice = (demand: HandoffAdmission.Demand) => {
     ? `${turn} is waiting for a project assistant slot. T3 cannot tell whether it came from the delivery or from your own turn, so it counts as the delivery's.${answer}`
     : `${turn} is waiting for a project assistant slot.${answer}`;
 };
+
+/** How many of a root's waits, and of its dispositions, the overview words as notices. */
+const OVERVIEW_NOTICES_MAX = 5;
 
 /** An observation that says nothing is known, for a read that failed. */
 const UNOBSERVED: HandoffAdmission.Observation = {
@@ -1236,12 +1240,89 @@ export const make = Effect.gen(function* () {
       return request.threadId;
     });
 
+  /** The delivery as the overview shows it; a failed read reads as `unknown`, a missing row as none. */
+  const overviewDelivery = (root: string) =>
+    Effect.gen(function* () {
+      const read = yield* factory
+        .follow(root)
+        .pipe(
+          Effect.map(Option.some),
+          Effect.catchTags({ HandoffFactoryError: () => Effect.succeedNone }),
+        );
+      const follow = Option.getOrNull(Option.flatten(read));
+      const child = follow?.child ?? null;
+      // A parent stopped or blocked by the child it awaits shows that child, as its mirror does.
+      const shown = child !== null && isResumable(child.status) ? child : follow;
+      const waiting = (yield* admission.demands(root)).filter(
+        ({ kind, state }) => kind !== "effect" && state === "waiting",
+      );
+      const blocked = waiting.filter(({ blockedReason }) => blockedReason !== null).length;
+      const ended = yield* admission.dispositions(root, OVERVIEW_NOTICES_MAX);
+      const threadId = child?.threadId ?? follow?.threadId ?? null;
+      return {
+        deliveryId: root,
+        status: Option.isNone(read) ? ("unknown" as const) : (shown?.status ?? null),
+        stage: shown?.stage ?? null,
+        needsYou: shown?.reason ?? null,
+        capacityWait: (follow?.marked.length ?? 0) > 0,
+        automaticWaits: { waiting: waiting.length - blocked, blocked },
+        endedDispositions: ended.count,
+        notices: [...waiting.slice(-OVERVIEW_NOTICES_MAX).map(demandNotice), ...ended.notices],
+        pullRequestUrl: follow?.pullRequest?.url ?? null,
+        threadId: threadId === null ? null : ThreadId.make(threadId),
+      };
+    });
+
   return {
     launch,
     reconcile,
     maintain,
     grant,
     questionThread,
+
+    /**
+     * What the overview adds to a Factory assignment: its Work item and its delivery, once it has
+     * one. Reads only what the assistant and Factory store, never a Work source. A read that fails
+     * leaves its part out, so one assignment never costs the owner the others.
+     */
+    overviewOf: (current: Portfolio.Assignment) =>
+      Effect.gen(function* () {
+        const assignment = yield* admission.factoryAssignment(current.assignmentId);
+        if (assignment === undefined) return {};
+        const capture = Option.getOrUndefined(
+          yield* captures.get(current.projectId, current.ideaId ?? "legacy"),
+        );
+        const recorded = capture?.captureId === assignment.captureId ? capture : undefined;
+        const workItem = {
+          ...assignment.item,
+          key: recorded?.itemKey ?? null,
+          url: recorded?.itemUrl ?? null,
+        };
+        return assignment.deliveryId === null
+          ? { workItem }
+          : { workItem, factory: yield* overviewDelivery(assignment.deliveryId) };
+      }).pipe(
+        deferred("overview"),
+        Effect.map((fields) => fields ?? {}),
+      ),
+
+    /** An idea's Work capture for the overview, when it has one and it can be read. */
+    overviewCapture: (projectId: ProjectId, ideaId: string) =>
+      captures.get(projectId, ideaId).pipe(
+        Effect.map(
+          Option.match({
+            onNone: () => ({}),
+            onSome: ({ state, sourceId, itemId, itemKey, itemUrl }) => ({
+              capture: {
+                state,
+                item: itemId === null ? null : { sourceId, itemId, key: itemKey, url: itemUrl },
+              },
+            }),
+          }),
+        ),
+        deferred("overview"),
+        Effect.map((fields) => fields ?? {}),
+      ),
 
     /** The captured item's fresh read, for an enqueue, taken before the assistant's lock. */
     readCaptured: (projectId: ProjectId, ideaId: string) =>

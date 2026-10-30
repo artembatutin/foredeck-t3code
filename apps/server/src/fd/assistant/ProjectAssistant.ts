@@ -612,34 +612,43 @@ const make = Effect.gen(function* () {
         const records = yield* dispatches();
         const work = yield* store.listAssignments();
         return {
-          ideas: briefs.map((brief) => ({
-            projectId: brief.projectId,
-            ideaId: brief.ideaId ?? "legacy",
-            goal: brief.goal,
-            brief: Portfolio.renderAssignmentBrief(brief),
-            authorized: brief.executionAuthorized,
-            priority: brief.priority?.rank ?? null,
-            priorityReason: brief.priority?.reason ?? "",
-          })),
-          assignments: work.map((item) => {
-            const record = records.find((r) => r.assignmentId === item.assignmentId);
-            return {
-              assignmentId: item.assignmentId,
-              projectId: item.projectId,
-              ideaId: item.ideaId ?? "legacy",
-              state: item.state,
-              attempt: item.attempt,
-              goal: record?.brief.goal ?? item.assignmentId,
-              brief: record
-                ? Portfolio.renderAssignmentBrief(record.brief)
-                : "Legacy assignment; inspect saved project history.",
-              threadId:
-                record && !record.looper && item.executor !== "factory" ? record.threadId : null,
-              runId: record?.runId ?? null,
-              evidence: item.evidence,
-              notice: item.progress.at(-1)?.text ?? "",
-            };
-          }),
+          ideas: yield* Effect.forEach(briefs, (brief) =>
+            factoryExecutor.overviewCapture(brief.projectId, brief.ideaId ?? "legacy").pipe(
+              Effect.map((capture) => ({
+                projectId: brief.projectId,
+                ideaId: brief.ideaId ?? "legacy",
+                goal: brief.goal,
+                brief: Portfolio.renderAssignmentBrief(brief),
+                authorized: brief.executionAuthorized,
+                priority: brief.priority?.rank ?? null,
+                priorityReason: brief.priority?.reason ?? "",
+                ...capture,
+              })),
+            ),
+          ),
+          assignments: yield* Effect.forEach(work, (item) =>
+            Effect.gen(function* () {
+              const record = records.find((r) => r.assignmentId === item.assignmentId);
+              return {
+                assignmentId: item.assignmentId,
+                projectId: item.projectId,
+                ideaId: item.ideaId ?? "legacy",
+                state: item.state,
+                attempt: item.attempt,
+                goal: record?.brief.goal ?? item.assignmentId,
+                brief: record
+                  ? Portfolio.renderAssignmentBrief(record.brief)
+                  : "Legacy assignment; inspect saved project history.",
+                threadId:
+                  record && !record.looper && item.executor !== "factory" ? record.threadId : null,
+                runId: record?.runId ?? null,
+                evidence: item.evidence,
+                notice: item.progress.at(-1)?.text ?? "",
+                executor: item.executor,
+                ...(item.executor === "factory" ? yield* factoryExecutor.overviewOf(item) : {}),
+              };
+            }),
+          ),
         };
       }),
     ),

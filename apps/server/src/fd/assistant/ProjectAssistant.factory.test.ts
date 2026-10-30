@@ -231,6 +231,7 @@ const factoryPort = (fakes: Fakes): typeof HandoffBackend.HandoffFactory.Service
             : Option.some({
                 deliveryId: id,
                 status,
+                stage: null,
                 awaiting: null,
                 pullRequest: null,
                 reason: null,

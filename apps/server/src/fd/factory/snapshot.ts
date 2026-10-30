@@ -233,13 +233,17 @@ export const needsYou = (state: FactoryDeliveryState): string | undefined => {
     : reason;
 };
 
+/** Whether the effect the delivery awaits is marked as waiting for a project assistant slot. */
+const awaitsCapacity = ({ awaiting, admissionWait }: FactoryDeliveryState) =>
+  awaiting?.type === "effect" && admissionWait?.effectId === awaiting.effect.id;
+
 /**
  * A delivery as clients see it: its progress, threads and the summaries of its receipts, reviews
  * and newest stage attempts, never their logs or evidence paths. Receipts and reviews carry their
  * evidence numbers, and each attempt names the one it produced; reviews carry the bounded details
  * kept when they were accepted. The current plan round's plan is carried while one is recorded,
  * so a parent waiting at the plan gate shows the plan it waits on. `needsYou` is set only while it
- * waits at the plan gate or is blocked.
+ * waits at the plan gate or is blocked, and `capacityWait` only while an awaited effect is marked.
  */
 export const toFactoryDelivery = (delivery: FactoryDeliveryWithRuns): FactoryDelivery => {
   const { state } = delivery;
@@ -269,6 +273,7 @@ export const toFactoryDelivery = (delivery: FactoryDeliveryWithRuns): FactoryDel
       .map((run) => stageRunSummary(run, evidence)),
     ...(plan === undefined ? {} : { plan: planSnapshot(plan) }),
     ...(reason === undefined ? {} : { needsYou: reason }),
+    ...(awaitsCapacity(state) ? { capacityWait: true } : {}),
     createdAt: delivery.createdAt,
     updatedAt: delivery.updatedAt,
   };

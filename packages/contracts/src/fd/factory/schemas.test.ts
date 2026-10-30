@@ -53,6 +53,44 @@ describe("Factory entry", () => {
   });
 });
 
+describe("FactoryDelivery's capacity wait", () => {
+  const delivery = {
+    deliveryId: "d1",
+    projectId: "project-a",
+    itemRef: { sourceId: uuid, itemId: "fd-aaaaaa" },
+    childIds: [],
+    status: "running",
+    rounds: { fix: 0, review: 0 },
+    threads: {},
+    receipts: [],
+    reviews: [],
+    stageRuns: [],
+    createdAt: "2026-10-24T09:00:00.000Z",
+    updatedAt: "2026-10-24T09:00:00.000Z",
+  };
+  /** The delivery as a client from before the capacity wait knows it. */
+  const { capacityWait: _capacityWait, ...oldFields } = FactoryDelivery.fields;
+  const decodeNew = Schema.decodeUnknownSync(FactoryDelivery);
+  const encodeNew = Schema.encodeSync(FactoryDelivery);
+  const decodeOld = Schema.decodeUnknownSync(Schema.Struct(oldFields));
+
+  it("is absent from an older server's delivery", () => {
+    expect(decodeNew(delivery)).not.toHaveProperty("capacityWait");
+  });
+
+  it("round-trips while it is set", () => {
+    const decoded = decodeNew({ ...delivery, capacityWait: true });
+    expect(decoded.capacityWait).toBe(true);
+    expect(encodeNew(decoded)).toMatchObject({ capacityWait: true });
+  });
+
+  it("is dropped by an older client's copy of the schema", () => {
+    const decoded = decodeOld({ ...delivery, capacityWait: true });
+    expect(decoded).not.toHaveProperty("capacityWait");
+    expect(decoded.status).toBe("running");
+  });
+});
+
 describe("Factory ids", () => {
   const decodeDeliveryId = Schema.decodeUnknownSync(FactoryDeliveryId);
   const decodeTaskId = Schema.decodeUnknownSync(FactoryTaskId);

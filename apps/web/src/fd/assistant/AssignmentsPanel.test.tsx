@@ -6,6 +6,7 @@ import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 const mocks = vi.hoisted(() => ({
   read: vi.fn(),
   control: vi.fn(),
+  navigate: vi.fn(),
   passthrough: ({ children }: { children?: unknown }) => children ?? null,
 }));
 vi.mock("~/components/ui/button", () => ({ Button: (props: object) => <button {...props} /> }));
@@ -28,7 +29,7 @@ vi.mock("~/components/ui/menu", () => ({
 }));
 vi.mock("~/state/entities", () => ({ useProjects: () => [], useThreadShells: () => [] }));
 vi.mock("~/hooks/useLiveRefresh", () => ({ useLiveRefresh: () => undefined }));
-vi.mock("@tanstack/react-router", () => ({ useNavigate: () => vi.fn() }));
+vi.mock("@tanstack/react-router", () => ({ useNavigate: () => mocks.navigate }));
 vi.mock("@effect/atom-react", () => ({ useAtomValue: () => true }));
 vi.mock("./commands", () => ({
   readOverview: "read-overview",
@@ -110,5 +111,86 @@ it("does not reread the overview when a control action fails", async () => {
   });
   expect(mocks.read).toHaveBeenCalledTimes(1);
   expect(badge(view)).toBe("Failed");
+  await act(async () => view.unmount());
+});
+
+const factoryOverview = (state: string, status: string) => {
+  const success = overview(state);
+  return {
+    ...success,
+    value: {
+      ...success.value,
+      assignments: success.value.assignments.map((item) => ({
+        ...item,
+        executor: "factory",
+        workItem: {
+          sourceId: "7e2aa85e-9347-44ce-b019-cb8dfd365b20",
+          itemId: "fd-aaaaaa",
+          key: "fd-aaaaaa",
+          url: null,
+        },
+        factory: {
+          deliveryId: "d1",
+          status,
+          stage: "verify",
+          needsYou: "Verify failed.",
+          capacityWait: false,
+          automaticWaits: { waiting: 0, blocked: 0 },
+          endedDispositions: 0,
+          notices: [],
+          pullRequestUrl: "https://github.com/acme/alpha/pull/7",
+          threadId: null,
+        },
+      })),
+    },
+  };
+};
+
+const menuLabels = (view: ReactTestRenderer) =>
+  view.root
+    .findAll((node) => node.props["data-menu-item"] === true)
+    .map((node) => node.props.children);
+
+it("offers a Factory row only what the server accepts, and refreshes after it", async () => {
+  mocks.read.mockResolvedValue(factoryOverview("needs-input", "waiting"));
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  // A plan gate is approved in Work, and neither stops nor resumes from here.
+  expect(menuLabels(view)).toEqual(["Cancel"]);
+
+  mocks.read.mockResolvedValue(factoryOverview("needs-input", "blocked"));
+  mocks.control.mockResolvedValue({ _tag: "Failure", cause: "refused" });
+  await act(async () => {
+    await menuItem(view, "Cancel").props.onClick();
+  });
+  expect(mocks.read).toHaveBeenCalledTimes(1);
+  mocks.control.mockResolvedValue({ _tag: "Success", value: undefined });
+  await act(async () => {
+    await menuItem(view, "Cancel").props.onClick();
+  });
+  expect(mocks.read).toHaveBeenCalledTimes(2);
+  expect(menuLabels(view)).toEqual(["Resume", "Cancel"]);
+  await act(async () => view.unmount());
+});
+
+it("opens a Factory row's Work item from the row", async () => {
+  mocks.read.mockResolvedValue(factoryOverview("running", "running"));
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  const open = view.root.findAll(
+    (node) => node.type === "button" && node.props.children === "Open in Work",
+  )[0]!;
+  await act(async () => open.props.onClick());
+  expect(mocks.navigate).toHaveBeenCalledWith({
+    to: "/work",
+    search: {
+      project: "env:p",
+      item: "7e2aa85e-9347-44ce-b019-cb8dfd365b20:fd-aaaaaa",
+    },
+  });
   await act(async () => view.unmount());
 });

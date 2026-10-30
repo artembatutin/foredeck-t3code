@@ -52,6 +52,24 @@ const LABELS = {
 };
 
 describe("mobileFleetRows", () => {
+  it("carries the shared slot wait without counting it as needing you or moving the row", () => {
+    const rows = mobileFleetRows(
+      [
+        env(envA, [
+          delivery("newer", "2026-10-26T10:00:00.000Z"),
+          delivery("waiting", "2026-10-26T09:00:00.000Z", { capacityWait: true }),
+          delivery("blocked", "2026-10-26T08:00:00.000Z", { status: "blocked" }),
+        ]),
+      ],
+      LABELS,
+    );
+    expect(rows.map(({ key, needsYou, capacityNote }) => [key, !!needsYou, capacityNote])).toEqual([
+      ["env-a:blocked", true, undefined],
+      ["env-a:newer", false, undefined],
+      ["env-a:waiting", false, "Waiting for a project assistant slot"],
+    ]);
+  });
+
   it("lists active deliveries needing you first, with their labels, and leaves terminal ones out", () => {
     const rows = mobileFleetRows(
       [

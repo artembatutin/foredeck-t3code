@@ -4,7 +4,7 @@ import type {
   ProjectId,
   RuntimeMode,
 } from "@t3tools/contracts";
-import type { FactoryDeliveryStatus } from "@t3tools/contracts/fd/factory";
+import type { FactoryDeliveryStatus, FactoryStageName } from "@t3tools/contracts/fd/factory";
 import {
   WorkErrorReason,
   type WorkItemId,
@@ -208,6 +208,8 @@ export interface HandoffDelivery {
  * every effect of its family marked as waiting for admission.
  */
 export interface HandoffFollow extends HandoffDelivery {
+  /** The stage it is in, once it has started one. */
+  readonly stage: FactoryStageName | null;
   readonly awaiting: "effect" | "run" | "child" | null;
   readonly pullRequest: {
     readonly url: string;
@@ -221,6 +223,7 @@ export interface HandoffFollow extends HandoffDelivery {
   readonly child: {
     readonly deliveryId: string;
     readonly status: FactoryDeliveryStatus;
+    readonly stage: FactoryStageName | null;
     readonly reason: string | null;
     readonly threadId: string | null;
   } | null;

@@ -67,6 +67,7 @@ const idle: Observation = { phase: "parked", busy: false, deferred: false, unkno
 const row = (root: string, overrides: Partial<Follow> = {}): Follow => ({
   deliveryId: root,
   status: "running",
+  stage: "author",
   awaiting: "run",
   pullRequest: null,
   reason: null,
@@ -80,6 +81,7 @@ const makeFakes = () => ({
   deliveries: new Map<string, Follow>(),
   activity: { ...idle } as Observation,
   activityFails: false,
+  followFails: false,
   requests: [] as Array<HandoffBackend.HandoffRequest>,
   deferral: "stale" as "deferred" | "running" | "stale",
   /** Runs inside each `ensureDeferred`, before it answers. */
@@ -102,7 +104,10 @@ const factoryPort = (fakes: Fakes): typeof HandoffBackend.HandoffFactory.Service
         ? Option.none()
         : Option.some({ deliveryId: id, status: found.status });
     }),
-  follow: (id) => Effect.sync(() => Option.fromUndefinedOr(fakes.deliveries.get(id))),
+  follow: (id) =>
+    fakes.followFails
+      ? Effect.fail(new HandoffBackend.HandoffFactoryError({ operation: "follow" }))
+      : Effect.sync(() => Option.fromUndefinedOr(fakes.deliveries.get(id))),
   start: ({ deliveryId }) =>
     Effect.suspend(() => {
       fakes.calls.push(`start:${deliveryId}`);
@@ -418,6 +423,7 @@ describe("what a Factory assignment shows of its delivery", () => {
             child: {
               deliveryId: "child-1",
               status: "blocked",
+              stage: "verify",
               reason: "Verify still fails.",
               threadId: "child-thread",
             },
@@ -968,6 +974,214 @@ describe("a Factory assignment whose delivery ended", () => {
         assert.notStrictEqual(newest, root);
         assert.deepStrictEqual(yield* rootOf(newest), { state: "active", reason: null });
         assert.deepStrictEqual(yield* rootOf(root), { state: "retired", reason: "cancelled" });
+      }),
+    );
+  });
+});
+
+describe("what the overview shows of a Factory assignment", () => {
+  const overviewRow = Effect.flatMap(service, (assistant) => assistant.overview).pipe(
+    Effect.map(({ assignments }) => assignments[0] ?? assert.fail("No assignment.")),
+  );
+  const resume = (root: string, runId: string) => ({
+    root,
+    provenance: "unknown" as const,
+    turn: {
+      kind: "usage_limit_resume" as const,
+      threadId: ThreadId.make("author-thread"),
+      messageId: `limit-resume:${runId}` as never,
+      key: `limit-resume:${runId}`,
+      usageLimitContinuationOfRunId: runId as never,
+    },
+  });
+
+  it.effect("names its Work item from the capture, and its delivery's progress", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const root = yield* claimedAssignment(fakes);
+        fakes.deliveries.set(
+          root,
+          row(root, {
+            stage: "verify",
+            awaiting: "effect",
+            marked: [{ deliveryId: root, effectId: 7 }],
+            pullRequest: { url, outcome: null },
+          }),
+        );
+        const shown = yield* overviewRow;
+        assert.strictEqual(shown.executor, "factory");
+        // A Factory assignment has no worker thread of its own for an older client to open.
+        assert.isNull(shown.threadId);
+        assert.deepStrictEqual(shown.workItem, {
+          sourceId,
+          itemId,
+          key: "fd-idea",
+          url: null,
+        });
+        assert.deepStrictEqual(shown.factory, {
+          deliveryId: root,
+          status: "running",
+          stage: "verify",
+          needsYou: null,
+          capacityWait: true,
+          automaticWaits: { waiting: 0, blocked: 0 },
+          endedDispositions: 0,
+          notices: [],
+          pullRequestUrl: url,
+          threadId: ThreadId.make("author-thread"),
+        });
+      }),
+    );
+  });
+
+  it.effect("names an idea's capture with the item it found", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        yield* claimedAssignment(fakes);
+        const { ideas } = yield* Effect.flatMap(service, (assistant) => assistant.overview);
+        assert.deepStrictEqual(ideas[0]?.capture, {
+          state: "captured",
+          item: { sourceId, itemId, key: "fd-idea", url: null },
+        });
+      }),
+    );
+  });
+
+  it.effect("shows a parent as the child that stopped it, on that child's thread", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const root = yield* claimedAssignment(fakes);
+        fakes.deliveries.set(
+          root,
+          row(root, {
+            stage: null,
+            awaiting: "child",
+            child: {
+              deliveryId: "child-1",
+              status: "blocked",
+              stage: "verify",
+              reason: "Verify still fails.",
+              threadId: "child-thread",
+            },
+          }),
+        );
+        assert.deepInclude((yield* overviewRow).factory, {
+          deliveryId: root,
+          status: "blocked",
+          stage: "verify",
+          needsYou: "Verify still fails.",
+          threadId: ThreadId.make("child-thread"),
+        });
+      }),
+    );
+  });
+
+  it.effect("counts what waits and what is blocked, in their notices' words", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const admission = yield* HandoffAdmission.HandoffAdmission;
+        const assistant = yield* service;
+        const root = yield* claimedAssignment(fakes);
+        // Held by the root itself, its turns wait for a grant of their own.
+        assert.strictEqual((yield* admission.decideTurn(resume(root, "run-1"))).type, "demand");
+        // A marked effect is the slot wait, never an automatic follow-up.
+        yield* admission.ensureEffectDemand({ root, deliveryId: root, effectId: 8 });
+        yield* assistant.revise({
+          projectId: alpha,
+          ideaId: "idea",
+          patch: { executionAuthorized: false },
+        });
+        assert.strictEqual((yield* admission.decideTurn(resume(root, "run-2"))).type, "blocked");
+
+        const { factory } = yield* overviewRow;
+        assert.deepStrictEqual(factory?.automaticWaits, { waiting: 1, blocked: 1 });
+        assert.strictEqual(factory?.endedDispositions, 0);
+        assert.lengthOf(factory?.notices ?? [], 2);
+        assert.include(factory?.notices[0], "T3 cannot tell whether it came from the delivery");
+        assert.include(factory?.notices[1], "is blocked because");
+      }),
+    );
+  });
+
+  it.effect("keeps the counts and notices bounded however much waits", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const admission = yield* HandoffAdmission.HandoffAdmission;
+        const root = yield* claimedAssignment(fakes);
+        for (const run of [1, 2, 3, 4, 5, 6, 7]) {
+          yield* admission.decideTurn(resume(root, `run-${run}`));
+        }
+        const { factory } = yield* overviewRow;
+        assert.strictEqual(factory?.automaticWaits.waiting, 7);
+        assert.lengthOf(factory?.notices ?? [], 5);
+      }),
+    );
+  });
+
+  it.effect("says what arrived after the delivery ended, and what to do about it", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const admission = yield* HandoffAdmission.HandoffAdmission;
+        const root = yield* claimedAssignment(fakes);
+        fakes.deliveries.set(
+          root,
+          row(root, { status: "done", awaiting: null, pullRequest: { url, outcome: "merged" } }),
+        );
+        fakes.activity = { ...idle, phase: "terminal" };
+        yield* tick;
+        assert.strictEqual(yield* stateOf(), "completed");
+        const late = yield* admission.decideTurn(resume(root, "run-late"));
+        assert.strictEqual(late.type, "declined");
+        // Presented again, it records and counts nothing more.
+        yield* admission.decideTurn(resume(root, "run-late"));
+
+        const { factory, notice } = yield* overviewRow;
+        assert.strictEqual(factory?.status, "done");
+        assert.strictEqual(factory?.pullRequestUrl, url);
+        assert.strictEqual(factory?.endedDispositions, 1);
+        const expected = `author-thread hit a usage limit after this assignment ended, and was not resumed automatically. Continue it from the thread if you want.`;
+        assert.deepStrictEqual(factory?.notices, [expected]);
+        assert.strictEqual(notice, expected);
+      }),
+    );
+  });
+
+  it.effect("reads a delivery it cannot read as unknown, and keeps the other fields", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const root = yield* claimedAssignment(fakes);
+        fakes.followFails = true;
+        const shown = yield* overviewRow;
+        assert.strictEqual(shown.factory?.status, "unknown");
+        assert.strictEqual(shown.factory?.deliveryId, root);
+        assert.strictEqual(shown.workItem?.key, "fd-idea");
+      }),
+    );
+  });
+
+  it.effect("says no row exists yet for a delivery only intended", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const root = yield* claimedAssignment(fakes);
+        fakes.deliveries.delete(root);
+        const { factory } = yield* overviewRow;
+        assert.deepInclude(factory, { deliveryId: root, status: null, stage: null });
       }),
     );
   });

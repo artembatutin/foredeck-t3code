@@ -158,6 +158,7 @@ export const make = Effect.gen(function* () {
             : undefined;
         return Option.some({
           ...deliveryOf(delivery),
+          stage: state.stage,
           awaiting: awaiting?.type ?? null,
           pullRequest:
             state.pullRequest === null
@@ -170,6 +171,7 @@ export const make = Effect.gen(function* () {
               ? null
               : {
                   ...deliveryOf(child),
+                  stage: child.state.stage,
                   reason: needsYou(child.state) ?? null,
                   threadId: openThread(child),
                 },
