@@ -90,6 +90,8 @@ import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../../../workspace/WorkspacePaths.ts";
+import { ProjectAssistant } from "../../assistant/index.ts";
+import * as AssistantHandoff from "../../assistant-handoff/index.ts";
 import { RepositorySet } from "../../multirepo/index.ts";
 import * as WorkManagement from "../../work-management/index.ts";
 import * as FactoryReactor from "../FactoryReactor.ts";
@@ -800,6 +802,15 @@ const factoryLayer = (input: ServerInput) =>
   );
 
 /**
+ * The project assistant and its Work capture over the bridge's Work port, as the server composes
+ * them. Built and rebuilt with Factory, so a rebuild is a new assistant instance as a new process
+ * would be. No tick runs: a test drives the assistant's services itself.
+ */
+const assistantLayer = ProjectAssistant.layerLive.pipe(
+  Layer.provide(AssistantHandoff.layerBackend),
+);
+
+/**
  * Core's startup recovery, in the order the server runs it before anything else (see
  * `serverRuntimeStartup`): the provider runtime's recovery, then the orchestrator's delegated
  * tasks.
@@ -815,11 +826,12 @@ const recoverCore = Effect.gen(function* () {
 );
 
 /**
- * The server on the harness's database: the core services and Factory, each built in a scope of
- * its own under `parent`. `restart` closes Factory's, and with `orchestration` the core's too,
- * then builds them anew over the same database, as a new server process would: lanes, locks,
- * jobs, reactors, sessions and every other in-memory state go with the closed scopes. A rebuilt
- * core runs core's startup recovery before Factory is built over it.
+ * The server on the harness's database: the core services, and Factory with the assistant, each
+ * built in a scope of its own under `parent`. `restart` closes Factory's, and with
+ * `orchestration` the core's too, then builds them anew over the same database, as a new server
+ * process would: lanes, locks, jobs, writers, reactors, sessions and every other in-memory state
+ * go with the closed scopes. A rebuilt core runs core's startup recovery before Factory is built
+ * over it.
  */
 const makeServer = (input: ServerInput, parent: Scope.Scope) =>
   Effect.gen(function* () {
@@ -830,7 +842,11 @@ const makeServer = (input: ServerInput, parent: Scope.Scope) =>
         return { scope, context };
       });
     const buildFactory = (core: Context.Context<Layer.Success<ReturnType<typeof coreLayer>>>) =>
-      build(factoryLayer(input).pipe(Layer.provide(Layer.succeedContext(core))));
+      build(
+        Layer.merge(factoryLayer(input), assistantLayer).pipe(
+          Layer.provide(Layer.succeedContext(core)),
+        ),
+      );
     let core = yield* build(coreLayer(input));
     let factory = yield* buildFactory(core.context);
     return {
@@ -910,6 +926,7 @@ export const threadProjection = (threadId: ThreadId) =>
 type Services =
   | Layer.Success<ReturnType<typeof coreLayer>>
   | Layer.Success<ReturnType<typeof factoryLayer>>
+  | Layer.Success<typeof assistantLayer>
   | NodeServices.NodeServices;
 
 /** A started delivery whose first thread's (the author's, or a parent's planner's) turn runs. */

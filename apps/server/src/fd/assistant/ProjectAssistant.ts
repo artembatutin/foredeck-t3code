@@ -35,6 +35,8 @@ import * as Looper from "./Looper.ts";
 import * as PortfolioStore from "./PortfolioStore.ts";
 import * as Portfolio from "./portfolio.ts";
 import { Dispatch, OCCUPIED_STATES } from "./dispatch.ts";
+import * as WorkCapture from "./WorkCapture.ts";
+import * as WorkCaptureStore from "./WorkCaptureStore.ts";
 
 export class AssistantError extends Schema.TaggedError<AssistantError>()("AssistantError", {
   reason: Schema.String,
@@ -927,10 +929,17 @@ const make = Effect.gen(function* () {
  * migrates first, so no assistant store is ever built against an older schema. server.ts also
  * mounts it with core, Work and Factory persistence; one build shares the one instance.
  */
-export const layerPersistence = PortfolioStore.layer.pipe(Layer.provide(HandoffMigrations.layer));
+export const layerPersistence = Layer.merge(PortfolioStore.layer, WorkCaptureStore.layer).pipe(
+  Layer.provide(HandoffMigrations.layer),
+);
 export const layer = Layer.effect(ProjectAssistant, make).pipe(Layer.provide(layerPersistence));
-export const layerLive = layer.pipe(
-  Layer.provide(Looper.layer.pipe(Layer.provide(ProcessRunner.layer))),
+/**
+ * The assistant and its Work capture. Captures reach Work through whichever `HandoffBackend` is
+ * provided beneath this layer; without one, nothing is captured.
+ */
+export const layerLive = Layer.merge(
+  layer.pipe(Layer.provide(Looper.layer.pipe(Layer.provide(ProcessRunner.layer)))),
+  WorkCapture.layer.pipe(Layer.provide(layerPersistence)),
 );
 export const workerLayer = Layer.effectDiscard(
   Effect.gen(function* () {

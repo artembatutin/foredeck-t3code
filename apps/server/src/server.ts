@@ -1,4 +1,5 @@
 import { ProjectAssistant } from "./fd/assistant/index.ts";
+import * as AssistantHandoff from "./fd/assistant-handoff/index.ts";
 import * as WorkManagement from "./fd/work-management/index.ts";
 import * as Factory from "./fd/factory/index.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
@@ -601,6 +602,8 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
 ).pipe(
   // Core Services
   Layer.provideMerge(ProjectAssistant.layerLive),
+  // The assistant's Work port, beneath the assistant that captures through it.
+  Layer.provideMerge(AssistantHandoff.layerBackend),
   Layer.provideMerge(Factory.layerLive),
   Layer.provideMerge(WorkManagement.layerLive),
   Layer.provideMerge(layerOrchestrationApplication),

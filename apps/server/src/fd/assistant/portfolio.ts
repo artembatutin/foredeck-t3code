@@ -1,3 +1,6 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- a synchronous hash keeps this module pure.
+import * as NodeCrypto from "node:crypto";
+
 import { IsoDateTime, ProjectId, TrimmedNonEmptyString } from "@t3tools/contracts";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -452,6 +455,13 @@ export function renderAssignmentBrief(brief: ProjectBrief): string {
       : [renderList("Open questions (ask instead of assuming)", brief.openQuestions, () => "-")]),
   ].join("\n\n");
 }
+
+/**
+ * The hash a capture records of the brief it was made from: of what a worker is told, so a change
+ * of priority or authorization alone never changes it.
+ */
+export const briefScopeHash = (brief: ProjectBrief): string =>
+  NodeCrypto.createHash("sha256").update(renderAssignmentBrief(brief)).digest("hex");
 
 export const MANAGER_SUMMARY_LIMITS = { projects: 8, charactersPerProject: 600 } as const;
 
