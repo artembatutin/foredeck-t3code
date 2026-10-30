@@ -115,6 +115,15 @@ export interface EffectEntry {
   readonly fresh: boolean;
 }
 
+/**
+ * Which effect a delivery's one effect demand stands for: the row is rewritten in place when
+ * another effect of the delivery comes to wait, at a fresh position.
+ */
+export interface EffectGeneration {
+  readonly effectId: number;
+  readonly seq: number;
+}
+
 export type EffectDecision =
   | { readonly type: "proceed"; readonly admitted?: Admitted }
   | { readonly type: "defer" }
@@ -493,9 +502,14 @@ export class HandoffAdmission extends Context.Service<
     >;
     /**
      * Grants a waiting effect demand at the free fair head: a held slot and its admission. A
-     * revoked root's effect is `refused` instead, writing nothing.
+     * revoked root's effect is `refused` instead, writing nothing. With `expected`, the demand must
+     * still be the generation the caller checked: another effect of the delivery takes over the
+     * same row, and is `stale` here, since the caller knows nothing of it.
      */
-    readonly grantEffect: (demandId: number) => Effect.Effect<GrantResult, HandoffAdmissionError>;
+    readonly grantEffect: (
+      demandId: number,
+      expected?: EffectGeneration,
+    ) => Effect.Effect<GrantResult, HandoffAdmissionError>;
     /**
      * Reserves the slot for an automatic demand at the free fair head, under a lease, once the
      * fresh `work` read confirms its root; a root that fails it blocks the demand, which keeps its
@@ -563,12 +577,13 @@ export class HandoffAdmission extends Context.Service<
     }) => Effect.Effect<void, HandoffAdmissionError>;
     /**
      * An effect demand whose delivery no longer awaits that effect is deleted, with history, and
-     * `note` when given, naming how the owner goes on. A reservation of it goes too.
+     * `note` when given, naming how the owner goes on. A reservation of it goes too. Only the
+     * generation the caller found stale is deleted: `kept`, writing nothing, when another effect
+     * of the delivery has taken over the row since.
      */
-    readonly dropStaleEffect: (input: {
-      readonly demandId: number;
-      readonly note?: string;
-    }) => Effect.Effect<void, HandoffAdmissionError>;
+    readonly dropStaleEffect: (
+      input: EffectGeneration & { readonly demandId: number; readonly note?: string },
+    ) => Effect.Effect<"dropped" | "kept", HandoffAdmissionError>;
     /** Every demand of the root, oldest position first. */
     readonly demands: (root: string) => Effect.Effect<ReadonlyArray<Demand>, HandoffAdmissionError>;
     /**
@@ -971,6 +986,19 @@ const make = Effect.gen(function* () {
       (rows) => rows[0]?.count ?? 0,
     );
 
+  /**
+   * When the root's blocked demands were last checked, or now for the first of them. They are one
+   * cohort with one stamp, so a demand blocked later waits for the root's next check and the root's
+   * Work item is read at most once per interval, however staggered its blocks.
+   */
+  const blockedStamp = (root: string) =>
+    Effect.gen(function* () {
+      const [row] = yield* sql<{ readonly stamp: string | null }>`
+        SELECT MAX(blocked_checked_at) AS stamp FROM fd_assistant_admission_demands
+        WHERE root_delivery_id = ${root} AND blocked_reason IS NOT NULL`;
+      return row?.stamp ?? (yield* now);
+    });
+
   /** A fresh position from the one counter every position and slot entry is taken from. */
   const freshSeq = Effect.gen(function* () {
     const [row] = yield* sql<{ readonly next_seq: number }>`
@@ -1370,6 +1398,10 @@ const make = Effect.gen(function* () {
       const seq = yield* freshSeq;
       const at = yield* now;
       const turn = demand.kind === "turn" ? demand.turn : undefined;
+      const blockedAt =
+        demand.kind === "turn" && demand.blocked !== undefined
+          ? yield* blockedStamp(root.root_delivery_id)
+          : null;
       const columns = {
         seq,
         root_delivery_id: root.root_delivery_id,
@@ -1403,7 +1435,7 @@ const make = Effect.gen(function* () {
         notification_json: null,
         provenance: demand.kind === "turn" ? demand.provenance : null,
         blocked_reason: demand.kind === "turn" ? (demand.blocked ?? null) : null,
-        blocked_checked_at: demand.kind === "turn" && demand.blocked !== undefined ? at : null,
+        blocked_checked_at: blockedAt,
         overtaken: 0,
         requested_at: at,
       };
@@ -1421,8 +1453,9 @@ const make = Effect.gen(function* () {
           WHERE root_delivery_id = ${demand.root_delivery_id}
             AND reserved_demand_id = ${demand.id}`;
       }
+      const checkedAt = yield* blockedStamp(demand.root_delivery_id);
       yield* sql`UPDATE fd_assistant_admission_demands
-        SET state = 'waiting', blocked_reason = ${category}, blocked_checked_at = ${yield* now}
+        SET state = 'waiting', blocked_reason = ${category}, blocked_checked_at = ${checkedAt}
         WHERE id = ${demand.id}`;
       yield* history({
         assignmentId: demand.assignment_id,
@@ -2294,7 +2327,7 @@ const make = Effect.gen(function* () {
       return { type: "queued" } as const;
     }).pipe(transact("prestart"));
 
-  const grantEffect: HandoffAdmission["Service"]["grantEffect"] = (demandId) =>
+  const grantEffect: HandoffAdmission["Service"]["grantEffect"] = (demandId, expected) =>
     Effect.gen(function* () {
       const stale = { type: "stale" } as const;
       const demand = yield* readDemand(demandId);
@@ -2302,7 +2335,9 @@ const make = Effect.gen(function* () {
         demand?.kind !== "effect" ||
         demand.state !== "waiting" ||
         demand.delivery_id === null ||
-        demand.effect_id === null
+        demand.effect_id === null ||
+        (expected !== undefined &&
+          (demand.effect_id !== expected.effectId || demand.seq !== expected.seq))
       ) {
         return stale;
       }
@@ -2591,10 +2626,11 @@ const make = Effect.gen(function* () {
         DateTime.add(yield* DateTime.now, { minutes: -BLOCKED_RECHECK_MINUTES }),
       );
       const rows = yield* sql<{ readonly root_delivery_id: string }>`
-        SELECT DISTINCT d.root_delivery_id FROM fd_assistant_admission_demands d
+        SELECT d.root_delivery_id FROM fd_assistant_admission_demands d
         JOIN fd_assistant_managed_roots r ON r.root_delivery_id = d.root_delivery_id
         WHERE r.state = 'active' AND d.blocked_reason IS NOT NULL
-          AND (${options?.force === true ? 1 : 0} = 1 OR d.blocked_checked_at <= ${due})
+        GROUP BY d.root_delivery_id
+        HAVING ${options?.force === true ? 1 : 0} = 1 OR MAX(d.blocked_checked_at) <= ${due}
         ORDER BY d.root_delivery_id`;
       return rows.map((row) => row.root_delivery_id);
     }).pipe(failed("read"));
@@ -2608,11 +2644,13 @@ const make = Effect.gen(function* () {
       const due = DateTime.formatIso(
         DateTime.add(yield* DateTime.now, { minutes: -BLOCKED_RECHECK_MINUTES }),
       );
+      // The cohort is due or not as one, and is checked as one.
       const blocked = yield* sql<DemandRow>`SELECT * FROM fd_assistant_admission_demands
         WHERE root_delivery_id = ${input.root} AND blocked_reason IS NOT NULL
-          AND (${input.force === true ? 1 : 0} = 1 OR blocked_checked_at <= ${due})
         ORDER BY seq`;
       if (blocked.length === 0) return 0;
+      const lastChecked = yield* blockedStamp(input.root);
+      if (input.force !== true && lastChecked > due) return 0;
       const refusal = (yield* makeAuthority()(link)) ?? freshness(link, input.work);
       if (refusal !== undefined) {
         const at = yield* now;
@@ -2642,7 +2680,13 @@ const make = Effect.gen(function* () {
   const dropStaleEffect: HandoffAdmission["Service"]["dropStaleEffect"] = (input) =>
     Effect.gen(function* () {
       const demand = yield* readDemand(input.demandId);
-      if (demand?.kind !== "effect") return;
+      if (
+        demand?.kind !== "effect" ||
+        demand.effect_id !== input.effectId ||
+        demand.seq !== input.seq
+      ) {
+        return "kept" as const;
+      }
       yield* sql`DELETE FROM fd_assistant_slots WHERE reserved_demand_id = ${demand.id}`;
       yield* deleteDemand(demand.id);
       yield* history({
@@ -2653,6 +2697,7 @@ const make = Effect.gen(function* () {
         outcome: "stale",
       });
       if (input.note !== undefined) yield* notice(demand.assignment_id, input.note);
+      return "dropped" as const;
     }).pipe(transact("maintain"));
 
   const demands: HandoffAdmission["Service"]["demands"] = (root) =>

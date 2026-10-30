@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import { CommandId, type RuntimeRequestId, type ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 
@@ -19,10 +20,11 @@ import {
   withProject,
   type World,
 } from "./testkit/deliveryHarness.ts";
-import { agentSends, delegateFrom, providerThreadOf } from "./testkit/familyThreads.ts";
+import { agentSteers, delegateFrom, providerThreadOf } from "./testkit/familyThreads.ts";
 import { linkOf, openSingle, reviewPasses, runStarted } from "./testkit/followThrough.ts";
 import {
   admissionsOf,
+  completionSteerFellBack,
   consult,
   consultRunning,
   decisionWatch,
@@ -347,7 +349,111 @@ describe("what waits for a slot across a restart", () => {
     );
   });
 
-  it.live("an ordinary owner thread's message into a family thread runs once, inline", () =>
+  it.live("a steered result that fell back converges once with core's boot re-offer", () => {
+    const watch = decisionWatch();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const opened = yield* openSingle(world);
+          const managed = yield* manage(world, opened.deliveryId, { state: "needs-input" });
+          yield* tick;
+          const { fillers, messageId } = yield* completionSteerFellBack(
+            world,
+            watch,
+            opened,
+            managed,
+          );
+          const before = yield* demandsOf(managed.root);
+          yield* watch.forget;
+
+          yield* world.rebuild(
+            Effect.gen(function* () {
+              // Core offers the settled steer's cohort again at boot: the same demand, no run.
+              yield* watch.decided("delegated_completion", "demand");
+              yield* drainOrchestration;
+              assert.deepStrictEqual(
+                (yield* demandsOf(managed.root)).map(({ id, seq }) => [id, seq]),
+                before.map(({ id, seq }) => [id, seq]),
+              );
+              yield* tick;
+              assert.isUndefined(yield* slotOf(managed.root));
+              assert.isFalse(
+                (yield* runsOf(opened.threadId)).some((run) => run.userMessageId === messageId),
+              );
+
+              yield* release(fillers[0]!);
+              yield* tick;
+              const run = yield* runOfMessage(messageId);
+              yield* runStarted(run);
+              assert.strictEqual((yield* slotOf(managed.root))?.state, "held");
+              yield* world.endRun(run, "completed");
+              yield* tick;
+              yield* nothingLeft(managed.root);
+              assert.lengthOf(
+                (yield* runsOf(opened.threadId)).filter((row) => row.userMessageId === messageId),
+                1,
+              );
+            }),
+            { orchestration: true },
+          );
+        }),
+      { ...gated, handoff: { admission: watch.admission } },
+    );
+  });
+
+  it.live("a steered result acknowledged before its grant is moot, across a rebuild", () => {
+    const watch = decisionWatch();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const opened = yield* openSingle(world);
+          const managed = yield* manage(world, opened.deliveryId, { state: "needs-input" });
+          yield* tick;
+          const { fillers, messageId, taskId } = yield* completionSteerFellBack(
+            world,
+            watch,
+            opened,
+            managed,
+          );
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* orchestrator.dispatch({
+            type: "delegated_task.completion-delivery.acknowledge",
+            commandId: CommandId.make("test-acknowledge-steer"),
+            parentThreadId: opened.threadId,
+            taskId,
+            observedByRunId: null,
+          });
+          yield* drainOrchestration;
+
+          yield* world.rebuild(
+            Effect.gen(function* () {
+              yield* drainOrchestration;
+              yield* release(fillers[0]!);
+              yield* tick;
+              // Reserved, and the redelivery finds nothing current; its lease ends it.
+              const sql = yield* SqlClient.SqlClient;
+              yield* sql`UPDATE fd_assistant_slots SET lease_until = '2000-01-01T00:00:00.000Z'
+                WHERE root_delivery_id = ${managed.root}`;
+              yield* tick;
+              yield* nothingLeft(managed.root);
+              assert.deepInclude(yield* grantOutcomesOf(managed.root), {
+                kind: "delegated_completion",
+                outcome: "moot",
+              });
+              assert.isFalse(
+                (yield* runsOf(opened.threadId)).some((run) => run.userMessageId === messageId),
+              );
+            }),
+            { orchestration: true },
+          );
+        }),
+      { ...gated, handoff: { admission: watch.admission } },
+    );
+  });
+
+  it.live("an owner thread agent's steer that fell back runs once, inline, across a rebuild", () =>
     withProject(
       verifyCommands.passes,
       (world) =>
@@ -356,20 +462,65 @@ describe("what waits for a slot across a restart", () => {
           const managed = yield* manage(world, opened.deliveryId, { state: "needs-input" });
           yield* tick;
           yield* fill(world, 2);
-          const before = (yield* runsOf(opened.threadId)).length;
-          const ownerThread = managed.manager;
-          const run = yield* agentSends(world.projectId, opened.threadId, ownerThread);
-          assert.strictEqual((yield* runsOf(opened.threadId)).length, before + 1);
-          assert.deepStrictEqual(yield* demandsOf(managed.root), []);
+          const thread = opened.threadId;
+
+          // The owner's turn runs on the family's thread; an agent of the owner's steers into it.
+          const ownerRun = yield* world.ownerTurn(thread, "Rename the button.");
+          const turn =
+            world.provider.started.find((candidate) => candidate.runId === ownerRun) ??
+            assert.fail("The owner's turn did not start.");
+          // Steerable once its provider turn runs; the thread's earlier turns do not count.
+          const sink = yield* EventSink.EventSinkV2;
+          yield* sink.stream().pipe(
+            Stream.filter(
+              ({ event }) =>
+                event.type === "provider-turn.updated" &&
+                event.payload.runAttemptId === turn.attemptId &&
+                event.payload.status === "running",
+            ),
+            Stream.runHead,
+          );
+          const messageId = yield* agentSteers(world.projectId, thread, managed.manager);
+          const steered = (yield* runsOf(thread)).filter((run) => run.userMessageId === messageId);
+          assert.deepStrictEqual(steered, []);
+
+          // The turn ends before the steer reaches its provider: core's follow-up runs at once.
+          yield* world.provider.endTurn(turn, "completed");
+          yield* runReached(ownerRun, ["waiting", ...ended]);
+          yield* drainOrchestration;
+          const followUp = yield* runOfMessage(messageId);
+          yield* runStarted(followUp);
+          // Core's own follow-up for the steer that missed its turn, not a queued message.
+          const created = yield* sink.stream().pipe(
+            Stream.filter(
+              ({ event }) =>
+                event.type === "run.created" && event.payload.userMessageId === messageId,
+            ),
+            Stream.runHead,
+          );
+          assert.isTrue(
+            Option.exists(created, ({ commandId }) =>
+              String(commandId).startsWith("command:steer-follow-up:"),
+            ),
+          );
+
+          // Never gated: no demand, slot or admission of the root, with both slots full.
+          const nothingOfRoot = Effect.gen(function* () {
+            yield* nothingLeft(managed.root);
+            assert.lengthOf(
+              (yield* runsOf(thread)).filter((run) => run.userMessageId === messageId),
+              1,
+            );
+          });
+          yield* tick;
+          yield* nothingOfRoot;
+          yield* world.endRun(followUp, "completed");
+
           yield* world.rebuild(
             Effect.gen(function* () {
               yield* drainOrchestration;
               yield* tick;
-              assert.deepStrictEqual(yield* demandsOf(managed.root), []);
-              assert.lengthOf(
-                (yield* runsOf(opened.threadId)).filter((row) => row.id === run),
-                1,
-              );
+              yield* nothingOfRoot;
             }),
             { orchestration: true },
           );

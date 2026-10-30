@@ -29,6 +29,7 @@ import {
 } from "./testkit/followThrough.ts";
 import {
   admissionsOf,
+  completionSteerFellBack,
   consult,
   consultRunning,
   decisionWatch,
@@ -177,6 +178,87 @@ describe("a released family's automatic work", () => {
       ),
     240_000,
   );
+
+  it.live("a result presented to a released family under full capacity runs one quantum", () => {
+    const watch = decisionWatch();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const opened = yield* openSingle(world);
+          const managed = yield* manage(world, opened.deliveryId, { state: "needs-input" });
+          yield* tick;
+          assert.isUndefined(yield* slotOf(managed.root));
+          const thread = opened.threadId;
+          const ownerRun = yield* world.ownerTurn(thread, "Check the export before you merge.");
+          const delegate = yield* delegateFrom(thread, ownerRun, "user");
+          const fillers = yield* fill(world, 2);
+          yield* world.endRun(ownerRun, "completed");
+
+          // Released, with both slots held by others: it waits, one demand and no run.
+          yield* world.endRun(delegate.runId, "completed");
+          yield* watch.decided("delegated_completion", "demand");
+          const [demand] = yield* demandsOf(managed.root);
+          assert.strictEqual(demand?.kind, "delegated_completion");
+          assert.lengthOf(yield* demandsOf(managed.root), 1);
+          const messageId = demand?.messageId ?? assert.fail("No completion waits.");
+          const noRun = (yield* runsOf(thread)).filter((run) => run.userMessageId === messageId);
+          assert.deepStrictEqual(noRun, []);
+          assert.isUndefined(yield* slotOf(managed.root));
+
+          yield* tick;
+          assert.lengthOf(yield* demandsOf(managed.root), 1);
+          assert.isUndefined(yield* slotOf(managed.root));
+
+          // A slot frees: one grant, one run, counted under the family's slot until it ends.
+          yield* release(fillers[0]!);
+          yield* tick;
+          const run = yield* runOfMessage(messageId);
+          assert.deepStrictEqual(yield* demandsOf(managed.root), []);
+          yield* endAndRelease(world, managed.root, run);
+          assert.isUndefined(yield* slotOf(managed.root));
+          assert.lengthOf(
+            (yield* runsOf(thread)).filter((row) => row.userMessageId === messageId),
+            1,
+          );
+        }),
+      { ...gated, handoff: { admission: watch.admission } },
+    );
+  });
+
+  it.live("a steered result that fell back on a released family runs one quantum", () => {
+    const watch = decisionWatch();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const opened = yield* openSingle(world);
+          const managed = yield* manage(world, opened.deliveryId, { state: "needs-input" });
+          yield* tick;
+          const { fillers, messageId } = yield* completionSteerFellBack(
+            world,
+            watch,
+            opened,
+            managed,
+          );
+          yield* tick;
+          assert.lengthOf(yield* demandsOf(managed.root), 1);
+          assert.isUndefined(yield* slotOf(managed.root));
+
+          yield* release(fillers[0]!);
+          yield* tick;
+          const run = yield* runOfMessage(messageId);
+          assert.deepStrictEqual(yield* demandsOf(managed.root), []);
+          yield* endAndRelease(world, managed.root, run);
+          assert.isUndefined(yield* slotOf(managed.root));
+          assert.lengthOf(
+            (yield* runsOf(opened.threadId)).filter((row) => row.userMessageId === messageId),
+            1,
+          );
+        }),
+      { ...gated, handoff: { admission: watch.admission } },
+    );
+  });
 
   it.live("a delegated result waits while its root holds, and runs once after release", () => {
     const watch = decisionWatch();

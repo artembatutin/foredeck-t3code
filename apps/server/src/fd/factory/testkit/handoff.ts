@@ -40,10 +40,13 @@ import * as Factory from "../index.ts";
 import {
   authorCommits,
   drainOrchestration,
+  ended,
+  runReached,
   stateOf,
   threadProjection,
   type World,
 } from "./deliveryHarness.ts";
+import { delegateFrom } from "./familyThreads.ts";
 import { reviewPasses } from "./followThrough.ts";
 
 /**
@@ -941,6 +944,10 @@ export const decisionWatch = () => {
     readonly type: string;
     readonly done: Deferred.Deferred<void>;
   }> = [];
+  const presented: Array<string> = [];
+  const finished: Array<string> = [];
+  const finishing: Array<{ readonly messageId: string; readonly done: Deferred.Deferred<void> }> =
+    [];
   return {
     admission: (
       service: HandoffAdmission.HandoffAdmission["Service"],
@@ -951,6 +958,7 @@ export const decisionWatch = () => {
           Effect.suspend(() => {
             const entry = { kind: input.turn.kind, type: decision.type };
             seen.push(entry);
+            presented.push(input.turn.kind);
             return Effect.forEach(
               waiting.filter(({ kind, type }) => kind === entry.kind && type === entry.type),
               ({ done }) => Deferred.succeed(done, undefined),
@@ -958,7 +966,33 @@ export const decisionWatch = () => {
             );
           }),
         ),
+      // An admission marked dispatched: what the release pass waits for.
+      markDispatched: service.markDispatched,
+      dispatchAdmitted: ((decide, dispatch, options) =>
+        Effect.tap(service.dispatchAdmitted(decide, dispatch, options), ({ decision }) =>
+          Effect.suspend(() => {
+            const admitted = decision.admitted;
+            if (admitted === undefined) return Effect.void;
+            finished.push(admitted.kind);
+            return Effect.forEach(
+              finishing.filter(({ messageId }) => messageId === admitted.kind),
+              ({ done }) => Deferred.succeed(done, undefined),
+              { discard: true },
+            );
+          }),
+        )) as typeof service.dispatchAdmitted,
     }),
+    /** How many times a turn of the kind was presented, across every rebuild. */
+    presentations: (kind: string) =>
+      Effect.sync(() => presented.filter((entry) => entry === kind).length),
+    /** Waits for an admission of the kind (`automatic_turn`, say) to finish its dispatch. */
+    dispatched: (kind: string) =>
+      Effect.suspend(() => {
+        if (finished.includes(kind)) return Effect.void;
+        const done = Deferred.makeUnsafe<void>();
+        finishing.push({ messageId: kind, done });
+        return Deferred.await(done);
+      }),
     /** Forgets what was decided, for a test to wait on a later decision of the same turn. */
     forget: Effect.sync(() => void seen.splice(0)),
     decided: (kind: string, type: string) =>
@@ -970,6 +1004,52 @@ export const decisionWatch = () => {
       }),
   };
 };
+
+/**
+ * A governed item at its open pull request and released, with the owner's turn running on its
+ * thread: a task the owner delegated there has ended, and its result, admitted at the free head,
+ * was steered into that turn. Then both slots go to others, and the turn ends before the steer
+ * reaches its provider, so core's follow-up presents the result again. It waits, with no run.
+ */
+export const completionSteerFellBack = (
+  world: World,
+  watch: ReturnType<typeof decisionWatch>,
+  opened: {
+    readonly deliveryId: FactoryDeliveryId;
+    readonly threadId: ThreadId;
+  },
+  managed: Managed,
+) =>
+  Effect.gen(function* () {
+    const threadId = opened.threadId;
+    const ownerRun = yield* world.ownerTurn(threadId, "Check the export before you merge.");
+    const delegate = yield* delegateFrom(threadId, ownerRun, "user");
+    yield* world.endRun(delegate.runId, "completed");
+    yield* watch.decided("delegated_completion", "admitted");
+    yield* watch.dispatched("automatic_turn");
+
+    // Nothing of the result's own runs: the family is quiet, and its slot goes.
+    yield* tick;
+    assert.isUndefined(yield* slotOf(managed.root));
+    const fillers = yield* fill(world, 2);
+    const runs = (yield* runsOf(threadId)).length;
+
+    const turn =
+      world.provider.started.find((candidate) => candidate.runId === ownerRun) ??
+      assert.fail("The owner's turn did not start.");
+    yield* world.provider.endTurn(turn, "completed");
+    yield* runReached(ownerRun, ["waiting", ...ended]);
+    yield* drainOrchestration;
+    yield* watch.decided("delegated_completion", "demand");
+
+    const [demand] = yield* demandsOf(managed.root);
+    assert.strictEqual(demand?.kind, "delegated_completion");
+    assert.lengthOf(yield* demandsOf(managed.root), 1);
+    const messageId = demand?.messageId ?? assert.fail("No completion waits.");
+    assert.strictEqual((yield* runsOf(threadId)).length, runs);
+    assert.isUndefined(yield* slotOf(managed.root));
+    return { fillers, messageId, ownerRun, taskId: delegate.taskId };
+  });
 
 /** Fails core's effect outbox reads until the returned effect restores them, by hiding its table. */
 export const failOutboxReads = Effect.gen(function* () {

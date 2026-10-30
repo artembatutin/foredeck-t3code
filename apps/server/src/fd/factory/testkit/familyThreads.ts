@@ -134,6 +134,31 @@ export const agentSends = (projectId: ProjectId, threadId: ThreadId, senderThrea
   }).pipe(Effect.orDie);
 
 /**
+ * An agent's message from `senderThreadId` steered into the thread's running turn, as
+ * `t3_thread_send` in auto mode does. Its steer effect stays queued for the next drain, so a test
+ * can end the turn first. Returns the message.
+ */
+export const agentSteers = (projectId: ProjectId, threadId: ThreadId, senderThreadId: ThreadId) =>
+  Effect.gen(function* () {
+    agentMessages += 1;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const messageId = MessageId.make(`test-agent-steer:${agentMessages}`);
+    yield* threads.sendToThread({
+      projectId,
+      commandId: CommandId.make(`test-agent-steer:${agentMessages}`),
+      threadId,
+      messageId,
+      senderThreadId,
+      text: "Check the export once more.",
+      attachments: [],
+      mode: "auto",
+      createdBy: "agent",
+      creationSource: "mcp",
+    });
+    return messageId;
+  }).pipe(Effect.orDie);
+
+/**
  * Ends the provider turn of the run and waits until orchestration has finished it and Factory's
  * reactor has handed its end on, but not for the effects that set off: one a test holds back
  * stays in flight.

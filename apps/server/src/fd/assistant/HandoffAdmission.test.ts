@@ -1079,6 +1079,161 @@ describe("fresh authority", () => {
   );
 });
 
+describe("a root's blocked demands, checked as one", () => {
+  const edited: HandoffAdmission.WorkRead = { type: "read", fingerprint: "edited", status: "todo" };
+  const due = Effect.flatMap(service, (admission) => admission.blockedRoots()).pipe(Effect.orDie);
+
+  it.effect("are due once per interval, however staggered their blocks", () =>
+    withAdmission(() =>
+      Effect.gen(function* () {
+        const admission = yield* service;
+        yield* seed("subject", { state: "running", root: "root-s" });
+        const block = (turn: AutomaticTurnGate.AutomaticTurn) =>
+          decide({ root: "root-s", turn }, edited);
+
+        // Blocked a minute apart, they share the root's one stamp.
+        yield* block(turns.limit());
+        yield* TestClock.adjust("1 minute");
+        assert.strictEqual((yield* block(turns.limit())).decision.type, "blocked");
+        assert.deepStrictEqual(yield* due, []);
+
+        // Due at the first's interval, the check covers both.
+        yield* TestClock.adjust("1 minute");
+        assert.deepStrictEqual(yield* due, ["root-s"]);
+        yield* admission.recheckBlocked({ root: "root-s", work: edited }).pipe(Effect.orDie);
+        assert.deepStrictEqual(yield* due, []);
+
+        // A minute on, the second's own block would have fallen due: the root is not.
+        yield* TestClock.adjust("1 minute");
+        assert.deepStrictEqual(yield* due, []);
+        assert.strictEqual(
+          yield* admission
+            .recheckBlocked({ root: "root-s", work: freshRead("subject") })
+            .pipe(Effect.orDie),
+          0,
+          "not due, so a read that would restore it changes nothing",
+        );
+        assert.lengthOf(
+          (yield* demandsOf("root-s")).filter(({ blockedReason }) => blockedReason !== null),
+          2,
+        );
+
+        // A demand blocked just before the next check joins it, and does not put it off.
+        yield* TestClock.adjust("59 seconds");
+        yield* block(turns.limit());
+        yield* TestClock.adjust("1 second");
+        assert.deepStrictEqual(yield* due, ["root-s"]);
+        assert.strictEqual(
+          yield* admission
+            .recheckBlocked({ root: "root-s", work: freshRead("subject") })
+            .pipe(Effect.orDie),
+          3,
+        );
+        assert.deepStrictEqual(
+          (yield* demandsOf("root-s")).map(({ blockedReason }) => blockedReason),
+          [null, null, null],
+        );
+      }),
+    ),
+  );
+
+  it.effect("are checked at once, all of them, when a resume forces it", () =>
+    withAdmission(() =>
+      Effect.gen(function* () {
+        const admission = yield* service;
+        yield* seed("subject", { state: "running", root: "root-s" });
+        yield* decide({ root: "root-s", turn: turns.limit() }, edited);
+        yield* TestClock.adjust("1 minute");
+        yield* decide({ root: "root-s", turn: turns.limit() }, edited);
+        assert.deepStrictEqual(yield* due, []);
+        assert.deepStrictEqual(yield* admission.blockedRoots({ force: true }).pipe(Effect.orDie), [
+          "root-s",
+        ]);
+        assert.strictEqual(
+          yield* admission
+            .recheckBlocked({ root: "root-s", work: freshRead("subject"), force: true })
+            .pipe(Effect.orDie),
+          2,
+        );
+      }),
+    ),
+  );
+});
+
+describe("an effect demand taken over by a later effect", () => {
+  /** A delivery's effect waiting, then a later effect of it waiting in the same row. */
+  const replaced = Effect.gen(function* () {
+    const subject = yield* seed("subject", { state: "running", root: "root-s" });
+    yield* fill(2);
+    yield* enter({ root: "root-s", effectId: 1 }, subject.work);
+    const [first] = yield* demandsOf("root-s");
+    yield* enter({ root: "root-s", effectId: 2 }, subject.work);
+    const [second] = yield* demandsOf("root-s");
+    assert.strictEqual(second?.id, first?.id);
+    assert.strictEqual(second?.effectId, 2);
+    assert.isAbove(second!.seq, first!.seq);
+    return { first: first!, second: second! };
+  });
+
+  it.effect("is not dropped by a check of the earlier effect", () =>
+    withAdmission(() =>
+      Effect.gen(function* () {
+        const admission = yield* service;
+        const { first, second } = yield* replaced;
+        const before = yield* snapshot;
+        assert.strictEqual(
+          yield* admission
+            .dropStaleEffect({
+              demandId: first.id,
+              effectId: 1,
+              seq: first.seq,
+              note: "Stale.",
+            })
+            .pipe(Effect.orDie),
+          "kept",
+        );
+        assert.deepStrictEqual(yield* snapshot, before);
+        assert.notInclude(
+          (yield* assignmentOf("subject")).progress.map(({ text }) => text),
+          "Stale.",
+        );
+        // Checked as it stands, it goes.
+        assert.strictEqual(
+          yield* admission
+            .dropStaleEffect({ demandId: second.id, effectId: 2, seq: second.seq })
+            .pipe(Effect.orDie),
+          "dropped",
+        );
+        assert.deepStrictEqual(yield* demandsOf("root-s"), []);
+      }),
+    ),
+  );
+
+  it.effect("is not granted under the earlier effect's check", () =>
+    withAdmission(() =>
+      Effect.gen(function* () {
+        const admission = yield* service;
+        const { first, second } = yield* replaced;
+        yield* admission
+          .release("root-other-1", (yield* slotOf("root-other-1"))!.entry_seq)
+          .pipe(Effect.orDie);
+        const before = yield* snapshot;
+        assert.deepStrictEqual(
+          yield* admission
+            .grantEffect(first.id, { effectId: 1, seq: first.seq })
+            .pipe(Effect.orDie),
+          { type: "stale" },
+        );
+        assert.deepStrictEqual(yield* snapshot, before);
+        const granted = yield* admission
+          .grantEffect(second.id, { effectId: 2, seq: second.seq })
+          .pipe(Effect.orDie);
+        assert.strictEqual(granted.type, "granted");
+      }),
+    ),
+  );
+});
+
 describe("fresh authority after a rescope", () => {
   it.effect("never rebinds a root to a rescoped brief, authorized again", () =>
     withAdmission(() =>

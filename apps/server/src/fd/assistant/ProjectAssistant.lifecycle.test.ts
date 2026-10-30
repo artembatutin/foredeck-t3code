@@ -82,6 +82,9 @@ const makeFakes = () => ({
   activityFails: false,
   requests: [] as Array<HandoffBackend.HandoffRequest>,
   deferral: "stale" as "deferred" | "running" | "stale",
+  /** Runs inside each `ensureDeferred`, before it answers. */
+  onDeferral: undefined as Effect.Effect<void> | undefined,
+  workReads: 0,
   startFails: false,
   runState: "ended" as "live" | "ended" | "none" | "fails",
   /** Every Factory call but a read, in order, as `<operation>:<id>`. */
@@ -144,9 +147,11 @@ const factoryPort = (fakes: Fakes): typeof HandoffBackend.HandoffFactory.Service
         : Effect.succeed(fakes.activity),
     ),
   ensureDeferred: (id, effectId) =>
-    Effect.sync(() => {
+    Effect.suspend(() => {
       fakes.calls.push(`ensureDeferred:${id}:${effectId}`);
-      return fakes.deferral;
+      const hook = fakes.onDeferral;
+      fakes.onDeferral = undefined;
+      return Effect.as(hook ?? Effect.void, fakes.deferral);
     }),
   redispatch: (id, effectId) =>
     Effect.sync(() => {
@@ -216,18 +221,22 @@ const layerOf = (fakes: Fakes) => {
     Layer.succeed(HandoffBackend.HandoffBackend, {
       ...HandoffBackend.HandoffBackend.defaultValue(),
       read: (ref) =>
-        Effect.succeed({
-          ref,
-          key: ref.itemId,
-          url: null,
-          title: "An item",
-          status: "todo",
-          revision: "1",
-          invalid: false,
-          body: "",
-          fingerprint: "print",
-          notes: "",
-        }),
+        Effect.sync(() => {
+          fakes.workReads += 1;
+        }).pipe(
+          Effect.as({
+            ref,
+            key: ref.itemId,
+            url: null,
+            title: "An item",
+            status: "todo",
+            revision: "1",
+            invalid: false,
+            body: "",
+            fingerprint: "print",
+            notes: "",
+          } as const),
+        ),
     }),
   );
   return Assistant.layer.pipe(Layer.provideMerge(admission), Layer.provide(core));
@@ -672,6 +681,89 @@ describe("a Factory assignment's waiting work, each tick", () => {
         assert.isNull(demand?.blockedReason ?? null);
         assert.strictEqual(demand?.state, "reserved");
         assert.strictEqual(yield* slotOf(root), "reserved");
+      }),
+    );
+  });
+
+  it.effect("reads a root's item once per interval however staggered its blocks", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const admission = yield* HandoffAdmission.HandoffAdmission;
+        const root = yield* released(fakes);
+        // Stays revoked throughout, so nothing it reads unblocks anything.
+        yield* revise(false);
+        yield* admission.decideTurn(resume(root, "run-1"));
+        yield* TestClock.adjust("1 minute");
+        yield* admission.decideTurn(resume(root, "run-2"));
+        fakes.workReads = 0;
+
+        // Over five minutes of ticks, the root's two re-checks are two minutes apart.
+        const readsAt: Array<number> = [];
+        for (let minute = 1; minute <= 5; minute += 1) {
+          yield* TestClock.adjust("1 minute");
+          const before = fakes.workReads;
+          yield* tick;
+          yield* tick;
+          if (fakes.workReads > before) readsAt.push(minute);
+          assert.isAtMost(fakes.workReads - before, 1);
+        }
+        assert.deepStrictEqual(readsAt, [1, 3, 5]);
+      }),
+    );
+  });
+
+  it.effect("keeps a demand a later effect took over while its old effect was checked", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const admission = yield* HandoffAdmission.HandoffAdmission;
+        const assistant = yield* service;
+        const sql = yield* SqlClient.SqlClient;
+        const root = yield* released(fakes);
+        fakes.deliveries.set(root, row(root, { status: "blocked", awaiting: null, reason: "No." }));
+        for (const id of ["other", "other-2"]) {
+          yield* sql`INSERT INTO fd_assistant_assignments ${sql.insert({
+            assignment_id: id,
+            project_id: alpha,
+            idea_id: id,
+            executor: "foredeck",
+            attempt: 1,
+            state: "running",
+            worker_refs_json: "[]",
+            progress_json: "[]",
+            evidence_json: "[]",
+            created_at: at,
+            updated_at: at,
+          })}`;
+        }
+        yield* admission.ensureEffectDemand({ root, deliveryId: root, effectId: 7 });
+
+        // While effect 7 is found stale, a Factory resume's effect 8 takes over its row.
+        fakes.deferral = "stale";
+        fakes.onDeferral = admission
+          .enter({ root, deliveryId: root, effectId: 8, fresh: false })
+          .pipe(Effect.asVoid, Effect.orDie);
+        yield* assistant.tick;
+
+        const [kept] = yield* admission.demands(root);
+        assert.strictEqual(kept?.effectId, 8);
+        assert.isFalse((yield* notes).some((note) => note.includes("lost its place")));
+
+        // Its own check comes next, whose mark the tick repairs.
+        fakes.deferral = "deferred";
+        yield* assistant.tick;
+        assert.include(fakes.calls, `ensureDeferred:${root}:8`);
+        assert.lengthOf(yield* admission.demands(root), 1);
+
+        // Granted, it is the later effect that runs.
+        yield* sql`UPDATE fd_assistant_assignments SET state = 'completed'
+          WHERE assignment_id = 'other'`;
+        yield* assistant.tick;
+        assert.include(fakes.calls, `redispatch:${root}:8`);
+        assert.notInclude(fakes.calls, `redispatch:${root}:7`);
       }),
     );
   });

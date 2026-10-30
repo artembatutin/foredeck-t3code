@@ -33,6 +33,8 @@ export function currentDelegatedCompletionDelivery(
     sourceRun?.delegatedCompletion?.disposition !== "open" ||
     delivery === null ||
     delivery === undefined ||
+    // Every task of it was acknowledged while its steer waited: nothing is left to report.
+    delivery.taskIds.length === 0 ||
     delivery.generation !== completion.generation ||
     delivery.messageId !== completion.messageId ||
     (alreadyDispatched && !isUndeliveredMailboxSteer(projection, completion.messageId))

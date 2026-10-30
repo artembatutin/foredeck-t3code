@@ -770,6 +770,8 @@ export const make = Effect.gen(function* () {
         if (marked === "stale") {
           yield* admission.dropStaleEffect({
             demandId: demand.id,
+            effectId: demand.effectId,
+            seq: demand.seq,
             note: staleEffectNotice(root),
           });
         }
@@ -1123,12 +1125,16 @@ export const make = Effect.gen(function* () {
       if (marked === "stale") {
         yield* admission.dropStaleEffect({
           demandId: demand.id,
+          effectId,
+          seq: demand.seq,
           note: staleEffectNotice(demand.root),
         });
         return true;
       }
-      const { decision } = yield* admission.dispatchAdmitted(admission.grantEffect(demand.id), () =>
-        factory.redispatch(deliveryId, effectId),
+      // Only the generation just checked: its redispatch names that effect and no other.
+      const { decision } = yield* admission.dispatchAdmitted(
+        admission.grantEffect(demand.id, { effectId, seq: demand.seq }),
+        () => factory.redispatch(deliveryId, effectId),
       );
       // Asked again, a revoked root's delivery refuses the effect itself and blocks.
       if (decision.type === "refused") {

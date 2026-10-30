@@ -200,6 +200,96 @@ describe("an effect waiting for a slot", () => {
     );
   });
 
+  it.live("a demand a resume's new effect took over survives the check of its old effect", () => {
+    const spy = spyOnFactoryPort();
+    const hook: { duringStale: Effect.Effect<void> | undefined } = { duringStale: undefined };
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const factory = yield* factoryService;
+          const { root, filler } = yield* atGateWithFullCapacity(world);
+          yield* refuseMarks;
+          yield* factory.approvePlan(root);
+          yield* drainFactory;
+          yield* allowMarks;
+          yield* hideDemands;
+          yield* world.rebuild(
+            Effect.gen(function* () {
+              yield* drainFactory;
+              assert.strictEqual((yield* stateOf(root)).status, "blocked");
+              yield* showDemands;
+              const rebuilt = yield* factoryService;
+              const [oldDemand] = yield* demandsOf(root);
+              const oldEffect = oldDemand?.effectId ?? assert.fail("No demand waits.");
+
+              // While the tick checks the old effect, the owner resumes in Factory: a new effect
+              // waits in the same row, and the mark on it cannot be stored.
+              const context = yield* Effect.context<
+                SqlClient.SqlClient | Factory.FactoryWorker.FactoryWorker
+              >();
+              hook.duringStale = Effect.gen(function* () {
+                yield* refuseMarks;
+                yield* rebuilt.resume(root).pipe(Effect.orDie);
+                const worker = yield* Factory.FactoryWorker.FactoryWorker;
+                yield* worker.drain;
+                yield* allowMarks;
+              }).pipe(Effect.provideContext(context), Effect.orDie);
+              yield* tick;
+
+              // The replacement stands, unmarked, with no note that it was lost.
+              const [kept] = yield* demandsOf(root);
+              const newEffect = kept?.effectId ?? assert.fail("The replacement was dropped.");
+              assert.isAbove(newEffect, oldEffect);
+              assert.strictEqual(kept?.id, oldDemand?.id);
+              const replaced = yield* stateOf(root);
+              assert.strictEqual(replaced.status, "running");
+              assert.notProperty(replaced, "admissionWait");
+              assert.isFalse(
+                (yield* noticesOf("big")).some((note) => note.includes("Resume it to go on")),
+              );
+
+              // The next tick repairs the mark, since its demand is still there to check.
+              yield* tick;
+              assert.deepStrictEqual((yield* stateOf(root)).admissionWait, {
+                effectId: newEffect,
+              });
+              assert.deepStrictEqual((yield* stateOf(root)).children, []);
+
+              // A slot frees: granted, it runs once.
+              yield* release(filler);
+              yield* tick;
+              yield* drainFactory;
+              assert.lengthOf((yield* stateOf(root)).children, 1);
+              assert.deepStrictEqual(yield* demandsOf(root), []);
+              yield* tick;
+              yield* drainFactory;
+              assert.lengthOf((yield* stateOf(root)).children, 1);
+            }),
+          );
+        }),
+      {
+        handoff: {},
+        automaticTurnGate: true,
+        assistantFactory: (service) => {
+          const wrapped = spy.wrap(service);
+          return {
+            ...wrapped,
+            ensureDeferred: (deliveryId, effectId) =>
+              Effect.tap(wrapped.ensureDeferred(deliveryId, effectId), (outcome) =>
+                Effect.suspend(() => {
+                  const during = hook.duringStale;
+                  if (outcome !== "stale" || during === undefined) return Effect.void;
+                  hook.duringStale = undefined;
+                  return during;
+                }),
+              ),
+          };
+        },
+      },
+    );
+  });
+
   it.live("a boot read failure blocks it; the tick drops the demand, and Resume goes on", () => {
     const spy = spyOnFactoryPort();
     return withProject(

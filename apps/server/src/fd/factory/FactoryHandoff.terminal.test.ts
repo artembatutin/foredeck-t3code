@@ -1,16 +1,34 @@
 import { assert, describe, it } from "@effect/vitest";
+import {
+  CommandId,
+  EventId,
+  ProviderThreadId,
+  RunId,
+  ThreadId,
+  type ThreadPullRequestLink,
+  TurnItemId,
+} from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
+import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 
 import * as AutomaticTurnGate from "../../orchestration-v2/AutomaticTurnGate.ts";
+import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import { HandoffAdmission, HandoffBackend, ProjectAssistant } from "../assistant/index.ts";
 import * as Factory from "./index.ts";
+// After Factory's entry: core's runtime cannot be the first module of its import cycle to load.
+import * as UsageLimitRecoveryWorker from "../../orchestration-v2/UsageLimitRecoveryWorker.ts";
+import * as Scheduler from "../../scheduling/Scheduler.ts";
+import * as ServerSettings from "../../serverSettings.ts";
 import {
   authorCommits,
   drainFactory,
   drainOrchestration,
   fakePullRequest,
   stateOf,
+  threadProjection,
   verifyCommands,
   withProject,
   type World,
@@ -22,6 +40,7 @@ import {
   openSingle,
   ownerQueues,
   syncPullRequest,
+  threadShell,
 } from "./testkit/followThrough.ts";
 import {
   admissionsOf,
@@ -70,12 +89,16 @@ interface Record {
   readonly dropped: Array<string>;
 }
 
+/** Whether what waits on a root waits for a slot, or is blocked by a revocation since restored. */
+type Waiting = "waiting" | "blocked";
+
 /**
  * A governed single item at its open pull request, released, with both slots held by others, and
- * one waiting demand of every automatic kind, a scope-blocked one, and kept native wakes of both
- * shapes. Returns what was seeded and the record of what ran or was cleared.
+ * one demand of every automatic kind, kept native wakes of both shapes among them, all waiting for
+ * a slot or all blocked by a revocation that has since been restored, plus an effect's demand.
+ * Returns what was seeded and the record of what ran or was cleared.
  */
-const seeded = (world: World) =>
+const seeded = (world: World, mode: Waiting) =>
   Effect.gen(function* () {
     const admission = yield* HandoffAdmission.HandoffAdmission;
     const assistant = yield* ProjectAssistant.ProjectAssistant;
@@ -94,6 +117,13 @@ const seeded = (world: World) =>
       turns.backgroundWake(thread, providerThread, true),
       turns.backgroundWake(thread, providerThread, false),
     ];
+    const authorize = (executionAuthorized: boolean) =>
+      assistant.revise({
+        projectId: world.projectId,
+        ideaId: managed.ideaId,
+        patch: { executionAuthorized },
+      });
+    if (mode === "blocked") yield* authorize(false);
     for (const turn of waiting) {
       assert.deepStrictEqual(
         yield* consult(turn, record),
@@ -101,22 +131,16 @@ const seeded = (world: World) =>
         turn.kind,
       );
     }
-    // A demand blocked by a revocation stays blocked once the brief is restored.
-    yield* assistant.revise({
-      projectId: world.projectId,
-      ideaId: managed.ideaId,
-      patch: { executionAuthorized: false },
-    });
+    if (mode === "blocked") yield* authorize(true);
+    // Each kind's own demand, blocked or not as asked; both native wakes are kept.
+    const demands = yield* demandsOf(managed.root);
     assert.deepStrictEqual(
-      yield* consult(turns.usageLimitResume(thread, opened.runId), record),
-      AutomaticTurnGate.notNow("deferred"),
+      demands.map(({ kind }) => kind),
+      waiting.map(({ kind }) => kind),
     );
-    yield* assistant.revise({
-      projectId: world.projectId,
-      ideaId: managed.ideaId,
-      patch: { executionAuthorized: true },
-    });
-    assert.isTrue((yield* demandsOf(managed.root)).some((demand) => demand.blockedReason !== null));
+    assert.isTrue(
+      demands.every(({ blockedReason }) => (blockedReason !== null) === (mode === "blocked")),
+    );
     // An effect demand: effect history is retired, with no disposition.
     yield* admission.ensureEffectDemand({
       root: managed.root,
@@ -125,6 +149,148 @@ const seeded = (world: World) =>
     });
     return { opened, managed, record, thread, waiting, runs: (yield* runsOf(thread)).length };
   });
+
+/** The assignment queued for its first claim, claimed directly: its start has not been called. */
+const claimedForFailure = Effect.gen(function* () {
+  const admission = yield* HandoffAdmission.HandoffAdmission;
+  const root = "7e2aa85e-9347-44ce-b019-cb8dfd365b20" as FactoryDeliveryId;
+  const claimed = yield* admission.claim({ assignmentId: "export", deliveryId: root });
+  if (claimed.type !== "claimed") return assert.fail("The assignment was not claimed.");
+  yield* admission.markDispatched(claimed.admitted);
+  return { root };
+});
+
+/** Factory refuses the start before writing a row, so no delivery can exist. */
+const refuseTheStart = (spy: ReturnType<typeof spyOnFactoryPort>) => {
+  spy.control.onStart = () =>
+    Effect.fail(
+      new HandoffBackend.HandoffFactoryRefused({
+        operation: "start",
+        reason: "no_base_commit",
+      }),
+    );
+};
+
+/**
+ * One turn of every automatic kind, on the threads of a delivery that never existed: each native
+ * wake of its own provider thread, so each keeps a disposition of its own.
+ */
+const lateTurnsWithoutThreads = (label: string) => {
+  const thread = ThreadId.make("factory-thread:missing:1");
+  const run = RunId.make(`run-${label}`);
+  const providerThread = (suffix: string) => ProviderThreadId.make(`${label}-provider-${suffix}`);
+  return [
+    pullRequestWakeTurn(thread, {
+      host: "github.com",
+      repository: "acme/alpha",
+      number: fakePullRequest.number,
+      url: `${fakePullRequest.url}-${label}`,
+      watch: { startedAt: "2026-10-30T12:00:00.000Z", failedChecks: [] },
+    } as unknown as ThreadPullRequestLink),
+    turns.usageLimitResume(thread, run),
+    turns.delegatedQuestion(thread, { childThreadId: thread, taskId: questionTask }, run),
+    turns.delegatedCompletion(thread, run, providerThread("completion")),
+    turns.backgroundWake(thread, providerThread("clearable"), true),
+    turns.backgroundWake(thread, providerThread("plain"), false),
+  ];
+};
+
+/** What a native wake's offer gives the admission to keep: a drop only if it can be cleared. */
+const keptFor = (turn: AutomaticTurnGate.AutomaticTurn, dropped: Array<string>) =>
+  turn.kind === "background_wake"
+    ? {
+        kept: {
+          dispatch: Effect.die("A failed root's wake never runs."),
+          ...(turn.clearable ? { drop: Effect.sync(() => void dropped.push(turn.messageId)) } : {}),
+        },
+      }
+    : {};
+
+/**
+ * Core's usage-limit recovery worker, whose sweep the test runs as the scheduler would, over the
+ * server's records and the automatic turn gate it consults, with resuming limited threads on.
+ */
+const withLimitSweep = <A, E, R>(body: (sweep: Effect.Effect<void>) => Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const registered = yield* Deferred.make<Effect.Effect<void>>();
+    const worker = UsageLimitRecoveryWorker.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(Scheduler.Scheduler)({
+            register: <SweepE, SweepR>(
+              _name: string,
+              runDueWork: Effect.Effect<void, SweepE, SweepR>,
+            ) =>
+              Effect.gen(function* () {
+                const context = yield* Effect.context<SweepR>();
+                yield* Deferred.succeed(
+                  registered,
+                  runDueWork.pipe(Effect.provideContext(context), Effect.orDie),
+                );
+              }),
+          }),
+          ServerSettings.layerTest({ autoResumeLimitedThreads: true }),
+        ),
+      ),
+    );
+    return yield* Effect.flatMap(Deferred.await(registered), body).pipe(Effect.provide(worker));
+  });
+
+/**
+ * The run fails on a usage limit, reported as a provider reports it, with a reset that has already
+ * passed since the run ended, so a sweep arms the recovery and the next finds its resume due.
+ */
+const usageLimitFailure = (threadId: ThreadId, runId: RunId) =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const { runs } = yield* threadProjection(threadId);
+    const run = runs.find((candidate) => candidate.id === runId) ?? assert.fail("No such run.");
+    const now = yield* DateTime.now;
+    const completedAt = DateTime.subtract(now, { minutes: 2 });
+    yield* sink.write({
+      commandId: CommandId.make(`test-usage-limit:${runId}`),
+      events: [
+        {
+          id: EventId.make(`test-usage-limit-run:${runId}`),
+          type: "run.updated",
+          threadId,
+          occurredAt: now,
+          payload: { ...run, status: "failed", completedAt },
+        },
+        {
+          id: EventId.make(`test-usage-limit-error:${runId}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`test-usage-limit-error:${runId}`),
+            type: "error",
+            threadId,
+            runId,
+            nodeId: run.rootNodeId,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 99,
+            status: "failed",
+            title: "Usage limit reached",
+            startedAt: completedAt,
+            completedAt,
+            updatedAt: completedAt,
+            failure: {
+              class: "usage_limit",
+              message: "Plan limit reached.",
+              code: "usageLimitExceeded",
+              retryable: null,
+              resetAt: DateTime.formatIso(DateTime.subtract(now, { minutes: 1 })),
+            },
+          },
+        },
+      ],
+    });
+    yield* drainOrchestration;
+  }).pipe(Effect.orDie);
 
 /** Takes the delivery to the terminal outcome, as its owner, its host or its merge does. */
 const endDelivery = (
@@ -196,25 +362,28 @@ const stableAcrossTicksAndRebuilds = (world: World, check: Effect.Effect<void, n
   });
 
 describe("a governed root reaching a terminal outcome", () => {
-  it.live.each([
-    { outcome: "done" as const, reason: "completed" as const },
-    { outcome: "owner-cancel" as const, reason: "cancelled" as const },
-    { outcome: "closed-unmerged" as const, reason: "cancelled" as const },
-  ])(
-    "$outcome retires it with zero runs and one disposition per key, under full capacity",
-    ({ outcome, reason }) =>
+  it.live.each(
+    (["waiting", "blocked"] as const).flatMap((mode) => [
+      { mode, outcome: "done" as const, reason: "completed" as const },
+      { mode, outcome: "owner-cancel" as const, reason: "cancelled" as const },
+      { mode, outcome: "closed-unmerged" as const, reason: "cancelled" as const },
+    ]),
+  )(
+    "$outcome with every kind $mode retires it with zero runs and one disposition per key",
+    ({ mode, outcome, reason }) =>
       withProject(
         verifyCommands.passes,
         (world) =>
           Effect.gen(function* () {
-            const { opened, managed, record, thread, waiting, runs } = yield* seeded(world);
+            const { opened, managed, record, thread, waiting, runs } = yield* seeded(world, mode);
             yield* endDelivery(world, outcome, opened.deliveryId, thread);
 
             yield* tick;
             // Every automatic kind's disposition, with the two native wakes one per provider
-            // thread, plus the blocked usage-limit resume's.
+            // thread.
             const native = waiting.filter(({ kind }) => kind === "background_wake");
-            yield* retiredAsExpected(managed, reason, waiting.length - native.length + 2);
+            const expected = waiting.length - native.length + 1;
+            yield* retiredAsExpected(managed, reason, expected);
             assert.deepStrictEqual(record.ran, []);
             assert.strictEqual((yield* runsOf(thread)).length, runs);
             // The kept dispatches are gone; only the offer that can be cleared was.
@@ -226,7 +395,7 @@ describe("a governed root reaching a terminal outcome", () => {
             const notices = (yield* noticesOf(managed.assignmentId)).filter((note) =>
               note.includes("after this assignment ended"),
             );
-            assert.lengthOf(notices, waiting.length - native.length + 2);
+            assert.lengthOf(notices, expected);
 
             yield* stableAcrossTicksAndRebuilds(
               world,
@@ -241,7 +410,96 @@ describe("a governed root reaching a terminal outcome", () => {
     240_000,
   );
 
-  it.live("a pre-delivery failure retires it failed, disposing of what waits", () => {
+  it.live.each(["waiting", "blocked"] as const)(
+    "a pre-delivery failure with every kind %s retires it failed, disposing of what waits",
+    (mode) => {
+      const spy = spyOnFactoryPort();
+      return withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const admission = yield* HandoffAdmission.HandoffAdmission;
+            const assistant = yield* ProjectAssistant.ProjectAssistant;
+            yield* startAssistantThread(world);
+            yield* agreeAndCapture(world, "export");
+            yield* assignToFactory(world, "export");
+            const { root } = yield* claimedForFailure;
+            yield* fill(world, 1);
+
+            // What waits on the root of a delivery that never was, of every automatic kind.
+            const dropped: Array<string> = [];
+            const authorize = (executionAuthorized: boolean) =>
+              assistant.revise({
+                projectId: world.projectId,
+                ideaId: "export",
+                patch: { executionAuthorized },
+              });
+            if (mode === "blocked") yield* authorize(false);
+            const waiting = lateTurnsWithoutThreads("seeded");
+            for (const turn of waiting) {
+              const decided = yield* admission.decideTurn({
+                root,
+                // A question of Factory's own would land in the claim's holding.
+                provenance: turn.kind === "delegated_question" ? "unknown" : "factory",
+                turn,
+                ...keptFor(turn, dropped),
+              });
+              assert.strictEqual(
+                decided.type,
+                mode === "blocked" ? "blocked" : "demand",
+                turn.kind,
+              );
+            }
+            if (mode === "blocked") yield* authorize(true);
+            yield* admission.ensureEffectDemand({ root, deliveryId: root, effectId: 999 });
+
+            refuseTheStart(spy);
+            yield* tick;
+            assert.strictEqual(spy.count("start"), 1);
+            assert.strictEqual((yield* assignmentOf("export")).state, "failed");
+            const row = yield* rootRowOf(root);
+            assert.strictEqual(row.state, "retired");
+            assert.strictEqual(row.reason, "failed");
+            yield* assertNothingHeld(root, "export");
+            // One disposition per key; the two native wakes differ by provider thread here.
+            const dispositions = yield* dispositionsOf(root);
+            assert.lengthOf(dispositions, waiting.length);
+            assert.deepStrictEqual(
+              dispositions
+                .filter(({ kind }) => kind === "background_wake")
+                .map(({ adapter_clear }) => adapter_clear),
+              ["requested", "unavailable"],
+            );
+            const clearable =
+              waiting.find((turn) => turn.kind === "background_wake" && turn.clearable)
+                ?.messageId ?? assert.fail("No clearable wake was seeded.");
+            assert.deepStrictEqual(dropped, [clearable]);
+            assert.deepInclude(yield* grantOutcomesOf(root), {
+              kind: "effect",
+              outcome: "retired",
+            });
+            assert.lengthOf(
+              (yield* noticesOf("export")).filter((note) =>
+                note.includes("after this assignment ended"),
+              ),
+              waiting.length,
+            );
+
+            yield* stableAcrossTicksAndRebuilds(
+              world,
+              Effect.sync(() => {
+                assert.deepStrictEqual(dropped, [clearable]);
+              }),
+            );
+          }),
+        { handoff: {}, automaticTurnGate: true, assistantFactory: spy.wrap },
+      );
+    },
+  );
+});
+
+describe("late arrivals after a pre-delivery failure", () => {
+  it.live("each is declined once, across two rebuilds, and a retry starts a new root", () => {
     const spy = spyOnFactoryPort();
     return withProject(
       verifyCommands.passes,
@@ -251,59 +509,93 @@ describe("a governed root reaching a terminal outcome", () => {
           yield* startAssistantThread(world);
           yield* agreeAndCapture(world, "export");
           yield* assignToFactory(world, "export");
-          const root = "7e2aa85e-9347-44ce-b019-cb8dfd365b20" as FactoryDeliveryId;
-          const claimed = yield* admission.claim({ assignmentId: "export", deliveryId: root });
-          assert.strictEqual(claimed.type, "claimed");
-          if (claimed.type === "claimed") yield* admission.markDispatched(claimed.admitted);
-          yield* fill(world, 1);
-
-          // What waits on the root of a delivery that never was: both shapes of native wake.
-          const dropped: Array<string> = [];
-          const thread = "factory-thread:missing:1" as never;
-          const clearable = turns.backgroundWake(thread, "provider-thread" as never, true);
-          const plain = turns.backgroundWake(thread, "provider-thread-2" as never, false);
-          for (const turn of [clearable, plain]) {
-            const decided = yield* admission.decideTurn({
-              root,
-              provenance: "factory",
-              turn,
-              kept: {
-                dispatch: Effect.die("A failed root's wake never runs."),
-                ...(turn.clearable
-                  ? { drop: Effect.sync(() => void dropped.push(turn.messageId)) }
-                  : {}),
-              },
-            });
-            assert.strictEqual(decided.type, "demand");
-          }
-
-          spy.control.onStart = () =>
-            Effect.fail(
-              new HandoffBackend.HandoffFactoryRefused({
-                operation: "start",
-                reason: "no_base_commit",
-              }),
-            );
+          const { root } = yield* claimedForFailure;
+          refuseTheStart(spy);
           yield* tick;
-          assert.strictEqual(spy.count("start"), 1);
-          assert.strictEqual((yield* assignmentOf("export")).state, "failed");
           assert.deepStrictEqual(yield* managedRootOf(root), {
             state: "retired",
             reason: "failed",
           });
+          spy.control.onStart = undefined;
+
+          // No thread of a delivery that never was can reach the gate, which finds no family for
+          // it: what its manager would be asked is asked of the admission directly.
+          const dropped: Array<string> = [];
+          const late = lateTurnsWithoutThreads("late");
+          const present = Effect.gen(function* () {
+            for (const turn of late) {
+              const decided = yield* admission.decideTurn({
+                root,
+                provenance: "factory",
+                turn,
+                ...keptFor(turn, dropped),
+              });
+              assert.strictEqual(decided.type, "declined", turn.kind);
+            }
+            assert.deepStrictEqual(
+              yield* admission.enter({
+                root,
+                deliveryId: root,
+                effectId: 1,
+                fresh: false,
+              }),
+              { type: "refuse", category: "ended" },
+            );
+            assert.deepStrictEqual(
+              yield* admission.admitDelegation({
+                root,
+                threadId: "factory-thread:missing:1",
+                messageId: "mcp-delegation:late",
+                work: { type: "unreadable" },
+              }),
+              { type: "refused", category: "ended" },
+            );
+          });
+          yield* present;
           yield* assertNothingHeld(root, "export");
-          assert.deepStrictEqual(
-            (yield* dispositionsOf(root)).map(({ adapter_clear }) => adapter_clear),
-            ["requested", "unavailable"],
+          const dispositions = yield* dispositionsOf(root);
+          assert.lengthOf(dispositions, late.length);
+          const notices = yield* noticesOf("export");
+          assert.strictEqual(
+            notices.filter((note) => note.includes("after this assignment ended")).length,
+            late.length,
           );
-          assert.deepStrictEqual(dropped, [clearable.messageId]);
 
           const rows = yield* handoffRows;
-          yield* tick;
+          const unchanged = Effect.gen(function* () {
+            yield* present;
+            yield* tick;
+            assert.deepStrictEqual(yield* handoffRows, rows);
+            assert.deepStrictEqual(yield* noticesOf("export"), notices);
+            yield* assertNothingHeld(root, "export");
+          });
+          yield* unchanged;
           yield* world.rebuild(
             Effect.gen(function* () {
-              yield* tick;
-              assert.deepStrictEqual(yield* handoffRows, rows);
+              yield* unchanged;
+              yield* world.rebuild(
+                Effect.gen(function* () {
+                  yield* unchanged;
+
+                  // A retry takes a new root and id; the failed root stays as it ended.
+                  const retried = yield* controlAssignment("export", "retry");
+                  assert.strictEqual(retried.state, "queued");
+                  yield* tick;
+                  const next = yield* rootIdOf("export");
+                  assert.notStrictEqual(next, root);
+                  assert.deepStrictEqual(yield* managedRootOf(next), {
+                    state: "active",
+                    reason: null,
+                  });
+                  const author = yield* world.launched(next);
+                  yield* world.endRun(author.runId, "cancelled");
+                  assert.deepStrictEqual(yield* managedRootOf(root), {
+                    state: "retired",
+                    reason: "failed",
+                  });
+                }),
+                { orchestration: true },
+              );
             }),
           );
         }),
@@ -533,31 +825,100 @@ describe("late arrivals after a terminal outcome", () => {
     );
   });
 
-  it.live("an armed limit resume is declined and its producer told to disarm it", () =>
-    withProject(
+  it.live.each([
+    { waited: false, label: "armed when it ended" },
+    { waited: true, label: "already waiting for a slot when it ended" },
+  ])("a usage-limit resume $label is disarmed by its worker, for good", ({ waited }) => {
+    const watch = decisionWatch();
+    return withProject(
       verifyCommands.passes,
       (world) =>
         Effect.gen(function* () {
-          const opened = yield* openSingle(world);
-          const managed = yield* manage(world, opened.deliveryId, { state: "needs-input" });
-          yield* endDelivery(world, "owner-cancel", opened.deliveryId, opened.threadId);
-          yield* tick;
-          const record: Record = { ran: [], dropped: [] };
-          const resume = turns.usageLimitResume(opened.threadId, opened.runId);
-          // `declined` is what core's worker answers with its one limit-disarm command.
-          assert.deepStrictEqual(
-            yield* consult(resume, record),
-            AutomaticTurnGate.notNow("declined"),
+          const author = yield* world.start;
+          const thread = author.threadId;
+          const managed = yield* manage(world, author.deliveryId);
+          yield* fill(world, 2);
+
+          // The author's run fails on a usage limit, so the delivery blocks.
+          yield* usageLimitFailure(thread, author.runId);
+          yield* drainFactory;
+          assert.strictEqual((yield* stateOf(author.deliveryId)).status, "blocked");
+
+          const presented = watch.presentations("usage_limit_resume");
+          yield* withLimitSweep((sweep) =>
+            Effect.gen(function* () {
+              // The worker's first sweep arms the recovery, which is no turn and asks nothing.
+              yield* sweep;
+              const armed = (yield* threadShell(thread)).limitRecovery;
+              assert.strictEqual(armed?.autoResume, true);
+              assert.strictEqual(yield* presented, 0);
+
+              if (waited) {
+                // Due with both slots held by others, it waits as one demand, still armed.
+                yield* sweep;
+                assert.strictEqual(yield* presented, 1);
+                assert.deepStrictEqual(
+                  (yield* demandsOf(managed.root)).map(({ kind }) => kind),
+                  ["usage_limit_resume"],
+                );
+                assert.strictEqual((yield* threadShell(thread)).limitRecovery?.autoResume, true);
+              }
+
+              yield* endDelivery(world, "owner-cancel", author.deliveryId, thread);
+              yield* tick;
+              assert.deepStrictEqual(yield* managedRootOf(managed.root), {
+                state: "retired",
+                reason: "cancelled",
+              });
+              const runs = (yield* runsOf(thread)).length;
+
+              // The next sweep presents it: declined, and the worker disarms the recovery.
+              const before = yield* presented;
+              yield* sweep;
+              assert.strictEqual(yield* presented, before + 1);
+              const disarmed = (yield* threadShell(thread)).limitRecovery;
+              assert.strictEqual(disarmed?.autoResume, false);
+              assert.include(disarmed?.requestId ?? "", "limit-disarm:");
+              assert.strictEqual((yield* threadShell(thread)).lastErrorClass, "usage_limit");
+              assert.lengthOf(yield* dispositionsOf(managed.root), 1);
+              assert.strictEqual((yield* runsOf(thread)).length, runs);
+
+              // Later sweeps do not present it at all.
+              yield* sweep;
+              yield* sweep;
+              assert.strictEqual(yield* presented, before + 1);
+            }),
           );
-          assert.deepStrictEqual(record.ran, []);
-          assert.lengthOf(
-            (yield* dispositionsOf(managed.root)).filter(
-              ({ kind }) => kind === "usage_limit_resume",
-            ),
-            1,
+
+          // Nor does a worker of a server restarted over the same records.
+          const total = yield* presented;
+          const notices = yield* noticesOf(managed.assignmentId);
+          const rows = yield* handoffRows;
+          const stillDisarmed = withLimitSweep((sweep) =>
+            Effect.gen(function* () {
+              yield* drainOrchestration;
+              yield* sweep;
+              yield* tick;
+              assert.strictEqual(yield* presented, total);
+              assert.deepStrictEqual(yield* handoffRows, rows);
+              assert.deepStrictEqual(yield* noticesOf(managed.assignmentId), notices);
+              assert.strictEqual((yield* threadShell(thread)).limitRecovery?.autoResume, false);
+              assert.isFalse(
+                (yield* runsOf(thread)).some((run) =>
+                  run.userMessageId.startsWith("limit-resume:"),
+                ),
+              );
+            }),
+          );
+          yield* world.rebuild(
+            Effect.gen(function* () {
+              yield* stillDisarmed;
+              yield* world.rebuild(stillDisarmed, { orchestration: true });
+            }),
+            { orchestration: true },
           );
         }),
-      { handoff: {}, automaticTurnGate: true },
-    ),
-  );
+      { handoff: { admission: watch.admission }, automaticTurnGate: true },
+    );
+  });
 });
