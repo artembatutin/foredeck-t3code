@@ -125,6 +125,9 @@ export const make = Effect.gen(function* () {
         Effect.mapError(failed("sources")),
       ),
     read,
+    // What a capture writes is the whole body, as written: a read of it fingerprints the same.
+    fingerprint: ({ kind, title, body }) =>
+      workItemScopeFingerprint({ kind, title, body, bodyTruncated: false, bodyFidelity: "exact" }),
     findByMarker,
     // Work's own grant for agents: a read-only client or a plan-mode thread only reads.
     writer: (caller) => {

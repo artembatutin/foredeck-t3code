@@ -133,6 +133,9 @@ const makeWork = (sources: ReadonlyArray<HandoffBackend.HandoffSource>) => {
   };
   const unavailable = (operation: HandoffBackend.HandoffBackendError["operation"]) =>
     new HandoffBackend.HandoffBackendError({ operation, reason: "unavailable" });
+  /** What a source's fingerprint does: tell apart two items that say different things. */
+  const fingerprint = (content: { readonly title: string; readonly body: string }) =>
+    JSON.stringify([content.title, content.body]);
   const view = (item: FakeItem): HandoffBackend.HandoffItem => ({
     ref: item.ref,
     key: item.key,
@@ -142,7 +145,7 @@ const makeWork = (sources: ReadonlyArray<HandoffBackend.HandoffSource>) => {
     revision: String(item.revision),
     invalid: false,
     body: item.body,
-    fingerprint: JSON.stringify([item.title, item.body]),
+    fingerprint: fingerprint(item),
     notes: "",
   });
   const find = (ref: HandoffBackend.HandoffItemRef) =>
@@ -173,6 +176,7 @@ const makeWork = (sources: ReadonlyArray<HandoffBackend.HandoffSource>) => {
             )
           : Effect.succeed(view(item));
       }),
+    fingerprint,
     findByMarker: ({ sourceId, marker }) =>
       Effect.suspend(() =>
         state.findFails
@@ -650,6 +654,122 @@ describe("recovery", () => {
       ),
   );
 
+  it.effect("adopts one Markdown match only from a listing that shows it is the only one", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const work = makeWork([tasks]);
+        yield* revise(agreed);
+        const first = yield* instance(fakeBackend(work));
+        work.state.beforeCreate = Effect.fail(work.unavailable("create"));
+        const failed = yield* Effect.flip(first.service.capture(input()));
+        assert.strictEqual(failed._tag, "WorkCaptureUncertain");
+        work.state.beforeCreate = undefined;
+        yield* first.close;
+        const captureId = (yield* captureOf())!.captureId;
+        const copy = work.add(
+          tasks.sourceId,
+          "Add the export button",
+          `${marker(captureId)}\n\nA copy the claim's write may have left.`,
+        );
+
+        // A stale listing, or one with a file Work cannot read, could hide a second copy.
+        work.state.complete = false;
+        const next = yield* instance(fakeBackend(work));
+        const incomplete = yield* Effect.flip(next.service.capture(input()));
+        assert.strictEqual(incomplete._tag, "WorkCaptureUncertain");
+        assert.strictEqual(
+          incomplete._tag === "WorkCaptureUncertain" ? incomplete.uncertainty : undefined,
+          "incomplete",
+        );
+        const stillUncertain = yield* captureOf();
+        assert.strictEqual(stillUncertain?.state, "uncertain");
+        assert.isNull(stillUncertain?.itemId);
+        assert.deepStrictEqual(yield* eventsOf(captureId), ["claimed", "create_uncertain"]);
+
+        // Read whole, it is the only one: adopted, and since it is not what the claim wrote, not
+        // confirmed until someone decides what it should say.
+        work.state.complete = true;
+        const unconfirmed = yield* Effect.flip(next.service.capture(input()));
+        assert.strictEqual(
+          unconfirmed._tag === "WorkCaptureRefused" ? unconfirmed.reason : unconfirmed._tag,
+          "item_unconfirmed",
+        );
+        const adopted = yield* captureOf();
+        assert.strictEqual(adopted?.state, "captured");
+        assert.strictEqual(adopted?.itemId, copy.ref.itemId);
+        assert.isNull(adopted?.itemFingerprint);
+        assert.strictEqual(work.calls.create, 1);
+        assert.deepStrictEqual(work.calls.update, []);
+      }),
+    ),
+  );
+
+  it.effect("an adopted item edited after the claim's write is never rewritten uninvited", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const work = makeWork([tasks]);
+        yield* revise(agreed);
+        const first = yield* instance(fakeBackend(work));
+        const entered = yield* Deferred.make<void>();
+        const shutdown = yield* Deferred.make<void>();
+        work.state.afterCreate = untilShutdown(entered, shutdown);
+        yield* first.service.capture(input()).pipe(Effect.exit, Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* first.close;
+        work.state.afterCreate = undefined;
+        const [item] = work.items;
+        item!.body = `${item!.body}\n\nThe owner's addition.`;
+        item!.revision += 1;
+        yield* revise({ constraints: ["No new dependencies", "Keep it small"] });
+
+        const next = yield* instance(fakeBackend(work));
+        const refusedAdoption = yield* Effect.flip(next.service.capture(input()));
+        assert.strictEqual(
+          refusedAdoption._tag === "WorkCaptureRefused" ? refusedAdoption.reason : undefined,
+          "item_unconfirmed",
+        );
+        assert.strictEqual((yield* captureOf())?.itemId, item!.ref.itemId);
+        assert.deepStrictEqual(work.calls.update, []);
+        assert.include(item!.body, "The owner's addition.");
+        assert.strictEqual(
+          (yield* next.service.capture(input({ overwrite: true }))).outcome,
+          "updated",
+        );
+        assert.notInclude(item!.body, "The owner's addition.");
+      }),
+    ),
+  );
+
+  it.effect("an adopted item that says what the claim wrote is brought up to date", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const work = makeWork([tasks]);
+        yield* revise(agreed);
+        const first = yield* instance(fakeBackend(work));
+        const entered = yield* Deferred.make<void>();
+        const shutdown = yield* Deferred.make<void>();
+        work.state.afterCreate = untilShutdown(entered, shutdown);
+        yield* first.service.capture(input()).pipe(Effect.exit, Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* first.close;
+        work.state.afterCreate = undefined;
+        yield* revise({ constraints: ["No new dependencies", "Keep it small"] });
+
+        const next = yield* instance(fakeBackend(work));
+        const result = yield* next.service.capture(input());
+        assert.strictEqual(result.outcome, "updated");
+        assert.isTrue(result.verified);
+        assert.deepStrictEqual(work.calls.update, [{ expectedRevision: "1" }]);
+        assert.include(work.items[0]!.body, "- Keep it small");
+        assert.deepStrictEqual(yield* eventsOf(result.captureId), [
+          "claimed",
+          "recovered",
+          "updated",
+        ]);
+      }),
+    ),
+  );
+
   it.effect(
     "after a close with no item, a complete Markdown listing creates once with the marker",
     () =>
@@ -1084,10 +1204,18 @@ The owner's own note.`;
           "update_uncertain",
         ]);
         work.state.afterUpdate = undefined;
-        // Unverified now: only an explicit overwrite writes it again.
-        assert.strictEqual(reasonOf(yield* Effect.flip(service.capture(input()))), "external_edit");
-        assert.strictEqual((yield* service.capture(input({ overwrite: true }))).outcome, "updated");
-        assert.isNotNull((yield* captureOf())?.itemFingerprint);
+        // The update did land: the item says exactly what the brief says, which confirms it.
+        const confirmed = yield* service.capture(input());
+        assert.strictEqual(confirmed.outcome, "verified");
+        assert.isTrue(confirmed.verified);
+        assert.strictEqual(
+          (yield* captureOf())?.itemFingerprint,
+          JSON.stringify([work.items[0]!.title, work.items[0]!.body]),
+        );
+        assert.deepStrictEqual(work.calls.update, [
+          { expectedRevision: "1" },
+          { expectedRevision: "1" },
+        ]);
       }),
     ),
   );
@@ -1113,6 +1241,72 @@ The owner's own note.`;
         assert.isFalse(verified.executionAuthorized);
         assert.deepStrictEqual(work.calls.update, []);
         assert.strictEqual(work.calls.create, 1);
+      }),
+    ),
+  );
+
+  it.effect(
+    "never confirms an unconfirmed item that someone edited, unless told to overwrite",
+    () =>
+      withDatabase(
+        Effect.gen(function* () {
+          const work = makeWork([tasks]);
+          const { service } = yield* instance(fakeBackend(work));
+          yield* revise(agreed);
+          work.state.readFails = true;
+          const created = yield* service.capture(input());
+          assert.isFalse(created.verified);
+          work.state.readFails = false;
+
+          // Edited before any read confirmed what the item says, with the brief unchanged.
+          const [item] = work.items;
+          item!.title = "Export everything";
+          item!.body = `${item!.body}\n\nAlso export PDF.`;
+          item!.revision += 1;
+          const refusedEdit = yield* Effect.flip(service.capture(input()));
+          assert.strictEqual(reasonOf(refusedEdit), "item_unconfirmed");
+          assert.isNull((yield* captureOf())?.itemFingerprint);
+          assert.deepStrictEqual(work.calls.update, []);
+          assert.strictEqual(item!.title, "Export everything");
+          // Nor does a revised brief rewrite it on its own.
+          yield* revise({ decisions: ["Use the menu"] });
+          assert.strictEqual(
+            reasonOf(yield* Effect.flip(service.capture(input()))),
+            "item_unconfirmed",
+          );
+          assert.deepStrictEqual(work.calls.update, []);
+
+          const overwritten = yield* service.capture(input({ overwrite: true }));
+          assert.strictEqual(overwritten.outcome, "updated");
+          assert.isTrue(overwritten.verified);
+          assert.deepStrictEqual(work.calls.update, [{ expectedRevision: "2" }]);
+          assert.strictEqual(item!.title, "Add the export button");
+          assert.notInclude(item!.body, "Also export PDF.");
+        }),
+      ),
+  );
+
+  it.effect("refuses an edited item whose update outcome was lost", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const work = makeWork([tasks]);
+        const { service } = yield* instance(fakeBackend(work));
+        yield* captured(work, service);
+        yield* revise({ decisions: ["Use the menu"] });
+        work.state.afterUpdate = Effect.fail(work.unavailable("update"));
+        assert.strictEqual(
+          (yield* Effect.flip(service.capture(input())))._tag,
+          "WorkCaptureUncertain",
+        );
+        work.state.afterUpdate = undefined;
+        work.items[0]!.body = `${work.items[0]!.body}\n\nThe owner's addition.`;
+        work.items[0]!.revision += 1;
+        assert.strictEqual(
+          reasonOf(yield* Effect.flip(service.capture(input()))),
+          "item_unconfirmed",
+        );
+        assert.isNull((yield* captureOf())?.itemFingerprint);
+        assert.include(work.items[0]!.body, "The owner's addition.");
       }),
     ),
   );

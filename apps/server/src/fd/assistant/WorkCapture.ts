@@ -1,6 +1,3 @@
-// @effect-diagnostics-next-line nodeBuiltinImport:off -- a synchronous hash keeps rendering pure.
-import * as NodeCrypto from "node:crypto";
-
 import type { ProjectId } from "@t3tools/contracts";
 import {
   WorkErrorReason,
@@ -56,6 +53,7 @@ export class WorkCaptureRefused extends Schema.TaggedError<WorkCaptureRefused>()
       "item_closed",
       "item_invalid",
       "external_edit",
+      "item_unconfirmed",
       "recover_mismatch",
       "recover_unneeded",
       "no_capture",
@@ -95,6 +93,8 @@ export class WorkCaptureRefused extends Schema.TaggedError<WorkCaptureRefused>()
         return "Work cannot read the captured item cleanly, so it was not changed. Fix it in its source and capture again.";
       case "external_edit":
         return "The captured Work item was changed outside the assistant since it was captured, so nothing was written. Show the owner the item in Work, and capture again with overwrite only if they want the brief to replace those changes.";
+      case "item_unconfirmed":
+        return "No read has confirmed what the captured Work item says since the assistant wrote it, and it now says neither what was written nor what the brief says, so nothing was written. Show the owner the item in Work, and capture again with overwrite only if they want the brief to replace what it says.";
       case "recover_mismatch":
         return "That Work item's description does not open with this capture's marker, so it was not adopted.";
       case "recover_unneeded":
@@ -142,7 +142,7 @@ export class WorkCaptureUncertain extends Schema.TaggedError<WorkCaptureUncertai
     const finding = {
       unconfirmed: `The Work source did not confirm the new item${why}.`,
       ambiguous: `More than one Work item opens with this capture's marker (${this.captureId}).`,
-      incomplete: `The Work source could not be read completely${why}, so the assistant cannot tell whether an item with this capture's marker (${this.captureId}) exists.`,
+      incomplete: `The Work source could not be read completely${why}, so the assistant cannot tell which item, if any, is the one with this capture's marker (${this.captureId}).`,
       not_found: `No Work item with this capture's marker (${this.captureId}) was found, but a tracker can take a while to show a new item.`,
     }[this.uncertainty];
     return this.tracker
@@ -204,8 +204,9 @@ interface CapturedItem {
 export interface CaptureResult {
   readonly captureId: string;
   /**
-   * `unchanged` wrote nothing: the item already says what the brief does. `verified` took a read
-   * of an unverified item as its fingerprint; `recovered` adopted an item an earlier write left.
+   * `unchanged` wrote nothing: the item already says what the brief does. `verified` confirmed an
+   * item no read had confirmed since it was written, which said exactly what was written or what
+   * the brief says; `recovered` adopted an item an earlier write left.
    */
   readonly outcome: "created" | "updated" | "unchanged" | "recovered" | "verified";
   readonly kind: CaptureKind;
@@ -224,14 +225,20 @@ export interface CaptureResult {
  * reviews the item before authorizing again.
  *
  * Every item opens with its capture's marker, which names the capture id, so a capture finds its
- * item again after a write it could not record. One writer per idea runs in the service's scope,
- * and callers join it: a caller that goes away leaves it running. The capture is claimed, with this
- * instance, before the item is created, and the source write and its read-back run uninterruptibly.
+ * item again after a write it could not record. What an item says is the capture's only when a read
+ * shows it says exactly what the capture wrote (or would write now), by Work's own fingerprint: an
+ * item edited since, or one no read has confirmed and that says something else, is never rewritten
+ * without `overwrite`.
+ *
+ * One writer per idea runs in the service's scope, and callers join it: a caller that goes away
+ * leaves it running. The capture is claimed, with this instance, before the item is created, and
+ * the source write and its read-back run uninterruptibly.
  * A claim no writer here can still write (the claiming instance shut down, since one server owns a
- * T3 home, or its writer here has ended) is reconciled by the marker: the one item carrying it is
- * adopted; when a Markdown source read whole holds none, the item is created once, with the same
- * marker; anything else stays uncertain. A GitHub or Jira item is never created again: its search
- * can miss a new item, so an uncertain one is adopted with `recoverItem` or the capture abandoned.
+ * T3 home, or its writer here has ended) is reconciled by the marker. In a Markdown source read
+ * whole, its one item is adopted, or with none the item is created once, with the same marker. A
+ * GitHub or Jira item is created at most once and never again, since its search can miss a new
+ * item: the one its search shows is adopted, and otherwise `recoverItem` adopts it or the capture
+ * is abandoned. Anything else stays uncertain.
  */
 export class WorkCapture extends Context.Service<
   WorkCapture,
@@ -280,22 +287,18 @@ const section = (title: string, items: ReadonlyArray<string>, numbered: boolean)
       : items.map((item, index) => `${numbered ? `${index + 1}.` : "-"} ${item}`).join("\n")
   }`;
 
-/** The item as the brief states it, and a hash of that content. */
-const render = (brief: Portfolio.ProjectBrief, captureId: string) => {
-  const title = titleOf(brief.goal);
-  const body = [
+/** The item as the brief states it. */
+const render = (brief: Portfolio.ProjectBrief, captureId: string) => ({
+  title: titleOf(brief.goal),
+  body: [
     markerOf(captureId),
     `## Goal\n\n${brief.goal}`,
     section("Acceptance criteria", brief.acceptanceCriteria, true),
     section("Constraints", brief.constraints, false),
     section("Decisions", brief.decisions ?? [], false),
     section("Open questions", brief.openQuestions, false),
-  ].join("\n\n");
-  const hash = NodeCrypto.createHash("sha256")
-    .update(JSON.stringify([title, body]))
-    .digest("hex");
-  return { title, body, hash };
-};
+  ].join("\n\n"),
+});
 
 const versionOf = ({ captureId, sequence }: WorkCaptureStore.StoredCapture) => ({
   captureId,
@@ -306,14 +309,18 @@ const fieldsOf = (capture: WorkCaptureStore.StoredCapture): WorkCaptureStore.Cap
   return fields;
 };
 
-/** A decision step: the result, or decide again on what the step stored. */
+/**
+ * A decision step: the result, or decide again on what the step stored, which may have adopted
+ * or confirmed the item.
+ */
 type Step =
   | { readonly type: "done"; readonly result: CaptureResult }
-  | { readonly type: "again"; readonly adopted: boolean };
+  | { readonly type: "again"; readonly found?: "recovered" | "verified" };
 
-const again = (adopted = false): Step => ({ type: "again", adopted });
-/** Decisions per call: adopting an item and then updating it takes two, a lost race one more. */
-const MAX_STEPS = 4;
+const again = (found?: "recovered" | "verified"): Step =>
+  found === undefined ? { type: "again" } : { type: "again", found };
+/** Decisions per call: adopting, confirming and then updating the item take three, a race one more. */
+const MAX_STEPS = 5;
 
 /** An item the capture's write created, before it was recorded. */
 interface Unrecorded {
@@ -466,6 +473,16 @@ const make = Effect.gen(function* () {
 
   const done = (result: CaptureResult): Step => ({ type: "done", result });
 
+  /**
+   * Work's fingerprint of the content as the capture writes it to the source, stored as the
+   * capture's `contentHash`: a read of the item fingerprints the same only when it says exactly
+   * that.
+   */
+  const fingerprintOf = (
+    source: HandoffBackend.HandoffSource,
+    content: { readonly title: string; readonly body: string },
+  ) => backend.fingerprint({ kind: source.kind, title: content.title, body: content.body });
+
   /** The item's fingerprint by a fresh read, or none when that read fails. */
   const readBack = (ref: HandoffBackend.HandoffItemRef) =>
     backend.read(ref).pipe(
@@ -592,7 +609,7 @@ const make = Effect.gen(function* () {
             itemKey: null,
             itemUrl: null,
             itemFingerprint: null,
-            contentHash: content.hash,
+            contentHash: fingerprintOf(source, content),
             scopeHash: Portfolio.briefScopeHash(brief),
             briefRevision: brief.revision,
           },
@@ -616,7 +633,11 @@ const make = Effect.gen(function* () {
       return yield* recordCreated(claimed.value, written.success);
     });
 
-  /** Records an item found for the capture; the next step brings it up to date with the brief. */
+  /**
+   * Records an item found for the capture; the next step brings it up to date with the brief.
+   * Finding it shows which item is the capture's, not what it says: its content is confirmed only
+   * when it says exactly what the claim wrote, and is otherwise left for the next step to confirm.
+   */
   const adopt = (
     capture: WorkCaptureStore.StoredCapture,
     item: HandoffBackend.HandoffItem,
@@ -631,7 +652,7 @@ const make = Effect.gen(function* () {
         itemId: item.ref.itemId,
         itemKey: item.key,
         itemUrl: item.url,
-        itemFingerprint: item.fingerprint,
+        itemFingerprint: item.fingerprint === capture.contentHash ? item.fingerprint : null,
       },
       "recovered",
       { detail, clear: true, authorized: false },
@@ -639,7 +660,7 @@ const make = Effect.gen(function* () {
       Effect.tap(() =>
         Effect.sync(() => unrecorded.delete(keyOf(capture.projectId, capture.ideaId))),
       ),
-      Effect.map((committed) => again(Option.isSome(committed))),
+      Effect.map((committed) => (Option.isSome(committed) ? again("recovered") : again())),
     );
 
   /** A capture no writer can still be writing: find its item by the marker, or create it once. */
@@ -661,11 +682,17 @@ const make = Effect.gen(function* () {
         opensWithMarker(item.body, capture.captureId),
       );
       const [match, ...others] = matches;
-      if (match !== undefined && others.length === 0) return yield* adopt(capture, match, "marker");
-      if (match !== undefined) return yield* uncertain(capture, source, "ambiguous");
-      // Only a Markdown source read whole proves the item absent; a tracker's item is never
-      // created again.
-      if (source.kind === "markdown" && found.success.complete) {
+      if (match !== undefined && others.length > 0) {
+        return yield* uncertain(capture, source, "ambiguous");
+      }
+      // A Markdown capture may be created again once a whole read finds none, so only a whole read
+      // shows that its one match is the only item, or that it has none. A tracker's is created at
+      // most once and never again, and its search never reads whole.
+      const whole = source.kind === "markdown" && found.success.complete;
+      if (match !== undefined && (whole || source.kind !== "markdown")) {
+        return yield* adopt(capture, match, "marker");
+      }
+      if (match === undefined && whole) {
         return yield* create(input, brief, source, writer, capture, capture.captureId);
       }
       return yield* uncertain(
@@ -691,6 +718,7 @@ const make = Effect.gen(function* () {
   const update = (
     input: CaptureInput,
     brief: Portfolio.ProjectBrief,
+    source: HandoffBackend.HandoffSource,
     writer: HandoffBackend.HandoffWriter,
     capture: WorkCaptureStore.StoredCapture,
   ) =>
@@ -715,10 +743,38 @@ const make = Effect.gen(function* () {
         key: item.key,
         url: item.url,
       };
-      const edited = item.fingerprint !== capture.itemFingerprint;
-      const sameContent = content.hash === capture.contentHash;
+      const intended = fingerprintOf(source, content);
+      if (capture.itemFingerprint === null) {
+        // No read has confirmed the item since it was written (its read-back failed, an update's
+        // outcome was lost, or it was adopted saying something else). Only what the item actually
+        // says confirms it: exactly what was written, or what the brief says now.
+        const now = item.fingerprint === intended;
+        if (now || item.fingerprint === capture.contentHash) {
+          const confirmed = yield* commit(
+            capture,
+            {
+              ...fieldsOf(capture),
+              itemFingerprint: item.fingerprint,
+              ...(now
+                ? {
+                    contentHash: intended,
+                    scopeHash: Portfolio.briefScopeHash(brief),
+                    briefRevision: brief.revision,
+                  }
+                : {}),
+            },
+            "recovered",
+            { detail: "verified", clear: true, authorized: brief.executionAuthorized },
+          );
+          return Option.isSome(confirmed) ? again("verified") : again();
+        }
+        if (input.overwrite !== true) return yield* refused("item_unconfirmed");
+      }
+      const edited =
+        capture.itemFingerprint !== null && item.fingerprint !== capture.itemFingerprint;
+      const sameContent = intended === capture.contentHash;
       const sameKind = input.kind === capture.kind;
-      if (!edited && sameContent) {
+      if (capture.itemFingerprint !== null && !edited && sameContent) {
         if (sameKind)
           return done(resultOf(capture, current, "unchanged", brief.executionAuthorized));
         // The item says the same; delivering it as another kind still needs authorizing again.
@@ -737,29 +793,7 @@ const make = Effect.gen(function* () {
           onSome: ({ saved, authorized }) => done(resultOf(saved, current, "updated", authorized)),
         });
       }
-      if (edited && input.overwrite !== true) {
-        // A write whose read-back failed left the item unverified: when it still says what was
-        // written, this read verifies it.
-        if (
-          capture.itemFingerprint === null &&
-          sameContent &&
-          sameKind &&
-          opensWithMarker(item.body, capture.captureId)
-        ) {
-          const verified = yield* commit(
-            capture,
-            { ...fieldsOf(capture), itemFingerprint: item.fingerprint },
-            "recovered",
-            { detail: "verified", clear: true, authorized: brief.executionAuthorized },
-          );
-          return Option.match(verified, {
-            onNone: () => again(),
-            onSome: ({ saved, authorized }) =>
-              done(resultOf(saved, current, "verified", authorized)),
-          });
-        }
-        return yield* refused("external_edit");
-      }
+      if (edited && input.overwrite !== true) return yield* refused("external_edit");
       const written = yield* Effect.uninterruptible(
         backend
           .update(writer, {
@@ -780,7 +814,7 @@ const make = Effect.gen(function* () {
             itemKey: item.key,
             itemUrl: item.url,
             itemFingerprint: written.success,
-            contentHash: content.hash,
+            contentHash: intended,
             scopeHash: Portfolio.briefScopeHash(brief),
             briefRevision: brief.revision,
           },
@@ -854,7 +888,7 @@ const make = Effect.gen(function* () {
       const capture = stored.value;
       if (capture.state === "captured") {
         if (recoverItem !== undefined) return yield* refused("recover_unneeded");
-        return yield* update(input, brief, writer, capture);
+        return yield* update(input, brief, source, writer, capture);
       }
       if (recoverItem !== undefined) return yield* recover(capture, recoverItem);
       // This instance created the item and could not record it: record it now.
@@ -869,18 +903,19 @@ const make = Effect.gen(function* () {
 
   const run = (input: CaptureInput, writer: HandoffBackend.HandoffWriter) =>
     Effect.gen(function* () {
-      let adopted = false;
+      // What an earlier step found, reported when nothing more had to be written.
+      let found: "recovered" | "verified" | undefined;
       let recoverItem = input.recoverItem;
       for (let step = 0; step < MAX_STEPS; step++) {
         const next = yield* decide(input, writer, recoverItem);
         if (next.type === "done") {
-          return adopted && next.result.outcome === "unchanged"
-            ? { ...next.result, outcome: "recovered" as const }
+          return found !== undefined && next.result.outcome === "unchanged"
+            ? { ...next.result, outcome: found }
             : next.result;
         }
-        adopted ||= next.adopted;
+        found ??= next.found;
         // An adopted item is the capture's: the item named to recover has been taken.
-        if (next.adopted) recoverItem = undefined;
+        if (next.found === "recovered") recoverItem = undefined;
       }
       return yield* new WorkCaptureFailed({ stage: "storage" });
     });

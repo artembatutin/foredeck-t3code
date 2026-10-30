@@ -95,13 +95,24 @@ const unavailable = (operation: HandoffBackendError["operation"]) =>
  * that no item carries it, which only a Markdown source read whole, with no stale page and no file
  * Work could not read, can prove: a tracker's search may not show an item created moments ago.
  *
- * The default reaches no Work: every call fails as unavailable, so nothing is ever captured.
+ * `fingerprint` is Work's fingerprint of content as a writer gives it, comparable with a read's:
+ * the two are equal only when the item says exactly that content. A source that changes what it
+ * stores, as Jira's rich text can, may never read back equal, so its item is never taken to say
+ * what was written.
+ *
+ * The default reaches no Work: every call fails as unavailable, so nothing is ever captured or
+ * read for a fingerprint to be compared with.
  */
 export class HandoffBackend extends Context.Reference<{
   readonly sources: (
     projectId: ProjectId,
   ) => Effect.Effect<ReadonlyArray<HandoffSource>, HandoffBackendError>;
   readonly read: (ref: HandoffItemRef) => Effect.Effect<HandoffItem, HandoffBackendError>;
+  readonly fingerprint: (content: {
+    readonly kind: WorkSourceKind;
+    readonly title: string;
+    readonly body: string;
+  }) => string;
   readonly findByMarker: (input: {
     readonly sourceId: WorkSourceId;
     readonly marker: string;
@@ -129,6 +140,7 @@ export class HandoffBackend extends Context.Reference<{
   defaultValue: () => ({
     sources: () => unavailable("sources"),
     read: () => unavailable("read"),
+    fingerprint: () => "",
     findByMarker: () => unavailable("find"),
     writer: () => unavailable("writer"),
     create: () => unavailable("create"),

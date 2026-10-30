@@ -57,6 +57,17 @@ const assistant: Caller = {
 
 const marker = (captureId: string) => `Captured by the Foredeck project assistant as ${captureId}.`;
 
+/** The description a capture of `agreed` writes. */
+const capturedBody = (captureId: string) =>
+  [
+    marker(captureId),
+    "## Goal\n\nAdd a CSV export\nThe toolbar gets an Export button.",
+    "## Acceptance criteria\n\n1. Exports the visible rows as CSV\n2. Has a test",
+    "## Constraints\n\n- No new dependencies",
+    "## Decisions\n\n- Use the existing toolbar",
+    "## Open questions\n\n(none recorded)",
+  ].join("\n\n");
+
 const revise = (
   world: World,
   patch: Parameters<ProjectAssistant.ProjectAssistant["Service"]["revise"]>[0]["patch"],
@@ -178,17 +189,7 @@ describe("capturing an idea in a real Markdown source", () => {
         const item = yield* read(ref);
         assert.strictEqual(item.title, "Add a CSV export");
         assert.strictEqual(item.status, "todo");
-        assert.strictEqual(
-          item.body.trimEnd(),
-          [
-            marker(result.captureId),
-            "## Goal\n\nAdd a CSV export\nThe toolbar gets an Export button.",
-            "## Acceptance criteria\n\n1. Exports the visible rows as CSV\n2. Has a test",
-            "## Constraints\n\n- No new dependencies",
-            "## Decisions\n\n- Use the existing toolbar",
-            "## Open questions\n\n(none recorded)",
-          ].join("\n\n"),
-        );
+        assert.strictEqual(item.body.trimEnd(), capturedBody(result.captureId));
         assert.isTrue(yield* fileSystem.exists(path.join(world.root, item.locator!)));
         assert.lengthOf(yield* markedItems(world, result.captureId), 1);
 
@@ -305,6 +306,8 @@ describe("recovering a capture after a restart, on real Markdown", () => {
             assert.isTrue(yield* Deferred.isDone(shutdown));
             assert.isTrue(Exit.isFailure(yield* Fiber.join(cut)));
             assert.strictEqual(result.outcome, "recovered");
+            // Read back from the task file, the item says exactly what the claim wrote.
+            assert.isTrue(result.verified);
             const marked = yield* markedItems(world, result.captureId);
             assert.lengthOf(marked, 1);
             assert.strictEqual(marked[0]?.ref.itemId, result.item.itemId);
@@ -352,7 +355,7 @@ describe("recovering a capture after a restart, on real Markdown", () => {
     },
   );
 
-  it.live("a file Work cannot read, or two items with the marker, leave it uncertain", () => {
+  it.live("one match is adopted only once a whole read shows it is the only one", () => {
     const { control, wrap } = createControl();
     return withProject(
       verifyCommands.passes,
@@ -369,7 +372,14 @@ describe("recovering a capture after a restart, on real Markdown", () => {
           const uncertainty = (error: WorkCapture.WorkCaptureError) =>
             error._tag === "WorkCaptureUncertain" ? error.uncertainty : error._tag;
 
-          // A task file that does not read as an item could be the capture's.
+          // The one item the listing shows with the marker, beside a task file that does not read
+          // as an item and could be another copy: nothing is taken.
+          const work = yield* WorkService.WorkService;
+          const own = yield* work.createItem(owner, {
+            sourceId: world.itemRef.sourceId,
+            title: "Add a CSV export",
+            body: capturedBody(captureId),
+          });
           const broken = path.join(world.root, "tasks", "fd-broken-export.md");
           yield* fileSystem.writeFileString(
             broken,
@@ -377,21 +387,29 @@ describe("recovering a capture after a restart, on real Markdown", () => {
           );
           const unreadable = yield* world.rebuild(Effect.flip(capture(world)));
           assert.strictEqual(uncertainty(unreadable), "incomplete");
-          assert.lengthOf(yield* markedItems(world, captureId), 0);
+          assert.lengthOf(yield* markedItems(world, captureId), 1);
 
           // Two items open with the marker: neither is taken.
           yield* fileSystem.remove(broken);
-          const work = yield* WorkService.WorkService;
-          for (const copy of ["One copy.", "Another copy."]) {
-            yield* work.createItem(owner, {
-              sourceId: world.itemRef.sourceId,
-              title: "Add a CSV export",
-              body: `${marker(captureId)}\n\n${copy}`,
-            });
-          }
+          const copy = yield* work.createItem(owner, {
+            sourceId: world.itemRef.sourceId,
+            title: "Add a CSV export",
+            body: `${marker(captureId)}\n\nAnother copy.`,
+          });
           const ambiguous = yield* world.rebuild(Effect.flip(capture(world)));
           assert.strictEqual(uncertainty(ambiguous), "ambiguous");
           assert.lengthOf(yield* markedItems(world, captureId), 2);
+
+          // Read whole with the copy gone, the one left is adopted, and a read of its task file
+          // confirms it says what the capture writes.
+          const extra = yield* read(copy.ref);
+          yield* fileSystem.remove(path.join(world.root, extra.locator!));
+          const adopted = yield* world.rebuild(capture(world));
+          assert.strictEqual(adopted.outcome, "recovered");
+          assert.isTrue(adopted.verified);
+          assert.strictEqual(adopted.captureId, captureId);
+          assert.strictEqual(adopted.item.itemId, own.ref.itemId);
+          assert.lengthOf(yield* markedItems(world, captureId), 1);
         }).pipe(Effect.orDie),
       { work: wrap },
     );
