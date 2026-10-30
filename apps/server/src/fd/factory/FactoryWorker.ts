@@ -347,13 +347,21 @@ const describeEffect = (effect: FactoryEffect) => {
 
 const SAFE_TAG = /^[A-Za-z][A-Za-z0-9]{0,63}$/;
 
+/** A refused effect's detail: what Factory did not do, then the refusal's fixed text. */
+const refusalDetail = (effect: FactoryEffect, category: FactoryAdmission.FactoryAdmissionRefusal) =>
+  `Factory did not ${describeEffect(effect)}. ${FactoryAdmission.admissionRefusalText[category]}`;
+
 /**
  * The `effect.failed` detail: what failed and the failure's tag. Never its message or cause,
  * which can carry command output or provider text, except a setup failure's message, which is
  * fixed text naming how the command ended, or a prompt override's message naming only the prompt.
+ * A launch whose opening was refused reads as a refused effect does.
  */
 const failureDetail = (effect: FactoryEffect, cause: Cause.Cause<unknown>) => {
   const error = Option.getOrUndefined(Cause.findErrorOption(cause));
+  if (FactoryAdmission.isFactoryOpeningRefusedError(error)) {
+    return refusalDetail(effect, error.category);
+  }
   if (FactoryVerifyRunner.isFactorySetupFailedError(error) || isFactoryPromptOverrideError(error)) {
     return `Factory could not ${describeEffect(effect)}. ${error.message}`;
   }
@@ -1603,7 +1611,7 @@ const make = Effect.gen(function* () {
   ): FactoryEvent => ({
     type: "effect.failed",
     effectId: effect.id,
-    detail: `Factory did not ${describeEffect(effect)}. ${FactoryAdmission.admissionRefusalText[category]}`,
+    detail: refusalDetail(effect, category),
   });
 
   /**

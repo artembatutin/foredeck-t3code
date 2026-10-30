@@ -1,4 +1,5 @@
-import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
+import { FactoryDeliveryId, FactoryRole } from "@t3tools/contracts/fd/factory";
+import type { WorkStatus } from "@t3tools/contracts/fd/work-management";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -21,12 +22,14 @@ import type { FactoryEffect } from "./pipeline/state.ts";
 export type FactoryManagement = "never" | "active" | "retired";
 
 /** Why a managed root refuses an effect; the delivery blocks with the category's fixed text. */
-export type FactoryAdmissionRefusal =
-  | "revoked"
-  | "scope_changed"
-  | "unreadable"
-  | "item_closed"
-  | "ended";
+export const FactoryAdmissionRefusal = Schema.Literals([
+  "revoked",
+  "scope_changed",
+  "unreadable",
+  "item_closed",
+  "ended",
+]);
+export type FactoryAdmissionRefusal = typeof FactoryAdmissionRefusal.Type;
 
 /**
  * What the port decides for an effect: run it now, leave it waiting until a redispatch runs it
@@ -47,6 +50,28 @@ export interface FactoryAdmissionEntry {
   /** Whether admitting it needs a fresh read of the root's Work item; see `isFreshEffect`. */
   readonly fresh: boolean;
 }
+
+/**
+ * A launch of a managed root's family about to send its opening message, the one message that
+ * renders the delivery's Work item: the scope fingerprint (`workItemScopeFingerprint`) and status
+ * of the very read that message renders. A child's launch also says whether its item still says
+ * what Factory wrote for its task, rendered from the parent's frozen task row.
+ */
+export interface FactoryOpening {
+  /** The root delivery: a child's parent, any other delivery itself. */
+  readonly root: FactoryDeliveryId;
+  readonly deliveryId: FactoryDeliveryId;
+  readonly role: FactoryRole;
+  readonly fingerprint: string;
+  readonly status: WorkStatus;
+  /** Present exactly for a child's launch. */
+  readonly childScopeMatches?: boolean;
+}
+
+/** Whether the opening may be sent; a refusal blocks the delivery with the category's text. */
+export type FactoryOpeningDecision =
+  | { readonly type: "allow" }
+  | { readonly type: "refuse"; readonly category: FactoryAdmissionRefusal };
 
 /**
  * The port could not read what the root's manager holds. Never taken as `never`: a caller that
@@ -101,6 +126,21 @@ export const admissionRefusalText: Readonly<Record<FactoryAdmissionRefusal, stri
 };
 
 /**
+ * The root's manager refused the launch's opening (see `FactoryAdmission.authorizeOpening`), so
+ * the launch sent none; its message is the refusal's fixed text.
+ */
+export class FactoryOpeningRefusedError extends Schema.TaggedError<FactoryOpeningRefusedError>()(
+  "FactoryOpeningRefusedError",
+  { deliveryId: FactoryDeliveryId, role: FactoryRole, category: FactoryAdmissionRefusal },
+) {
+  override get message(): string {
+    return admissionRefusalText[this.category];
+  }
+}
+
+export const isFactoryOpeningRefusedError = Schema.is(FactoryOpeningRefusedError);
+
+/**
  * A turn core would start on its own on a family thread of a managed root, which Factory could not
  * show to be its owner's (see `FactoryAutomaticTurns`): `factory` when it carries on Factory's own
  * work, `unknown` when nothing shows whose it is. `retired` when the root's management has ended
@@ -128,6 +168,7 @@ export type FactoryAutomaticTurn<A, E, R> = {
 );
 
 const proceed: FactoryAdmissionDecision = { type: "proceed" };
+const allow: FactoryOpeningDecision = { type: "allow" };
 
 /**
  * How Factory asks whoever manages a root delivery before it acts for it. The worker asks `enter`
@@ -135,12 +176,15 @@ const proceed: FactoryAdmissionDecision = { type: "proceed" };
  * the effect as waiting (`admissionWait`) and runs nothing until a redispatch; a refusal blocks
  * the delivery with the category's text. After a restart the boot sweep asks `deferredDemand`
  * whether an awaited effect stored without that mark was deferred, and blocks it when not.
- * Factory imports nothing of its manager: one is provided where Factory is built. Automatic turns
- * on a managed root's family threads that Factory cannot show to be the owner's reach
- * `automaticTurn`, which decides whether and when they run.
+ * A launch of a root that is not `never` asks `authorizeOpening` once more right before it sends
+ * its opening message, the one that renders the Work item, after its workspace is prepared and
+ * set up; a refusal sends none. Factory imports nothing of its manager: one is provided where
+ * Factory is built. Automatic turns on a managed root's family threads that Factory cannot show
+ * to be the owner's reach `automaticTurn`, which decides whether and when they run.
  *
- * The default manages nothing: every root is `never`, every effect proceeds, nothing was deferred
- * and every automatic turn runs inline, so Factory runs as it does without a manager.
+ * The default manages nothing: every root is `never`, every effect proceeds, every opening is
+ * allowed, nothing was deferred and every automatic turn runs inline, so Factory runs as it does
+ * without a manager.
  */
 export class FactoryAdmission extends Context.Reference<{
   readonly management: (
@@ -154,6 +198,9 @@ export class FactoryAdmission extends Context.Reference<{
     readonly deliveryId: FactoryDeliveryId;
     readonly effectId: number;
   }) => Effect.Effect<boolean, FactoryAdmissionReadError>;
+  readonly authorizeOpening: (
+    opening: FactoryOpening,
+  ) => Effect.Effect<FactoryOpeningDecision, FactoryAdmissionReadError>;
   readonly automaticTurn: <A, E, R>(
     turn: FactoryAutomaticTurn<A, E, R>,
   ) => Effect.Effect<AutomaticTurnOutcome<A>, E | AutomaticTurnDecisionError, R>;
@@ -162,6 +209,7 @@ export class FactoryAdmission extends Context.Reference<{
     management: () => Effect.succeed("never"),
     enter: () => Effect.succeed(proceed),
     deferredDemand: () => Effect.succeed(false),
+    authorizeOpening: () => Effect.succeed(allow),
     automaticTurn: (turn) => Effect.map(turn.dispatch, ran),
   }),
 }) {}
