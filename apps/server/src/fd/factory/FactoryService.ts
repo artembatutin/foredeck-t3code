@@ -1,4 +1,10 @@
-import { AuthWorkReadScope, type ProjectId, type RuntimeMode, ThreadId } from "@t3tools/contracts";
+import {
+  AuthWorkReadScope,
+  type ProjectId,
+  type RuntimeMode,
+  type RuntimeRequestId,
+  ThreadId,
+} from "@t3tools/contracts";
 import {
   FACTORY_REPLAN_NOTE_MAX_LENGTH,
   FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
@@ -518,6 +524,19 @@ export class FactoryService extends Context.Service<
     readonly familyRoot: (
       threadId: ThreadId,
     ) => Effect.Effect<FactoryDeliveryId | null, FactoryActivity.FactoryOwnershipReadError>;
+    /**
+     * Whose the runtime request on the thread is, read-only, for a caller policy judging an
+     * answer to it: the root of the thread's family (null for none, as `familyRoot` says), the
+     * request's status, kind, response capability and run, and that run's status and class on the
+     * root's family. Fails when a record cannot be read or the lineage goes deeper.
+     */
+    readonly requestOwnership: (input: {
+      readonly threadId: ThreadId;
+      readonly requestId: RuntimeRequestId;
+    }) => Effect.Effect<
+      FactoryActivity.FactoryRequestOwnership,
+      FactoryActivity.FactoryOwnershipReadError
+    >;
     /**
      * What the root delivery's family is doing, read-only (see `FactoryActivity`): its phase,
      * whether work Factory cannot show to be the owner's is under way or about to start on its
@@ -1246,6 +1265,7 @@ const make = Effect.gen(function* () {
     ensureDeferred: worker.ensureDeferred,
     familyRoot: (threadId) =>
       activity.family(threadId).pipe(Effect.map((family) => family?.root ?? null)),
+    requestOwnership: activity.requestOwnership,
     activity: activity.activity,
     updatePlan,
     approvePlan,

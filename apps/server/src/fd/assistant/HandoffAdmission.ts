@@ -4,6 +4,7 @@ import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import { identity } from "effect/Function";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -139,6 +140,7 @@ export type OpeningDecision =
 export type DelegationDecision =
   | { readonly type: "admitted"; readonly admitted: Admitted }
   | { readonly type: "refused"; readonly category: Refusal | "not_holding" }
+  | { readonly type: "needs_work"; readonly item: ItemRef }
   | { readonly type: "unmanaged" };
 
 /** A candidate of the fair order: a queued assignment, or a demand waiting for its own grant. */
@@ -283,6 +285,10 @@ export class HandoffAdmission extends Context.Service<
     readonly instanceId: string;
     /** The root's management, read now; a failed read is never taken as `never`. */
     readonly management: (root: string) => Effect.Effect<Management, HandoffAdmissionError>;
+    /** The root's slot as it stands now: held, reserved for a demand, or none. */
+    readonly slot: (
+      root: string,
+    ) => Effect.Effect<"held" | "reserved" | "none", HandoffAdmissionError>;
     /**
      * Decides a Factory effect of the root's family (note 6.3). A root never managed proceeds and
      * writes nothing; an ending or retired one refuses `ended`. An active root whose authority
@@ -329,13 +335,14 @@ export class HandoffAdmission extends Context.Service<
     }) => Effect.Effect<TurnDecision, HandoffAdmissionError>;
     /**
      * Admits a delegation from a family caller: only for an active root holding its slot, with its
-     * authority and the fresh Work read; `not_holding` with no slot or only a reserved one.
+     * authority and the fresh Work read; `not_holding` with no slot or only a reserved one. Without
+     * `work` an admissible delegation stops short, naming the item to read (`needs_work`).
      */
     readonly admitDelegation: (input: {
       readonly root: string;
       readonly threadId: string;
       readonly messageId: string;
-      readonly work: WorkRead;
+      readonly work?: WorkRead;
     }) => Effect.Effect<DelegationDecision, HandoffAdmissionError>;
     /**
      * Runs `decide`, an admitting operation, and for its admission `dispatch`: the admitted probe,
@@ -343,6 +350,10 @@ export class HandoffAdmission extends Context.Service<
      * it ends. The whole region from the commit to the mark is uninterruptible, so an admission is
      * never marked dispatched with its dispatch not run. A mark that fails is retried, never the
      * dispatch, before the release pass, a release or a pre-start operation next judges the root.
+     *
+     * `interruptible` leaves the probe and the dispatch interruptible, for a dispatch that commits
+     * what it admits in its own fiber, such as a delegation's handler: an interrupt ends it before
+     * its commit or after, never with a commit still to come, and the mark still waits for it.
      */
     readonly dispatchAdmitted: <
       D extends { readonly type: string; readonly admitted?: Admitted | undefined },
@@ -353,6 +364,7 @@ export class HandoffAdmission extends Context.Service<
     >(
       decide: Effect.Effect<D, DE>,
       dispatch: (admitted: Admitted) => Effect.Effect<A, E, R>,
+      options?: { readonly interruptible?: boolean },
     ) => Effect.Effect<{ readonly decision: D; readonly value: Option.Option<A> }, DE | E, R>;
     /**
      * Marks the admission dispatched, for the release pass to delete later. Only the generation
@@ -1444,25 +1456,39 @@ const make = Effect.gen(function* () {
     ),
   );
 
-  /** The admitted probe, then the dispatch, then its admission marked dispatched. */
-  const runAdmitted = <A, E, R>(admitted: Admitted, dispatch: Effect.Effect<A, E, R>) =>
-    Effect.andThen(probe.admitted(admitted), dispatch).pipe(
+  /**
+   * The admitted probe, then the dispatch, then its admission marked dispatched. `restore` makes
+   * the probe and dispatch interruptible again; the mark is set up outside it, so it runs however
+   * soon an interrupt lands.
+   */
+  const runAdmitted = <A, E, R>(
+    admitted: Admitted,
+    dispatch: Effect.Effect<A, E, R>,
+    restore: <X, Y, Z>(effect: Effect.Effect<X, Y, Z>) => Effect.Effect<X, Y, Z> = identity,
+  ) =>
+    restore(Effect.andThen(probe.admitted(admitted), dispatch)).pipe(
       Effect.ensuring(settleDispatch(admitted)),
     );
 
   // Uninterruptible from the commit to the mark: an interrupt landing before the dispatch ran
   // would otherwise mark the row dispatched and let the release pass free a slot its work never
   // took. The transaction commits inside the same region, so its result is never lost either.
-  const dispatchAdmitted: HandoffAdmission["Service"]["dispatchAdmitted"] = (decide, dispatch) =>
-    Effect.uninterruptible(
+  const dispatchAdmitted: HandoffAdmission["Service"]["dispatchAdmitted"] = (
+    decide,
+    dispatch,
+    options,
+  ) =>
+    Effect.uninterruptibleMask((restore) =>
       Effect.flatMap(decide, (decision) => {
         const admitted = decision.admitted;
         if (admitted === undefined) {
           return Effect.succeed({ decision, value: Option.none() });
         }
-        return runAdmitted(admitted, dispatch(admitted)).pipe(
-          Effect.map((value) => ({ decision, value: Option.some(value) })),
-        );
+        return runAdmitted(
+          admitted,
+          dispatch(admitted),
+          options?.interruptible === true ? restore : identity,
+        ).pipe(Effect.map((value) => ({ decision, value: Option.some(value) })));
       }),
     );
 
@@ -1470,6 +1496,12 @@ const make = Effect.gen(function* () {
     readRoot(root).pipe(
       Effect.map((row): Management => row?.state ?? "never"),
       failed("management", root),
+    );
+
+  const slot: HandoffAdmission["Service"]["slot"] = (root) =>
+    readSlot(root).pipe(
+      Effect.map((row) => row?.state ?? "none"),
+      failed("read", root),
     );
 
   const enter: HandoffAdmission["Service"]["enter"] = (entry, work) =>
@@ -1858,10 +1890,17 @@ const make = Effect.gen(function* () {
       if (root.state !== "active") return { type: "refused", category: "ended" } as const;
       const link = yield* readLink(root.assignment_id);
       if (link === undefined) return { type: "refused", category: "revoked" } as const;
-      const refusal = (yield* makeAuthority()(link)) ?? freshness(link, input.work);
-      if (refusal !== undefined) return { type: "refused", category: refusal } as const;
-      const slot = yield* readSlot(root.root_delivery_id);
-      if (slot?.state !== "held") return { type: "refused", category: "not_holding" } as const;
+      const authority = yield* makeAuthority()(link);
+      if (authority !== undefined) return { type: "refused", category: authority } as const;
+      const held = (yield* readSlot(root.root_delivery_id))?.state === "held";
+      if (input.work === undefined) {
+        return held
+          ? ({ type: "needs_work", item: itemOf(link) } as const)
+          : ({ type: "refused", category: "not_holding" } as const);
+      }
+      const stale = freshness(link, input.work);
+      if (stale !== undefined) return { type: "refused", category: stale } as const;
+      if (!held) return { type: "refused", category: "not_holding" } as const;
       const entrySeq = yield* freshSeq;
       yield* holdSlot(root.root_delivery_id, entrySeq);
       const admitted = yield* insertAdmission(root, {
@@ -2632,6 +2671,7 @@ const make = Effect.gen(function* () {
   return HandoffAdmission.of({
     instanceId,
     management,
+    slot,
     enter,
     deferredDemand,
     authorizeOpening,

@@ -74,6 +74,7 @@ describe("Factory RPC errors", () => {
       redispatch: () => unexpected,
       ensureDeferred: () => unexpected,
       familyRoot: () => unexpected,
+      requestOwnership: () => unexpected,
       activity: () => unexpected,
       updatePlan: () => unexpected,
       approvePlan: () => unexpected,

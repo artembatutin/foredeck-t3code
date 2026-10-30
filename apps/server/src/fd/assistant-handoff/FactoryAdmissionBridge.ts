@@ -22,7 +22,7 @@ import { FactoryAdmission } from "../factory/index.ts";
 type Port = typeof FactoryAdmission.FactoryAdmission.Service;
 
 /** The fresh read of a root's item a decision asked for; a failed or invalid read is a result. */
-const readWorkWith =
+export const readWorkWith =
   (backend: typeof HandoffBackend.HandoffBackend.Service) => (item: HandoffAdmission.ItemRef) =>
     backend.read(item).pipe(
       Effect.map((read): HandoffAdmission.WorkRead =>

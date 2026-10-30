@@ -761,6 +761,9 @@ const layerMakeRoutes = Layer.mergeAll(
   McpHttpServer.layer.pipe(
     Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
+    // Screens the threads of Factory deliveries the project assistant manages, and counts what
+    // they delegate, over the runtime's one admission instance.
+    Layer.provide(AssistantHandoff.layerCallerPolicy),
   ),
 ).pipe(
   // Guides read through the same pull request service as every other surface.

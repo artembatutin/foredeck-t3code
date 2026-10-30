@@ -23,6 +23,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as AutomaticTurnGate from "../../../orchestration-v2/AutomaticTurnGate.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import { HandoffAdmission, HandoffBackend, ProjectAssistant } from "../../assistant/index.ts";
+import * as Factory from "../index.ts";
 import { drainOrchestration, threadProjection, type World } from "./deliveryHarness.ts";
 
 /**
@@ -347,6 +348,67 @@ export const handoffRows = Effect.gen(function* () {
     tables[table] = yield* sql`SELECT * FROM ${sql(table)} ORDER BY rowid`;
   return tables;
 }).pipe(Effect.orDie);
+
+/**
+ * How many rows each record an agent's tool could write holds: every event and command core
+ * committed, its queued effects, threads, messages, runs, tasks and requests, schedules,
+ * Factory's deliveries, Work's links and the assistant's spoken replies, with every handoff row.
+ * Equal before and after shows a call wrote nothing.
+ */
+export const writtenRows = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const counts: Record<string, number> = {};
+  for (const table of [
+    "orchestration_v2_events",
+    "orchestration_v2_command_receipts",
+    "orchestration_v2_effect_outbox",
+    "orchestration_v2_projection_threads",
+    "orchestration_v2_projection_messages",
+    "orchestration_v2_projection_runs",
+    "orchestration_v2_projection_subagents",
+    "orchestration_v2_projection_runtime_requests",
+    "scheduled_tasks",
+    "fd_factory_deliveries",
+    "fd_work_thread_links",
+    "fd_assistant_spoken_replies",
+  ]) {
+    const [row] = yield* sql<{
+      readonly count: number;
+    }>`SELECT COUNT(*) AS count FROM ${sql(table)}`;
+    counts[table] = row?.count ?? 0;
+  }
+  return { counts, handoff: yield* handoffRows };
+}).pipe(Effect.orDie);
+
+/**
+ * Agent MCP messages sent from a family thread of the root, and asynchronous answers anywhere:
+ * what a governed caller's refused tools would have left behind. A delegation's own prompt to its
+ * child, which core names `message:delegated-task:<command>`, is the counted route, not a send.
+ */
+export const governedMessages = (root: FactoryDeliveryId) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const factory = yield* Factory.FactoryService.FactoryService;
+    const rows = yield* sql<{
+      readonly message_id: string;
+      readonly sender: string | null;
+      readonly created_by: string | null;
+      readonly source: string | null;
+    }>`SELECT message_id, json_extract(payload_json, '$.senderThreadId') AS sender,
+        json_extract(payload_json, '$.createdBy') AS created_by,
+        json_extract(payload_json, '$.creationSource') AS source
+      FROM orchestration_v2_projection_messages`;
+    const found: Array<string> = [];
+    for (const row of rows) {
+      if (row.message_id.startsWith("async-answer:")) found.push(row.message_id);
+      else if (row.message_id.startsWith("message:delegated-task:")) continue;
+      else if (row.created_by === "agent" && row.source === "mcp" && row.sender !== null) {
+        if ((yield* factory.familyRoot(row.sender as ThreadId)) === root)
+          found.push(row.message_id);
+      }
+    }
+    return found;
+  }).pipe(Effect.orDie);
 
 /** The fresh read of the world's item a decision asks for, as the bridge takes it. */
 export const freshRead = (world: World) =>

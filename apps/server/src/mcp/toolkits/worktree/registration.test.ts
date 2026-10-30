@@ -1,4 +1,10 @@
-import { ProjectAssistant, WorkCapture } from "../../../fd/assistant/index.ts";
+import {
+  HandoffAdmission,
+  HandoffBackend,
+  ProjectAssistant,
+  WorkCapture,
+} from "../../../fd/assistant/index.ts";
+import * as AssistantHandoff from "../../../fd/assistant-handoff/index.ts";
 import { FactoryService } from "../../../fd/factory/index.ts";
 import { WorkService, WorkThreads } from "../../../fd/work-management/index.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
@@ -9,10 +15,13 @@ import { expect, it } from "@effect/vitest";
 import { NodeHttpServer } from "@effect/platform-node";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { HttpBody, HttpClient, HttpRouter } from "effect/http";
+
+import { liveThreadShell } from "../../McpToolAccess.testkit.ts";
 
 import * as ServerEnvironment from "../../../environment/ServerEnvironment.ts";
 import * as GitWorkflowService from "../../../git/GitWorkflowService.ts";
@@ -190,6 +199,16 @@ it.effect("production mcp layer lists worktree tools over http", () =>
       const factoryDeliver = tools.find((tool) => tool.name === "factory_deliver");
       expect(factoryDeliver?.annotations?.readOnlyHint).toBe(false);
 
+      // The caller policy classes every published tool by its exact name, so a governed thread
+      // never reaches a new tool by falling through.
+      expect(
+        toolNames.filter((name) => !AssistantHandoff.CallerTools.isClassifiedTool(name)),
+      ).toEqual([]);
+      expect(AssistantHandoff.CallerTools.callerToolClass("delegate_task")).toBe("delegate");
+      expect(AssistantHandoff.CallerTools.callerToolClass("t3_pending_request_respond")).toBe(
+        "respond_live",
+      );
+
       // MCP requires every tool input schema to be a top-level object schema.
       // A non-object schema (e.g. the anyOf produced by an empty
       // Schema.Struct({})) makes clients reject the entire server.
@@ -202,6 +221,121 @@ it.effect("production mcp layer lists worktree tools over http", () =>
       Layer.mergeAll(
         NodeHttpServer.layerTest,
         ServerConfig.layerTest(process.cwd(), { prefix: "t3-worktree-mcp-" }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
+        NodeServices.layer,
+      ),
+    ),
+  ),
+);
+
+const managedRoot = FactoryDeliveryId.make("delivery-managed");
+const callerThread = ThreadId.make("factory-thread:delivery-managed:1");
+
+/**
+ * The production MCP layer with the caller policy the server provides, over stubs that make the
+ * caller a managed delivery's thread whose root holds no slot.
+ */
+const layerGovernedServices = Layer.mergeAll(
+  Layer.mock(FactoryService.FactoryService)({
+    familyRoot: (threadId) => Effect.succeed(threadId === callerThread ? managedRoot : null),
+  }),
+  Layer.mock(HandoffAdmission.HandoffAdmission)({
+    instanceId: "instance",
+    management: () => Effect.succeed("active" as const),
+    admitDelegation: () =>
+      Effect.succeed({ type: "refused" as const, category: "not_holding" as const }),
+  }),
+  Layer.mock(HandoffBackend.HandoffBackend)({ fingerprint: () => "fingerprint" }),
+  Layer.mock(ThreadManagementService.ThreadManagementService)({
+    getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+  }),
+);
+
+const ToolCallPayload = Schema.fromJsonString(
+  Schema.Struct({
+    result: Schema.Struct({
+      isError: Schema.Boolean,
+      content: Schema.Array(Schema.Struct({ type: Schema.String, text: Schema.String })),
+    }),
+  }),
+);
+const decodeToolCallPayload = Schema.decodeUnknownEffect(ToolCallPayload);
+
+it.effect("production mcp layer screens and counts governed callers through the bridge", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const layerRoutes = McpHttpServer.layer.pipe(
+        Layer.provide(McpSessionRegistry.layer),
+        Layer.provide(AssistantHandoff.layerCallerPolicy),
+      );
+      yield* HttpRouter.serve(layerRoutes, {
+        disableListenLog: true,
+        disableLogger: true,
+      }).pipe(
+        Layer.provide(
+          Layer.mock(ServerEnvironment.ServerEnvironment)({
+            getEnvironmentId: Effect.succeed("environment-governed" as never),
+          }),
+        ),
+        Layer.provide(PreviewAutomationBroker.layer),
+        Layer.provide(PreviewBrowser.layer),
+        // The governed stubs replace the inert ones of the same services.
+        Layer.provide(Layer.merge(layerStubServices, layerGovernedServices)),
+        Layer.build,
+      );
+      const credential = yield* McpSessionRegistry.issueActiveMcpCredential({
+        threadId: callerThread,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+      });
+      const auth = credential!.config.authorizationHeader;
+      const httpClient = yield* HttpClient.HttpClient;
+      const initResponse = yield* httpClient.post("/mcp", {
+        headers: { accept: "application/json, text/event-stream", authorization: auth },
+        body: HttpBody.text(
+          `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"governed","version":"1.0.0"}}}`,
+          "application/json",
+        ),
+      });
+      const sessionId = initResponse.headers["mcp-session-id"];
+      const callText = (id: number, name: string, args: Record<string, unknown>) =>
+        Effect.gen(function* () {
+          const response = yield* httpClient.post("/mcp", {
+            headers: {
+              accept: "application/json, text/event-stream",
+              authorization: auth,
+              "mcp-protocol-version": "2025-06-18",
+              ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+            },
+            body: HttpBody.text(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id,
+                method: "tools/call",
+                params: { name, arguments: args },
+              }),
+              "application/json",
+            ),
+          });
+          const payload = yield* decodeToolCallPayload((yield* response.text).match(/\{.*\}/s)![0]);
+          expect(payload.result.isError).toBe(true);
+          return payload.result.content.map(({ text }) => text).join("");
+        });
+
+      // The screen: a run-creating tool is refused before its handler.
+      expect(
+        yield* callText(2, "t3_thread_send", { threadId: callerThread, message: "Go on." }),
+      ).toBe(AssistantHandoff.callerPolicyText.active);
+      // The delegation bracket: delegate_task passes the screen, then the admission refuses it.
+      expect(yield* callText(3, "delegate_task", { task: "Check the export." })).toContain(
+        AssistantHandoff.callerPolicyText.notHolding,
+      );
+    }),
+  ).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        NodeHttpServer.layerTest,
+        ServerConfig.layerTest(process.cwd(), { prefix: "t3-governed-mcp-" }).pipe(
           Layer.provide(NodeServices.layer),
         ),
         NodeServices.layer,

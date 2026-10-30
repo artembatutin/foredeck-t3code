@@ -1,4 +1,11 @@
-import { type MessageId, type RunId, ThreadId } from "@t3tools/contracts";
+import {
+  type MessageId,
+  type OrchestrationV2RunStatus,
+  type OrchestrationV2RuntimeRequest,
+  type RunId,
+  type RuntimeRequestId,
+  ThreadId,
+} from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import * as Context from "effect/Context";
@@ -71,6 +78,26 @@ export interface FactoryActivityReport {
 }
 
 /**
+ * Whose a runtime request is, as a caller policy judges an answer to it: the root of the family its
+ * thread belongs to (null for none), the request as core holds it (null when it has none of that
+ * id), and the run it was asked in, with that run's class on the root's family (null without a
+ * root or a run).
+ */
+export interface FactoryRequestOwnership {
+  readonly root: FactoryDeliveryId | null;
+  readonly request: {
+    readonly status: OrchestrationV2RuntimeRequest["status"];
+    readonly kind: OrchestrationV2RuntimeRequest["kind"];
+    readonly capability: OrchestrationV2RuntimeRequest["responseCapability"]["type"];
+    readonly runId: RunId | null;
+  } | null;
+  readonly run: {
+    readonly status: OrchestrationV2RunStatus;
+    readonly class: FactoryOwnership.FactoryProvenance["class"];
+  } | null;
+}
+
+/**
  * Reads whose work Factory's family threads carry (see `FactoryOwnership`), and what a root's
  * family is doing, from core's records, Factory's deliveries and the automatic turns Factory
  * recorded. Every read is strict and read-only: a failure fails a decision, and makes a report
@@ -88,6 +115,11 @@ export class FactoryActivity extends Context.Service<
       turn: AutomaticTurn,
       root: FactoryDeliveryId,
     ) => Effect.Effect<FactoryOwnership.FactoryProvenance, FactoryOwnershipReadError>;
+    /** Whose the runtime request on the thread is (see `FactoryRequestOwnership`), read-only. */
+    readonly requestOwnership: (input: {
+      readonly threadId: ThreadId;
+      readonly requestId: RuntimeRequestId;
+    }) => Effect.Effect<FactoryRequestOwnership, FactoryOwnershipReadError>;
     /**
      * What the root's family is doing, read-only (see `FactoryActivityReport`). Fails only when
      * Factory's own deliveries cannot be read.
@@ -462,6 +494,47 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const requestOwnership: FactoryActivity["Service"]["requestOwnership"] = ({
+    threadId,
+    requestId,
+  }) =>
+    Effect.gen(function* () {
+      const reads = makeReads();
+      const family = yield* FactoryOwnership.familyOf(reads, threadId);
+      if (family === null) return { root: null, request: null, run: null };
+      // A family thread whose record is gone holds no request.
+      const context = yield* projections
+        .getRuntimeResponseContext(threadId, requestId)
+        .pipe(Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.undefined }));
+      const request = context?.request;
+      if (request === undefined) return { root: family.root, request: null, run: null };
+      // Core answers a request in the run its node belongs to.
+      const runId = context?.node?.runId ?? null;
+      const run =
+        runId === null
+          ? undefined
+          : (yield* reads.thread(threadId))?.runs.find((candidate) => candidate.id === runId);
+      return {
+        root: family.root,
+        request: {
+          status: request.status,
+          kind: request.kind,
+          capability: request.responseCapability.type,
+          runId,
+        },
+        run:
+          run === undefined
+            ? null
+            : {
+                status: run.status,
+                class: (yield* FactoryOwnership.classifier(reads, family.root).run(
+                  threadId,
+                  run.id,
+                )).class,
+              },
+      } satisfies FactoryRequestOwnership;
+    }).pipe(Effect.mapError(readFailed(threadId)));
+
   return FactoryActivity.of({
     family: (threadId) =>
       FactoryOwnership.familyOf(makeReads(), threadId).pipe(Effect.mapError(readFailed(threadId))),
@@ -469,6 +542,7 @@ const make = Effect.gen(function* () {
       FactoryOwnership.classifier(makeReads(), root)
         .turn(turn)
         .pipe(Effect.mapError(readFailed(turn.threadId))),
+    requestOwnership,
     activity,
   });
 });

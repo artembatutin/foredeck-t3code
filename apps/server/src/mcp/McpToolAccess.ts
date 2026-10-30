@@ -15,6 +15,7 @@ import {
   DispatchModeLimit,
   type DispatchModeRefusal,
 } from "../orchestration-v2/DispatchModeLimit.ts";
+import * as McpCallerPolicy from "./McpCallerPolicy.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import { resolveInteractionMode, resolveRuntimeMode } from "./OrchestratorMcpService.ts";
 import {
@@ -150,6 +151,23 @@ export const actsAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A,
     requireThreadCaller.pipe(
       Effect.flatMap(() => writingCaller),
       Effect.flatMap(() => handle(params)),
+    ),
+  );
+
+/**
+ * Delegates a task from the calling T3 thread: `actsAsCaller`'s checks, then the handler inside
+ * the caller policy's delegation (see `McpCallerPolicy`), which may refuse it or count it with the
+ * caller's own work. The policy is the instance the request's screen used.
+ */
+export const delegatesAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
+  declare((params: P) =>
+    requireThreadCaller.pipe(
+      Effect.flatMap(() => writingCaller),
+      Effect.flatMap(({ scope }) =>
+        Effect.flatMap(McpCallerPolicy.McpCallerPolicy, (policy) =>
+          policy.delegation(scope, handle(params)),
+        ),
+      ),
     ),
   );
 

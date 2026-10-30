@@ -17,6 +17,7 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   type RunId,
+  RuntimeRequestId,
   TurnItemId,
   type RuntimeMode,
   type ServerProvider,
@@ -149,6 +150,7 @@ const makeFakeProvider = Effect.gen(function* () {
   const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
   const started: Array<ProviderAdapter.ProviderAdapterV2TurnInput> = [];
   const interrupted: Array<ProviderAdapter.ProviderAdapterV2InterruptInput> = [];
+  const responded: Array<ProviderAdapter.ProviderAdapterV2RuntimeRequestResponseInput> = [];
   const threadLoads: {
     before?: (() => Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>) | undefined;
     ensure?: ProviderAdapter.ProviderAdapterV2SessionRuntime["ensureThread"];
@@ -251,7 +253,7 @@ const makeFakeProvider = Effect.gen(function* () {
           steerTurn: () => Effect.die("Factory never steers a turn."),
           // The turn goes on until the test ends it, as a provider still finishing it would.
           interruptTurn: (input) => Effect.sync(() => void interrupted.push(input)),
-          respondToRuntimeRequest: () => Effect.void,
+          respondToRuntimeRequest: (input) => Effect.sync(() => void responded.push(input)),
           readThreadSnapshot: (input) =>
             Effect.suspend(() => threadLoads.snapshot?.(input) ?? Effect.die("unused")),
           rollbackThread: () => Effect.die("unused"),
@@ -395,7 +397,98 @@ const makeFakeProvider = Effect.gen(function* () {
       });
     });
 
-  return { adapter, started, interrupted, threadLoads, endTurn, say, startCommand, reportSubagent };
+  let questions = 0;
+  /**
+   * Asks the owner one question during the turn, as a provider's user-input request: `live` while
+   * the provider waits for the answer in this turn, `message` for one answered with a new message.
+   * Returns the request.
+   */
+  const ask = (turn: ProviderAdapter.ProviderAdapterV2TurnInput, mode: "live" | "message") =>
+    Effect.gen(function* () {
+      questions += 1;
+      const now = yield* DateTime.now;
+      const native = `question:${turn.attemptId}:${questions}`;
+      const requestId = RuntimeRequestId.make(`request:${native}`);
+      const nodeId = NodeId.make(`node:${native}`);
+      const providerSessionId = turn.providerThread.providerSessionId;
+      if (providerSessionId === null) return yield* Effect.die("The turn has no provider session.");
+      const nativeItemRef = { driver, nativeId: native, strength: "strong" as const };
+      yield* Queue.offer(events, {
+        type: "node.updated",
+        driver,
+        node: {
+          id: nodeId,
+          threadId: turn.threadId,
+          runId: turn.runId,
+          parentNodeId: turn.rootNodeId,
+          rootNodeId: turn.rootNodeId,
+          kind: "user_input_request",
+          status: "waiting",
+          countsForRun: false,
+          providerThreadId: turn.providerThread.id,
+          providerTurnId: providerTurnId(turn),
+          nativeItemRef,
+          runtimeRequestId: requestId,
+          checkpointScopeId: null,
+          startedAt: now,
+          completedAt: null,
+        },
+      });
+      yield* Queue.offer(events, {
+        type: "turn_item.updated",
+        driver,
+        turnItem: {
+          id: TurnItemId.make(`item:${native}`),
+          threadId: turn.threadId,
+          runId: turn.runId,
+          nodeId,
+          providerThreadId: turn.providerThread.id,
+          providerTurnId: providerTurnId(turn),
+          nativeItemRef,
+          parentItemId: null,
+          ordinal: 10 + questions,
+          status: "waiting",
+          title: null,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          type: "user_input_request",
+          requestId,
+          questions: [{ id: "format", header: "Format", question: "Which format?", options: [] }],
+          ...(mode === "message" ? { responseMode: "message" as const } : {}),
+        },
+      });
+      yield* Queue.offer(events, {
+        type: "runtime_request.updated",
+        driver,
+        runtimeRequest: {
+          id: requestId,
+          nodeId,
+          providerTurnId: providerTurnId(turn),
+          nativeRequestRef: nativeItemRef,
+          kind: "user_input",
+          status: "pending",
+          responseCapability:
+            mode === "message" ? { type: "message" } : { type: "live", providerSessionId },
+          createdAt: now,
+          resolvedAt: null,
+        },
+      });
+      return requestId;
+    });
+
+  return {
+    adapter,
+    started,
+    interrupted,
+    responded,
+    threadLoads,
+    endTurn,
+    say,
+    startCommand,
+    reportSubagent,
+    ask,
+  };
 });
 
 type FakeProvider = Effect.Success<typeof makeFakeProvider>;
