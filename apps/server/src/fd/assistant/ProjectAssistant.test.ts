@@ -23,8 +23,11 @@ import * as Threads from "../../orchestration-v2/ThreadManagementService.ts";
 import * as Launches from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as Projects from "../../project/ProjectService.ts";
 import * as Git from "../../vcs/GitVcsDriver.ts";
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { emptyProjection } from "../../orchestration-v2/ProjectionStore.ts";
+import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import { v2PullRequestThread } from "../../orchestration-v2/testkit/pullRequestFixtures.ts";
+import * as HandoffAdmission from "./HandoffAdmission.ts";
 import * as Assistant from "./ProjectAssistant.ts";
 import * as Looper from "./Looper.ts";
 
@@ -215,7 +218,17 @@ function harness(looperMode = false) {
         }),
     }),
   );
-  const layer = () => Assistant.layer.pipe(Layer.provide(dependencies));
+  // Ordinary and Looper assignments have no managed root, so admission reads no thread or project.
+  const admission = HandoffAdmission.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+        Layer.mock(ProjectStore.ProjectStoreV2)({}),
+        Assistant.layerPersistence,
+      ),
+    ),
+  );
+  const layer = () => Assistant.layer.pipe(Layer.provide(admission), Layer.provide(dependencies));
   const change = (id: ThreadId, status: OrchestrationV2Run["status"]) => {
     const projection = projections.get(id)!;
     projections.set(id, {

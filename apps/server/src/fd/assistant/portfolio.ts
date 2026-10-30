@@ -193,12 +193,12 @@ export const AssignmentState = Schema.Literals([
 ]);
 export type AssignmentState = typeof AssignmentState.Type;
 
-export const ExecutorKind = Schema.Literals(["foredeck", "looper"]);
+export const ExecutorKind = Schema.Literals(["foredeck", "looper", "factory"]);
 export type ExecutorKind = typeof ExecutorKind.Type;
 
 /** An exact identifier the executor returned for this attempt. */
 export const WorkerRef = Schema.Struct({
-  kind: Schema.Literals(["thread", "run", "looper-run"]),
+  kind: Schema.Literals(["thread", "run", "looper-run", "factory-delivery", "work-item"]),
   id: TrimmedNonEmptyString,
 });
 export type WorkerRef = typeof WorkerRef.Type;
@@ -266,6 +266,7 @@ export type AssignmentEvent = { readonly note?: string } & (
   | { readonly type: "resume" }
   | { readonly type: "fail" }
   | { readonly type: "retry" }
+  | { readonly type: "retry-delivery" }
   | { readonly type: "complete"; readonly evidence: ReadonlyArray<string> }
   | { readonly type: "cancel" }
   | {
@@ -361,6 +362,9 @@ const MOVES: {
     to: "failed",
   },
   retry: { from: ["failed"], to: "queued", requiresAuthorization: true },
+  // A Factory assignment's retry, for a new delivery once its root has ended; an ordinary worker's
+  // cancelled assignment stays cancelled.
+  "retry-delivery": { from: ["failed", "cancelled"], to: "queued", requiresAuthorization: true },
   complete: { from: ["running", "stopping", "awaiting-verification"], to: "completed" },
   cancel: {
     from: ["draft", "queued", "stopped", "failed", "awaiting-verification"],
@@ -455,6 +459,7 @@ export function transitionAssignment(
     }
     case "resume":
     case "retry":
+    case "retry-delivery":
       return Result.succeed({
         ...next,
         attempt: assignment.attempt + 1,

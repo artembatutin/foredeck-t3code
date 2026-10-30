@@ -67,12 +67,13 @@ export const AssistantToolkit = Toolkit.make(
   Tool.make("assistant_assign", {
     ...common,
     description:
-      "Queue authorized work using a stable assignmentId, reused after a lost reply. The server launches at most two assignments in priority order with fresh project-only contexts and isolated Git worktrees. Default executor is Foredeck. Pass an actual validated Looper configuration path only when the owner selected Looper. Returning queued does not mean launched.",
+      "Queue authorized work using a stable assignmentId, reused after a lost reply. The server launches at most two assignments in priority order with fresh project-only contexts and isolated Git worktrees. Default executor is Foredeck. Pass an actual validated Looper configuration path only when the owner selected Looper. Pass executor factory to deliver the idea's captured Work item through Factory: it needs a saved capture the owner reviewed, their explicit authorization and the project's verify command, and Factory plans, verifies, reviews and opens the pull request. Returning queued does not mean launched.",
     parameters: Schema.Struct({
       assignmentId: TrimmedNonEmptyString,
       projectId: ProjectId,
       ideaId: TrimmedNonEmptyString,
       looperConfig: Schema.optionalKey(TrimmedNonEmptyString),
+      executor: Schema.optionalKey(Schema.Literals(["foredeck", "factory"])),
     }),
   }),
   Tool.make("assistant_control", {

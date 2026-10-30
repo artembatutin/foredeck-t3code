@@ -92,7 +92,7 @@ import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../../../workspace/WorkspacePaths.ts";
-import { HandoffAdmission, ProjectAssistant } from "../../assistant/index.ts";
+import { HandoffAdmission, HandoffBackend, ProjectAssistant } from "../../assistant/index.ts";
 import * as AssistantHandoff from "../../assistant-handoff/index.ts";
 import { RepositorySet } from "../../multirepo/index.ts";
 import * as WorkManagement from "../../work-management/index.ts";
@@ -795,6 +795,7 @@ interface ServerInput {
   readonly admission: typeof Factory.FactoryAdmission.FactoryAdmission.Service | undefined;
   readonly handoff: HandoffOption | undefined;
   readonly assistantThreads: ThreadServiceWrapper | undefined;
+  readonly assistantFactory: FactoryPortWrapper | undefined;
   readonly automaticTurnGate: boolean;
   readonly root: string;
   readonly t3Home: string;
@@ -931,15 +932,30 @@ type ThreadServiceWrapper = (
   service: ThreadManagement.ThreadManagementService["Service"],
 ) => ThreadManagement.ThreadManagementService["Service"];
 
+/** Wraps the Factory port the project assistant starts and controls deliveries through. */
+type FactoryPortWrapper = (
+  service: typeof HandoffBackend.HandoffFactory.Service,
+) => typeof HandoffBackend.HandoffFactory.Service;
+
 /**
- * The project assistant and its Work capture over the bridge's Work port, as the server composes
- * them, with its thread service wrapped by `assistantThreads` when given. Built and rebuilt with
+ * The project assistant and its Work capture over the bridge's Work and Factory ports and the one
+ * admission instance, as the server composes them, with its thread service wrapped by
+ * `assistantThreads` and its Factory port by `assistantFactory` when given. Built and rebuilt with
  * Factory, so a rebuild is a new assistant instance as a new process would be. No tick runs: a
  * test drives the assistant's services itself.
  */
-const assistantLayer = (input: ServerInput) =>
+const assistantLayer = (input: ServerInput, handoff: ReturnType<typeof handoffLayer>) =>
   ProjectAssistant.layerLive.pipe(
     Layer.provide(AssistantHandoff.layerBackend),
+    Layer.provide(
+      input.assistantFactory === undefined
+        ? AssistantHandoff.layerFactory
+        : Layer.effect(
+            HandoffBackend.HandoffFactory,
+            Effect.map(HandoffBackend.HandoffFactory, input.assistantFactory),
+          ).pipe(Layer.provide(AssistantHandoff.layerFactory)),
+    ),
+    Layer.provide(handoff),
     Layer.provide(
       input.assistantThreads === undefined
         ? Layer.empty
@@ -984,11 +1000,14 @@ const makeServer = (input: ServerInput, parent: Scope.Scope) =>
     // One layer object, so each build shares one admission instance between Factory's port, the
     // assistant and the test.
     const handoff = handoffLayer(input);
+    const factoryServices = factoryLayer(input, handoff);
     const buildFactory = (core: Context.Context<Layer.Success<ReturnType<typeof coreLayer>>>) =>
       build(
-        Layer.mergeAll(factoryLayer(input, handoff), assistantLayer(input), handoff).pipe(
-          Layer.provide(Layer.succeedContext(core)),
-        ),
+        Layer.mergeAll(
+          factoryServices,
+          assistantLayer(input, handoff).pipe(Layer.provide(factoryServices)),
+          handoff,
+        ).pipe(Layer.provide(Layer.succeedContext(core))),
       );
     let core = yield* build(coreLayer(input));
     let factory = yield* buildFactory(core.context);
@@ -1183,6 +1202,8 @@ export interface World {
   readonly ownerThreadAt: (
     root: string,
     text: string,
+    /** The thread's own id, for a thread only its id tells apart; a minted one when absent. */
+    threadId?: ThreadId,
   ) => Effect.Effect<{ readonly threadId: ThreadId; readonly runId: RunId }, never, Services>;
   /**
    * Ends the provider turn of `runId` and waits until orchestration has finished the run and
@@ -1224,6 +1245,8 @@ export const withProject = <A, E>(
      * service's untouched, so a test can hold the assistant's tick inside its lock.
      */
     readonly assistantThreads?: ThreadServiceWrapper;
+    /** Wraps the Factory port the project assistant uses, to count or fail its calls. */
+    readonly assistantFactory?: FactoryPortWrapper;
     /**
      * Gives core's producers the installable automatic turn gate Factory installs, as the server
      * does (see `automaticTurnGate`); without it they run every automatic turn inline.
@@ -1263,6 +1286,7 @@ export const withProject = <A, E>(
         admission: options.admission,
         handoff: options.handoff,
         assistantThreads: options.assistantThreads,
+        assistantFactory: options.assistantFactory,
         automaticTurnGate: options.automaticTurnGate === true,
         root,
         t3Home,
@@ -1370,7 +1394,7 @@ export const withProject = <A, E>(
           return sent.run.id;
         }).pipe(Effect.orDie);
 
-      const ownerThreadAt: World["ownerThreadAt"] = (workspaceRoot, text) =>
+      const ownerThreadAt: World["ownerThreadAt"] = (workspaceRoot, text, threadId) =>
         Effect.gen(function* () {
           ownerTurns += 1;
           const ownerProject = ProjectId.make(`project-owner-${ownerTurns}`);
@@ -1384,6 +1408,7 @@ export const withProject = <A, E>(
           const messageId = MessageId.make(`owner-launch-message:${ownerTurns}`);
           const launched = yield* launches.launch({
             commandId: CommandId.make(`owner-launch:${ownerTurns}`),
+            ...(threadId === undefined ? {} : { threadId }),
             projectId: ownerProject,
             title: "Owner thread",
             modelSelection,

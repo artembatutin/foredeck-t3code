@@ -218,6 +218,19 @@ export class FactoryDeliveryIdError extends Schema.TaggedError<FactoryDeliveryId
   }
 }
 
+/**
+ * A caller's intended delivery id already names a delivery of another item, kind or ceiling; nothing
+ * was written.
+ */
+export class FactoryDeliveryIdConflictError extends Schema.TaggedError<FactoryDeliveryIdConflictError>()(
+  "FactoryDeliveryIdConflictError",
+  { deliveryId: FactoryDeliveryId },
+) {
+  override get message(): string {
+    return `Factory delivery ${this.deliveryId} already exists for another item, kind or runtime ceiling.`;
+  }
+}
+
 /** No delivery has this id. */
 export class FactoryDeliveryNotFoundError extends Schema.TaggedError<FactoryDeliveryNotFoundError>()(
   "FactoryDeliveryNotFoundError",
@@ -339,6 +352,7 @@ export type FactoryStartError =
   | ThreadLaunch.ThreadLaunchBaseRefError
   | FactoryBranchUnavailableError
   | FactoryDeliveryIdError
+  | FactoryDeliveryIdConflictError
   | FactoryDeliveryStore.FactoryDeliveryActive
   | FactoryStoreError;
 
@@ -383,12 +397,20 @@ export class FactoryService extends Context.Service<
      * which the delivery keeps, none of its threads ever launches or runs broader than that mode
      * (a caller's own, for an agent's start), and a launch on a provider that offers no mode
      * within it fails before anything runs; without one they launch with the project's default.
+     *
+     * With `deliveryId`, which only a server caller passes, the start is idempotent under that
+     * id: a new id is stored as given; one already naming a delivery of this item, kind and
+     * ceiling takes the start step only if it is still queued, and is otherwise returned as it is,
+     * even done or cancelled, whatever Work or the settings say now; one naming any other fails
+     * with `FactoryDeliveryIdConflictError`, writing nothing.
      */
     readonly start: (input: {
       readonly itemRef: WorkItemRef;
       /** Single when absent. A child is started by its parent, never on its own. */
       readonly kind?: Exclude<FactoryDeliveryKind, "child">;
       readonly runtimeModeCeiling?: RuntimeMode;
+      /** The delivery's id, minted by the caller; a random one when absent. */
+      readonly deliveryId?: FactoryDeliveryId;
     }) => Effect.Effect<FactoryDeliveryWithRuns, FactoryStartError>;
     /**
      * Starts the project's next Ready item as a single delivery, through `start`, for MCP and
@@ -739,6 +761,47 @@ const make = Effect.gen(function* () {
       // hold a second delivery.
       const itemRef = yield* work.canonicalRef(input.itemRef);
       const kind = input.kind ?? "single";
+      const { deliveryId: intended } = input;
+      /** The delivery the caller's id already names, if any; another item's is a conflict. */
+      const named = Effect.gen(function* () {
+        if (intended === undefined) return Option.none();
+        const stored = yield* deliveries.get(intended);
+        if (Option.isNone(stored)) return stored;
+        const { itemRef: storedItem, state } = stored.value;
+        return workItemRefString(storedItem) === workItemRefString(itemRef) &&
+          state.kind === kind &&
+          state.runtimeModeCeiling === input.runtimeModeCeiling
+          ? stored
+          : yield* new FactoryDeliveryIdConflictError({ deliveryId: intended });
+      });
+      /**
+       * The start step, for a queued delivery alone: the engine takes it once however many ask,
+       * and one further along is returned as it is.
+       */
+      const started = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
+        delivery.state.status !== "queued"
+          ? withRuns([delivery]).pipe(
+              Effect.map(([found]) => found ?? { ...delivery, stageRuns: [] }),
+            )
+          : // A storage failure here leaves the delivery queued with nothing launched.
+            worker
+              .stepWith(delivery.deliveryId, () =>
+                Effect.succeed({ event: { type: "start" } as const, value: undefined }),
+              )
+              .pipe(
+                Effect.map(
+                  Option.match({
+                    onNone: () => ({ ...delivery, stageRuns: [] }),
+                    onSome: steppedWithRuns,
+                  }),
+                ),
+              );
+      // A delivery the id names needs nothing else to be true: what it was started from may be
+      // gone by now, and a repeat still finds it.
+      if (intended !== undefined) {
+        const existing = yield* itemLocks.withLock(workItemRefString(itemRef), named);
+        if (Option.isSome(existing)) return yield* started(existing.value);
+      }
       const source = (yield* work.resolveSource(itemRef.sourceId)).stored;
       // Owner decision: a parent's tasks become child items only in a Markdown source.
       if (kind === "parent" && source.kind !== "markdown") {
@@ -759,6 +822,9 @@ const make = Effect.gen(function* () {
       // item runs: a delivery stored meanwhile, then cancelled before its launch made its
       // branch, would otherwise leave this start on the branch it chose.
       const queued = yield* Effect.gen(function* () {
+        // A start of the same id that got here first holds its row by now.
+        const raced = yield* named;
+        if (Option.isSome(raced)) return raced.value;
         // A new delivery starts over: a cancelled or finished one keeps its branch and worktree.
         const earlier = yield* deliveries.listByItem(itemRef);
         const branch = yield* freshBranchName({
@@ -781,11 +847,13 @@ const make = Effect.gen(function* () {
         }
         yield* launches.checkWorktreeBase({ projectId, workspaceStrategy: workspace });
 
-        const deliveryId = FactoryDeliveryId.make(
-          yield* crypto
-            .randomUUIDv4()
-            .pipe(Effect.mapError((cause) => new FactoryDeliveryIdError({ cause }))),
-        );
+        const deliveryId =
+          intended ??
+          FactoryDeliveryId.make(
+            yield* crypto
+              .randomUUIDv4()
+              .pipe(Effect.mapError((cause) => new FactoryDeliveryIdError({ cause }))),
+          );
         // The insert refuses an item with an active delivery inside its transaction, so of two
         // starts only one is stored, even from another spelling. A single item's task row is
         // written in the same transaction: a refused start adds none, and no stored single item
@@ -822,14 +890,7 @@ const make = Effect.gen(function* () {
             }),
           );
       }).pipe((locked) => itemLocks.withLock(workItemRefString(itemRef), locked));
-      // A storage failure here leaves the delivery queued with nothing launched.
-      const started = yield* worker.stepWith(queued.deliveryId, () =>
-        Effect.succeed({ event: { type: "start" } as const, value: undefined }),
-      );
-      return Option.match(started, {
-        onNone: () => ({ ...queued, stageRuns: [] }),
-        onSome: steppedWithRuns,
-      });
+      return yield* started(queued);
     },
   );
 

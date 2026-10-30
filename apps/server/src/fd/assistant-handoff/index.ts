@@ -5,6 +5,7 @@ import { HandoffBackend } from "../assistant/index.ts";
 import { FactoryAdmission } from "../factory/index.ts";
 import * as CallerPolicy from "./CallerPolicy.ts";
 import * as FactoryAdmissionBridge from "./FactoryAdmissionBridge.ts";
+import * as FactoryBackend from "./FactoryBackend.ts";
 import * as WorkBackend from "./WorkBackend.ts";
 
 /**
@@ -17,6 +18,9 @@ export { callerPolicyText } from "./CallerPolicy.ts";
 
 /** The assistant's Work port over Work's service, which it needs. */
 export const layerBackend = Layer.effect(HandoffBackend.HandoffBackend, WorkBackend.make);
+
+/** The assistant's Factory port over Factory's service and settings, which it needs. */
+export const layerFactory = Layer.effect(HandoffBackend.HandoffFactory, FactoryBackend.make);
 
 /**
  * Factory's admission port over the assistant's admission of the roots it manages, and the

@@ -156,6 +156,33 @@ export type GrantCandidate = Scheduler.Candidate<string> &
     | { readonly type: "demand"; readonly demand: Demand }
   );
 
+/**
+ * A Factory assignment as its executor judges it: its link, and what of its root's ownership
+ * stands now. `claim` is the root's claim admission; `mine` says this instance wrote it, so that,
+ * dispatching, its start may still be running.
+ */
+export interface FactoryAssignment {
+  readonly assignmentId: string;
+  readonly captureId: string;
+  readonly item: ItemRef;
+  readonly kind: "single" | "parent";
+  readonly itemFingerprint: string;
+  readonly runtimeMode: RuntimeMode;
+  readonly deliveryId: string | null;
+  readonly control: "none" | "stop" | "cancel";
+  readonly root: {
+    readonly state: "active" | "ending" | "retired";
+    readonly reason: RetiredReason | null;
+  } | null;
+  readonly slot: { readonly state: "held" | "reserved"; readonly entrySeq: number } | null;
+  readonly claim: {
+    readonly admissionId: string;
+    readonly entrySeq: number;
+    readonly state: "dispatching" | "dispatched";
+    readonly mine: boolean;
+  } | null;
+}
+
 export type ClaimResult =
   | {
       readonly type: "claimed";
@@ -393,6 +420,67 @@ export class HandoffAdmission extends Context.Service<
       readonly deliveryId?: string;
     }) => Effect.Effect<ClaimResult, HandoffAdmissionError>;
     /**
+     * Claims a queued ordinary or Looper assignment at the free fair head: it moves to launching,
+     * counted by that state. False, writing nothing, otherwise.
+     */
+    readonly claimOrdinary: (assignmentId: string) => Effect.Effect<boolean, HandoffAdmissionError>;
+    /** The assignment's link and its root's ownership; undefined for one with no link. */
+    readonly factoryAssignment: (
+      assignmentId: string,
+    ) => Effect.Effect<FactoryAssignment | undefined, HandoffAdmissionError>;
+    /** Writes a Factory assignment's link, in its enqueue's transaction. */
+    readonly createLink: (input: {
+      readonly assignmentId: string;
+      readonly captureId: string;
+      readonly item: ItemRef;
+      readonly kind: "single" | "parent";
+      readonly scopeHash: string;
+      readonly itemFingerprint: string;
+      readonly runtimeMode: RuntimeMode;
+    }) => Effect.Effect<void, HandoffAdmissionError>;
+    /** Whether an assignment that has not ended, other than `except`, uses the capture. */
+    readonly captureInUse: (input: {
+      readonly captureId: string;
+      readonly except?: string;
+    }) => Effect.Effect<boolean, HandoffAdmissionError>;
+    /** Persists a control's intent; reconcile and every later claim read it. */
+    readonly setControl: (
+      assignmentId: string,
+      control: "none" | "stop" | "cancel",
+    ) => Effect.Effect<void, HandoffAdmissionError>;
+    /**
+     * Whether the assignment may run as the database and `work` hold now (note 6.2): why not,
+     * or undefined when it may.
+     */
+    readonly authority: (
+      assignmentId: string,
+      work: WorkRead,
+    ) => Effect.Effect<BlockedReason | undefined, HandoffAdmissionError>;
+    /** Enters the assignment into the fair order at a fresh position. */
+    readonly enterQueue: (assignmentId: string) => Effect.Effect<void, HandoffAdmissionError>;
+    /** Takes the assignment out of the fair order. */
+    readonly leaveQueue: (assignmentId: string) => Effect.Effect<void, HandoffAdmissionError>;
+    /**
+     * Gives each queued assignment without a position, as an earlier build left them, one in
+     * `(created_at, assignment_id)` order. One with no stored dispatch has nothing to launch and
+     * stays out of the order.
+     */
+    readonly normalizeQueue: Effect.Effect<void, HandoffAdmissionError>;
+    /**
+     * Requeues a Factory assignment whose root ended, for a new delivery: its link no longer names
+     * a root, and the next claim mints a new id, once the fresh read confirms it as `authority`
+     * does and nothing else that has not ended uses the capture. Writes nothing otherwise.
+     */
+    readonly retryReentry: (input: {
+      readonly assignmentId: string;
+      readonly work: WorkRead;
+    }) => Effect.Effect<
+      | { readonly type: "queued" }
+      | { readonly type: "refused"; readonly category: BlockedReason }
+      | { readonly type: "contended" },
+      HandoffAdmissionError
+    >;
+    /**
      * Grants a waiting effect demand at the free fair head: a held slot and its admission. A
      * revoked root's effect is `refused` instead, writing nothing.
      */
@@ -576,6 +664,7 @@ interface LinkRow {
   readonly capture_id: string;
   readonly source_id: string;
   readonly item_id: string;
+  readonly kind: "single" | "parent";
   readonly scope_hash: string;
   readonly item_fingerprint: string;
   readonly runtime_mode: string;
@@ -798,7 +887,7 @@ const make = Effect.gen(function* () {
     );
   const readLink = (assignmentId: string) =>
     Effect.map(
-      sql<LinkRow>`SELECT assignment_id, capture_id, source_id, item_id, scope_hash,
+      sql<LinkRow>`SELECT assignment_id, capture_id, source_id, item_id, kind, scope_hash,
           item_fingerprint, runtime_mode, delivery_id, control
         FROM fd_assistant_factory_links WHERE assignment_id = ${assignmentId}`,
       (rows) => rows[0],
@@ -913,20 +1002,25 @@ const make = Effect.gen(function* () {
   /**
    * The root's authority as the database holds it (note 6.2, A), memoized for one decision:
    * undefined when it holds, otherwise `revoked`. The capture's item, the brief's scope, the
-   * manager's thread and permissions and the project are read as they stand now.
+   * manager's thread and permissions and the project are read as they stand now. A retry's
+   * (`retrying`) is judged for the assignment it will be again, so its having ended and any cancel
+   * it ended with do not count.
    */
-  const makeAuthority = () => {
+  const makeAuthority = (options?: { readonly retrying?: boolean }) => {
     const results = new Map<string, BlockedReason | undefined>();
     const compute = (link: LinkRow) =>
       Effect.gen(function* () {
-        if (link.control === "cancel") return "revoked" as const;
+        if (link.control === "cancel" && options?.retrying !== true) return "revoked" as const;
         const [assignment] = yield* sql<{
           readonly project_id: string;
           readonly idea_id: string;
           readonly state: string;
         }>`SELECT project_id, idea_id, state FROM fd_assistant_assignments
           WHERE assignment_id = ${link.assignment_id}`;
-        if (assignment === undefined || TERMINAL_ASSIGNMENT.has(assignment.state)) {
+        if (
+          assignment === undefined ||
+          (TERMINAL_ASSIGNMENT.has(assignment.state) && options?.retrying !== true)
+        ) {
           return "revoked" as const;
         }
         const projectId = ProjectId.make(assignment.project_id);
@@ -1027,10 +1121,17 @@ const make = Effect.gen(function* () {
         readonly delivery_id: string | null;
         readonly root_state: string | null;
         readonly slots: number;
+        readonly idea_busy: number;
       }>`SELECT a.assignment_id, a.project_id, a.idea_id, p.seq, p.overtaken,
           l.assignment_id IS NOT NULL AS linked, l.delivery_id, r.state AS root_state,
           (SELECT COUNT(*) FROM fd_assistant_slots s
-            WHERE s.assignment_id = a.assignment_id) AS slots
+            WHERE s.assignment_id = a.assignment_id) AS slots,
+          EXISTS (
+            SELECT 1 FROM fd_assistant_assignments other
+            WHERE other.project_id = a.project_id AND other.idea_id = a.idea_id
+              AND other.assignment_id <> a.assignment_id
+              AND other.state IN ${sql.in([...OCCUPIED_STATES])}
+          ) AS idea_busy
         FROM fd_assistant_queue_positions p
         JOIN fd_assistant_assignments a ON a.assignment_id = p.assignment_id
         LEFT JOIN fd_assistant_factory_links l ON l.assignment_id = a.assignment_id
@@ -1039,12 +1140,14 @@ const make = Effect.gen(function* () {
       for (const row of queued) {
         const brief = briefOf(row.project_id, row.idea_id);
         const link = row.linked === 1 ? yield* readLink(row.assignment_id) : undefined;
+        // One assignment of an idea runs at a time, whichever executor runs it.
         const eligible =
-          link === undefined
+          row.idea_busy === 0 &&
+          (link === undefined
             ? brief?.executionAuthorized === true
             : link.control === "none" &&
               (link.delivery_id === null || (row.root_state === "active" && row.slots === 0)) &&
-              (yield* authority(link)) === undefined;
+              (yield* authority(link)) === undefined);
         candidates.push({
           type: "assignment",
           id: `assignment:${row.assignment_id}`,
@@ -1113,7 +1216,7 @@ const make = Effect.gen(function* () {
   const recordGrant = (
     candidates: ReadonlyArray<GrantCandidate>,
     granted: { readonly id: string | undefined; readonly assignmentId: string },
-    entry: { readonly root: string; readonly kind: string; readonly seq: number | null },
+    entry: { readonly root: string | null; readonly kind: string; readonly seq: number | null },
   ) =>
     Effect.gen(function* () {
       if (granted.id !== undefined) {
@@ -1984,6 +2087,171 @@ const make = Effect.gen(function* () {
       return { type: "claimed", admitted, root: root.root_delivery_id, first } as const;
     }).pipe(transact("claim"));
 
+  const claimOrdinary: HandoffAdmission["Service"]["claimOrdinary"] = (assignmentId) =>
+    Effect.gen(function* () {
+      const id = `assignment:${assignmentId}`;
+      const candidates = yield* atHeadOf(makeAuthority(), id);
+      if (candidates === undefined) return false;
+      yield* portfolio.transitionAssignment({ assignmentId, event: { type: "claim" } });
+      yield* recordGrant(
+        candidates,
+        { id, assignmentId },
+        {
+          root: null,
+          kind: "claim",
+          seq: candidates.find((candidate) => candidate.id === id)?.seq ?? null,
+        },
+      );
+      return true;
+    }).pipe(transact("claim"));
+
+  const factoryAssignment: HandoffAdmission["Service"]["factoryAssignment"] = (assignmentId) =>
+    // A dispatch that returned and could not be marked is no dispatch still running. One that
+    // cannot be marked again still reads as running, and the caller waits for the next pass.
+    Effect.andThen(
+      Effect.ignore(flushUnmarked),
+      Effect.gen(function* () {
+        const link = yield* readLink(assignmentId);
+        if (link === undefined) return undefined;
+        const root = link.delivery_id === null ? undefined : yield* readRoot(link.delivery_id);
+        const slot = link.delivery_id === null ? undefined : yield* readSlot(link.delivery_id);
+        const claim =
+          link.delivery_id === null
+            ? undefined
+            : (yield* admissionsOf(link.delivery_id)).find(({ kind }) => kind === "claim");
+        return {
+          assignmentId,
+          captureId: link.capture_id,
+          item: itemOf(link),
+          kind: link.kind,
+          itemFingerprint: link.item_fingerprint,
+          // Written from a caller's own runtime mode, by `createLink`.
+          runtimeMode: link.runtime_mode as RuntimeMode,
+          deliveryId: link.delivery_id,
+          control: link.control,
+          root: root === undefined ? null : { state: root.state, reason: root.reason },
+          slot: slot === undefined ? null : { state: slot.state, entrySeq: slot.entry_seq },
+          claim:
+            claim === undefined
+              ? null
+              : {
+                  admissionId: claim.admission_id,
+                  entrySeq: claim.entry_seq,
+                  state: claim.state,
+                  mine: claim.instance_id === instanceId,
+                },
+        } satisfies FactoryAssignment;
+      }).pipe(transact("read")),
+    );
+
+  const createLink: HandoffAdmission["Service"]["createLink"] = (input) =>
+    Effect.gen(function* () {
+      const at = yield* now;
+      yield* sql`INSERT INTO fd_assistant_factory_links ${sql.insert({
+        assignment_id: input.assignmentId,
+        capture_id: input.captureId,
+        source_id: input.item.sourceId,
+        item_id: input.item.itemId,
+        kind: input.kind,
+        scope_hash: input.scopeHash,
+        item_fingerprint: input.itemFingerprint,
+        runtime_mode: input.runtimeMode,
+        delivery_id: null,
+        control: "none",
+        created_at: at,
+        updated_at: at,
+      })}`;
+    }).pipe(transact("claim"));
+
+  const captureInUse: HandoffAdmission["Service"]["captureInUse"] = (input) =>
+    sql<{ readonly used: number }>`SELECT 1 AS used
+      FROM fd_assistant_factory_links l
+      JOIN fd_assistant_assignments a ON a.assignment_id = l.assignment_id
+      WHERE l.capture_id = ${input.captureId} AND a.state NOT IN ('completed', 'cancelled')
+        AND l.assignment_id <> ${input.except ?? ""}
+      LIMIT 1`.pipe(
+      Effect.map((rows) => rows.length > 0),
+      failed("read"),
+    );
+
+  const setControl: HandoffAdmission["Service"]["setControl"] = (assignmentId, control) =>
+    Effect.flatMap(
+      now,
+      (at) => sql`UPDATE fd_assistant_factory_links SET control = ${control}, updated_at = ${at}
+        WHERE assignment_id = ${assignmentId}`,
+    ).pipe(Effect.asVoid, failed("prestart"));
+
+  const authorityOf: HandoffAdmission["Service"]["authority"] = (assignmentId, work) =>
+    Effect.gen(function* () {
+      const link = yield* readLink(assignmentId);
+      if (link === undefined) return "revoked" as const;
+      return (yield* makeAuthority()(link)) ?? freshness(link, work);
+    }).pipe(transact("read"));
+
+  const positionAt = (assignmentId: string, seq: number) =>
+    sql`INSERT INTO fd_assistant_queue_positions (assignment_id, seq, overtaken)
+      VALUES (${assignmentId}, ${seq}, 0)
+      ON CONFLICT (assignment_id) DO UPDATE SET seq = excluded.seq, overtaken = 0`;
+
+  const enterQueue: HandoffAdmission["Service"]["enterQueue"] = (assignmentId) =>
+    Effect.flatMap(freshSeq, (seq) => positionAt(assignmentId, seq)).pipe(
+      Effect.asVoid,
+      transact("claim"),
+    );
+
+  const leaveQueue: HandoffAdmission["Service"]["leaveQueue"] = (assignmentId) =>
+    sql`DELETE FROM fd_assistant_queue_positions WHERE assignment_id = ${assignmentId}`.pipe(
+      Effect.asVoid,
+      failed("maintain"),
+    );
+
+  const normalizeQueue: HandoffAdmission["Service"]["normalizeQueue"] = Effect.gen(function* () {
+    const missing = yield* sql<{ readonly assignment_id: string }>`SELECT a.assignment_id
+      FROM fd_assistant_assignments a
+      JOIN fd_assistant_dispatches d ON d.assignment_id = a.assignment_id
+      WHERE a.state = 'queued' AND NOT EXISTS (
+        SELECT 1 FROM fd_assistant_queue_positions p WHERE p.assignment_id = a.assignment_id
+      )
+      ORDER BY a.created_at, a.assignment_id`;
+    for (const { assignment_id } of missing) {
+      yield* positionAt(assignment_id, yield* freshSeq);
+    }
+  }).pipe(transact("maintain"));
+
+  const retryReentry: HandoffAdmission["Service"]["retryReentry"] = (input) =>
+    Effect.gen(function* () {
+      const contended = { type: "contended" } as const;
+      const link = yield* readLink(input.assignmentId);
+      const assignment = yield* assignmentState(input.assignmentId);
+      const root =
+        link === undefined || link.delivery_id === null
+          ? undefined
+          : yield* readRoot(link.delivery_id);
+      if (
+        link === undefined ||
+        root?.state !== "retired" ||
+        (assignment?.state !== "failed" && assignment?.state !== "cancelled") ||
+        (yield* captureInUse({ captureId: link.capture_id, except: input.assignmentId }))
+      ) {
+        return contended;
+      }
+      const refusal =
+        (yield* makeAuthority({ retrying: true })(link)) ?? freshness(link, input.work);
+      if (refusal !== undefined) return { type: "refused", category: refusal } as const;
+      yield* sql`UPDATE fd_assistant_factory_links
+        SET delivery_id = NULL, control = 'none', updated_at = ${yield* now}
+        WHERE assignment_id = ${input.assignmentId}`;
+      yield* portfolio.transitionAssignment({
+        assignmentId: input.assignmentId,
+        event: {
+          type: "retry-delivery",
+          note: `Retrying with a new delivery; Factory delivery ${root.root_delivery_id} stays as it ended.`,
+        },
+      });
+      yield* positionAt(input.assignmentId, yield* freshSeq);
+      return { type: "queued" } as const;
+    }).pipe(transact("prestart"));
+
   const grantEffect: HandoffAdmission["Service"]["grantEffect"] = (demandId) =>
     Effect.gen(function* () {
       const stale = { type: "stale" } as const;
@@ -2681,6 +2949,16 @@ const make = Effect.gen(function* () {
     markDispatched,
     next,
     claim,
+    claimOrdinary,
+    factoryAssignment,
+    createLink,
+    captureInUse,
+    setControl,
+    authority: authorityOf,
+    enterQueue,
+    leaveQueue,
+    normalizeQueue,
+    retryReentry,
     grantEffect,
     reserve,
     redeliverNative,

@@ -4,25 +4,35 @@ import * as NodeCrypto from "node:crypto";
 import { assert } from "@effect/vitest";
 import {
   CommandId,
+  EnvironmentId,
   MessageId,
   NodeId,
   ProviderDriverKind,
+  ProviderInstanceId,
   type ProviderThreadId,
   type RunId,
   RuntimeRequestId,
-  type ThreadId,
+  ThreadId,
   type ThreadPullRequestLink,
 } from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
+import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import type { Caller } from "../../../mcp/threadAccess.ts";
 import * as AutomaticTurnGate from "../../../orchestration-v2/AutomaticTurnGate.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
-import { HandoffAdmission, HandoffBackend, ProjectAssistant } from "../../assistant/index.ts";
+import type * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
+import {
+  HandoffAdmission,
+  HandoffBackend,
+  ProjectAssistant,
+  WorkCapture,
+} from "../../assistant/index.ts";
 import * as Factory from "../index.ts";
 import { drainOrchestration, threadProjection, type World } from "./deliveryHarness.ts";
 
@@ -409,6 +419,245 @@ export const governedMessages = (root: FactoryDeliveryId) =>
     }
     return found;
   }).pipe(Effect.orDie);
+
+/** The project assistant's thread, which alone can queue and control its assignments. */
+export const assistantThread = ThreadId.make("fd-assistant-owner");
+
+/** The assistant thread's MCP caller, as `readCaller` builds it; only its scope and limits count. */
+const assistantCaller: Caller = {
+  scope: {
+    environmentId: EnvironmentId.make("environment"),
+    capabilities: new Set(["orchestration"]),
+    issuedAt: 0,
+    requestNamespace: "test",
+    thread: {
+      threadId: assistantThread,
+      providerSessionId: "session",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    },
+    client: undefined,
+  },
+  threads: {} as Caller["threads"],
+  caller: undefined,
+  limits: { runtimeMode: "full-access", interactionMode: "default" },
+};
+
+/** Starts the project assistant's own thread, which an assignment's authority reads. */
+export const startAssistantThread = (world: World) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const folder = path.join(path.dirname(world.root), "assistant");
+    yield* fileSystem.makeDirectory(folder, { recursive: true });
+    return yield* world.ownerThreadAt(folder, "Plan with me.", assistantThread);
+  }).pipe(Effect.orDie);
+
+/**
+ * An idea agreed, captured as a Work item through the assistant's real capture, and authorized,
+ * as the owner does in that order. Returns the item.
+ */
+export const agreeAndCapture = (world: World, idea: string, kind: "single" | "parent" = "single") =>
+  Effect.gen(function* () {
+    const assistant = yield* ProjectAssistant.ProjectAssistant;
+    const captures = yield* WorkCapture.WorkCapture;
+    yield* assistant.revise({
+      projectId: world.projectId,
+      ideaId: idea,
+      patch: {
+        goal: `Deliver ${idea}`,
+        acceptanceCriteria: [`Check ${idea}`],
+      },
+    });
+    const { item } = yield* captures.capture({
+      caller: assistantCaller,
+      projectId: world.projectId,
+      ideaId: idea,
+      kind,
+    });
+    yield* assistant.revise({
+      projectId: world.projectId,
+      ideaId: idea,
+      patch: { executionAuthorized: true },
+    });
+    return { sourceId: item.sourceId, itemId: item.itemId } satisfies WorkItemRef;
+  }).pipe(Effect.orDie);
+
+/** Queues the captured idea as a Factory assignment named after it. */
+export const assignToFactory = (world: World, idea: string) =>
+  Effect.flatMap(ProjectAssistant.ProjectAssistant, (assistant) =>
+    assistant.enqueue({
+      assignmentId: idea,
+      projectId: world.projectId,
+      ideaId: idea,
+      executor: "factory",
+      managerThreadId: assistantThread,
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      looperConfig: null,
+    }),
+  );
+
+/** The assistant's control of an assignment, as its thread asks for it. */
+export const controlAssignment = (
+  assignmentId: string,
+  action: "stop" | "resume" | "retry" | "cancel",
+) =>
+  Effect.flatMap(ProjectAssistant.ProjectAssistant, (assistant) =>
+    assistant.control({ assignmentId, managerThreadId: assistantThread, action }),
+  );
+
+export const tick = Effect.flatMap(
+  ProjectAssistant.ProjectAssistant,
+  (assistant) => assistant.tick,
+);
+
+/** The assignment's state, attempt and references as stored. */
+export const assignmentOf = (assignmentId: string) =>
+  Effect.flatMap(
+    SqlClient.SqlClient,
+    (sql) => sql<{
+      readonly state: string;
+      readonly attempt: number;
+      readonly worker_refs_json: string;
+    }>`SELECT state, attempt, worker_refs_json FROM fd_assistant_assignments
+      WHERE assignment_id = ${assignmentId}`,
+  ).pipe(
+    Effect.orDie,
+    Effect.map((rows) => rows[0] ?? assert.fail(`No assignment ${assignmentId}.`)),
+  );
+
+/** The assignment's link to its current root. */
+export const linkOf = (assignmentId: string) =>
+  Effect.flatMap(
+    SqlClient.SqlClient,
+    (sql) => sql<{
+      readonly delivery_id: string | null;
+      readonly control: string;
+    }>`SELECT delivery_id, control FROM fd_assistant_factory_links
+      WHERE assignment_id = ${assignmentId}`,
+  ).pipe(
+    Effect.orDie,
+    Effect.map((rows) => rows[0] ?? assert.fail(`No link for ${assignmentId}.`)),
+  );
+
+/** The assignment's current root, as its link names it. */
+export const rootIdOf = (assignmentId: string) =>
+  Effect.map(
+    linkOf(assignmentId),
+    (link) =>
+      (link.delivery_id ?? assert.fail(`${assignmentId} names no root.`)) as FactoryDeliveryId,
+  );
+
+export const managedRootOf = (root: string) =>
+  Effect.flatMap(
+    SqlClient.SqlClient,
+    (sql) =>
+      sql<{
+        readonly state: string;
+        readonly reason: string | null;
+      }>`SELECT state, reason FROM fd_assistant_managed_roots WHERE root_delivery_id = ${root}`,
+  ).pipe(
+    Effect.orDie,
+    Effect.map((rows) => rows[0]),
+  );
+
+export const queuePositionOf = (assignmentId: string) =>
+  Effect.flatMap(
+    SqlClient.SqlClient,
+    (sql) => sql<{
+      readonly seq: number;
+      readonly overtaken: number;
+    }>`SELECT seq, overtaken FROM fd_assistant_queue_positions
+      WHERE assignment_id = ${assignmentId}`,
+  ).pipe(
+    Effect.orDie,
+    Effect.map((rows) => rows[0]),
+  );
+
+/** Every outcome the grant history holds for the root, oldest first. */
+export const grantOutcomesOf = (root: string) =>
+  Effect.flatMap(
+    SqlClient.SqlClient,
+    (sql) => sql<{
+      readonly kind: string;
+      readonly outcome: string;
+    }>`SELECT kind, outcome FROM fd_assistant_grant_history
+      WHERE root_delivery_id = ${root} ORDER BY grant_number`,
+  ).pipe(Effect.orDie);
+
+/**
+ * Counts every call of the assistant's Factory port and lets a test fail or replace them: `onStart`
+ * is given the real start to run or not, and `failGet` and `failCancel` fail those reads and calls
+ * as a storage failure would.
+ */
+export const spyOnFactoryPort = () => {
+  const calls: Array<string> = [];
+  /** Every thread the assistant asked to interrupt, through the thread service it alone sees. */
+  const interrupted: Array<string> = [];
+  const threads = (
+    service: ThreadManagement.ThreadManagementService["Service"],
+  ): ThreadManagement.ThreadManagementService["Service"] => ({
+    ...service,
+    interruptThread: (input) =>
+      Effect.suspend(() => {
+        interrupted.push(input.threadId);
+        return service.interruptThread(input);
+      }),
+  });
+  const control: {
+    onStart:
+      | ((
+          input: { readonly deliveryId: string },
+          start: ReturnType<typeof HandoffBackend.HandoffFactory.Service.start>,
+        ) => ReturnType<typeof HandoffBackend.HandoffFactory.Service.start>)
+      | undefined;
+    failGet: boolean;
+    failCancel: boolean;
+    verifiesAnyway: boolean;
+  } = { onStart: undefined, failGet: false, failCancel: false, verifiesAnyway: false };
+  const wrap = (
+    service: typeof HandoffBackend.HandoffFactory.Service,
+  ): typeof HandoffBackend.HandoffFactory.Service => ({
+    ...service,
+    verifyConfigured: (projectId) =>
+      control.verifiesAnyway ? Effect.succeed(true) : service.verifyConfigured(projectId),
+    get: (id) =>
+      Effect.suspend(() => {
+        calls.push(`get:${id}`);
+        return control.failGet
+          ? Effect.fail(new HandoffBackend.HandoffFactoryError({ operation: "get" }))
+          : service.get(id);
+      }),
+    start: (input) =>
+      Effect.suspend(() => {
+        calls.push(`start:${input.deliveryId}`);
+        return control.onStart === undefined
+          ? service.start(input)
+          : control.onStart(input, service.start(input));
+      }),
+    stop: (id) =>
+      Effect.suspend(() => {
+        calls.push(`stop:${id}`);
+        return service.stop(id);
+      }),
+    resume: (id) =>
+      Effect.suspend(() => {
+        calls.push(`resume:${id}`);
+        return service.resume(id);
+      }),
+    cancel: (id) =>
+      Effect.suspend(() => {
+        calls.push(`cancel:${id}`);
+        return control.failCancel
+          ? Effect.fail(new HandoffBackend.HandoffFactoryError({ operation: "cancel" }))
+          : service.cancel(id);
+      }),
+  });
+  const count = (operation: string) =>
+    calls.filter((call) => call.startsWith(`${operation}:`)).length;
+  return { calls, control, wrap, count, interrupted, threads };
+};
 
 /** The fresh read of the world's item a decision asks for, as the bridge takes it. */
 export const freshRead = (world: World) =>
