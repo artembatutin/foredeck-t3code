@@ -822,7 +822,7 @@ const make = Effect.gen(function* () {
       // item runs: a delivery stored meanwhile, then cancelled before its launch made its
       // branch, would otherwise leave this start on the branch it chose.
       const queued = yield* Effect.gen(function* () {
-        // A start of the same id that got here first holds its row by now.
+        // A start of the same item and id that got here first holds its row by now.
         const raced = yield* named;
         if (Option.isSome(raced)) return raced.value;
         // A new delivery starts over: a cancelled or finished one keeps its branch and worktree.
@@ -858,37 +858,47 @@ const make = Effect.gen(function* () {
         // starts only one is stored, even from another spelling. A single item's task row is
         // written in the same transaction: a refused start adds none, and no stored single item
         // lacks it. A parent's tasks are its approved plan's.
-        return yield* deliveries
-          .insert({
-            deliveryId,
-            projectId,
-            itemRef,
-            // The round limits stay those the delivery started with.
-            state: queuedDeliveryState({
-              kind,
-              branch: workspace.branch,
-              baseRef: workspace.baseRef,
-              limits: {
-                maxFixRounds: limits.maxFixRounds,
-                maxReviewRounds: limits.maxReviewRounds,
-              },
-              ...(input.runtimeModeCeiling === undefined
-                ? {}
-                : { runtimeModeCeiling: input.runtimeModeCeiling }),
+        // The lock held here is the item's, so a start of another item can have stored this id
+        // since the check above; what this transaction reads holds until it commits.
+        return yield* named.pipe(
+          Effect.flatMap(
+            Option.match({
+              onSome: Effect.succeed,
+              onNone: () =>
+                deliveries
+                  .insert({
+                    deliveryId,
+                    projectId,
+                    itemRef,
+                    // The round limits stay those the delivery started with.
+                    state: queuedDeliveryState({
+                      kind,
+                      branch: workspace.branch,
+                      baseRef: workspace.baseRef,
+                      limits: {
+                        maxFixRounds: limits.maxFixRounds,
+                        maxReviewRounds: limits.maxReviewRounds,
+                      },
+                      ...(input.runtimeModeCeiling === undefined
+                        ? {}
+                        : { runtimeModeCeiling: input.runtimeModeCeiling }),
+                    }),
+                  })
+                  .pipe(
+                    Effect.tap(() =>
+                      kind === "single"
+                        ? tasks.insert({ deliveryId, taskId: SINGLE_ITEM_TASK })
+                        : Effect.void,
+                    ),
+                  ),
             }),
-          })
-          .pipe(
-            Effect.tap(() =>
-              kind === "single"
-                ? tasks.insert({ deliveryId, taskId: SINGLE_ITEM_TASK })
-                : Effect.void,
-            ),
-            (write) => changes.transact(write),
-            Effect.catchTags({
-              SqlError: (cause) =>
-                Effect.fail(new FactoryStoreError({ operation: "service.start", cause })),
-            }),
-          );
+          ),
+          (write) => changes.transact(write),
+          Effect.catchTags({
+            SqlError: (cause) =>
+              Effect.fail(new FactoryStoreError({ operation: "service.start", cause })),
+          }),
+        );
       }).pipe((locked) => itemLocks.withLock(workItemRefString(itemRef), locked));
       return yield* started(queued);
     },

@@ -72,8 +72,8 @@ type Launch =
 type Claim = NonNullable<HandoffAdmission.FactoryAssignment["claim"]>;
 
 /**
- * What a Factory assignment's enqueue found: the link it writes, from its capture, confirmed by a
- * fresh read of the item.
+ * What a Factory assignment's enqueue found: the link it writes, from its capture, and the fresh
+ * read of the item that confirmed it, which the enqueue's transaction judges once more.
  */
 interface Authorized {
   readonly captureId: string;
@@ -82,6 +82,7 @@ interface Authorized {
   readonly scopeHash: string;
   readonly itemFingerprint: string;
   readonly runtimeMode: RuntimeMode;
+  readonly work: HandoffAdmission.WorkRead;
 }
 
 /**
@@ -143,6 +144,7 @@ export const make = Effect.gen(function* () {
     assignment: HandoffAdmission.FactoryAssignment,
     root: string,
     delivery: HandoffBackend.HandoffDelivery,
+    note = `Factory delivery ${root} accepted the assignment.`,
   ) =>
     delivery.status === "queued"
       ? Effect.void
@@ -152,7 +154,7 @@ export const make = Effect.gen(function* () {
             { kind: "factory-delivery", id: root },
             { kind: "work-item", id: workItemRefString(assignment.item) },
           ],
-          note: `Factory delivery ${root} accepted the assignment.`,
+          note,
         }).pipe(Effect.asVoid);
 
   /** No delivery row exists, and none can: the assignment fails, and its root retires. */
@@ -409,19 +411,38 @@ export const make = Effect.gen(function* () {
         yield* honored();
         return yield* adopt(assignment, root, delivery);
       }
-      if (control === "stop" && (delivery === undefined || delivery.status === "queued")) {
-        yield* honored();
-        return yield* park(current.assignmentId, root, claim);
-      }
       if (control === "stop") {
         yield* honored();
+        if (delivery === undefined || delivery.status === "queued") {
+          return yield* park(current.assignmentId, root, claim);
+        }
         const stopped = yield* Effect.result(factory.stop(root));
-        if (Result.isFailure(stopped)) return yield* adopt(assignment, root, delivery!);
-        return yield* move(current.assignmentId, {
-          type: "mirror",
-          to: "stopping",
-          note: `Stopping Factory delivery ${root} after its step.`,
-        }).pipe(Effect.asVoid);
+        if (Result.isSuccess(stopped)) {
+          return yield* move(current.assignmentId, {
+            type: "mirror",
+            to: "stopping",
+            note: `Stopping Factory delivery ${root} after its step.`,
+          }).pipe(Effect.asVoid);
+        }
+        // Factory refusing a row that runs no stage spends the stop. Any other failure says
+        // nothing about the row, so the stop stays persisted and the next pass asks again.
+        if (
+          stopped.failure._tag !== "HandoffFactoryRefused" ||
+          stopped.failure.reason !== "not_stoppable"
+        ) {
+          return yield* uncertain(current.assignmentId, LAUNCH_UNKNOWN);
+        }
+        return yield* sql.withTransaction(
+          Effect.andThen(
+            admission.setControl(current.assignmentId, "none"),
+            adopt(
+              assignment,
+              root,
+              delivery,
+              `Factory delivery ${root} cannot stop after its step while it runs no stage, so the stop was dropped.`,
+            ),
+          ),
+        );
       }
       if (control === "cancel" && delivery === undefined) {
         yield* honored();
@@ -602,7 +623,10 @@ export const make = Effect.gen(function* () {
         case "needs-input":
         case "stopping":
           yield* admission.setControl(assignment.assignmentId, "cancel");
-          return yield* cancelDelivery(current, root);
+          // Saved, the cancel stands: one Factory failed to take is the next pass's to ask again.
+          return yield* cancelDelivery(current, root).pipe(
+            Effect.catchTags({ HandoffFactoryError: () => Effect.succeed(current) }),
+          );
         default:
           return yield* move(assignment.assignmentId, { type: "cancel" });
       }
@@ -728,7 +752,8 @@ export const make = Effect.gen(function* () {
      * Whether the idea's capture may be queued (note 6.2, F). Refuses for a thread in plan mode, a
      * capture that does not exist or was never confirmed, a brief or item that moved on from it, a
      * closed or unreadable item, a project with no verify command, and a capture another
-     * assignment that has not ended uses.
+     * assignment that has not ended uses. Reads that outlast these checks are answered by
+     * `enterAuthorized`.
      */
     authorize: (input: {
       readonly projectId: ProjectId;
@@ -799,14 +824,24 @@ export const make = Effect.gen(function* () {
           scopeHash: captured.scopeHash,
           itemFingerprint: captured.itemFingerprint,
           runtimeMode: input.runtimeMode,
+          work: { type: "read", fingerprint: input.read.fingerprint, status: input.read.status },
         } satisfies Authorized;
       }),
 
-    /** The link and queue position of a Factory assignment, in its enqueue's transaction. */
-    enterAuthorized: (assignmentId: string, authorized: Authorized) =>
+    /**
+     * The link and queue position of a Factory assignment, in its enqueue's transaction, which
+     * then judges the root's authority as a claim's does: the manager, brief, capture and project
+     * as they stand now, with the read taken before it. Any of them can have changed while the
+     * reads ran; failing here rolls back every row the enqueue wrote.
+     */
+    enterAuthorized: (assignmentId: string, { work, ...link }: Authorized) =>
       Effect.gen(function* () {
-        yield* admission.createLink({ assignmentId, ...authorized });
+        yield* admission.createLink({ assignmentId, ...link });
         yield* admission.enterQueue(assignmentId);
+        const category = yield* admission.authority(assignmentId, work);
+        if (category !== undefined) {
+          return yield* refusal(`Not queued: ${REFUSED_BECAUSE[category]}.`);
+        }
       }),
 
     /** A control of a Factory assignment (note 6.8), under the assistant's lock. */

@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import { AuthWorkReadScope, AuthWorkWriteScope } from "@t3tools/contracts";
+import { AuthWorkReadScope, AuthWorkWriteScope, CommandId } from "@t3tools/contracts";
 import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as Deferred from "effect/Deferred";
@@ -9,6 +9,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import { HandoffAdmission, HandoffBackend, ProjectAssistant } from "../assistant/index.ts";
 import { type WorkActor, type WorkDomainError, WorkService } from "../work-management/index.ts";
 import * as Factory from "./index.ts";
@@ -266,6 +267,73 @@ describe("an authorized Factory assignment on the real stack", () => {
           assert.deepStrictEqual(spy.calls, []);
         }),
       options(spy),
+    );
+  });
+});
+
+describe("a manager that changes while its enqueue reads Work", () => {
+  const before: { run?: Effect.Effect<void> } = {};
+  const countsOf = (assignmentId: string) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const counts: Record<string, number> = {};
+      for (const table of [
+        "fd_assistant_assignments",
+        "fd_assistant_dispatches",
+        "fd_assistant_factory_links",
+        "fd_assistant_queue_positions",
+      ]) {
+        const [row] = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM ${sql(table)} WHERE assignment_id = ${assignmentId}`;
+        counts[table] = row?.count ?? 0;
+      }
+      return counts;
+    }).pipe(Effect.orDie);
+  const none = {
+    fd_assistant_assignments: 0,
+    fd_assistant_dispatches: 0,
+    fd_assistant_factory_links: 0,
+    fd_assistant_queue_positions: 0,
+  };
+
+  it.live.each([
+    { name: "archived", command: "thread.archive" as const },
+    { name: "deleted", command: "thread.delete" as const },
+  ])("refuses a manager $name during the read, writing nothing", ({ command }) => {
+    const spy = spyOnFactoryPort();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const manager = yield* startAssistantThread(world);
+          yield* world.endRun(manager.runId, "completed");
+          yield* agreeAndCapture(world, "export");
+
+          before.run = orchestrator
+            .dispatch({
+              type: command,
+              commandId: CommandId.make(`manager-${command}`),
+              threadId: manager.threadId,
+            })
+            .pipe(Effect.orDie, Effect.asVoid);
+          const refused = yield* Effect.flip(assignToFactory(world, "export"));
+          assert.include(refused.message, "Not queued");
+          assert.isUndefined(before.run);
+          assert.deepStrictEqual(yield* countsOf("export"), none);
+          assert.deepStrictEqual(spy.calls, []);
+        }),
+      options(spy, {
+        work: (service) => ({
+          ...service,
+          getItem: (actor, input) =>
+            Effect.suspend(() => {
+              const run = actor.id === "assistant:handoff" ? before.run : undefined;
+              if (run !== undefined) delete before.run;
+              return (run ?? Effect.void).pipe(Effect.andThen(service.getItem(actor, input)));
+            }),
+        }),
+      }),
     );
   });
 });
@@ -885,6 +953,46 @@ describe("controls of a delivery whose claim did not hear back, on the real stac
       options(spy),
     );
   });
+
+  it.live(
+    "a stop Factory failed to take stays persisted through a rebuild, then stops that id",
+    () => {
+      const spy = spyOnFactoryPort();
+      return withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            yield* startAssistantThread(world);
+            const { root } = yield* lostReply(world, spy, "export");
+            const author = yield* world.launched(root);
+            spy.control.failStop = true;
+
+            const asked = yield* controlAssignment("export", "stop");
+            assert.strictEqual(asked.state, "launch-uncertain");
+            assert.strictEqual((yield* linkOf("export")).control, "stop");
+            assert.strictEqual(spy.count("stop"), 1);
+            assert.strictEqual((yield* stateOf(root)).status, "running");
+            yield* tick;
+            assert.strictEqual(spy.count("stop"), 2);
+            assert.strictEqual((yield* assignmentOf("export")).state, "launch-uncertain");
+
+            yield* world.rebuild(
+              Effect.gen(function* () {
+                spy.control.failStop = false;
+                yield* tick;
+                assert.strictEqual(spy.count("stop"), 3);
+                assert.strictEqual((yield* stateOf(root)).status, "stopping");
+                assert.strictEqual((yield* assignmentOf("export")).state, "stopping");
+                assert.strictEqual(spy.count("start"), 1);
+                assert.deepStrictEqual(spy.interrupted, []);
+                yield* world.endRun(author.runId, "completed");
+              }),
+            );
+          }),
+        options(spy),
+      );
+    },
+  );
 
   it.live(
     "a cancel after a rebuild reads the row its lost reply stored, and cancels that id",

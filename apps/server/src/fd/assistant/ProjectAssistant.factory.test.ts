@@ -6,6 +6,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -82,6 +83,10 @@ const makeFakes = () => {
     verifyFails: false,
     getFails: false,
     cancelFails: false,
+    stopFails: false,
+    /** Run once each, inside the next Work read and the next verify read, before they answer. */
+    onRead: undefined as Effect.Effect<void> | undefined,
+    onVerify: undefined as Effect.Effect<void> | undefined,
     /** Runs at the start of each `start`, in its place when it returns a failure. */
     onStart: undefined as
       | ((
@@ -98,6 +103,14 @@ const makeFakes = () => {
 };
 type Fakes = ReturnType<typeof makeFakes>;
 
+/** Runs a hook a test set, once. */
+const runOnce = (fakes: Fakes, hook: "onRead" | "onVerify") =>
+  Effect.suspend(() => {
+    const effect = fakes[hook];
+    fakes[hook] = undefined;
+    return effect ?? Effect.void;
+  });
+
 const count = (fakes: Fakes, operation: string) =>
   fakes.calls.filter((call) => call.startsWith(`${operation}:`)).length;
 
@@ -112,10 +125,13 @@ const factoryPort = (fakes: Fakes): typeof HandoffBackend.HandoffFactory.Service
   };
   return {
     verifyConfigured: () =>
-      Effect.suspend(() =>
-        fakes.verifyFails
-          ? Effect.fail(new HandoffBackend.HandoffFactoryError({ operation: "verify" }))
-          : Effect.succeed(fakes.verify),
+      Effect.andThen(
+        runOnce(fakes, "onVerify"),
+        Effect.suspend(() =>
+          fakes.verifyFails
+            ? Effect.fail(new HandoffBackend.HandoffFactoryError({ operation: "verify" }))
+            : Effect.succeed(fakes.verify),
+        ),
       ),
     get: (id) =>
       Effect.suspend(() => {
@@ -161,6 +177,9 @@ const factoryPort = (fakes: Fakes): typeof HandoffBackend.HandoffFactory.Service
     stop: (id) =>
       Effect.gen(function* () {
         fakes.calls.push(`stop:${id}`);
+        if (fakes.stopFails) {
+          return yield* new HandoffBackend.HandoffFactoryError({ operation: "stop" });
+        }
         const status = yield* known(id);
         if (status !== "running" && status !== "stopping") {
           return yield* new HandoffBackend.HandoffFactoryRefused({
@@ -220,26 +239,29 @@ const factoryPort = (fakes: Fakes): typeof HandoffBackend.HandoffFactory.Service
 
 const workPort = (fakes: Fakes): Partial<typeof HandoffBackend.HandoffBackend.Service> => ({
   read: (ref) =>
-    Effect.suspend(() => {
-      const item = fakes.items.get(ref.itemId);
-      if (item === undefined || !item.readable) {
-        return Effect.fail(
-          new HandoffBackend.HandoffBackendError({ operation: "read", reason: "unavailable" }),
-        );
-      }
-      return Effect.succeed({
-        ref,
-        key: ref.itemId,
-        url: null,
-        title: "An item",
-        status: item.status,
-        revision: "1",
-        invalid: false,
-        body: "",
-        fingerprint: item.fingerprint,
-        notes: "",
-      });
-    }),
+    Effect.andThen(
+      runOnce(fakes, "onRead"),
+      Effect.suspend(() => {
+        const item = fakes.items.get(ref.itemId);
+        if (item === undefined || !item.readable) {
+          return Effect.fail(
+            new HandoffBackend.HandoffBackendError({ operation: "read", reason: "unavailable" }),
+          );
+        }
+        return Effect.succeed({
+          ref,
+          key: ref.itemId,
+          url: null,
+          title: "An item",
+          status: item.status,
+          revision: "1",
+          invalid: false,
+          body: "",
+          fingerprint: item.fingerprint,
+          notes: "",
+        });
+      }),
+    ),
 });
 
 const layerOf = (fakes: Fakes, probe?: typeof HandoffAdmission.HandoffAdmissionProbe.Service) => {
@@ -833,6 +855,123 @@ describe("a Factory assignment's enqueue", () => {
     assign("idea", "second"),
   );
 
+  /** An enqueue at full access, which a manager narrowed below that no longer covers. */
+  const assignFullAccess = Effect.flatMap(service, (assistant) =>
+    assistant.enqueue({
+      assignmentId: "idea",
+      projectId: alpha,
+      ideaId: "idea",
+      executor: "factory",
+      managerThreadId: managerId,
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      looperConfig: null,
+    }),
+  );
+
+  // What the manager's own request said no longer holds by the time the enqueue would commit.
+  const managerChanges: ReadonlyArray<{
+    readonly name: string;
+    readonly change: (fakes: Fakes) => void;
+    readonly attempt: typeof assignFullAccess;
+  }> = [
+    {
+      name: "was deleted",
+      change: (fakes) => {
+        fakes.manager = null;
+      },
+      attempt: assign("idea"),
+    },
+    {
+      name: "was archived",
+      change: (fakes) => {
+        fakes.manager = managerShell({ archivedAt: DateTime.makeUnsafe(at) });
+      },
+      attempt: assign("idea"),
+    },
+    {
+      name: "switched to plan mode",
+      change: (fakes) => {
+        fakes.manager = managerShell({ interactionMode: "plan" });
+      },
+      attempt: assign("idea"),
+    },
+    {
+      name: "narrowed its permissions",
+      change: (fakes) => {
+        fakes.manager = managerShell({ runtimeMode: "approval-required" });
+      },
+      attempt: assignFullAccess,
+    },
+  ];
+
+  it.effect.each(
+    managerChanges.flatMap((manager) => [
+      { ...manager, hook: "onRead" as const, during: "the item's read" },
+      { ...manager, hook: "onVerify" as const, during: "the verify read" },
+    ]),
+  )("writes nothing when the manager $name during $during", ({ change, attempt, hook }) => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        yield* agree(fakes, "idea");
+        const before = yield* enqueueRows;
+        fakes[hook] = Effect.sync(() => change(fakes));
+        const error = yield* Effect.flip(attempt);
+        assert.include(error.message, "Not queued");
+        assert.deepStrictEqual(yield* enqueueRows, before);
+        assert.isUndefined(yield* positionOf("idea"));
+
+        // Nothing stands in the way once the manager is back.
+        fakes.manager = managerShell();
+        assert.strictEqual((yield* attempt).state, "queued");
+      }),
+    );
+  });
+
+  it.effect(
+    "writes nothing when the brief, capture or project changes during the verify read",
+    () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          const assistant = yield* service;
+          const sql = yield* sqlOf;
+          yield* agree(fakes, "idea");
+          const before = yield* enqueueRows;
+
+          fakes.onVerify = assistant
+            .revise({ projectId: alpha, ideaId: "idea", patch: { executionAuthorized: false } })
+            .pipe(Effect.orDie, Effect.asVoid);
+          assert.include((yield* Effect.flip(assign("idea"))).message, "Not queued");
+          assert.deepStrictEqual(yield* enqueueRows, before);
+          yield* assistant.revise({
+            projectId: alpha,
+            ideaId: "idea",
+            patch: { executionAuthorized: true },
+          });
+
+          fakes.onVerify = Effect.sync(() => {
+            fakes.repositories = ["one", "two"];
+          });
+          assert.include((yield* Effect.flip(assign("idea"))).message, "Not queued");
+          assert.deepStrictEqual(yield* enqueueRows, before);
+          fakes.repositories = [];
+
+          fakes.onVerify = sql`DELETE FROM fd_assistant_work_captures`.pipe(
+            Effect.orDie,
+            Effect.asVoid,
+          );
+          assert.include((yield* Effect.flip(assign("idea"))).message, "Not queued");
+          assert.deepStrictEqual(yield* enqueueRows, before);
+        }),
+      );
+    },
+  );
+
   it.effect("writes its rows in one go, and a repeat returns them unchanged", () => {
     const fakes = makeFakes();
     return withFakes(
@@ -1405,6 +1544,123 @@ describe("pre-delivery controls", () => {
         assert.strictEqual(stopping.state, "stopping");
         assert.strictEqual(count(fakes, "stop"), 1);
         assert.strictEqual(fakes.deliveries.get(root), "stopping");
+      }),
+    );
+  });
+
+  /** A claim whose start ran its row, with the reply and the read after it lost. */
+  const uncertainOverARow = (fakes: Fakes, idea: string) =>
+    Effect.gen(function* () {
+      yield* agreed(fakes, idea);
+      fakes.onStart = () => Effect.succeed("lost");
+      fakes.getFails = true;
+      yield* tick;
+      fakes.onStart = undefined;
+      fakes.getFails = false;
+      assert.strictEqual(yield* stateOf(idea), "launch-uncertain");
+      const root = (yield* linkOf(idea))!.delivery_id!;
+      assert.strictEqual(fakes.deliveries.get(root), "running");
+      return root;
+    });
+
+  it.effect("a stop Factory failed to take stays persisted, and a later pass stops the row", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const root = yield* uncertainOverARow(fakes, "idea");
+        fakes.stopFails = true;
+
+        const asked = yield* control("idea", "stop");
+        assert.strictEqual(asked.state, "launch-uncertain");
+        assert.strictEqual((yield* linkOf("idea"))?.control, "stop");
+        assert.strictEqual(count(fakes, "stop"), 1);
+        assert.strictEqual(fakes.deliveries.get(root), "running");
+
+        // Still failing, it is asked again and nothing else moves.
+        yield* tick;
+        assert.strictEqual(count(fakes, "stop"), 2);
+        assert.strictEqual(yield* stateOf("idea"), "launch-uncertain");
+        assert.strictEqual((yield* linkOf("idea"))?.control, "stop");
+        assert.strictEqual((yield* slotOf(root))?.state, "held");
+
+        fakes.stopFails = false;
+        yield* tick;
+        assert.strictEqual(count(fakes, "stop"), 3);
+        assert.strictEqual(yield* stateOf("idea"), "stopping");
+        assert.strictEqual(fakes.deliveries.get(root), "stopping");
+
+        yield* tick;
+        assert.strictEqual(count(fakes, "stop"), 3);
+        assert.strictEqual(count(fakes, "start"), 1);
+      }),
+    );
+  });
+
+  it.effect("a stop whose reply was lost converges on the same row", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const root = yield* uncertainOverARow(fakes, "idea");
+        fakes.stopFails = true;
+        yield* control("idea", "stop");
+        // Factory took it; only the reply was lost.
+        fakes.deliveries.set(root, "stopping");
+        fakes.stopFails = false;
+        yield* tick;
+        assert.strictEqual(yield* stateOf("idea"), "stopping");
+        assert.strictEqual(fakes.deliveries.get(root), "stopping");
+      }),
+    );
+  });
+
+  it.effect("a stop Factory refuses for a row that runs no stage is spent, not retried", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const root = yield* uncertainOverARow(fakes, "idea");
+        fakes.deliveries.set(root, "blocked");
+        const asked = yield* control("idea", "stop");
+        assert.strictEqual(asked.state, "running");
+        assert.strictEqual((yield* linkOf("idea"))?.control, "none");
+        assert.strictEqual(count(fakes, "stop"), 1);
+        const { assignments } = yield* Effect.flatMap(service, (assistant) =>
+          assistant.inspect(alpha, "idea"),
+        );
+        assert.include(assignments[0]?.progress.at(-1)?.text ?? "", "cannot stop");
+
+        yield* tick;
+        yield* tick;
+        assert.strictEqual(count(fakes, "stop"), 1);
+        assert.strictEqual(yield* stateOf("idea"), "running");
+      }),
+    );
+  });
+
+  it.effect("a cancel Factory failed to take on a running row stands, and is asked again", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        yield* agreed(fakes, "idea");
+        yield* tick;
+        const root = (yield* linkOf("idea"))!.delivery_id!;
+        fakes.cancelFails = true;
+
+        // The intent is saved, so the caller is not told it failed.
+        const asked = yield* control("idea", "cancel");
+        assert.strictEqual(asked.state, "running");
+        assert.strictEqual((yield* linkOf("idea"))?.control, "cancel");
+        assert.strictEqual(count(fakes, "cancel"), 1);
+        assert.strictEqual(fakes.deliveries.get(root), "running");
+
+        fakes.cancelFails = false;
+        yield* tick;
+        assert.strictEqual(count(fakes, "cancel"), 2);
+        assert.strictEqual(fakes.deliveries.get(root), "cancelled");
+        assert.strictEqual(yield* stateOf("idea"), "stopping");
       }),
     );
   });

@@ -588,8 +588,8 @@ export const grantOutcomesOf = (root: string) =>
 
 /**
  * Counts every call of the assistant's Factory port and lets a test fail or replace them: `onStart`
- * is given the real start to run or not, and `failGet` and `failCancel` fail those reads and calls
- * as a storage failure would.
+ * is given the real start to run or not, and `failGet`, `failStop` and `failCancel` fail those
+ * reads and calls as a storage failure would.
  */
 export const spyOnFactoryPort = () => {
   const calls: Array<string> = [];
@@ -613,9 +613,16 @@ export const spyOnFactoryPort = () => {
         ) => ReturnType<typeof HandoffBackend.HandoffFactory.Service.start>)
       | undefined;
     failGet: boolean;
+    failStop: boolean;
     failCancel: boolean;
     verifiesAnyway: boolean;
-  } = { onStart: undefined, failGet: false, failCancel: false, verifiesAnyway: false };
+  } = {
+    onStart: undefined,
+    failGet: false,
+    failStop: false,
+    failCancel: false,
+    verifiesAnyway: false,
+  };
   const wrap = (
     service: typeof HandoffBackend.HandoffFactory.Service,
   ): typeof HandoffBackend.HandoffFactory.Service => ({
@@ -639,7 +646,9 @@ export const spyOnFactoryPort = () => {
     stop: (id) =>
       Effect.suspend(() => {
         calls.push(`stop:${id}`);
-        return service.stop(id);
+        return control.failStop
+          ? Effect.fail(new HandoffBackend.HandoffFactoryError({ operation: "stop" }))
+          : service.stop(id);
       }),
     resume: (id) =>
       Effect.suspend(() => {

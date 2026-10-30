@@ -799,13 +799,13 @@ const make = Effect.gen(function* () {
                       executor: authorized ? "factory" : input.looperConfig ? "looper" : "foredeck",
                     });
                     yield* save({ payload: record });
-                    const queued = yield* move(input.assignmentId, { type: "queue" });
+                    // Judged before the move, so a revoked brief is refused with its reason.
                     if (authorized) {
                       yield* factoryExecutor.enterAuthorized(input.assignmentId, authorized);
                     } else {
                       yield* admission.enterQueue(input.assignmentId);
                     }
-                    return queued;
+                    return yield* move(input.assignmentId, { type: "queue" });
                   }),
                 );
               }),
