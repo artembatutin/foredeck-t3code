@@ -4,7 +4,8 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import * as EffectOutbox from "../../orchestration-v2/EffectOutbox.ts";
-import { HandoffAdmission, HandoffBackend } from "../assistant/index.ts";
+import { HandoffAdmission, HandoffBackend, ProjectAssistant } from "../assistant/index.ts";
+import * as Factory from "./index.ts";
 import {
   consult,
   demandsOf,
@@ -19,6 +20,7 @@ import {
 } from "./testkit/handoff.ts";
 import { coreRecovery, providerThreadOf, providerTurnRunning } from "./testkit/familyThreads.ts";
 import { editTaskFile, linkOf, openSingle } from "./testkit/followThrough.ts";
+import { authorCommits } from "./testkit/deliveryHarness.ts";
 import {
   drainFactory,
   drainOrchestration,
@@ -103,6 +105,53 @@ describe("fresh authority for a managed root's automatic turns", () => {
         { handoff: {}, automaticTurnGate: true },
       ),
     180_000,
+  );
+
+  it.live("refuses an effect that waits for a slot once its root is revoked", () =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const admission = yield* HandoffAdmission.HandoffAdmission;
+          const assistant = yield* ProjectAssistant.ProjectAssistant;
+          const factory = yield* Factory.FactoryService.FactoryService;
+          const author = yield* world.start;
+          const managed = yield* manage(world, author.deliveryId);
+          const [filler] = yield* fill(world, 2);
+          yield* authorCommits(author.worktreePath, "feat: add the export button", "x\n");
+          yield* world.endRun(author.runId, "completed");
+          const waiting = yield* stateOf(author.deliveryId);
+          if (waiting.awaiting?.type !== "effect") return assert.fail("No effect waits.");
+          const effectId = waiting.awaiting.effect.id;
+          assert.strictEqual(waiting.admissionWait?.effectId, effectId);
+
+          // The owner withdraws the authorization while the effect waits, then a slot frees.
+          yield* assistant.revise({
+            projectId: world.projectId,
+            ideaId: managed.ideaId,
+            patch: { executionAuthorized: false },
+          });
+          yield* release(filler!);
+          const refused = yield* admission.blockRevoked;
+          assert.deepStrictEqual(
+            refused.map(({ demand, category }) => [demand.effectId, category]),
+            [[effectId, "revoked"]],
+          );
+          const [demand] = yield* demandsOf(managed.root);
+          const granted = yield* admission.grantEffect(demand!.id);
+          assert.strictEqual(granted.type, "refused");
+          // Redispatched, the effect is refused and the delivery blocks, holding no slot.
+          assert.strictEqual(yield* factory.redispatch(author.deliveryId, effectId), "dispatched");
+          yield* drainFactory;
+          const state = yield* stateOf(author.deliveryId);
+          assert.strictEqual(state.status, "blocked");
+          if (state.block?.reason !== "effect_failed") return assert.fail("No effect failed.");
+          assert.include(state.block.detail, Factory.FactoryAdmission.admissionRefusalText.revoked);
+          assert.deepStrictEqual(yield* demandsOf(managed.root), []);
+          assert.isUndefined(yield* slotOf(managed.root));
+        }),
+      { handoff: {}, automaticTurnGate: true },
+    ),
   );
 
   it.live("redelivers a reserved native wake only once its root's item reads as authorized", () =>

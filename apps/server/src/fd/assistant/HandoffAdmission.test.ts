@@ -2832,3 +2832,198 @@ describe("kept native redelivery", () => {
       ),
   );
 });
+
+describe("revocation of work already waiting", () => {
+  it.effect("refuses a waiting effect once its root is revoked, granted or asked again", () =>
+    withAdmission(() =>
+      Effect.gen(function* () {
+        const admission = yield* service;
+        const subject = yield* seed("subject", { state: "running", root: "root-s" });
+        yield* fill(2);
+        assert.deepStrictEqual(yield* enter({ root: "root-s", effectId: 1 }, subject.work), {
+          decision: { type: "defer" },
+          reads: 0,
+        });
+        const [demand] = yield* demandsOf("root-s");
+        // Revoked while it waits, then a slot frees.
+        yield* reviseSubject({ executionAuthorized: false });
+        yield* admission
+          .release("root-other-1", (yield* slotOf("root-other-1"))!.entry_seq)
+          .pipe(Effect.orDie);
+
+        // The tick's grant refuses it, writing nothing, for its redispatch to be refused.
+        const before = yield* snapshot;
+        assert.deepStrictEqual(yield* admission.grantEffect(demand!.id).pipe(Effect.orDie), {
+          type: "refused",
+          category: "revoked",
+          deliveryId: "root-s",
+          effectId: 1,
+        });
+        assert.deepStrictEqual(yield* snapshot, before);
+        assert.strictEqual((yield* admission.next.pipe(Effect.orDie)).free, 1);
+        assert.deepStrictEqual(
+          (yield* admission.blockRevoked.pipe(Effect.orDie)).map(({ demand, category }) => [
+            demand.id,
+            category,
+          ]),
+          [[demand!.id, "revoked"]],
+        );
+        // Asked again, the effect is refused with no read, and its demand goes.
+        assert.deepStrictEqual(yield* enter({ root: "root-s", effectId: 1 }, subject.work), {
+          decision: { type: "refuse", category: "revoked" },
+          reads: 0,
+        });
+        assert.deepStrictEqual(yield* demandsOf("root-s"), []);
+        assert.strictEqual((yield* historyOf("subject")).at(-1)?.outcome, "declined");
+        assert.isUndefined(yield* slotOf("root-s"));
+        // An effect that never waited is refused just the same, with capacity free.
+        assert.deepStrictEqual(
+          yield* enter({ root: "root-s", deliveryId: "child-1", effectId: 2 }, subject.work),
+          { decision: { type: "refuse", category: "revoked" }, reads: 0 },
+        );
+        assert.deepStrictEqual(yield* demandsOf("root-s"), []);
+      }),
+    ),
+  );
+
+  it.effect(
+    "blocks a waiting automatic demand once its root is revoked, and restores it later",
+    () =>
+      withAdmission(() =>
+        Effect.gen(function* () {
+          const admission = yield* service;
+          const subject = yield* seed("subject", { state: "running", root: "root-s" });
+          yield* fill(2);
+          yield* decide({ root: "root-s", turn: turns.pullRequest() }, subject.work);
+          const [waiting] = yield* demandsOf("root-s");
+          assert.strictEqual(waiting?.blockedReason, null);
+          yield* reviseSubject({ executionAuthorized: false });
+          yield* admission
+            .release("root-other-1", (yield* slotOf("root-other-1"))!.entry_seq)
+            .pipe(Effect.orDie);
+
+          // The tick reaches it with a slot free: it is blocked, not passed over as stale.
+          assert.deepStrictEqual(
+            yield* admission.reserve(waiting!.id, subject.work).pipe(Effect.orDie),
+            { type: "blocked", category: "revoked" },
+          );
+          const [blocked] = yield* demandsOf("root-s");
+          assert.deepStrictEqual(
+            { state: blocked?.state, blockedReason: blocked?.blockedReason, seq: blocked?.seq },
+            { state: "waiting", blockedReason: "revoked", seq: waiting!.seq },
+          );
+          assert.isUndefined(yield* slotOf("root-s"));
+          assert.strictEqual((yield* historyOf("subject")).at(-1)?.outcome, "blocked");
+          assert.deepStrictEqual(
+            yield* admission.reserve(waiting!.id, subject.work).pipe(Effect.orDie),
+            { type: "stale" },
+          );
+
+          // Authorized again, it is no candidate until a re-check restores it at a fresh position.
+          yield* reviseSubject({ executionAuthorized: true });
+          assert.isUndefined((yield* admission.next.pipe(Effect.orDie)).head);
+          assert.strictEqual(
+            yield* admission
+              .recheckBlocked({ root: "root-s", work: subject.work, force: true })
+              .pipe(Effect.orDie),
+            1,
+          );
+          const [restored] = yield* demandsOf("root-s");
+          assert.strictEqual(restored?.blockedReason, null);
+          assert.isAbove(restored!.seq, waiting!.seq);
+          assert.strictEqual(restored?.overtaken, 0);
+          assert.strictEqual(
+            (yield* admission.next.pipe(Effect.orDie)).head?.id,
+            `demand:${waiting!.id}`,
+          );
+          assert.strictEqual(
+            (yield* admission.reserve(waiting!.id, subject.work).pipe(Effect.orDie)).type,
+            "reserved",
+          );
+        }),
+      ),
+  );
+
+  it.effect("blocks a waiting demand presented again after a revocation, reading nothing", () =>
+    withAdmission(() =>
+      Effect.gen(function* () {
+        const subject = yield* seed("subject", { state: "running", root: "root-s" });
+        yield* fill(2);
+        const limit = turns.limit();
+        assert.strictEqual(
+          (yield* decide({ root: "root-s", turn: limit }, subject.work)).decision.type,
+          "demand",
+        );
+        const [waiting] = yield* demandsOf("root-s");
+        yield* reviseSubject({ executionAuthorized: false });
+        const again = yield* decide({ root: "root-s", turn: limit }, subject.work);
+        assert.deepStrictEqual(again, {
+          decision: { type: "blocked", demandId: waiting!.id, category: "revoked" },
+          reads: 0,
+          ran: false,
+        });
+        // Blocked already, a further presentation changes nothing.
+        const before = yield* snapshot;
+        const later = yield* decide({ root: "root-s", turn: limit }, subject.work);
+        assert.deepStrictEqual(later.decision, { type: "demand", demandId: waiting!.id });
+        assert.strictEqual(later.reads, 0);
+        assert.deepStrictEqual(yield* snapshot, before);
+        // A turn arriving while revoked waits blocked; a continuation declines.
+        const completion = yield* decide(
+          { root: "root-s", turn: turns.completion() },
+          subject.work,
+        );
+        assert.strictEqual(completion.decision.type, "blocked");
+        assert.strictEqual(completion.reads, 0);
+        assert.strictEqual(
+          (yield* decide({ root: "root-s", turn: turns.continuation() }, subject.work)).decision
+            .type,
+          "declined",
+        );
+        assert.deepStrictEqual(
+          (yield* demandsOf("root-s")).map(({ kind, blockedReason }) => [kind, blockedReason]),
+          [
+            ["usage_limit_resume", "revoked"],
+            ["delegated_completion", "revoked"],
+          ],
+        );
+      }),
+    ),
+  );
+
+  it.effect("blocks each waiting demand of a revoked root in one pass, leaving others alone", () =>
+    withAdmission(() =>
+      Effect.gen(function* () {
+        const admission = yield* service;
+        const subject = yield* seed("subject", { state: "running", root: "root-s" });
+        const bravo = yield* seed("bravo", { state: "running", root: "root-b" });
+        yield* fill(2);
+        yield* decide({ root: "root-s", turn: turns.pullRequest() }, subject.work);
+        yield* decide({ root: "root-s", turn: turns.question() }, subject.work);
+        yield* enter({ root: "root-s", effectId: 4 }, subject.work);
+        yield* decide({ root: "root-b", turn: turns.pullRequest() }, bravo.work);
+        const bravoBefore = yield* demandsOf("root-b");
+        yield* reviseSubject({ executionAuthorized: false });
+
+        const refused = yield* admission.blockRevoked.pipe(Effect.orDie);
+        assert.deepStrictEqual(
+          refused.map(({ demand, category }) => [demand.kind, demand.effectId, category]),
+          [["effect", 4, "revoked"]],
+        );
+        assert.deepStrictEqual(
+          (yield* demandsOf("root-s")).map(({ kind, blockedReason }) => [kind, blockedReason]),
+          [
+            ["pull_request_wake", "revoked"],
+            ["delegated_question", "revoked"],
+            ["effect", null],
+          ],
+        );
+        assert.deepStrictEqual(yield* demandsOf("root-b"), bravoBefore);
+        // Again, it changes nothing and returns the effect still to be refused.
+        const before = yield* snapshot;
+        assert.deepStrictEqual(yield* admission.blockRevoked.pipe(Effect.orDie), refused);
+        assert.deepStrictEqual(yield* snapshot, before);
+      }),
+    ),
+  );
+});

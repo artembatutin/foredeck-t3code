@@ -171,6 +171,16 @@ export type GrantResult =
       readonly deliveryId: string;
       readonly effectId: number;
     }
+  /**
+   * The root's authority fails: nothing was granted, and the effect is to be redispatched so its
+   * delivery asks again, is refused with the category and blocks.
+   */
+  | {
+      readonly type: "refused";
+      readonly category: BlockedReason;
+      readonly deliveryId: string;
+      readonly effectId: number;
+    }
   | { readonly type: "stale" };
 
 export type ReserveResult =
@@ -275,10 +285,11 @@ export class HandoffAdmission extends Context.Service<
     readonly management: (root: string) => Effect.Effect<Management, HandoffAdmissionError>;
     /**
      * Decides a Factory effect of the root's family (note 6.3). A root never managed proceeds and
-     * writes nothing; an ending or retired one refuses `ended`. An active root proceeds holding or
-     * reserving its slot, or granted the slot at the free fair head, needing its authority and, for
-     * a `fresh` effect, a fresh Work read (`needs_work` asks for one); otherwise the effect waits as
-     * the delivery's one effect demand, which keeps its position.
+     * writes nothing; an ending or retired one refuses `ended`. An active root whose authority
+     * fails refuses the effect with its category, a waiting one included, whose demand goes.
+     * Otherwise it proceeds holding or reserving its slot, or granted the slot at the free fair
+     * head, needing for a `fresh` effect a fresh Work read (`needs_work` asks for one); else the
+     * effect waits as the delivery's one effect demand, which keeps its position.
      */
     readonly enter: (
       entry: EffectEntry,
@@ -305,7 +316,8 @@ export class HandoffAdmission extends Context.Service<
     /**
      * Decides an automatic turn Factory classified as the root's own or unknown work (note 6.3).
      * An ending or retired root declines it; the first presentation of each key records one
-     * disposition and notice, later ones only read it. A native wake's `kept` dispatch is held
+     * disposition and notice, later ones only read it. An active root whose authority fails
+     * blocks it, its waiting demand included, with the category. A native wake's `kept` dispatch is held
      * while its demand waits, for a grant to run later.
      */
     readonly decideTurn: (input: {
@@ -367,12 +379,15 @@ export class HandoffAdmission extends Context.Service<
       readonly assignmentId: string;
       readonly deliveryId?: string;
     }) => Effect.Effect<ClaimResult, HandoffAdmissionError>;
-    /** Grants a waiting effect demand at the free fair head: a held slot and its admission. */
+    /**
+     * Grants a waiting effect demand at the free fair head: a held slot and its admission. A
+     * revoked root's effect is `refused` instead, writing nothing.
+     */
     readonly grantEffect: (demandId: number) => Effect.Effect<GrantResult, HandoffAdmissionError>;
     /**
      * Reserves the slot for an automatic demand at the free fair head, under a lease, once the
      * fresh `work` read confirms its root; a root that fails it blocks the demand, which keeps its
-     * turn.
+     * turn. A revoked root's demand is blocked whether or not it is at the head.
      */
     readonly reserve: (
       demandId: number,
@@ -402,6 +417,16 @@ export class HandoffAdmission extends Context.Service<
     readonly expireLeases: <E>(
       currency: (demand: Demand) => Effect.Effect<Currency, E>,
     ) => Effect.Effect<void, HandoffAdmissionError | E>;
+    /**
+     * Applies revocation to work already waiting, from the database alone (note 6.2): each
+     * waiting demand of an active root whose authority fails is blocked with its category, out
+     * of the fair order until a re-check restores it at a fresh position. An effect demand is
+     * returned instead of blocked, to be redispatched so its delivery refuses it.
+     */
+    readonly blockRevoked: Effect.Effect<
+      ReadonlyArray<{ readonly demand: Demand; readonly category: BlockedReason }>,
+      HandoffAdmissionError
+    >;
     /** Roots with blocked demands due for a re-check (every one when `force`). */
     readonly blockedRoots: (options?: {
       readonly force?: boolean;
@@ -1417,6 +1442,22 @@ const make = Effect.gen(function* () {
       const authority = makeAuthority();
       const slot = yield* readSlot(root.root_delivery_id);
       const demand = yield* effectDemand(root.root_delivery_id, entry.deliveryId);
+      // The root's authority, read from the database alone, decides first: a revoked root's
+      // effect is refused whether it would be admitted or wait, its waiting demand included.
+      const category = yield* authority(link);
+      if (category !== undefined) {
+        if (demand !== undefined) {
+          yield* deleteDemand(demand.id);
+          yield* history({
+            assignmentId: root.assignment_id,
+            root: root.root_delivery_id,
+            kind: "effect",
+            seq: demand.seq,
+            outcome: "declined",
+          });
+        }
+        return { type: "refuse", category } as const;
+      }
       const head =
         slot === undefined
           ? yield* freeAndHead(authority, demand === undefined ? undefined : `demand:${demand.id}`)
@@ -1453,12 +1494,10 @@ const make = Effect.gen(function* () {
         }
         return { type: "defer" } as const;
       }
-      const category = yield* authority(link);
-      if (category === undefined && entry.fresh && work === undefined) {
+      if (entry.fresh && work === undefined) {
         return { type: "needs_work", item: itemOf(link) } as const;
       }
-      const refusal =
-        category ?? (entry.fresh && work !== undefined ? freshness(link, work) : undefined);
+      const refusal = entry.fresh && work !== undefined ? freshness(link, work) : undefined;
       if (refusal !== undefined) {
         if (demand !== undefined) {
           yield* deleteDemand(demand.id);
@@ -1615,6 +1654,45 @@ const make = Effect.gen(function* () {
         turn.kind === "restart_continuation"
           ? undefined
           : yield* demandByKey(root.root_delivery_id, turn.kind, wakeKeyOf(turn));
+      /**
+       * Waits with `category` instead of running: its demand, reserved or waiting, is blocked,
+       * or one is recorded blocked. A continuation, which never waits, declines.
+       */
+      const blockTurn = (category: BlockedReason) =>
+        Effect.gen(function* () {
+          if (turn.kind === "restart_continuation") {
+            return { type: "declined", clear: false } as const;
+          }
+          if (demand !== undefined) {
+            yield* blockDemand(demand, category);
+            return { type: "blocked", demandId: demand.id, category } as const;
+          }
+          const demandId = yield* insertDemand(root, {
+            kind: "turn",
+            turn,
+            provenance,
+            blocked: category,
+          });
+          yield* history({
+            assignmentId: root.assignment_id,
+            root: root.root_delivery_id,
+            kind: turn.kind,
+            seq: null,
+            outcome: "blocked",
+          });
+          return { type: "blocked", demandId, category } as const;
+        });
+      // The root's authority, read from the database alone, decides first, so a revocation
+      // reaches work already waiting: its demand is blocked with the category, out of the fair
+      // order until a re-check restores it at a fresh position. One blocked already stays so,
+      // and nothing is read for it.
+      const category = yield* authority(link);
+      if (category !== undefined) {
+        if (demand?.blocked_reason !== null && demand?.blocked_reason !== undefined) {
+          return { type: "demand", demandId: demand.id } as const;
+        }
+        return yield* blockTurn(category);
+      }
       const reservedForKey =
         slot?.state === "reserved" && demand !== undefined && slot.reserved_demand_id === demand.id;
       const atHead = () =>
@@ -1666,34 +1744,11 @@ const make = Effect.gen(function* () {
         const demandId = yield* insertDemand(root, { kind: "turn", turn, provenance });
         return { type: "demand", demandId } as const;
       }
-      const category = yield* authority(link);
-      if (category === undefined && input.work === undefined) {
+      if (input.work === undefined) {
         return { type: "needs_work", item: itemOf(link) } as const;
       }
-      const refusal =
-        category ?? (input.work === undefined ? undefined : freshness(link, input.work));
-      if (refusal !== undefined) {
-        if (turn.kind === "restart_continuation")
-          return { type: "declined", clear: false } as const;
-        if (demand !== undefined) {
-          yield* blockDemand(demand, refusal);
-          return { type: "blocked", demandId: demand.id, category: refusal } as const;
-        }
-        const demandId = yield* insertDemand(root, {
-          kind: "turn",
-          turn,
-          provenance,
-          blocked: refusal,
-        });
-        yield* history({
-          assignmentId: root.assignment_id,
-          root: root.root_delivery_id,
-          kind: turn.kind,
-          seq: null,
-          outcome: "blocked",
-        });
-        return { type: "blocked", demandId, category: refusal } as const;
-      }
+      const refusal = freshness(link, input.work);
+      if (refusal !== undefined) return yield* blockTurn(refusal);
       const entrySeq = yield* freshSeq;
       if (route === "held" || route === "reserved") {
         yield* holdSlot(root.root_delivery_id, entrySeq);
@@ -1863,10 +1918,22 @@ const make = Effect.gen(function* () {
         return stale;
       }
       const root = yield* readRoot(demand.root_delivery_id);
-      if (root?.state !== "active" || (yield* readSlot(root.root_delivery_id)) !== undefined) {
-        return stale;
+      if (root?.state !== "active") return stale;
+      // A revoked root's effect is never granted, at the head or not: redispatched, its
+      // delivery is refused with the category.
+      const authority = makeAuthority();
+      const link = yield* readLink(root.assignment_id);
+      const category = link === undefined ? "revoked" : yield* authority(link);
+      if (category !== undefined) {
+        return {
+          type: "refused",
+          category,
+          deliveryId: demand.delivery_id,
+          effectId: demand.effect_id,
+        } as const;
       }
-      const candidates = yield* atHeadOf(makeAuthority(), `demand:${demandId}`);
+      if ((yield* readSlot(root.root_delivery_id)) !== undefined) return stale;
+      const candidates = yield* atHeadOf(authority, `demand:${demandId}`);
       if (candidates === undefined) return stale;
       const entrySeq = yield* freshSeq;
       yield* insertSlot(root, entrySeq);
@@ -1906,11 +1973,20 @@ const make = Effect.gen(function* () {
       ) {
         return stale;
       }
+      // Blocked, only a re-check restores it.
+      if (demand.blocked_reason !== null) return stale;
+      // A revoked root's demand is blocked at once, at the head or not, so restoring the root
+      // brings it back at a fresh position.
       const authority = makeAuthority();
+      const category = yield* authority(link);
+      if (category !== undefined) {
+        yield* blockDemand(demand, category);
+        return { type: "blocked", category } as const;
+      }
       const candidates = yield* atHeadOf(authority, `demand:${demandId}`);
       if (candidates === undefined) return stale;
       // The head's own fresh read decides; failing it blocks the demand without its turn.
-      const refusal = (yield* authority(link)) ?? freshness(link, work);
+      const refusal = freshness(link, work);
       if (refusal !== undefined) {
         yield* blockDemand(demand, refusal);
         return { type: "blocked", category: refusal } as const;
@@ -2102,6 +2178,23 @@ const make = Effect.gen(function* () {
         }).pipe(transact("maintain", demand.root_delivery_id));
       }
     });
+
+  const blockRevoked: HandoffAdmission["Service"]["blockRevoked"] = Effect.gen(function* () {
+    const waiting = yield* sql<DemandRow>`SELECT d.* FROM fd_assistant_admission_demands d
+      JOIN fd_assistant_managed_roots r ON r.root_delivery_id = d.root_delivery_id
+      WHERE r.state = 'active' AND d.state = 'waiting' AND d.blocked_reason IS NULL
+      ORDER BY d.seq`;
+    const authority = makeAuthority();
+    const refused: Array<{ readonly demand: Demand; readonly category: BlockedReason }> = [];
+    for (const demand of waiting) {
+      const link = yield* readLink(demand.assignment_id);
+      const category = link === undefined ? "revoked" : yield* authority(link);
+      if (category === undefined) continue;
+      if (demand.kind === "effect") refused.push({ demand: demandOf(demand), category });
+      else yield* blockDemand(demand, category);
+    }
+    return refused;
+  }).pipe(transact("maintain"));
 
   const blockedRoots: HandoffAdmission["Service"]["blockedRoots"] = (options) =>
     Effect.gen(function* () {
@@ -2507,6 +2600,7 @@ const make = Effect.gen(function* () {
     lose,
     firstTick,
     expireLeases,
+    blockRevoked,
     blockedRoots,
     recheckBlocked,
     demands,
