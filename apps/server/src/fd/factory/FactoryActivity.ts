@@ -1,5 +1,6 @@
 import { type MessageId, type RunId, ThreadId } from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
+import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -12,6 +13,11 @@ import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore
 import * as EffectOutbox from "../../orchestration-v2/EffectOutbox.ts";
 import * as EventStore from "../../orchestration-v2/EventStore.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import {
+  cancelledRosterTaskWork,
+  cancelledTurnItemWork,
+  isAwaitedWork,
+} from "../../orchestration-v2/RestartBackgroundNote.ts";
 import * as FactoryAdmission from "./FactoryAdmission.ts";
 import * as FactoryOwnership from "./FactoryOwnership.ts";
 import { launchThreadId } from "./FactoryThreadEffects.ts";
@@ -51,9 +57,10 @@ export type FactoryActivityPhase = "proceeding" | "parked" | "terminal" | "missi
  * its threads is under way or about to start that Factory cannot show to be the owner's. Threads
  * are read only once it is parked or terminal, the phases where that decides anything, so before
  * then `busy` counts jobs alone. `deferred`: an effect waits for admission with no job.
- * `backgroundWaits`: work its runs wait for that ends in an automatic turn (background tasks still
- * open, delegated cohorts not delivered), which is no work of the family's until that turn is
- * admitted. `unknown`: something could not be read, so the report says nothing is idle.
+ * `backgroundWaits`: work its runs await that ends in an automatic turn, which is no work of the
+ * family's until that turn is admitted: each provider thread holding awaited native work still
+ * open, as core judges it for a restart, and each delegated cohort not delivered. `unknown`:
+ * something could not be read, so the report says nothing is idle.
  */
 export interface FactoryActivityReport {
   readonly phase: FactoryActivityPhase;
@@ -182,6 +189,17 @@ const make = Effect.gen(function* () {
           Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.undefined }),
         ),
     );
+    /** The thread's turn items still open: pending, running or waiting. */
+    const openTurnItems = memoized(String, (threadId: ThreadId) =>
+      projections
+        .getThreadRecords(threadId, ["turnItems"], {
+          turnItemStatuses: ["pending", "running", "waiting"],
+        })
+        .pipe(
+          Effect.map(({ turnItems }) => turnItems),
+          Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed([]) }),
+        ),
+    );
     const message = memoized(
       ([threadId, messageId]: readonly [ThreadId, MessageId]) => `${threadId}\u0000${messageId}`,
       ([threadId, messageId]) =>
@@ -240,7 +258,7 @@ const make = Effect.gen(function* () {
       recorded,
       management,
     };
-    return { ...reads, runCreations };
+    return { ...reads, runCreations, openTurnItems };
   };
 
   const readFailed = (threadId: ThreadId) => (cause: unknown) =>
@@ -304,17 +322,21 @@ const make = Effect.gen(function* () {
             backgroundWaits += 1;
           }
         }
-        // A restart cut the thread's latest run, and its continuation has yet to run or decline.
-        const latest = thread.runs.reduce<(typeof thread.runs)[number] | undefined>(
-          (last, run) => (last === undefined || run.ordinal > last.ordinal ? run : last),
+        // A restart cut the run its continuation carries on, which has yet to run or decline.
+        // That run is core's (see `restartContinuationRun`): the latest that started, by
+        // `runRanAfter`. A queued run never started, held behind the cut one, and once a later
+        // run starts core delivers no continuation for an earlier one.
+        const source = thread.runs.reduce<(typeof thread.runs)[number] | undefined>(
+          (last, run) =>
+            run.status !== "queued" && (last === undefined || runRanAfter(run, last)) ? run : last,
           undefined,
         );
         if (
-          latest !== undefined &&
-          !isOpenRun(latest.status) &&
-          counts(yield* classes.run(threadId, latest.id))
+          source !== undefined &&
+          !isOpenRun(source.status) &&
+          counts(yield* classes.run(threadId, source.id))
         ) {
-          const continuation = yield* outbox.get(`effect:restart-continuation:${latest.id}`);
+          const continuation = yield* outbox.get(`effect:restart-continuation:${source.id}`);
           if (
             Option.exists(
               continuation,
@@ -324,14 +346,51 @@ const make = Effect.gen(function* () {
             busy = true;
           }
         }
+        // Work its runs await, as core judges what a restart continues for (`hasOpenAwaitedWork`
+        // in RestartContinuation.ts): a native subagent, task or monitor still open, judged by
+        // the run that started it, or one the provider's root thread still lists, judged by
+        // every run on that provider thread. A background shell command is awaited by nothing,
+        // and an app-owned delegation reports back from its own thread, counted there. Each
+        // provider thread holding such work is one wait.
+        const awaiting = new Set<string>();
+        for (const item of yield* reads.openTurnItems(threadId)) {
+          if (
+            item.type === "subagent" &&
+            item.origin === "app_owned" &&
+            item.childThreadId !== null
+          )
+            continue;
+          const work = cancelledTurnItemWork(item);
+          if (work === undefined || !isAwaitedWork(work)) continue;
+          const providerThreadId =
+            item.providerThreadId ??
+            thread.runs.find((run) => run.id === item.runId)?.providerThreadId ??
+            null;
+          const key = providerThreadId ?? item.id;
+          if (awaiting.has(key)) continue;
+          const provenance =
+            item.runId !== null
+              ? yield* classes.run(threadId, item.runId)
+              : providerThreadId !== null
+                ? yield* classes.providerThread(threadId, providerThreadId)
+                : undefined;
+          if (provenance === undefined || counts(provenance)) awaiting.add(key);
+        }
         for (const providerThread of thread.providerThreads) {
           if (
-            (providerThread.pendingBackgroundTasks?.length ?? 0) > 0 &&
-            counts(yield* classes.providerThread(threadId, providerThread.id))
+            awaiting.has(providerThread.id) ||
+            providerThread.ownerNodeId !== null ||
+            !(providerThread.pendingBackgroundTasks ?? []).some((task) =>
+              isAwaitedWork(cancelledRosterTaskWork(task)),
+            )
           ) {
-            backgroundWaits += 1;
+            continue;
+          }
+          if (counts(yield* classes.providerThread(threadId, providerThread.id))) {
+            awaiting.add(providerThread.id);
           }
         }
+        backgroundWaits += awaiting.size;
       }
       // A wake of the root's own pull request that it has not taken yet: Factory takes it as a
       // round (or, cancelled, to stop it), whether its run still goes on or has already ended.

@@ -1,23 +1,30 @@
 import { assert, describe, it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CommandId,
   EventId,
   MessageId,
   NodeId,
+  type OrchestrationV2DomainEvent,
   ProjectId,
+  type PullRequestDetail,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   ProviderThreadId,
   RunId,
   RuntimeRequestId,
+  SourceControlProviderKind,
   ThreadId,
   type ThreadPullRequestLink,
+  TurnItemId,
 } from "@t3tools/contracts";
 import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -28,13 +35,20 @@ import * as TxRef from "effect/TxRef";
 
 import * as AutomaticTurnGate from "../../orchestration-v2/AutomaticTurnGate.ts";
 import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore.ts";
+import * as DelegatedTaskQuestionReactor from "../../orchestration-v2/DelegatedTaskQuestionReactor.ts";
 import * as EffectOutbox from "../../orchestration-v2/EffectOutbox.ts";
+import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as EventStore from "../../orchestration-v2/EventStore.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderContinuationService from "../../orchestration-v2/ProviderContinuationService.ts";
+import * as PullRequestWatchReactor from "../../orchestration-v2/PullRequestWatchReactor.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
+import * as UsageLimitRecoveryWorker from "../../orchestration-v2/UsageLimitRecoveryWorker.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
+import * as PullRequestService from "../../pullRequest/PullRequestService.ts";
+import * as Scheduler from "../../scheduling/Scheduler.ts";
+import * as ServerSettings from "../../serverSettings.ts";
 import * as FactoryActivity from "./FactoryActivity.ts";
 import * as FactoryAdmission from "./FactoryAdmission.ts";
 import * as FactoryAutomaticTurns from "./FactoryAutomaticTurns.ts";
@@ -57,7 +71,9 @@ import {
   authorCommits,
   drainFactory,
   drainOrchestration,
+  ended,
   fakePullRequest,
+  runReached,
   stateOf,
   threadProjection,
   verifyCommands,
@@ -749,6 +765,66 @@ describe("automatic turns after intervening runs on the real stack", () => {
   );
 });
 
+/**
+ * The host's view of a watched pull request whose `lint` check fails, which core's watch reactor
+ * reports to the thread watching it.
+ */
+const failingPullRequest = (link: ThreadPullRequestLink, at: string): PullRequestDetail => ({
+  provider: SourceControlProviderKind.make("github"),
+  capabilities: {
+    diff: true,
+    comment: true,
+    actions: [],
+    mergeMethods: [],
+    search: false,
+    review: { inlineComment: false, reply: false, resolve: false, verdicts: [] },
+    reviewers: { request: false, listCandidates: false },
+  },
+  viewerPermissions: {
+    actions: [],
+    comment: true,
+    resolve: true,
+    verdicts: [],
+    requestReviewers: false,
+  },
+  projectId: ProjectId.make("project-factory-delivery"),
+  projectTitle: "Alpha",
+  workspaceRoot: "/workspace/alpha",
+  repository: link.repository,
+  number: link.number,
+  title: "Add the export button",
+  body: "",
+  url: link.url,
+  author: { login: "agent-user", name: null, avatarUrl: null },
+  state: "open",
+  isDraft: false,
+  mergeability: "mergeable",
+  additions: 1,
+  deletions: 0,
+  changedFiles: 1,
+  headBranch: "work/fd-aaaaaa-add-the-export-button",
+  headSha: "abc1234def",
+  baseBranch: "main",
+  createdAt: at,
+  updatedAt: at,
+  mergedAt: null,
+  closedAt: null,
+  reviewers: [],
+  labels: [],
+  checks: [{ name: "lint", status: "failure", description: null, url: null }],
+  mergeCapabilities: { merge: true, squash: true, rebase: true },
+  viewer: "agent-user",
+});
+
+const projected = (reached: ReadonlyArray<Reached>) =>
+  reached.map(({ kind, threadId, root, provenance, management }) => ({
+    kind,
+    threadId,
+    root,
+    provenance,
+    management,
+  }));
+
 describe("core's producers consulting Factory's gate on the real stack", () => {
   it.live(
     "a restart's continuation of Factory's cut run reaches the manager and runs nothing",
@@ -841,6 +917,294 @@ describe("core's producers consulting Factory's gate on the real stack", () => {
               ],
             );
             yield* world.endRun(author.runId, "completed");
+          }),
+        { admission: port, automaticTurnGate: true },
+      );
+    },
+  );
+
+  it.live("the watch reactor's wake of Factory's own pull request reaches the manager", () => {
+    const { reached, port } = recordingPort("active");
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const opened = yield* openSingle(world);
+          const link = yield* linkOf(opened.threadId, fakePullRequest.number);
+          const before = (yield* threadProjection(opened.threadId).pipe(Effect.orDie)).runs.length;
+          const at = DateTime.formatIso(yield* DateTime.now);
+          const reactor = yield* PullRequestWatchReactor.make.pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                NodeServices.layer,
+                Layer.mock(PullRequestService.PullRequestService)({
+                  detail: () => Effect.succeed(failingPullRequest(link, at)),
+                  activity: () =>
+                    Effect.succeed({
+                      comments: [],
+                      commentCount: 0,
+                      commentsTruncated: false,
+                      reviewThreads: [],
+                      commits: [],
+                    }),
+                }),
+              ),
+            ),
+          );
+          yield* reactor.sweep;
+          assert.deepStrictEqual(projected(reached), [
+            {
+              kind: "pull_request_wake",
+              threadId: opened.threadId,
+              root: opened.deliveryId,
+              provenance: "factory",
+              management: "active",
+            },
+          ]);
+          // Held back, the wake ran nothing and recorded nothing of the watch's progress.
+          assert.strictEqual(
+            (yield* threadProjection(opened.threadId).pipe(Effect.orDie)).runs.length,
+            before,
+          );
+          assert.deepStrictEqual((yield* linkOf(opened.threadId, link.number)).watch, link.watch);
+        }),
+      { admission: port, automaticTurnGate: true },
+    );
+  });
+
+  it.live("the usage-limit sweep's resume of Factory's run reaches the manager", () => {
+    const { reached, port } = recordingPort("active");
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const author = yield* world.start;
+          const sink = yield* EventSink.EventSinkV2;
+          const run =
+            (yield* threadProjection(author.threadId).pipe(Effect.orDie)).runs.find(
+              (candidate) => candidate.id === author.runId,
+            ) ?? assert.fail("The author's run is not recorded.");
+          const now = yield* DateTime.now;
+          const failedAt = DateTime.subtract(now, { minutes: 2 });
+          // The author's run stopped on its provider's usage limit, which has reset since.
+          yield* sink.write({
+            commandId: CommandId.make("test-usage-limit"),
+            events: [
+              {
+                id: EventId.make("test-usage-limit-run"),
+                type: "run.updated",
+                threadId: author.threadId,
+                occurredAt: failedAt,
+                payload: { ...run, status: "failed", completedAt: failedAt },
+              },
+              {
+                id: EventId.make("test-usage-limit-error"),
+                type: "turn-item.updated",
+                threadId: author.threadId,
+                occurredAt: failedAt,
+                payload: {
+                  id: TurnItemId.make("test-usage-limit-error"),
+                  type: "error",
+                  threadId: author.threadId,
+                  runId: run.id,
+                  nodeId: run.rootNodeId,
+                  providerThreadId: null,
+                  providerTurnId: null,
+                  nativeItemRef: null,
+                  parentItemId: null,
+                  ordinal: 3,
+                  status: "failed",
+                  title: "Usage limit reached",
+                  startedAt: failedAt,
+                  completedAt: failedAt,
+                  updatedAt: failedAt,
+                  failure: {
+                    class: "usage_limit",
+                    message: "Plan limit reached.",
+                    code: "usageLimitExceeded",
+                    retryable: null,
+                    resetAt: DateTime.formatIso(DateTime.subtract(now, { minutes: 1 })),
+                  },
+                },
+              },
+            ],
+          });
+          yield* drainFactory;
+          const registered = yield* Deferred.make<Effect.Effect<void>>();
+          const worker = UsageLimitRecoveryWorker.layer.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.mock(Scheduler.Scheduler)({
+                  // Hands the sweep to the test to run, as the scheduler would each tick.
+                  register: <E, R>(_name: string, runDueWork: Effect.Effect<void, E, R>) =>
+                    Effect.gen(function* () {
+                      const context = yield* Effect.context<R>();
+                      yield* Deferred.succeed(
+                        registered,
+                        runDueWork.pipe(Effect.provideContext(context), Effect.orDie),
+                      );
+                    }),
+                }),
+                ServerSettings.layerTest({ autoResumeLimitedThreads: true }),
+              ),
+            ),
+          );
+          yield* Effect.gen(function* () {
+            const sweep = yield* Deferred.await(registered);
+            // The first sweep arms the recovery; the reset has passed, so the next presents it.
+            yield* sweep;
+            assert.deepStrictEqual(reached, []);
+            yield* sweep;
+          }).pipe(Effect.provide(worker));
+          assert.deepStrictEqual(projected(reached), [
+            {
+              kind: "usage_limit_resume",
+              threadId: author.threadId,
+              root: author.deliveryId,
+              provenance: "factory",
+              management: "active",
+            },
+          ]);
+          assert.isTrue(
+            (yield* threadProjection(author.threadId).pipe(Effect.orDie)).runs.every(
+              (candidate) => candidate.id === author.runId,
+            ),
+          );
+        }),
+      { admission: port, automaticTurnGate: true },
+    );
+  });
+
+  it.live(
+    "the question reactor's wake for a task Factory's run delegated reaches the manager",
+    () => {
+      const { reached, port } = recordingPort("active");
+      return withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const author = yield* world.start;
+            const delegate = yield* delegateFrom(author.threadId, author.runId);
+            const childRun =
+              (yield* threadProjection(delegate.childThreadId).pipe(Effect.orDie)).runs[0] ??
+              assert.fail("The delegated task has no run.");
+            const nodeId = childRun.rootNodeId ?? assert.fail("The task's run has no root node.");
+            const sink = yield* EventSink.EventSinkV2;
+            const now = yield* DateTime.now;
+            // The delegated agent asks a question that waits for an answer.
+            const asked: OrchestrationV2DomainEvent = {
+              id: EventId.make("test-question"),
+              type: "runtime-request.updated",
+              threadId: delegate.childThreadId,
+              runId: childRun.id,
+              nodeId,
+              occurredAt: now,
+              payload: {
+                id: RuntimeRequestId.make("request-question"),
+                nodeId,
+                providerTurnId: null,
+                nativeRequestRef: null,
+                kind: "user_input",
+                status: "pending",
+                responseCapability: {
+                  type: "live",
+                  providerSessionId: ProviderSessionId.make("provider-session:test"),
+                },
+                createdAt: now,
+                resolvedAt: null,
+              },
+            };
+            yield* sink.write({ commandId: CommandId.make("test-question"), events: [asked] });
+            const questions = yield* DelegatedTaskQuestionReactor.DelegatedTaskQuestionReactor.pipe(
+              Effect.provide(DelegatedTaskQuestionReactor.layer),
+            );
+            yield* questions.handle(asked);
+            assert.deepStrictEqual(projected(reached), [
+              {
+                kind: "delegated_question",
+                threadId: author.threadId,
+                root: author.deliveryId,
+                provenance: "factory",
+                management: "active",
+              },
+            ]);
+            // Held back, the author got no wake about it.
+            assert.isTrue(
+              (yield* threadProjection(author.threadId).pipe(Effect.orDie)).runs.every(
+                (candidate) => candidate.id === author.runId,
+              ),
+            );
+            yield* world.endRun(delegate.runId, "completed");
+          }),
+        { admission: port, automaticTurnGate: true },
+      );
+    },
+  );
+
+  it.live(
+    "a delegated result steered into Factory's turn that ended first reaches the manager again",
+    () => {
+      const offered = Deferred.makeUnsafe<void>();
+      const release = Deferred.makeUnsafe<void>();
+      const delivered = Deferred.makeUnsafe<void>();
+      const reached: Array<{
+        readonly origin: string;
+        readonly messageId: MessageId;
+        readonly provenance: string;
+      }> = [];
+      // The manager runs the first offer, then holds back what follows it.
+      const port: typeof FactoryAdmission.FactoryAdmission.Service = {
+        ...FactoryAdmission.FactoryAdmission.defaultValue(),
+        management: () => Effect.succeed("active"),
+        automaticTurn: (turn) =>
+          Effect.suspend(() => {
+            if (turn.turn.kind !== "delegated_completion") {
+              return Effect.succeed(AutomaticTurnGate.notNow("deferred"));
+            }
+            reached.push({
+              origin: turn.turn.origin,
+              messageId: turn.turn.messageId,
+              provenance: turn.provenance,
+            });
+            return turn.turn.origin === "offer" && reached.length === 1
+              ? Deferred.succeed(offered, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.andThen(Effect.map(turn.dispatch, AutomaticTurnGate.ran)),
+                  Effect.tap(() => Deferred.succeed(delivered, undefined)),
+                )
+              : Effect.succeed(AutomaticTurnGate.notNow("deferred"));
+          }),
+      };
+      return withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const author = yield* world.start;
+            const authorTurn =
+              world.provider.started.find((candidate) => candidate.runId === author.runId) ??
+              assert.fail("The author's turn did not start.");
+            const delegate = yield* delegateFrom(author.threadId, author.runId);
+            // The task ends while the author works: its result is offered, and core steers the
+            // delivery into the author's running turn.
+            yield* world.endRun(delegate.runId, "completed");
+            yield* Deferred.await(offered);
+            yield* Deferred.succeed(release, undefined);
+            yield* Deferred.await(delivered);
+            // The author's turn ends before the steer reaches its provider.
+            yield* world.provider.endTurn(authorTurn, "completed");
+            yield* runReached(author.runId, ["waiting", ...ended]);
+            yield* drainOrchestration;
+            const [offer, steer] = reached;
+            assert.deepStrictEqual(
+              reached.map(({ origin, provenance }) => [origin, provenance]),
+              [
+                ["offer", "factory"],
+                ["steer", "factory"],
+              ],
+            );
+            // The steer's follow-up keeps the delivery's message, and its recorded class.
+            assert.strictEqual(steer?.messageId, offer?.messageId);
+            yield* drainFactory;
           }),
         { admission: port, automaticTurnGate: true },
       );

@@ -8,6 +8,7 @@ import {
   type GitRunStackedActionInput,
   type GitRunStackedActionResult,
   MessageId,
+  NodeId,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2RunStatus,
   ProjectId,
@@ -350,7 +351,48 @@ const makeFakeProvider = Effect.gen(function* () {
       });
     });
 
-  return { adapter, started, interrupted, threadLoads, endTurn, say, startCommand };
+  /**
+   * Reports a provider-native subagent the turn started, as a provider does: `running` while it
+   * works, which it can go on doing after the turn ends, and then `completed`.
+   */
+  const reportSubagent = (
+    turn: ProviderAdapter.ProviderAdapterV2TurnInput,
+    status: "running" | "completed",
+  ) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const id = `subagent:${turn.attemptId}`;
+      yield* Queue.offer(events, {
+        type: "turn_item.updated",
+        driver,
+        turnItem: {
+          id: TurnItemId.make(id),
+          threadId: turn.threadId,
+          runId: turn.runId,
+          nodeId: turn.rootNodeId,
+          providerThreadId: turn.providerThread.id,
+          providerTurnId: providerTurnId(turn),
+          nativeItemRef: { driver, nativeId: id, strength: "strong" },
+          parentItemId: null,
+          ordinal: 2,
+          status,
+          title: "Check the export",
+          startedAt: now,
+          completedAt: status === "running" ? null : now,
+          updatedAt: now,
+          type: "subagent",
+          subagentId: NodeId.make(id),
+          origin: "provider_native",
+          driver,
+          providerInstanceId: instanceId,
+          childThreadId: null,
+          prompt: "Check the export.",
+          result: status === "running" ? null : "Checked.",
+        },
+      });
+    });
+
+  return { adapter, started, interrupted, threadLoads, endTurn, say, startCommand, reportSubagent };
 });
 
 type FakeProvider = Effect.Success<typeof makeFakeProvider>;

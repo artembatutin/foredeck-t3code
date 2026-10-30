@@ -3,6 +3,7 @@ import {
   CommandId,
   EventId,
   MessageId,
+  NodeId,
   type OrchestrationV2DomainEvent,
   ProjectId,
   ProviderDriverKind,
@@ -11,6 +12,7 @@ import {
   ProviderThreadId,
   RunId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
@@ -22,6 +24,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Stream from "effect/Stream";
 import * as TxRef from "effect/TxRef";
 
 import * as AutomaticTurnGate from "../../orchestration-v2/AutomaticTurnGate.ts";
@@ -67,6 +70,7 @@ import {
   endWhileDown,
   linkOf,
   openSingle,
+  ownerQueues,
   reviewPasses,
   runStarted,
   wakeThread,
@@ -475,6 +479,21 @@ const seedRecords = Effect.gen(function* () {
   return deliveryId;
 }).pipe(Effect.orDie);
 
+/** Waits until a subagent turn item of the thread is stored with `status`. */
+const turnItemStored = (threadId: ThreadId, status: "running" | "completed") =>
+  Effect.flatMap(EventSink.EventSinkV2, (sink) =>
+    sink.stream().pipe(
+      Stream.filter(
+        ({ event }) =>
+          event.type === "turn-item.updated" &&
+          event.threadId === threadId &&
+          event.payload.type === "subagent" &&
+          event.payload.status === status,
+      ),
+      Stream.runHead,
+    ),
+  ).pipe(Effect.orDie);
+
 /** The status of the restart continuation core's outbox holds for the run; none if it holds none. */
 const continuationOf = (runId: RunId) =>
   Effect.flatMap(
@@ -501,7 +520,7 @@ const writable = Effect.gen(function* () {
 
 describe("FactoryActivity background waits", () => {
   it.effect(
-    "reports background work its provider threads hold open as a wait, the owner's not",
+    "reports awaited native work its family's runs started as waits, and no shell or owner's work",
     () => {
       const faults = makeFaults();
       return Effect.gen(function* () {
@@ -512,15 +531,20 @@ describe("FactoryActivity background waits", () => {
         const instanceId = ProviderInstanceId.make("codex");
         const modelSelection = { instanceId, model: "test-model" };
         const driver = ProviderDriverKind.make("codex");
-        const commit = (name: string, events: ReadonlyArray<OrchestrationV2DomainEvent>) =>
-          sink.commitCommand({
-            commandId: CommandId.make(name),
-            threadId,
-            commandType: name,
-            acceptedAt: now,
-            events,
-            effects: [],
+        let commits = 0;
+        const commit = (events: ReadonlyArray<OrchestrationV2DomainEvent>) =>
+          Effect.suspend(() => {
+            commits += 1;
+            return sink.commitCommand({
+              commandId: CommandId.make(`activity-waits-${commits}`),
+              threadId,
+              commandType: "test.seed",
+              acceptedAt: now,
+              events,
+              effects: [],
+            });
           });
+        const event = (id: string) => ({ id: EventId.make(id), threadId, occurredAt: now });
         const run = (
           id: string,
           messageId: string,
@@ -543,18 +567,20 @@ describe("FactoryActivity background waits", () => {
           checkpointId: null,
           contextHandoffId: null,
         });
-        const withOpenTasks = (id: ProviderThreadId) => ({
-          id: EventId.make(`open-tasks:${id}`),
+        const providerThreadWith = (
+          id: ProviderThreadId,
+          tasks: ReadonlyArray<{ readonly taskId: string; readonly kind: "command" | "subagent" }>,
+          ownerNodeId: NodeId | null = null,
+        ) => ({
+          ...event(`provider-thread:${id}`),
           type: "provider-thread.updated" as const,
-          threadId,
-          occurredAt: now,
           payload: {
             id,
             driver,
             providerInstanceId: instanceId,
             providerSessionId: ProviderSessionId.make("session-activity"),
             appThreadId: threadId,
-            ownerNodeId: null,
+            ownerNodeId,
             nativeThreadRef: { driver, nativeId: `native:${id}`, strength: "strong" as const },
             nativeConversationHeadRef: null,
             status: "idle" as const,
@@ -564,35 +590,73 @@ describe("FactoryActivity background waits", () => {
             forkedFrom: null,
             createdAt: now,
             updatedAt: now,
-            pendingBackgroundTasks: [{ taskId: `build:${id}`, kind: "command" as const }],
+            pendingBackgroundTasks: tasks,
           },
         });
-        const factoryThread = ProviderThreadId.make("provider-thread-factory");
-        const ownerThread = ProviderThreadId.make("provider-thread-owner");
-        yield* commit("activity-repair", [
-          {
-            id: EventId.make("activity-repair-run"),
-            type: "run.created",
+        const openItem = (
+          id: string,
+          runId: string,
+          providerThreadId: ProviderThreadId,
+          work:
+            | { readonly type: "command_execution" }
+            | { readonly type: "subagent"; readonly origin: "provider_native" | "app_owned" },
+        ) => ({
+          ...event(`item:${id}`),
+          type: "turn-item.updated" as const,
+          payload: {
+            id: TurnItemId.make(id),
             threadId,
-            occurredAt: now,
-            payload: run(
-              "run-activity-repair",
-              `factory-fix-verify-message:${deliveryId}:4`,
-              3,
-              factoryThread,
-            ),
+            runId: RunId.make(runId),
+            nodeId: null,
+            providerThreadId,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            status: "running" as const,
+            title: null,
+            startedAt: now,
+            completedAt: null,
+            updatedAt: now,
+            ...(work.type === "command_execution"
+              ? { type: "command_execution" as const, input: "vp dev" }
+              : {
+                  type: "subagent" as const,
+                  subagentId: NodeId.make(`task:${id}`),
+                  origin: work.origin,
+                  driver,
+                  providerInstanceId: instanceId,
+                  childThreadId: work.origin === "app_owned" ? ThreadId.make(`child:${id}`) : null,
+                  prompt: "Check the export.",
+                  result: null,
+                }),
           },
-        ]);
-        yield* commit("activity-owner", [
+        });
+        const factory = (name: string) => ProviderThreadId.make(`provider-thread-factory-${name}`);
+        const owners = ProviderThreadId.make("provider-thread-owner");
+        // Factory's ended runs, each on a provider thread of its own, and an ended owner run.
+        yield* commit(
+          ["roster", "shell-roster", "nested", "native", "shell", "delegated"].map(
+            (name, index) => ({
+              ...event(`run:${name}`),
+              type: "run.created" as const,
+              payload: run(
+                `run-${name}`,
+                `factory-fix-verify-message:${deliveryId}:${index + 10}`,
+                index + 3,
+                factory(name),
+              ),
+            }),
+          ),
+        );
+        yield* commit([
           {
-            id: EventId.make("activity-owner-message"),
+            ...event("owner-message"),
             type: "message.updated",
-            threadId,
-            occurredAt: now,
             payload: {
               id: MessageId.make("owner-activity"),
               threadId,
-              runId: RunId.make("run-activity-owner"),
+              runId: RunId.make("run-owner"),
               nodeId: null,
               role: "user",
               text: "Build it.",
@@ -605,23 +669,51 @@ describe("FactoryActivity background waits", () => {
             },
           },
           {
-            id: EventId.make("activity-owner-run"),
+            ...event("owner-run"),
             type: "run.created",
-            threadId,
-            occurredAt: now,
-            payload: run("run-activity-owner", "owner-activity", 4, ownerThread),
+            payload: run("run-owner", "owner-activity", 9, owners),
           },
         ]);
-        yield* commit("activity-open-tasks", [
-          withOpenTasks(factoryThread),
-          withOpenTasks(ownerThread),
-        ]);
-        // Factory's provider thread waits on its background build; the owner's is theirs.
         assert.deepStrictEqual(yield* activityOf(deliveryId), {
           phase: "parked",
           busy: false,
           deferred: false,
-          backgroundWaits: 1,
+          backgroundWaits: 0,
+          unknown: false,
+        });
+
+        yield* commit([
+          // Awaited work the provider's root thread lists counts; a shell command and a nested
+          // provider thread's roster do not.
+          providerThreadWith(factory("roster"), [{ taskId: "subagent-1", kind: "subagent" }]),
+          providerThreadWith(factory("shell-roster"), [{ taskId: "build", kind: "command" }]),
+          providerThreadWith(
+            factory("nested"),
+            [{ taskId: "subagent-2", kind: "subagent" }],
+            NodeId.make("node-nested"),
+          ),
+          // A native subagent still open after the run that started it ended counts, by that run;
+          // a background command, a delegation that reports from its own thread, and the owner's
+          // own native work do not.
+          openItem("native", "run-native", factory("native"), {
+            type: "subagent",
+            origin: "provider_native",
+          }),
+          openItem("shell", "run-shell", factory("shell"), { type: "command_execution" }),
+          openItem("delegated", "run-delegated", factory("delegated"), {
+            type: "subagent",
+            origin: "app_owned",
+          }),
+          openItem("owner-native", "run-owner", owners, {
+            type: "subagent",
+            origin: "provider_native",
+          }),
+        ]);
+        assert.deepStrictEqual(yield* activityOf(deliveryId), {
+          phase: "parked",
+          busy: false,
+          deferred: false,
+          backgroundWaits: 2,
           unknown: false,
         });
       }).pipe(Effect.provide(activityStack(faults)));
@@ -829,6 +921,34 @@ describe("FactoryService.activity on the server's real stack", () => {
     180_000,
   );
 
+  it.live("reports native work outliving the run that started it as a wait, not as busy", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const factory = yield* Factory.FactoryService.FactoryService;
+        const author = yield* world.start;
+        const turn =
+          world.provider.started.find((candidate) => candidate.runId === author.runId) ??
+          assert.fail("The author's turn did not start.");
+        // The author starts a native subagent, and the owner asks the delivery to stop after
+        // the author's step.
+        yield* world.provider.reportSubagent(turn, "running");
+        yield* turnItemStored(author.threadId, "running");
+        yield* factory.stop(author.deliveryId);
+        yield* authorCommits(author.worktreePath, "feat: add the export button", "x\n");
+        yield* world.endRun(author.runId, "completed");
+        assert.strictEqual((yield* stateOf(author.deliveryId)).status, "stopped");
+        // The run ended; the subagent it started still works, and its wake will come.
+        assert.deepStrictEqual(
+          yield* reportOf(author.deliveryId),
+          report("parked", { backgroundWaits: 1 }),
+        );
+        yield* world.provider.reportSubagent(turn, "completed");
+        yield* turnItemStored(author.threadId, "completed");
+        assert.deepStrictEqual(yield* reportOf(author.deliveryId), report("parked"));
+      }).pipe(Effect.orDie),
+    ),
+  );
+
   it.live("counts its own pull request's wake as busy until Factory takes it", () =>
     withProject(
       verifyCommands.passes,
@@ -858,57 +978,75 @@ describe("FactoryService.activity on the server's real stack", () => {
     ),
   );
 
-  it.live("counts a cut run's continuation as busy while it is pending and while it runs", () => {
-    const reachedContinuation = Deferred.makeUnsafe<void>();
-    const release = Deferred.makeUnsafe<void>();
-    const port: typeof FactoryAdmission.FactoryAdmission.Service = {
-      ...FactoryAdmission.FactoryAdmission.defaultValue(),
-      management: () => Effect.succeed("active"),
-      automaticTurn: (turn) =>
-        turn.turn.kind === "restart_continuation"
-          ? Deferred.succeed(reachedContinuation, undefined).pipe(
-              Effect.andThen(Deferred.await(release)),
-              Effect.as(AutomaticTurnGate.notNow("declined")),
-            )
-          : Effect.succeed(AutomaticTurnGate.notNow("deferred")),
-    };
-    return withProject(
-      verifyCommands.passes,
-      (world) =>
-        Effect.gen(function* () {
-          const author = yield* world.start;
-          // Core's shutdown records restart intent for the turn its provider still works on.
-          yield* providerTurnRunning(author.threadId);
-          const recovery = yield* coreRecovery;
-          yield* recovery.prepareForShutdown;
-          yield* recovery.reconcile("shutdown");
-          yield* world.rebuild(
-            Effect.gen(function* () {
-              // Core's recovery cut the author's run; Factory blocked on it.
-              yield* drainFactory;
-              assert.strictEqual(yield* continuationOf(author.runId), "pending");
-              assert.deepStrictEqual(
-                yield* reportOf(author.deliveryId),
-                report("parked", { busy: true }),
-              );
-              const draining = yield* Effect.forkChild(drainOrchestration);
-              yield* Deferred.await(reachedContinuation);
-              assert.strictEqual(yield* continuationOf(author.runId), "running");
-              assert.deepStrictEqual(
-                yield* reportOf(author.deliveryId),
-                report("parked", { busy: true }),
-              );
-              yield* Deferred.succeed(release, undefined);
-              yield* Fiber.join(draining);
-              assert.notInclude(["pending", "running"], yield* continuationOf(author.runId));
-              assert.deepStrictEqual(yield* reportOf(author.deliveryId), report("parked"));
-            }),
-            { orchestration: true },
-          );
-        }),
-      { admission: port, automaticTurnGate: true },
-    );
-  });
+  it.live.each([
+    { shape: "alone on its thread", ownerQueued: false },
+    { shape: "with the owner's turn held behind it", ownerQueued: true },
+  ] as const)(
+    "counts a cut run's continuation as busy while it is pending and while it runs, $shape",
+    ({ ownerQueued }) => {
+      const reachedContinuation = Deferred.makeUnsafe<void>();
+      const release = Deferred.makeUnsafe<void>();
+      const port: typeof FactoryAdmission.FactoryAdmission.Service = {
+        ...FactoryAdmission.FactoryAdmission.defaultValue(),
+        management: () => Effect.succeed("active"),
+        automaticTurn: (turn) =>
+          turn.turn.kind === "restart_continuation"
+            ? Deferred.succeed(reachedContinuation, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.as(AutomaticTurnGate.notNow("declined")),
+              )
+            : Effect.succeed(AutomaticTurnGate.notNow("deferred")),
+      };
+      return withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const author = yield* world.start;
+            // The owner's turn waits behind the author's, and a restart holds it there: it never
+            // started, so the author's cut run is still the one a continuation carries on.
+            const owners = ownerQueued
+              ? yield* ownerQueues(author.threadId, "Rename the button.")
+              : undefined;
+            // Core's shutdown records restart intent for the turn its provider still works on.
+            yield* providerTurnRunning(author.threadId);
+            const recovery = yield* coreRecovery;
+            yield* recovery.prepareForShutdown;
+            yield* recovery.reconcile("shutdown");
+            yield* world.rebuild(
+              Effect.gen(function* () {
+                // Core's recovery cut the author's run; Factory blocked on it.
+                yield* drainFactory;
+                assert.strictEqual(yield* continuationOf(author.runId), "pending");
+                if (owners !== undefined) {
+                  const held = (yield* threadProjection(author.threadId).pipe(
+                    Effect.orDie,
+                  )).runs.find((run) => run.id === owners);
+                  assert.strictEqual(held?.status, "queued");
+                  assert.isTrue(held?.queueHeld === true);
+                }
+                assert.deepStrictEqual(
+                  yield* reportOf(author.deliveryId),
+                  report("parked", { busy: true }),
+                );
+                const draining = yield* Effect.forkChild(drainOrchestration);
+                yield* Deferred.await(reachedContinuation);
+                assert.strictEqual(yield* continuationOf(author.runId), "running");
+                assert.deepStrictEqual(
+                  yield* reportOf(author.deliveryId),
+                  report("parked", { busy: true }),
+                );
+                yield* Deferred.succeed(release, undefined);
+                yield* Fiber.join(draining);
+                assert.notInclude(["pending", "running"], yield* continuationOf(author.runId));
+                assert.deepStrictEqual(yield* reportOf(author.deliveryId), report("parked"));
+              }),
+              { orchestration: true },
+            );
+          }),
+        { admission: port, automaticTurnGate: true },
+      );
+    },
+  );
 
   it.live("counts a cancelled delivery's job still running as busy until it ends", () =>
     withProject(verifyCommands.passes, (world) =>
