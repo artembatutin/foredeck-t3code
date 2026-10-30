@@ -797,6 +797,7 @@ interface ServerInput {
   readonly assistantThreads: ThreadServiceWrapper | undefined;
   readonly assistantFactory: FactoryPortWrapper | undefined;
   readonly automaticTurnGate: boolean;
+  readonly gateConsults: GateConsults | undefined;
   readonly root: string;
   readonly t3Home: string;
   /** The harness's one database, already built: every build of the server shares it. */
@@ -809,6 +810,33 @@ const inertGateInstaller = Layer.succeed(
   AutomaticTurnGate.AutomaticTurnGateInstaller.of({ install: () => Effect.void }),
 );
 
+/** Told how each consult of the gate ended, undecided ones included; see `withProject`. */
+type GateConsults = (
+  turn: AutomaticTurnGate.AutomaticTurn,
+  exit: Exit.Exit<unknown, unknown>,
+) => Effect.Effect<void>;
+
+/** The installable gate, with what Factory installs into it reporting each consult's end. */
+const observedGate = (observe: GateConsults) =>
+  Layer.effect(
+    AutomaticTurnGate.AutomaticTurnGateInstaller,
+    Effect.map(AutomaticTurnGate.AutomaticTurnGateInstaller, (inner) =>
+      AutomaticTurnGate.AutomaticTurnGateInstaller.of({
+        install: (gate) =>
+          inner.install(
+            AutomaticTurnGate.AutomaticTurnGate.of({
+              admit: (turn, dispatch) =>
+                gate.admit(turn, dispatch).pipe(Effect.onExit((exit) => observe(turn, exit))),
+              hand: (turn, dispatch, options) =>
+                gate
+                  .hand(turn, dispatch, options)
+                  .pipe(Effect.onExit((exit) => observe(turn, exit))),
+            }),
+          ),
+      }),
+    ),
+  ).pipe(Layer.provideMerge(AutomaticTurnGate.layerInstallable));
+
 /**
  * With `on`, the one installable automatic turn gate the server provides beneath its runtime, so
  * core's producers here (restart continuations and the continuation worker's native wakes and
@@ -818,9 +846,13 @@ const inertGateInstaller = Layer.succeed(
  */
 const automaticTurnGate = (
   on: boolean,
+  consults: GateConsults | undefined,
 ): Layer.Layer<AutomaticTurnGate.AutomaticTurnGateInstaller> =>
   on
-    ? Layer.merge(AutomaticTurnGate.layerInstallable, ProviderContinuationRequests.layer)
+    ? Layer.merge(
+        consults === undefined ? AutomaticTurnGate.layerInstallable : observedGate(consults),
+        ProviderContinuationRequests.layer,
+      )
     : inertGateInstaller;
 
 /**
@@ -873,7 +905,7 @@ const coreLayer = (input: ServerInput) => {
     Layer.provideMerge(ServerSettings.layerTest()),
     Layer.provideMerge(serverConfig),
     Layer.provideMerge(VcsProcess.layer),
-    Layer.provideMerge(automaticTurnGate(input.automaticTurnGate)),
+    Layer.provideMerge(automaticTurnGate(input.automaticTurnGate, input.gateConsults)),
   );
 };
 
@@ -1266,6 +1298,8 @@ export const withProject = <A, E>(
      * does (see `automaticTurnGate`); without it they run every automatic turn inline.
      */
     readonly automaticTurnGate?: boolean;
+    /** Told how each consult of that gate ended, a decision it could not make included. */
+    readonly gateConsults?: GateConsults;
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -1302,6 +1336,7 @@ export const withProject = <A, E>(
         assistantThreads: options.assistantThreads,
         assistantFactory: options.assistantFactory,
         automaticTurnGate: options.automaticTurnGate === true,
+        gateConsults: options.gateConsults,
         root,
         t3Home,
         // One database for every build of the server, as a T3 home keeps across restarts.

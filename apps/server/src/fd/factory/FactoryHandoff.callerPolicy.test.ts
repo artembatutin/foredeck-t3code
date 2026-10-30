@@ -33,7 +33,12 @@ import {
 } from "./testkit/handoff.ts";
 import { delegateFrom, providerTurnRunning } from "./testkit/familyThreads.ts";
 import { awaitedRun, editTaskFile, openSingle, reviewPasses } from "./testkit/followThrough.ts";
-import { type McpCaller, withEndpoint } from "./testkit/mcpEndpoint.ts";
+import {
+  type McpCaller,
+  refusesAll,
+  runCreatingCalls,
+  withEndpoint,
+} from "./testkit/mcpEndpoint.ts";
 import {
   authorCommits,
   drainFactory,
@@ -69,80 +74,6 @@ class FakeWorkUnavailable extends Schema.TaggedError<FakeWorkUnavailable>()("Wor
 const edited = "Add the export button and a CSV option";
 const retitle = (from: string, to: string) => (body: string) =>
   body.replace(`title: ${from}`, `title: ${to}`);
-
-/** Every tool that starts, messages, schedules, hands off or watches work, as an agent calls it. */
-const runCreatingCalls = (
-  world: World,
-  targets: { readonly own: ThreadId; readonly family: ThreadId; readonly owner: ThreadId },
-): ReadonlyArray<readonly [string, Record<string, unknown>]> => {
-  const threads = [targets.own, targets.family, targets.owner];
-  const item = `${world.itemRef.sourceId}:${world.itemRef.itemId}`;
-  return [
-    ...threads.flatMap((threadId) =>
-      (["queue", "auto", "steer", "restart"] as const).map(
-        (mode) => ["t3_thread_send", { threadId, message: "Check it once more.", mode }] as const,
-      ),
-    ),
-    ...threads.map(
-      (threadId) =>
-        [
-          "t3_thread_send_attachments",
-          { threadId, message: "See the log.", attachmentIds: ["upload-1"] },
-        ] as const,
-    ),
-    ["t3_thread_launch", { projectId: world.projectId, message: "Start a side task." }],
-    ["create_threads", { threads: [{ title: "Side task", message: "Start a side task." }] }],
-    ["schedule_task", { title: "Nightly", prompt: "Deliver the next item.", cron: "0 3 * * *" }],
-    ["update_scheduled_task", { taskId: "task-1", prompt: "Deliver everything." }],
-    ["run_scheduled_task_now", { taskId: "task-1" }],
-    ["t3_worktree_handoff", { mode: "worktree" }],
-    ["t3_thread_fork", { threadId: targets.own, sourcePoint: { type: "latest" } }],
-    [
-      "t3_thread_merge_back",
-      {
-        sourceThreadId: targets.own,
-        targetThreadId: targets.owner,
-        sourcePoint: { type: "latest" },
-      },
-    ],
-    ["t3_queue_edit", { threadId: targets.family, queuedRunId: "run-1", text: "Changed." }],
-    [
-      "t3_queue_promote_to_steer",
-      { threadId: targets.family, queuedRunId: "run-1", targetRunId: "run-2" },
-    ],
-    ["watch_pull_request", { threadId: targets.own, number: 7 }],
-    ["work_start_thread", { item, mode: "implement" }],
-    ["factory_deliver", { item }],
-    ["voice_reply", { text: "Done." }],
-    ["assistant_assign", { assignmentId: "side", projectId: world.projectId, ideaId: "side" }],
-    ["assistant_capture_work", { projectId: world.projectId, ideaId: "side", kind: "single" }],
-    ["assistant_portfolio", {}],
-    ["a_tool_nobody_published", {}],
-  ];
-};
-
-/** Calls each tool as `caller` and expects the policy's `refusal` for every one. */
-const refusesAll = (
-  caller: McpCaller,
-  calls: ReadonlyArray<readonly [string, Record<string, unknown>]>,
-  refusal: string,
-) =>
-  Effect.forEach(
-    calls,
-    ([tool, args]) =>
-      caller
-        .call(tool, args)
-        .pipe(
-          Effect.map((answer) =>
-            assert.deepStrictEqual(
-              answer,
-              { isError: true, text: refusal },
-              `${tool} on ${caller.threadId}`,
-            ),
-          ),
-        ),
-    { discard: true },
-  );
 
 /** The owner withdraws, or gives back, the execution grant on the managed idea's brief. */
 const authorize = (world: World, managed: Managed, executionAuthorized: boolean) =>

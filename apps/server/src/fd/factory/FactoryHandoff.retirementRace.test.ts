@@ -29,11 +29,13 @@ import {
   failOutboxReads,
   fill,
   freshRead,
+  makeRetirementProbe,
   manage,
   type Managed,
   managedRootOf,
   questionTask,
   release,
+  type RetirementProbe,
   runsOf,
   slotOf,
   tick,
@@ -47,41 +49,6 @@ import {
  * commits, each on a Deferred. Whatever the order, no terminal assignment coexists with live family
  * work or an admission row, and no slot leaks.
  */
-
-/** Holds whichever probe stage a test arms, once, until it lets go. */
-const makeProbe = Effect.gen(function* () {
-  const gates = {
-    released: { entered: yield* Deferred.make<void>(), go: yield* Deferred.make<void>() },
-    observed: { entered: yield* Deferred.make<void>(), go: yield* Deferred.make<void>() },
-    admitted: { entered: yield* Deferred.make<void>(), go: yield* Deferred.make<void>() },
-  };
-  const armed = { released: false, observed: false, admitted: false };
-  const stage = (name: keyof typeof armed) =>
-    Effect.suspend(() => {
-      if (!armed[name]) return Effect.void;
-      armed[name] = false;
-      return Deferred.succeed(gates[name].entered, undefined).pipe(
-        Effect.andThen(Deferred.await(gates[name].go)),
-      );
-    });
-  const probe: typeof HandoffAdmission.HandoffAdmissionProbe.Service = {
-    admitted: () => stage("admitted"),
-    released: () => stage("released"),
-    observed: () => stage("observed"),
-  };
-  // An admission's dispatch cannot be interrupted, so a failing test lets go of it to finish.
-  const guarded = <A, E, R>(body: Effect.Effect<A, E, R>) =>
-    body.pipe(
-      Effect.ensuring(
-        Effect.forEach(Object.values(gates), ({ go }) => Deferred.succeed(go, undefined), {
-          discard: true,
-        }),
-      ),
-    );
-  return { gates, armed, probe, guarded };
-});
-
-type Probe = Effect.Success<typeof makeProbe>;
 
 /**
  * A governed single item at its open pull request, its slot released, Work Ready and no control
@@ -140,8 +107,8 @@ const notTerminalYet = (managed: Managed) =>
 
 const shapes = ["native-clearable", "native-plain", "completion", "question"] as const;
 
-const withProbe = <A, E, R>(body: (probe: Probe) => Effect.Effect<A, E, R>) =>
-  Effect.flatMap(makeProbe, body);
+const withProbe = <A, E, R>(body: (probe: RetirementProbe) => Effect.Effect<A, E, R>) =>
+  Effect.flatMap(makeRetirementProbe, body);
 
 describe("a retirement racing an automatic turn", () => {
   describe.each([{ stage: "released" as const }, { stage: "observed" as const }])(

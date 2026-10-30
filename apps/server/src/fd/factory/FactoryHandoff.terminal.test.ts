@@ -1,34 +1,16 @@
 import { assert, describe, it } from "@effect/vitest";
-import {
-  CommandId,
-  EventId,
-  ProviderThreadId,
-  RunId,
-  ThreadId,
-  type ThreadPullRequestLink,
-  TurnItemId,
-} from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
-import * as DateTime from "effect/DateTime";
-import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
-import * as Layer from "effect/Layer";
 
 import * as AutomaticTurnGate from "../../orchestration-v2/AutomaticTurnGate.ts";
-import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import { HandoffAdmission, HandoffBackend, ProjectAssistant } from "../assistant/index.ts";
 import * as Factory from "./index.ts";
-// After Factory's entry: core's runtime cannot be the first module of its import cycle to load.
-import * as UsageLimitRecoveryWorker from "../../orchestration-v2/UsageLimitRecoveryWorker.ts";
-import * as Scheduler from "../../scheduling/Scheduler.ts";
-import * as ServerSettings from "../../serverSettings.ts";
 import {
   authorCommits,
   drainFactory,
   drainOrchestration,
   fakePullRequest,
   stateOf,
-  threadProjection,
   verifyCommands,
   withProject,
   type World,
@@ -56,6 +38,7 @@ import {
   fill,
   grantOutcomesOf,
   handoffRows,
+  keptFor,
   manage,
   type Managed,
   managedRootOf,
@@ -71,7 +54,10 @@ import {
   startAssistantThread,
   tick,
   turns,
+  turnsWithoutThreads,
+  usageLimitFailure,
   wakeThroughGate,
+  withLimitSweep,
 } from "./testkit/handoff.ts";
 
 /**
@@ -170,127 +156,6 @@ const refuseTheStart = (spy: ReturnType<typeof spyOnFactoryPort>) => {
       }),
     );
 };
-
-/**
- * One turn of every automatic kind, on the threads of a delivery that never existed: each native
- * wake of its own provider thread, so each keeps a disposition of its own.
- */
-const lateTurnsWithoutThreads = (label: string) => {
-  const thread = ThreadId.make("factory-thread:missing:1");
-  const run = RunId.make(`run-${label}`);
-  const providerThread = (suffix: string) => ProviderThreadId.make(`${label}-provider-${suffix}`);
-  return [
-    pullRequestWakeTurn(thread, {
-      host: "github.com",
-      repository: "acme/alpha",
-      number: fakePullRequest.number,
-      url: `${fakePullRequest.url}-${label}`,
-      watch: { startedAt: "2026-10-30T12:00:00.000Z", failedChecks: [] },
-    } as unknown as ThreadPullRequestLink),
-    turns.usageLimitResume(thread, run),
-    turns.delegatedQuestion(thread, { childThreadId: thread, taskId: questionTask }, run),
-    turns.delegatedCompletion(thread, run, providerThread("completion")),
-    turns.backgroundWake(thread, providerThread("clearable"), true),
-    turns.backgroundWake(thread, providerThread("plain"), false),
-  ];
-};
-
-/** What a native wake's offer gives the admission to keep: a drop only if it can be cleared. */
-const keptFor = (turn: AutomaticTurnGate.AutomaticTurn, dropped: Array<string>) =>
-  turn.kind === "background_wake"
-    ? {
-        kept: {
-          dispatch: Effect.die("A failed root's wake never runs."),
-          ...(turn.clearable ? { drop: Effect.sync(() => void dropped.push(turn.messageId)) } : {}),
-        },
-      }
-    : {};
-
-/**
- * Core's usage-limit recovery worker, whose sweep the test runs as the scheduler would, over the
- * server's records and the automatic turn gate it consults, with resuming limited threads on.
- */
-const withLimitSweep = <A, E, R>(body: (sweep: Effect.Effect<void>) => Effect.Effect<A, E, R>) =>
-  Effect.gen(function* () {
-    const registered = yield* Deferred.make<Effect.Effect<void>>();
-    const worker = UsageLimitRecoveryWorker.layer.pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          Layer.mock(Scheduler.Scheduler)({
-            register: <SweepE, SweepR>(
-              _name: string,
-              runDueWork: Effect.Effect<void, SweepE, SweepR>,
-            ) =>
-              Effect.gen(function* () {
-                const context = yield* Effect.context<SweepR>();
-                yield* Deferred.succeed(
-                  registered,
-                  runDueWork.pipe(Effect.provideContext(context), Effect.orDie),
-                );
-              }),
-          }),
-          ServerSettings.layerTest({ autoResumeLimitedThreads: true }),
-        ),
-      ),
-    );
-    return yield* Effect.flatMap(Deferred.await(registered), body).pipe(Effect.provide(worker));
-  });
-
-/**
- * The run fails on a usage limit, reported as a provider reports it, with a reset that has already
- * passed since the run ended, so a sweep arms the recovery and the next finds its resume due.
- */
-const usageLimitFailure = (threadId: ThreadId, runId: RunId) =>
-  Effect.gen(function* () {
-    const sink = yield* EventSink.EventSinkV2;
-    const { runs } = yield* threadProjection(threadId);
-    const run = runs.find((candidate) => candidate.id === runId) ?? assert.fail("No such run.");
-    const now = yield* DateTime.now;
-    const completedAt = DateTime.subtract(now, { minutes: 2 });
-    yield* sink.write({
-      commandId: CommandId.make(`test-usage-limit:${runId}`),
-      events: [
-        {
-          id: EventId.make(`test-usage-limit-run:${runId}`),
-          type: "run.updated",
-          threadId,
-          occurredAt: now,
-          payload: { ...run, status: "failed", completedAt },
-        },
-        {
-          id: EventId.make(`test-usage-limit-error:${runId}`),
-          type: "turn-item.updated",
-          threadId,
-          occurredAt: now,
-          payload: {
-            id: TurnItemId.make(`test-usage-limit-error:${runId}`),
-            type: "error",
-            threadId,
-            runId,
-            nodeId: run.rootNodeId,
-            providerThreadId: null,
-            providerTurnId: null,
-            nativeItemRef: null,
-            parentItemId: null,
-            ordinal: 99,
-            status: "failed",
-            title: "Usage limit reached",
-            startedAt: completedAt,
-            completedAt,
-            updatedAt: completedAt,
-            failure: {
-              class: "usage_limit",
-              message: "Plan limit reached.",
-              code: "usageLimitExceeded",
-              retryable: null,
-              resetAt: DateTime.formatIso(DateTime.subtract(now, { minutes: 1 })),
-            },
-          },
-        },
-      ],
-    });
-    yield* drainOrchestration;
-  }).pipe(Effect.orDie);
 
 /** Takes the delivery to the terminal outcome, as its owner, its host or its merge does. */
 const endDelivery = (
@@ -435,7 +300,7 @@ describe("a governed root reaching a terminal outcome", () => {
                 patch: { executionAuthorized },
               });
             if (mode === "blocked") yield* authorize(false);
-            const waiting = lateTurnsWithoutThreads("seeded");
+            const waiting = turnsWithoutThreads("seeded");
             for (const turn of waiting) {
               const decided = yield* admission.decideTurn({
                 root,
@@ -521,7 +386,7 @@ describe("late arrivals after a pre-delivery failure", () => {
           // No thread of a delivery that never was can reach the gate, which finds no family for
           // it: what its manager would be asked is asked of the admission directly.
           const dropped: Array<string> = [];
-          const late = lateTurnsWithoutThreads("late");
+          const late = turnsWithoutThreads("late");
           const present = Effect.gen(function* () {
             for (const turn of late) {
               const decided = yield* admission.decideTurn({

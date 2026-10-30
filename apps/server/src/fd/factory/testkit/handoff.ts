@@ -3,8 +3,11 @@ import * as NodeCrypto from "node:crypto";
 
 import { assert } from "@effect/vitest";
 import {
+  AuthWorkReadScope,
+  AuthWorkWriteScope,
   CommandId,
   EnvironmentId,
+  EventId,
   MessageId,
   NodeId,
   ProviderDriverKind,
@@ -14,12 +17,16 @@ import {
   RuntimeRequestId,
   ThreadId,
   type ThreadPullRequestLink,
+  TurnItemId,
 } from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
+import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -27,16 +34,23 @@ import * as Stream from "effect/Stream";
 
 import type { Caller } from "../../../mcp/threadAccess.ts";
 import * as AutomaticTurnGate from "../../../orchestration-v2/AutomaticTurnGate.ts";
+import * as DelegatedTaskQuestionReactor from "../../../orchestration-v2/DelegatedTaskQuestionReactor.ts";
 import * as EventSink from "../../../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as ServerActivation from "../../../serverActivation.ts";
 import {
   HandoffAdmission,
   HandoffBackend,
   ProjectAssistant,
   WorkCapture,
 } from "../../assistant/index.ts";
+import { type WorkActor, type WorkDomainError, WorkService } from "../../work-management/index.ts";
 import * as Factory from "../index.ts";
+// After Factory's entry: core's runtime cannot be the first module of its import cycle to load.
+import * as UsageLimitRecoveryWorker from "../../../orchestration-v2/UsageLimitRecoveryWorker.ts";
+import * as Scheduler from "../../../scheduling/Scheduler.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 import {
   authorCommits,
   drainOrchestration,
@@ -437,7 +451,7 @@ export const governedMessages = (root: FactoryDeliveryId) =>
 export const assistantThread = ThreadId.make("fd-assistant-owner");
 
 /** The assistant thread's MCP caller, as `readCaller` builds it; only its scope and limits count. */
-const assistantCaller: Caller = {
+export const assistantCaller: Caller = {
   scope: {
     environmentId: EnvironmentId.make("environment"),
     capabilities: new Set(["orchestration"]),
@@ -1018,7 +1032,7 @@ export const completionSteerFellBack = (
     readonly deliveryId: FactoryDeliveryId;
     readonly threadId: ThreadId;
   },
-  managed: Managed,
+  managed: Pick<Managed, "root">,
 ) =>
   Effect.gen(function* () {
     const threadId = opened.threadId;
@@ -1083,3 +1097,471 @@ export const runsOf = (threadId: ThreadId) =>
     Effect.map(({ runs }) => runs),
     Effect.orDie,
   );
+
+/**
+ * The owner, as their client reaches Work: every read past Work's cache and every edit of an item
+ * is theirs, not the assistant's.
+ */
+const owner: WorkActor = {
+  id: "session:owner",
+  grants: [AuthWorkReadScope, AuthWorkWriteScope],
+  label: "owner",
+};
+
+/** The owner renames the item through Work, which every later read sees. */
+export const ownerEdits = (ref: WorkItemRef) =>
+  Effect.gen(function* () {
+    const work = yield* WorkService.WorkService;
+    const item = yield* work.getItem(owner, { ref });
+    yield* work.updateItem(owner, {
+      ref,
+      expectedRevision: item.revision,
+      title: `${item.title}, and more`,
+      body: item.body,
+    });
+  }).pipe(Effect.orDie);
+
+/** Puts the item's title back as it was before `ownerEdits`, so it says what was authorized. */
+export const ownerRestores = (ref: WorkItemRef) =>
+  Effect.gen(function* () {
+    const work = yield* WorkService.WorkService;
+    const item = yield* work.getItem(owner, { ref });
+    yield* work.updateItem(owner, {
+      ref,
+      expectedRevision: item.revision,
+      title: item.title.replace(/, and more$/, ""),
+      body: item.body,
+    });
+  }).pipe(Effect.orDie);
+
+/** How many items the source holds, invalid ones included, read past Work's cache. */
+export const itemCount = (world: World) =>
+  Effect.gen(function* () {
+    const work = yield* WorkService.WorkService;
+    yield* work.refresh(owner, {});
+    const { items } = yield* work.listItems(owner, {
+      sourceId: world.itemRef.sourceId,
+      limit: 100,
+    });
+    return items.length;
+  }).pipe(Effect.orDie);
+
+/** Stands in for Work's error, which only Work's own modules may construct. */
+class FakeWorkUnavailable extends Schema.TaggedError<FakeWorkUnavailable>()("WorkUnavailable", {
+  detail: Schema.String,
+}) {}
+
+/**
+ * Work as the server runs it, whose reads for the assistant's admission and capture fail while
+ * `failing.on`, as an unreachable source does. Everything else reads as usual.
+ */
+export const unreadableForAssistant =
+  (failing: { on: boolean }) =>
+  (service: WorkService.WorkService["Service"]): WorkService.WorkService["Service"] => ({
+    ...service,
+    getItem: (actor, input) =>
+      failing.on && actor.id === "assistant:handoff"
+        ? Effect.fail(
+            new FakeWorkUnavailable({
+              detail: "The source could not be reached.",
+            }) as unknown as WorkDomainError,
+          )
+        : service.getItem(actor, input),
+  });
+
+/** A brief saved, its goal and criteria agreed, with nothing captured or authorized. */
+export const agree = (world: World, idea: string) =>
+  Effect.flatMap(ProjectAssistant.ProjectAssistant, (assistant) =>
+    assistant.revise({
+      projectId: world.projectId,
+      ideaId: idea,
+      patch: { goal: `Deliver ${idea}`, acceptanceCriteria: [`Check ${idea}`] },
+    }),
+  ).pipe(Effect.orDie);
+
+/** The assistant's capture of the idea's brief, as its thread asks for it. */
+export const captureIdea = (world: World, idea: string, kind: "single" | "parent" = "single") =>
+  Effect.flatMap(WorkCapture.WorkCapture, (captures) =>
+    captures.capture({ caller: assistantCaller, projectId: world.projectId, ideaId: idea, kind }),
+  );
+
+/** The owner gives, or withdraws, the execution grant on the idea's brief. */
+export const authorizeIdea = (world: World, idea: string, executionAuthorized = true) =>
+  Effect.flatMap(ProjectAssistant.ProjectAssistant, (assistant) =>
+    assistant.revise({ projectId: world.projectId, ideaId: idea, patch: { executionAuthorized } }),
+  ).pipe(Effect.orDie);
+
+/** An idea captured, authorized, assigned and claimed by a tick; returns its root and item. */
+export const claimIdea = (world: World, idea: string, kind: "single" | "parent" = "single") =>
+  Effect.gen(function* () {
+    const ref = yield* agreeAndCapture(world, idea, kind);
+    yield* assignToFactory(world, idea);
+    yield* tick;
+    return { ref, root: yield* rootIdOf(idea) };
+  });
+
+/**
+ * Two other real assignments, each claimed by a tick with its author's turn running, so both slots
+ * are held by work that can end. Returns them for `freeOne`.
+ */
+export const occupyBoth = (world: World, prefix = "busy") =>
+  Effect.gen(function* () {
+    const held = [];
+    for (const suffix of [1, 2]) {
+      const idea = `${prefix}-${suffix}`;
+      const { root } = yield* claimIdea(world, idea);
+      held.push({ idea, root, author: yield* world.launched(root) });
+    }
+    return held;
+  });
+
+/** The other assignment's delivery runs to its open pull request, and a tick lets its slot go. */
+export const freeOne = (world: World, other: { readonly root: FactoryDeliveryId }) =>
+  Effect.gen(function* () {
+    yield* runToPullRequest(world, other.root);
+    yield* tick;
+    assert.isUndefined(yield* slotOf(other.root));
+  });
+
+const ambiguousStart = () =>
+  Effect.fail(new HandoffBackend.HandoffFactoryError({ operation: "start" }));
+
+/**
+ * A root's first start ends ambiguously with no row, and a stop then parks it: its delivery is
+ * proven absent, and nothing of it holds capacity. `spy` is the world's Factory port.
+ */
+export const parkAbsent = (world: World, spy: ReturnType<typeof spyOnFactoryPort>, idea: string) =>
+  Effect.gen(function* () {
+    const ref = yield* agreeAndCapture(world, idea);
+    yield* assignToFactory(world, idea);
+    spy.control.onStart = ambiguousStart;
+    yield* tick;
+    spy.control.onStart = undefined;
+    yield* controlAssignment(idea, "stop");
+    assert.strictEqual((yield* assignmentOf(idea)).state, "stopped");
+    return { ref, root: yield* rootIdOf(idea) };
+  });
+
+/** Stores the start's row and fails its step, as a crash right after the insert leaves it. */
+export const failStartStep = Effect.flatMap(
+  SqlClient.SqlClient,
+  (sql) => sql`CREATE TRIGGER handoff_start_step_fails BEFORE UPDATE ON fd_factory_deliveries
+    WHEN OLD.status = 'queued'
+    BEGIN SELECT RAISE(ABORT, 'held by the test'); END`,
+).pipe(Effect.orDie);
+export const restoreStartStep = Effect.flatMap(
+  SqlClient.SqlClient,
+  (sql) => sql`DROP TRIGGER handoff_start_step_fails`,
+).pipe(Effect.orDie);
+
+/** The same park over a queued orphan: its row stored, and its start step never stored. */
+export const parkOrphan = (world: World, idea: string) =>
+  Effect.gen(function* () {
+    const ref = yield* agreeAndCapture(world, idea);
+    yield* assignToFactory(world, idea);
+    yield* failStartStep;
+    yield* tick;
+    yield* controlAssignment(idea, "stop");
+    yield* restoreStartStep;
+    assert.strictEqual((yield* assignmentOf(idea)).state, "stopped");
+    const root = yield* rootIdOf(idea);
+    assert.strictEqual((yield* stateOf(root)).status, "queued");
+    return { ref, root };
+  });
+
+/** The provider's question in the run's turn, once core stores it pending. */
+export const askedOn = (world: World, runId: RunId, mode: "live" | "message") =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const turn =
+      world.provider.started.find((candidate) => candidate.runId === runId) ??
+      assert.fail(`No provider turn started run ${runId}.`);
+    const requestId = yield* world.provider.ask(turn, mode);
+    yield* sink.stream().pipe(
+      Stream.filter(
+        ({ event }) =>
+          event.type === "runtime-request.updated" &&
+          event.payload.id === requestId &&
+          event.payload.status === "pending",
+      ),
+      Stream.runHead,
+    );
+    yield* drainOrchestration;
+    return requestId;
+  }).pipe(Effect.orDie);
+
+/** What the adapter was asked of a native offer: each offer it cleared, and each it dispatched. */
+interface NativeOffers {
+  readonly cleared: Array<string>;
+  readonly dispatched: Array<string>;
+}
+
+export const nativeOffers = (): NativeOffers => ({ cleared: [], dispatched: [] });
+
+let offered = 0;
+
+/**
+ * The provider's background work finishing outside a turn, offered on core's one continuation queue
+ * the way its adapters offer it: `callbacks` as Codex does, whose offer can be dispatched only while
+ * current and be cleared, and `plain` as Claude does, with neither. Returns the message the worker
+ * runs it under when `messageId` is on; with it off the worker allocates one, as a Claude wake's.
+ */
+export const offerNative = (
+  threadId: ThreadId,
+  providerThreadId: ProviderThreadId,
+  shape: "callbacks" | "plain",
+  record: NativeOffers,
+  options: { readonly messageId?: boolean } = {},
+) =>
+  Effect.gen(function* () {
+    const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+    offered += 1;
+    const messageId = MessageId.make(`native-offer-${offered}`);
+    yield* requests.offer({
+      threadId,
+      providerThreadId,
+      driver,
+      detail: null,
+      ...(options.messageId === false ? {} : { messageId }),
+      ...(shape === "callbacks"
+        ? {
+            dispatchIfCurrent: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+              Effect.sync(() => void record.dispatched.push(messageId)).pipe(
+                Effect.andThen(effect),
+                Effect.asSome,
+              ),
+            clearIfCurrent: () => Effect.sync(() => void record.cleared.push(messageId)),
+          }
+        : {}),
+    });
+    return messageId;
+  });
+
+/**
+ * Runs `body` with core's question reactor following the event log, as the server starts it: a
+ * question its worker sees reaches the gate by itself. The rebuilt server of a restart starts one of
+ * its own inside `world.rebuild`.
+ */
+export const withQuestionReactor = <A, E, R>(body: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const reactor = yield* DelegatedTaskQuestionReactor.DelegatedTaskQuestionReactor;
+    yield* reactor.start();
+    return yield* body;
+  }).pipe(
+    Effect.provide(
+      DelegatedTaskQuestionReactor.layer.pipe(
+        Layer.provideMerge(Layer.succeed(ServerActivation.ServerActivation, Effect.void)),
+      ),
+    ),
+    Effect.scoped,
+  );
+
+/**
+ * Core's usage-limit recovery worker, whose sweep the test runs as the scheduler would, over the
+ * server's records and the automatic turn gate it consults, with resuming limited threads on.
+ */
+export const withLimitSweep = <A, E, R>(
+  body: (sweep: Effect.Effect<void>) => Effect.Effect<A, E, R>,
+) =>
+  Effect.gen(function* () {
+    const registered = yield* Deferred.make<Effect.Effect<void>>();
+    const worker = UsageLimitRecoveryWorker.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(Scheduler.Scheduler)({
+            register: <SweepE, SweepR>(
+              _name: string,
+              runDueWork: Effect.Effect<void, SweepE, SweepR>,
+            ) =>
+              Effect.gen(function* () {
+                const context = yield* Effect.context<SweepR>();
+                yield* Deferred.succeed(
+                  registered,
+                  runDueWork.pipe(Effect.provideContext(context), Effect.orDie),
+                );
+              }),
+          }),
+          ServerSettings.layerTest({ autoResumeLimitedThreads: true }),
+        ),
+      ),
+    );
+    return yield* Effect.flatMap(Deferred.await(registered), body).pipe(Effect.provide(worker));
+  });
+
+/**
+ * The run ended on a usage limit, reported as a provider reports it, with a reset that has already
+ * passed since the run ended, so a sweep arms the recovery and the next finds its resume due.
+ */
+export const usageLimitFailure = (threadId: ThreadId, runId: RunId) =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const { runs } = yield* threadProjection(threadId);
+    const run = runs.find((candidate) => candidate.id === runId) ?? assert.fail("No such run.");
+    const now = yield* DateTime.now;
+    const completedAt = DateTime.subtract(now, { minutes: 2 });
+    yield* sink.write({
+      commandId: CommandId.make(`test-usage-limit:${runId}`),
+      events: [
+        {
+          id: EventId.make(`test-usage-limit-run:${runId}`),
+          type: "run.updated",
+          threadId,
+          occurredAt: now,
+          payload: { ...run, status: "failed", completedAt },
+        },
+        {
+          id: EventId.make(`test-usage-limit-error:${runId}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`test-usage-limit-error:${runId}`),
+            type: "error",
+            threadId,
+            runId,
+            nodeId: run.rootNodeId,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 99,
+            status: "failed",
+            title: "Usage limit reached",
+            startedAt: completedAt,
+            completedAt,
+            updatedAt: completedAt,
+            failure: {
+              class: "usage_limit",
+              message: "Plan limit reached.",
+              code: "usageLimitExceeded",
+              retryable: null,
+              resetAt: DateTime.formatIso(DateTime.subtract(now, { minutes: 1 })),
+            },
+          },
+        },
+      ],
+    });
+    yield* drainOrchestration;
+  }).pipe(Effect.orDie);
+
+/** Holds whichever probe stage a test arms, once, until it lets go. */
+export const makeRetirementProbe = Effect.gen(function* () {
+  const gates = {
+    released: { entered: yield* Deferred.make<void>(), go: yield* Deferred.make<void>() },
+    observed: { entered: yield* Deferred.make<void>(), go: yield* Deferred.make<void>() },
+    admitted: { entered: yield* Deferred.make<void>(), go: yield* Deferred.make<void>() },
+  };
+  const armed = { released: false, observed: false, admitted: false };
+  const stage = (name: keyof typeof armed) =>
+    Effect.suspend(() => {
+      if (!armed[name]) return Effect.void;
+      armed[name] = false;
+      return Deferred.succeed(gates[name].entered, undefined).pipe(
+        Effect.andThen(Deferred.await(gates[name].go)),
+      );
+    });
+  const probe: typeof HandoffAdmission.HandoffAdmissionProbe.Service = {
+    admitted: () => stage("admitted"),
+    released: () => stage("released"),
+    observed: () => stage("observed"),
+  };
+  // An admission's dispatch cannot be interrupted, so a failing test lets go of it to finish.
+  const guarded = <A, E, R>(body: Effect.Effect<A, E, R>) =>
+    body.pipe(
+      Effect.ensuring(
+        Effect.forEach(Object.values(gates), ({ go }) => Deferred.succeed(go, undefined), {
+          discard: true,
+        }),
+      ),
+    );
+  return { gates, armed, probe, guarded };
+});
+
+export type RetirementProbe = Effect.Success<typeof makeRetirementProbe>;
+
+/** An assignment started, claimed and delivered to its open pull request, its slot let go. */
+export const deliverIdea = (world: World, idea = "export") =>
+  Effect.gen(function* () {
+    yield* startAssistantThread(world);
+    const { ref, root } = yield* claimIdea(world, idea);
+    const opened = yield* runToPullRequest(world, root);
+    yield* tick;
+    assert.isUndefined(yield* slotOf(root));
+    assert.strictEqual((yield* assignmentOf(idea)).state, "needs-input");
+    return { ref, root, opened, thread: opened.threadId };
+  });
+
+/** The reviewer's thread of the delivery, and its latest run. */
+export const reviewerOf = (root: FactoryDeliveryId) =>
+  Effect.gen(function* () {
+    const { threads } = yield* stateOf(root);
+    const thread = threads.reviewer ?? assert.fail("No reviewer ran.");
+    const run = (yield* runsOf(thread)).at(-1) ?? assert.fail("The reviewer ran nothing.");
+    return { thread, run: run.id };
+  });
+
+/** The thread's runs of the message: one, once it ran, however often it was presented. */
+export const runsOfMessage = (threadId: ThreadId, messageId: string) =>
+  Effect.map(runsOf(threadId), (runs) => runs.filter((run) => run.userMessageId === messageId));
+
+/**
+ * One turn of every automatic kind, on the threads of a delivery that never existed: each native
+ * wake of its own provider thread, so each keeps a disposition of its own.
+ */
+export const turnsWithoutThreads = (label: string) => {
+  const thread = ThreadId.make("factory-thread:missing:1");
+  const run = `run-${label}` as RunId;
+  const providerThread = (suffix: string) => `${label}-provider-${suffix}` as ProviderThreadId;
+  return [
+    pullRequestWakeTurn(thread, {
+      host: "github.com",
+      repository: "acme/alpha",
+      number: 7,
+      url: `https://github.com/acme/alpha/pull/7-${label}`,
+      watch: { startedAt: "2026-10-30T12:00:00.000Z", failedChecks: [] },
+    } as unknown as ThreadPullRequestLink),
+    turns.usageLimitResume(thread, run),
+    turns.delegatedQuestion(thread, { childThreadId: thread, taskId: questionTask }, run),
+    turns.delegatedCompletion(thread, run, providerThread("completion")),
+    turns.backgroundWake(thread, providerThread("clearable"), true),
+    turns.backgroundWake(thread, providerThread("plain"), false),
+  ];
+};
+
+/** What a native wake's offer gives the admission to keep: a drop only if it can be cleared. */
+export const keptFor = (turn: AutomaticTurnGate.AutomaticTurn, dropped: Array<string>) =>
+  turn.kind === "background_wake"
+    ? {
+        kept: {
+          dispatch: Effect.die("A failed root's wake never runs."),
+          ...(turn.clearable ? { drop: Effect.sync(() => void dropped.push(turn.messageId)) } : {}),
+        },
+      }
+    : {};
+
+/**
+ * Sees each consult of the gate end, for a test to wait on all of a turn's decision, a declined
+ * wake's clear included: pass `gateConsults` as the harness's option, and await `ended` by message.
+ */
+export const consultWatch = () => {
+  const done: Array<string> = [];
+  const waiting: Array<{ readonly messageId: string; readonly done: Deferred.Deferred<void> }> = [];
+  return {
+    gateConsults: (turn: AutomaticTurnGate.AutomaticTurn): Effect.Effect<void> =>
+      Effect.suspend(() => {
+        done.push(turn.messageId);
+        return Effect.forEach(
+          waiting.filter(({ messageId }) => messageId === turn.messageId),
+          (entry) => Deferred.succeed(entry.done, undefined),
+          { discard: true },
+        );
+      }),
+    ended: (messageId: string) =>
+      Effect.suspend(() => {
+        if (done.includes(messageId)) return Effect.void;
+        const entry = { messageId, done: Deferred.makeUnsafe<void>() };
+        waiting.push(entry);
+        return Deferred.await(entry.done);
+      }),
+  };
+};
