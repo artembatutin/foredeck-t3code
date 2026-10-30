@@ -1,4 +1,4 @@
-export { createFactoryEnvironmentAtoms } from "./atoms.ts";
+export { createFactoryEnvironmentAtoms, type EnvironmentTarget } from "./atoms.ts";
 export { factoryFleet, type FactoryFleetEnvironment, type FactoryFleetRow } from "./fleet.ts";
 export { createFactoryFleetAtom, type FactoryFleetState } from "./fleetAtom.ts";
 export {
