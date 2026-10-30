@@ -5,16 +5,21 @@ import {
   type RuntimeRequestId,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 
-import type * as AutomaticTurnGate from "../../orchestration-v2/AutomaticTurnGate.ts";
+import * as AutomaticTurnGate from "../../orchestration-v2/AutomaticTurnGate.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import { HandoffAdmission } from "../assistant/index.ts";
 import * as AssistantHandoff from "../assistant-handoff/index.ts";
@@ -1071,6 +1076,8 @@ describe("everyone else's answers and sends", () => {
   );
 });
 
+const isDecisionError = Schema.is(AutomaticTurnGate.AutomaticTurnDecisionError);
+
 const refuseRecords = Effect.flatMap(
   SqlClient.SqlClient,
   (sql) => sql`CREATE TRIGGER acceptance_refuses_record BEFORE INSERT ON fd_factory_automatic_turns
@@ -1083,31 +1090,81 @@ const allowRecords = Effect.flatMap(
 
 describe("a callback-free native offer the gate could not decide", () => {
   /**
+   * The test clock, saying when it has armed each timer. A consult's end is too early to move the
+   * clock by: `Deferred.succeed` runs what awaits it at once, and the worker arms its backoff only
+   * afterwards, on a fiber it forks then. A timer armed after the clock moved would never fire.
+   */
+  const armedTimers = () => {
+    const armed: Array<number> = [];
+    const waiting: Array<{ readonly millis: number; readonly done: Deferred.Deferred<void> }> = [];
+    const report = (millis: number) =>
+      Effect.suspend(() => {
+        const index = waiting.findIndex((entry) => entry.millis === millis);
+        if (index < 0) {
+          armed.push(millis);
+          return Effect.void;
+        }
+        const [entry] = waiting.splice(index, 1);
+        return Deferred.succeed(entry!.done, undefined);
+      });
+    return {
+      /** Forgets every timer armed so far, the scenario's own setup's among them. */
+      forget: Effect.sync(() => void armed.splice(0)),
+      /** Waits until a timer of exactly `millis` is armed that no earlier wait took. */
+      armed: (millis: number) =>
+        Effect.suspend(() => {
+          const index = armed.indexOf(millis);
+          if (index >= 0) {
+            armed.splice(index, 1);
+            return Effect.void;
+          }
+          const done = Deferred.makeUnsafe<void>();
+          waiting.push({ millis, done });
+          return Deferred.await(done);
+        }),
+      /** Runs `body`, and everything it builds, on the clock that says so. */
+      on: <A, E, R>(body: Effect.Effect<A, E, R>) =>
+        TestClock.testClockWith((clock) =>
+          body.pipe(
+            Effect.provideService(Clock.Clock, {
+              ...clock,
+              sleep: (duration) =>
+                Effect.gen(function* () {
+                  // Started at once, so the timer exists before anyone hears of it.
+                  const sleeping = yield* clock
+                    .sleep(duration)
+                    .pipe(Effect.forkChild({ startImmediately: true }));
+                  yield* report(Duration.toMillis(duration));
+                  yield* Fiber.join(sleeping);
+                }),
+            }),
+          ),
+        ),
+    };
+  };
+
+  /**
    * Fails the admission's management read while `reads > 0`, as an ownership read that fails does,
-   * and reports each consult of a native wake as it ends, so a test drives the backoff's clock to
-   * exactly the attempt it means.
+   * and reports each consult of a native wake as it ends, with the stage an undecided one failed
+   * at, so a test waits for exactly the attempt it means.
    */
   const faults = () => {
     const control = { reads: 0 };
     const attempts: Array<{
       readonly messageId: MessageId;
-      readonly undecided: boolean;
-      readonly done: Deferred.Deferred<void>;
+      readonly undecided: "read" | "record" | "admission" | null;
     }> = [];
     const waiting: Array<{ readonly count: number; readonly done: Deferred.Deferred<void> }> = [];
     return {
       control,
       attempts,
-      /** Waits until the native wake has been consulted `count` times, driving the backoff's clock. */
+      /** Waits until the native wake has been consulted `count` times. */
       consulted: (count: number) =>
-        Effect.gen(function* () {
-          if (attempts.length >= count) return;
+        Effect.suspend(() => {
+          if (attempts.length >= count) return Effect.void;
           const done = Deferred.makeUnsafe<void>();
           waiting.push({ count, done });
-          while (!(yield* Deferred.isDone(done))) {
-            yield* TestClock.adjust("100 millis");
-            yield* Effect.yieldNow;
-          }
+          return Deferred.await(done);
         }),
       admission: (
         service: HandoffAdmission.HandoffAdmission["Service"],
@@ -1134,10 +1191,12 @@ describe("a callback-free native offer the gate could not decide", () => {
         turn.kind !== "background_wake"
           ? Effect.void
           : Effect.suspend(() => {
+              const error = Exit.isFailure(exit)
+                ? Option.getOrUndefined(Cause.findErrorOption(exit.cause))
+                : undefined;
               attempts.push({
                 messageId: turn.messageId,
-                undecided: Exit.isFailure(exit),
-                done: Deferred.makeUnsafe(),
+                undecided: isDecisionError(error) ? error.stage : null,
               });
               return Effect.forEach(
                 waiting.filter(({ count }) => attempts.length >= count),
@@ -1156,69 +1215,87 @@ describe("a callback-free native offer the gate could not decide", () => {
     ({ full }) => {
       const spy = spyOnFactoryPort();
       const fault = faults();
-      return withProject(
-        verifyCommands.passes,
-        (world) =>
-          Effect.gen(function* () {
-            const { root, opened, thread } = yield* deliverIdea(world);
-            const providerThread = yield* providerThreadOf(thread, opened.runId);
-            const [filler] = full ? yield* fill(world, 2) : [];
-            const native = nativeOffers();
-            const runs = (yield* runsOf(thread)).length;
-            const rows = yield* handoffRows;
+      const timers = armedTimers();
+      return timers.on(
+        withProject(
+          verifyCommands.passes,
+          (world) =>
+            Effect.gen(function* () {
+              const { root, opened, thread } = yield* deliverIdea(world);
+              const providerThread = yield* providerThreadOf(thread, opened.runId);
+              const [filler] = full ? yield* fill(world, 2) : [];
+              const native = nativeOffers();
+              const runs = (yield* runsOf(thread)).length;
+              const rows = yield* handoffRows;
+              const nothingMoved = Effect.gen(function* () {
+                assert.strictEqual((yield* runsOf(thread)).length, runs);
+                assert.deepStrictEqual(yield* handoffRows, rows);
+                assert.deepStrictEqual(native.cleared, []);
+                assert.deepStrictEqual(native.dispatched, []);
+              });
 
-            // The ownership read fails, then the record's write: undecided twice, nothing moves.
-            fault.control.reads = 1;
-            yield* refuseRecords;
-            yield* offerNative(thread, providerThread, "plain", native, { messageId: false });
-            yield* fault.consulted(2);
-            assert.isTrue(fault.attempts.every(({ undecided }) => undecided));
-            assert.strictEqual((yield* runsOf(thread)).length, runs);
-            assert.deepStrictEqual(yield* handoffRows, rows);
-            assert.deepStrictEqual(native.cleared, []);
-            assert.deepStrictEqual(native.dispatched, []);
-            yield* allowRecords;
+              // The ownership read fails: undecided, nothing moves, and its first backoff step is set.
+              fault.control.reads = 1;
+              yield* refuseRecords;
+              yield* timers.forget;
+              yield* offerNative(thread, providerThread, "plain", native, { messageId: false });
+              yield* fault.consulted(1);
+              yield* timers.armed(100);
+              assert.strictEqual(fault.control.reads, 0);
+              yield* nothingMoved;
 
-            // Restored, the same wake under the same id decides at last, by its re-offer.
-            yield* fault.consulted(3);
-            const [first] = fault.attempts;
-            const messageId = first?.messageId ?? assert.fail("The wake was never consulted.");
-            assert.deepStrictEqual(
-              fault.attempts.map((attempt) => attempt.messageId),
-              [messageId, messageId, messageId],
-            );
-            assert.isFalse(fault.attempts[2]?.undecided);
-            yield* drainOrchestration;
-
-            if (full) {
+              // The step ends and it is offered again: the record's write fails, and the next is set.
+              yield* TestClock.adjust("100 millis");
+              yield* fault.consulted(2);
+              const messageId =
+                fault.attempts[0]?.messageId ?? assert.fail("The wake was never consulted.");
               assert.deepStrictEqual(
-                (yield* demandsOf(root)).map(({ kind, messageId: id }) => [kind, id]),
-                [["background_wake", messageId]],
+                fault.attempts.map(({ messageId: id, undecided }) => [id, undecided]),
+                [
+                  [messageId, "read"],
+                  [messageId, "record"],
+                ],
               );
-              assert.strictEqual((yield* runsOf(thread)).length, runs);
-              yield* release(filler!);
-              yield* tick;
-            }
-            const run = yield* runOfMessage(messageId);
-            yield* runStarted(run);
-            assert.strictEqual((yield* slotOf(root))?.state, "held");
-            assert.deepStrictEqual(yield* demandsOf(root), []);
-            yield* world.endRun(run, "completed");
-            yield* tick;
-            assert.lengthOf(yield* runsOfMessage(thread, messageId), 1);
-            assert.strictEqual((yield* runsOf(thread)).length, runs + 1);
-            assert.isUndefined(yield* slotOf(root));
-            assert.deepStrictEqual(native.cleared, []);
+              yield* timers.armed(200);
+              yield* nothingMoved;
+              yield* allowRecords;
 
-            // Decided, it is offered no more, however far the clock moves.
-            const attempts = fault.attempts.length;
-            yield* TestClock.adjust("1 hour");
-            assert.strictEqual(fault.attempts.length, attempts);
+              // Restored, the same wake under the same id decides at last, by its re-offer.
+              yield* TestClock.adjust("200 millis");
+              yield* fault.consulted(3);
+              assert.deepStrictEqual(fault.attempts[2], { messageId, undecided: null });
+              yield* drainOrchestration;
+
+              if (full) {
+                assert.deepStrictEqual(
+                  (yield* demandsOf(root)).map(({ kind, messageId: id }) => [kind, id]),
+                  [["background_wake", messageId]],
+                );
+                assert.strictEqual((yield* runsOf(thread)).length, runs);
+                yield* release(filler!);
+                yield* tick;
+              }
+              const run = yield* runOfMessage(messageId);
+              yield* runStarted(run);
+              assert.strictEqual((yield* slotOf(root))?.state, "held");
+              assert.deepStrictEqual(yield* demandsOf(root), []);
+              yield* world.endRun(run, "completed");
+              yield* tick;
+              assert.lengthOf(yield* runsOfMessage(thread, messageId), 1);
+              assert.strictEqual((yield* runsOf(thread)).length, runs + 1);
+              assert.isUndefined(yield* slotOf(root));
+              assert.deepStrictEqual(native.cleared, []);
+
+              // Decided, it is offered no more, however far the clock moves.
+              const attempts = fault.attempts.length;
+              yield* TestClock.adjust("1 hour");
+              assert.strictEqual(fault.attempts.length, attempts);
+            }),
+          stack(spy, {
+            handoff: { admission: fault.admission },
+            gateConsults: fault.gateConsults,
           }),
-        stack(spy, {
-          handoff: { admission: fault.admission },
-          gateConsults: fault.gateConsults,
-        }),
+        ),
       );
     },
     240_000,
