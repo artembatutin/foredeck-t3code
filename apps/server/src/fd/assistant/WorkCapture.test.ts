@@ -1311,6 +1311,107 @@ The owner's own note.`;
     ),
   );
 
+  /** An owner's edit of the newest item, landing before the capture reads its write back. */
+  const ownerAddition = (work: ReturnType<typeof makeWork>) =>
+    Effect.sync(() => {
+      const item = work.items.at(-1)!;
+      item.body = `${item.body}\n\nThe owner's addition.`;
+      item.revision += 1;
+    });
+
+  it.effect("an edit landing between the create and its read-back is never taken as written", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const work = makeWork([tasks]);
+        const { service } = yield* instance(fakeBackend(work));
+        yield* revise(agreed);
+        work.state.afterCreate = ownerAddition(work);
+        const created = yield* service.capture(input());
+        work.state.afterCreate = undefined;
+        assert.strictEqual(created.outcome, "created");
+        assert.isFalse(created.verified);
+        const stored = yield* captureOf();
+        assert.isNull(stored?.itemFingerprint);
+        assert.notStrictEqual(
+          stored?.contentHash,
+          JSON.stringify([work.items[0]!.title, work.items[0]!.body]),
+        );
+
+        // A revised brief does not replace the owner's addition uninvited.
+        yield* revise({ decisions: ["Use the menu"] });
+        assert.strictEqual(
+          reasonOf(yield* Effect.flip(service.capture(input()))),
+          "item_unconfirmed",
+        );
+        assert.deepStrictEqual(work.calls.update, []);
+        assert.include(work.items[0]!.body, "The owner's addition.");
+        const overwritten = yield* service.capture(input({ overwrite: true }));
+        assert.strictEqual(overwritten.outcome, "updated");
+        assert.isTrue(overwritten.verified);
+        assert.notInclude(work.items[0]!.body, "The owner's addition.");
+      }),
+    ),
+  );
+
+  it.effect("an edit landing between an update and its read-back is never taken as written", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const work = makeWork([tasks]);
+        const { service } = yield* instance(fakeBackend(work));
+        yield* captured(work, service);
+        yield* revise({ decisions: ["Use the menu"] });
+        work.state.afterUpdate = ownerAddition(work);
+        const updated = yield* service.capture(input());
+        work.state.afterUpdate = undefined;
+        assert.strictEqual(updated.outcome, "updated");
+        assert.isFalse(updated.verified);
+        assert.isNull((yield* captureOf())?.itemFingerprint);
+        assert.isFalse((yield* briefOf()).executionAuthorized);
+
+        yield* revise({ constraints: ["No new dependencies", "Keep it small"] });
+        assert.strictEqual(
+          reasonOf(yield* Effect.flip(service.capture(input()))),
+          "item_unconfirmed",
+        );
+        assert.deepStrictEqual(work.calls.update, [{ expectedRevision: "1" }]);
+        assert.include(work.items[0]!.body, "The owner's addition.");
+        assert.include(work.items[0]!.body, "- Use the menu");
+      }),
+    ),
+  );
+
+  it.effect("stores a fingerprint only as the content recorded with it", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const store = yield* WorkCaptureStore.WorkCaptureStore;
+        const exit = yield* Effect.exit(
+          store.write({
+            expected: null,
+            next: {
+              projectId: alpha,
+              ideaId: "export",
+              captureId: "cap-invariant",
+              sourceId: tasks.sourceId,
+              kind: "single",
+              state: "captured",
+              writerInstanceId: "instance",
+              itemId: WorkItemId.make("T-1"),
+              itemKey: "T-1",
+              itemUrl: null,
+              itemFingerprint: "what an edit says",
+              contentHash: "what was written",
+              scopeHash: "scope",
+              briefRevision: 1,
+            },
+            event: "created",
+          }),
+        );
+        assert.isTrue(Exit.isFailure(exit));
+        assert.isNull(yield* captureOf());
+      }),
+    ),
+  );
+
   it.effect("refuses an item that no longer exists", () =>
     withDatabase(
       Effect.gen(function* () {

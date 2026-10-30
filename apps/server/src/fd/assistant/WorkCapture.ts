@@ -432,6 +432,11 @@ const make = Effect.gen(function* () {
   /**
    * Stores `next` with its event and, when `clear`, clears the brief's execution authorization in
    * the same transaction. None when the capture moved since it was read.
+   *
+   * The item's fingerprint is the baseline execution and later updates are judged against, so it
+   * is recorded only when it is the content recorded with it (`contentHash`): a read showing
+   * anything else, even right after the capture's own write, may show an edit that landed in
+   * between, and leaves the item unconfirmed for the next capture to confirm or refuse.
    */
   const commit = (
     capture: WorkCaptureStore.StoredCapture,
@@ -444,7 +449,11 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const saved = yield* captures.write({
             expected: versionOf(capture),
-            next,
+            next: {
+              ...next,
+              itemFingerprint:
+                next.itemFingerprint === next.contentHash ? next.itemFingerprint : null,
+            },
             event,
             ...(options.detail === undefined ? {} : { detail: options.detail }),
           });
@@ -483,7 +492,10 @@ const make = Effect.gen(function* () {
     content: { readonly title: string; readonly body: string },
   ) => backend.fingerprint({ kind: source.kind, title: content.title, body: content.body });
 
-  /** The item's fingerprint by a fresh read, or none when that read fails. */
+  /**
+   * The item's fingerprint by a fresh read, or none when that read fails. Recorded only when it
+   * is what was written (see `commit`).
+   */
   const readBack = (ref: HandoffBackend.HandoffItemRef) =>
     backend.read(ref).pipe(
       Effect.map((item): string | null => item.fingerprint),
@@ -636,7 +648,8 @@ const make = Effect.gen(function* () {
   /**
    * Records an item found for the capture; the next step brings it up to date with the brief.
    * Finding it shows which item is the capture's, not what it says: its content is confirmed only
-   * when it says exactly what the claim wrote, and is otherwise left for the next step to confirm.
+   * when it says exactly what the claim wrote (see `commit`), and is otherwise left for the next
+   * step to confirm.
    */
   const adopt = (
     capture: WorkCaptureStore.StoredCapture,
@@ -652,7 +665,7 @@ const make = Effect.gen(function* () {
         itemId: item.ref.itemId,
         itemKey: item.key,
         itemUrl: item.url,
-        itemFingerprint: item.fingerprint === capture.contentHash ? item.fingerprint : null,
+        itemFingerprint: item.fingerprint,
       },
       "recovered",
       { detail, clear: true, authorized: false },

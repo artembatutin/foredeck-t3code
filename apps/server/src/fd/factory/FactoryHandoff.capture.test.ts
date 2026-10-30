@@ -9,6 +9,7 @@ import {
 import {
   type WorkItemDetail,
   type WorkItemRef,
+  type WorkItemSummary,
   WorkSourceId,
 } from "@t3tools/contracts/fd/work-management";
 import * as Deferred from "effect/Deferred";
@@ -137,12 +138,12 @@ const countOf = (table: string) =>
   );
 
 /**
- * Work's `createItem`, held or failed by the test. `hold` runs after the real create, inside the
- * source write; `refuse` makes Work refuse the create before anything is written.
+ * Work's `createItem`, held or failed by the test. `hold` runs inside the source write: after the
+ * real create, given the item, or before Work refuses the create when `refuse` is set.
  */
 const createControl = () => {
   const control: {
-    hold: Effect.Effect<void> | undefined;
+    hold: ((created?: WorkItemSummary) => Effect.Effect<void>) | undefined;
     refuse: boolean;
   } = { hold: undefined, refuse: false };
   const missing = WorkSourceId.make("99999999-9999-4999-8999-999999999999");
@@ -153,12 +154,14 @@ const createControl = () => {
     createItem: (actor, input) =>
       control.refuse
         ? // A real refusal: Work writes nothing for a source it does not have.
-          Effect.suspend(() => control.hold ?? Effect.void).pipe(
+          Effect.suspend(() => control.hold?.() ?? Effect.void).pipe(
             Effect.andThen(service.createItem(actor, { ...input, sourceId: missing })),
           )
         : service
             .createItem(actor, input)
-            .pipe(Effect.tap(() => Effect.suspend(() => control.hold ?? Effect.void))),
+            .pipe(
+              Effect.tap((created) => Effect.suspend(() => control.hold?.(created) ?? Effect.void)),
+            ),
   });
   return { control, wrap };
 };
@@ -280,6 +283,46 @@ describe("capturing an idea in a real Markdown source", () => {
   );
 });
 
+describe("an owner's edit landing between a capture's write and its read-back", () => {
+  it.live("is never taken as what the capture wrote, nor rewritten uninvited", () => {
+    const { control, wrap } = createControl();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const work = yield* WorkService.WorkService;
+          yield* revise(world, agreed);
+          // The owner adds to the new task file through Work before the capture reads it back.
+          control.hold = (created) =>
+            Effect.gen(function* () {
+              if (created === undefined) return;
+              const fresh = yield* work.getItem(owner, { ref: created.ref });
+              yield* work.updateItem(owner, {
+                ref: created.ref,
+                expectedRevision: fresh.revision,
+                body: `${fresh.body.trimEnd()}\n\nThe owner's addition.`,
+              });
+            }).pipe(Effect.orDie);
+          const created = yield* capture(world);
+          control.hold = undefined;
+          assert.strictEqual(created.outcome, "created");
+          assert.isFalse(created.verified);
+
+          yield* revise(world, { decisions: ["Use the existing toolbar", "Log each export"] });
+          const refused = yield* Effect.flip(capture(world));
+          assert.strictEqual(
+            refused._tag === "WorkCaptureRefused" ? refused.reason : refused._tag,
+            "item_unconfirmed",
+          );
+          const item = yield* read(refOf(created));
+          assert.include(item.body, "The owner's addition.");
+          assert.notInclude(item.body, "Log each export");
+        }).pipe(Effect.orDie),
+      { work: wrap },
+    );
+  });
+});
+
 describe("recovering a capture after a restart, on real Markdown", () => {
   it.live(
     "a capture cut during its write adopts the one item with its marker after rebuild",
@@ -292,7 +335,7 @@ describe("recovering a capture after a restart, on real Markdown", () => {
             yield* revise(world, agreed);
             const entered = yield* Deferred.make<void>();
             const shutdown = yield* Deferred.make<void>();
-            control.hold = untilShutdown(entered, shutdown);
+            control.hold = () => untilShutdown(entered, shutdown);
             const cut = yield* capture(world).pipe(Effect.exit, Effect.forkChild);
             yield* Deferred.await(entered);
 
@@ -330,7 +373,7 @@ describe("recovering a capture after a restart, on real Markdown", () => {
             const entered = yield* Deferred.make<void>();
             const shutdown = yield* Deferred.make<void>();
             control.refuse = true;
-            control.hold = untilShutdown(entered, shutdown);
+            control.hold = () => untilShutdown(entered, shutdown);
             yield* capture(world).pipe(Effect.exit, Effect.forkChild);
             yield* Deferred.await(entered);
 

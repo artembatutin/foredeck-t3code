@@ -40,7 +40,8 @@ const CaptureRow = Schema.Struct({
 /**
  * The one Work item an idea was captured as. `pending` is claimed by the writer of
  * `writerInstanceId`, which may have created the item; `uncertain` may have an item nobody
- * recorded; `captured` names it. `itemFingerprint` is null until a read verified the item.
+ * recorded; `captured` names it. `itemFingerprint` is null until a read confirmed that the item
+ * says what was written, and is then `contentHash`, Work's fingerprint of that content.
  * `sequence` is the capture's latest event: every write appends one, so it versions the row.
  */
 export type StoredCapture = typeof CaptureRow.Type;
@@ -150,6 +151,9 @@ const make = Effect.gen(function* () {
 
   const write: WorkCaptureStore["Service"]["write"] = ({ expected, next, event, detail }) =>
     Effect.gen(function* () {
+      if (next.itemFingerprint !== null && next.itemFingerprint !== next.contentHash) {
+        return yield* Effect.die("A capture's item fingerprint is only ever its content's.");
+      }
       const current = yield* read(next.projectId, next.ideaId);
       if (moved(current, expected)) return Option.none();
       const at = yield* now;
