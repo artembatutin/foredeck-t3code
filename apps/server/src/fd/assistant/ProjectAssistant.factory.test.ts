@@ -521,8 +521,7 @@ const withFakes = <A, E, R>(
   probe?: typeof HandoffAdmission.HandoffAdmissionProbe.Service,
 ) =>
   program.pipe(
-    Effect.provide(layerOf(fakes, probe)),
-    Effect.provide(Sqlite.layerMemory),
+    Effect.provide(layerOf(fakes, probe).pipe(Layer.provideMerge(Sqlite.layerMemory))),
     Effect.orDie,
   );
 
