@@ -568,6 +568,10 @@ export class FactoryService extends Context.Service<
     readonly activity: (
       root: FactoryDeliveryId,
     ) => Effect.Effect<FactoryActivity.FactoryActivityReport, FactoryStoreError>;
+    /** Where the turn sent as the message is, read-only (see `FactoryActivity.turnRunState`). */
+    readonly turnRunState: FactoryActivity.FactoryActivity["Service"]["turnRunState"];
+    /** Every request still pending on the root's family's threads, read-only. */
+    readonly familyRequests: FactoryActivity.FactoryActivity["Service"]["familyRequests"];
     /**
      * The owner's edit of the plan a parent waits on at the plan gate: `plan`, any value as it
      * arrived, replaces it, and the delivery waits on. The edit is judged under the delivery's
@@ -1338,6 +1342,8 @@ const make = Effect.gen(function* () {
       activity.family(threadId).pipe(Effect.map((family) => family?.root ?? null)),
     requestOwnership: activity.requestOwnership,
     activity: activity.activity,
+    turnRunState: activity.turnRunState,
+    familyRequests: activity.familyRequests,
     updatePlan,
     approvePlan,
     rejectPlan,

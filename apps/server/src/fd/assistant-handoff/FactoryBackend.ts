@@ -1,9 +1,10 @@
+import { type MessageId, ThreadId } from "@t3tools/contracts";
 import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
 import { HandoffBackend } from "../assistant/index.ts";
-import { FactoryService, FactorySettings } from "../factory/index.ts";
+import { FactoryService, FactorySettings, needsYou } from "../factory/index.ts";
 
 type Refused = HandoffBackend.HandoffFactoryRefused;
 
@@ -54,6 +55,16 @@ const deliveryOf = ({ deliveryId, state }: FactoryService.FactoryDeliveryWithRun
   deliveryId,
   status: state.status,
 });
+
+/** The thread a delivery awaits, or else its latest author's. */
+const openThread = ({ state }: FactoryService.FactoryDeliveryWithRuns) =>
+  state.awaiting?.type === "run" ? state.awaiting.threadId : (state.threads.author ?? null);
+
+/** The effect a delivery awaits, while it is marked waiting for admission. */
+const markedEffect = ({ deliveryId, state }: FactoryService.FactoryDeliveryWithRuns) =>
+  state.awaiting?.type === "effect" && state.admissionWait?.effectId === state.awaiting.effect.id
+    ? [{ deliveryId, effectId: state.awaiting.effect.id }]
+    : [];
 
 /** The assistant's Factory port over Factory's service; see `HandoffFactory`. */
 export const make = Effect.gen(function* () {
@@ -130,6 +141,66 @@ export const make = Effect.gen(function* () {
       factory.activity(FactoryDeliveryId.make(root)).pipe(
         Effect.map(({ phase, busy, deferred, unknown }) => ({ phase, busy, deferred, unknown })),
         Effect.mapError(failed("activity")),
+      ),
+    follow: (root) =>
+      Effect.gen(function* () {
+        const found = yield* factory.get(FactoryDeliveryId.make(root));
+        if (Option.isNone(found)) return Option.none();
+        const delivery = found.value;
+        const { state } = delivery;
+        const children = (yield* Effect.forEach(state.children, factory.get)).flatMap(
+          Option.toArray,
+        );
+        const { awaiting } = state;
+        const child =
+          awaiting?.type === "child"
+            ? children.find(({ deliveryId }) => deliveryId === awaiting.deliveryId)
+            : undefined;
+        return Option.some({
+          ...deliveryOf(delivery),
+          awaiting: awaiting?.type ?? null,
+          pullRequest:
+            state.pullRequest === null
+              ? null
+              : { url: state.pullRequest.url, outcome: state.pullRequest.outcome ?? null },
+          reason: needsYou(state) ?? null,
+          threadId: openThread(delivery),
+          child:
+            child === undefined
+              ? null
+              : {
+                  ...deliveryOf(child),
+                  reason: needsYou(child.state) ?? null,
+                  threadId: openThread(child),
+                },
+          marked: [delivery, ...children].flatMap(markedEffect),
+        });
+      }).pipe(Effect.mapError(failed("follow"))),
+    ensureDeferred: (deliveryId, effectId) =>
+      factory
+        .ensureDeferred(FactoryDeliveryId.make(deliveryId), effectId)
+        .pipe(Effect.mapError(failed("deferral"))),
+    redispatch: (deliveryId, effectId) =>
+      factory
+        .redispatch(FactoryDeliveryId.make(deliveryId), effectId)
+        .pipe(Effect.mapError(failed("deferral"))),
+    runStateOf: ({ threadId, messageId }) =>
+      factory
+        .turnRunState({ threadId: ThreadId.make(threadId), messageId: messageId as MessageId })
+        .pipe(Effect.mapError(failed("runState"))),
+    requests: (root) =>
+      factory.familyRequests(FactoryDeliveryId.make(root)).pipe(
+        Effect.map((requests) =>
+          requests.map((request) => ({
+            threadId: request.threadId,
+            requestId: request.requestId,
+            kind: request.kind,
+            capability: request.capability,
+            run: request.run,
+            questions: request.questions,
+          })),
+        ),
+        Effect.mapError(failed("requests")),
       ),
   });
 });

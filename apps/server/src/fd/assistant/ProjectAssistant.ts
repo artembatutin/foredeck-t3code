@@ -540,12 +540,17 @@ const make = Effect.gen(function* () {
             Effect.catch((cause) => Effect.logWarning("Assistant reconciliation deferred", cause)),
           );
 
+        yield* factoryExecutor.maintain;
         yield* admission.normalizeQueue;
         while (true) {
           // Capacity and the claim commit together before any external launch. Unknown outcomes keep a slot.
           const { head } = yield* admission.next;
+          if (head === undefined) break;
           // A waiting demand's turn comes before anything behind it, and its own grant takes it.
-          if (head?.type !== "assignment") break;
+          if (head.type === "demand") {
+            if (!(yield* factoryExecutor.grant(head.demand))) break;
+            continue;
+          }
           const record = (yield* dispatches()).find(
             (item) => item.assignmentId === head.assignmentId,
           );
@@ -908,6 +913,21 @@ const make = Effect.gen(function* () {
         mutex.withPermit(
           Effect.gen(function* () {
             const record = yield* owned(input.assignmentId, input.managerThreadId);
+            const work = yield* assignment(input.assignmentId);
+            if (work.executor === "factory") {
+              const threadId = yield* factoryExecutor.questionThread(work, input.requestId);
+              yield* withLimits(
+                record,
+                threads.dispatch({
+                  type: "runtime-request.respond",
+                  threadId: ThreadId.make(threadId),
+                  requestId: input.requestId,
+                  commandId: CommandId.make(`answer:${input.requestId}`),
+                  answers: input.answers,
+                }),
+              );
+              return;
+            }
             const { runtimeRequests, nodes } = yield* threads.getThreadRecords(record.threadId, [
               "runtimeRequests",
               "nodes",
@@ -948,6 +968,10 @@ const make = Effect.gen(function* () {
           Effect.gen(function* () {
             yield* owned(input.assignmentId, input.managerThreadId);
             const work = yield* assignment(input.assignmentId);
+            if (work.executor === "factory")
+              return yield* failure(
+                "A Factory assignment completes itself once its pull request merges and Factory closes it out, so there is nothing to verify here.",
+              );
             if (work.state !== "awaiting-verification")
               return yield* failure("Only a completed worker turn can be verified.");
             if (!input.evidence.length || input.evidence.some((item) => !item.trim()))

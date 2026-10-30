@@ -174,7 +174,11 @@ export interface FactoryAssignment {
     readonly state: "active" | "ending" | "retired";
     readonly reason: RetiredReason | null;
   } | null;
-  readonly slot: { readonly state: "held" | "reserved"; readonly entrySeq: number } | null;
+  readonly slot: {
+    readonly state: "held" | "reserved";
+    readonly entrySeq: number;
+    readonly reservedDemandId: number | null;
+  } | null;
   readonly claim: {
     readonly admissionId: string;
     readonly entrySeq: number;
@@ -456,6 +460,13 @@ export class HandoffAdmission extends Context.Service<
       assignmentId: string,
       work: WorkRead,
     ) => Effect.Effect<BlockedReason | undefined, HandoffAdmissionError>;
+    /**
+     * Whether the assignment's authority still holds as the database alone says (note 6.2, A):
+     * why not, or undefined when it does. Takes no Work read, so it says nothing of the item.
+     */
+    readonly revocation: (
+      assignmentId: string,
+    ) => Effect.Effect<BlockedReason | undefined, HandoffAdmissionError>;
     /** Enters the assignment into the fair order at a fresh position. */
     readonly enterQueue: (assignmentId: string) => Effect.Effect<void, HandoffAdmissionError>;
     /** Takes the assignment out of the fair order. */
@@ -541,6 +552,23 @@ export class HandoffAdmission extends Context.Service<
       readonly work: WorkRead;
       readonly force?: boolean;
     }) => Effect.Effect<number, HandoffAdmissionError>;
+    /**
+     * An effect Factory marks as waiting for admission whose demand is missing (a marker with no
+     * demand, note 6.11 G4): one enters at a fresh position. A demand it has stays as it is.
+     */
+    readonly ensureEffectDemand: (input: {
+      readonly root: string;
+      readonly deliveryId: string;
+      readonly effectId: number;
+    }) => Effect.Effect<void, HandoffAdmissionError>;
+    /**
+     * An effect demand whose delivery no longer awaits that effect is deleted, with history, and
+     * `note` when given, naming how the owner goes on. A reservation of it goes too.
+     */
+    readonly dropStaleEffect: (input: {
+      readonly demandId: number;
+      readonly note?: string;
+    }) => Effect.Effect<void, HandoffAdmissionError>;
     /** Every demand of the root, oldest position first. */
     readonly demands: (root: string) => Effect.Effect<ReadonlyArray<Demand>, HandoffAdmissionError>;
     /**
@@ -2130,7 +2158,14 @@ const make = Effect.gen(function* () {
           deliveryId: link.delivery_id,
           control: link.control,
           root: root === undefined ? null : { state: root.state, reason: root.reason },
-          slot: slot === undefined ? null : { state: slot.state, entrySeq: slot.entry_seq },
+          slot:
+            slot === undefined
+              ? null
+              : {
+                  state: slot.state,
+                  entrySeq: slot.entry_seq,
+                  reservedDemandId: slot.reserved_demand_id,
+                },
           claim:
             claim === undefined
               ? null
@@ -2186,6 +2221,13 @@ const make = Effect.gen(function* () {
       const link = yield* readLink(assignmentId);
       if (link === undefined) return "revoked" as const;
       return (yield* makeAuthority()(link)) ?? freshness(link, work);
+    }).pipe(transact("read"));
+
+  const revocation: HandoffAdmission["Service"]["revocation"] = (assignmentId) =>
+    Effect.gen(function* () {
+      const link = yield* readLink(assignmentId);
+      if (link === undefined) return "revoked" as const;
+      return yield* makeAuthority()(link);
     }).pipe(transact("read"));
 
   const positionAt = (assignmentId: string, seq: number) =>
@@ -2585,6 +2627,34 @@ const make = Effect.gen(function* () {
       return blocked.length;
     }).pipe(transact("maintain", input.root));
 
+  const ensureEffectDemand: HandoffAdmission["Service"]["ensureEffectDemand"] = (input) =>
+    Effect.gen(function* () {
+      const root = yield* readRoot(input.root);
+      if (root?.state !== "active") return;
+      if ((yield* effectDemand(input.root, input.deliveryId)) !== undefined) return;
+      yield* insertDemand(root, {
+        kind: "effect",
+        deliveryId: input.deliveryId,
+        effectId: input.effectId,
+      });
+    }).pipe(transact("maintain", input.root));
+
+  const dropStaleEffect: HandoffAdmission["Service"]["dropStaleEffect"] = (input) =>
+    Effect.gen(function* () {
+      const demand = yield* readDemand(input.demandId);
+      if (demand?.kind !== "effect") return;
+      yield* sql`DELETE FROM fd_assistant_slots WHERE reserved_demand_id = ${demand.id}`;
+      yield* deleteDemand(demand.id);
+      yield* history({
+        assignmentId: demand.assignment_id,
+        root: demand.root_delivery_id,
+        kind: demand.kind,
+        seq: demand.seq,
+        outcome: "stale",
+      });
+      if (input.note !== undefined) yield* notice(demand.assignment_id, input.note);
+    }).pipe(transact("maintain"));
+
   const demands: HandoffAdmission["Service"]["demands"] = (root) =>
     sql<DemandRow>`SELECT * FROM fd_assistant_admission_demands
       WHERE root_delivery_id = ${root} ORDER BY seq`.pipe(
@@ -2955,6 +3025,7 @@ const make = Effect.gen(function* () {
     captureInUse,
     setControl,
     authority: authorityOf,
+    revocation,
     enterQueue,
     leaveQueue,
     normalizeQueue,
@@ -2969,6 +3040,8 @@ const make = Effect.gen(function* () {
     blockRevoked,
     blockedRoots,
     recheckBlocked,
+    ensureEffectDemand,
+    dropStaleEffect,
     demands,
     settleAdmissions,
     release,

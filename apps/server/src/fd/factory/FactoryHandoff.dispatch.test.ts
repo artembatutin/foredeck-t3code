@@ -33,6 +33,7 @@ import {
   handoffRows,
   linkOf,
   managedRootOf,
+  noticesOf,
   queuePositionOf,
   release,
   rootIdOf,
@@ -608,15 +609,37 @@ describe("a Factory assignment's partial failures", () => {
           yield* revoke(world, "export");
           yield* restoreStartStep;
 
+          // The cancel holds the claim's slot and admission until the family is quiescent.
+          yield* tick;
+          assert.strictEqual(spy.count("cancel"), 1);
+          assert.strictEqual((yield* stateOf(root)).status, "cancelled");
+          assert.strictEqual((yield* assignmentOf("export")).state, "stopping");
+          assert.deepStrictEqual(yield* managedRootOf(root), { state: "active", reason: null });
+          assert.strictEqual((yield* slotOf(root))?.state, "held");
+          assert.lengthOf(yield* admissionsOf(root), 1);
+
           const settled = Effect.gen(function* () {
             assert.strictEqual(spy.count("cancel"), 1);
+            assert.strictEqual(spy.count("resume"), 0);
             assert.strictEqual((yield* stateOf(root)).status, "cancelled");
             assert.lengthOf(yield* deliveriesOf(ref), 1);
             assert.lengthOf(authorThreadsOf(world, root), 0);
-            assert.strictEqual((yield* assignmentOf("export")).state, "stopping");
-            assert.deepStrictEqual(yield* managedRootOf(root), { state: "active", reason: null });
-            assert.strictEqual((yield* slotOf(root))?.state, "held");
-            assert.lengthOf(yield* admissionsOf(root), 1);
+            assert.strictEqual((yield* assignmentOf("export")).state, "cancelled");
+            assert.deepStrictEqual(yield* managedRootOf(root), {
+              state: "retired",
+              reason: "cancelled",
+            });
+            assert.isUndefined(yield* slotOf(root));
+            assert.deepStrictEqual(yield* admissionsOf(root), []);
+            assert.deepStrictEqual(yield* demandsOf(root), []);
+            assert.isUndefined(yield* queuePositionOf("export"));
+            const notes = yield* noticesOf("export");
+            assert.strictEqual(
+              notes.filter((note) =>
+                note.startsWith(`Factory delivery ${root} was cancelled before it started because`),
+              ).length,
+              1,
+            );
           });
           yield* tick;
           yield* settled;
@@ -626,6 +649,13 @@ describe("a Factory assignment's partial failures", () => {
             Effect.gen(function* () {
               yield* tick;
               yield* settled;
+              yield* world.rebuild(
+                Effect.gen(function* () {
+                  yield* tick;
+                  yield* settled;
+                }),
+                { orchestration: true },
+              );
             }),
           );
         }),

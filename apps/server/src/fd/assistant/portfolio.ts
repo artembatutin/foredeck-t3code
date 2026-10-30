@@ -273,6 +273,7 @@ export type AssignmentEvent = { readonly note?: string } & (
       readonly type: "mirror";
       readonly to: MirroredState;
       readonly evidence?: ReadonlyArray<string>;
+      readonly workerRefs?: ReadonlyArray<WorkerRef>;
     }
 );
 
@@ -455,7 +456,11 @@ export function transitionAssignment(
     case "mirror": {
       const evidence = [...assignment.evidence, ...normalizeList(event.evidence ?? [])];
       if (event.to === "completed" && evidence.length === 0) return reject("missing-evidence");
-      return Result.succeed({ ...next, evidence });
+      return Result.succeed({
+        ...next,
+        evidence,
+        workerRefs: uniqueRefs([...assignment.workerRefs, ...(event.workerRefs ?? [])]),
+      });
     }
     case "resume":
     case "retry":

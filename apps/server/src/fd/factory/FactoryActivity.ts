@@ -98,6 +98,24 @@ export interface FactoryRequestOwnership {
 }
 
 /**
+ * A request still pending on a thread of a root's family, as the root's manager judges relaying an
+ * answer to it: the thread and id that answer it, the request as core holds it, the run it was
+ * asked in with that run's class on the root's family (null without a run), and, for a question,
+ * what it asks.
+ */
+export interface FactoryFamilyRequest {
+  readonly threadId: ThreadId;
+  readonly requestId: RuntimeRequestId;
+  readonly kind: OrchestrationV2RuntimeRequest["kind"];
+  readonly capability: OrchestrationV2RuntimeRequest["responseCapability"]["type"];
+  readonly run: {
+    readonly status: OrchestrationV2RunStatus;
+    readonly class: FactoryOwnership.FactoryProvenance["class"];
+  } | null;
+  readonly questions: unknown;
+}
+
+/**
  * Reads whose work Factory's family threads carry (see `FactoryOwnership`), and what a root's
  * family is doing, from core's records, Factory's deliveries and the automatic turns Factory
  * recorded. Every read is strict and read-only: a failure fails a decision, and makes a report
@@ -127,6 +145,18 @@ export class FactoryActivity extends Context.Service<
     readonly activity: (
       root: FactoryDeliveryId,
     ) => Effect.Effect<FactoryActivityReport, FactoryStoreError>;
+    /**
+     * Where the turn sent as `messageId` is: `live` while its run has not ended, `ended` once it
+     * has, `none` with no run of that message or no such thread. A failed read fails it.
+     */
+    readonly turnRunState: (input: {
+      readonly threadId: ThreadId;
+      readonly messageId: MessageId;
+    }) => Effect.Effect<"live" | "ended" | "none", FactoryOwnershipReadError>;
+    /** Every request still pending on a thread of the root's family. */
+    readonly familyRequests: (
+      root: FactoryDeliveryId,
+    ) => Effect.Effect<ReadonlyArray<FactoryFamilyRequest>, FactoryOwnershipReadError>;
   }
 >()("t3/fd/factory/FactoryActivity") {}
 
@@ -297,20 +327,15 @@ const make = Effect.gen(function* () {
     new FactoryOwnershipReadError({ threadId, cause });
 
   /**
-   * Whether work on the family's threads is under way or about to start, and what its runs wait
-   * for: every thread a family delivery's launch made (named by the launch's effect, numbered up
-   * to the effects it issued) and every thread delegated from one, to `MAX_FAMILY_DEPTH` levels.
+   * The family's threads: every thread a family delivery's launch made (named by the launch's
+   * effect, numbered up to the effects it issued) and every thread delegated from one, to
+   * `MAX_FAMILY_DEPTH` levels.
    */
-  const probeThreads = (
-    root: FactoryDeliveryId,
-    owner: FactoryDeliveryState,
+  const familyThreads = <E>(
+    reads: Pick<FactoryOwnership.OwnershipReads<E>, "thread">,
     family: ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>,
   ) =>
     Effect.gen(function* () {
-      const reads = makeReads();
-      const classes = FactoryOwnership.classifier(reads, root);
-      let busy = false;
-      let backgroundWaits = 0;
       const pending: Array<{
         readonly threadId: ThreadId;
         readonly parent: ThreadId | null;
@@ -323,6 +348,10 @@ const make = Effect.gen(function* () {
         })),
       );
       const seen = new Set<ThreadId>();
+      const found: Array<{
+        readonly threadId: ThreadId;
+        readonly thread: FactoryOwnership.FamilyThread;
+      }> = [];
       for (const { threadId, parent, depth } of pending) {
         if (seen.has(threadId)) continue;
         seen.add(threadId);
@@ -345,6 +374,37 @@ const make = Effect.gen(function* () {
           }
           pending.push({ threadId: task.childThreadId, parent: threadId, depth: depth + 1 });
         }
+        found.push({ threadId, thread });
+      }
+      return found;
+    });
+
+  /** The root's delivery with its children; a child it names that is not stored has no row. */
+  const readFamily = (root: FactoryDeliveryId) =>
+    Effect.gen(function* () {
+      const rootDelivery = Option.getOrUndefined(yield* deliveries.get(root));
+      if (rootDelivery === undefined) return [];
+      const children = yield* Effect.forEach(rootDelivery.state.children, (childId) =>
+        deliveries.get(childId),
+      );
+      return [rootDelivery, ...children.flatMap(Option.toArray)];
+    });
+
+  /**
+   * Whether work on the family's threads is under way or about to start, and what its runs wait
+   * for, on every thread of the family.
+   */
+  const probeThreads = (
+    root: FactoryDeliveryId,
+    owner: FactoryDeliveryState,
+    family: ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>,
+  ) =>
+    Effect.gen(function* () {
+      const reads = makeReads();
+      const classes = FactoryOwnership.classifier(reads, root);
+      let busy = false;
+      let backgroundWaits = 0;
+      for (const { threadId, thread } of yield* familyThreads(reads, family)) {
         for (const run of thread.runs) {
           if (isOpenRun(run.status) && counts(yield* classes.run(threadId, run.id))) busy = true;
           if (
@@ -535,7 +595,60 @@ const make = Effect.gen(function* () {
       } satisfies FactoryRequestOwnership;
     }).pipe(Effect.mapError(readFailed(threadId)));
 
+  const turnRunState: FactoryActivity["Service"]["turnRunState"] = ({ threadId, messageId }) =>
+    projections.getThreadRecords(threadId, ["runs"]).pipe(
+      Effect.map(({ runs }) => {
+        const run = runs.find((candidate) => candidate.userMessageId === messageId);
+        return run === undefined
+          ? ("none" as const)
+          : isOpenRun(run.status)
+            ? ("live" as const)
+            : ("ended" as const);
+      }),
+      Effect.catchTags({
+        ProjectionStoreThreadNotFoundError: () => Effect.succeed("none" as const),
+      }),
+      Effect.mapError(readFailed(threadId)),
+    );
+
+  const familyRequests: FactoryActivity["Service"]["familyRequests"] = (root) =>
+    Effect.gen(function* () {
+      const reads = makeReads();
+      const classes = FactoryOwnership.classifier(reads, root);
+      const found: Array<FactoryFamilyRequest> = [];
+      for (const { threadId, thread } of yield* familyThreads(reads, yield* readFamily(root))) {
+        const records = yield* projections.getThreadRecords(
+          threadId,
+          ["runtimeRequests", "nodes", "turnItems"],
+          { turnItemTypes: ["user_input_request"] },
+        );
+        for (const request of records.runtimeRequests) {
+          if (request.status !== "pending") continue;
+          // Core answers a request in the run its node belongs to.
+          const runId = records.nodes.find((node) => node.id === request.nodeId)?.runId;
+          const run = thread.runs.find((candidate) => candidate.id === runId);
+          const question = records.turnItems.find(
+            (item) => item.type === "user_input_request" && item.requestId === request.id,
+          );
+          found.push({
+            threadId,
+            requestId: request.id,
+            kind: request.kind,
+            capability: request.responseCapability.type,
+            run:
+              run === undefined
+                ? null
+                : { status: run.status, class: (yield* classes.run(threadId, run.id)).class },
+            questions: question?.type === "user_input_request" ? question.questions : null,
+          });
+        }
+      }
+      return found;
+    }).pipe(Effect.mapError(readFailed(ThreadId.make(root))));
+
   return FactoryActivity.of({
+    turnRunState,
+    familyRequests,
     family: (threadId) =>
       FactoryOwnership.familyOf(makeReads(), threadId).pipe(Effect.mapError(readFailed(threadId))),
     classify: (turn, root) =>

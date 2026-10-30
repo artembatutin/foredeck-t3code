@@ -17,16 +17,19 @@ import {
 } from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Stream from "effect/Stream";
 
 import type { Caller } from "../../../mcp/threadAccess.ts";
 import * as AutomaticTurnGate from "../../../orchestration-v2/AutomaticTurnGate.ts";
+import * as EventSink from "../../../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
-import type * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import {
   HandoffAdmission,
   HandoffBackend,
@@ -34,7 +37,14 @@ import {
   WorkCapture,
 } from "../../assistant/index.ts";
 import * as Factory from "../index.ts";
-import { drainOrchestration, threadProjection, type World } from "./deliveryHarness.ts";
+import {
+  authorCommits,
+  drainOrchestration,
+  stateOf,
+  threadProjection,
+  type World,
+} from "./deliveryHarness.ts";
+import { reviewPasses } from "./followThrough.ts";
 
 /**
  * Factory deliveries the project assistant manages, on the delivery harness built with its
@@ -81,7 +91,7 @@ const insertAssignment = (assignmentId: string, projectId: string, ideaId: strin
       assignment_id: assignmentId,
       project_id: projectId,
       idea_id: ideaId,
-      executor: "foredeck",
+      executor: "factory",
       attempt: 1,
       state,
       worker_refs_json: "[]",
@@ -758,6 +768,28 @@ export const turns = {
   },
 };
 
+/** The turn core's watch reactor presents for a wake of the linked, watched pull request. */
+export const pullRequestWakeTurn = (
+  threadId: ThreadId,
+  link: ThreadPullRequestLink,
+): AutomaticTurnGate.PullRequestWakeTurn => {
+  const watch = link.watch ?? assert.fail(`Pull request #${link.number} is not watched.`);
+  return {
+    kind: "pull_request_wake",
+    threadId,
+    messageId: MessageId.make(`message:pr-watch:${fresh("wake")}`),
+    key: link.url,
+    pullRequest: {
+      host: link.host,
+      repository: link.repository,
+      number: link.number,
+      url: link.url,
+    },
+    watchStartedAt: watch.startedAt,
+    ending: null,
+  };
+};
+
 /** A task node named by the questions presented in these tests. */
 export const questionTask = NodeId.make("node:delegated-task:asking");
 
@@ -791,21 +823,8 @@ export const consult = (
 export const wakeThroughGate = (threadId: ThreadId, link: ThreadPullRequestLink) =>
   Effect.gen(function* () {
     const watch = link.watch ?? assert.fail(`Pull request #${link.number} is not watched.`);
-    const messageId = MessageId.make(`message:pr-watch:${fresh("wake")}`);
-    const turn: AutomaticTurnGate.PullRequestWakeTurn = {
-      kind: "pull_request_wake",
-      threadId,
-      messageId,
-      key: link.url,
-      pullRequest: {
-        host: link.host,
-        repository: link.repository,
-        number: link.number,
-        url: link.url,
-      },
-      watchStartedAt: watch.startedAt,
-      ending: null,
-    };
+    const turn = pullRequestWakeTurn(threadId, link);
+    const { messageId } = turn;
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const gate = yield* AutomaticTurnGate.AutomaticTurnGate;
     const outcome = yield* gate.admit(
@@ -839,6 +858,144 @@ export const wakeThroughGate = (threadId: ThreadId, link: ThreadPullRequestLink)
     yield* drainOrchestration;
     return { turn, outcome, runId };
   }).pipe(Effect.orDie);
+
+/**
+ * Presents the turn to the gate with a dispatch that sends its message on the thread, as core's
+ * producers do: a run counted under whatever the gate admitted it into. Returns the outcome.
+ */
+export const consultRunning = (
+  world: World,
+  turn: AutomaticTurnGate.AutomaticTurn,
+  options: { readonly drop?: Effect.Effect<void> } = {},
+) =>
+  Effect.gen(function* () {
+    const gate = yield* AutomaticTurnGate.AutomaticTurnGate;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const dispatch = threads
+      .sendToThread({
+        projectId: world.projectId,
+        commandId: CommandId.make(`test-turn:${turn.messageId}`),
+        threadId: turn.threadId,
+        messageId: turn.messageId,
+        text: "Carry on with the automatic turn.",
+        attachments: [],
+        mode: "queue",
+        createdBy: "agent",
+        creationSource: "server",
+      })
+      .pipe(Effect.orDie);
+    return turn.kind === "background_wake"
+      ? yield* gate.hand(turn, dispatch, options)
+      : yield* gate.admit(turn, dispatch);
+  });
+
+/**
+ * The delivery of an assignment claimed already, run to its open pull request: its author commits,
+ * the server verifies, and its reviewer passes it. Returns the author's thread and the state.
+ */
+export const runToPullRequest = (world: World, root: FactoryDeliveryId) =>
+  Effect.gen(function* () {
+    const author = yield* world.launched(root);
+    yield* authorCommits(author.worktreePath, "feat: add the export button");
+    yield* world.endRun(author.runId, "completed");
+    yield* reviewPasses(world, root);
+    const state = yield* stateOf(root);
+    assert.strictEqual(state.status, "pr_open");
+    return { ...author, state };
+  }).pipe(Effect.orDie);
+
+/** Nothing of the root holds capacity or waits: no slot, admission, demand or queue row. */
+export const assertNothingHeld = (root: string, assignmentId: string) =>
+  Effect.gen(function* () {
+    assert.isUndefined(yield* slotOf(root), "slot");
+    assert.deepStrictEqual(yield* admissionsOf(root), [], "admissions");
+    assert.deepStrictEqual(yield* demandsOf(root), [], "demands");
+    assert.isUndefined(yield* queuePositionOf(assignmentId), "queue position");
+  });
+
+/** The root's row, with when it was fenced: a root that went through ending has `ending_at`. */
+export const rootRowOf = (root: string) =>
+  Effect.flatMap(
+    SqlClient.SqlClient,
+    (sql) => sql<{
+      readonly state: string;
+      readonly reason: string | null;
+      readonly ending_at: string | null;
+      readonly retired_at: string | null;
+    }>`SELECT state, reason, ending_at, retired_at FROM fd_assistant_managed_roots
+      WHERE root_delivery_id = ${root}`,
+  ).pipe(
+    Effect.orDie,
+    Effect.map((rows) => rows[0] ?? assert.fail(`No root ${root}.`)),
+  );
+
+/**
+ * Sees each automatic turn the admission decides, for a test to wait on the decision of a turn
+ * core's worker presents by itself: pass `admission` as the harness's handoff option, and await
+ * `decided` for the first decision of a kind and outcome, however early it came.
+ */
+export const decisionWatch = () => {
+  const seen: Array<{ readonly kind: string; readonly type: string }> = [];
+  const waiting: Array<{
+    readonly kind: string;
+    readonly type: string;
+    readonly done: Deferred.Deferred<void>;
+  }> = [];
+  return {
+    admission: (
+      service: HandoffAdmission.HandoffAdmission["Service"],
+    ): HandoffAdmission.HandoffAdmission["Service"] => ({
+      ...service,
+      decideTurn: (input) =>
+        Effect.tap(service.decideTurn(input), (decision) =>
+          Effect.suspend(() => {
+            const entry = { kind: input.turn.kind, type: decision.type };
+            seen.push(entry);
+            return Effect.forEach(
+              waiting.filter(({ kind, type }) => kind === entry.kind && type === entry.type),
+              ({ done }) => Deferred.succeed(done, undefined),
+              { discard: true },
+            );
+          }),
+        ),
+    }),
+    /** Forgets what was decided, for a test to wait on a later decision of the same turn. */
+    forget: Effect.sync(() => void seen.splice(0)),
+    decided: (kind: string, type: string) =>
+      Effect.suspend(() => {
+        if (seen.some((entry) => entry.kind === kind && entry.type === type)) return Effect.void;
+        const done = Deferred.makeUnsafe<void>();
+        waiting.push({ kind, type, done });
+        return Deferred.await(done);
+      }),
+  };
+};
+
+/** Fails core's effect outbox reads until the returned effect restores them, by hiding its table. */
+export const failOutboxReads = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`ALTER TABLE orchestration_v2_effect_outbox RENAME TO hidden_effect_outbox`;
+  return sql`ALTER TABLE hidden_effect_outbox RENAME TO orchestration_v2_effect_outbox`.pipe(
+    Effect.asVoid,
+    Effect.orDie,
+  );
+}).pipe(Effect.orDie);
+
+/** The run the message started, once it exists: a turn core's worker sends by itself. */
+export const runOfMessage = (messageId: string) =>
+  Effect.flatMap(EventSink.EventSinkV2, (sink) =>
+    sink.stream().pipe(
+      Stream.filter(
+        ({ event }) => event.type === "run.created" && event.payload.userMessageId === messageId,
+      ),
+      Stream.runHead,
+      Effect.map((found) =>
+        found._tag === "Some" && found.value.event.type === "run.created"
+          ? found.value.event.payload.id
+          : assert.fail(`No run of message ${messageId}.`),
+      ),
+    ),
+  );
 
 /** The thread's runs, as the projection holds them. */
 export const runsOf = (threadId: ThreadId) =>

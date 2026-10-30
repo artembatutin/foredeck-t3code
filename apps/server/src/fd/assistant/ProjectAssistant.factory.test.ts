@@ -219,6 +219,31 @@ const factoryPort = (fakes: Fakes): typeof HandoffBackend.HandoffFactory.Service
         fakes.deliveries.set(id, "cancelled");
         return { deliveryId: id, status: "cancelled" as const };
       }),
+    follow: (id) =>
+      Effect.suspend(() => {
+        if (fakes.getFails) {
+          return Effect.fail(new HandoffBackend.HandoffFactoryError({ operation: "follow" }));
+        }
+        const status = fakes.deliveries.get(id);
+        return Effect.succeed(
+          status === undefined
+            ? Option.none()
+            : Option.some({
+                deliveryId: id,
+                status,
+                awaiting: null,
+                pullRequest: null,
+                reason: null,
+                threadId: null,
+                child: null,
+                marked: [],
+              }),
+        );
+      }),
+    ensureDeferred: () => Effect.succeed("stale"),
+    redispatch: () => Effect.succeed("stale"),
+    runStateOf: () => Effect.succeed("ended"),
+    requests: () => Effect.succeed([]),
     activity: (id) =>
       Effect.sync(() => {
         const status = fakes.deliveries.get(id);
@@ -1634,7 +1659,8 @@ describe("pre-delivery controls", () => {
         yield* tick;
         yield* tick;
         assert.strictEqual(count(fakes, "stop"), 1);
-        assert.strictEqual(yield* stateOf("idea"), "running");
+        // The blocked delivery it found is what its assignment now shows.
+        assert.strictEqual(yield* stateOf("idea"), "needs-input");
       }),
     );
   });

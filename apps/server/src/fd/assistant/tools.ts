@@ -79,7 +79,7 @@ export const AssistantToolkit = Toolkit.make(
   Tool.make("assistant_control", {
     ...common,
     description:
-      "Stop, resume, retry or cancel the exact assignment. Stop waits for executor confirmation; cancel running work requests a stop first. Resume/retry uses a fresh attempt. Uncertain launches must be reconciled before retrying. Does not stop other projects.",
+      "Stop, resume, retry or cancel the exact assignment. Stop waits for executor confirmation; cancel running work requests a stop first. Resume/retry uses a fresh attempt. Uncertain launches must be reconciled before retrying. For a Factory assignment, stop and resume act on its delivery, cancel shows stopping until Factory has ended and its threads are quiet, and retry starts a new delivery only after the old one ended. Does not stop other projects.",
     parameters: Schema.Struct({
       assignmentId: TrimmedNonEmptyString,
       action: Schema.Literals(["stop", "resume", "retry", "cancel"]),
@@ -88,7 +88,7 @@ export const AssistantToolkit = Toolkit.make(
   Tool.make("assistant_answer", {
     ...common,
     description:
-      "Route the owner's answer to the exact pending question on this assignment. Pass its requestId from the worker. Cannot approve permissions; use the worker approval UI for those.",
+      "Route the owner's answer to the exact pending question on this assignment. Pass its requestId from the worker. Cannot approve permissions; use the worker approval UI for those. For a Factory assignment, only a live question from Factory's own running agent can be answered here; any other is answered in its thread.",
     parameters: Schema.Struct({
       assignmentId: TrimmedNonEmptyString,
       requestId: RuntimeRequestId,
@@ -98,7 +98,7 @@ export const AssistantToolkit = Toolkit.make(
   Tool.make("assistant_verify", {
     ...common,
     description:
-      "After inspecting the worker's actual results, record acceptance-criterion verification evidence and mark the assignment complete. Evidence must distinguish implemented, tested, integrated and deployed, including limitations. A worker's completed turn alone is not sufficient.",
+      "After inspecting the worker's actual results, record acceptance-criterion verification evidence and mark the assignment complete. Evidence must distinguish implemented, tested, integrated and deployed, including limitations. A worker's completed turn alone is not sufficient. Refused for a Factory assignment, which completes itself once its pull request merges and Factory closes it out.",
     parameters: Schema.Struct({
       assignmentId: TrimmedNonEmptyString,
       evidence: Schema.Array(TrimmedNonEmptyString).check(Schema.isMinLength(1)),

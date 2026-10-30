@@ -1,6 +1,7 @@
 import * as Layer from "effect/Layer";
 
 import * as McpCallerPolicy from "../../mcp/McpCallerPolicy.ts";
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { HandoffBackend } from "../assistant/index.ts";
 import { FactoryAdmission } from "../factory/index.ts";
 import * as CallerPolicy from "./CallerPolicy.ts";
@@ -30,7 +31,9 @@ export const layerFactory = Layer.effect(HandoffBackend.HandoffFactory, FactoryB
  */
 export const layerAdmission = Layer.mergeAll(
   Layer.effect(FactoryAdmission.FactoryAdmission, FactoryAdmissionBridge.make),
-  Layer.effect(HandoffBackend.HandoffRedelivery, FactoryAdmissionBridge.makeRedelivery),
+  Layer.effect(HandoffBackend.HandoffRedelivery, FactoryAdmissionBridge.makeRedelivery).pipe(
+    Layer.provide(ProjectionStore.layer),
+  ),
 );
 
 /**

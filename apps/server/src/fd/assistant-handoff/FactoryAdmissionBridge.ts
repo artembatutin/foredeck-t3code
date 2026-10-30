@@ -16,6 +16,8 @@ import {
   ran,
 } from "../../orchestration-v2/AutomaticTurnGate.ts";
 import * as DelegatedTaskQuestionReactor from "../../orchestration-v2/DelegatedTaskQuestionReactor.ts";
+import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import { currentDelegatedCompletionDelivery } from "../../orchestration-v2/ProviderContinuationService.ts";
 import { HandoffAdmission, HandoffBackend } from "../assistant/index.ts";
 import { FactoryAdmission } from "../factory/index.ts";
 
@@ -217,6 +219,7 @@ export const makeRedelivery = Effect.gen(function* () {
   const readWork = readWorkWith(yield* HandoffBackend.HandoffBackend);
   const questions = yield* DelegatedTaskQuestionReactor.DelegatedTaskQuestionReactor;
   const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
 
   const redeliver: (typeof HandoffBackend.HandoffRedelivery.Service)["redeliver"] = (demand) => {
     const failedAs =
@@ -294,5 +297,53 @@ export const makeRedelivery = Effect.gen(function* () {
     }
   };
 
-  return HandoffBackend.HandoffRedelivery.of({ redeliver });
+  /** Whether a reserved question or completion still needs delivering, as its source holds it. */
+  const currency: (typeof HandoffBackend.HandoffRedelivery.Service)["currency"] = (demand) => {
+    const { childThreadId, requestId, threadId, parentRunId, generation, messageId } = demand;
+    const read =
+      demand.kind === "delegated_question" && childThreadId !== null && requestId !== null
+        ? projections
+            .getRuntimeResponseContext(
+              ThreadId.make(childThreadId),
+              RuntimeRequestId.make(requestId),
+            )
+            .pipe(
+              Effect.map(
+                (context) =>
+                  context.request?.status === "pending" && context.request.kind === "user_input",
+              ),
+              Effect.catchTags({
+                ProjectionStoreThreadNotFoundError: () => Effect.succeed(false),
+              }),
+            )
+        : demand.kind === "delegated_completion" &&
+            threadId !== null &&
+            parentRunId !== null &&
+            generation !== null &&
+            messageId !== null
+          ? Effect.gen(function* () {
+              const completion = {
+                parentRunId: RunId.make(parentRunId),
+                generation,
+                messageId: MessageId.make(messageId),
+              };
+              const projection = yield* projections.getThreadRecords(
+                ThreadId.make(threadId),
+                ["messages", "runs", "providerTurns"],
+                { messageIds: [completion.messageId] },
+              );
+              return currentDelegatedCompletionDelivery(projection, completion) !== undefined;
+            }).pipe(
+              Effect.catchTags({
+                ProjectionStoreThreadNotFoundError: () => Effect.succeed(false),
+              }),
+            )
+          : Effect.succeed(true);
+    return read.pipe(
+      Effect.map((current) => (current ? ("current" as const) : ("not_current" as const))),
+      Effect.orElseSucceed(() => "unreadable" as const),
+    );
+  };
+
+  return HandoffBackend.HandoffRedelivery.of({ redeliver, currency });
 });

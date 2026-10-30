@@ -881,7 +881,29 @@ const coreLayer = (input: ServerInput) => {
 export interface HandoffOption {
   /** Where the admission path stops for the test, provided beneath the admission service. */
   readonly probe?: typeof HandoffAdmission.HandoffAdmissionProbe.Service;
+  /** Wraps the one admission instance everything uses, to see what it decided. */
+  readonly admission?: (
+    service: HandoffAdmission.HandoffAdmission["Service"],
+  ) => HandoffAdmission.HandoffAdmission["Service"];
 }
+
+/** The admission service with the probe and the wrapper given, one instance per build. */
+const admissionOf = (input: ServerInput) => {
+  const built = HandoffAdmission.layerLive.pipe(
+    Layer.provide(
+      input.handoff?.probe === undefined
+        ? Layer.empty
+        : Layer.succeed(HandoffAdmission.HandoffAdmissionProbe, input.handoff.probe),
+    ),
+  );
+  const wrap = input.handoff?.admission;
+  return wrap === undefined
+    ? built
+    : Layer.effect(
+        HandoffAdmission.HandoffAdmission,
+        Effect.map(HandoffAdmission.HandoffAdmission, wrap),
+      ).pipe(Layer.provide(built));
+};
 
 /**
  * The project assistant's admission of the roots it manages, its Work port, and the bridge's
@@ -892,15 +914,7 @@ const handoffLayer = (input: ServerInput) =>
   AssistantHandoff.layerAdmission.pipe(
     Layer.provide(DelegatedTaskQuestionReactor.layer),
     Layer.provideMerge(AssistantHandoff.layerBackend),
-    Layer.provideMerge(
-      HandoffAdmission.layerLive.pipe(
-        Layer.provide(
-          input.handoff?.probe === undefined
-            ? Layer.empty
-            : Layer.succeed(HandoffAdmission.HandoffAdmissionProbe, input.handoff.probe),
-        ),
-      ),
-    ),
+    Layer.provideMerge(admissionOf(input)),
   );
 
 /**

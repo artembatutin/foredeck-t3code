@@ -302,7 +302,7 @@ describe("the gate beside the assistant's tick", () => {
 
   it.live("decides while the assistant's tick holds its lock, blocked behind a Deferred", () => {
     const hold: {
-      thread?: string;
+      root?: string;
       entered?: Deferred.Deferred<void>;
       go?: Deferred.Deferred<void>;
     } = {};
@@ -315,8 +315,8 @@ describe("the gate beside the assistant's tick", () => {
           const managed = yield* manage(world, author.deliveryId);
           hold.entered = yield* Deferred.make<void>();
           hold.go = yield* Deferred.make<void>();
-          hold.thread = managed.dispatchThread;
-          // The tick reconciles the assignment's dispatch inside its lock; that read is held.
+          hold.root = managed.root;
+          // The tick reconciles the assignment's delivery inside its lock; that read is held.
           const ticking = yield* assistant.tick.pipe(Effect.forkChild);
           yield* Deferred.await(hold.entered);
           // A second tick waits for the lock the first one keeps.
@@ -352,15 +352,15 @@ describe("the gate beside the assistant's tick", () => {
       {
         handoff: {},
         automaticTurnGate: true,
-        assistantThreads: (service) => ({
+        assistantFactory: (service) => ({
           ...service,
-          getThreadShell: (threadId) =>
-            threadId === hold.thread && hold.entered !== undefined && hold.go !== undefined
+          follow: (root) =>
+            root === hold.root && hold.entered !== undefined && hold.go !== undefined
               ? Deferred.succeed(hold.entered, undefined).pipe(
                   Effect.andThen(Deferred.await(hold.go)),
-                  Effect.andThen(service.getThreadShell(threadId)),
+                  Effect.andThen(service.follow(root)),
                 )
-              : service.getThreadShell(threadId),
+              : service.follow(root),
         }),
       },
     );

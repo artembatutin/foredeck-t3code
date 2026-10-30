@@ -18,7 +18,7 @@ function delegatedCompletionText(taskIds: ReadonlyArray<string>): string {
     : `Delegated tasks ${taskList} reached terminal states. Use task_status with each taskId to read the results.`;
 }
 
-function currentDelegatedCompletionDelivery(
+export function currentDelegatedCompletionDelivery(
   projection: Pick<OrchestrationV2ThreadProjection, "messages" | "runs" | "providerTurns">,
   completion: NonNullable<
     ProviderContinuationRequests.ProviderContinuationRequest["delegatedCompletion"]

@@ -1,4 +1,9 @@
-import type { AuthEnvironmentScope, ProjectId, RuntimeMode } from "@t3tools/contracts";
+import type {
+  AuthEnvironmentScope,
+  OrchestrationV2RunStatus,
+  ProjectId,
+  RuntimeMode,
+} from "@t3tools/contracts";
 import type { FactoryDeliveryStatus } from "@t3tools/contracts/fd/factory";
 import {
   WorkErrorReason,
@@ -13,7 +18,7 @@ import type * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import type { Caller } from "../../mcp/threadAccess.ts";
-import type { Demand, Observation } from "./HandoffAdmission.ts";
+import type { Currency, Demand, Observation } from "./HandoffAdmission.ts";
 
 /** An active Work source of a project, which an idea can be captured in. */
 export interface HandoffSource {
@@ -172,7 +177,9 @@ export class HandoffRedeliveryError extends Schema.TaggedError<HandoffRedelivery
  * worker's shared queue; a native wake runs the dispatch the gate kept once the root's authority
  * and a fresh read of its item confirm it (`blocked`, waiting, otherwise), or is `lost` when none
  * is kept here. A pull request wake or usage-limit resume needs nothing: its producer presents it
- * again by itself. The default redelivers nothing, so a reservation waits for its lease.
+ * again by itself. `currency` reads whether a reserved question or completion whose lease ran out
+ * still needs delivering; a failed read is `unreadable`. The default redelivers nothing, so a
+ * reservation waits for its lease, and can read nothing.
  */
 export class HandoffRedelivery extends Context.Reference<{
   readonly redeliver: (
@@ -181,14 +188,57 @@ export class HandoffRedelivery extends Context.Reference<{
     "dispatched" | "offered" | "deferred" | "blocked" | "moot" | "lost" | "none",
     HandoffRedeliveryError
   >;
+  readonly currency: (demand: Demand) => Effect.Effect<Currency>;
 }>("t3/fd/assistant/HandoffRedelivery", {
-  defaultValue: () => ({ redeliver: () => Effect.succeed("none") }),
+  defaultValue: () => ({
+    redeliver: () => Effect.succeed("none"),
+    currency: () => Effect.succeed("unreadable"),
+  }),
 }) {}
 
 /** A Factory delivery as the assistant follows it. */
 export interface HandoffDelivery {
   readonly deliveryId: string;
   readonly status: FactoryDeliveryStatus;
+}
+
+/**
+ * A root delivery as its assignment mirrors it (note 6.8): where it is, what it awaits, its pull
+ * request, why it needs its owner and the thread to open, with the same of the child it awaits, and
+ * every effect of its family marked as waiting for admission.
+ */
+export interface HandoffFollow extends HandoffDelivery {
+  readonly awaiting: "effect" | "run" | "child" | null;
+  readonly pullRequest: {
+    readonly url: string;
+    readonly outcome: "merged" | "closed" | null;
+  } | null;
+  /** Why it waits on its owner, at a plan gate or blocked; null otherwise. */
+  readonly reason: string | null;
+  /** The thread it awaits, or else its latest author's. */
+  readonly threadId: string | null;
+  /** The child it awaits. */
+  readonly child: {
+    readonly deliveryId: string;
+    readonly status: FactoryDeliveryStatus;
+    readonly reason: string | null;
+    readonly threadId: string | null;
+  } | null;
+  readonly marked: ReadonlyArray<{ readonly deliveryId: string; readonly effectId: number }>;
+}
+
+/** A request still pending on a thread of a root's family; see `HandoffFactory.requests`. */
+export interface HandoffRequest {
+  readonly threadId: string;
+  readonly requestId: string;
+  /** `user_input` for a question; anything else asks for a decision the thread's UI takes. */
+  readonly kind: string;
+  readonly capability: "live" | "message" | "not_resumable";
+  readonly run: {
+    readonly status: OrchestrationV2RunStatus;
+    readonly class: "factory" | "explicit" | "unknown";
+  } | null;
+  readonly questions: unknown;
 }
 
 /**
@@ -251,7 +301,19 @@ export class HandoffFactoryRefused extends Schema.TaggedError<HandoffFactoryRefu
 export class HandoffFactoryError extends Schema.TaggedError<HandoffFactoryError>()(
   "HandoffFactoryError",
   {
-    operation: Schema.Literals(["verify", "get", "start", "stop", "cancel", "resume", "activity"]),
+    operation: Schema.Literals([
+      "verify",
+      "get",
+      "follow",
+      "start",
+      "stop",
+      "cancel",
+      "resume",
+      "activity",
+      "deferral",
+      "runState",
+      "requests",
+    ]),
     cause: Schema.optionalKey(Schema.Defect()),
   },
 ) {
@@ -292,8 +354,31 @@ export class HandoffFactory extends Context.Reference<{
   readonly cancel: (
     deliveryId: string,
   ) => Effect.Effect<HandoffDelivery, HandoffFactoryRefused | HandoffFactoryError>;
-  /** What the root's family is doing, as a retirement judges it. */
+  /** What the root's family is doing, as a release and a retirement judge it. */
   readonly activity: (root: string) => Effect.Effect<Observation, HandoffFactoryError>;
+  /** The root as its assignment mirrors it; strict, as `get` is. */
+  readonly follow: (
+    root: string,
+  ) => Effect.Effect<Option.Option<HandoffFollow>, HandoffFactoryError>;
+  /** Makes sure an awaited effect waits marked, never running it; see `FactoryService`. */
+  readonly ensureDeferred: (
+    deliveryId: string,
+    effectId: number,
+  ) => Effect.Effect<"deferred" | "running" | "stale", HandoffFactoryError>;
+  /** Runs a marked effect once, which asks for its admission again before it runs. */
+  readonly redispatch: (
+    deliveryId: string,
+    effectId: number,
+  ) => Effect.Effect<"dispatched" | "stale", HandoffFactoryError>;
+  /** Where an admitted turn's run is, for the release pass; a failed read is never `ended`. */
+  readonly runStateOf: (turn: {
+    readonly threadId: string;
+    readonly messageId: string;
+  }) => Effect.Effect<"live" | "ended" | "none", HandoffFactoryError>;
+  /** Every request still pending on the root's family's threads. */
+  readonly requests: (
+    root: string,
+  ) => Effect.Effect<ReadonlyArray<HandoffRequest>, HandoffFactoryError>;
 }>("t3/fd/assistant/HandoffFactory", {
   defaultValue: () => ({
     verifyConfigured: () => factoryUnavailable("verify"),
@@ -303,5 +388,10 @@ export class HandoffFactory extends Context.Reference<{
     resume: () => factoryUnavailable("resume"),
     cancel: () => factoryUnavailable("cancel"),
     activity: () => factoryUnavailable("activity"),
+    follow: () => factoryUnavailable("follow"),
+    ensureDeferred: () => factoryUnavailable("deferral"),
+    redispatch: () => factoryUnavailable("deferral"),
+    runStateOf: () => factoryUnavailable("runState"),
+    requests: () => factoryUnavailable("requests"),
   }),
 }) {}

@@ -37,6 +37,7 @@ export * as FactoryService from "./FactoryService.ts";
 export * as FactorySettings from "./FactorySettings.ts";
 export * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 export * as FactoryWorker from "./FactoryWorker.ts";
+export { needsYou } from "./snapshot.ts";
 export { toolLayer as factoryToolLayer } from "./mcp/handlers.ts";
 export { layerWsRpc, WS_METHOD_TAGS } from "./rpc/handlers.ts";
 export { FactoryToolkit } from "./mcp/tools.ts";
