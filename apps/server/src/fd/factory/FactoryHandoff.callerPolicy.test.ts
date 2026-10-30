@@ -3,6 +3,7 @@ import {
   AuthWorkReadScope,
   AuthWorkWriteScope,
   type MessageId,
+  type RunId,
   type ThreadId,
 } from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
@@ -31,7 +32,7 @@ import {
   writtenRows,
 } from "./testkit/handoff.ts";
 import { delegateFrom, providerTurnRunning } from "./testkit/familyThreads.ts";
-import { awaitedRun, editTaskFile, openSingle } from "./testkit/followThrough.ts";
+import { awaitedRun, editTaskFile, openSingle, reviewPasses } from "./testkit/followThrough.ts";
 import { type McpCaller, withEndpoint } from "./testkit/mcpEndpoint.ts";
 import {
   authorCommits,
@@ -156,6 +157,53 @@ const authorize = (world: World, managed: Managed, executionAuthorized: boolean)
 const childrenOf = (threadId: ThreadId) =>
   threadProjection(threadId).pipe(
     Effect.map(({ subagents }) => subagents.length),
+    Effect.orDie,
+  );
+
+/**
+ * What an agent's send could have left, however its target's turn ended: a message with one of
+ * its texts anywhere, a run that message started (a queued turn, or the follow-up core runs for a
+ * steer that missed its turn), a steer effect queued on one of the threads, or the receipt of
+ * core's steer follow-up there.
+ */
+const sendTraces = (texts: ReadonlyArray<string>, threadIds: ReadonlyArray<ThreadId>) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const messages = yield* sql<{
+      readonly message_id: string;
+      readonly text: string | null;
+    }>`SELECT message_id, json_extract(payload_json, '$.text') AS text
+      FROM orchestration_v2_projection_messages`;
+    const steers = yield* sql<{ readonly effect_id: string }>`SELECT effect_id
+      FROM orchestration_v2_effect_outbox
+      WHERE effect_type = 'provider-turn.steer' AND thread_id IN ${sql.in(threadIds)}`;
+    const followUps = yield* sql<{ readonly command_id: string }>`SELECT command_id
+      FROM orchestration_v2_command_receipts
+      WHERE command_id LIKE 'command:steer-follow-up:%' AND thread_id IN ${sql.in(threadIds)}`;
+    const sent = messages
+      .filter((row) => row.text !== null && texts.includes(row.text))
+      .map((row) => row.message_id);
+    const runs = yield* sql<{ readonly run_id: string; readonly message_id: string | null }>`
+      SELECT run_id, json_extract(payload_json, '$.userMessageId') AS message_id
+      FROM orchestration_v2_projection_runs`;
+    return {
+      messages: sent,
+      runs: runs
+        .filter((row) => row.message_id !== null && sent.includes(row.message_id))
+        .map((row) => row.run_id),
+      steers: steers.map((row) => row.effect_id),
+      followUps: followUps.map((row) => row.command_id),
+    };
+  }).pipe(Effect.orDie);
+
+const noTraces = { messages: [], runs: [], steers: [], followUps: [] };
+
+const runStatus = (threadId: ThreadId, runId: RunId) =>
+  threadProjection(threadId).pipe(
+    Effect.map(
+      ({ runs }) =>
+        runs.find((run) => run.id === runId)?.status ?? assert.fail(`Run ${runId} is gone.`),
+    ),
     Effect.orDie,
   );
 
@@ -363,6 +411,140 @@ describe("governed callers of a managed delivery's threads", () => {
   );
 
   it.live(
+    "refuses a governed auto send while its target's turn completes, held either side of the send",
+    () =>
+      Effect.gen(function* () {
+        const screened = yield* Deferred.make<void>();
+        const resume = yield* Deferred.make<void>();
+        const hold = { on: false };
+        return yield* withProject(
+          verifyCommands.passes,
+          (world) =>
+            Effect.gen(function* () {
+              const author = yield* world.start;
+              const managed = yield* manage(world, author.deliveryId, { holding: true });
+              const child = yield* delegateFrom(author.threadId, author.runId);
+              yield* providerTurnRunning(author.threadId);
+              const duringCompletion = "Also add a CSV option, while the turn completes.";
+              const acrossCompletion = "Also check the header row, as the review completes.";
+              const texts = [duringCompletion, acrossCompletion];
+              let reviewerThread: ThreadId | undefined;
+
+              yield* withEndpoint(
+                driver,
+                (endpoint) =>
+                  Effect.gen(function* () {
+                    const authorAgent = yield* endpoint.callerOn(author.threadId);
+                    const childAgent = yield* endpoint.callerOn(child.childThreadId);
+                    const send = (caller: McpCaller, threadId: ThreadId, message: string) =>
+                      caller.call("t3_thread_send", { threadId, message, mode: "auto" });
+
+                    // (A) The provider has reported the end of the author's turn, and core's
+                    // finishing of the run is held behind a Deferred: the turn is completing.
+                    yield* authorCommits(author.worktreePath, "feat: add the export button");
+                    const turn =
+                      world.provider.started.find(
+                        (candidate) => candidate.runId === author.runId,
+                      ) ?? assert.fail("The author's turn did not start.");
+                    yield* world.provider.endTurn(turn, "completed");
+                    yield* runReached(author.runId, ["waiting", ...ended]);
+                    const gate = yield* Deferred.make<void>();
+                    const completion = yield* Deferred.await(gate).pipe(
+                      Effect.andThen(drainOrchestration),
+                      Effect.andThen(drainFactory),
+                      Effect.forkChild,
+                    );
+                    assert.strictEqual(yield* runStatus(author.threadId, author.runId), "waiting");
+                    const held = yield* writtenRows;
+                    // The agent's own completing turn, and the same turn from a family thread.
+                    for (const caller of [authorAgent, childAgent]) {
+                      assert.deepStrictEqual(
+                        yield* send(caller, author.threadId, duringCompletion),
+                        { isError: true, text: text.active },
+                        caller.threadId,
+                      );
+                    }
+                    assert.deepStrictEqual(yield* writtenRows, held);
+                    assert.strictEqual(yield* runStatus(author.threadId, author.runId), "waiting");
+                    // The completion goes on: nothing the sends could have queued follows it.
+                    yield* Deferred.succeed(gate, undefined);
+                    yield* Fiber.join(completion);
+                    assert.strictEqual(
+                      yield* runStatus(author.threadId, author.runId),
+                      "completed",
+                    );
+                    const reviewer = yield* awaitedRun(author.deliveryId);
+                    reviewerThread = reviewer.threadId;
+                    yield* drainOrchestration;
+                    assert.deepStrictEqual(
+                      yield* sendTraces(texts, [author.threadId, reviewer.threadId]),
+                      noTraces,
+                    );
+
+                    // (B) The send to the reviewer's running turn is held right after the screen
+                    // decided, while that turn completes and Factory records and publishes it.
+                    hold.on = true;
+                    const call = yield* send(authorAgent, reviewer.threadId, acrossCompletion).pipe(
+                      Effect.forkChild,
+                    );
+                    yield* Deferred.await(screened);
+                    hold.on = false;
+                    yield* reviewPasses(world, author.deliveryId);
+                    assert.strictEqual(
+                      yield* runStatus(reviewer.threadId, reviewer.runId),
+                      "completed",
+                    );
+                    const settled = yield* writtenRows;
+                    yield* Deferred.succeed(resume, undefined);
+                    assert.deepStrictEqual(yield* Fiber.join(call), {
+                      isError: true,
+                      text: text.active,
+                    });
+                    yield* drainOrchestration;
+                    yield* drainFactory;
+                    assert.deepStrictEqual(yield* writtenRows, settled);
+                    assert.deepStrictEqual(
+                      yield* sendTraces(texts, [author.threadId, reviewer.threadId]),
+                      noTraces,
+                    );
+                    assert.deepStrictEqual(yield* governedMessages(managed.root), []);
+                  }).pipe(Effect.ensuring(Deferred.succeed(resume, undefined))),
+                {
+                  // The bridge's own decision, then a hold before the endpoint answers.
+                  policy: (policy) => ({
+                    ...policy,
+                    screen: (input) =>
+                      Effect.tap(policy.screen(input), () =>
+                        hold.on
+                          ? Deferred.succeed(screened, undefined).pipe(
+                              Effect.andThen(Deferred.await(resume)),
+                            )
+                          : Effect.void,
+                      ),
+                  }),
+                },
+              );
+
+              // A rebuilt server, core's restart recovery included, finds none of it either.
+              const threads = [author.threadId, reviewerThread ?? assert.fail("No reviewer ran.")];
+              yield* world.rebuild(
+                Effect.gen(function* () {
+                  yield* drainOrchestration;
+                  yield* drainFactory;
+                  yield* drainOrchestration;
+                  assert.deepStrictEqual(yield* sendTraces(texts, threads), noTraces);
+                  assert.deepStrictEqual(yield* governedMessages(managed.root), []);
+                }),
+                { orchestration: true },
+              );
+            }),
+          { handoff: {}, automaticTurnGate: true },
+        );
+      }),
+    240_000,
+  );
+
+  it.live(
     "leaves never-managed deliveries, owner threads and outside clients as they are",
     () =>
       withProject(
@@ -436,6 +618,12 @@ describe("governed callers of a managed delivery's threads", () => {
                 (run) => run.userMessageId === message.id,
               );
               assert.strictEqual(followUps.length, 1);
+              // What the governed sends never leave: the message, its steer and the run it got.
+              const traces = yield* sendTraces(["Also add a CSV option."], [author.threadId]);
+              assert.deepStrictEqual(
+                [traces.messages.length, traces.steers.length, traces.runs.length],
+                [1, 1, 1],
+              );
               // Run inline as the owner's: no demand, no recorded automatic turn, uncounted.
               assert.deepStrictEqual(
                 (yield* demandsOf(managed.root)).filter(({ kind }) => kind !== "effect"),
