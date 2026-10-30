@@ -198,7 +198,7 @@ describe("governed Factory effects on the real stack", () => {
               "dispatched",
             );
             yield* world.endRun(reviewer.runId, "completed");
-          }),
+          }).pipe(Effect.ensuring(Deferred.succeed(held.go, undefined))),
         { handoff: { probe: held.probe }, automaticTurnGate: true },
       ),
     ),
@@ -231,7 +231,7 @@ describe("governed Factory effects on the real stack", () => {
               Factory.FactoryAdmission.admissionRefusalText.scope_changed,
             );
             assert.isUndefined(state.threads.reviewer);
-          }),
+          }).pipe(Effect.ensuring(Deferred.succeed(held.go, undefined))),
         { handoff: { probe: held.probe }, automaticTurnGate: true },
       ),
     ),
@@ -300,6 +300,72 @@ describe("the gate beside the assistant's tick", () => {
     );
   });
 
+  it.live("decides while the assistant's tick holds its lock, blocked behind a Deferred", () => {
+    const hold: {
+      thread?: string;
+      entered?: Deferred.Deferred<void>;
+      go?: Deferred.Deferred<void>;
+    } = {};
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const assistant = yield* ProjectAssistant.ProjectAssistant;
+          const author = yield* world.start;
+          const managed = yield* manage(world, author.deliveryId);
+          hold.entered = yield* Deferred.make<void>();
+          hold.go = yield* Deferred.make<void>();
+          hold.thread = managed.dispatchThread;
+          // The tick reconciles the assignment's dispatch inside its lock; that read is held.
+          const ticking = yield* assistant.tick.pipe(Effect.forkChild);
+          yield* Deferred.await(hold.entered);
+          // A second tick waits for the lock the first one keeps.
+          const waiting = yield* assistant.tick.pipe(Effect.forkChild({ startImmediately: true }));
+
+          // Meanwhile the gate decides: a resume of Factory's run at the free head reads the
+          // item, takes the slot and runs; a second presentation of the kind waits in its demand.
+          const ran: Array<string> = [];
+          const resume = turns.usageLimitResume(author.threadId, author.runId);
+          assert.deepStrictEqual(yield* consult(resume, { ran }), AutomaticTurnGate.ran(undefined));
+          assert.deepStrictEqual(ran, [resume.messageId]);
+          assert.strictEqual((yield* slotOf(author.deliveryId))?.state, "held");
+          const later = turns.usageLimitResume(author.threadId, author.runId);
+          assert.deepStrictEqual(
+            yield* consult(later, { ran }),
+            AutomaticTurnGate.notNow("deferred"),
+          );
+          // Both ticks are still where they were: the gate never waited for their lock.
+          assert.isUndefined(ticking.pollUnsafe());
+          assert.isUndefined(waiting.pollUnsafe());
+
+          yield* Deferred.succeed(hold.go, undefined);
+          yield* Fiber.join(ticking);
+          yield* Fiber.join(waiting);
+          yield* world.endRun(author.runId, "completed");
+        }).pipe(
+          Effect.ensuring(
+            Effect.suspend(() =>
+              hold.go === undefined ? Effect.void : Deferred.succeed(hold.go, undefined),
+            ),
+          ),
+        ),
+      {
+        handoff: {},
+        automaticTurnGate: true,
+        assistantThreads: (service) => ({
+          ...service,
+          getThreadShell: (threadId) =>
+            threadId === hold.thread && hold.entered !== undefined && hold.go !== undefined
+              ? Deferred.succeed(hold.entered, undefined).pipe(
+                  Effect.andThen(Deferred.await(hold.go)),
+                  Effect.andThen(service.getThreadShell(threadId)),
+                )
+              : service.getThreadShell(threadId),
+        }),
+      },
+    );
+  });
+
   it.live("decides while a tick's grant is held between its commit and its dispatch", () =>
     Effect.flatMap(holdingProbe, (held) =>
       withProject(
@@ -339,7 +405,7 @@ describe("the gate beside the assistant's tick", () => {
             assert.strictEqual((yield* admissionsOf("root-queued"))[0]?.state, "dispatched");
             assert.isTrue((yield* freshRead(world)).type === "read");
             yield* world.endRun(author.runId, "completed");
-          }),
+          }).pipe(Effect.ensuring(Deferred.succeed(held.go, undefined))),
         { handoff: { probe: held.probe }, automaticTurnGate: true },
       ),
     ),

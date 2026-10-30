@@ -4,16 +4,20 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import * as EffectOutbox from "../../orchestration-v2/EffectOutbox.ts";
-import { HandoffAdmission } from "../assistant/index.ts";
+import { HandoffAdmission, HandoffBackend } from "../assistant/index.ts";
 import {
+  consult,
   demandsOf,
+  fill,
   freshRead,
   manage,
+  release,
   runsOf,
   slotOf,
+  turns,
   wakeThroughGate,
 } from "./testkit/handoff.ts";
-import { coreRecovery, providerTurnRunning } from "./testkit/familyThreads.ts";
+import { coreRecovery, providerThreadOf, providerTurnRunning } from "./testkit/familyThreads.ts";
 import { editTaskFile, linkOf, openSingle } from "./testkit/followThrough.ts";
 import {
   drainFactory,
@@ -99,6 +103,50 @@ describe("fresh authority for a managed root's automatic turns", () => {
         { handoff: {}, automaticTurnGate: true },
       ),
     180_000,
+  );
+
+  it.live("redelivers a reserved native wake only once its root's item reads as authorized", () =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const admission = yield* HandoffAdmission.HandoffAdmission;
+          const redelivery = yield* HandoffBackend.HandoffRedelivery;
+          const author = yield* world.start;
+          const managed = yield* manage(world, author.deliveryId);
+          const [filler] = yield* fill(world, 2);
+          // Factory's own background work wakes with both slots held: kept, waiting.
+          const record = { ran: [] as Array<string> };
+          const wake = turns.backgroundWake(
+            author.threadId,
+            yield* providerThreadOf(author.threadId, author.runId),
+          );
+          yield* consult(wake, record);
+          const [demand] = yield* demandsOf(managed.root);
+          // A slot frees and the tick reserves it on a fresh read; the item is edited after.
+          yield* release(filler!);
+          assert.strictEqual(
+            (yield* admission.reserve(demand!.id, yield* freshRead(world))).type,
+            "reserved",
+          );
+          yield* editTaskFile(world, world.itemRef, retitle(world.itemTitle, edited));
+          assert.strictEqual(yield* redelivery.redeliver(demand!), "blocked");
+          assert.deepStrictEqual(record.ran, []);
+          assert.isUndefined(yield* slotOf(managed.root));
+          assert.strictEqual((yield* demandsOf(managed.root))[0]?.blockedReason, "scope_changed");
+
+          // Restored, re-checked and reserved again, its kept dispatch runs once.
+          yield* editTaskFile(world, world.itemRef, retitle(edited, world.itemTitle));
+          const restored = yield* freshRead(world);
+          yield* admission.recheckBlocked({ root: managed.root, work: restored, force: true });
+          yield* admission.reserve(demand!.id, restored);
+          assert.strictEqual(yield* redelivery.redeliver(demand!), "dispatched");
+          assert.deepStrictEqual(record.ran, [wake.messageId]);
+          assert.strictEqual((yield* slotOf(managed.root))?.state, "held");
+          yield* world.endRun(author.runId, "completed");
+        }),
+      { handoff: {}, automaticTurnGate: true },
+    ),
   );
 
   it.live(

@@ -127,6 +127,8 @@ export type TurnDecision =
   /** `clear`: the turn was a native wake whose adapter offer can be dropped. */
   | { readonly type: "declined"; readonly clear: boolean }
   | { readonly type: "needs_work"; readonly item: ItemRef }
+  /** This instance is still dispatching an admission of the same turn; nothing more runs. */
+  | { readonly type: "in_flight" }
   | { readonly type: "unmanaged" };
 
 export type OpeningDecision =
@@ -175,6 +177,18 @@ export type ReserveResult =
   | { readonly type: "reserved"; readonly demand: Demand }
   | { readonly type: "blocked"; readonly category: BlockedReason }
   | { readonly type: "stale" };
+
+/**
+ * What a reserved native wake's redelivery did: its kept dispatch was admitted and runs, the
+ * dispatch was not kept here so the wake is lost, the reservation is gone, the root's authority
+ * or fresh read blocked the demand, or a fresh read of the item is needed to decide.
+ */
+export type NativeRedelivery =
+  | { readonly type: "dispatched" }
+  | { readonly type: "lost" }
+  | { readonly type: "stale" }
+  | { readonly type: "blocked"; readonly category: BlockedReason }
+  | { readonly type: "needs_work"; readonly item: ItemRef };
 
 /** A currency read of a reserved question or completion whose lease ran out. */
 export type Currency = "current" | "not_current" | "unreadable";
@@ -313,8 +327,9 @@ export class HandoffAdmission extends Context.Service<
     }) => Effect.Effect<DelegationDecision, HandoffAdmissionError>;
     /**
      * Runs `decide`, an admitting operation, and for its admission `dispatch`: the admitted probe,
-     * then the dispatch, and the row marked dispatched once the dispatch returns, however it ends.
-     * Nothing interrupts between the admission's commit and that mark but the probe and dispatch.
+     * then the dispatch, and that admission marked dispatched once the dispatch returns, however
+     * it ends. The whole region from the commit to the mark is uninterruptible, so an admission is
+     * never marked dispatched with its dispatch not run.
      */
     readonly dispatchAdmitted: <
       D extends { readonly type: string; readonly admitted?: Admitted | undefined },
@@ -326,8 +341,13 @@ export class HandoffAdmission extends Context.Service<
       decide: Effect.Effect<D, DE>,
       dispatch: (admitted: Admitted) => Effect.Effect<A, E, R>,
     ) => Effect.Effect<{ readonly decision: D; readonly value: Option.Option<A> }, DE | E, R>;
-    /** Marks the admission dispatched; the release pass deletes it later. */
-    readonly markDispatched: (admissionId: string) => Effect.Effect<void, HandoffAdmissionError>;
+    /**
+     * Marks the admission dispatched, for the release pass to delete later. Only the generation
+     * it names (its `entrySeq`) is marked, never a later admission of the same turn.
+     */
+    readonly markDispatched: (
+      admitted: Pick<Admitted, "admissionId" | "entrySeq">,
+    ) => Effect.Effect<void, HandoffAdmissionError>;
     /** The free capacity and the fair order's head, as the tick grants. */
     readonly next: Effect.Effect<
       {
@@ -359,12 +379,15 @@ export class HandoffAdmission extends Context.Service<
       work: WorkRead,
     ) => Effect.Effect<ReserveResult, HandoffAdmissionError>;
     /**
-     * Runs a reserved native wake's kept dispatch under a held slot; with no dispatch kept here,
-     * its demand takes the lost disposition.
+     * Runs a reserved native wake's kept dispatch under a held slot, as an admitting decision: the
+     * root's authority is read in its transaction and the item's `work` read is required
+     * (`needs_work` asks for one), and either failing blocks the demand, keeping its dispatch.
+     * With no dispatch kept here, the demand takes the lost disposition.
      */
     readonly redeliverNative: (
       demandId: number,
-    ) => Effect.Effect<"dispatched" | "lost" | "stale", HandoffAdmissionError>;
+      work?: WorkRead,
+    ) => Effect.Effect<NativeRedelivery, HandoffAdmissionError>;
     /** A redelivery found the reserved turn no longer needed: it and its slot are deleted. */
     readonly moot: (demandId: number) => Effect.Effect<void, HandoffAdmissionError>;
     /** The demand's work is gone with a restart: the lost disposition, with history and notice. */
@@ -760,6 +783,17 @@ const make = Effect.gen(function* () {
   const admissionsOf = (root: string) =>
     sql<AdmissionRow>`SELECT admission_id, kind, instance_id, state, entry_seq
       FROM fd_assistant_admissions WHERE root_delivery_id = ${root}`;
+  /**
+   * Whether this instance still dispatches an admission of the turn. Another one would take over
+   * its row, and the earlier dispatch's end could then settle the later admission.
+   */
+  const turnInFlight = (threadId: string, messageId: string) =>
+    Effect.map(
+      sql<{ readonly found: number }>`SELECT 1 AS found FROM fd_assistant_admissions
+        WHERE kind = 'automatic_turn' AND thread_id = ${threadId} AND message_id = ${messageId}
+          AND state = 'dispatching' AND instance_id = ${instanceId}`,
+      (rows) => rows.length > 0,
+    );
   const demandCount = (root: string) =>
     Effect.map(
       sql<{ readonly count: number }>`SELECT COUNT(*) AS count
@@ -1329,28 +1363,39 @@ const make = Effect.gen(function* () {
       { discard: true },
     );
 
-  const markDispatched: HandoffAdmission["Service"]["markDispatched"] = (admissionId) =>
+  const markDispatched: HandoffAdmission["Service"]["markDispatched"] = (admitted) =>
     Effect.flatMap(
       now,
       (at) => sql`UPDATE fd_assistant_admissions SET state = 'dispatched', updated_at = ${at}
-        WHERE admission_id = ${admissionId} AND state = 'dispatching'`,
+        WHERE admission_id = ${admitted.admissionId} AND entry_seq = ${admitted.entrySeq}
+          AND state = 'dispatching'`,
     ).pipe(Effect.asVoid, failed("dispatched"));
 
+  /** Marks a dispatch's admission dispatched; nothing would try again, so a failure is logged. */
+  const settleDispatch = (admitted: Admitted) =>
+    markDispatched(admitted).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("the assistant could not mark an admission dispatched", cause),
+      ),
+    );
+
+  /** The admitted probe, then the dispatch, then its admission marked dispatched. */
+  const runAdmitted = <A, E, R>(admitted: Admitted, dispatch: Effect.Effect<A, E, R>) =>
+    Effect.andThen(probe.admitted(admitted), dispatch).pipe(
+      Effect.ensuring(settleDispatch(admitted)),
+    );
+
+  // Uninterruptible from the commit to the mark: an interrupt landing before the dispatch ran
+  // would otherwise mark the row dispatched and let the release pass free a slot its work never
+  // took. The transaction commits inside the same region, so its result is never lost either.
   const dispatchAdmitted: HandoffAdmission["Service"]["dispatchAdmitted"] = (decide, dispatch) =>
-    Effect.uninterruptibleMask((restore) =>
+    Effect.uninterruptible(
       Effect.flatMap(decide, (decision) => {
         const admitted = decision.admitted;
         if (admitted === undefined) {
           return Effect.succeed({ decision, value: Option.none() });
         }
-        return restore(Effect.andThen(probe.admitted(admitted), dispatch(admitted))).pipe(
-          Effect.ensuring(
-            markDispatched(admitted.admissionId).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning("the assistant could not mark an admission dispatched", cause),
-              ),
-            ),
-          ),
+        return runAdmitted(admitted, dispatch(admitted)).pipe(
           Effect.map((value) => ({ decision, value: Option.some(value) })),
         );
       }),
@@ -1555,6 +1600,10 @@ const make = Effect.gen(function* () {
         }
       } else if (root.state !== "active") {
         return yield* declineEnded(root, provenance, turn);
+      }
+      // Presented again while its dispatch goes on: that dispatch is the turn's, alone.
+      if (yield* turnInFlight(turn.threadId, turn.messageId)) {
+        return { type: "in_flight" } as const;
       }
       const link = yield* readLink(root.assignment_id);
       if (link === undefined) {
@@ -1890,14 +1939,13 @@ const make = Effect.gen(function* () {
       } as const;
     }).pipe(transact("reserve"));
 
-  const redeliverNative: HandoffAdmission["Service"]["redeliverNative"] = (demandId) =>
-    Effect.uninterruptibleMask((restore) =>
+  const redeliverNative: HandoffAdmission["Service"]["redeliverNative"] = (demandId, work) =>
+    Effect.uninterruptible(
       Effect.gen(function* () {
+        const stale = { type: "stale" } as const;
         const decided = yield* Effect.gen(function* () {
           const demand = yield* readDemand(demandId);
-          if (demand?.kind !== "background_wake" || demand.state !== "reserved") {
-            return { type: "stale" } as const;
-          }
+          if (demand?.kind !== "background_wake" || demand.state !== "reserved") return stale;
           const root = yield* readRoot(demand.root_delivery_id);
           const slot = root === undefined ? undefined : yield* readSlot(root.root_delivery_id);
           if (
@@ -1905,14 +1953,29 @@ const make = Effect.gen(function* () {
             slot?.state !== "reserved" ||
             slot.reserved_demand_id !== demandId ||
             demand.message_id === null ||
-            demand.thread_id === null
+            demand.thread_id === null ||
+            (yield* turnInFlight(demand.thread_id, demand.message_id))
           ) {
-            return { type: "stale" } as const;
+            return stale;
           }
           const entry = kept.get(demand.message_id);
           if (entry === undefined) {
             yield* loseDemand(root, demand);
             return { type: "lost" } as const;
+          }
+          const link = yield* readLink(root.assignment_id);
+          if (link === undefined) return stale;
+          // An admitting decision like any other: the root's authority as it stands, and the
+          // item read again since the reservation.
+          const category = yield* makeAuthority()(link);
+          if (category === undefined && work === undefined) {
+            return { type: "needs_work", item: itemOf(link) } as const;
+          }
+          const refusal = category ?? (work === undefined ? undefined : freshness(link, work));
+          if (refusal !== undefined) {
+            // Blocked, it waits with its dispatch kept until the root is restored.
+            yield* blockDemand(demand, refusal);
+            return { type: "blocked", category: refusal } as const;
           }
           const entrySeq = yield* freshSeq;
           yield* holdSlot(root.root_delivery_id, entrySeq);
@@ -1926,20 +1989,13 @@ const make = Effect.gen(function* () {
           kept.delete(demand.message_id);
           return { type: "admitted", admitted, dispatch: entry.dispatch } as const;
         }).pipe(transact("grant"));
-        if (decided.type !== "admitted") return decided.type;
-        const { admitted, dispatch } = decided;
-        // The kept dispatch runs on its own fiber; its row is marked dispatched once it returns.
-        yield* restore(Effect.andThen(probe.admitted(admitted), dispatch)).pipe(
-          Effect.ensuring(
-            markDispatched(admitted.admissionId).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning("the assistant could not mark an admission dispatched", cause),
-              ),
-            ),
-          ),
+        if (decided.type !== "admitted") return decided;
+        // The kept dispatch runs on a fiber of its own, uninterruptible from the commit to its
+        // admission's mark like any admitted dispatch.
+        yield* runAdmitted(decided.admitted, decided.dispatch).pipe(
           Effect.forkIn(scope, { startImmediately: true, uninterruptible: true }),
         );
-        return "dispatched" as const;
+        return { type: "dispatched" } as const;
       }),
     );
 

@@ -701,6 +701,7 @@ interface ServerInput {
   readonly manualReactor: boolean;
   readonly admission: typeof Factory.FactoryAdmission.FactoryAdmission.Service | undefined;
   readonly handoff: HandoffOption | undefined;
+  readonly assistantThreads: ThreadServiceWrapper | undefined;
   readonly automaticTurnGate: boolean;
   readonly root: string;
   readonly t3Home: string;
@@ -832,14 +833,29 @@ const factoryLayer = (input: ServerInput, handoff: ReturnType<typeof handoffLaye
     ),
   );
 
+/** Wraps the thread service the project assistant alone sees; see `withProject`. */
+type ThreadServiceWrapper = (
+  service: ThreadManagement.ThreadManagementService["Service"],
+) => ThreadManagement.ThreadManagementService["Service"];
+
 /**
  * The project assistant and its Work capture over the bridge's Work port, as the server composes
- * them. Built and rebuilt with Factory, so a rebuild is a new assistant instance as a new process
- * would be. No tick runs: a test drives the assistant's services itself.
+ * them, with its thread service wrapped by `assistantThreads` when given. Built and rebuilt with
+ * Factory, so a rebuild is a new assistant instance as a new process would be. No tick runs: a
+ * test drives the assistant's services itself.
  */
-const assistantLayer = ProjectAssistant.layerLive.pipe(
-  Layer.provide(AssistantHandoff.layerBackend),
-);
+const assistantLayer = (input: ServerInput) =>
+  ProjectAssistant.layerLive.pipe(
+    Layer.provide(AssistantHandoff.layerBackend),
+    Layer.provide(
+      input.assistantThreads === undefined
+        ? Layer.empty
+        : Layer.effect(
+            ThreadManagement.ThreadManagementService,
+            Effect.map(ThreadManagement.ThreadManagementService, input.assistantThreads),
+          ),
+    ),
+  );
 
 /**
  * Core's startup recovery, in the order the server runs it before anything else (see
@@ -877,7 +893,7 @@ const makeServer = (input: ServerInput, parent: Scope.Scope) =>
     const handoff = handoffLayer(input);
     const buildFactory = (core: Context.Context<Layer.Success<ReturnType<typeof coreLayer>>>) =>
       build(
-        Layer.mergeAll(factoryLayer(input, handoff), assistantLayer, handoff).pipe(
+        Layer.mergeAll(factoryLayer(input, handoff), assistantLayer(input), handoff).pipe(
           Layer.provide(Layer.succeedContext(core)),
         ),
       );
@@ -960,7 +976,7 @@ export const threadProjection = (threadId: ThreadId) =>
 type Services =
   | Layer.Success<ReturnType<typeof coreLayer>>
   | Layer.Success<ReturnType<typeof factoryLayer>>
-  | Layer.Success<typeof assistantLayer>
+  | Layer.Success<ReturnType<typeof assistantLayer>>
   | Layer.Success<ReturnType<typeof handoffLayer>>
   | NodeServices.NodeServices;
 
@@ -1111,6 +1127,11 @@ export const withProject = <A, E>(
      */
     readonly handoff?: HandoffOption;
     /**
+     * Wraps the thread service the project assistant reads and acts through, leaving every other
+     * service's untouched, so a test can hold the assistant's tick inside its lock.
+     */
+    readonly assistantThreads?: ThreadServiceWrapper;
+    /**
      * Gives core's producers the installable automatic turn gate Factory installs, as the server
      * does (see `automaticTurnGate`); without it they run every automatic turn inline.
      */
@@ -1148,6 +1169,7 @@ export const withProject = <A, E>(
         manualReactor: options.manualReactor === true,
         admission: options.admission,
         handoff: options.handoff,
+        assistantThreads: options.assistantThreads,
         automaticTurnGate: options.automaticTurnGate === true,
         root,
         t3Home,

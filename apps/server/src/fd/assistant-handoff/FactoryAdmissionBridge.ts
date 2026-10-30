@@ -21,6 +21,21 @@ import { FactoryAdmission } from "../factory/index.ts";
 
 type Port = typeof FactoryAdmission.FactoryAdmission.Service;
 
+/** The fresh read of a root's item a decision asked for; a failed or invalid read is a result. */
+const readWorkWith =
+  (backend: typeof HandoffBackend.HandoffBackend.Service) => (item: HandoffAdmission.ItemRef) =>
+    backend.read(item).pipe(
+      Effect.map((read): HandoffAdmission.WorkRead =>
+        read.invalid
+          ? { type: "unreadable" }
+          : { type: "read", fingerprint: read.fingerprint, status: read.status },
+      ),
+      Effect.catchTags({
+        HandoffBackendError: () =>
+          Effect.succeed<HandoffAdmission.WorkRead>({ type: "unreadable" }),
+      }),
+    );
+
 /**
  * Factory's admission port over the project assistant's admission of the roots it manages (see
  * `HandoffAdmission`). Each Factory delivery's root is the assistant's managed root of the same id,
@@ -35,19 +50,7 @@ export const make = Effect.gen(function* () {
   const admission = yield* HandoffAdmission.HandoffAdmission;
   const backend = yield* HandoffBackend.HandoffBackend;
 
-  /** The fresh read of a root's item a decision asked for; a failed or invalid read is a result. */
-  const readWork = (item: HandoffAdmission.ItemRef) =>
-    backend.read(item).pipe(
-      Effect.map((read): HandoffAdmission.WorkRead =>
-        read.invalid
-          ? { type: "unreadable" }
-          : { type: "read", fingerprint: read.fingerprint, status: read.status },
-      ),
-      Effect.catchTags({
-        HandoffBackendError: () =>
-          Effect.succeed<HandoffAdmission.WorkRead>({ type: "unreadable" }),
-      }),
-    );
+  const readWork = readWorkWith(backend);
 
   /** Runs `decide` once, and again with a fresh read when it asked for one. */
   const withWork = <X extends { readonly decision: { readonly type: string } }, E, R>(
@@ -184,6 +187,8 @@ export const make = Effect.gen(function* () {
         case "demand":
         case "blocked":
         case "needs_work":
+        // Its dispatch already in flight runs it; this presentation runs nothing more.
+        case "in_flight":
           return notNow("deferred");
         case "declined":
           // Only an offer that can be cleared is.
@@ -209,6 +214,7 @@ export const make = Effect.gen(function* () {
  */
 export const makeRedelivery = Effect.gen(function* () {
   const admission = yield* HandoffAdmission.HandoffAdmission;
+  const readWork = readWorkWith(yield* HandoffBackend.HandoffBackend);
   const questions = yield* DelegatedTaskQuestionReactor.DelegatedTaskQuestionReactor;
   const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
 
@@ -264,10 +270,23 @@ export const makeRedelivery = Effect.gen(function* () {
           })
           .pipe(Effect.as("offered" as const));
       case "background_wake":
-        return admission.redeliverNative(demand.id).pipe(
-          Effect.map((outcome) => (outcome === "stale" ? ("none" as const) : outcome)),
-          failedAs(demand.kind),
-        );
+        // Admitted only once the root's authority and a fresh read of its item confirm it.
+        return Effect.gen(function* () {
+          const first = yield* admission.redeliverNative(demand.id);
+          const outcome =
+            first.type === "needs_work"
+              ? yield* admission.redeliverNative(demand.id, yield* readWork(first.item))
+              : first;
+          switch (outcome.type) {
+            case "dispatched":
+            case "lost":
+            case "blocked":
+              return outcome.type;
+            case "stale":
+            case "needs_work":
+              return "none" as const;
+          }
+        }).pipe(failedAs(demand.kind));
       case "pull_request_wake":
       case "usage_limit_resume":
       case "effect":

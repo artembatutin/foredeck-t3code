@@ -1195,7 +1195,7 @@ const pausedAdmission = (
             yield* admission.release(root, (yield* slotOf(root))!.entry_seq).pipe(Effect.orDie),
             "released",
           );
-        }),
+        }).pipe(Effect.ensuring(Deferred.succeed(paused.go, undefined))),
       paused.probe,
     ),
   );
@@ -1384,7 +1384,7 @@ describe("release and lease expiry", () => {
         const e2 = (yield* slotOf("root-s"))!.entry_seq;
         assert.strictEqual(yield* admission.release("root-s", e2).pipe(Effect.orDie), "kept");
         if (claimRow.type === "admitted") {
-          yield* admission.markDispatched(claimRow.admitted.admissionId).pipe(Effect.orDie);
+          yield* admission.markDispatched(claimRow.admitted).pipe(Effect.orDie);
         }
         assert.strictEqual(yield* admission.release("root-s", e2).pipe(Effect.orDie), "released");
         assert.isUndefined(yield* slotOf("root-s"));
@@ -1747,7 +1747,7 @@ describe("delegation", () => {
             (yield* admissionsOf("root-s")).map(({ kind, state }) => [kind, state]),
             [["delegation", "dispatching"]],
           );
-          yield* admission.markDispatched(admitted.admitted.admissionId).pipe(Effect.orDie);
+          yield* admission.markDispatched(admitted.admitted).pipe(Effect.orDie);
           assert.deepStrictEqual(
             (yield* admissionsOf("root-s")).map(({ kind, state }) => [kind, state]),
             [["delegation", "dispatched"]],
@@ -1903,36 +1903,38 @@ describe("retirement linearization", () => {
     ),
   );
 
-  it.effect(
-    "keeps an assignment whose admission lands between the observation and the attempt",
-    () =>
+  it.effect.each([{ stage: "released" as const }, { stage: "observed" as const }])(
+    "keeps an assignment whose admission lands at the $stage probe, before the attempt",
+    ({ stage }) =>
       Effect.gen(function* () {
         const entered = yield* Deferred.make<void>();
         const go = yield* Deferred.make<void>();
         const admitting: { fiber?: Fiber.Fiber<unknown, HandoffAdmission.HandoffAdmissionError> } =
           {};
         const ran: Array<string> = [];
-        // At the observed probe, a turn is admitted at the free head and its dispatch held.
+        // At the probe stage, a turn is admitted at the free head and its dispatch held: after
+        // the release pass, or after the quiescent observation the attempt then relies on.
+        const admitMeanwhile = () =>
+          Effect.gen(function* () {
+            const admission = yield* service;
+            admitting.fiber = yield* admission
+              .dispatchAdmitted(
+                admission.decideTurn({
+                  root: "root-s",
+                  provenance: "factory",
+                  turn: turns.pullRequest(),
+                  work: freshRead("subject"),
+                }),
+                () => Effect.sync(() => void ran.push("wake")),
+              )
+              .pipe(Effect.forkDetach);
+            yield* Deferred.await(entered);
+          }).pipe(Effect.provideService(service, admissionRef.current!));
         const probe: Probe = {
           admitted: () =>
             Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(go))),
-          released: () => Effect.void,
-          observed: () =>
-            Effect.gen(function* () {
-              const admission = yield* service;
-              admitting.fiber = yield* admission
-                .dispatchAdmitted(
-                  admission.decideTurn({
-                    root: "root-s",
-                    provenance: "factory",
-                    turn: turns.pullRequest(),
-                    work: freshRead("subject"),
-                  }),
-                  () => Effect.sync(() => void ran.push("wake")),
-                )
-                .pipe(Effect.forkDetach);
-              yield* Deferred.await(entered);
-            }).pipe(Effect.provideService(service, admissionRef.current!)),
+          released: () => (stage === "released" ? admitMeanwhile() : Effect.void),
+          observed: () => (stage === "observed" ? admitMeanwhile() : Effect.void),
         };
         const admissionRef: { current?: HandoffAdmission.HandoffAdmission["Service"] } = {};
         return yield* withAdmission(
@@ -1984,7 +1986,7 @@ describe("retirement linearization", () => {
                 "retired",
               );
               assert.strictEqual((yield* assignmentOf("subject")).state, "cancelled");
-            }),
+            }).pipe(Effect.ensuring(Deferred.succeed(go, undefined))),
           probe,
         );
       }),
@@ -2012,7 +2014,7 @@ describe("retirement linearization", () => {
             .pipe(Effect.orDie),
           "contended",
         );
-        yield* admission.markDispatched(claimed.admitted.admissionId).pipe(Effect.orDie);
+        yield* admission.markDispatched(claimed.admitted).pipe(Effect.orDie);
         // Another row of the root, even another instance's, refuses it too.
         const other = yield* anotherInstance(world);
         const foreign = yield* other
@@ -2136,7 +2138,7 @@ describe("pre-start parking, resume and cancel", () => {
         const position = yield* positionOf("subject");
         // In flight here, it is refused.
         assert.strictEqual(yield* park(admitted), "contended");
-        yield* admission.markDispatched(admitted.admissionId).pipe(Effect.orDie);
+        yield* admission.markDispatched(admitted).pipe(Effect.orDie);
         // A moved entry, another row, a demand, or control other than stop refuse it.
         yield* sqlRun(
           (sql) => sql`UPDATE fd_assistant_slots SET entry_seq = entry_seq + 1000
@@ -2150,7 +2152,7 @@ describe("pre-start parking, resume and cancel", () => {
         const extra = yield* delegate("root-s", freshRead("subject"));
         assert.strictEqual(extra.type, "admitted");
         if (extra.type === "admitted") {
-          yield* admission.markDispatched(extra.admitted.admissionId).pipe(Effect.orDie);
+          yield* admission.markDispatched(extra.admitted).pipe(Effect.orDie);
         }
         yield* sqlRun(
           (sql) => sql`UPDATE fd_assistant_slots SET entry_seq = ${admitted.entrySeq}
@@ -2228,7 +2230,7 @@ describe("pre-start parking, resume and cancel", () => {
         yield* fill(1);
         const others = yield* bystander;
         const admitted = yield* claimedStopped;
-        yield* admission.markDispatched(admitted.admissionId).pipe(Effect.orDie);
+        yield* admission.markDispatched(admitted).pipe(Effect.orDie);
         const before = (yield* positionOf("subject"))!;
         // With its slot still held, a resume re-enters nothing.
         assert.deepStrictEqual(
@@ -2303,7 +2305,7 @@ describe("pre-start parking, resume and cancel", () => {
         yield* fill(1);
         const others = yield* bystander;
         const admitted = yield* claimedStopped;
-        yield* admission.markDispatched(admitted.admissionId).pipe(Effect.orDie);
+        yield* admission.markDispatched(admitted).pipe(Effect.orDie);
         yield* park(admitted);
         yield* admission
           .resumeReentry({ root: "root-s", work: freshRead("subject") })
@@ -2373,7 +2375,7 @@ describe("pre-start parking, resume and cancel", () => {
   const pendingResume = Effect.gen(function* () {
     const admission = yield* service;
     const admitted = yield* claimedStopped;
-    yield* admission.markDispatched(admitted.admissionId).pipe(Effect.orDie);
+    yield* admission.markDispatched(admitted).pipe(Effect.orDie);
     yield* park(admitted);
     yield* admission
       .resumeReentry({ root: "root-s", work: freshRead("subject") })
@@ -2391,7 +2393,7 @@ describe("pre-start parking, resume and cancel", () => {
         yield* fill(1);
         const others = yield* bystander;
         const admitted = yield* claimedStopped;
-        yield* admission.markDispatched(admitted.admissionId).pipe(Effect.orDie);
+        yield* admission.markDispatched(admitted).pipe(Effect.orDie);
         yield* park(admitted);
         // Without its cancel persisted, it is refused.
         assert.strictEqual(yield* parkedRetire, "contended");
@@ -2456,6 +2458,376 @@ describe("pre-start parking, resume and cancel", () => {
             yield* admission.claim({ assignmentId: "subject" }).pipe(Effect.orDie),
             { type: "stale" },
           );
+        }),
+      ),
+  );
+});
+
+/** Raw ownership rows of root-s, as another transaction would have left them. */
+const extraRows = {
+  slot: sqlRun(
+    (sql) => sql`INSERT INTO fd_assistant_slots
+    (root_delivery_id, assignment_id, state, entry_seq, granted_at)
+    VALUES ('root-s', 'subject', 'held', 7000, ${at})`,
+  ),
+  admission: sqlRun(
+    (sql) =>
+      sql`INSERT INTO fd_assistant_admissions ${sql.insert({
+        admission_id: "extra-row",
+        root_delivery_id: "root-s",
+        assignment_id: "subject",
+        kind: "effect",
+        delivery_id: "root-s",
+        effect_id: 1,
+        instance_id: "a-dead-process",
+        state: "dispatched",
+        entry_seq: 7001,
+        created_at: at,
+        updated_at: at,
+      })}`,
+  ),
+  demand: sqlRun(
+    (sql) =>
+      sql`INSERT INTO fd_assistant_admission_demands ${sql.insert({
+        seq: 7002,
+        root_delivery_id: "root-s",
+        assignment_id: "subject",
+        delivery_id: "root-s",
+        kind: "effect",
+        state: "waiting",
+        effect_id: 1,
+        overtaken: 0,
+        requested_at: at,
+      })}`,
+  ),
+  clear: sqlRun((sql) =>
+    Effect.all([
+      sql`DELETE FROM fd_assistant_slots WHERE root_delivery_id = 'root-s'`,
+      sql`DELETE FROM fd_assistant_admissions WHERE root_delivery_id = 'root-s'`,
+      sql`DELETE FROM fd_assistant_admission_demands WHERE root_delivery_id = 'root-s'`,
+    ]),
+  ),
+};
+
+/** A pre-start root parked by a stop, its claim's slot released. */
+const parked = Effect.gen(function* () {
+  const admission = yield* service;
+  const admitted = yield* claimedStopped;
+  yield* admission.markDispatched(admitted).pipe(Effect.orDie);
+  assert.strictEqual(yield* park(admitted), "parked");
+});
+
+/** Runs `operation` once with each single extra ownership row, expecting it to change nothing. */
+const refusedWithEachExtraRow = <A>(
+  rowsToTry: ReadonlyArray<"slot" | "admission" | "demand">,
+  operation: Effect.Effect<A, never, HandoffAdmission.HandoffAdmission | SqlClient.SqlClient>,
+  refused: A,
+) =>
+  Effect.gen(function* () {
+    for (const extra of rowsToTry) {
+      yield* extraRows[extra];
+      const before = yield* snapshot;
+      assert.deepStrictEqual(yield* operation, refused, extra);
+      assert.deepStrictEqual(yield* snapshot, before, extra);
+      yield* extraRows.clear;
+    }
+  });
+
+describe("pre-start refusals, one ownership row at a time", () => {
+  it.effect("refuses a resume re-entry while a slot or an admission row alone exists", () =>
+    withAdmission(() =>
+      Effect.gen(function* () {
+        const admission = yield* service;
+        yield* parked;
+        // Stopped, active and linked: only the extra row refuses it.
+        const resume = admission
+          .resumeReentry({ root: "root-s", work: freshRead("subject") })
+          .pipe(Effect.orDie);
+        yield* refusedWithEachExtraRow(["slot", "admission"], resume, { type: "contended" });
+        assert.deepStrictEqual(yield* resume, { type: "queued" });
+      }),
+    ),
+  );
+
+  it.effect("refuses a re-claim while a slot, an admission row or a demand alone exists", () =>
+    withAdmission(() =>
+      Effect.gen(function* () {
+        const admission = yield* service;
+        yield* parked;
+        yield* admission
+          .resumeReentry({ root: "root-s", work: freshRead("subject") })
+          .pipe(Effect.orDie);
+        // Queued, active, control none and at the free head: only the extra row refuses it.
+        const reclaim = admission.claim({ assignmentId: "subject" }).pipe(Effect.orDie);
+        yield* refusedWithEachExtraRow(["slot", "admission", "demand"], reclaim, {
+          type: "stale",
+        });
+        assert.strictEqual((yield* reclaim).type, "claimed");
+      }),
+    ),
+  );
+
+  it.effect(
+    "refuses a parked cancel's retirement while a slot, an admission or a demand exists",
+    () =>
+      withAdmission(() =>
+        Effect.gen(function* () {
+          const admission = yield* service;
+          yield* parked;
+          yield* setControl("cancel");
+          const retire = admission
+            .retirePreDelivery({ root: "root-s", reason: "abandoned", shape: { type: "parked" } })
+            .pipe(Effect.orDie);
+          yield* refusedWithEachExtraRow(["slot", "admission", "demand"], retire, "contended");
+          assert.strictEqual(yield* retire, "retired");
+        }),
+      ),
+  );
+});
+
+describe("dispatch lifetime", () => {
+  it.effect("never admits a turn again while this instance still dispatches it", () =>
+    Effect.flatMap(pausingProbe, (paused) =>
+      withAdmission(
+        () =>
+          Effect.gen(function* () {
+            const admission = yield* service;
+            const subject = yield* seed("subject", {
+              state: "running",
+              root: "root-s",
+              slot: "held",
+            });
+            const question = turns.question();
+            const present = (label: string, ran: Array<string>) =>
+              admission.dispatchAdmitted(
+                admission.decideTurn({
+                  root: "root-s",
+                  provenance: "factory",
+                  turn: question,
+                  work: subject.work,
+                }),
+                () => Effect.sync(() => void ran.push(label)),
+              );
+            const ran: Array<string> = [];
+            paused.state.armed = true;
+            const first = yield* present("first", ran).pipe(Effect.orDie, Effect.forkChild);
+            const admitted = yield* Deferred.await(paused.entered);
+            paused.state.armed = false;
+
+            // Presented again while its dispatch is held: it runs nothing and takes over nothing.
+            const before = yield* snapshot;
+            const second = yield* present("second", ran).pipe(Effect.orDie);
+            assert.deepStrictEqual(second.decision, { type: "in_flight" });
+            assert.deepStrictEqual(yield* snapshot, before);
+            assert.strictEqual(
+              yield* admission.release("root-s", admitted.entrySeq).pipe(Effect.orDie),
+              "kept",
+            );
+
+            yield* Deferred.succeed(paused.go, undefined);
+            yield* Fiber.join(first);
+            assert.deepStrictEqual(ran, ["first"]);
+            assert.deepStrictEqual(
+              (yield* admissionsOf("root-s")).map(({ state, entry_seq }) => [state, entry_seq]),
+              [["dispatched", admitted.entrySeq]],
+            );
+            assert.strictEqual(
+              yield* admission.release("root-s", admitted.entrySeq).pipe(Effect.orDie),
+              "released",
+            );
+          }).pipe(Effect.ensuring(Deferred.succeed(paused.go, undefined))),
+        paused.probe,
+      ),
+    ),
+  );
+
+  it.effect("marks only the admission generation a dispatch belongs to", () =>
+    withAdmission(() =>
+      Effect.gen(function* () {
+        const admission = yield* service;
+        const subject = yield* seed("subject", { state: "running", root: "root-s", slot: "held" });
+        const question = turns.question();
+        const decideQuestion = admission.decideTurn({
+          root: "root-s",
+          provenance: "factory",
+          turn: question,
+          work: subject.work,
+        });
+        const { decision: first } = yield* admission
+          .dispatchAdmitted(decideQuestion, () => Effect.void)
+          .pipe(Effect.orDie);
+        if (first.type !== "admitted") return assert.fail("The question was not admitted.");
+        // Dispatched, it may be admitted again: its row is taken over by a new generation.
+        const second = yield* decideQuestion.pipe(Effect.orDie);
+        if (second.type !== "admitted") return assert.fail("The question was not admitted again.");
+        assert.strictEqual(second.admitted.admissionId, first.admitted.admissionId);
+        assert.isAbove(second.admitted.entrySeq, first.admitted.entrySeq);
+        // The earlier dispatch's end settles nothing of the later admission.
+        yield* admission.markDispatched(first.admitted).pipe(Effect.orDie);
+        assert.deepStrictEqual(
+          (yield* admissionsOf("root-s")).map(({ state }) => state),
+          ["dispatching"],
+        );
+        assert.strictEqual(
+          yield* admission.release("root-s", second.admitted.entrySeq).pipe(Effect.orDie),
+          "kept",
+        );
+        yield* admission.markDispatched(second.admitted).pipe(Effect.orDie);
+        assert.strictEqual(
+          yield* admission.release("root-s", second.admitted.entrySeq).pipe(Effect.orDie),
+          "released",
+        );
+      }),
+    ),
+  );
+
+  it.effect(
+    "dispatches an admission whose fiber is interrupted at the probe before marking it",
+    () =>
+      Effect.flatMap(pausingProbe, (paused) =>
+        withAdmission(
+          () =>
+            Effect.gen(function* () {
+              const admission = yield* service;
+              const subject = yield* seed("subject", {
+                state: "running",
+                root: "root-s",
+                slot: "held",
+              });
+              const ran: Array<string> = [];
+              paused.state.armed = true;
+              const fiber = yield* admission
+                .dispatchAdmitted(
+                  admission.enter(
+                    { root: "root-s", deliveryId: "root-s", effectId: 1, fresh: true },
+                    subject.work,
+                  ),
+                  () => Effect.sync(() => void ran.push("dispatched")),
+                )
+                .pipe(Effect.orDie, Effect.forkChild);
+              const admitted = yield* Deferred.await(paused.entered);
+              // The interrupt is sent now and waits for the region to end.
+              const interrupting = yield* Fiber.interrupt(fiber).pipe(
+                Effect.forkChild({ startImmediately: true }),
+              );
+              assert.isUndefined(interrupting.pollUnsafe());
+              assert.deepStrictEqual(ran, []);
+              assert.deepStrictEqual(
+                (yield* admissionsOf("root-s")).map(({ state }) => state),
+                ["dispatching"],
+              );
+              assert.strictEqual(
+                yield* admission.release("root-s", admitted.entrySeq).pipe(Effect.orDie),
+                "kept",
+              );
+              yield* Deferred.succeed(paused.go, undefined);
+              yield* Fiber.join(interrupting);
+              assert.deepStrictEqual(ran, ["dispatched"]);
+              assert.deepStrictEqual(
+                (yield* admissionsOf("root-s")).map(({ state }) => state),
+                ["dispatched"],
+              );
+            }).pipe(Effect.ensuring(Deferred.succeed(paused.go, undefined))),
+          paused.probe,
+        ),
+      ),
+  );
+});
+
+describe("kept native redelivery", () => {
+  /** A native wake's kept dispatch, counting its runs and signalling each. */
+  const keptDispatch = Effect.gen(function* () {
+    const runs = { count: 0, done: yield* Deferred.make<void>() };
+    const dispatch = Effect.suspend(() => {
+      runs.count += 1;
+      return Deferred.succeed(runs.done, undefined);
+    }).pipe(Effect.asVoid);
+    return { runs, kept: { dispatch } satisfies HandoffAdmission.KeptDispatch };
+  });
+
+  it.effect("blocks a reserved native wake whose authority was revoked since its reservation", () =>
+    withAdmission(() =>
+      Effect.gen(function* () {
+        const admission = yield* service;
+        const { runs, kept } = yield* keptDispatch;
+        const demand = yield* reservedDemand(turns.native(), kept);
+        yield* reviseSubject({ executionAuthorized: false });
+        // Revoked, it is refused before any read of the item.
+        assert.deepStrictEqual(yield* admission.redeliverNative(demand.id).pipe(Effect.orDie), {
+          type: "blocked",
+          category: "revoked",
+        });
+        assert.strictEqual(runs.count, 0);
+        assert.isUndefined(yield* slotOf("root-s"));
+        assert.deepStrictEqual(yield* admissionsOf("root-s"), []);
+        const [blocked] = yield* demandsOf("root-s");
+        assert.deepStrictEqual(
+          { state: blocked?.state, blockedReason: blocked?.blockedReason },
+          { state: "waiting", blockedReason: "revoked" },
+        );
+        // Its dispatch is still kept: authorized again and granted, it runs once.
+        yield* admission.pruneKept.pipe(Effect.orDie);
+        yield* reviseSubject({ executionAuthorized: true });
+        assert.strictEqual(
+          yield* admission
+            .recheckBlocked({ root: "root-s", work: freshRead("subject"), force: true })
+            .pipe(Effect.orDie),
+          1,
+        );
+        assert.strictEqual(
+          (yield* admission.reserve(blocked!.id, freshRead("subject")).pipe(Effect.orDie)).type,
+          "reserved",
+        );
+        const asked = yield* admission.redeliverNative(blocked!.id).pipe(Effect.orDie);
+        assert.strictEqual(asked.type, "needs_work");
+        assert.deepStrictEqual(
+          yield* admission.redeliverNative(blocked!.id, freshRead("subject")).pipe(Effect.orDie),
+          { type: "dispatched" },
+        );
+        yield* Deferred.await(runs.done);
+        assert.strictEqual(runs.count, 1);
+        assert.strictEqual((yield* slotOf("root-s"))?.state, "held");
+        assert.deepStrictEqual(yield* demandsOf("root-s"), []);
+      }),
+    ),
+  );
+
+  it.effect(
+    "blocks a reserved native wake whose item changed or is unreadable since its reservation",
+    () =>
+      withAdmission(() =>
+        Effect.gen(function* () {
+          const admission = yield* service;
+          const { runs, kept } = yield* keptDispatch;
+          const demand = yield* reservedDemand(turns.native(), kept);
+          const asked = yield* admission.redeliverNative(demand.id).pipe(Effect.orDie);
+          // The item it names is the root's, frozen in its link.
+          assert.deepStrictEqual<unknown>(asked, {
+            type: "needs_work",
+            item: { sourceId: "source-1", itemId: "item-subject" },
+          });
+          // Asking writes nothing: the reservation still waits for the read.
+          assert.strictEqual((yield* slotOf("root-s"))?.state, "reserved");
+          assert.deepStrictEqual(
+            yield* admission
+              .redeliverNative(demand.id, { type: "read", fingerprint: "edited", status: "todo" })
+              .pipe(Effect.orDie),
+            { type: "blocked", category: "scope_changed" },
+          );
+          assert.strictEqual(runs.count, 0);
+          assert.isUndefined(yield* slotOf("root-s"));
+          assert.deepStrictEqual(yield* admissionsOf("root-s"), []);
+          assert.strictEqual((yield* demandsOf("root-s"))[0]?.blockedReason, "scope_changed");
+          // Reserved again with the item unreadable at its conversion: blocked again.
+          yield* admission
+            .recheckBlocked({ root: "root-s", work: freshRead("subject"), force: true })
+            .pipe(Effect.orDie);
+          yield* admission.reserve(demand.id, freshRead("subject")).pipe(Effect.orDie);
+          assert.deepStrictEqual(
+            yield* admission.redeliverNative(demand.id, { type: "unreadable" }).pipe(Effect.orDie),
+            { type: "blocked", category: "unreadable" },
+          );
+          assert.strictEqual(runs.count, 0);
         }),
       ),
   );

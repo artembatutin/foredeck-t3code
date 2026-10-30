@@ -167,15 +167,16 @@ export class HandoffRedeliveryError extends Schema.TaggedError<HandoffRedelivery
  * importing core's producers: the bridge feature provides it where the server is composed. A
  * question goes through its reactor, which presents it to the gate again (`moot` once it needs no
  * answer, and the reservation is gone); a completion is offered again on the continuation
- * worker's shared queue; a native wake runs the dispatch the gate kept, or is `lost` when none is
- * kept here. A pull request wake or usage-limit resume needs nothing: its producer presents it
+ * worker's shared queue; a native wake runs the dispatch the gate kept once the root's authority
+ * and a fresh read of its item confirm it (`blocked`, waiting, otherwise), or is `lost` when none
+ * is kept here. A pull request wake or usage-limit resume needs nothing: its producer presents it
  * again by itself. The default redelivers nothing, so a reservation waits for its lease.
  */
 export class HandoffRedelivery extends Context.Reference<{
   readonly redeliver: (
     demand: Demand,
   ) => Effect.Effect<
-    "dispatched" | "offered" | "deferred" | "moot" | "lost" | "none",
+    "dispatched" | "offered" | "deferred" | "blocked" | "moot" | "lost" | "none",
     HandoffRedeliveryError
   >;
 }>("t3/fd/assistant/HandoffRedelivery", {

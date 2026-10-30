@@ -48,6 +48,8 @@ export interface Managed {
   readonly assignmentId: string;
   readonly ideaId: string;
   readonly manager: ThreadId;
+  /** The thread the assignment's stored dispatch names, which the assistant's tick reads. */
+  readonly dispatchThread: string;
   /** The item's fingerprint the assistant authorized, as the root's link freezes it. */
   readonly fingerprint: string;
 }
@@ -205,6 +207,7 @@ export const manage = (
       assignmentId,
       ideaId,
       manager: manager.threadId,
+      dispatchThread: `assignment-thread-${managers}`,
       fingerprint: item.fingerprint,
     } satisfies Managed;
   }).pipe(Effect.orDie);
