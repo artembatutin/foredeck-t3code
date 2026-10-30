@@ -3027,3 +3027,192 @@ describe("revocation of work already waiting", () => {
     ),
   );
 });
+
+/** Fails every dispatched mark until `allowMarks`, as a failing write would. */
+const refuseMarks = sqlRun(
+  (sql) => sql`CREATE TRIGGER refuse_mark
+  BEFORE UPDATE OF state ON fd_assistant_admissions WHEN NEW.state = 'dispatched'
+  BEGIN SELECT RAISE(ABORT, 'refused'); END`,
+);
+const allowMarks = sqlRun((sql) => sql`DROP TRIGGER refuse_mark`);
+
+describe("a dispatched mark that fails", () => {
+  it.effect("marks a finished dispatch again once writes work, without running it twice", () =>
+    Effect.flatMap(pausingProbe, (paused) =>
+      withAdmission(
+        () =>
+          Effect.gen(function* () {
+            const admission = yield* service;
+            const subject = yield* seed("subject", {
+              state: "running",
+              root: "root-s",
+              slot: "held",
+            });
+            yield* fill(1);
+            yield* seed("queued", { queued: true });
+            const runs = { count: 0 };
+            const run = () => Effect.sync(() => void (runs.count += 1));
+            const effect = (effectId: number) =>
+              admission.enter(
+                { root: "root-s", deliveryId: "root-s", effectId, fresh: true },
+                subject.work,
+              );
+
+            // The dispatch returns; its mark fails, and the row still reads as dispatching.
+            yield* refuseMarks;
+            const finished = yield* admission.dispatchAdmitted(effect(1), run).pipe(Effect.orDie);
+            assert.strictEqual(finished.decision.type, "proceed");
+            assert.strictEqual(runs.count, 1);
+            assert.deepStrictEqual(
+              (yield* admissionsOf("root-s")).map(({ state }) => state),
+              ["dispatching"],
+            );
+            // While marks still fail, nothing is judged: the pass and the release fail.
+            const entry = (yield* slotOf("root-s"))!.entry_seq;
+            const pass = yield* admission
+              .settleAdmissions("root-s", () => Effect.succeed("ended" as const))
+              .pipe(Effect.flip);
+            assert.strictEqual(pass._tag, "HandoffAdmissionError");
+            assert.strictEqual(
+              (yield* admission.release("root-s", entry).pipe(Effect.flip))._tag,
+              "HandoffAdmissionError",
+            );
+            assert.strictEqual((yield* slotOf("root-s"))?.state, "held");
+
+            // Writes work again; another effect is admitted and held at its probe, really active.
+            yield* allowMarks;
+            paused.state.armed = true;
+            const active = yield* admission
+              .dispatchAdmitted(effect(2), run)
+              .pipe(Effect.orDie, Effect.forkChild);
+            const admitted = yield* Deferred.await(paused.entered);
+            paused.state.armed = false;
+            // The pass marks the finished generation and deletes it, never running it again;
+            // the active one still holds the slot.
+            assert.deepStrictEqual(
+              yield* admission
+                .settleAdmissions("root-s", () => Effect.succeed("ended" as const))
+                .pipe(Effect.orDie),
+              { entrySeq: admitted.entrySeq, busy: true, unknown: false },
+            );
+            assert.deepStrictEqual(
+              (yield* admissionsOf("root-s")).map(({ admission_id, state }) => [
+                admission_id,
+                state,
+              ]),
+              [[admitted.admissionId, "dispatching"]],
+            );
+            assert.strictEqual(runs.count, 1);
+            assert.strictEqual(
+              yield* admission.release("root-s", admitted.entrySeq).pipe(Effect.orDie),
+              "kept",
+            );
+            assert.strictEqual((yield* admission.next.pipe(Effect.orDie)).free, 0);
+            assert.deepStrictEqual(
+              yield* admission
+                .claim({ assignmentId: "queued", deliveryId: "root-q" })
+                .pipe(Effect.orDie),
+              { type: "stale" },
+            );
+
+            // Once that one returns too, the slot goes and the waiting assignment is claimed.
+            yield* Deferred.succeed(paused.go, undefined);
+            yield* Fiber.join(active);
+            assert.strictEqual(runs.count, 2);
+            const settled = yield* admission
+              .settleAdmissions("root-s", () => Effect.succeed("ended" as const))
+              .pipe(Effect.orDie);
+            assert.isFalse(settled.busy);
+            assert.strictEqual(
+              yield* admission.release("root-s", settled.entrySeq!).pipe(Effect.orDie),
+              "released",
+            );
+            assert.strictEqual((yield* admission.next.pipe(Effect.orDie)).free, 1);
+            assert.strictEqual(
+              (yield* admission
+                .claim({ assignmentId: "queued", deliveryId: "root-q" })
+                .pipe(Effect.orDie)).type,
+              "claimed",
+            );
+          }).pipe(Effect.ensuring(Deferred.succeed(paused.go, undefined))),
+        paused.probe,
+      ),
+    ),
+  );
+
+  it.effect("takes a finished turn whose mark failed as no longer in flight, by generation", () =>
+    withAdmission(() =>
+      Effect.gen(function* () {
+        const admission = yield* service;
+        const subject = yield* seed("subject", { state: "running", root: "root-s", slot: "held" });
+        const question = turns.question();
+        const present = () =>
+          admission
+            .dispatchAdmitted(
+              admission.decideTurn({
+                root: "root-s",
+                provenance: "factory",
+                turn: question,
+                work: subject.work,
+              }),
+              () => Effect.void,
+            )
+            .pipe(Effect.orDie);
+        yield* refuseMarks;
+        const first = yield* present();
+        if (first.decision.type !== "admitted")
+          return assert.fail("The question was not admitted.");
+        // Its dispatch returned: presented again, it is admitted again, not held as in flight.
+        const second = yield* present();
+        if (second.decision.type !== "admitted") {
+          return assert.fail("The question was held as in flight.");
+        }
+        assert.isAbove(second.decision.admitted.entrySeq, first.decision.admitted.entrySeq);
+        yield* allowMarks;
+        // Both owed marks are flushed by generation: the earlier is superseded, the later marked.
+        const settled = yield* admission
+          .settleAdmissions("root-s", () => Effect.succeed("ended" as const))
+          .pipe(Effect.orDie);
+        assert.deepStrictEqual(settled, {
+          entrySeq: second.decision.admitted.entrySeq,
+          busy: false,
+          unknown: false,
+        });
+        assert.deepStrictEqual(yield* admissionsOf("root-s"), []);
+      }),
+    ),
+  );
+
+  it.effect("parks a claim whose mark failed once writes work", () =>
+    withAdmission(() =>
+      Effect.gen(function* () {
+        const admission = yield* service;
+        yield* seed("subject", { queued: true });
+        yield* refuseMarks;
+        const { decision } = yield* admission
+          .dispatchAdmitted(
+            admission.claim({ assignmentId: "subject", deliveryId: "root-s" }),
+            () => Effect.void,
+          )
+          .pipe(Effect.orDie);
+        if (decision.type !== "claimed") return assert.fail("The claim was not made.");
+        yield* setControl("stop");
+        // While marks fail, parking fails rather than reading the claim as still in flight.
+        assert.strictEqual(
+          (yield* admission
+            .parkPreStart({
+              root: "root-s",
+              admissionId: decision.admitted.admissionId,
+              entrySeq: decision.admitted.entrySeq,
+            })
+            .pipe(Effect.flip))._tag,
+          "HandoffAdmissionError",
+        );
+        yield* allowMarks;
+        assert.strictEqual(yield* park(decision.admitted), "parked");
+        assert.isUndefined(yield* slotOf("root-s"));
+        assert.strictEqual((yield* assignmentOf("subject")).state, "stopped");
+      }),
+    ),
+  );
+});

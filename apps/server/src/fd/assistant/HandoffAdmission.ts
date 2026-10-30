@@ -341,7 +341,8 @@ export class HandoffAdmission extends Context.Service<
      * Runs `decide`, an admitting operation, and for its admission `dispatch`: the admitted probe,
      * then the dispatch, and that admission marked dispatched once the dispatch returns, however
      * it ends. The whole region from the commit to the mark is uninterruptible, so an admission is
-     * never marked dispatched with its dispatch not run.
+     * never marked dispatched with its dispatch not run. A mark that fails is retried, never the
+     * dispatch, before the release pass, a release or a pre-start operation next judges the root.
      */
     readonly dispatchAdmitted: <
       D extends { readonly type: string; readonly admitted?: Admitted | undefined },
@@ -448,7 +449,8 @@ export class HandoffAdmission extends Context.Service<
      * another instance's counts as dispatched. A dispatched claim, effect or delegation is
      * deleted, since its work is visible as the family's by then; a dispatched automatic turn is
      * deleted once `runState` shows its run ended or never made, is busy while it is live, and
-     * unknown when that read fails.
+     * unknown when that read fails. A dispatch this instance finished whose mark failed is marked
+     * first; a mark failing again fails the pass, which then judges nothing.
      */
     readonly settleAdmissions: <E>(
       root: string,
@@ -745,6 +747,14 @@ const make = Effect.gen(function* () {
     string,
     KeptDispatch & { readonly root: string; readonly threadId: string; pending: boolean }
   >();
+  /**
+   * Admissions whose dispatch returned but whose dispatched mark failed, by generation. Their
+   * rows still read as this instance's dispatches, so each is marked again before ownership is
+   * next judged; the dispatch itself never runs again.
+   */
+  const unmarked = new Map<string, Admitted>();
+  const generationOf = (admitted: Pick<Admitted, "admissionId" | "entrySeq">) =>
+    `${admitted.admissionId}:${admitted.entrySeq}`;
 
   const now = Effect.map(DateTime.now, DateTime.formatIso);
   const minutesFromNow = (minutes: number) =>
@@ -810,14 +820,20 @@ const make = Effect.gen(function* () {
       FROM fd_assistant_admissions WHERE root_delivery_id = ${root}`;
   /**
    * Whether this instance still dispatches an admission of the turn. Another one would take over
-   * its row, and the earlier dispatch's end could then settle the later admission.
+   * its row, and the earlier dispatch's end could then settle the later admission. A dispatch
+   * that returned and only awaits its mark is not in flight.
    */
   const turnInFlight = (threadId: string, messageId: string) =>
     Effect.map(
-      sql<{ readonly found: number }>`SELECT 1 AS found FROM fd_assistant_admissions
+      sql<{ readonly admission_id: string; readonly entry_seq: number }>`
+        SELECT admission_id, entry_seq FROM fd_assistant_admissions
         WHERE kind = 'automatic_turn' AND thread_id = ${threadId} AND message_id = ${messageId}
           AND state = 'dispatching' AND instance_id = ${instanceId}`,
-      (rows) => rows.length > 0,
+      (rows) =>
+        rows.some(
+          (row) =>
+            !unmarked.has(generationOf({ admissionId: row.admission_id, entrySeq: row.entry_seq })),
+        ),
     );
   const demandCount = (root: string) =>
     Effect.map(
@@ -1396,13 +1412,37 @@ const make = Effect.gen(function* () {
           AND state = 'dispatching'`,
     ).pipe(Effect.asVoid, failed("dispatched"));
 
-  /** Marks a dispatch's admission dispatched; nothing would try again, so a failure is logged. */
+  /**
+   * Marks a dispatch's admission dispatched once the dispatch returned. A mark that fails is kept
+   * as owed, for `flushUnmarked` to retry, so the finished dispatch never holds the slot.
+   */
   const settleDispatch = (admitted: Admitted) =>
     markDispatched(admitted).pipe(
       Effect.catchCause((cause) =>
-        Effect.logWarning("the assistant could not mark an admission dispatched", cause),
+        Effect.sync(() => void unmarked.set(generationOf(admitted), admitted)).pipe(
+          Effect.andThen(
+            Effect.logWarning(
+              "the assistant could not mark an admission dispatched; it is retried",
+              cause,
+            ),
+          ),
+        ),
       ),
     );
+
+  /**
+   * Marks each dispatch this instance finished but could not mark, by its own generation, before
+   * ownership is judged. A mark that fails again stays owed and fails the caller, which judges
+   * nothing until it succeeds; a generation a later admission took over is marked no more.
+   */
+  const flushUnmarked = Effect.suspend(() =>
+    Effect.forEach(
+      Array.from(unmarked),
+      ([generation, admitted]) =>
+        Effect.tap(markDispatched(admitted), () => Effect.sync(() => unmarked.delete(generation))),
+      { discard: true },
+    ),
+  );
 
   /** The admitted probe, then the dispatch, then its admission marked dispatched. */
   const runAdmitted = <A, E, R>(admitted: Admitted, dispatch: Effect.Effect<A, E, R>) =>
@@ -2247,6 +2287,7 @@ const make = Effect.gen(function* () {
 
   const settleAdmissions: HandoffAdmission["Service"]["settleAdmissions"] = (root, runState) =>
     Effect.gen(function* () {
+      yield* flushUnmarked;
       const slot = yield* readSlot(root).pipe(failed("release", root));
       const rows = yield* sql<
         AdmissionRow & { readonly thread_id: string | null; readonly message_id: string | null }
@@ -2289,25 +2330,28 @@ const make = Effect.gen(function* () {
     });
 
   const release: HandoffAdmission["Service"]["release"] = (root, entrySeq) =>
-    Effect.gen(function* () {
-      const slot = yield* readSlot(root);
-      if (slot?.state !== "held" || slot.entry_seq !== entrySeq) return "kept" as const;
-      // Another instance's dispatching row is a dead process's, taken as dispatched.
-      const dispatching = (yield* admissionsOf(root)).some(
-        (row) => row.state === "dispatching" && row.instance_id === instanceId,
-      );
-      if (dispatching) return "kept" as const;
-      yield* sql`DELETE FROM fd_assistant_slots
+    Effect.andThen(
+      flushUnmarked,
+      Effect.gen(function* () {
+        const slot = yield* readSlot(root);
+        if (slot?.state !== "held" || slot.entry_seq !== entrySeq) return "kept" as const;
+        // Another instance's dispatching row is a dead process's, taken as dispatched.
+        const dispatching = (yield* admissionsOf(root)).some(
+          (row) => row.state === "dispatching" && row.instance_id === instanceId,
+        );
+        if (dispatching) return "kept" as const;
+        yield* sql`DELETE FROM fd_assistant_slots
         WHERE root_delivery_id = ${root} AND state = 'held' AND entry_seq = ${entrySeq}`;
-      yield* history({
-        assignmentId: slot.assignment_id,
-        root,
-        kind: "release",
-        seq: null,
-        outcome: "released",
-      });
-      return "released" as const;
-    }).pipe(transact("release", root));
+        yield* history({
+          assignmentId: slot.assignment_id,
+          root,
+          kind: "release",
+          seq: null,
+          outcome: "released",
+        });
+        return "released" as const;
+      }).pipe(transact("release", root)),
+    );
 
   const fenceRoot = (root: string, reason: "completed" | "cancelled") =>
     Effect.gen(function* () {
@@ -2410,6 +2454,7 @@ const make = Effect.gen(function* () {
 
   const retirePreDelivery: HandoffAdmission["Service"]["retirePreDelivery"] = (input) =>
     Effect.gen(function* () {
+      yield* flushUnmarked;
       const committed = yield* Effect.gen(function* () {
         const root = yield* readRoot(input.root);
         if (root?.state !== "active") return false;
@@ -2474,40 +2519,43 @@ const make = Effect.gen(function* () {
     });
 
   const parkPreStart: HandoffAdmission["Service"]["parkPreStart"] = (input) =>
-    Effect.gen(function* () {
-      const root = yield* readRoot(input.root);
-      if (root?.state !== "active") return "contended" as const;
-      const link = yield* readLink(root.assignment_id);
-      const assignment = yield* assignmentState(root.assignment_id);
-      const slot = yield* readSlot(input.root);
-      const admissions = yield* admissionsOf(input.root);
-      const claimRow = admissions.find((row) => row.admission_id === input.admissionId);
-      if (
-        link?.delivery_id !== input.root ||
-        link.control !== "stop" ||
-        (assignment?.state !== "launching" && assignment?.state !== "launch-uncertain") ||
-        claimRow === undefined ||
-        !claimSettled(claimRow, input.entrySeq) ||
-        admissions.length !== 1 ||
-        slot?.state !== "held" ||
-        slot.entry_seq !== input.entrySeq ||
-        (yield* demandCount(input.root)) > 0
-      ) {
-        return "contended" as const;
-      }
-      yield* sql`DELETE FROM fd_assistant_admissions WHERE admission_id = ${input.admissionId}`;
-      yield* sql`DELETE FROM fd_assistant_slots
+    Effect.andThen(
+      flushUnmarked,
+      Effect.gen(function* () {
+        const root = yield* readRoot(input.root);
+        if (root?.state !== "active") return "contended" as const;
+        const link = yield* readLink(root.assignment_id);
+        const assignment = yield* assignmentState(root.assignment_id);
+        const slot = yield* readSlot(input.root);
+        const admissions = yield* admissionsOf(input.root);
+        const claimRow = admissions.find((row) => row.admission_id === input.admissionId);
+        if (
+          link?.delivery_id !== input.root ||
+          link.control !== "stop" ||
+          (assignment?.state !== "launching" && assignment?.state !== "launch-uncertain") ||
+          claimRow === undefined ||
+          !claimSettled(claimRow, input.entrySeq) ||
+          admissions.length !== 1 ||
+          slot?.state !== "held" ||
+          slot.entry_seq !== input.entrySeq ||
+          (yield* demandCount(input.root)) > 0
+        ) {
+          return "contended" as const;
+        }
+        yield* sql`DELETE FROM fd_assistant_admissions WHERE admission_id = ${input.admissionId}`;
+        yield* sql`DELETE FROM fd_assistant_slots
         WHERE root_delivery_id = ${input.root} AND entry_seq = ${input.entrySeq}`;
-      yield* mirror(root.assignment_id, "stopped", parkedNotice(input.root));
-      yield* history({
-        assignmentId: root.assignment_id,
-        root: input.root,
-        kind: "park",
-        seq: null,
-        outcome: "released",
-      });
-      return "parked" as const;
-    }).pipe(transact("prestart", input.root));
+        yield* mirror(root.assignment_id, "stopped", parkedNotice(input.root));
+        yield* history({
+          assignmentId: root.assignment_id,
+          root: input.root,
+          kind: "park",
+          seq: null,
+          outcome: "released",
+        });
+        return "parked" as const;
+      }).pipe(transact("prestart", input.root)),
+    );
 
   const resumeReentry: HandoffAdmission["Service"]["resumeReentry"] = (input) =>
     Effect.gen(function* () {
