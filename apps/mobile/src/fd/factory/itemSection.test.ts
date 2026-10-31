@@ -56,6 +56,13 @@ const section = (overrides: Partial<MobileFactoryDestination> = {}) =>
   });
 
 describe("mobileFactorySection", () => {
+  it("shows the shared slot wait, which is not a reason the delivery needs you", () => {
+    const view = section({ deliveries: [delivery("d1", { capacityWait: true })] });
+    expect(view?.capacityNote).toBe("Waiting for a project assistant slot");
+    expect(view?.needsYou).toBeUndefined();
+    expect(section()?.capacityNote).toBeUndefined();
+  });
+
   it.each([
     ["running", { stop: true, resume: false, cancel: true }],
     ["stopping", { stop: false, resume: true, cancel: true }],

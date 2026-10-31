@@ -1,3 +1,7 @@
+// Loads before ThreadManagementService: the fork's assistant role, which CodexAdapterV2 imports,
+// reaches the MCP services that import ThreadManagementService back. Entered there first, that
+// cycle runs OrchestratorMcpService before ThreadManagementService has defined its errors.
+import "./Adapters/CodexAdapterV2.ts";
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -66,6 +70,18 @@ import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryServic
 import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as PullRequestWatchReactor from "./PullRequestWatchReactor.ts";
+import { PULL_REQUEST_WATCH_WAKE_LIMIT } from "./pullRequestWatch.ts";
+import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
+import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
+import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
+import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import * as TerminalManager from "../terminal/Manager.ts";
+import * as TextGeneration from "../textGeneration/TextGeneration.ts";
+import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ProjectStore from "./ProjectStore.ts";
@@ -335,6 +351,168 @@ const layerProjectDeletionTest = Layer.mergeAll(
   Layer.provide(layerTestProviderInstanceRegistry),
   Layer.provide(layerGitWorkflowTest),
   Layer.provide(layerPlatformTest),
+);
+
+/** The production runtime over test stores, with `gate` as its automatic turn gate. */
+const layerProductionTest = (gate: (typeof AutomaticTurnGate.AutomaticTurnGate)["Service"]) =>
+  Layer.mergeAll(RuntimeLayer.layerProduction, RuntimeLayer.layerEventSink).pipe(
+    Layer.provideMerge(ProjectStore.layer),
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.succeed(AutomaticTurnGate.AutomaticTurnGate, gate),
+        Layer.mock(ProjectEnrichmentService.ProjectEnrichmentService)({
+          peek: () =>
+            Effect.succeed({
+              repositoryIdentity: null,
+              faviconPath: null,
+              repositoryIdentityResolved: false,
+            }),
+          invalidate: () => Effect.void,
+        }),
+        Layer.mock(WorkspacePaths.WorkspacePaths)({
+          normalizeWorkspaceRoot: (workspaceRoot) => Effect.succeed(workspaceRoot),
+        }),
+        // Secret requests read their salt when built.
+        Layer.mock(ServerSecretStore.ServerSecretStore)({
+          getOrCreateRandom: (_name, bytes) => Effect.succeed(new Uint8Array(bytes)),
+        }),
+        // Built by the production runtime, but never reached by these tests.
+        Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+        Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({}),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+        Layer.mock(TerminalManager.TerminalManager)({}),
+        Layer.mock(TextGeneration.TextGeneration)({}),
+        Layer.mock(WorktreeSetupTracker.WorktreeSetupTracker)({}),
+        layerGitWorkflowTest,
+      ),
+    ),
+    Layer.provide(McpSessionRegistryTestkit.layer),
+    Layer.provide(McpProviderSessions.layer),
+    Layer.provide(SqlitePersistence.layerMemory),
+    Layer.provide(layerCheckpointStoreTest),
+    Layer.provide(layerServerConfig),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(layerTestProviderInstanceRegistry),
+    Layer.provide(layerPlatformTest),
+  );
+
+it.effect("offers on the production continuation queue reach the continuation worker", () =>
+  Effect.gen(function* () {
+    const consults = yield* Queue.unbounded<AutomaticTurnGate.AutomaticTurn>();
+    const gate = AutomaticTurnGate.AutomaticTurnGate.of({
+      admit: (turn, dispatch) =>
+        Effect.map(dispatch, AutomaticTurnGate.ran).pipe(
+          Effect.tap(() => Queue.offer(consults, turn)),
+        ),
+      hand: (turn) =>
+        Queue.offer(consults, turn).pipe(Effect.as(AutomaticTurnGate.notNow("declined"))),
+    });
+    yield* Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+      const now = yield* DateTime.now;
+      const projectId = ProjectId.make("production-queue-project");
+      yield* seedProject({
+        projectId,
+        title: "Production queue",
+        workspaceRoot: process.cwd(),
+        defaultModelSelection: modelSelection,
+        createdAt: DateTime.formatIso(now),
+      });
+      const providerThreadId = ProviderThreadId.make("production-queue-provider-thread");
+      /** A parent whose run holds a cohort delivery that is `disposition`. */
+      const seedCohort = (name: string, disposition: "open" | "stopped") =>
+        Effect.gen(function* () {
+          const threadId = ThreadId.make(`production-queue-${name}`);
+          const runId = RunId.make(`production-queue-run-${name}`);
+          const messageId = MessageId.make(`production-queue-delivery-${name}`);
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make(`production-queue-create-${name}`),
+            threadId,
+            projectId,
+            title: "Delegating thread",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`production-queue-run-${name}`),
+                type: "run.updated",
+                threadId,
+                runId,
+                occurredAt: now,
+                payload: {
+                  id: runId,
+                  threadId,
+                  ordinal: 1,
+                  providerInstanceId: modelSelection.instanceId,
+                  modelSelection,
+                  providerThreadId,
+                  userMessageId: MessageId.make(`production-queue-user-${name}`),
+                  rootNodeId: NodeId.make(`production-queue-root-${name}`),
+                  activeAttemptId: null,
+                  status: "completed",
+                  requestedAt: now,
+                  startedAt: now,
+                  completedAt: now,
+                  checkpointId: null,
+                  contextHandoffId: null,
+                  delegatedCompletion: {
+                    disposition,
+                    nextGeneration: 2,
+                    delivery: {
+                      generation: 1,
+                      messageId,
+                      taskIds: [NodeId.make(`production-queue-task-${name}`)],
+                    },
+                  },
+                },
+              },
+            ],
+          });
+          const offer = requests.offer({
+            threadId,
+            providerThreadId,
+            driver,
+            detail: null,
+            delivery: "message_text",
+            delegatedCompletion: { parentRunId: runId, generation: 1, messageId },
+          });
+          const deliveries = Effect.map(orchestrator.getThreadProjection(threadId), (projection) =>
+            projection.runs.filter((run) => run.userMessageId === messageId),
+          );
+          return { threadId, messageId, offer, deliveries };
+        });
+      const current = yield* seedCohort("current", "open");
+      const closed = yield* seedCohort("closed", "stopped");
+
+      yield* current.offer;
+      yield* current.offer;
+      yield* closed.offer;
+      // Offers are taken in order, so once this wake is consulted the others are done.
+      yield* requests.offer({
+        threadId: closed.threadId,
+        providerThreadId,
+        driver,
+        detail: null,
+        messageId: MessageId.make("production-queue-marker"),
+      });
+      const delivered = yield* Queue.take(consults);
+      assert.equal(delivered.kind, "delegated_completion");
+      assert.equal(delivered.messageId, current.messageId);
+      assert.equal((yield* Queue.take(consults)).kind, "background_wake");
+      assert.lengthOf(yield* current.deliveries, 1);
+      assert.lengthOf(yield* closed.deliveries, 0);
+    }).pipe(Effect.provide(layerProductionTest(gate)));
+  }),
 );
 
 it.layer(layerProjectDeletionTest)("project deletion during thread commands", (it) => {
@@ -3163,6 +3341,203 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect.each(
+    (["checks", "unreadable", "closed", "comment-limit"] as const).flatMap((wake) =>
+      (["deferred", "declined", "error"] as const).map((answer) => [wake, answer] as const),
+    ),
+  )("a %s wake the gate answers with %s changes nothing and is asked again", ([wake, answer]) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const name = `${wake}-${answer}`;
+      const threadId = ThreadId.make(`runtime-pull-request-watch-gated-${name}`);
+      const projectId = ProjectId.make(`pr-watch-gated-project-${name}`);
+      yield* seedProject({
+        projectId,
+        title: "Watch gated",
+        workspaceRoot: "/workspace/watch-gated",
+        defaultModelSelection: null,
+        createdAt: "2026-10-01T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(`pr-watch-gated-create-${name}`),
+        threadId,
+        projectId,
+        title: "Watch gated",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      const key = { host: "github.com", repository: "pingdotgg/t3code", number: 21 };
+      const url = "https://github.com/pingdotgg/t3code/pull/21";
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make(`pr-watch-gated-start-${name}`),
+        threadId,
+        ...key,
+        watching: true,
+        link: { url, source: "agent" },
+      });
+      const watchOf = Effect.map(
+        orchestrator.getThreadShell(threadId),
+        (thread) => thread?.pullRequests?.[0]?.watch,
+      );
+      if (wake === "comment-limit") {
+        // One comment-only wake short of the limit, on the head and failure the host reports.
+        const started = (yield* watchOf)!;
+        yield* orchestrator.dispatch({
+          type: "thread.pull-request-watch.sync",
+          commandId: CommandId.make(`pr-watch-gated-near-limit-${name}`),
+          threadId,
+          ...key,
+          startedAt: started.startedAt,
+          watch: {
+            ...started,
+            headSha: "abc1234def",
+            failedChecks: ["lint"],
+            wakes: PULL_REQUEST_WATCH_WAKE_LIMIT - 1,
+          },
+        });
+      }
+      const before = yield* watchOf;
+      assert.isDefined(before);
+
+      const detail: PullRequestDetail = {
+        ...watchedPullRequestDetail({ projectId, number: key.number, at: "2026-10-02T12:00:00Z" }),
+        state: wake === "closed" ? "closed" : "open",
+      };
+      const remark: PullRequestComment = {
+        id: "remark-gated",
+        kind: "issue-comment",
+        author: { login: "reviewer", name: null, avatarUrl: null },
+        body: "Please rename this.",
+        createdAt: "2999-01-01T00:00:00.000Z",
+        url: null,
+        path: null,
+        reviewState: null,
+      };
+      let reads = 0;
+      let decision: "deferred" | "declined" | "error" | "admit" = answer;
+      const consults: Array<AutomaticTurnGate.AutomaticTurn> = [];
+      // Watches earlier tests left on share these sweeps; their wakes are left as they are.
+      const gate = AutomaticTurnGate.AutomaticTurnGate.of({
+        admit: (turn, dispatch) =>
+          Effect.gen(function* () {
+            if (turn.threadId !== threadId) return AutomaticTurnGate.notNow("deferred");
+            consults.push(turn);
+            if (decision === "admit") return AutomaticTurnGate.ran(yield* dispatch);
+            if (decision === "error") {
+              return yield* new AutomaticTurnGate.AutomaticTurnDecisionError({
+                kind: turn.kind,
+                thread: turn.threadId,
+                stage: "read",
+                cause: new Error("the manager could not be read"),
+              });
+            }
+            return AutomaticTurnGate.notNow(decision);
+          }),
+        hand: () => Effect.die("a pull request watch hands no native wake"),
+      });
+      const commands: Array<string> = [];
+      const recording = Orchestrator.OrchestratorV2.of({
+        ...orchestrator,
+        dispatch: (command) =>
+          Effect.sync(() => {
+            if ("threadId" in command && command.threadId === threadId) commands.push(command.type);
+          }).pipe(Effect.andThen(orchestrator.dispatch(command))),
+      });
+      const logged: Array<string> = [];
+      const capture = Logger.make(({ message }) => {
+        const [text, fields] = Array.isArray(message) ? message : [message];
+        const about = (fields as { readonly threadId?: unknown } | undefined)?.threadId;
+        if (typeof text === "string" && about === threadId) logged.push(text);
+      });
+      const reactor = yield* PullRequestWatchReactor.make.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            Layer.mock(PullRequestService.PullRequestService)({
+              detail: (reference) =>
+                Effect.suspend(() => {
+                  if (reference.projectId === projectId) reads += 1;
+                  return wake === "unreadable"
+                    ? Effect.die("host unreachable")
+                    : Effect.succeed(detail);
+                }),
+              activity: () =>
+                wake === "unreadable"
+                  ? Effect.die("host unreachable")
+                  : Effect.succeed({
+                      comments: wake === "comment-limit" ? [remark] : [],
+                      commentCount: wake === "comment-limit" ? 1 : 0,
+                      commentsTruncated: false,
+                      reviewThreads: [],
+                      commits: [],
+                    }),
+            }),
+          ),
+        ),
+        Effect.provideService(AutomaticTurnGate.AutomaticTurnGate, gate),
+        Effect.provideService(Orchestrator.OrchestratorV2, recording),
+      );
+      const sweep = reactor.sweep.pipe(Effect.provide(Logger.layer([capture])));
+      const unchanged = Effect.gen(function* () {
+        assert.deepEqual(yield* watchOf, before);
+        const records = yield* orchestrator.getThreadRecords(threadId, ["messages", "runs"]);
+        assert.deepEqual(records.messages, []);
+        assert.deepEqual(records.runs, []);
+        assert.notInclude(commands, "thread.pull-request-watch.sync");
+        assert.notInclude(logged, "pull request watch ended");
+      });
+
+      // An unreadable pull request is given up on only after repeated failed reads.
+      const passesToWake = wake === "unreadable" ? 8 : 1;
+      for (let pass = 0; pass < passesToWake; pass += 1) yield* sweep;
+      assert.lengthOf(consults, 1);
+      assert.deepEqual(consults[0], {
+        kind: "pull_request_wake",
+        threadId,
+        messageId: consults[0]!.messageId,
+        key: url,
+        pullRequest: { ...key, url },
+        watchStartedAt: before!.startedAt,
+        ending: wake === "checks" ? null : wake,
+      });
+      assert.match(consults[0]!.messageId, /^message:pr-watch:/);
+      yield* unchanged;
+
+      // Nothing remembers the pass: the next one reads the pull request and asks again.
+      const readsBefore = reads;
+      yield* sweep;
+      assert.equal(reads, readsBefore + 1);
+      assert.lengthOf(consults, 2);
+      yield* unchanged;
+      assert.equal(
+        logged.filter((text) => text === "pull request watch wake could not be decided").length,
+        answer === "error" ? 2 : 0,
+      );
+
+      // Admitted, the wake lands under the message it was presented with.
+      decision = "admit";
+      yield* sweep;
+      assert.lengthOf(consults, 3);
+      const { messages } = yield* orchestrator.getThreadRecords(threadId, ["messages"]);
+      assert.deepEqual(
+        messages.map((message) => message.id),
+        [consults[2]!.messageId],
+      );
+      assert.equal((yield* watchOf) === undefined, wake !== "checks");
+      assert.equal(
+        logged.filter((text) => text === "pull request watch ended").length,
+        wake === "checks" ? 0 : 1,
+      );
+    }),
+  );
+
   it.effect("persists rejected command receipts across retries", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -5721,6 +6096,199 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
         assert.equal(resumed.runs[1]?.status, "starting");
         assert.isFalse(resumed.runs[1]?.queueHeld);
       }
+    }),
+  );
+  it.effect("presents a due resume to the gate, and disarms it once declined", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make("recovery:gated");
+      const projectId = ProjectId.make("recovery:project:gated");
+      yield* seedProject({
+        projectId,
+        title: "Recovery project",
+        workspaceRoot: process.cwd(),
+        defaultModelSelection: modelSelection,
+        createdAt: DateTime.formatIso(yield* DateTime.now),
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("recovery:create:gated"),
+        threadId,
+        projectId,
+        title: "Limited thread",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("recovery:message:gated"),
+        threadId,
+        messageId: MessageId.make("recovery:message:gated"),
+        text: "Work on this.",
+        attachments: [],
+        dispatchMode: { type: "defer_start" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      const now = yield* DateTime.now;
+      const resetAt = DateTime.formatIso(DateTime.add(now, { minutes: 1 }));
+      yield* events.write({
+        commandId: CommandId.make("recovery:failure:gated"),
+        events: [
+          {
+            id: EventId.make("recovery:run:gated"),
+            type: "run.updated",
+            threadId,
+            occurredAt: now,
+            payload: { ...run, status: "failed", completedAt: now },
+          },
+          {
+            id: EventId.make("recovery:error:gated"),
+            type: "turn-item.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: TurnItemId.make("recovery:error:gated"),
+              type: "error",
+              threadId,
+              runId: run.id,
+              nodeId: run.rootNodeId,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 2,
+              status: "failed",
+              title: "Usage limit reached",
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+              failure: {
+                class: "usage_limit",
+                message: "Plan limit reached.",
+                code: "usageLimitExceeded",
+                retryable: null,
+                resetAt,
+              },
+            },
+          },
+        ],
+      });
+
+      let answer: "deferred" | "declined" = "deferred";
+      const consults: Array<AutomaticTurnGate.AutomaticTurn> = [];
+      const gate = AutomaticTurnGate.AutomaticTurnGate.of({
+        admit: (turn) =>
+          Effect.sync(() => {
+            consults.push(turn);
+            return AutomaticTurnGate.notNow(answer);
+          }),
+        hand: () => Effect.die("a usage-limit resume hands no native wake"),
+      });
+      const registered = yield* Deferred.make<Effect.Effect<void>>();
+      const layerWorker = UsageLimitRecoveryWorker.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(Scheduler.Scheduler)({
+              // Hands the sweep to the test to run, as the scheduler would each tick.
+              register: <E, R>(_name: string, runDueWork: Effect.Effect<void, E, R>) =>
+                Effect.gen(function* () {
+                  const context = yield* Effect.context<R>();
+                  yield* Deferred.succeed(
+                    registered,
+                    runDueWork.pipe(Effect.provideContext(context), Effect.orDie),
+                  );
+                }),
+            }),
+            ServerSettings.layerTest({ autoResumeLimitedThreads: true }),
+            Layer.succeed(AutomaticTurnGate.AutomaticTurnGate, gate),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const sweep = yield* Deferred.await(registered);
+        const current = Effect.map(orchestrator.getThreadProjection(threadId), (projection) => ({
+          recovery: projection.thread.limitRecovery,
+          runs: projection.runs.length,
+        }));
+
+        // Before the reset the sweep arms the recovery, which is no turn and asks nothing.
+        yield* sweep;
+        const armed = (yield* current).recovery;
+        assert.equal(armed?.autoResume, true);
+        assert.lengthOf(consults, 0);
+
+        // A deferred resume starts nothing, and the next sweep presents the same one again.
+        yield* TestClock.adjust("1 minute");
+        yield* sweep;
+        yield* sweep;
+        const identity = `${threadId}:${run.id}:${Date.parse(resetAt)}:${armed!.requestId}`;
+        const resume: AutomaticTurnGate.UsageLimitResumeTurn = {
+          kind: "usage_limit_resume",
+          threadId,
+          messageId: MessageId.make(`limit-resume:${identity}`),
+          key: `limit-resume:${identity}`,
+          usageLimitContinuationOfRunId: run.id,
+        };
+        assert.deepEqual(consults, [resume, resume]);
+        assert.deepEqual(yield* current, { recovery: armed, runs: 1 });
+
+        // A declined resume disarms the recovery once and is never presented again.
+        answer = "declined";
+        yield* sweep;
+        yield* sweep;
+        assert.deepEqual(consults, [resume, resume, resume]);
+        assert.deepEqual(yield* current, {
+          recovery: {
+            runId: run.id,
+            resetAt,
+            autoResume: false,
+            snooze: false,
+            requestId: CommandId.make(`limit-disarm:${identity}`),
+          },
+          runs: 1,
+        });
+
+        // The owner arms the same run and reset again: a new recovery, whose own decline
+        // disarms it in turn instead of replaying the first disarm.
+        yield* orchestrator.dispatch({
+          type: "thread.metadata.update",
+          commandId: CommandId.make("recovery:rearm:gated"),
+          threadId,
+          limitRecovery: { runId: run.id, resetAt, autoResume: true },
+        });
+        yield* sweep;
+        yield* sweep;
+        const rearmed = `${threadId}:${run.id}:${Date.parse(resetAt)}:recovery:rearm:gated`;
+        assert.deepEqual(consults.slice(3), [
+          {
+            ...resume,
+            messageId: MessageId.make(`limit-resume:${rearmed}`),
+            key: `limit-resume:${rearmed}`,
+          },
+        ]);
+        assert.deepEqual(yield* current, {
+          recovery: {
+            runId: run.id,
+            resetAt,
+            autoResume: false,
+            snooze: false,
+            requestId: CommandId.make(`limit-disarm:${rearmed}`),
+          },
+          runs: 1,
+        });
+        const shell = (yield* orchestrator.getShellSnapshot()).threads.find(
+          (thread) => thread.id === threadId,
+        );
+        assert.equal(shell?.lastErrorClass, "usage_limit");
+      }).pipe(Effect.provide(layerWorker));
     }),
   );
 });

@@ -173,6 +173,74 @@ it starts nothing listed after it and says the list was incomplete; check the so
 Like any delivery, it needs the project's verify command, and its threads never run with broader
 permissions than the task's agent.
 
+## Hand work over from the project assistant
+
+On desktop and web, the [project assistant](./composer.md#project-assistant) can deliver an idea
+you agreed on through Factory. Discussing it starts nothing; each step waits for you to ask:
+
+1. **Capture.** Ask the assistant to record the idea in Work. With `assistant_capture_work` it
+   writes the goal, acceptance criteria, constraints, decisions and open questions into one item.
+   If the project has several Work sources, say which to use. An idea Factory should plan into
+   tasks needs a Markdown source.
+2. **Review.** Read the item in Work. If you edit it or the idea changes, ask for a new capture:
+   a capture that changes the item withdraws your go-ahead, and an item edited since its capture
+   is not queued until you have decided which version stands.
+3. **Authorize.** Tell the assistant to go ahead. It saves your go-ahead with
+   `assistant_revise_brief` and queues the delivery with `assistant_assign`. The project needs a
+   verify command; open the project's settings and use **Factory**.
+
+The assistant's **Assignments** list shows where each delivery is and why, with links to its Work
+item, thread and pull request. The assistant can also stop, resume, retry or cancel it with
+`assistant_control`, and answer a live question from Factory's own running agent with
+`assistant_answer`. On mobile, a delivery's item and the Factory list show the same status and slot
+wait, but handing work over happens on desktop and web.
+
+### Slot waits
+
+The assistant runs two assignments at a time on an environment, in priority order, and an
+assignment that keeps being passed over goes first. A delivery holds its slot until it next rests:
+waiting at the plan gate, stopped, blocked, or with its pull request open and nothing left to do.
+When it has more to do and no slot is free, it shows **Waiting for a project assistant slot**. That
+asks nothing of you, and it starts by itself once a slot frees up.
+
+Stopping a delivery before Factory has started it frees its slot and keeps the delivery. **Resume**
+waits for a slot and starts that same delivery; **Cancel** ends it. **Retry** is for an assignment
+that failed or was cancelled, and starts a new delivery.
+
+### Follow-ups that wait
+
+Pull request feedback, a usage-limit resume, a delegated agent's question or result, and background
+work that finishes are follow-ups T3 starts on a delivery's threads by itself. A delivery's
+follow-up also needs a slot, so it can wait, and the assignment says which ones do:
+
+- **Unknown origin.** When T3 cannot tell whether a follow-up came from the delivery or from your
+  own turn on the thread, the notice says so and it counts as the delivery's. Your own messages
+  and their follow-ups never wait.
+- **Blocked.** A follow-up waits without taking a turn while the Work item changed, is closed or
+  cannot be read, or your go-ahead was withdrawn. It goes on once that is restored; cancelling the
+  assignment drops it.
+- **Lost background work.** Background work that finished while waiting does not survive a server
+  restart. The notice names the thread; open it and ask the agent to check that work.
+
+### When the delivery has ended
+
+Automatic work that arrives after a delivery ended is not done. Nothing acts on it, and the
+assignment's notice says what you can do: review the pull request yourself, answer a question in
+its thread, read a delegated result there, or retry the assignment for a new delivery. Messages you
+send on those threads still run.
+
+### What stays with you
+
+Agents on a delivery the assistant manages cannot message, start, schedule, hand off or watch other
+work, or answer a question when the answer would start a new turn. They delegate a subtask with
+`delegate_task`, which runs under the delivery's slot, or ask you to do it. Once the delivery has
+ended they cannot delegate either.
+
+Approving a parent's plan and merging the pull request stay yours: approve, edit or replan in the
+item's Factory section, and merge on your pull request's host. The assignment completes only after
+the merge and Factory's close-out, not when the agents finish, the review passes or the pull request
+opens. A pull request closed without merging cancels it.
+
 ## Follow a delivery
 
 The item's Factory section shows its current delivery: its status, the stage it is in, its branch

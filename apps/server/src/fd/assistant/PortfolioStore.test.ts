@@ -14,6 +14,7 @@ import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import type { AssignmentEvent } from "./portfolio.ts";
 import * as PortfolioStore from "./PortfolioStore.ts";
 import portfolioMigration from "./migration.ts";
+import * as ProjectAssistant from "./ProjectAssistant.ts";
 
 const PORTFOLIO_TABLES = [
   "fd_assistant_assignments",
@@ -41,9 +42,9 @@ const portfolioTables = (
     .filter((object) => object.type === "table" && isPortfolioObject(object.name))
     .map((object) => object.name);
 
-/** A full server persistence stack (migrations included) on one database file. */
+/** A full server persistence stack (migrations and the assistant ledger included) on one file. */
 const persistenceAt = (dbPath: string) =>
-  PortfolioStore.layer.pipe(
+  ProjectAssistant.layerPersistence.pipe(
     Layer.provideMerge(SqlitePersistence.layerFromPath(dbPath)),
     Layer.provide(NodeServices.layer),
   );
@@ -55,7 +56,9 @@ const tempDatabase = Effect.gen(function* () {
   return path.join(dir, "state.sqlite");
 });
 
-const memoryStore = PortfolioStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory));
+const memoryStore = ProjectAssistant.layerPersistence.pipe(
+  Layer.provideMerge(SqlitePersistence.layerMemory),
+);
 
 const alpha = ProjectId.make("project-alpha");
 

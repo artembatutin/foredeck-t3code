@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
+  MessageId,
   type ModelSelection,
   type OrchestrationV2RunStatus,
   type OrchestrationV2StoredEvent,
@@ -43,6 +44,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService } from "../work-management/index.ts";
+import * as FactoryAdmission from "./FactoryAdmission.ts";
 import * as FactoryChildren from "./FactoryChildren.ts";
 import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
@@ -58,7 +60,7 @@ import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import { advance } from "./pipeline/engine.ts";
 import { queuedDeliveryState } from "./pipeline/state.ts";
 import type { FactoryDeliveryState, FactoryEvent } from "./pipeline/state.ts";
-import type { FactoryAuthorItem } from "./prompts/author.ts";
+import { type FactoryAuthorItem, renderAuthorPrompt } from "./prompts/author.ts";
 import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 
@@ -463,6 +465,54 @@ describe("FactoryThreadEffects launches", () => {
         assert.strictEqual(attempt?.runId, firstRun);
       }),
     ),
+  );
+
+  it.effect(
+    "launches through core with the opening as before when nothing manages the root, never asking about it",
+    () => {
+      // Installed, and refusing every opening: only a managed root's openings are asked about.
+      const managed: Array<FactoryDeliveryId> = [];
+      const asked: Array<FactoryAdmission.FactoryOpening> = [];
+      const port: typeof FactoryAdmission.FactoryAdmission.Service = {
+        ...FactoryAdmission.FactoryAdmission.defaultValue(),
+        management: (root) => Effect.sync(() => (managed.push(root), "never")),
+        authorizeOpening: (opening) =>
+          Effect.sync(() => (asked.push(opening), { type: "refuse", category: "scope_changed" })),
+      };
+      return withWorld((world) =>
+        Effect.gen(function* () {
+          const { worktree } = yield* makeProject(world);
+          world.worktreePath = worktree;
+          yield* useSettings({ author: authorModel });
+          yield* insert();
+
+          yield* step({ type: "start" });
+          yield* drain;
+
+          // Core carries the opening, the author prompt as ever, and Factory sends no turn.
+          assert.deepStrictEqual(managed, [deliveryId]);
+          assert.deepStrictEqual(asked, []);
+          assert.deepStrictEqual(
+            world.launches.map(({ initialMessage }) => initialMessage),
+            [
+              {
+                messageId: MessageId.make(`factory-launch-message:${deliveryId}:1`),
+                text: renderAuthorPrompt({ item, branch }),
+                attachments: [],
+              },
+            ],
+          );
+          assert.deepStrictEqual(world.sends, []);
+          const state = yield* stored;
+          assert.strictEqual(state.threads.author, author);
+          assert.deepStrictEqual(state.awaiting, {
+            type: "run",
+            threadId: author,
+            runId: firstRun,
+          });
+        }),
+      ).pipe(Effect.provideService(FactoryAdmission.FactoryAdmission, port));
+    },
   );
 
   it.effect("launches a later thread in the recorded worktree from its HEAD", () =>

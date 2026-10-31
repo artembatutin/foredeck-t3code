@@ -1,3 +1,6 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- a synchronous hash keeps this module pure.
+import * as NodeCrypto from "node:crypto";
+
 import { IsoDateTime, ProjectId, TrimmedNonEmptyString } from "@t3tools/contracts";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -190,12 +193,12 @@ export const AssignmentState = Schema.Literals([
 ]);
 export type AssignmentState = typeof AssignmentState.Type;
 
-export const ExecutorKind = Schema.Literals(["foredeck", "looper"]);
+export const ExecutorKind = Schema.Literals(["foredeck", "looper", "factory"]);
 export type ExecutorKind = typeof ExecutorKind.Type;
 
 /** An exact identifier the executor returned for this attempt. */
 export const WorkerRef = Schema.Struct({
-  kind: Schema.Literals(["thread", "run", "looper-run"]),
+  kind: Schema.Literals(["thread", "run", "looper-run", "factory-delivery", "work-item"]),
   id: TrimmedNonEmptyString,
 });
 export type WorkerRef = typeof WorkerRef.Type;
@@ -263,9 +266,33 @@ export type AssignmentEvent = { readonly note?: string } & (
   | { readonly type: "resume" }
   | { readonly type: "fail" }
   | { readonly type: "retry" }
+  | { readonly type: "retry-delivery" }
   | { readonly type: "complete"; readonly evidence: ReadonlyArray<string> }
   | { readonly type: "cancel" }
+  | {
+      readonly type: "mirror";
+      readonly to: MirroredState;
+      readonly evidence?: ReadonlyArray<string>;
+      readonly workerRefs?: ReadonlyArray<WorkerRef>;
+    }
 );
+
+/**
+ * The states a Factory delivery's assignment shows, which `mirror` moves it into. Its assignment
+ * is a projection of the delivery Factory runs, so it moves where the delivery is rather than by
+ * the moves an ordinary worker's assignment takes; only the project assistant's admission of a
+ * managed root writes it.
+ */
+export const MIRRORED_STATES = [
+  "running",
+  "needs-input",
+  "stopping",
+  "stopped",
+  "failed",
+  "completed",
+  "cancelled",
+] as const satisfies ReadonlyArray<AssignmentState>;
+export type MirroredState = (typeof MIRRORED_STATES)[number];
 export type AssignmentEventType = AssignmentEvent["type"];
 
 const AssignmentRejectionReason = Schema.Literals([
@@ -336,10 +363,25 @@ const MOVES: {
     to: "failed",
   },
   retry: { from: ["failed"], to: "queued", requiresAuthorization: true },
+  // A Factory assignment's retry, for a new delivery once its root has ended; an ordinary worker's
+  // cancelled assignment stays cancelled.
+  "retry-delivery": { from: ["failed", "cancelled"], to: "queued", requiresAuthorization: true },
   complete: { from: ["running", "stopping", "awaiting-verification"], to: "completed" },
   cancel: {
     from: ["draft", "queued", "stopped", "failed", "awaiting-verification"],
     to: "cancelled",
+  },
+  // `to` is the event's own, for a Factory delivery's assignment that has not ended.
+  mirror: {
+    from: [
+      "queued",
+      "launching",
+      "launch-uncertain",
+      "running",
+      "needs-input",
+      "stopping",
+      "stopped",
+    ],
   },
 };
 
@@ -390,7 +432,7 @@ export function transitionAssignment(
 
   const next: Assignment = {
     ...assignment,
-    state: move.to ?? assignment.state,
+    state: event.type === "mirror" ? event.to : (move.to ?? assignment.state),
     progress: appendNote(assignment.progress, event.note, context.at),
     updatedAt: context.at,
   };
@@ -411,8 +453,18 @@ export function transitionAssignment(
       if (evidence.length === 0) return reject("missing-evidence");
       return Result.succeed({ ...next, evidence });
     }
+    case "mirror": {
+      const evidence = [...assignment.evidence, ...normalizeList(event.evidence ?? [])];
+      if (event.to === "completed" && evidence.length === 0) return reject("missing-evidence");
+      return Result.succeed({
+        ...next,
+        evidence,
+        workerRefs: uniqueRefs([...assignment.workerRefs, ...(event.workerRefs ?? [])]),
+      });
+    }
     case "resume":
     case "retry":
+    case "retry-delivery":
       return Result.succeed({
         ...next,
         attempt: assignment.attempt + 1,
@@ -452,6 +504,13 @@ export function renderAssignmentBrief(brief: ProjectBrief): string {
       : [renderList("Open questions (ask instead of assuming)", brief.openQuestions, () => "-")]),
   ].join("\n\n");
 }
+
+/**
+ * The hash a capture records of the brief it was made from: of what a worker is told, so a change
+ * of priority or authorization alone never changes it.
+ */
+export const briefScopeHash = (brief: ProjectBrief): string =>
+  NodeCrypto.createHash("sha256").update(renderAssignmentBrief(brief)).digest("hex");
 
 export const MANAGER_SUMMARY_LIMITS = { projects: 8, charactersPerProject: 600 } as const;
 

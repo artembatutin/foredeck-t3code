@@ -16,7 +16,7 @@ const handlers = {
       return yield* service.capabilities(scope);
     }),
   ),
-  delegate_task: McpToolAccess.actsAsCaller((input) =>
+  delegate_task: McpToolAccess.delegatesAsCaller((input) =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;
       const service = yield* OrchestratorMcpService.OrchestratorMcpService;

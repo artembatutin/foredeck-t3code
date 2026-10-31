@@ -12,6 +12,7 @@ import {
   isTurnEffect,
   issue,
   nextChild,
+  ownsWake,
   planAtGate,
   receiptFailed,
   runsStages,
@@ -597,6 +598,21 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
     : undefined;
 };
 
+/** The id of the effect the delivery awaits; undefined while it awaits anything else. */
+const awaitedEffectId = ({ awaiting }: FactoryDeliveryState) =>
+  awaiting?.type === "effect" ? awaiting.effect.id : undefined;
+
+/**
+ * Drops an admission mark that no longer names the effect the delivery awaits. A step that changes
+ * nothing keeps the very same state.
+ */
+const keepAdmissionWait = (next: FactoryAdvance): FactoryAdvance => {
+  const { admissionWait, ...rest } = next.delivery;
+  return admissionWait === undefined || awaitedEffectId(next.delivery) === admissionWait.effectId
+    ? next
+    : { ...next, delivery: rest };
+};
+
 /**
  * Folds one event into a delivery and returns the effects the worker must carry out. Pure: no
  * services, I/O or clock, and the input is never mutated, so a delivery's events replay to the
@@ -673,9 +689,35 @@ const awaitedEffect = <T extends FactoryEffect["type"]>(
  * parent, `resumePlanning`, `resumeApproved` and `resumeFollowThrough`); a parent past its
  * children integrates again, from a fresh verify. A delivery blocked closing out its merge closes
  * out again.
+ *
+ * An effect the delivery awaits can wait for admission (see `FactoryAdmission`):
+ * `admission.deferred` marks it, and `admission.granted` clears the mark before a redispatch runs
+ * it. The mark names only the effect the delivery awaits, so it goes whenever the delivery awaits
+ * anything else: another effect it issues, a block, a cancel.
  */
-export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
+export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance =>
+  keepAdmissionWait(fold(delivery, event));
+
+/** `advance`'s step, before `keepAdmissionWait`. */
+const fold = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvance => {
   switch (event.type) {
+    // Bookkeeping of the effect the delivery awaits, whatever its status: only that effect's
+    // admission mark changes, and an event naming any other effect changes nothing.
+    case "admission.deferred":
+      return awaitedEffectId(delivery) !== event.effectId ||
+        delivery.admissionWait?.effectId === event.effectId
+        ? unchanged(delivery)
+        : step({ ...delivery, admissionWait: { effectId: event.effectId } });
+    case "admission.granted": {
+      if (
+        awaitedEffectId(delivery) !== event.effectId ||
+        delivery.admissionWait?.effectId !== event.effectId
+      ) {
+        return unchanged(delivery);
+      }
+      const { admissionWait: _, ...granted } = delivery;
+      return step(granted);
+    }
     case "start": {
       if (delivery.status !== "queued") return unchanged(delivery);
       const started = {
@@ -806,14 +848,13 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
         : step({ ...releasingWatch(following), status: "cancelled", awaiting: null });
     }
     case "pr.feedback": {
-      // Only a wake on the thread its pull request is linked to, a single item's author thread or
-      // a parent's last child's author thread, committed after its first watch command (one from
-      // before that pull request was published answers nothing), and each run once.
-      const { pullRequest, followThrough } = delivery;
+      // Only a wake of its own (see `ownsWake`), each run once: on the thread its pull request is
+      // linked to, after its first watch command, and of its open pull request, or once cancelled
+      // only what the watch Factory started set off.
+      const { followThrough } = delivery;
       if (
-        followedThread(delivery) !== event.threadId ||
         followThrough === undefined ||
-        event.sequence <= followThrough.watchedAfter ||
+        !ownsWake(delivery, event) ||
         followThrough.runs.includes(event.runId)
       ) {
         return unchanged(delivery);
@@ -821,32 +862,8 @@ export const advance = (delivery: FactoryDeliveryState, event: FactoryEvent): Fa
       // Every wake of its pull request is the delivery's own, whatever it reports: a cancel
       // stops its run as Factory's turn.
       const owned = { ...followThrough, runs: [...followThrough.runs, event.runId] };
-      // Cancelled, it takes only the work the watch Factory started set off, to stop it: a wake
-      // that watch sent, or the end that removed it. A watch is its pull request and its start,
-      // since a watch on another pull request of the thread can start at the same moment; the
-      // release names that pull request when the PR stage's result was lost. Nothing revives the
-      // delivery.
-      if (delivery.status === "cancelled") {
-        const started = followThrough.watchStartedAt;
-        const watched = followThrough.heldPullRequest ?? pullRequest;
-        const sentByFactory =
-          started !== null &&
-          watched?.number === event.number &&
-          watched.url === event.url &&
-          (event.watchStartedAt === started ||
-            (event.watchStartedAt === null && followThrough.heldUntil === event.linkSequence));
-        return sentByFactory ? step({ ...delivery, followThrough: owned }) : unchanged(delivery);
-      }
-      // Otherwise only a wake of the open pull request it recorded.
-      if (
-        isTerminal(delivery) ||
-        pullRequest === null ||
-        pullRequest.outcome !== undefined ||
-        pullRequest.number !== event.number ||
-        pullRequest.url !== event.url
-      ) {
-        return unchanged(delivery);
-      }
+      // Cancelled, it takes such a wake only to stop its run; nothing revives the delivery.
+      if (delivery.status === "cancelled") return step({ ...delivery, followThrough: owned });
       // Waiting on its pull request, the delivery takes feedback as a round at once; while it
       // runs a stage or waits on its owner, the wake waits for it.
       const idle = delivery.status === "pr_open" && delivery.awaiting === null;

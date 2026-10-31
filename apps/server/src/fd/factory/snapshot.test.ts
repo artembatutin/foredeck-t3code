@@ -104,6 +104,35 @@ describe("toFactoryDelivery", () => {
     expect(roundTrip(snapshot)).toStrictEqual(snapshot);
   });
 
+  describe("capacityWait", () => {
+    const awaitingEffect: FactoryDeliveryState = {
+      ...running,
+      stage: "verify",
+      awaiting: { type: "effect", effect: { id: 4, type: "close_out" } },
+    };
+
+    it("is set while the effect the delivery awaits is marked", () => {
+      const snapshot = toFactoryDelivery(
+        stored({ ...awaitingEffect, admissionWait: { effectId: 4 } }),
+      );
+      expect(snapshot.capacityWait).toBe(true);
+      expect(snapshot).not.toHaveProperty("needsYou");
+      expect(roundTrip(snapshot)).toStrictEqual(snapshot);
+    });
+
+    it.each<[string, FactoryDeliveryState]>([
+      ["awaiting an effect that is not marked", awaitingEffect],
+      [
+        "marked for another effect than it awaits",
+        { ...awaitingEffect, admissionWait: { effectId: 3 } },
+      ],
+      ["awaiting a run, with a mark left over", { ...running, admissionWait: { effectId: 4 } }],
+      ["awaiting nothing, with a mark left over", { ...base, admissionWait: { effectId: 4 } }],
+    ])("is absent %s", (_label, state) => {
+      expect(toFactoryDelivery(stored(state))).not.toHaveProperty("capacityWait");
+    });
+  });
+
   it("leaves out the stage and worktree before the delivery starts", () => {
     const snapshot = toFactoryDelivery(stored(base));
     expect(snapshot).not.toHaveProperty("stage");

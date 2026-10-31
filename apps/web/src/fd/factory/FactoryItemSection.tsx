@@ -170,6 +170,9 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
       {delivery?.needsYou !== undefined ? (
         <p className="text-sm text-warning-foreground">{delivery.needsYou}</p>
       ) : null}
+      {delivery?.capacityNote !== undefined ? (
+        <p className="text-muted-foreground text-sm">{delivery.capacityNote}</p>
+      ) : null}
       {delivery !== null && control !== null ? (
         <>
           <p className="text-muted-foreground text-xs">

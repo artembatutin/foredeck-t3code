@@ -2,7 +2,12 @@ import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import type { FactoryDelivery, FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 
-import { FACTORY_STAGE_LABELS, FACTORY_STATUS_LABELS, factoryNeedsYou } from "./model.ts";
+import {
+  FACTORY_STAGE_LABELS,
+  FACTORY_STATUS_LABELS,
+  factoryCapacityNote,
+  factoryNeedsYou,
+} from "./model.ts";
 
 /** One environment's part of the fleet: whether it serves Factory, and its deliveries once read. */
 export interface FactoryFleetEnvironment {
@@ -25,6 +30,8 @@ export interface FactoryFleetRow {
   readonly stage: string | undefined;
   /** Why it waits on its owner; undefined when it does not. */
   readonly needsYou: string | undefined;
+  /** That it waits for a project assistant slot, which asks nothing of its owner. */
+  readonly capacityNote: string | undefined;
   /** A status or stage this build does not know: shown, but nothing is offered on it. */
   readonly readOnly: boolean;
 }
@@ -57,6 +64,7 @@ const row = ({ environmentId, delivery }: Listed): FactoryFleetRow => ({
   status: FACTORY_STATUS_LABELS[delivery.status],
   stage: delivery.stage === undefined ? undefined : FACTORY_STAGE_LABELS[delivery.stage.name],
   needsYou: factoryNeedsYou(delivery),
+  capacityNote: factoryCapacityNote(delivery),
   readOnly:
     delivery.status === "unknown" ||
     delivery.stage?.name === "unknown" ||

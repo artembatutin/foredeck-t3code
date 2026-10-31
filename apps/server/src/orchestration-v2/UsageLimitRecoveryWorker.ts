@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 
@@ -71,10 +72,63 @@ export function limitRecoveryCommand(
   };
 }
 
+/**
+ * Turns off the armed recovery whose resume the automatic turn gate declined for good, under
+ * that resume's identity. The recovery's request is part of it: an owner who arms the same run
+ * and reset again arms a new recovery, and a decline of that one must disarm it too rather than
+ * replay the first disarm's receipt. The thread keeps its usage-limit failure for its owner.
+ */
+function limitDisarmCommand(
+  thread: ProjectionStore.ProjectionLimitRecoveryCandidate,
+): OrchestrationV2Command | null {
+  const recovery = thread.limitRecovery;
+  if (!recovery) return null;
+  return {
+    type: "thread.metadata.update",
+    commandId: CommandId.make(
+      `limit-disarm:${thread.id}:${recovery.runId}:${Date.parse(recovery.resetAt)}:${recovery.requestId ?? "legacy"}`,
+    ),
+    threadId: thread.id,
+    limitRecovery: {
+      runId: recovery.runId,
+      resetAt: recovery.resetAt,
+      autoResume: false,
+      snooze: false,
+    },
+  };
+}
+
 const makeSweep = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const threads = yield* ThreadManagement.ThreadManagementService;
   const settings = yield* ServerSettings.ServerSettingsService;
+  const gate = yield* AutomaticTurnGate.AutomaticTurnGate;
+  /**
+   * Arms a recovery, or presents its resume to the automatic turn gate, keyed by the resume's
+   * command. A deferred resume, or one the gate could not decide, dispatches nothing and is
+   * presented again on the next sweep.
+   */
+  const resumeOrArm = Effect.fnUntraced(function* (
+    thread: ProjectionStore.ProjectionLimitRecoveryCandidate,
+    command: OrchestrationV2Command,
+  ) {
+    if (command.type !== "message.dispatch" || command.usageLimitContinuationOfRunId === undefined)
+      return yield* threads.dispatch(command);
+    const outcome = yield* gate.admit(
+      {
+        kind: "usage_limit_resume",
+        threadId: command.threadId,
+        messageId: command.messageId,
+        key: command.commandId,
+        usageLimitContinuationOfRunId: command.usageLimitContinuationOfRunId,
+      },
+      threads.dispatch(command),
+    );
+    if (outcome._tag === "Ran" || outcome.reason === "deferred") return;
+    const disarm = limitDisarmCommand(thread);
+    if (disarm !== null) yield* threads.dispatch(disarm);
+  });
+
   return Effect.fn("UsageLimitRecoveryWorker.sweep")(function* () {
     const preferences = yield* settings.getSettings;
     const now = yield* DateTime.now;
@@ -92,7 +146,7 @@ const makeSweep = Effect.gen(function* () {
         preferences.snoozeLimitedThreads,
       );
       if (command === null) continue;
-      yield* threads.dispatch(command).pipe(
+      yield* resumeOrArm(thread, command).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("orchestration-v2.limit-recovery.dispatch-failed", {
             threadId: thread.id,

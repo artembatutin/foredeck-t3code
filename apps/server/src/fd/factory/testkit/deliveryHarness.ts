@@ -8,6 +8,7 @@ import {
   type GitRunStackedActionInput,
   type GitRunStackedActionResult,
   MessageId,
+  NodeId,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2RunStatus,
   ProjectId,
@@ -16,6 +17,7 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   type RunId,
+  RuntimeRequestId,
   TurnItemId,
   type RuntimeMode,
   type ServerProvider,
@@ -30,11 +32,14 @@ import {
 import type { WorkCommentInput, WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
+import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import { FetchHttpClient } from "effect/http";
 import * as Layer from "effect/Layer";
@@ -42,7 +47,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
-import type * as Scope from "effect/Scope";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
@@ -50,7 +55,10 @@ import * as ServerConfig from "../../../config.ts";
 import * as GitManager from "../../../git/GitManager.ts";
 import * as GitWorkflow from "../../../git/GitWorkflowService.ts";
 import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
+import * as AutomaticTurnGate from "../../../orchestration-v2/AutomaticTurnGate.ts";
 import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
+import * as DelegatedTaskQuestionReactor from "../../../orchestration-v2/DelegatedTaskQuestionReactor.ts";
+import * as EffectOutbox from "../../../orchestration-v2/EffectOutbox.ts";
 import * as EffectWorker from "../../../orchestration-v2/EffectWorker.ts";
 import * as EventSink from "../../../orchestration-v2/EventSink.ts";
 import * as LegacyV1ThreadImporter from "../../../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
@@ -58,6 +66,7 @@ import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../../orchestration-v2/ProjectStore.ts";
 import * as ProviderAdapterRegistry from "../../../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ProviderRuntimeRecoveryService from "../../../orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import * as RuntimePolicy from "../../../orchestration-v2/RuntimePolicy.ts";
 import * as ProviderReplayHarness from "../../../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts";
@@ -83,6 +92,8 @@ import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../../../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../../../workspace/WorkspacePaths.ts";
+import { HandoffAdmission, HandoffBackend, ProjectAssistant } from "../../assistant/index.ts";
+import * as AssistantHandoff from "../../assistant-handoff/index.ts";
 import { RepositorySet } from "../../multirepo/index.ts";
 import * as WorkManagement from "../../work-management/index.ts";
 import * as FactoryReactor from "../FactoryReactor.ts";
@@ -139,6 +150,7 @@ const makeFakeProvider = Effect.gen(function* () {
   const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
   const started: Array<ProviderAdapter.ProviderAdapterV2TurnInput> = [];
   const interrupted: Array<ProviderAdapter.ProviderAdapterV2InterruptInput> = [];
+  const responded: Array<ProviderAdapter.ProviderAdapterV2RuntimeRequestResponseInput> = [];
   const threadLoads: {
     before?: (() => Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>) | undefined;
     ensure?: ProviderAdapter.ProviderAdapterV2SessionRuntime["ensureThread"];
@@ -241,7 +253,7 @@ const makeFakeProvider = Effect.gen(function* () {
           steerTurn: () => Effect.die("Factory never steers a turn."),
           // The turn goes on until the test ends it, as a provider still finishing it would.
           interruptTurn: (input) => Effect.sync(() => void interrupted.push(input)),
-          respondToRuntimeRequest: () => Effect.void,
+          respondToRuntimeRequest: (input) => Effect.sync(() => void responded.push(input)),
           readThreadSnapshot: (input) =>
             Effect.suspend(() => threadLoads.snapshot?.(input) ?? Effect.die("unused")),
           rollbackThread: () => Effect.die("unused"),
@@ -344,7 +356,139 @@ const makeFakeProvider = Effect.gen(function* () {
       });
     });
 
-  return { adapter, started, interrupted, threadLoads, endTurn, say, startCommand };
+  /**
+   * Reports a provider-native subagent the turn started, as a provider does: `running` while it
+   * works, which it can go on doing after the turn ends, and then `completed`.
+   */
+  const reportSubagent = (
+    turn: ProviderAdapter.ProviderAdapterV2TurnInput,
+    status: "running" | "completed",
+  ) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const id = `subagent:${turn.attemptId}`;
+      yield* Queue.offer(events, {
+        type: "turn_item.updated",
+        driver,
+        turnItem: {
+          id: TurnItemId.make(id),
+          threadId: turn.threadId,
+          runId: turn.runId,
+          nodeId: turn.rootNodeId,
+          providerThreadId: turn.providerThread.id,
+          providerTurnId: providerTurnId(turn),
+          nativeItemRef: { driver, nativeId: id, strength: "strong" },
+          parentItemId: null,
+          ordinal: 2,
+          status,
+          title: "Check the export",
+          startedAt: now,
+          completedAt: status === "running" ? null : now,
+          updatedAt: now,
+          type: "subagent",
+          subagentId: NodeId.make(id),
+          origin: "provider_native",
+          driver,
+          providerInstanceId: instanceId,
+          childThreadId: null,
+          prompt: "Check the export.",
+          result: status === "running" ? null : "Checked.",
+        },
+      });
+    });
+
+  let questions = 0;
+  /**
+   * Asks the owner one question during the turn, as a provider's user-input request: `live` while
+   * the provider waits for the answer in this turn, `message` for one answered with a new message.
+   * Returns the request.
+   */
+  const ask = (turn: ProviderAdapter.ProviderAdapterV2TurnInput, mode: "live" | "message") =>
+    Effect.gen(function* () {
+      questions += 1;
+      const now = yield* DateTime.now;
+      const native = `question:${turn.attemptId}:${questions}`;
+      const requestId = RuntimeRequestId.make(`request:${native}`);
+      const nodeId = NodeId.make(`node:${native}`);
+      const providerSessionId = turn.providerThread.providerSessionId;
+      if (providerSessionId === null) return yield* Effect.die("The turn has no provider session.");
+      const nativeItemRef = { driver, nativeId: native, strength: "strong" as const };
+      yield* Queue.offer(events, {
+        type: "node.updated",
+        driver,
+        node: {
+          id: nodeId,
+          threadId: turn.threadId,
+          runId: turn.runId,
+          parentNodeId: turn.rootNodeId,
+          rootNodeId: turn.rootNodeId,
+          kind: "user_input_request",
+          status: "waiting",
+          countsForRun: false,
+          providerThreadId: turn.providerThread.id,
+          providerTurnId: providerTurnId(turn),
+          nativeItemRef,
+          runtimeRequestId: requestId,
+          checkpointScopeId: null,
+          startedAt: now,
+          completedAt: null,
+        },
+      });
+      yield* Queue.offer(events, {
+        type: "turn_item.updated",
+        driver,
+        turnItem: {
+          id: TurnItemId.make(`item:${native}`),
+          threadId: turn.threadId,
+          runId: turn.runId,
+          nodeId,
+          providerThreadId: turn.providerThread.id,
+          providerTurnId: providerTurnId(turn),
+          nativeItemRef,
+          parentItemId: null,
+          ordinal: 10 + questions,
+          status: "waiting",
+          title: null,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          type: "user_input_request",
+          requestId,
+          questions: [{ id: "format", header: "Format", question: "Which format?", options: [] }],
+          ...(mode === "message" ? { responseMode: "message" as const } : {}),
+        },
+      });
+      yield* Queue.offer(events, {
+        type: "runtime_request.updated",
+        driver,
+        runtimeRequest: {
+          id: requestId,
+          nodeId,
+          providerTurnId: providerTurnId(turn),
+          nativeRequestRef: nativeItemRef,
+          kind: "user_input",
+          status: "pending",
+          responseCapability:
+            mode === "message" ? { type: "message" } : { type: "live", providerSessionId },
+          createdAt: now,
+          resolvedAt: null,
+        },
+      });
+      return requestId;
+    });
+
+  return {
+    adapter,
+    started,
+    interrupted,
+    responded,
+    threadLoads,
+    endTurn,
+    say,
+    startCommand,
+    reportSubagent,
+    ask,
+  };
 });
 
 type FakeProvider = Effect.Success<typeof makeFakeProvider>;
@@ -358,6 +502,31 @@ export interface PullRequestCall {
 
 /** A command Factory's own services dispatch to the orchestrator. */
 export type FactoryDispatch = Parameters<Orchestrator.OrchestratorV2["Service"]["dispatch"]>[0];
+
+/** An interrupt Factory asks a thread for, as it asks core's thread management. */
+export type FactoryInterrupt = Parameters<
+  ThreadManagement.ThreadManagementService["Service"]["interruptThread"]
+>[0];
+
+/**
+ * Core's thread management as Factory's services see it: each interrupt they ask for runs
+ * `hooks.beforeInterrupt` first, so a test can refuse it as core would refuse one.
+ */
+const factoryThreads = (hooks: {
+  beforeInterrupt?: ((input: FactoryInterrupt) => Effect.Effect<void>) | undefined;
+}) =>
+  Layer.effect(
+    ThreadManagement.ThreadManagementService,
+    Effect.map(ThreadManagement.ThreadManagementService, (threads) =>
+      ThreadManagement.ThreadManagementService.of({
+        ...threads,
+        interruptThread: (input) =>
+          Effect.suspend(() => hooks.beforeInterrupt?.(input) ?? Effect.void).pipe(
+            Effect.andThen(threads.interruptThread(input)),
+          ),
+      }),
+    ),
+  );
 
 /**
  * The orchestrator as Factory's services see it: each command runs `hooks.before` first, so a
@@ -609,58 +778,113 @@ const providerInstances = (supportedRuntimeModes: ReadonlyArray<RuntimeMode> | u
   });
 };
 
-/**
- * The server's orchestration stack around the fake provider, on one in-memory database, with the
- * project root and T3 home in temp folders. Turns run under the server's runtime policy, which
- * runs a mode the provider does not advertise as one it does. Factory opens pull requests through
- * the fake PR service. Effects run only when the test drains the worker.
- */
-const makeLayer = (input: {
+/** What the server's layers are built from. */
+interface ServerInput {
   readonly provider: FakeProvider;
   readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
   readonly providers: ReadonlyArray<ServerProvider> | undefined;
   readonly pullRequestCalls: Array<PullRequestCall>;
   readonly worktreeRemovals: Array<VcsRemoveWorktreeInput>;
   readonly publishHooks: Array<Effect.Effect<void>>;
-  readonly factoryDispatch: {
-    before?: ((command: FactoryDispatch) => Effect.Effect<void>) | undefined;
-    beforeShell?: ((threadId: ThreadId) => Effect.Effect<void>) | undefined;
-  };
+  readonly factoryDispatch: World["factoryDispatch"];
   readonly processes: World["processes"];
   readonly setupScripts: World["setupScripts"];
   readonly commentCalls: Array<CommentCall>;
   readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
   readonly manualReactor: boolean;
+  readonly admission: typeof Factory.FactoryAdmission.FactoryAdmission.Service | undefined;
+  readonly handoff: HandoffOption | undefined;
+  readonly assistantThreads: ThreadServiceWrapper | undefined;
+  readonly assistantFactory: FactoryPortWrapper | undefined;
+  readonly automaticTurnGate: boolean;
+  readonly gateConsults: GateConsults | undefined;
   readonly root: string;
   readonly t3Home: string;
-}) => {
-  const database = SqlitePersistence.layerMemory;
+  /** The harness's one database, already built: every build of the server shares it. */
+  readonly database: Layer.Layer<Layer.Success<typeof SqlitePersistence.layerMemory>>;
+}
+
+/** Takes Factory's gate and installs it nowhere: core's producers keep the default inline gate. */
+const inertGateInstaller = Layer.succeed(
+  AutomaticTurnGate.AutomaticTurnGateInstaller,
+  AutomaticTurnGate.AutomaticTurnGateInstaller.of({ install: () => Effect.void }),
+);
+
+/** Told how each consult of the gate ended, undecided ones included; see `withProject`. */
+type GateConsults = (
+  turn: AutomaticTurnGate.AutomaticTurn,
+  exit: Exit.Exit<unknown, unknown>,
+) => Effect.Effect<void>;
+
+/** The installable gate, with what Factory installs into it reporting each consult's end. */
+const observedGate = (observe: GateConsults) =>
+  Layer.effect(
+    AutomaticTurnGate.AutomaticTurnGateInstaller,
+    Effect.map(AutomaticTurnGate.AutomaticTurnGateInstaller, (inner) =>
+      AutomaticTurnGate.AutomaticTurnGateInstaller.of({
+        install: (gate) =>
+          inner.install(
+            AutomaticTurnGate.AutomaticTurnGate.of({
+              admit: (turn, dispatch) =>
+                gate.admit(turn, dispatch).pipe(Effect.onExit((exit) => observe(turn, exit))),
+              hand: (turn, dispatch, options) =>
+                gate
+                  .hand(turn, dispatch, options)
+                  .pipe(Effect.onExit((exit) => observe(turn, exit))),
+            }),
+          ),
+      }),
+    ),
+  ).pipe(Layer.provideMerge(AutomaticTurnGate.layerInstallable));
+
+/**
+ * With `on`, the one installable automatic turn gate the server provides beneath its runtime, so
+ * core's producers here (restart continuations and the continuation worker's native wakes and
+ * delegated completions) consult the gate Factory installs; and the continuation requests queue
+ * those offers go through, which the adapters and the worker share. Otherwise Factory installs its
+ * gate nowhere.
+ */
+const automaticTurnGate = (
+  on: boolean,
+  consults: GateConsults | undefined,
+): Layer.Layer<AutomaticTurnGate.AutomaticTurnGateInstaller> =>
+  on
+    ? Layer.merge(
+        consults === undefined ? AutomaticTurnGate.layerInstallable : observedGate(consults),
+        ProviderContinuationRequests.layer,
+      )
+    : inertGateInstaller;
+
+/**
+ * The server's orchestration stack around the fake provider, on the harness's database, with the
+ * project root and T3 home in temp folders: everything Factory runs on. Turns run under the
+ * server's runtime policy, which runs a mode the provider does not advertise as one it does.
+ * Effects run only when the test drains the worker.
+ */
+const coreLayer = (input: ServerInput) => {
+  const { database } = input;
   const serverConfig = ServerConfig.layerTest(input.root, input.t3Home);
-  const instances = providerInstances(input.supportedRuntimeModes);
   const runtimePolicy = RuntimePolicy.layerFromProjectStore.pipe(
     Layer.provide(RepositorySet.layerDefault),
-    Layer.provide(instances),
+    Layer.provide(providerInstances(input.supportedRuntimeModes)),
     Layer.provide(ProjectStore.layer),
     Layer.provide(database),
     Layer.provide(serverConfig),
     Layer.provide(NodeServices.layer),
-    // The database is the harness's own, memoized: its build fails the test before this would.
+    // The database is the harness's own, already built, so it never fails this build.
     Layer.orDie,
   );
   const orchestration = ProviderReplayHarness.layerWithRegistry(
     { name: "factory-delivery" },
     ProviderAdapterRegistry.layerSingle(input.provider.adapter),
-    { databaseLayer: database, runEffectWorker: false, runtimePolicyLayer: runtimePolicy },
+    {
+      databaseLayer: database,
+      runEffectWorker: false,
+      runtimePolicyLayer: runtimePolicy,
+      runContinuationWorker: input.automaticTurnGate,
+    },
   );
-  return (input.manualReactor ? downReactor : factoryReactor).pipe(
-    Layer.provideMerge(Factory.layerLive),
-    Layer.provide(factoryOrchestrator(input.factoryDispatch)),
-    Layer.provide(
-      fakePullRequests(input.pullRequestCalls, input.worktreeRemovals, input.publishHooks),
-    ),
-    Layer.provide(ProviderRegistryMock.layer(input.providers)),
-    Layer.provide(instances),
-    Layer.provideMerge(recordingWork(input.commentCalls, input.wrapWork)),
+  return recordingWork(input.commentCalls, input.wrapWork).pipe(
     Layer.provideMerge(threadLaunch(input.setupScripts)),
     Layer.provideMerge(projectService),
     Layer.provideMerge(ThreadManagement.layer),
@@ -681,8 +905,172 @@ const makeLayer = (input: {
     Layer.provideMerge(ServerSettings.layerTest()),
     Layer.provideMerge(serverConfig),
     Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(automaticTurnGate(input.automaticTurnGate, input.gateConsults)),
   );
 };
+
+/** How a world runs the project assistant's admission beneath Factory; see `withProject`. */
+export interface HandoffOption {
+  /** Where the admission path stops for the test, provided beneath the admission service. */
+  readonly probe?: typeof HandoffAdmission.HandoffAdmissionProbe.Service;
+  /** Wraps the one admission instance everything uses, to see what it decided. */
+  readonly admission?: (
+    service: HandoffAdmission.HandoffAdmission["Service"],
+  ) => HandoffAdmission.HandoffAdmission["Service"];
+}
+
+/** The admission service with the probe and the wrapper given, one instance per build. */
+const admissionOf = (input: ServerInput) => {
+  const built = HandoffAdmission.layerLive.pipe(
+    Layer.provide(
+      input.handoff?.probe === undefined
+        ? Layer.empty
+        : Layer.succeed(HandoffAdmission.HandoffAdmissionProbe, input.handoff.probe),
+    ),
+  );
+  const wrap = input.handoff?.admission;
+  return wrap === undefined
+    ? built
+    : Layer.effect(
+        HandoffAdmission.HandoffAdmission,
+        Effect.map(HandoffAdmission.HandoffAdmission, wrap),
+      ).pipe(Layer.provide(built));
+};
+
+/**
+ * The project assistant's admission of the roots it manages, its Work port, and the bridge's
+ * admission port and turn redelivery, as the server composes them beneath Factory, with the probe
+ * given. Built in Factory's scope, so a rebuild is a new admission instance as a new process's.
+ */
+const handoffLayer = (input: ServerInput) =>
+  AssistantHandoff.layerAdmission.pipe(
+    Layer.provide(DelegatedTaskQuestionReactor.layer),
+    Layer.provideMerge(AssistantHandoff.layerBackend),
+    Layer.provideMerge(admissionOf(input)),
+  );
+
+/**
+ * Factory and its reactor over the core services, opening pull requests through the fake PR
+ * service, with the admission port given: the assistant's, through `handoff`, with the handoff
+ * option; Factory's default otherwise.
+ */
+const factoryLayer = (input: ServerInput, handoff: ReturnType<typeof handoffLayer>) =>
+  (input.manualReactor ? downReactor : factoryReactor).pipe(
+    Layer.provideMerge(Factory.layerLive),
+    Layer.provide(factoryOrchestrator(input.factoryDispatch)),
+    Layer.provide(factoryThreads(input.factoryDispatch)),
+    Layer.provide(
+      fakePullRequests(input.pullRequestCalls, input.worktreeRemovals, input.publishHooks),
+    ),
+    Layer.provide(ProviderRegistryMock.layer(input.providers)),
+    Layer.provide(providerInstances(input.supportedRuntimeModes)),
+    Layer.provide(
+      input.handoff !== undefined
+        ? handoff
+        : input.admission === undefined
+          ? Layer.empty
+          : Layer.succeed(Factory.FactoryAdmission.FactoryAdmission, input.admission),
+    ),
+  );
+
+/** Wraps the thread service the project assistant alone sees; see `withProject`. */
+type ThreadServiceWrapper = (
+  service: ThreadManagement.ThreadManagementService["Service"],
+) => ThreadManagement.ThreadManagementService["Service"];
+
+/** Wraps the Factory port the project assistant starts and controls deliveries through. */
+type FactoryPortWrapper = (
+  service: typeof HandoffBackend.HandoffFactory.Service,
+) => typeof HandoffBackend.HandoffFactory.Service;
+
+/**
+ * The project assistant and its Work capture over the bridge's Work and Factory ports and the one
+ * admission instance, as the server composes them, with its thread service wrapped by
+ * `assistantThreads` and its Factory port by `assistantFactory` when given. Built and rebuilt with
+ * Factory, so a rebuild is a new assistant instance as a new process would be. No tick runs: a
+ * test drives the assistant's services itself.
+ */
+const assistantLayer = (input: ServerInput, handoff: ReturnType<typeof handoffLayer>) =>
+  ProjectAssistant.layerLive.pipe(
+    Layer.provide(AssistantHandoff.layerBackend),
+    Layer.provide(
+      input.assistantFactory === undefined
+        ? AssistantHandoff.layerFactory
+        : Layer.effect(
+            HandoffBackend.HandoffFactory,
+            Effect.map(HandoffBackend.HandoffFactory, input.assistantFactory),
+          ).pipe(Layer.provide(AssistantHandoff.layerFactory)),
+    ),
+    Layer.provide(handoff),
+    Layer.provide(
+      input.assistantThreads === undefined
+        ? Layer.empty
+        : Layer.effect(
+            ThreadManagement.ThreadManagementService,
+            Effect.map(ThreadManagement.ThreadManagementService, input.assistantThreads),
+          ),
+    ),
+  );
+
+/**
+ * Core's startup recovery, in the order the server runs it before anything else (see
+ * `serverRuntimeStartup`): the provider runtime's recovery, then the orchestrator's delegated
+ * tasks.
+ */
+const recoverCore = Effect.gen(function* () {
+  const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+  yield* recovery.recover;
+  const orchestrator = yield* Orchestrator.OrchestratorV2;
+  yield* orchestrator.recoverDelegatedTasks;
+}).pipe(
+  Effect.provide(ProviderRuntimeRecoveryService.layer.pipe(Layer.provide(EffectOutbox.layer))),
+  Effect.orDie,
+);
+
+/**
+ * The server on the harness's database: the core services, and Factory with the assistant, each
+ * built in a scope of its own under `parent`. `restart` closes Factory's, and with
+ * `orchestration` the core's too, then builds them anew over the same database, as a new server
+ * process would: lanes, locks, jobs, writers, reactors, sessions and every other in-memory state
+ * go with the closed scopes. A rebuilt core runs core's startup recovery before Factory is built
+ * over it.
+ */
+const makeServer = (input: ServerInput, parent: Scope.Scope) =>
+  Effect.gen(function* () {
+    const build = <ROut, E, RIn>(layer: Layer.Layer<ROut, E, RIn>) =>
+      Effect.gen(function* () {
+        const scope = yield* Scope.fork(parent, "sequential");
+        const context = yield* Layer.buildWithMemoMap(layer, Layer.makeMemoMapUnsafe(), scope);
+        return { scope, context };
+      });
+    // One layer object, so each build shares one admission instance between Factory's port, the
+    // assistant and the test.
+    const handoff = handoffLayer(input);
+    const factoryServices = factoryLayer(input, handoff);
+    const buildFactory = (core: Context.Context<Layer.Success<ReturnType<typeof coreLayer>>>) =>
+      build(
+        Layer.mergeAll(
+          factoryServices,
+          assistantLayer(input, handoff).pipe(Layer.provide(factoryServices)),
+          handoff,
+        ).pipe(Layer.provide(Layer.succeedContext(core))),
+      );
+    let core = yield* build(coreLayer(input));
+    let factory = yield* buildFactory(core.context);
+    return {
+      context: () => Context.merge(core.context, factory.context),
+      restart: (orchestration: boolean) =>
+        Effect.gen(function* () {
+          yield* Scope.close(factory.scope, Exit.void);
+          if (orchestration) {
+            yield* Scope.close(core.scope, Exit.void);
+            core = yield* build(coreLayer(input));
+            yield* recoverCore.pipe(Effect.provideContext(core.context));
+          }
+          factory = yield* buildFactory(core.context);
+        }).pipe(Effect.orDie),
+    };
+  });
 
 export const git = (cwd: string, args: ReadonlyArray<string>) =>
   Effect.flatMap(GitVcsDriver.GitVcsDriver, (driver) =>
@@ -743,7 +1131,12 @@ export const threadProjection = (threadId: ThreadId) =>
   );
 
 /** What a test body runs with: the server layers and the platform. */
-type Services = Layer.Success<ReturnType<typeof makeLayer>> | NodeServices.NodeServices;
+type Services =
+  | Layer.Success<ReturnType<typeof coreLayer>>
+  | Layer.Success<ReturnType<typeof factoryLayer>>
+  | Layer.Success<ReturnType<typeof assistantLayer>>
+  | Layer.Success<ReturnType<typeof handoffLayer>>
+  | NodeServices.NodeServices;
 
 /** A started delivery whose first thread's (the author's, or a parent's planner's) turn runs. */
 interface StartedAuthor {
@@ -773,12 +1166,14 @@ export interface World {
    */
   readonly publishHooks: Array<Effect.Effect<void>>;
   /**
-   * Run before each command Factory's services dispatch to the orchestrator (`before`), and before
-   * each thread shell they read from it (`beforeShell`), when set.
+   * Run before each command Factory's services dispatch to the orchestrator (`before`), before
+   * each thread shell they read from it (`beforeShell`), and before each interrupt they ask a
+   * thread for (`beforeInterrupt`), when set.
    */
   readonly factoryDispatch: {
     before?: ((command: FactoryDispatch) => Effect.Effect<void>) | undefined;
     beforeShell?: ((threadId: ThreadId) => Effect.Effect<void>) | undefined;
+    beforeInterrupt?: ((input: FactoryInterrupt) => Effect.Effect<void>) | undefined;
   };
   /**
    * Runs each process the server's process runner is asked for, such as a verify or setup
@@ -824,6 +1219,18 @@ export interface World {
    * on; otherwise one reactor runs throughout, and this runs `body` as it is.
    */
   readonly boot: <A, E>(body: Effect.Effect<A, E, Services>) => Effect.Effect<A, E, Services>;
+  /**
+   * Runs `body` on a server restarted over the same database: Factory's services (its worker,
+   * service and reactor) are closed and built anew, dropping their lanes, locks, jobs and other
+   * in-memory state, and with `orchestration` so is the orchestration runtime with every service
+   * above it, which runs core's startup recovery first. A rebuilt Factory's reactor runs its boot
+   * sweep as any boot does (with `manualReactor`, inside `world.boot`). The services in effect
+   * before are closed, so everything that runs after the restart belongs in `body`.
+   */
+  readonly rebuild: <A, E>(
+    body: Effect.Effect<A, E, Services>,
+    options?: { readonly orchestration?: boolean },
+  ) => Effect.Effect<A, E, Services>;
   /** A fresh core launch service and tracker, closed before returning to inspect shutdown. */
   readonly launchScope: <A, E>(
     body: Effect.Effect<A, E, Services | Scope.Scope>,
@@ -841,6 +1248,8 @@ export interface World {
   readonly ownerThreadAt: (
     root: string,
     text: string,
+    /** The thread's own id, for a thread only its id tells apart; a minted one when absent. */
+    threadId?: ThreadId,
   ) => Effect.Effect<{ readonly threadId: ThreadId; readonly runId: RunId }, never, Services>;
   /**
    * Ends the provider turn of `runId` and waits until orchestration has finished the run and
@@ -870,6 +1279,27 @@ export const withProject = <A, E>(
     readonly work?: (service: WorkServiceShape) => WorkServiceShape;
     /** Factory's reactor runs only inside `world.boot`; see there. */
     readonly manualReactor?: boolean;
+    /** The admission port Factory is built with, rebuilds included; its default otherwise. */
+    readonly admission?: typeof Factory.FactoryAdmission.FactoryAdmission.Service;
+    /**
+     * Builds Factory over the project assistant's admission, as the server does (see
+     * `handoffLayer`), in place of `admission`.
+     */
+    readonly handoff?: HandoffOption;
+    /**
+     * Wraps the thread service the project assistant reads and acts through, leaving every other
+     * service's untouched, so a test can hold the assistant's tick inside its lock.
+     */
+    readonly assistantThreads?: ThreadServiceWrapper;
+    /** Wraps the Factory port the project assistant uses, to count or fail its calls. */
+    readonly assistantFactory?: FactoryPortWrapper;
+    /**
+     * Gives core's producers the installable automatic turn gate Factory installs, as the server
+     * does (see `automaticTurnGate`); without it they run every automatic turn inline.
+     */
+    readonly automaticTurnGate?: boolean;
+    /** Told how each consult of that gate ended, a decision it could not make included. */
+    readonly gateConsults?: GateConsults;
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -887,6 +1317,33 @@ export const withProject = <A, E>(
     const processes: World["processes"] = {};
     const setupScripts: World["setupScripts"] = {};
     const commentCalls: Array<CommentCall> = [];
+    const server = yield* makeServer(
+      {
+        provider,
+        supportedRuntimeModes: options.supportedRuntimeModes,
+        providers: options.providers,
+        pullRequestCalls,
+        worktreeRemovals,
+        publishHooks,
+        factoryDispatch,
+        processes,
+        setupScripts,
+        commentCalls,
+        wrapWork: options.work ?? ((service) => service),
+        manualReactor: options.manualReactor === true,
+        admission: options.admission,
+        handoff: options.handoff,
+        assistantThreads: options.assistantThreads,
+        assistantFactory: options.assistantFactory,
+        automaticTurnGate: options.automaticTurnGate === true,
+        gateConsults: options.gateConsults,
+        root,
+        t3Home,
+        // One database for every build of the server, as a T3 home keeps across restarts.
+        database: Layer.succeedContext(yield* Layer.build(SqlitePersistence.layerMemory)),
+      },
+      yield* Effect.scope,
+    );
 
     return yield* Effect.gen(function* () {
       // The project's remote: a bare repository the fake PR service pushes to.
@@ -928,7 +1385,6 @@ export const withProject = <A, E>(
         }),
       );
 
-      const service = yield* Factory.FactoryService.FactoryService;
       const launched: World["launched"] = (deliveryId) =>
         Effect.gen(function* () {
           yield* drainFactory;
@@ -944,7 +1400,9 @@ export const withProject = <A, E>(
           return { deliveryId, threadId: awaiting.threadId, runId: awaiting.runId, worktreePath };
         }).pipe(Effect.orDie);
       const startWith: World["startWith"] = (options) =>
-        service.start({ ...options, itemRef: item.ref }).pipe(
+        Effect.flatMap(Factory.FactoryService.FactoryService, (service) =>
+          service.start({ ...options, itemRef: item.ref }),
+        ).pipe(
           Effect.orDie,
           Effect.flatMap(({ deliveryId }) => launched(deliveryId)),
         );
@@ -985,11 +1443,11 @@ export const withProject = <A, E>(
           return sent.run.id;
         }).pipe(Effect.orDie);
 
-      const ownerThreadAt: World["ownerThreadAt"] = (workspaceRoot, text) =>
+      const ownerThreadAt: World["ownerThreadAt"] = (workspaceRoot, text, threadId) =>
         Effect.gen(function* () {
           ownerTurns += 1;
           const ownerProject = ProjectId.make(`project-owner-${ownerTurns}`);
-          yield* projects.create({
+          yield* (yield* ProjectService.ProjectService).create({
             commandId: CommandId.make(`create-owner-project:${ownerTurns}`),
             projectId: ownerProject,
             title: `Owner ${ownerTurns}`,
@@ -999,6 +1457,7 @@ export const withProject = <A, E>(
           const messageId = MessageId.make(`owner-launch-message:${ownerTurns}`);
           const launched = yield* launches.launch({
             commandId: CommandId.make(`owner-launch:${ownerTurns}`),
+            ...(threadId === undefined ? {} : { threadId }),
             projectId: ownerProject,
             title: "Owner thread",
             modelSelection,
@@ -1027,6 +1486,13 @@ export const withProject = <A, E>(
               return yield* body;
             }).pipe(Effect.provide(FactoryReactor.layer), Effect.scoped);
 
+      const rebuild: World["rebuild"] = (after, rebuildOptions) =>
+        server
+          .restart(rebuildOptions?.orchestration === true)
+          .pipe(
+            Effect.andThen(Effect.suspend(() => Effect.provideContext(after, server.context()))),
+          );
+
       const rootStatus = yield* git(root, ["status", "--porcelain=v1", "--untracked-files=all"]);
       return yield* body({
         provider,
@@ -1050,6 +1516,7 @@ export const withProject = <A, E>(
         startWith,
         launched,
         boot,
+        rebuild,
         launchScope: (body) =>
           body.pipe(
             Effect.provide(
@@ -1062,26 +1529,7 @@ export const withProject = <A, E>(
         ownerThreadAt,
         endRun,
       });
-    }).pipe(
-      Effect.provide(
-        makeLayer({
-          provider,
-          supportedRuntimeModes: options.supportedRuntimeModes,
-          providers: options.providers,
-          pullRequestCalls,
-          worktreeRemovals,
-          publishHooks,
-          factoryDispatch,
-          processes,
-          setupScripts,
-          commentCalls,
-          wrapWork: options.work ?? ((service) => service),
-          manualReactor: options.manualReactor === true,
-          root,
-          t3Home,
-        }),
-      ),
-    );
+    }).pipe(Effect.provideContext(server.context()));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 /** Commits `export.ts` with `text` in the worktree, as the author agent would during its turn. */

@@ -30,10 +30,15 @@ import {
 } from "../../orchestration-v2/DispatchModeLimit.ts";
 import * as Projects from "../../project/ProjectService.ts";
 import * as Git from "../../vcs/GitVcsDriver.ts";
+import * as FactoryExecutor from "./FactoryExecutor.ts";
+import * as HandoffAdmission from "./HandoffAdmission.ts";
+import * as HandoffMigrations from "./handoffMigrations.ts";
 import * as Looper from "./Looper.ts";
 import * as PortfolioStore from "./PortfolioStore.ts";
 import * as Portfolio from "./portfolio.ts";
 import { Dispatch, OCCUPIED_STATES } from "./dispatch.ts";
+import * as WorkCapture from "./WorkCapture.ts";
+import * as WorkCaptureStore from "./WorkCaptureStore.ts";
 
 export class AssistantError extends Schema.TaggedError<AssistantError>()("AssistantError", {
   reason: Schema.String,
@@ -83,7 +88,7 @@ export class ProjectAssistant extends Context.Service<
         | "previousLooperRunId"
         | "history"
         | "resumeWorkspace"
-      > & { projectId: ProjectId; ideaId?: string },
+      > & { projectId: ProjectId; ideaId?: string; executor?: "foredeck" | "factory" },
     ) => Effect.Effect<Portfolio.Assignment, AssistantError>;
     readonly control: (input: {
       assignmentId: string;
@@ -109,6 +114,7 @@ export class ProjectAssistant extends Context.Service<
 >()("t3/fd/assistant/ProjectAssistant") {}
 
 const isAssistantError = Schema.is(AssistantError);
+const isExecutorRefusal = Schema.is(FactoryExecutor.FactoryExecutorRefusal);
 const encodeQuestions = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const failure = (reason: string) => new AssistantError({ reason });
@@ -117,11 +123,13 @@ const protect = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     Effect.mapError((cause) =>
       isAssistantError(cause)
         ? cause
-        : new AssistantError({
-            reason:
-              "The assistant operation could not be completed; inspect the assignment before retrying.",
-            cause,
-          }),
+        : isExecutorRefusal(cause)
+          ? new AssistantError({ reason: cause.reason })
+          : new AssistantError({
+              reason:
+                "The assistant operation could not be completed; inspect the assignment before retrying.",
+              cause,
+            }),
     ),
   );
 
@@ -133,6 +141,8 @@ const make = Effect.gen(function* () {
   const projects = yield* Projects.ProjectService;
   const git = yield* Git.GitVcsDriver;
   const looper = yield* Looper.Looper;
+  const admission = yield* HandoffAdmission.HandoffAdmission;
+  const factoryExecutor = yield* FactoryExecutor.make;
   const mutex = yield* Semaphore.make(1);
   const readDispatches = SqlSchema.findAll({
     Request: Schema.Void,
@@ -209,6 +219,7 @@ const make = Effect.gen(function* () {
   const reconcile = Effect.fn(function* (initial: Dispatch) {
     let record = initial;
     let work = yield* assignment(record.assignmentId);
+    if (work.executor === "factory") return yield* factoryExecutor.reconcile(work);
     if (
       ![
         ...OCCUPIED_STATES,
@@ -529,62 +540,63 @@ const make = Effect.gen(function* () {
             Effect.catch((cause) => Effect.logWarning("Assistant reconciliation deferred", cause)),
           );
 
+        yield* factoryExecutor.maintain;
+        yield* admission.normalizeQueue;
         while (true) {
           // Capacity and the claim commit together before any external launch. Unknown outcomes keep a slot.
-          const next = yield* sql.withTransaction(
+          const { head } = yield* admission.next;
+          if (head === undefined) break;
+          // A waiting demand's turn comes before anything behind it, and its own grant takes it.
+          if (head.type === "demand") {
+            if (!(yield* factoryExecutor.grant(head.demand))) break;
+            continue;
+          }
+          const record = (yield* dispatches()).find(
+            (item) => item.assignmentId === head.assignmentId,
+          );
+          if (!record) break;
+          if (head.factory) {
+            const claimed = yield* factoryExecutor.launch(
+              record.brief.projectId,
+              head.assignmentId,
+              head.root,
+            );
+            if (!claimed) break;
+            continue;
+          }
+          const claimed = yield* sql.withTransaction(
             Effect.gen(function* () {
-              const active = yield* store.listAssignments({ states: OCCUPIED_STATES });
-              if (active.length >= 2) return undefined;
-              const records = yield* dispatches();
-              const briefs = yield* store.listBriefs();
-              const queued = yield* store.listAssignments({ states: ["queued"] });
-              for (const brief of briefs) {
-                if (
-                  !brief.executionAuthorized ||
-                  active.some(
-                    (work) =>
-                      work.projectId === brief.projectId &&
-                      (work.ideaId ?? "legacy") === (brief.ideaId ?? "legacy"),
-                  )
-                )
-                  continue;
-                const work = queued.find(
-                  (item) =>
-                    item.projectId === brief.projectId &&
-                    (item.ideaId ?? "legacy") === (brief.ideaId ?? "legacy"),
-                );
-                if (!work) continue;
-                const record = records.find((item) => item.assignmentId === work.assignmentId);
-                if (!record) continue;
-                if (
-                  Portfolio.renderAssignmentBrief(brief) !==
+              const brief = yield* store.getBrief(record.brief.projectId, record.brief.ideaId);
+              if (
+                Option.isSome(brief) &&
+                Portfolio.renderAssignmentBrief(brief.value) !==
                   Portfolio.renderAssignmentBrief(record.brief)
-                ) {
-                  yield* move(work.assignmentId, {
-                    type: "fail",
-                    note: "The agreed scope changed after queuing. Authorize a new assignment with the updated brief.",
-                  });
-                  continue;
-                }
-                yield* move(work.assignmentId, { type: "claim" });
-                return record;
+              ) {
+                yield* move(head.assignmentId, {
+                  type: "fail",
+                  note: "The agreed scope changed after queuing. Authorize a new assignment with the updated brief.",
+                });
+                return "failed" as const;
               }
-              return undefined;
+              return (yield* admission.claimOrdinary(head.assignmentId))
+                ? ("claimed" as const)
+                : ("stale" as const);
             }),
           );
-          if (!next) break;
-          yield* launch(next).pipe(
+          if (claimed === "stale") break;
+          if (claimed === "failed") continue;
+          yield* launch(record).pipe(
             Effect.matchEffect({
               onFailure: (cause) =>
                 isAssistantError(cause)
-                  ? move(next.assignmentId, { type: "fail", note: cause.message }).pipe(
+                  ? move(record.assignmentId, { type: "fail", note: cause.message }).pipe(
                       Effect.asVoid,
                     )
-                  : move(next.assignmentId, {
+                  : move(record.assignmentId, {
                       type: "uncertain",
                       note: "Launch response failed. Reconcile the saved identity; do not blindly retry.",
                     }).pipe(Effect.asVoid),
-              onSuccess: () => reconcile(next),
+              onSuccess: () => reconcile(record),
             }),
           );
         }
@@ -600,33 +612,43 @@ const make = Effect.gen(function* () {
         const records = yield* dispatches();
         const work = yield* store.listAssignments();
         return {
-          ideas: briefs.map((brief) => ({
-            projectId: brief.projectId,
-            ideaId: brief.ideaId ?? "legacy",
-            goal: brief.goal,
-            brief: Portfolio.renderAssignmentBrief(brief),
-            authorized: brief.executionAuthorized,
-            priority: brief.priority?.rank ?? null,
-            priorityReason: brief.priority?.reason ?? "",
-          })),
-          assignments: work.map((item) => {
-            const record = records.find((r) => r.assignmentId === item.assignmentId);
-            return {
-              assignmentId: item.assignmentId,
-              projectId: item.projectId,
-              ideaId: item.ideaId ?? "legacy",
-              state: item.state,
-              attempt: item.attempt,
-              goal: record?.brief.goal ?? item.assignmentId,
-              brief: record
-                ? Portfolio.renderAssignmentBrief(record.brief)
-                : "Legacy assignment; inspect saved project history.",
-              threadId: record && !record.looper ? record.threadId : null,
-              runId: record?.runId ?? null,
-              evidence: item.evidence,
-              notice: item.progress.at(-1)?.text ?? "",
-            };
-          }),
+          ideas: yield* Effect.forEach(briefs, (brief) =>
+            factoryExecutor.overviewCapture(brief.projectId, brief.ideaId ?? "legacy").pipe(
+              Effect.map((capture) => ({
+                projectId: brief.projectId,
+                ideaId: brief.ideaId ?? "legacy",
+                goal: brief.goal,
+                brief: Portfolio.renderAssignmentBrief(brief),
+                authorized: brief.executionAuthorized,
+                priority: brief.priority?.rank ?? null,
+                priorityReason: brief.priority?.reason ?? "",
+                ...capture,
+              })),
+            ),
+          ),
+          assignments: yield* Effect.forEach(work, (item) =>
+            Effect.gen(function* () {
+              const record = records.find((r) => r.assignmentId === item.assignmentId);
+              return {
+                assignmentId: item.assignmentId,
+                projectId: item.projectId,
+                ideaId: item.ideaId ?? "legacy",
+                state: item.state,
+                attempt: item.attempt,
+                goal: record?.brief.goal ?? item.assignmentId,
+                brief: record
+                  ? Portfolio.renderAssignmentBrief(record.brief)
+                  : "Legacy assignment; inspect saved project history.",
+                threadId:
+                  record && !record.looper && item.executor !== "factory" ? record.threadId : null,
+                runId: record?.runId ?? null,
+                evidence: item.evidence,
+                notice: item.progress.at(-1)?.text ?? "",
+                executor: item.executor,
+                ...(item.executor === "factory" ? yield* factoryExecutor.overviewOf(item) : {}),
+              };
+            }),
+          ),
         };
       }),
     ),
@@ -687,94 +709,122 @@ const make = Effect.gen(function* () {
           return yield* store.reviseBrief(input);
         }),
       ),
-    enqueue: (input) =>
+    enqueue: ({ executor = "foredeck", ...input }) =>
       protect(
-        mutex.withPermit(
-          Effect.gen(function* () {
-            const existing = yield* store.getAssignment(input.assignmentId);
-            if (Option.isSome(existing)) {
-              yield* owned(input.assignmentId, input.managerThreadId);
-              if (
-                existing.value.projectId !== input.projectId ||
-                (existing.value.ideaId ?? "legacy") !== (input.ideaId ?? "legacy")
-              )
-                return yield* failure("This assignment ID belongs to another project.");
-              return existing.value;
-            }
-            if (!isAssistantThread(input.managerThreadId))
-              return yield* failure("Dispatch requires the project assistant.");
-            const brief = yield* currentBrief(input.projectId, input.ideaId);
-            if (
-              !brief.executionAuthorized ||
-              !brief.goal.trim() ||
-              brief.acceptanceCriteria.length === 0
-            )
-              return yield* failure(
-                "Save an agreed goal, acceptance criteria, and explicit execution authorization first.",
-              );
-            const project = yield* projects.getById(input.projectId);
-            if (Option.isNone(project) || project.value.deletedAt !== null)
-              return yield* failure("The destination project is unavailable.");
-            if ((project.value.repositories?.length ?? 0) > 1)
-              return yield* failure(
-                "Multi-repository projects cannot currently create isolated worktrees. No worker was launched.",
-              );
-            if (
-              input.looperConfig &&
-              (input.runtimeMode !== "full-access" || input.interactionMode !== "default")
-            )
-              return yield* failure(
-                "Looper's CLI requires explicit full-access execution; it cannot preserve supervised Foredeck permissions.",
-              );
-            const prepared = input.looperConfig
-              ? yield* looper.prepare(
-                  input.looperConfig,
-                  project.value.workspaceRoot,
-                  Portfolio.renderAssignmentBrief(brief),
-                )
-              : null;
-            if (
-              prepared &&
-              (yield* dispatches()).some(
-                (row) =>
-                  row.looper?.runtimeDir === prepared.runtimeDir ||
-                  row.looper?.worktree === prepared.worktree,
-              )
-            )
-              return yield* failure(
-                "This Looper runtime or worktree already belongs to an assignment.",
-              );
-            const threadId = ThreadId.make(yield* randomUuidV4);
-            const record: Dispatch = {
-              ...input,
-              brief,
-              threadId,
-              commandId: CommandId.make(`assignment:${threadId}`),
-              messageId: MessageId.make(`assignment:${threadId}`),
-              runId: null,
-              cancelRequested: false,
-              lastNotice: "",
-              lastProgress: "",
-              answeredRequestIds: [],
-              resumeWorkspace: null,
-              looper: prepared,
-              looperRunId: null,
-              previousLooperRunId: null,
-              history: [],
-            };
-            return yield* sql.withTransaction(
+        // A Factory assignment's item is read before the lock, so a slow source holds nothing.
+        (executor === "factory"
+          ? factoryExecutor.readCaptured(input.projectId, input.ideaId ?? "legacy")
+          : Effect.undefined
+        ).pipe(
+          Effect.flatMap((captured) =>
+            mutex.withPermit(
               Effect.gen(function* () {
-                yield* store.createAssignment({
-                  assignmentId: input.assignmentId,
-                  projectId: input.projectId,
-                  ideaId: input.ideaId ?? "legacy",
-                  executor: input.looperConfig ? "looper" : "foredeck",
-                });
-                yield* save({ payload: record });
-                return yield* move(input.assignmentId, { type: "queue" });
+                const existing = yield* store.getAssignment(input.assignmentId);
+                if (Option.isSome(existing)) {
+                  yield* owned(input.assignmentId, input.managerThreadId);
+                  if (
+                    existing.value.projectId !== input.projectId ||
+                    (existing.value.ideaId ?? "legacy") !== (input.ideaId ?? "legacy")
+                  )
+                    return yield* failure("This assignment ID belongs to another project.");
+                  if ((existing.value.executor === "factory") !== (executor === "factory"))
+                    return yield* failure("This assignment ID belongs to another executor.");
+                  return existing.value;
+                }
+                if (!isAssistantThread(input.managerThreadId))
+                  return yield* failure("Dispatch requires the project assistant.");
+                const brief = yield* currentBrief(input.projectId, input.ideaId);
+                if (
+                  !brief.executionAuthorized ||
+                  !brief.goal.trim() ||
+                  brief.acceptanceCriteria.length === 0
+                )
+                  return yield* failure(
+                    "Save an agreed goal, acceptance criteria, and explicit execution authorization first.",
+                  );
+                const project = yield* projects.getById(input.projectId);
+                if (Option.isNone(project) || project.value.deletedAt !== null)
+                  return yield* failure("The destination project is unavailable.");
+                if ((project.value.repositories?.length ?? 0) > 1)
+                  return yield* failure(
+                    "Multi-repository projects cannot currently create isolated worktrees. No worker was launched.",
+                  );
+                const authorized =
+                  executor === "factory"
+                    ? yield* factoryExecutor.authorize({
+                        projectId: input.projectId,
+                        ideaId: input.ideaId ?? "legacy",
+                        brief,
+                        runtimeMode: input.runtimeMode,
+                        interactionMode: input.interactionMode,
+                        looperConfig: input.looperConfig,
+                        read: captured,
+                      })
+                    : null;
+                if (
+                  input.looperConfig &&
+                  (input.runtimeMode !== "full-access" || input.interactionMode !== "default")
+                )
+                  return yield* failure(
+                    "Looper's CLI requires explicit full-access execution; it cannot preserve supervised Foredeck permissions.",
+                  );
+                const prepared = input.looperConfig
+                  ? yield* looper.prepare(
+                      input.looperConfig,
+                      project.value.workspaceRoot,
+                      Portfolio.renderAssignmentBrief(brief),
+                    )
+                  : null;
+                if (
+                  prepared &&
+                  (yield* dispatches()).some(
+                    (row) =>
+                      row.looper?.runtimeDir === prepared.runtimeDir ||
+                      row.looper?.worktree === prepared.worktree,
+                  )
+                )
+                  return yield* failure(
+                    "This Looper runtime or worktree already belongs to an assignment.",
+                  );
+                const threadId = ThreadId.make(yield* randomUuidV4);
+                const record: Dispatch = {
+                  ...input,
+                  brief,
+                  threadId,
+                  commandId: CommandId.make(`assignment:${threadId}`),
+                  messageId: MessageId.make(`assignment:${threadId}`),
+                  runId: null,
+                  cancelRequested: false,
+                  lastNotice: "",
+                  lastProgress: "",
+                  answeredRequestIds: [],
+                  resumeWorkspace: null,
+                  looper: prepared,
+                  looperRunId: null,
+                  previousLooperRunId: null,
+                  history: [],
+                };
+                return yield* sql.withTransaction(
+                  Effect.gen(function* () {
+                    yield* store.createAssignment({
+                      assignmentId: input.assignmentId,
+                      projectId: input.projectId,
+                      ideaId: input.ideaId ?? "legacy",
+                      executor: authorized ? "factory" : input.looperConfig ? "looper" : "foredeck",
+                    });
+                    yield* save({ payload: record });
+                    // Judged before the move, so a revoked brief is refused with its reason.
+                    if (authorized) {
+                      yield* factoryExecutor.enterAuthorized(input.assignmentId, authorized);
+                    } else {
+                      yield* admission.enterQueue(input.assignmentId);
+                    }
+                    return yield* move(input.assignmentId, { type: "queue" });
+                  }),
+                );
               }),
-            );
-          }),
+            ),
+          ),
         ),
       ),
     control: (input) =>
@@ -783,6 +833,9 @@ const make = Effect.gen(function* () {
           Effect.gen(function* () {
             const record = yield* owned(input.assignmentId, input.managerThreadId);
             let work = yield* assignment(input.assignmentId);
+            if (work.executor === "factory") {
+              return yield* factoryExecutor.control(work, input.action);
+            }
             if (input.action === "stop" || input.action === "cancel") {
               if (
                 input.action === "cancel" &&
@@ -827,6 +880,7 @@ const make = Effect.gen(function* () {
                     "Changed Looper scope needs a new configuration and assignment.",
                   );
                 const next = yield* move(input.assignmentId, { type: input.action });
+                yield* admission.enterQueue(input.assignmentId);
                 const id = yield* randomUuidV4;
                 yield* save({
                   payload: {
@@ -868,6 +922,21 @@ const make = Effect.gen(function* () {
         mutex.withPermit(
           Effect.gen(function* () {
             const record = yield* owned(input.assignmentId, input.managerThreadId);
+            const work = yield* assignment(input.assignmentId);
+            if (work.executor === "factory") {
+              const threadId = yield* factoryExecutor.questionThread(work, input.requestId);
+              yield* withLimits(
+                record,
+                threads.dispatch({
+                  type: "runtime-request.respond",
+                  threadId: ThreadId.make(threadId),
+                  requestId: input.requestId,
+                  commandId: CommandId.make(`answer:${input.requestId}`),
+                  answers: input.answers,
+                }),
+              );
+              return;
+            }
             const { runtimeRequests, nodes } = yield* threads.getThreadRecords(record.threadId, [
               "runtimeRequests",
               "nodes",
@@ -908,6 +977,10 @@ const make = Effect.gen(function* () {
           Effect.gen(function* () {
             yield* owned(input.assignmentId, input.managerThreadId);
             const work = yield* assignment(input.assignmentId);
+            if (work.executor === "factory")
+              return yield* failure(
+                "A Factory assignment completes itself once its pull request merges and Factory closes it out, so there is nothing to verify here.",
+              );
             if (work.state !== "awaiting-verification")
               return yield* failure("Only a completed worker turn can be verified.");
             if (!input.evidence.length || input.evidence.some((item) => !item.trim()))
@@ -921,9 +994,22 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(ProjectAssistant, make).pipe(Layer.provide(PortfolioStore.layer));
-export const layerLive = layer.pipe(
-  Layer.provide(Looper.layer.pipe(Layer.provide(ProcessRunner.layer))),
+/**
+ * Assistant persistence on the core-migrated SQL client. The `fd_assistant_migrations` ledger
+ * migrates first, so no assistant store is ever built against an older schema. server.ts also
+ * mounts it with core, Work and Factory persistence; one build shares the one instance.
+ */
+export const layerPersistence = Layer.merge(PortfolioStore.layer, WorkCaptureStore.layer).pipe(
+  Layer.provide(HandoffMigrations.layer),
+);
+export const layer = Layer.effect(ProjectAssistant, make).pipe(Layer.provide(layerPersistence));
+/**
+ * The assistant and its Work capture. Captures reach Work through whichever `HandoffBackend` is
+ * provided beneath this layer; without one, nothing is captured.
+ */
+export const layerLive = Layer.merge(
+  layer.pipe(Layer.provide(Looper.layer.pipe(Layer.provide(ProcessRunner.layer)))),
+  WorkCapture.layer.pipe(Layer.provide(layerPersistence)),
 );
 export const workerLayer = Layer.effectDiscard(
   Effect.gen(function* () {

@@ -157,6 +157,8 @@ const parseNoteLine = (line: string) => {
 };
 
 interface NotesSection {
+  /** Where the heading line starts. */
+  readonly start: number;
   /** The end of the heading's text, before its line break. */
   readonly headingEnd: number;
   /** The first offset after the heading line. */
@@ -243,6 +245,7 @@ const findNotes = (body: string): NotesSection | undefined => {
     if (section === undefined) {
       if (line.content.trimEnd() === NOTES_HEADING) {
         section = {
+          start: line.start,
           headingEnd: line.start + line.content.trimEnd().length,
           contentStart: line.next,
         };
@@ -252,6 +255,20 @@ const findNotes = (body: string): NotesSection | undefined => {
     }
   }
   return section === undefined ? undefined : { ...section, end: body.length };
+};
+
+/**
+ * The body without its `## Notes` section, and that section as written, heading included: the
+ * comments Work keeps in a task file, apart from what the task says. `notes` is empty when the
+ * body has no such section.
+ */
+export const splitNotes = (body: string): { readonly rest: string; readonly notes: string } => {
+  const section = findNotes(body);
+  if (section === undefined) return { rest: body, notes: "" };
+  return {
+    rest: body.slice(0, section.start) + body.slice(section.end),
+    notes: body.slice(section.start, section.end),
+  };
 };
 
 /**

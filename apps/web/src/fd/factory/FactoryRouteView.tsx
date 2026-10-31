@@ -142,6 +142,9 @@ function FactoryFleetRowItem({
         {row.needsYou !== undefined ? (
           <span className="text-sm text-warning-foreground">{row.needsYou}</span>
         ) : null}
+        {row.capacityNote !== undefined ? (
+          <span className="text-muted-foreground text-sm">{row.capacityNote}</span>
+        ) : null}
       </button>
     </li>
   );

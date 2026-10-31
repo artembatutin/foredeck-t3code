@@ -60,6 +60,7 @@ import {
   verifyCommands,
   withProject,
 } from "./testkit/deliveryHarness.ts";
+import { endTurnOnly, providerTurnRunning } from "./testkit/familyThreads.ts";
 
 const projectId = ProjectId.make("project-alpha");
 /** `workBranchName` of the item below. */
@@ -919,6 +920,106 @@ describe("stop and cancel on the server's real stack", () => {
         assert.strictEqual((yield* harnessStateOf(author.deliveryId)).status, "cancelled");
       }),
     ).pipe(Effect.orDie),
+  );
+
+  it.live(
+    "keeps a reviewer that launched after the cancel busy, through a restart, until it ends",
+    () => {
+      // The reviewer's launch, its thread and run made, waits here to report until the cancel landed.
+      const hold: {
+        readonly reached: Deferred.Deferred<ThreadId>;
+        readonly release: Deferred.Deferred<void>;
+        author: ThreadId | null;
+      } = { reached: Deferred.makeUnsafe(), release: Deferred.makeUnsafe(), author: null };
+      return withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const factory = yield* Factory.FactoryService.FactoryService;
+            const author = yield* world.start;
+            hold.author = author.threadId;
+            yield* authorCommits(author.worktreePath, "feat: add the export button");
+            yield* endTurnOnly(world, author.runId);
+            const reviewerThread = yield* Deferred.await(hold.reached);
+            // The reviewer's turn starts on its provider before the delivery is cancelled.
+            const [reviewerRun] = (yield* threadProjection(reviewerThread)).runs;
+            if (reviewerRun === undefined) return assert.fail("The reviewer's launch made no run.");
+            assert.strictEqual(
+              yield* runReached(reviewerRun.id, ["starting", ...ended]),
+              "starting",
+            );
+            yield* drainOrchestration;
+            yield* providerTurnRunning(reviewerThread);
+            // Core refuses every interrupt Factory asks the reviewer's thread for.
+            world.factoryDispatch.beforeInterrupt = (input) =>
+              input.threadId === reviewerThread
+                ? Effect.die("Core refused the interrupt.")
+                : Effect.void;
+            const cancelled = yield* factory.cancel(author.deliveryId);
+            assert.strictEqual(cancelled.state.status, "cancelled");
+            yield* Deferred.succeed(hold.release, undefined);
+            yield* drainFactory;
+            yield* drainOrchestration;
+
+            // The launch went through anyway: the cancelled delivery took none of it, and its run
+            // goes on, since core refused the interrupt Factory sent it.
+            const turn =
+              world.provider.started.find((candidate) => candidate.threadId === reviewerThread) ??
+              assert.fail("The reviewer's launch started no turn.");
+            assert.strictEqual(
+              FactoryThreadEffects.launchDeliveryId(reviewerThread),
+              author.deliveryId,
+            );
+            assert.deepStrictEqual(yield* harnessStateOf(author.deliveryId), cancelled.state);
+            assert.isUndefined(cancelled.state.threads.reviewer);
+            assert.deepStrictEqual(world.provider.interrupted, []);
+            assert.strictEqual(
+              (yield* threadProjection(reviewerThread)).runs.find((run) => run.id === turn.runId)
+                ?.status,
+              "running",
+            );
+            const activity = factory.activity(author.deliveryId);
+            const busy = {
+              phase: "terminal",
+              busy: true,
+              deferred: false,
+              backgroundWaits: 0,
+              unknown: false,
+            } as const;
+            assert.deepStrictEqual(yield* activity, busy);
+
+            // A rebuilt Factory, with nothing of it in memory, reads it from core's records.
+            yield* world.rebuild(
+              Effect.gen(function* () {
+                const rebuilt = yield* Factory.FactoryService.FactoryService;
+                assert.deepStrictEqual(yield* rebuilt.activity(author.deliveryId), busy);
+                yield* world.endRun(turn.runId, "completed");
+                assert.deepStrictEqual(yield* rebuilt.activity(author.deliveryId), {
+                  ...busy,
+                  busy: false,
+                });
+              }),
+            );
+          }),
+        {
+          work: (service) => ({
+            ...service,
+            linkLaunch: (input, launch) =>
+              hold.author !== null && input.threadId !== hold.author
+                ? service
+                    .linkLaunch(input, launch)
+                    .pipe(
+                      Effect.tap(() =>
+                        Deferred.succeed(hold.reached, input.threadId).pipe(
+                          Effect.andThen(Deferred.await(hold.release)),
+                        ),
+                      ),
+                    )
+                : service.linkLaunch(input, launch),
+          }),
+        },
+      ).pipe(Effect.orDie);
+    },
   );
 
   it.live("starts over on a branch of its own after a cancel during the author's launch", () =>

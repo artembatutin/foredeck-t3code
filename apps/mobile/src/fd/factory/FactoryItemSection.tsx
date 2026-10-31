@@ -178,6 +178,9 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
           <Text className="text-sm font-t3-medium text-warning-foreground">{view.needsYou}</Text>
         </View>
       ) : null}
+      {view.capacityNote !== undefined ? (
+        <Text className="text-sm text-foreground-muted">{view.capacityNote}</Text>
+      ) : null}
       <Text className="text-xs text-foreground-muted">
         {view.branch === undefined ? null : (
           <Text selectable className="font-mono text-foreground">

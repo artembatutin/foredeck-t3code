@@ -20,6 +20,7 @@ export type FactoryServiceError =
   | FactorySettings.FactoryVerifyCommandMissingError
   | FactoryService.FactoryParentSourceUnsupportedError
   | FactoryService.FactoryDeliveryIdError
+  | FactoryService.FactoryDeliveryIdConflictError
   | FactoryService.FactoryDeliveryNotFoundError
   | FactoryService.FactoryStopRefusedError
   | FactoryService.FactoryResumeRefusedError
@@ -56,6 +57,12 @@ export const toFactoryError = (error: FactoryServiceError): FactoryError => {
       return new FactoryError({
         reason: "conflict",
         message: "This Work item already has a Factory delivery that is not done or cancelled.",
+        deliveryId: error.deliveryId,
+      });
+    case "FactoryDeliveryIdConflictError":
+      return new FactoryError({
+        reason: "conflict",
+        message: "This Factory delivery id already names a delivery of something else.",
         deliveryId: error.deliveryId,
       });
     case "FactoryDeliveryNotFoundError":

@@ -769,3 +769,160 @@ ordinary read cannot answer this, since Work bounds it to 50 comments (Markdown 
 A lookup that fails leaves the comment unfinished for the next boot, never posted on a guess. The
 reference also tells a later block apart from an earlier one with the same text
 ([`FactoryWorkComments.ts`](../../apps/server/src/fd/factory/FactoryWorkComments.ts)).
+
+## The project assistant admits a managed root's work
+
+Once the project assistant claims a root delivery, that root's whole family shares one of the
+environment's two slots ([`handoffScheduler.ts`](../../apps/server/src/fd/assistant/handoffScheduler.ts)).
+Factory imports nothing of the assistant; it asks the
+[`FactoryAdmission`](../../apps/server/src/fd/factory/FactoryAdmission.ts) port, whose default
+manages nothing, so a delivery nobody claimed runs as it always did. The trap is that work reaches a
+family's threads by several unrelated routes. Any route the rules below miss runs uncounted.
+
+### Every route into a family passes one gate
+
+Factory's effects ask `FactoryAdmission.enter` in the worker. A close-out is exempt, because it
+finishes a merged delivery and is what lets its slot go. Automatic turns ask
+[`AutomaticTurnGate`](../../apps/server/src/orchestration-v2/AutomaticTurnGate.ts) in their
+producers, not in the orchestrator: by the time a command reaches the orchestrator its cause is gone,
+and only the producer knows how the turn comes back if it cannot run now. The gate is installable and
+consults wait until Factory installs it, so no turn runs ungoverned during startup.
+
+A new upstream producer of automatic turns must join this table, presenting one turn under one
+message id across its retries and naming its restart source:
+
+| Producer                                                                                                      | Turn                   | Seam    | Comes back through                                                                         |
+| ------------------------------------------------------------------------------------------------------------- | ---------------------- | ------- | ------------------------------------------------------------------------------------------ |
+| [`PullRequestWatchReactor`](../../apps/server/src/orchestration-v2/PullRequestWatchReactor.ts)                | `pull_request_wake`    | `admit` | The watch sweep asks again                                                                 |
+| [`RestartContinuation`](../../apps/server/src/orchestration-v2/RestartContinuation.ts)                        | `restart_continuation` | `admit` | Never waits. An undecided consult fails the outbox effect, whose last attempt declines     |
+| [`UsageLimitRecoveryWorker`](../../apps/server/src/orchestration-v2/UsageLimitRecoveryWorker.ts)              | `usage_limit_resume`   | `admit` | The next sweep; a decline is disarmed so the sweep stops asking                            |
+| [`DelegatedTaskQuestionReactor`](../../apps/server/src/orchestration-v2/DelegatedTaskQuestionReactor.ts)      | `delegated_question`   | `admit` | The demand, redelivered through the reactor; the request stays pending in the child thread |
+| [`ProviderContinuationService`](../../apps/server/src/orchestration-v2/ProviderContinuationService.ts), offer | `delegated_completion` | `admit` | The demand, re-offered on the shared queue, and core's boot recovery of delegated tasks    |
+| [`EffectWorker`](../../apps/server/src/orchestration-v2/EffectWorker.ts), completion steer                    | `delegated_completion` | `admit` | The same two; both converge on one run because the delivery's message id is fixed          |
+| `ProviderContinuationService`, native wake                                                                    | `background_wake`      | `hand`  | None. Its output exists only in provider memory, so a restart records it as lost           |
+
+`hand` differs from `admit` because a native wake cannot be asked for again: the gate keeps the
+dispatch to run at the demand's grant. A steer follow-up with no delegated completion is deliberately
+not gated, since its message comes from the owner or from an agent outside the family.
+
+### Provenance is exact, and families are structural
+
+A family is a structure, not a guess: the threads a delivery's launch made, and every thread whose
+lineage leads to one, at most eight levels deep. A deeper walk fails like a failed read. Threads
+delegated from elsewhere are not in it.
+
+Each turn or run on a family thread has one class, decided from its exact cause
+([`FactoryOwnership.ts`](../../apps/server/src/fd/factory/FactoryOwnership.ts)) and recorded on first
+decision, so a turn presented again keeps its class:
+
+- `factory`: the root's own work, by Factory's message, its own pull request's wake, or a run it
+  delegated or continued.
+- `explicit`: someone started it on purpose, as the owner, a schedule, or an agent outside every
+  managed family. It runs inline and is never counted, or owner work would queue behind the slot.
+- `unknown`: nothing shows which. It is treated as the delivery's, with a notice saying so.
+
+Neighbouring runs and timestamps never decide a class: an owner's turn can sit between two of
+Factory's on one thread. A native wake's class is exhaustive over the runs on its provider thread,
+because background work there can only have been started by one of them. All Factory's for this root
+is `factory`, all explicit is `explicit`, and anything else is `unknown`.
+
+### Ending is fenced, and retirement compares
+
+A root's management is `never`, `active`, `ending` or `retired`, and only moves forward. A row is
+written before any thread of the root can exist and is never deleted, because no row means `never`,
+and a formerly managed root's late work must not read as unmanaged.
+
+Retirement has to be linearized against admission, since a turn can be admitted at the moment the
+delivery is seen to end. So every transaction that creates ownership requires the root `active`, and
+inserts or requires a slot row. The first observation of `done` or `cancelled` fences the root to
+`ending` (Factory's terminal states are final, so a fence never needs reverting), after which
+ownership only decreases. `retireAttempt` then commits only on a terminal, quiescent observation
+while no slot row and no admission row exists, and never deletes one. Otherwise only the fence
+stands and a later pass tries again. In the retiring transaction, waiting follow-ups become
+dispositions, each with one notice, and the assignment moves to its end; a late arrival afterwards
+finds the disposition and adds nothing. A root that never got a delivery row retires through
+`retirePreDelivery`, which is exact about the claim or parked shape it removes.
+
+### Agent tools on managed threads are refused by class
+
+MCP credentials belong to a provider session on a thread, not to a run, so a tool call cannot be told
+apart from one made during the owner's own turn on that thread. A run such a call started would also
+escape the slot. So a caller is governed by the thread's family root, whichever run is active, once
+that root has any management; other threads, outside clients and never-managed deliveries are
+unchanged.
+
+[`callerTools.ts`](../../apps/server/src/fd/assistant-handoff/callerTools.ts) gives every published
+tool a class, by exact name, and a name it does not list is refused. A new tool must join it:
+[`registration.test.ts`](../../apps/server/src/mcp/toolkits/worktree/registration.test.ts) fails on a
+published tool with no class.
+
+- `refuse`: tools that start, message, schedule, hand off or watch work, and every `assistant_*` name.
+- `allow`: tools that read, or change nothing that starts a run.
+- `delegate`: `delegate_task`, the counted route. Under an `active` root's held slot it bumps the
+  slot's `entry_seq` and writes a dispatching row around the handler, marked dispatched once the
+  handler ends, however it ends. It never takes a slot of its own. A reserved or missing slot refuses
+  it, and so does an `ending` or `retired` root.
+- `respond_live`: `t3_pending_request_respond`, allowed for `active` and `ending` roots under a held
+  slot, only for a pending live `user_input` on a non-terminal `factory` or `unknown` run of the
+  family, and never for a `retired` root or a message-capable request. `ending` is allowed so that a
+  run waiting on an answer can drain and let its root retire.
+
+The answer rule rests on a request's response capability being immutable in the direction that
+matters: it is fixed when the adapter creates the request, and afterwards can only become
+`not_resumable`, which core refuses before any event. A request screened as `live` therefore either
+continues that provider request or is refused; it can never turn into a `message` answer, which
+would create a run. Reading the capability without a lock is safe only because of this, so a future
+adapter that upgrades a request to `message` would break the rule.
+
+### One grant is one quantum
+
+A slot is one grant of work, not a lease on the family. A held root admits its own Factory effects,
+continuations of its `factory` runs cut mid-turn, question wakes from a `factory` run, and
+delegations. It does not admit pull request wakes, native wakes, delegated completions or usage-limit
+resumes, which wait for a grant of their own after release. Otherwise a family could hold its slot
+forever on follow-ups alone, which is the starvation capacity exists to prevent. `unknown` work never
+uses the held slot's allowance, and a continuation of a run that had already settled always declines,
+since core delivers its note with the next run. Owner actions landing while a slot is held or
+reserved run in that holding. Each grant consumes the candidate's turn, and re-entry takes a fresh
+position.
+
+### Admission rows and release
+
+An admission commits its `entry_seq` bump or slot insert together with a dispatching row, and the
+row turns dispatched only after what it admitted has returned, by which time any run it created is
+visible. The release pass reads `entry_seq`, then the root's rows, then Factory's activity, and
+deletes the slot by compare-and-delete on that `entry_seq`, only for a parked or terminal family with
+nothing busy, deferred or unknown. That is what closes the race: an admission before the first read
+is still dispatching or visible as busy, one during the pass moved `entry_seq`, and one after it finds
+no slot and goes through the fair order. A dead instance's dispatching row counts as dispatched. A
+queued or missing delivery is neither parked nor terminal, so a claim before its first start leaves
+only through `parkPreStart` or `retirePreDelivery`.
+
+### Activity reads are strict
+
+[`FactoryActivity`](../../apps/server/src/fd/factory/FactoryActivity.ts) answers "may this slot go?",
+so any failed read reports `unknown`, never idle: a projection, record or outbox failure keeps the
+slot, with a notice. A lenient read would free a slot under a run still working, and nothing would
+notice. It writes nothing. Owner-started runs are excluded, so an owner's long turn does not hold
+capacity.
+
+### Native retries have no callback to lean on
+
+A native offer's `dispatchIfCurrent` and `clearIfCurrent` are optional, and Claude's carries neither,
+so no failure path may assume them. An undecided consult re-offers the request through
+`ProviderContinuationService`'s capped backoff under its pre-allocated message id, and calls neither.
+A dropped offer without `clearIfCurrent` clears nothing, and its disposition records the adapter
+clear as `unavailable`. That is safe: by exhaustion, every later wake on that provider thread is
+`factory` or `unknown`, and is declined too.
+
+### Deferral recovers across two stores
+
+A deferred effect is recorded twice: as a demand in the assistant's tables and as `admissionWait` in
+Factory's state, with no shared transaction. The demand commits first, so a crash between them leaves
+an awaited effect with a demand and no mark. Factory's boot sweep treats an awaited effect with no job
+as lost and blocks it, so it first asks `deferredDemand` and re-marks one that was deferred; a read
+that fails reads as not deferred, and blocks rather than running it twice. Each tick also repairs the
+other way, through `ensureDeferred` and `ensureEffectDemand`: a lost mark is written again, a marked
+effect with no demand gets one, and a demand for an effect no longer awaited is dropped with a notice
+naming Resume. The drop and the grant compare the effect and position they checked, because one
+delivery's demand row is rewritten in place when a later effect comes to wait.

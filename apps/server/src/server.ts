@@ -1,4 +1,5 @@
-import { ProjectAssistant } from "./fd/assistant/index.ts";
+import { HandoffAdmission, ProjectAssistant } from "./fd/assistant/index.ts";
+import * as AssistantHandoff from "./fd/assistant-handoff/index.ts";
 import * as WorkManagement from "./fd/work-management/index.ts";
 import * as Factory from "./fd/factory/index.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
@@ -10,6 +11,7 @@ import * as StorageCleanup from "./storageCleanup.ts";
 import * as PullRequestSyncReactor from "./orchestration-v2/PullRequestSyncReactor.ts";
 import * as PullRequestWatchReactor from "./orchestration-v2/PullRequestWatchReactor.ts";
 import * as DelegatedTaskQuestionReactor from "./orchestration-v2/DelegatedTaskQuestionReactor.ts";
+import * as AutomaticTurnGate from "./orchestration-v2/AutomaticTurnGate.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeHttp from "node:http";
 
@@ -552,6 +554,18 @@ const layerProviderInstallationRefresh = Layer.effectDiscard(
   }),
 );
 
+/**
+ * The assistant's admission of the Factory roots it manages and its Work port, with the bridge's
+ * Factory admission port and redelivery of turns the assistant reserved a slot for, through a
+ * question reactor and the runtime's shared continuation queue. The assistant imports neither
+ * Work nor Factory.
+ */
+const layerAssistantHandoff = AssistantHandoff.layerAdmission.pipe(
+  Layer.provide(DelegatedTaskQuestionReactor.layer.pipe(Layer.provide(ProjectionStoreV2.layer))),
+  Layer.provideMerge(AssistantHandoff.layerBackend),
+  Layer.provideMerge(HandoffAdmission.layerLive),
+);
+
 const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   AgentAwarenessRelay.layer,
   // Asks T3 Connect to deliver webhooks it held while this environment was offline.
@@ -599,10 +613,17 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep),
 ).pipe(
   // Core Services
-  Layer.provideMerge(ProjectAssistant.layerLive),
+  // With its Factory port, so it starts its assignments' deliveries through Factory.
+  Layer.provideMerge(ProjectAssistant.layerLive.pipe(Layer.provide(AssistantHandoff.layerFactory))),
   Layer.provideMerge(Factory.layerLive),
+  // Beneath the assistant, which captures through its Work port, and Factory, which asks its
+  // admission port before a managed root's work runs.
+  Layer.provideMerge(layerAssistantHandoff),
   Layer.provideMerge(WorkManagement.layerLive),
   Layer.provideMerge(layerOrchestrationApplication),
+  // One gate for every automatic turn producer, in the runtime and in the reactors above it.
+  // Factory installs its implementation while its layers build; consults before then wait.
+  Layer.provideMerge(AutomaticTurnGate.layerInstallable),
   Layer.provideMerge(RuntimeLayer.layerEventInfrastructure),
   Layer.provideMerge(Layer.merge(ProjectStore.layer, ThreadSearch.layer)),
   Layer.provideMerge(layerServerSettings),
@@ -612,6 +633,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   Layer.provideMerge(layerGit),
   Layer.provideMerge(layerVcs),
   Layer.provideMerge(Layer.mergeAll(layerTerminal, layerPreview, layerDevice)),
+  Layer.provideMerge(ProjectAssistant.layerPersistence),
   Layer.provideMerge(Factory.layerPersistence),
   Layer.provideMerge(layerPersistence),
   // Both read a user-owned file out of the state directory and stream changes
@@ -740,6 +762,9 @@ const layerMakeRoutes = Layer.mergeAll(
   McpHttpServer.layer.pipe(
     Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
+    // Screens the threads of Factory deliveries the project assistant manages, and counts what
+    // they delegate, over the runtime's one admission instance.
+    Layer.provide(AssistantHandoff.layerCallerPolicy),
   ),
 ).pipe(
   // Guides read through the same pull request service as every other surface.

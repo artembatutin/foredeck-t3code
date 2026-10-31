@@ -102,6 +102,32 @@ describe("factoryFleet", () => {
     expect(keys(reversed)).toEqual(expected);
   });
 
+  it("shows a slot wait on its row, without counting it as needing you or moving the row", () => {
+    const deliveries = [
+      delivery("newest", "2026-10-26T10:00:00.000Z"),
+      delivery("waiting-for-a-slot", "2026-10-26T09:00:00.000Z", { capacityWait: true }),
+      delivery("blocked", "2026-10-26T08:00:00.000Z", { status: "blocked" }),
+      delivery("oldest", "2026-10-26T07:00:00.000Z"),
+    ];
+    const rows = factoryFleet([env(envA, deliveries)]);
+    expect(rows.map((row) => row.deliveryId)).toEqual([
+      "blocked",
+      "newest",
+      "waiting-for-a-slot",
+      "oldest",
+    ]);
+    expect(rows[2]).toMatchObject({
+      capacityNote: "Waiting for a project assistant slot",
+      needsYou: undefined,
+    });
+    expect(rows.filter((row) => row.capacityNote !== undefined)).toHaveLength(1);
+    // The same fleet without the wait lists the same rows in the same order.
+    const without = deliveries.map((entry) => ({ ...entry, capacityWait: false }));
+    expect(factoryFleet([env(envA, without)]).map((row) => row.key)).toEqual(
+      rows.map((row) => row.key),
+    );
+  });
+
   it("keeps a delivery with an unknown status or stage listed, read-only", () => {
     const rows = factoryFleet([
       env(envA, [
