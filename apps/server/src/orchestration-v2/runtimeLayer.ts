@@ -368,6 +368,9 @@ export const layerProduction = Layer.mergeAll(
     Layer.provide(Layer.mergeAll(ProjectionStore.layer, layerThreadManagementProvided)),
   ),
   layerProviderContinuationWorkerProvided,
+  // The queue the orchestrator and the continuation worker share, for callers
+  // that offer a stored continuation request again.
+  ProviderContinuationRequests.layer,
   layerAgentSessionImporterProvided,
   EffectOutbox.layerPruneWorker.pipe(Layer.provide(EffectOutbox.layer)),
 ).pipe(Layer.provide(Scheduler.layer), Layer.provideMerge(layerEventInfrastructure));

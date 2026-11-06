@@ -11,6 +11,7 @@ import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management"
 import {
   currentDelivery,
   FACTORY_STATUS_LABELS,
+  factoryCapacityNote,
   factoryControls,
   factoryNeedsYou,
   factoryTimeline,
@@ -72,6 +73,22 @@ const STATUSES: ReadonlyArray<FactoryStatus> = [
   "cancelled",
   "unknown",
 ];
+
+describe("factoryCapacityNote", () => {
+  it("says a delivery waits for a slot only while the server says so", () => {
+    expect(factoryCapacityNote({ capacityWait: true })).toBe(
+      "Waiting for a project assistant slot",
+    );
+    expect(factoryCapacityNote({ capacityWait: false })).toBeUndefined();
+    expect(factoryCapacityNote({})).toBeUndefined();
+  });
+
+  it("does not make a delivery need its owner, or change its controls", () => {
+    const waiting = delivery({ capacityWait: true });
+    expect(factoryNeedsYou(waiting)).toBeUndefined();
+    expect(factoryControls(waiting)).toEqual(factoryControls(delivery()));
+  });
+});
 
 describe("serverFactorySupport", () => {
   it("reads the advertised Factory and hides it otherwise", () => {

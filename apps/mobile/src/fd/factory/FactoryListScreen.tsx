@@ -97,7 +97,14 @@ export function FactoryListScreen() {
         renderItem={({ item: row }) => (
           <Pressable
             accessibilityRole="button"
-            accessibilityLabel={[row.item, row.project, row.status, row.stage, row.needsYou]
+            accessibilityLabel={[
+              row.item,
+              row.project,
+              row.status,
+              row.stage,
+              row.needsYou,
+              row.capacityNote,
+            ]
               .filter(Boolean)
               .join(", ")}
             className="flex-row gap-3 px-4 active:bg-row-hover"
@@ -141,6 +148,11 @@ export function FactoryListScreen() {
                   {row.needsYou}
                 </Text>
               ) : null}
+              {row.capacityNote !== undefined ? (
+                <Text className="text-sm text-foreground-muted" numberOfLines={2}>
+                  {row.capacityNote}
+                </Text>
+              ) : null}
             </View>
           </Pressable>
         )}
@@ -154,4 +166,5 @@ const sameRow = (left: MobileFleetRow, right: MobileFleetRow) =>
   left.project === right.project &&
   left.status === right.status &&
   left.stage === right.stage &&
-  left.needsYou === right.needsYou;
+  left.needsYou === right.needsYou &&
+  left.capacityNote === right.capacityNote;

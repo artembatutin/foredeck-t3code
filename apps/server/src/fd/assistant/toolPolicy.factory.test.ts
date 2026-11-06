@@ -26,3 +26,14 @@ it("refuses factory_deliver on an assistant thread as it refuses work_start_thre
 it("lets an assistant thread read deliveries with factory_status", () => {
   assert.isUndefined(assistantToolRefusal("fd-assistant-owner", call("factory_status")));
 });
+
+it("keeps factory_deliver and work_start_thread refused beside the capture tools, which point at capture", () => {
+  for (const name of ["factory_deliver", "work_start_thread"]) {
+    const refusal = assistantToolRefusal("fd-assistant-owner", call(name));
+    assert.isTrue(refusal?.result.isError);
+    assert.include(refusal?.result.content[0]?.text ?? "", "assistant_capture_work");
+  }
+  for (const name of ["assistant_capture_work", "assistant_abandon_capture"]) {
+    assert.isUndefined(assistantToolRefusal("fd-assistant-owner", call(name)));
+  }
+});

@@ -41,7 +41,7 @@ export function assistantToolRefusal(threadId: string | undefined, body: unknown
       content: [
         {
           type: "text",
-          text: "Use assistant_assign, assistant_control or assistant_answer. Project assistant work must pass through the durable queue and its permission checks. Work items are started by the owner from Work; read and update them with the work_* tools.",
+          text: "Use assistant_assign, assistant_control or assistant_answer. Project assistant work must pass through the durable queue and its permission checks. Work items are started by the owner from Work; record an agreed idea as one with assistant_capture_work, and read and update items with the work_* tools.",
         },
       ],
     },

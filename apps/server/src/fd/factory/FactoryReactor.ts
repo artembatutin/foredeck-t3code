@@ -248,12 +248,12 @@ const make = Effect.gen(function* () {
    * then the wakes queued for that pull request meanwhile, adopting one or keeping it pending. A
    * delivery awaiting a run then gets the run's end or its thread's deletion, as the tail would
    * have handed them on, so a stopping one stops where the run's end leads it. One awaiting an
-   * effect lost it with the previous process and blocks, unless what it did is stored (see
-   * `failInterruptedEffect`); a PR stage blocked so after its watch command then records what
-   * that command proves (see `recoverPullRequest`). A parent awaiting its child takes the child's
-   * approval stored before the restart, and otherwise waits for that child. A delivery awaiting
-   * nothing else (queued, stopped, blocked) waits for its owner. Each step reads the delivery
-   * again, so one cancelled here takes nothing more.
+   * effect lost it with the previous process and blocks, unless what it did is stored or the
+   * effect waits for admission (see `failInterruptedEffect`); a PR stage blocked so after its
+   * watch command then records what that command proves (see `recoverPullRequest`). A parent
+   * awaiting its child takes the child's approval stored before the restart, and otherwise waits
+   * for that child. A delivery awaiting nothing else (queued, stopped, blocked) waits for its
+   * owner. Each step reads the delivery again, so one cancelled here takes nothing more.
    */
   const reconcile = (listed: FactoryDeliveryStore.StoredFactoryDelivery) =>
     Effect.gen(function* () {

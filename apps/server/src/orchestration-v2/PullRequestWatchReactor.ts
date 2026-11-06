@@ -32,6 +32,7 @@ import {
 } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import { forkParked } from "../serverActivation.ts";
+import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { evaluatePullRequestWatch, pullRequestWatchMessage } from "./pullRequestWatch.ts";
@@ -236,6 +237,7 @@ export const make = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const pullRequests = yield* PullRequestService.PullRequestService;
   const crypto = yield* Crypto.Crypto;
+  const gate = yield* AutomaticTurnGate.AutomaticTurnGate;
   const bootedAt = yield* Clock.currentTimeMillis;
   const lives = new Map<string, WatchLife>();
 
@@ -302,15 +304,23 @@ export const make = Effect.gen(function* () {
   /**
    * Records what a pass saw, and wakes the agent with it. The orchestrator applies this only
    * while the same watch is on, so a stop or restart that lands during the host read wins.
+   * A wake runs only once the automatic turn gate admits it; otherwise nothing is recorded, not
+   * even the watch's end the wake reports, and the next pass asks again. Succeeds with whether
+   * the update landed.
    */
   const record = (
     target: WatchTarget,
     next: ThreadPullRequestWatch | null,
-    wake?: { readonly text: string; readonly notification: OrchestrationV2Notification },
+    wake?: {
+      readonly text: string;
+      readonly notification: OrchestrationV2Notification;
+      readonly ending: AutomaticTurnGate.PullRequestWakeTurn["ending"];
+    },
   ) =>
     Effect.gen(function* () {
       const uuid = yield* crypto.randomUUIDv4();
-      yield* engine.dispatch({
+      const messageId = MessageId.make(`message:pr-watch:${uuid}`);
+      const sync = engine.dispatch({
         type: "thread.pull-request-watch.sync",
         commandId: CommandId.make(`server:pr-watch:${target.thread.id}:${uuid}`),
         threadId: target.thread.id,
@@ -319,8 +329,37 @@ export const make = Effect.gen(function* () {
         watch: next,
         ...(wake === undefined
           ? {}
-          : { wake: { ...wake, messageId: MessageId.make(`message:pr-watch:${uuid}`) } }),
+          : { wake: { text: wake.text, notification: wake.notification, messageId } }),
       });
+      if (wake === undefined) {
+        yield* sync;
+        return true;
+      }
+      const outcome = yield* gate
+        .admit(
+          {
+            kind: "pull_request_wake",
+            threadId: target.thread.id,
+            messageId,
+            key: target.link.url,
+            pullRequest: { ...identityOf(target.link), url: target.link.url },
+            watchStartedAt: target.watch.startedAt,
+            ending: wake.ending,
+          },
+          sync,
+        )
+        .pipe(
+          Effect.catchTags({
+            AutomaticTurnDecisionError: (error) =>
+              Effect.logWarning("pull request watch wake could not be decided", {
+                threadId: target.thread.id,
+                pullRequest: threadPullRequestKeyOf(target.link),
+                stage: error.stage,
+                cause: error.cause,
+              }).pipe(Effect.as(AutomaticTurnGate.notNow("deferred"))),
+          }),
+        );
+      return outcome._tag === "Ran";
     });
 
   // A watch that cannot read its pull request ends with a wake saying so, rather than showing
@@ -333,10 +372,12 @@ export const make = Effect.gen(function* () {
         outcome: "failed",
         summary: `#${target.link.number}: stopped watching, could not read it`,
       },
+      ending: "unreadable",
     }).pipe(
-      Effect.tap(() => woke(target)),
+      Effect.tap((landed) => (landed ? woke(target) : Effect.void)),
+      // A wake the orchestrator refused still ends the watch; one the gate held back does not.
       Effect.catch(() => record(target, null)),
-      Effect.tap(() => ended(target, "unreadable")),
+      Effect.tap((landed) => (landed ? ended(target, "unreadable") : Effect.void)),
     );
 
   const readRemarks = Effect.fn("PullRequestWatchReactor.readRemarks")(
@@ -401,9 +442,11 @@ export const make = Effect.gen(function* () {
         outcome: "updated",
         summary: `#${target.link.number}: closed, stopped watching`,
       },
+      ending: "closed",
     }).pipe(
-      Effect.tap(() => woke(target)),
-      Effect.tap(() => ended(target, "closed")),
+      Effect.tap((landed) =>
+        landed ? woke(target).pipe(Effect.andThen(ended(target, "closed"))) : Effect.void,
+      ),
     );
 
   /** Why a watch ends without a host read; the rest are read once per pull request. */
@@ -424,19 +467,22 @@ export const make = Effect.gen(function* () {
    */
   const eachTarget = <E>(
     group: WatchGroup,
-    step: (target: WatchTarget) => Effect.Effect<void, E>,
+    step: (target: WatchTarget) => Effect.Effect<boolean, E>,
   ) =>
     Effect.forEach(group.targets, (target) =>
       step(target).pipe(
-        Effect.as(true),
-        Effect.catchCause((cause) => {
-          // A thread that did not get its update must not wait for the quiet reread.
-          lastReads.delete(group.key);
-          return logFailure("pull request watch update failed", {
+        Effect.catchCause((cause) =>
+          logFailure("pull request watch update failed", {
             threadId: target.thread.id,
             pullRequest: group.key,
-          })(cause).pipe(Effect.as(false));
-        }),
+          })(cause).pipe(Effect.as(false)),
+        ),
+        Effect.tap((landed) =>
+          Effect.sync(() => {
+            // A thread that did not get its update must not wait for the quiet reread.
+            if (!landed) lastReads.delete(group.key);
+          }),
+        ),
       ),
     ).pipe(Effect.map((landed) => landed.every(Boolean)));
 
@@ -550,22 +596,28 @@ export const make = Effect.gen(function* () {
     yield* eachTarget(group, (target) => {
       const report = evaluatePullRequestWatch(target.watch, detail, remarks);
       if (report.changes.length > 0) {
-        return record(
-          target,
-          report.exhausted ? null : report.next,
-          pullRequestWatchMessage({
+        return record(target, report.exhausted ? null : report.next, {
+          ...pullRequestWatchMessage({
             number: target.link.number,
             url: target.link.url,
             baseBranch: detail.baseBranch,
             headSha: report.next.headSha,
             report,
           }),
-        ).pipe(
-          Effect.tap(() => woke(target)),
-          Effect.tap(() => (report.exhausted ? ended(target, "comment-limit") : Effect.void)),
+          ending: report.exhausted ? "comment-limit" : null,
+        }).pipe(
+          Effect.tap((landed) =>
+            landed
+              ? woke(target).pipe(
+                  Effect.andThen(report.exhausted ? ended(target, "comment-limit") : Effect.void),
+                )
+              : Effect.void,
+          ),
         );
       }
-      return watchesEqual(report.next, target.watch) ? Effect.void : record(target, report.next);
+      return watchesEqual(report.next, target.watch)
+        ? Effect.succeed(true)
+        : record(target, report.next);
     });
   });
 

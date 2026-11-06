@@ -73,6 +73,17 @@ export const factoryNeedsYou = (
   return delivery.needsYou?.trim() || fallback;
 };
 
+/** What a delivery says while its next step waits for a project assistant slot. */
+export const FACTORY_CAPACITY_WAIT_NOTE = "Waiting for a project assistant slot";
+
+/**
+ * The note of a delivery waiting for a project assistant slot, or undefined. Nothing is asked of
+ * the owner, so it is never a reason the delivery needs them and changes no ordering.
+ */
+export const factoryCapacityNote = (
+  delivery: Pick<FactoryDelivery, "capacityWait">,
+): string | undefined => (delivery.capacityWait === true ? FACTORY_CAPACITY_WAIT_NOTE : undefined);
+
 export interface FactoryControls {
   readonly stop: boolean;
   readonly resume: boolean;

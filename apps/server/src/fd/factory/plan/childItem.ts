@@ -6,7 +6,7 @@ import type {
 import { WorkItemCreateInput, type WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as Schema from "effect/Schema";
 
-import { canWriteMarkdownItem } from "../../work-management/index.ts";
+import { canWriteMarkdownItem, workItemScopeFingerprint } from "../../work-management/index.ts";
 
 /**
  * The line that opens an approved task's child item: the parent delivery and the task the item
@@ -70,6 +70,22 @@ export const childItemInput = (input: {
   body: childItemBody(input.deliveryId, input.task),
   parent: input.parent.itemId,
 });
+
+/**
+ * What the task's child item says, as `workItemScopeFingerprint` reads it: the Markdown item
+ * `childItemInput` writes, whole and exact. A read of that item fingerprints the same until
+ * someone changes what it asks for; the comments Work adds under its `## Notes` change nothing.
+ */
+export const childItemFingerprint = (input: Parameters<typeof childItemInput>[0]) => {
+  const { title, body = "" } = childItemInput(input);
+  return workItemScopeFingerprint({
+    kind: "markdown",
+    title,
+    body,
+    bodyTruncated: false,
+    bodyFidelity: "exact",
+  });
+};
 
 const isCreatable = Schema.is(WorkItemCreateInput);
 

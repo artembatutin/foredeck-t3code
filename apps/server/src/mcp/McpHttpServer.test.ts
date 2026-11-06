@@ -26,9 +26,11 @@ import {
   HttpServerResponse,
 } from "effect/http";
 
+import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as PullRequestReviewGuideService from "../pullRequest/PullRequestReviewGuideService.ts";
 import * as ServerConfig from "../config.ts";
+import * as McpCallerPolicy from "./McpCallerPolicy.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as McpToolAccessTestkit from "./McpToolAccess.testkit.ts";
@@ -1097,4 +1099,199 @@ it.effect("admits provider and OAuth client credentials and points only clients 
       expect(deadProvider.headers["www-authenticate"]).toBe('Bearer error="invalid_token"');
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect(
+  "screens thread callers' tool calls before any handler runs, and hands handlers the same policy",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const threadToken = "threadTokenWithoutDots";
+        const assistantToken = "assistantTokenWithoutDots";
+        const clientToken = "client-payload.client-signature";
+        const threadCaller = (threadId: string): McpInvocationContext.McpThreadInvocationScope => ({
+          environmentId,
+          requestNamespace: `provider:${threadId}`,
+          thread: {
+            threadId: ThreadId.make(threadId),
+            providerSessionId: `provider:${threadId}`,
+            providerInstanceId: ProviderInstanceId.make("codex"),
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        });
+        const clientScope: McpInvocationContext.McpInvocationScope = {
+          environmentId,
+          requestNamespace: "client:session-1",
+          thread: undefined,
+          client: { sessionId: "session-1", label: "Claude Code", access: "auto" },
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        };
+        const screened: Array<{
+          readonly threadId: string;
+          readonly calls: ReadonlyArray<McpCallerPolicy.McpToolCall>;
+        }> = [];
+        const delegated: Array<string | undefined> = [];
+        const ran: Array<string> = [];
+        const policy: typeof McpCallerPolicy.McpCallerPolicy.Service = {
+          screen: ({ caller, calls }) =>
+            Effect.sync(() => {
+              screened.push({ threadId: caller.threadId, calls });
+              return calls.some(({ tool }) => tool === "refused")
+                ? { type: "refuse" as const, text: "Refused by the caller policy." }
+                : { type: "allow" as const };
+            }),
+          delegation: (scope, handler) =>
+            Effect.sync(() => delegated.push(scope.thread?.threadId)).pipe(Effect.andThen(handler)),
+        };
+        const probe = {
+          success: Schema.Struct({ ok: Schema.Boolean }),
+          failure: OrchestratorMcpFailure,
+          failureMode: "return" as const,
+          dependencies: [McpInvocationContext.McpInvocationContext],
+        };
+        const ScreenedToolkit = Toolkit.make(
+          Tool.make("allowed", { ...probe, parameters: Schema.Struct({ note: Schema.String }) }),
+          Tool.make("refused", probe),
+          Tool.make("delegating", {
+            ...probe,
+            dependencies: [
+              McpInvocationContext.McpInvocationContext,
+              ThreadManagementService.ThreadManagementService,
+            ],
+          }),
+        );
+        const record = (name: string) =>
+          Effect.sync(() => ran.push(name)).pipe(Effect.as({ ok: true }));
+        const serverLayer = McpHttpServer.toolkitRegistration(
+          ScreenedToolkit,
+          McpToolAccess.toLayer(ScreenedToolkit, {
+            allowed: McpToolAccess.reads(() => record("allowed")),
+            refused: McpToolAccess.reads(() => record("refused")),
+            delegating: McpToolAccess.delegatesAsCaller(() => record("delegating")),
+          }),
+        ).pipe(
+          Layer.provideMerge(McpHttpServer.layerMcpTransport),
+          Layer.provide(
+            Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+              resolve: (token) =>
+                Effect.succeed(
+                  token === threadToken
+                    ? threadCaller("thread-screened")
+                    : token === assistantToken
+                      ? threadCaller("fd-assistant-screened")
+                      : undefined,
+                ),
+            }),
+          ),
+          Layer.provide(
+            Layer.succeed(McpHttpServer.McpClientAuthenticator, {
+              authenticate: (request) =>
+                Effect.succeed(
+                  request.headers.authorization === `Bearer ${clientToken}`
+                    ? clientScope
+                    : undefined,
+                ),
+            }),
+          ),
+          Layer.provide(Layer.succeed(McpCallerPolicy.McpCallerPolicy, policy)),
+          Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+        );
+        yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+          Layer.build,
+        );
+        const httpClient = yield* HttpClient.HttpClient;
+        const post = (token: string, body: unknown) =>
+          Effect.gen(function* () {
+            const headers = {
+              accept: "application/json, text/event-stream",
+              authorization: `Bearer ${token}`,
+            };
+            const initialize = yield* httpClient.post("/mcp", {
+              headers,
+              body: HttpBody.text(
+                `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0.0"}}}`,
+                "application/json",
+              ),
+            });
+            expect(initialize.status).toBe(200);
+            const response = yield* httpClient.post("/mcp", {
+              headers: {
+                ...headers,
+                "mcp-session-id": initialize.headers["mcp-session-id"]!,
+                "mcp-protocol-version": "2025-06-18",
+              },
+              body: HttpBody.text(JSON.stringify(body), "application/json"),
+            });
+            return decodeJsonText((yield* response.text).match(/[[{].*[\]}]/s)![0]);
+          });
+        const toolCall = (id: number, name: string, args: unknown = {}) => ({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name, arguments: args },
+        });
+        const refusal = (id: number) => ({
+          jsonrpc: "2.0",
+          id,
+          result: {
+            isError: true,
+            content: [{ type: "text", text: "Refused by the caller policy." }],
+          },
+        });
+
+        // An allowed call runs, and the screen saw its name and arguments as they arrived.
+        expect(yield* post(threadToken, toolCall(2, "allowed", { note: "keep" }))).toMatchObject({
+          id: 2,
+          result: { isError: false },
+        });
+        expect(screened).toEqual([
+          {
+            threadId: "thread-screened",
+            calls: [{ tool: "allowed", arguments: { note: "keep" } }],
+          },
+        ]);
+        expect(ran).toEqual(["allowed"]);
+
+        // A refused call answers with the policy's text and runs nothing.
+        expect(yield* post(threadToken, toolCall(3, "refused"))).toEqual(refusal(3));
+        expect(ran).toEqual(["allowed"]);
+
+        // A batch is refused whole: every request in it, the allowed one too.
+        expect(
+          yield* post(threadToken, [
+            toolCall(4, "allowed", { note: "batched" }),
+            toolCall(5, "refused"),
+          ]),
+        ).toEqual([refusal(4), refusal(5)]);
+        expect(screened.at(-1)?.calls.map(({ tool }) => tool)).toEqual(["allowed", "refused"]);
+        expect(ran).toEqual(["allowed"]);
+
+        // Handlers read the instance the screen used.
+        expect(yield* post(threadToken, toolCall(6, "delegating"))).toMatchObject({
+          id: 6,
+          result: { isError: false },
+        });
+        expect(delegated).toEqual(["thread-screened"]);
+        expect(ran).toEqual(["allowed", "delegating"]);
+
+        // The assistant's own refusal comes first, unchanged, and the screen never sees it.
+        const screens = screened.length;
+        expect(yield* post(assistantToken, toolCall(7, "t3_thread_launch"))).toMatchObject({
+          id: 7,
+          result: { isError: true },
+        });
+        expect(screened).toHaveLength(screens);
+
+        // A client outside every thread is not screened.
+        expect(yield* post(clientToken, toolCall(8, "refused"))).toMatchObject({
+          id: 8,
+          result: { isError: false },
+        });
+        expect(screened).toHaveLength(screens);
+        expect(ran).toEqual(["allowed", "delegating", "refused"]);
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

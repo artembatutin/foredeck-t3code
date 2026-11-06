@@ -12,6 +12,7 @@ import {
   currentDelivery,
   FACTORY_STAGE_LABELS,
   FACTORY_STATUS_LABELS,
+  factoryCapacityNote,
   type FactoryControls,
   factoryControls,
   factoryNeedsYou,
@@ -100,6 +101,8 @@ export interface FactoryDeliveryView {
   readonly family: FactoryDeliveryFamily;
   readonly label: string;
   readonly needsYou: string | undefined;
+  /** That it waits for a project assistant slot, which asks nothing of its owner. */
+  readonly capacityNote: string | undefined;
   readonly stage: string | undefined;
   readonly rounds: FactoryDelivery["rounds"];
   readonly branch: string | undefined;
@@ -167,6 +170,7 @@ export function factoryDeliveryView(input: {
     family: factoryDeliveryFamily(current),
     label: FACTORY_STATUS_LABELS[current.status],
     needsYou: factoryNeedsYou(current),
+    capacityNote: factoryCapacityNote(current),
     stage: current.stage === undefined ? undefined : FACTORY_STAGE_LABELS[current.stage.name],
     rounds: current.rounds,
     branch: current.branch,

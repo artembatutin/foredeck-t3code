@@ -40,11 +40,19 @@ import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import { getAutoBootstrapThreadModelSelection } from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
-import { type WorkActor, WorkService } from "../work-management/index.ts";
-import { readReviewEvidence, reviewBasis } from "./FactoryReview.ts";
+import { type WorkActor, WorkService, workItemScopeFingerprint } from "../work-management/index.ts";
+import * as FactoryAdmission from "./FactoryAdmission.ts";
+import { taskOfChild } from "./FactoryChildren.ts";
+import {
+  FactoryReviewBasisMissingError,
+  readReviewEvidence,
+  reviewBasis,
+} from "./FactoryReview.ts";
 import { FactoryBranchStartError, readBranchCreation } from "./git/branchStart.ts";
 import * as FactorySettings from "./FactorySettings.ts";
+import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import type { StoredFactoryDelivery } from "./persistence/FactoryDeliveryStore.ts";
+import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 import * as FactoryTurnSelectionStore from "./persistence/FactoryTurnSelectionStore.ts";
 import { escalateEffort, mechanicalEffort } from "./pipeline/effort.ts";
 import {
@@ -54,6 +62,7 @@ import {
   type FactoryTerminalRunStatus,
   isTerminalRunStatus,
 } from "./pipeline/state.ts";
+import { childItemFingerprint } from "./plan/childItem.ts";
 import { authorThreadTitle, renderAuthorPrompt } from "./prompts/author.ts";
 import { renderFixCommitPrompt } from "./prompts/fixCommit.ts";
 import { renderFixReviewPrompt } from "./prompts/fixReview.ts";
@@ -192,6 +201,17 @@ const launchMessageId = (deliveryId: FactoryDeliveryId, effectId: number) =>
 /** Every message Factory sends: a launch's first message, or a turn's (see `sendTurn`). */
 const FACTORY_MESSAGE = /^factory-[a-z-]+-message:/;
 
+const FACTORY_MESSAGE_DELIVERY = /^factory-[a-z-]+-message:(.+):\d+$/;
+
+/**
+ * The delivery that sent the message, when Factory sent it: each id names the delivery and the
+ * effect it was sent for. None for any other message.
+ */
+export const factoryMessageDeliveryId = (messageId: MessageId) => {
+  const deliveryId = FACTORY_MESSAGE_DELIVERY.exec(messageId)?.[1];
+  return deliveryId === undefined ? undefined : FactoryDeliveryId.make(deliveryId);
+};
+
 /**
  * What became of a launch: it made no thread, made one that was deleted since, or made one whose
  * run is unfinished (or not created yet) or has ended.
@@ -230,7 +250,10 @@ export class FactoryThreadEffects extends Context.Service<
      * after its turn was sent runs nothing again and reports that turn's run, whatever
      * `beforeOpening` it is given; one replayed before takes the new worktree as its preparation
      * left it (see `recoverWorktree`) and launches into it. A failure of `beforeOpening` fails
-     * the launch.
+     * the launch. For a root something manages (see `FactoryAdmission`), a new worktree is always
+     * launched without the turn, and the manager is asked about what the turn renders last before
+     * it is sent, as before an existing worktree's launch; a refusal sends none and fails the
+     * launch with `FactoryOpeningRefusedError`.
      */
     readonly launchThread: (
       delivery: StoredFactoryDelivery,
@@ -429,6 +452,9 @@ const make = Effect.gen(function* () {
   const turnSelections = yield* FactoryTurnSelectionStore.FactoryTurnSelectionStore;
   const events = yield* EventStore.EventStoreV2;
   const work = yield* WorkService.WorkService;
+  const admission = yield* FactoryAdmission.FactoryAdmission;
+  const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+  const tasks = yield* FactoryTaskStore.FactoryTaskStore;
   const git = yield* GitVcsDriver.GitVcsDriver;
   const providers = yield* ProviderRegistry.ProviderRegistry;
   const providerInstances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
@@ -1088,6 +1114,41 @@ const make = Effect.gen(function* () {
       Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.void }),
     );
 
+  /**
+   * The tasks a parent's plan approval froze, as their rows store them, in plan order; a row
+   * without its plan, or none at all, leaves nothing to review.
+   */
+  const frozenTasks = (deliveryId: FactoryDeliveryId) =>
+    tasks.listByDelivery(deliveryId).pipe(
+      Effect.flatMap((rows) => {
+        const plans = rows.flatMap(({ plan }) => (plan === null ? [] : [plan]));
+        return plans.length === 0 || plans.length !== rows.length
+          ? Effect.fail(new FactoryReviewBasisMissingError({ deliveryId }))
+          : Effect.succeed(plans);
+      }),
+    );
+
+  /**
+   * Whether a child's item still says what Factory wrote for its task: `fingerprint`, its read's,
+   * equals that of `childItemInput` rendered from the parent's frozen task row. A parent or task
+   * row that cannot be found proves nothing, so it does not match.
+   */
+  const childScopeMatches = (
+    parentId: FactoryDeliveryId,
+    childId: FactoryDeliveryId,
+    fingerprint: string,
+  ) =>
+    Effect.gen(function* () {
+      const parent = Option.getOrUndefined(yield* deliveries.get(parentId));
+      if (parent === undefined) return false;
+      const task = taskOfChild(parentId, yield* tasks.listByDelivery(parentId), childId);
+      if (task === undefined || task.plan === null) return false;
+      return (
+        childItemFingerprint({ parent: parent.itemRef, deliveryId: parentId, task: task.plan }) ===
+        fingerprint
+      );
+    });
+
   const launchThread: FactoryThreadEffects["Service"]["launchThread"] = (
     delivery,
     effect,
@@ -1096,6 +1157,11 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const { role } = effect;
       const { deliveryId, projectId, state } = delivery;
+      const root = delivery.parentId ?? deliveryId;
+      // A managed root's launches send their opening, the one message that renders the item,
+      // only once its manager allows what that message renders (see `authorizeOpening` below); a
+      // root nothing manages launches as it always has.
+      const governed = (yield* admission.management(root)) !== "never";
       // A review starts from the verified commit; without one, nothing is launched.
       const basis = role === "reviewer" ? yield* reviewBasis(delivery) : null;
       const project = Option.getOrUndefined(yield* projects.get(projectId));
@@ -1117,6 +1183,33 @@ const make = Effect.gen(function* () {
       ).settings;
       const { roles, highRiskEffort } = yield* factorySettings.get(projectId);
       const item = yield* work.getItem(itemReader(deliveryId), { ref: delivery.itemRef });
+      // What the manager is asked about: this very read, which the opening renders. A child's
+      // launch also says whether its item still says what its parent's frozen task does.
+      const fingerprint = workItemScopeFingerprint(item);
+      const scope: FactoryAdmission.FactoryOpening | null = governed
+        ? {
+            root,
+            deliveryId,
+            role,
+            fingerprint,
+            status: item.status,
+            ...(delivery.parentId === null
+              ? {}
+              : {
+                  childScopeMatches: yield* childScopeMatches(
+                    delivery.parentId,
+                    deliveryId,
+                    fingerprint,
+                  ),
+                }),
+          }
+        : null;
+      // A managed parent's integrate reviewer judges the tasks its approval froze, as their rows
+      // store them.
+      const reviewed =
+        governed && basis !== null && basis.tasks !== null
+          ? { ...basis, tasks: yield* frozenTasks(deliveryId) }
+          : basis;
 
       const { workspace } = effect;
       // Read before anything is dispatched, so a base ref that names no commit launches nothing.
@@ -1169,8 +1262,8 @@ const make = Effect.gen(function* () {
       // Planners and reviewers work in plan mode: they read and judge, and never change the
       // worktree.
       const opening =
-        basis !== null
-          ? { ...reviewOpening(basis), interactionMode: "plan" as const }
+        reviewed !== null
+          ? { ...reviewOpening(reviewed), interactionMode: "plan" as const }
           : role === "planner"
             ? {
                 title: planThreadTitle(item),
@@ -1205,22 +1298,46 @@ const make = Effect.gen(function* () {
         createdBy: "system",
         creationSource: "server",
       } satisfies ThreadLaunch.ThreadLaunchInput;
+      // Asked last before the opening goes out, after whatever preparation, setup, recovery or
+      // replay came first, so a refusal sends none; the launch fails, and a resume that replays it
+      // asks again. Nothing to ask for a root nothing manages.
+      const authorizeOpening =
+        scope === null
+          ? Effect.void
+          : admission.authorizeOpening(scope).pipe(
+              Effect.flatMap((decision) =>
+                decision.type === "allow"
+                  ? Effect.void
+                  : Effect.fail(
+                      new FactoryAdmission.FactoryOpeningRefusedError({
+                        deliveryId,
+                        role,
+                        category: decision.category,
+                      }),
+                    ),
+              ),
+            );
       // Core starts the opening turn's run once it has prepared the workspace, and fails that run
       // when it cannot. An existing worktree is there already, so it gets `beforeOpening` first,
-      // unless a replay finds the turn sent, and is launched as any other. A new one exists only
-      // once the launch prepared it, so that launch leaves the turn for Factory to send after.
+      // unless a replay finds the turn sent, and is launched as any other, with the opening: a
+      // managed root's manager is asked between the two. A new one exists only once the launch
+      // prepared it, so that launch leaves the turn for Factory to send after.
       if (
-        beforeOpening !== undefined &&
+        (beforeOpening !== undefined || scope !== null) &&
         workspace.type === "existing_worktree" &&
         !(yield* openingSent(threadId, messageId))
       ) {
-        yield* beforeOpening(workspace.worktreePath);
+        if (beforeOpening !== undefined) yield* beforeOpening(workspace.worktreePath);
+        yield* authorizeOpening;
       }
       // An existing thread without its opening still needs recovery if setup was cleared since
-      // the runless launch. A fresh unconfigured launch keeps core's with-message path.
+      // the runless launch. A fresh unconfigured launch keeps core's with-message path, unless a
+      // manager has to allow its opening once the worktree is ready: core would send it then.
       const runless =
         workspace.type === "worktree" &&
-        (beforeOpening !== undefined || (yield* openingSent(threadId, messageId)) === false)
+        (scope !== null ||
+          beforeOpening !== undefined ||
+          (yield* openingSent(threadId, messageId)) === false)
           ? { workspace, setup: beforeOpening }
           : undefined;
       // Work links the thread to the delivery's item before the launch runs, so a run that ends
@@ -1254,6 +1371,7 @@ const make = Effect.gen(function* () {
             ? yield* Effect.gen(function* () {
                 const worktreePath = yield* awaitRunlessWorkspace(threadId);
                 if (runless.setup !== undefined) yield* runless.setup(worktreePath);
+                yield* authorizeOpening;
                 return (yield* sendOpening).run;
               })
             : // A replay without the turn takes the worktree as the preparation left it, runs
@@ -1279,6 +1397,7 @@ const make = Effect.gen(function* () {
                   commandId,
                 });
                 if (runless.setup !== undefined) yield* runless.setup(worktreePath);
+                yield* authorizeOpening;
                 // Releasing through the same still-running core preparation would leave the new
                 // run waiting behind its async observer. It already handed off this workspace.
                 if (prepared) return (yield* sendOpening).run;

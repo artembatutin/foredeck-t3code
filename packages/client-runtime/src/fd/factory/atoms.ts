@@ -24,7 +24,7 @@ import {
 } from "../../state/runtime.ts";
 import { serverFactorySupport } from "./model.ts";
 
-interface EnvironmentTarget<Input> {
+export interface EnvironmentTarget<Input> {
   readonly environmentId: EnvironmentId;
   readonly input: Input;
 }

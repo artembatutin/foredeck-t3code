@@ -27,6 +27,7 @@ import * as RuntimeRequestService from "./RuntimeRequestService.ts";
 import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
 
 export class OrchestrationEffectExecutionError extends Schema.TaggedError<OrchestrationEffectExecutionError>()(
@@ -104,6 +105,9 @@ export const layerExecutor: Layer.Layer<
       yield* ThreadTitleRegenerationService.ThreadTitleRegenerationService;
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const settings = yield* ServerSettings.ServerSettingsService;
+    // Effects run on the worker's fibers, so the gate this executor was built
+    // with is captured here rather than read from whichever fiber claims them.
+    const gate = yield* AutomaticTurnGate.AutomaticTurnGate;
     return OrchestrationEffectExecutorV2.of({
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
@@ -113,6 +117,7 @@ export const layerExecutor: Layer.Layer<
             return continueRestartedRun({ threadId: effect.threadId, sourceRunId }).pipe(
               Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
               Effect.provideService(ServerSettings.ServerSettingsService, settings),
+              Effect.provideService(AutomaticTurnGate.AutomaticTurnGate, gate),
               // A continuation that will never run still owes a delegated parent a result.
               Effect.tapError(() =>
                 willRetry
@@ -269,16 +274,17 @@ export const layerExecutor: Layer.Layer<
                     }
                     const projection = yield* threads.getThreadRecords(
                       effect.threadId,
-                      ["messages", "runs"],
+                      ["messages", "runs", "providerThreads"],
                       { messageIds: [effect.request.messageId] },
                     );
                     const messageId = effect.request.messageId;
+                    const providerThreadId = effect.request.providerThreadId;
                     const message = projection.messages.find((item) => item.id === messageId);
                     const run = projection.runs.find((item) => item.id === message?.runId);
                     if (message === undefined || run === undefined) return yield* error;
                     // Reuse the message identity and a stable command receipt so an outbox
                     // retry cannot append a duplicate message or start a second follow-up.
-                    yield* threads
+                    const followUp = threads
                       .dispatch({
                         type: "message.dispatch",
                         commandId: CommandId.make(`command:steer-follow-up:${effect.id}`),
@@ -333,6 +339,33 @@ export const layerExecutor: Layer.Layer<
                             ),
                         }),
                       );
+                    // A person's or an agent's steer was sent now and runs as
+                    // sent. A delegated completion's is an automatic turn: held
+                    // back, it stays an undelivered mailbox steer that the
+                    // cohort's next offer delivers.
+                    const completion = message.delegatedCompletion;
+                    if (completion === undefined) {
+                      yield* followUp;
+                      return;
+                    }
+                    const providerThread = projection.providerThreads.find(
+                      (item) => item.id === providerThreadId,
+                    );
+                    if (providerThread === undefined) return yield* error;
+                    yield* gate.admit(
+                      {
+                        kind: "delegated_completion",
+                        threadId: effect.threadId,
+                        messageId: message.id,
+                        key: `${completion.parentRunId}:${completion.generation}:${message.id}`,
+                        parentRunId: completion.parentRunId,
+                        generation: completion.generation,
+                        providerThreadId,
+                        driver: providerThread.driver,
+                        origin: "steer",
+                      },
+                      followUp,
+                    );
                   }),
                 ),
                 Effect.mapError(

@@ -115,6 +115,17 @@ describe("factoryDeliveryView", () => {
     expect(view({ deliveries: [delivery("d1")] })?.needsYou).toBeUndefined();
   });
 
+  it("shows a slot wait beside the status, which is not a reason it needs you", () => {
+    const waiting = view({ deliveries: [delivery("d1", { capacityWait: true })] });
+    expect(waiting).toMatchObject({
+      label: "Running",
+      capacityNote: "Waiting for a project assistant slot",
+      needsYou: undefined,
+      controls: { stop: true, resume: false, cancel: true },
+    });
+    expect(view({ deliveries: [delivery("d1")] })?.capacityNote).toBeUndefined();
+  });
+
   it("shows the newest of a terminal history, with nothing to control", () => {
     const history = view({
       deliveries: [

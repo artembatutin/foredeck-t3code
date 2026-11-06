@@ -490,6 +490,11 @@ export const FactoryDelivery = Schema.Struct({
   plan: ForwardCompatibleOptional(FactoryPlan),
   /** Why the delivery waits on the owner, at a gate or blocked; absent when it does not. */
   needsYou: Schema.optionalKey(Schema.String),
+  /**
+   * Set while the effect the delivery awaits is marked as waiting for a project assistant slot.
+   * It never means the owner has anything to do. Absent otherwise and from older servers.
+   */
+  capacityWait: Schema.optionalKey(Schema.Boolean),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });

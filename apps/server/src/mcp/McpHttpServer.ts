@@ -28,6 +28,7 @@ import * as DeviceService from "../device/DeviceService.ts";
 import * as HtmlRender from "../htmlRender/HtmlRender.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import * as McpCallerPolicy from "./McpCallerPolicy.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
@@ -152,9 +153,39 @@ export const normalizeMcpHttpResponse = (
 // Session tokens are `<payload>.<signature>`; registry tokens are a bare base64url secret.
 const looksLikeProviderToken = (token: string) => token.length > 0 && !token.includes(".");
 
+const ToolCallRequest = Schema.Struct({
+  method: Schema.Literal("tools/call"),
+  params: Schema.Struct({ name: Schema.String, arguments: Schema.optional(Schema.Unknown) }),
+});
+const isToolCallRequest = Schema.is(ToolCallRequest);
+const RequestId = Schema.Struct({ id: Schema.Union([Schema.String, Schema.Number, Schema.Null]) });
+const isRequest = Schema.is(RequestId);
+
+/** The `tools/call` requests of a JSON-RPC body: the body itself, or any of a batch. */
+const toolCallsOf = (body: unknown): ReadonlyArray<McpCallerPolicy.McpToolCall> =>
+  (Array.isArray(body) ? body : [body])
+    .filter(isToolCallRequest)
+    .map(({ params }) => ({ tool: params.name, arguments: params.arguments }));
+
+/**
+ * The caller policy's refusal as each request of the body's result, as the assistant's refusal
+ * answers: a batch is refused whole, so none of its calls runs.
+ */
+const callerRefusal = (body: unknown, text: string) => {
+  const refused = (id: unknown) => ({
+    jsonrpc: "2.0",
+    id,
+    result: { isError: true, content: [{ type: "text", text }] },
+  });
+  return Array.isArray(body)
+    ? body.filter(isRequest).map(({ id }) => refused(id))
+    : refused(isRequest(body) ? body.id : null);
+};
+
 const makeMcpAuthMiddleware = Effect.gen(function* () {
   const registry = yield* McpSessionRegistry.McpSessionRegistry;
   const clients = yield* Effect.serviceOption(McpClientAuthenticator);
+  const policy = yield* McpCallerPolicy.McpCallerPolicy;
   return Effect.fn("McpHttpServer.authenticateRequest")(function* (httpEffect) {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const authorization = request.headers.authorization;
@@ -180,15 +211,25 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
         offerOAuth: Option.isSome(clients) && !looksLikeProviderToken(token),
       });
     }
-    if (invocation.thread?.threadId.startsWith("fd-assistant-") && request.method === "POST") {
-      const refusal = assistantToolRefusal(
-        invocation.thread.threadId,
-        yield* request.json.pipe(Effect.orElseSucceed(() => undefined)),
-      );
-      if (refusal) return HttpServerResponse.jsonUnsafe(refusal);
+    if (invocation.thread !== undefined && request.method === "POST") {
+      const body = yield* request.json.pipe(Effect.orElseSucceed(() => undefined));
+      if (invocation.thread.threadId.startsWith("fd-assistant-")) {
+        const refusal = assistantToolRefusal(invocation.thread.threadId, body);
+        if (refusal) return HttpServerResponse.jsonUnsafe(refusal);
+      }
+      // Before any handler runs, so a refused call resolves and dispatches nothing.
+      const calls = toolCallsOf(body);
+      if (calls.length > 0) {
+        const screened = yield* policy.screen({ caller: invocation.thread, calls });
+        if (screened.type === "refuse") {
+          return HttpServerResponse.jsonUnsafe(callerRefusal(body, screened.text));
+        }
+      }
     }
+    // Handlers read the same policy instance the screen used (see `delegatesAsCaller`).
     return yield* httpEffect.pipe(
       Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+      Effect.provideService(McpCallerPolicy.McpCallerPolicy, policy),
       Effect.map(normalizeMcpHttpResponse),
     );
   }) satisfies McpAuthMiddleware;

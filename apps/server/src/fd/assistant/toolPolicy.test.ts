@@ -28,6 +28,8 @@ it("routes manager worker mutations through the queue without restricting ordina
     "assistant_answer",
     "assistant_control",
     "assistant_portfolio",
+    "assistant_capture_work",
+    "assistant_abandon_capture",
     "t3_thread_read",
     "t3_pending_request_read",
     "t3_project_list",

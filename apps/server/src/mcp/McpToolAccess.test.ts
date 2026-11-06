@@ -1,4 +1,4 @@
-import { expect, it } from "@effect/vitest";
+import { describe, expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
   OrchestratorMcpFailure,
@@ -14,6 +14,7 @@ import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 
 import { OrchestratorProjectionError } from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+import * as McpCallerPolicy from "./McpCallerPolicy.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
@@ -86,6 +87,7 @@ const ProbeToolkit = Toolkit.make(
   Tool.make("reads", probe),
   Tool.make("reads_as_caller", probe),
   Tool.make("acts_as_caller", probe),
+  Tool.make("delegates_as_caller", probe),
   Tool.make("writes", probe),
   Tool.make("writes_with_capability", probe),
   Tool.make("writes_threads", {
@@ -106,6 +108,7 @@ const probeHandlers: McpToolAccess.Handlers<typeof ProbeToolkit.tools> = {
   reads: McpToolAccess.reads(() => ran),
   reads_as_caller: McpToolAccess.readsAsCaller(() => ran),
   acts_as_caller: McpToolAccess.actsAsCaller(() => ran),
+  delegates_as_caller: McpToolAccess.delegatesAsCaller(() => ran),
   writes: McpToolAccess.writes(() => ran),
   writes_with_capability: McpToolAccess.writesWithCapability(() => ran),
   writes_threads: McpToolAccess.writesThreads(
@@ -153,6 +156,7 @@ export const refusedAtCompileTime = () => {
       reads: unchecked,
       reads_as_caller: unchecked,
       acts_as_caller: unchecked,
+      delegates_as_caller: unchecked,
       writes: unchecked,
       writes_with_capability: unchecked,
       writes_threads: unchecked,
@@ -218,6 +222,11 @@ it.effect.each([
   ["acts_as_caller", supervised, {}, "ran"],
   ["acts_as_caller", ended, {}, "parent_not_active"],
   ["acts_as_caller", fullAccessClient, {}, "thread_credential_required"],
+  // Delegating checks what acting as the caller does; with no policy provided it then just runs.
+  ["delegates_as_caller", supervised, {}, "ran"],
+  ["delegates_as_caller", ended, {}, "parent_not_active"],
+  ["delegates_as_caller", fullAccessClient, {}, "thread_credential_required"],
+  ["delegates_as_caller", readOnlyClient, {}, "thread_credential_required"],
 
   // Any change needs a thread caller's live turn; a client has none to lose.
   ["writes", supervised, {}, "ran"],
@@ -320,3 +329,57 @@ it.effect("refuses a change when the calling thread cannot be read", () =>
     ),
   ),
 );
+
+describe("delegation under a caller policy", () => {
+  const liveThreads = Layer.mock(ThreadManagement.ThreadManagementService)({
+    getThreadShell: (threadId) => Effect.succeed(shells.get(threadId) ?? null),
+  });
+  /** A policy that records each delegation it sees, then runs or refuses it as `decide` says. */
+  const recordingPolicy = (decide: "run" | "refuse") => {
+    const seen: Array<string | undefined> = [];
+    const note = (scope: McpInvocationContext.McpInvocationScope) =>
+      Effect.sync(() => void seen.push(scope.thread?.threadId));
+    const policy: typeof McpCallerPolicy.McpCallerPolicy.Service = {
+      screen: () => Effect.succeed({ type: "allow" }),
+      delegation:
+        decide === "run"
+          ? (scope, handler) => Effect.andThen(note(scope), handler)
+          : (scope) =>
+              Effect.andThen(
+                note(scope),
+                Effect.fail(
+                  new OrchestratorMcpFailure({ code: "capability_denied", message: "refused" }),
+                ),
+              ),
+    };
+    return { seen, policy };
+  };
+
+  it.effect("runs the handler inside the policy the request carries, after the caller checks", () =>
+    Effect.gen(function* () {
+      const running = recordingPolicy("run");
+      const runs = (tool: string, scope: McpInvocationContext.McpInvocationScope) =>
+        call(tool, scope).pipe(
+          Effect.provideService(McpCallerPolicy.McpCallerPolicy, running.policy),
+        );
+      expect(yield* runs("delegates_as_caller", supervised)).toBe("ran");
+      expect(running.seen).toEqual([supervisedThreadId]);
+      // The caller's own checks refuse first: the policy never sees these.
+      expect(yield* runs("delegates_as_caller", ended)).toBe("parent_not_active");
+      expect(yield* runs("delegates_as_caller", fullAccessClient)).toBe(
+        "thread_credential_required",
+      );
+      // Acting as the caller is not delegating.
+      expect(yield* runs("acts_as_caller", supervised)).toBe("ran");
+      expect(running.seen).toEqual([supervisedThreadId]);
+
+      const refusing = recordingPolicy("refuse");
+      expect(
+        yield* call("delegates_as_caller", supervised).pipe(
+          Effect.provideService(McpCallerPolicy.McpCallerPolicy, refusing.policy),
+        ),
+      ).toBe("capability_denied");
+      expect(refusing.seen).toEqual([supervisedThreadId]);
+    }).pipe(Effect.provide(probeServer(liveThreads))),
+  );
+});

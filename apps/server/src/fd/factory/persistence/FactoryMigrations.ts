@@ -161,6 +161,27 @@ const FactoryRetireSelectionHistoryTrigger = Effect.gen(function* () {
   // Already archived rows remain readable for existing overrides; nothing writes new rows.
 });
 
+const FactoryAutomaticTurns = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  // The first decision on each automatic turn of a managed root's family thread, which routes the
+  // turn: unlike the unchecked status columns above, a kind or class this build cannot route is
+  // never stored. The first decision wins, so a turn presented again keeps its class.
+  yield* sql`CREATE TABLE fd_factory_automatic_turns (
+    thread_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    root_delivery_id TEXT NOT NULL REFERENCES fd_factory_deliveries (delivery_id),
+    delivery_id TEXT REFERENCES fd_factory_deliveries (delivery_id),
+    kind TEXT NOT NULL CHECK (kind IN (
+      'pull_request_wake', 'restart_continuation', 'usage_limit_resume',
+      'delegated_question', 'delegated_completion', 'background_wake'
+    )),
+    class TEXT NOT NULL CHECK (class IN ('factory', 'explicit', 'unknown')),
+    source_run_id TEXT,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (thread_id, message_id)
+  )`;
+});
+
 export const factoryMigrationEntries = [
   [1, "FactorySettings", FactorySettings],
   [2, "FactoryDeliveries", FactoryDeliveries],
@@ -173,6 +194,7 @@ export const factoryMigrationEntries = [
   [9, "FactoryTurnSelections", FactoryTurnSelections],
   [10, "FactorySelectionHistory", FactorySelectionHistory],
   [11, "FactoryRetireSelectionHistoryTrigger", FactoryRetireSelectionHistoryTrigger],
+  [12, "FactoryAutomaticTurns", FactoryAutomaticTurns],
 ] as const;
 
 const run = Migrator.make({});

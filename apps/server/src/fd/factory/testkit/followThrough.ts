@@ -162,7 +162,7 @@ export const openSingle = (world: World) =>
   }).pipe(Effect.orDie);
 
 /** Two tasks, so the parent has a first child and a last one. */
-const twoTaskPlan = {
+export const twoTaskPlan = {
   tasks: [
     {
       id: "export-csv",

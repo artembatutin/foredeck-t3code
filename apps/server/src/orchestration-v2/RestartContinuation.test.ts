@@ -19,6 +19,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as ServerSettings from "../serverSettings.ts";
+import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
 import { restartContinuationRun, continueRestartedRun } from "./RestartContinuation.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
@@ -1118,4 +1119,128 @@ it.effect.each(["completed", "failed", "interrupted"] as const)(
         [],
       );
     }),
+);
+
+/** A run the restart cut mid-turn, and one that had settled waiting on a monitor it cancelled. */
+const gatedSources = () => {
+  const base = makeProjection();
+  return {
+    cut: {
+      ...base,
+      runs: [{ ...base.runs[0]!, status: "cancelled" }],
+    } as unknown as OrchestrationV2ThreadProjection,
+    settled: {
+      ...base,
+      runs: [
+        {
+          ...base.runs[0]!,
+          status: "completed",
+          restartCancelledBackgroundWork: [{ kind: "monitor", label: "Watch CI run 42" }],
+        },
+      ],
+      providerTurns: [{ ...base.providerTurns[0]!, status: "completed" }],
+    } as unknown as OrchestrationV2ThreadProjection,
+  };
+};
+
+const continueThrough = (
+  projection: OrchestrationV2ThreadProjection,
+  gate: (typeof AutomaticTurnGate.AutomaticTurnGate)["Service"],
+  dispatch: ThreadManagementService.ThreadManagementService["Service"]["dispatch"],
+) =>
+  Effect.gen(function* () {
+    const recovered: Array<readonly [ThreadId, RunId]> = [];
+    yield* continueRestartedRun({ threadId, sourceRunId: runId }).pipe(
+      Effect.provideService(AutomaticTurnGate.AutomaticTurnGate, gate),
+      Effect.provide(
+        Layer.merge(
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: () => Effect.succeed(projection),
+            recoverDelegatedTask: (childThreadId, sourceRunId) =>
+              Effect.sync(() => recovered.push([childThreadId, sourceRunId])),
+            dispatch,
+          }),
+          ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+        ),
+      ),
+    );
+    return recovered;
+  });
+
+it.effect.each(
+  (["cut", "settled"] as const).flatMap((source) =>
+    (["deferred", "declined"] as const).map((reason) => [source, reason] as const),
+  ),
+)(
+  "a %s source's continuation held back as %s starts nothing and recovers its child",
+  ([source, reason]) =>
+    Effect.gen(function* () {
+      const consults: Array<AutomaticTurnGate.AutomaticTurn> = [];
+      const commands: Array<
+        Parameters<ThreadManagementService.ThreadManagementService["Service"]["dispatch"]>[0]
+      > = [];
+      const recovered = yield* continueThrough(
+        gatedSources()[source],
+        AutomaticTurnGate.AutomaticTurnGate.of({
+          admit: (turn) =>
+            Effect.sync(() => {
+              consults.push(turn);
+              return AutomaticTurnGate.notNow(reason);
+            }),
+          hand: () => Effect.die("a restart continuation hands no native wake"),
+        }),
+        (command) => Effect.sync(() => commands.push(command)).pipe(Effect.as({} as never)),
+      );
+      assert.deepEqual(consults, [
+        {
+          kind: "restart_continuation",
+          threadId,
+          messageId: MessageId.make(`message:restart-continuation:${runId}`),
+          key: runId,
+          sourceRunId: runId,
+          settled: source === "settled",
+        },
+      ]);
+      assert.deepEqual(commands, []);
+      // The effect settles like any declined continuation, so a waiting child gets its result.
+      assert.deepEqual(recovered, [[threadId, runId]]);
+    }),
+);
+
+it.effect("an admitted continuation keeps the disabled-instance handling", () =>
+  Effect.gen(function* () {
+    const consults: Array<AutomaticTurnGate.AutomaticTurn> = [];
+    const commands: Array<
+      Parameters<ThreadManagementService.ThreadManagementService["Service"]["dispatch"]>[0]
+    > = [];
+    const recovered = yield* continueThrough(
+      gatedSources().cut,
+      AutomaticTurnGate.AutomaticTurnGate.of({
+        admit: (turn, dispatch) =>
+          Effect.sync(() => consults.push(turn)).pipe(
+            Effect.andThen(dispatch),
+            Effect.map(AutomaticTurnGate.ran),
+          ),
+        hand: () => Effect.die("a restart continuation hands no native wake"),
+      }),
+      (command) =>
+        Effect.sync(() => commands.push(command)).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new ThreadManagementService.ThreadManagementProviderInstanceDisabledError({
+                projectId: ProjectId.make("restart-project"),
+                instanceId,
+              }),
+            ),
+          ),
+        ),
+    );
+    assert.lengthOf(consults, 1);
+    assert.deepEqual(
+      commands.map((command) => command.type),
+      ["message.dispatch"],
+    );
+    // The refusal will not change, so the effect succeeds and recovers the child at once.
+    assert.deepEqual(recovered, [[threadId, runId]]);
+  }),
 );

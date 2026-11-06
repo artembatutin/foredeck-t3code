@@ -5,16 +5,19 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe("microphone lifetime", () => {
   it("releases a microphone granted after cancellation without starting a recorder", async () => {
-    const permission = Promise.withResolvers<MediaStream>();
+    let grant!: (stream: MediaStream) => void;
+    const permission = new Promise<MediaStream>((resolve) => {
+      grant = resolve;
+    });
     const stop = vi.fn();
     const recorder = vi.fn();
-    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia: () => permission.promise } });
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia: () => permission } });
     vi.stubGlobal("MediaRecorder", recorder);
     const abort = new AbortController();
     const pending = startRecording(abort.signal);
     const rejected = expect(pending).rejects.toMatchObject({ name: "AbortError" });
     abort.abort();
-    permission.resolve({ getTracks: () => [{ stop }] } as unknown as MediaStream);
+    grant({ getTracks: () => [{ stop }] } as unknown as MediaStream);
     await rejected;
     expect(stop).toHaveBeenCalledOnce();
     expect(recorder).not.toHaveBeenCalled();

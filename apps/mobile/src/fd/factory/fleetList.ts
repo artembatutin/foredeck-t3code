@@ -26,6 +26,7 @@ export interface MobileFleetRow {
   readonly status: string;
   readonly stage: string | undefined;
   readonly needsYou: string | undefined;
+  readonly capacityNote: string | undefined;
   readonly target: MobileFleetTarget;
 }
 
@@ -84,6 +85,7 @@ export function mobileFleetRows(
       status: row.status,
       stage: row.stage,
       needsYou: row.needsYou,
+      capacityNote: row.capacityNote,
       target: mobileFleetRowTarget(row),
     };
   });

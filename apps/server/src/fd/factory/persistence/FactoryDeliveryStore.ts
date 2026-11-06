@@ -296,6 +296,9 @@ const StoredDeliveryState = Schema.Struct({
   ),
   // Set by a cancel while a watch Factory started may be on, until the worker ends it.
   releaseWatch: Schema.optionalKey(Schema.Literal(true)),
+  // Added with admission: absent while no awaited effect waits for it, and from rows stored
+  // before it.
+  admissionWait: Schema.optionalKey(Schema.Struct({ effectId: PositiveInt })),
   block: Schema.NullOr(StoredBlock),
   // Added with stop after step: rows stored before it name no checkpoint, even when stopped. The
   // stop request is the `stopping` status, which every stored row could already hold. A blocked

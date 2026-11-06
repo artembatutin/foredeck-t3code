@@ -12,11 +12,37 @@ import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
-import { layerAdapters, layerLive, layerPersistence, WorkService } from "./index.ts";
+import {
+  layerAdapters,
+  layerLive,
+  layerPersistence,
+  WorkService,
+  workItemNotes,
+  workItemScopeFingerprint,
+} from "./index.ts";
 import { WorkSourceAdapterRegistry } from "./sources/WorkSourceAdapter.ts";
 import { owner } from "./testkit/fakes.ts";
 
 describe("work-management composition", () => {
+  it("exports the scope fingerprint, which a Markdown task's Notes never change", () => {
+    const item = (body: string) => ({
+      kind: "markdown" as const,
+      title: "Add the export button",
+      body,
+      bodyTruncated: false,
+      bodyFidelity: "exact" as const,
+    });
+    const noted = item("Export CSV.\n\n## Notes\n- 2026-10-20T10:40:00Z (owner) Looks right.\n");
+    assert.strictEqual(
+      workItemScopeFingerprint(noted),
+      workItemScopeFingerprint(item("Export CSV.\n")),
+    );
+    assert.strictEqual(
+      workItemNotes(noted),
+      "## Notes\n- 2026-10-20T10:40:00Z (owner) Looks right.\n",
+    );
+  });
+
   it.effect("ships exactly the source kinds the capability advertises", () =>
     Effect.gen(function* () {
       const registry = yield* WorkSourceAdapterRegistry;

@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
-import { CommandId, ProjectId, ThreadId } from "@t3tools/contracts";
-import { FactoryProjectSettings } from "@t3tools/contracts/fd/factory";
+import { CommandId, MessageId, ProjectId, RunId, ThreadId } from "@t3tools/contracts";
+import { FactoryDeliveryId, FactoryProjectSettings } from "@t3tools/contracts/fd/factory";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -12,6 +12,7 @@ import { migrationManifest } from "../../../persistence/Migrations.ts";
 import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
 import * as Work from "../../work-management/index.ts";
 import * as Factory from "../index.ts";
+import * as FactoryAutomaticTurnStore from "./FactoryAutomaticTurnStore.ts";
 import * as FactoryMigrations from "./FactoryMigrations.ts";
 import * as FactorySettingsStore from "./FactorySettingsStore.ts";
 import * as FactoryTurnSelectionStore from "./FactoryTurnSelectionStore.ts";
@@ -71,6 +72,7 @@ describe("runFactoryMigrations", () => {
         ["index", "fd_factory_stage_runs_active_thread"],
         ["index", "fd_factory_stage_runs_thread"],
         ["index", "fd_factory_turn_selections_thread"],
+        ["table", "fd_factory_automatic_turns"],
         ["table", "fd_factory_deliveries"],
         ["table", "fd_factory_migrations"],
         ["table", "fd_factory_selection_history"],
@@ -133,9 +135,10 @@ describe("runFactoryMigrations", () => {
       const work = yield* workLedger;
       assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), [
         [11, "FactoryRetireSelectionHistoryTrigger"],
+        [12, "FactoryAutomaticTurns"],
       ]);
       assert.deepStrictEqual(
-        yield* schemaObjects,
+        (yield* schemaObjects).filter(({ name }) => name !== "fd_factory_automatic_turns"),
         schema.filter(({ name }) => name !== "fd_factory_preserve_selection_history"),
       );
       assert.deepStrictEqual(yield* sql`SELECT * FROM fd_factory_selection_history`, archived);
@@ -193,6 +196,7 @@ describe("runFactoryMigrations", () => {
         assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), [
           [10, "FactorySelectionHistory"],
           [11, "FactoryRetireSelectionHistoryTrigger"],
+          [12, "FactoryAutomaticTurns"],
         ]);
         assert.deepStrictEqual(yield* sql`SELECT * FROM fd_factory_turn_selections`, saved);
         assert.deepStrictEqual(yield* coreLedger, core);
@@ -202,7 +206,144 @@ describe("runFactoryMigrations", () => {
   );
 });
 
+/** Runs Factory's migrations up to `id`, as a build that ended there did. */
+const migrateThrough = (id: number) =>
+  Migrator.make({})({
+    loader: Migrator.fromRecord(
+      Object.fromEntries(
+        FactoryMigrations.factoryMigrationEntries
+          .filter(([entryId]) => entryId <= id)
+          .map(([entryId, name, migration]) => [`${entryId}_${name}`, migration]),
+      ),
+    ),
+    table: FactoryMigrations.FACTORY_MIGRATIONS_TABLE,
+  });
+
+/** A delivery row, which an automatic turn's root names. */
+const insertDelivery = (deliveryId: string) =>
+  Effect.flatMap(
+    SqlClient.SqlClient,
+    (sql) => sql`INSERT INTO fd_factory_deliveries
+      (delivery_id, project_id, source_id, item_id, status, state_json, created_at, updated_at)
+      VALUES (${deliveryId}, 'project', 'source', ${`item-${deliveryId}`}, 'running', '{}',
+        'before', 'before')`,
+  );
+
+const automaticTurnRows = Effect.flatMap(
+  SqlClient.SqlClient,
+  (sql) => sql`SELECT thread_id, message_id, root_delivery_id, delivery_id, kind, class,
+    source_run_id FROM fd_factory_automatic_turns ORDER BY message_id`,
+);
+
+describe("Factory migration 12, automatic turns", () => {
+  it.effect("is appended to a version-11 ledger, whose ids 1-11 and rows stay as they were", () =>
+    Effect.gen(function* () {
+      yield* migrateThrough(11);
+      const before = yield* factoryLedger;
+      assert.deepStrictEqual(before, factoryManifest.slice(0, 11));
+      yield* insertDelivery("delivery-root");
+      const sql = yield* SqlClient.SqlClient;
+      const deliveries = yield* sql`SELECT * FROM fd_factory_deliveries`;
+
+      assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), [
+        [12, "FactoryAutomaticTurns"],
+      ]);
+      assert.deepStrictEqual(yield* factoryLedger, [...before, [12, "FactoryAutomaticTurns"]]);
+      assert.deepStrictEqual(yield* factoryLedger, factoryManifest);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM fd_factory_deliveries`, deliveries);
+      assert.deepStrictEqual(yield* automaticTurnRows, []);
+      assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), []);
+    }).pipe(Effect.provide(coreAndWork)),
+  );
+
+  it.effect("refuses a kind or class it cannot route and a second row for one turn", () =>
+    Effect.gen(function* () {
+      yield* FactoryMigrations.runFactoryMigrations();
+      yield* insertDelivery("delivery-root");
+      const sql = yield* SqlClient.SqlClient;
+      const insert = (messageId: string, kind: string, decided: string) => sql`
+        INSERT INTO fd_factory_automatic_turns
+          (thread_id, message_id, root_delivery_id, delivery_id, kind, class, source_run_id,
+            recorded_at)
+        VALUES ('thread', ${messageId}, 'delivery-root', NULL, ${kind}, ${decided}, NULL, 'at')`;
+      const refusal = <A, E extends { readonly _tag: string }, R>(write: Effect.Effect<A, E, R>) =>
+        Effect.flip(write).pipe(Effect.map((error) => error._tag));
+      yield* insert("message-1", "background_wake", "unknown");
+
+      assert.strictEqual(
+        yield* refusal(insert("message-2", "owner_message", "explicit")),
+        "SqlError",
+      );
+      assert.strictEqual(
+        yield* refusal(insert("message-3", "background_wake", "owner")),
+        "SqlError",
+      );
+      assert.strictEqual(
+        yield* refusal(insert("message-1", "pull_request_wake", "factory")),
+        "SqlError",
+      );
+      assert.deepStrictEqual(yield* automaticTurnRows, [
+        {
+          thread_id: "thread",
+          message_id: "message-1",
+          root_delivery_id: "delivery-root",
+          delivery_id: null,
+          kind: "background_wake",
+          class: "unknown",
+          source_run_id: null,
+        },
+      ]);
+    }).pipe(Effect.provide(coreAndWork)),
+  );
+
+  it.effect("keeps the first decision recorded on a turn", () =>
+    Effect.gen(function* () {
+      yield* insertDelivery("delivery-root");
+      const store = yield* FactoryAutomaticTurnStore.FactoryAutomaticTurnStore;
+      const key = { threadId: ThreadId.make("thread"), messageId: MessageId.make("message-1") };
+      const first: FactoryAutomaticTurnStore.FactoryAutomaticTurnDecision = {
+        ...key,
+        root: FactoryDeliveryId.make("delivery-root"),
+        deliveryId: FactoryDeliveryId.make("delivery-root"),
+        kind: "usage_limit_resume",
+        class: "factory",
+        sourceRunId: RunId.make("run-author"),
+      };
+      assert.deepStrictEqual(yield* store.get(key), Option.none());
+
+      assert.deepStrictEqual(yield* store.record(first), first);
+      // Presented again once later runs changed what a decision would read, it keeps its class.
+      assert.deepStrictEqual(
+        yield* store.record({ ...first, class: "unknown", sourceRunId: null }),
+        first,
+      );
+      assert.deepStrictEqual(yield* store.get(key), Option.some(first));
+      assert.strictEqual((yield* automaticTurnRows).length, 1);
+    }).pipe(Effect.provide(Factory.layerPersistence.pipe(Layer.provideMerge(coreAndWork)))),
+  );
+});
+
 describe("Factory migration ledger guard", () => {
+  it.effect("refuses a ledger that recorded another migration under id 12", () =>
+    Effect.gen(function* () {
+      yield* migrateThrough(11);
+      yield* Migrator.make({})({
+        loader: Migrator.fromRecord({ "12_OtherTurns": Effect.void }),
+        table: FactoryMigrations.FACTORY_MIGRATIONS_TABLE,
+      });
+
+      const refused = yield* Effect.flip(FactoryMigrations.runFactoryMigrations());
+      assert.strictEqual(refused._tag, "MigrationError");
+      if (refused._tag !== "MigrationError") return;
+      assert.strictEqual(refused.kind, "BadState");
+      assert.include(refused.message, "12_FactoryAutomaticTurns (recorded: OtherTurns)");
+      assert.notInclude(
+        (yield* factoryObjects).map(([, name]) => name),
+        "fd_factory_automatic_turns",
+      );
+    }).pipe(Effect.provide(coreAndWork)),
+  );
+
   it.effect("refuses a ledger that renamed an id this build already ran", () =>
     Effect.gen(function* () {
       yield* FactoryMigrations.runFactoryMigrations();

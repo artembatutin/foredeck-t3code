@@ -13,6 +13,7 @@ import * as Effect from "effect/Effect";
 import type { ProjectionRuntimeRecoveryState } from "./ProjectionStore.ts";
 
 import * as ServerSettings from "../serverSettings.ts";
+import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
 import { isNativeMaintenanceCommand } from "./Orchestrator.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import {
@@ -215,17 +216,9 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
     const source = projection.runs.find((run) => run.id === input.sourceRunId);
     // Reconciliation cancels a waiting run it cannot checkpoint, so a settled
     // source can be cancelled too. It continues only for awaited work.
-    if (
-      !source ||
-      !isRestartContinuationSource(source, projection.providerTurns) ||
-      restartContinuationBlocked(
-        projection,
-        source,
-        yield* DateTime.now,
-        isRestartNoteSource(source, projection.providerTurns),
-      )
-    )
-      return;
+    if (!source || !isRestartContinuationSource(source, projection.providerTurns)) return;
+    const settled = isRestartNoteSource(source, projection.providerTurns);
+    if (restartContinuationBlocked(projection, source, yield* DateTime.now, settled)) return;
     // A user submission after reconciliation takes precedence over an automatic
     // prompt. Queued runs never started and stay held behind this one.
     if (
@@ -285,7 +278,7 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
         : note.settled
           ? noteText
           : `${noteText}\n\n${CONTINUE_PROMPT}`;
-    yield* threads
+    const dispatch = threads
       .dispatch({
         type: "message.dispatch",
         commandId: CommandId.make(`command:restart-continuation:${input.sourceRunId}`),
@@ -324,6 +317,28 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
             }),
         }),
       );
+    // A decision error fails this effect so the outbox asks again; its last
+    // attempt declines like any other, recovering a waiting delegated child.
+    const gate = yield* AutomaticTurnGate.AutomaticTurnGate;
+    const outcome = yield* gate.admit(
+      {
+        kind: "restart_continuation",
+        threadId: input.threadId,
+        messageId,
+        key: input.sourceRunId,
+        sourceRunId: input.sourceRunId,
+        settled,
+      },
+      dispatch,
+    );
+    // Declined like the checks above: the note stays on the source run.
+    if (outcome._tag === "NotNow") {
+      yield* Effect.logInfo("orchestration-v2.restart-continuation.not-now", {
+        threadId: input.threadId,
+        sourceRunId: input.sourceRunId,
+        reason: outcome.reason,
+      });
+    }
   },
   // A delegated child this declined to continue still owes its parent a
   // result. Once a continuation run exists this is a no-op; that run settles it.

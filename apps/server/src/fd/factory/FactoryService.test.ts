@@ -49,6 +49,8 @@ const sourceId = WorkSourceId.make("7e2aa85e-9347-44ce-b019-cb8dfd365b20");
 const canonicalRef: WorkItemRef = { sourceId, itemId: WorkItemId.make("fd-aaaaaa") };
 /** The same item as a tracker would also accept it. */
 const otherSpelling: WorkItemRef = { sourceId, itemId: WorkItemId.make("FD-AAAAAA") };
+/** Another item of the source. */
+const otherItem: WorkItemRef = { sourceId, itemId: WorkItemId.make("fd-bbbbbb") };
 /** `workBranchName` of the item below. */
 const branch = "work/fd-aaaaaa-add-the-export-button";
 const workspaceRoot = "/projects/alpha";
@@ -106,7 +108,8 @@ const fakes = (world: World) =>
       getItem: (_actor, { ref }) =>
         Effect.suspend(() => {
           world.reads.push(ref);
-          return world.itemReadable && ref.itemId === canonicalRef.itemId
+          return world.itemReadable &&
+            (ref.itemId === canonicalRef.itemId || ref.itemId === otherItem.itemId)
             ? Effect.succeed(item)
             : Effect.fail(
                 new FakeItemNotFound({ itemId: ref.itemId }) as unknown as WorkDomainError,
@@ -285,6 +288,54 @@ const storeStatus = (
   });
 
 describe("FactoryService.start", () => {
+  it.effect("refuses one of two different items starting at once under one id", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        yield* useVerify;
+        const factory = yield* FactoryService.FactoryService;
+        const intended = FactoryDeliveryId.make("7e2aa85e-9347-44ce-b019-cb8dfd365b20");
+        // Each holds its base check open: past every check that found no row under the id, and
+        // holding only its own item's lock, so neither has stored anything when both go on.
+        const arrivals = [yield* Deferred.make<void>(), yield* Deferred.make<void>()];
+        const waiting = [...arrivals];
+        const release = yield* Deferred.make<void>();
+        world.onCheck = Effect.suspend(() => {
+          const arrival = waiting.shift();
+          return arrival === undefined ? Effect.void : Deferred.succeed(arrival, undefined);
+        }).pipe(Effect.andThen(Deferred.await(release)));
+        const first = yield* Effect.forkChild(
+          Effect.exit(factory.start({ itemRef: canonicalRef, deliveryId: intended })),
+        );
+        const second = yield* Effect.forkChild(
+          Effect.exit(factory.start({ itemRef: otherItem, deliveryId: intended })),
+        );
+        yield* Effect.forEach(arrivals, Deferred.await, { discard: true });
+        assert.isTrue(Option.isNone(yield* get(intended)));
+
+        yield* Deferred.succeed(release, undefined);
+        const exits = [yield* Fiber.join(first), yield* Fiber.join(second)];
+        yield* drain;
+
+        const stored = exits.filter(Exit.isSuccess).map((exit) => exit.value);
+        const errors = exits
+          .filter(Exit.isFailure)
+          .map((exit) => Option.getOrThrow(Cause.findErrorOption(exit.cause)));
+        assert.lengthOf(stored, 1);
+        assert.lengthOf(errors, 1);
+        assert.instanceOf(errors[0], FactoryService.FactoryDeliveryIdConflictError);
+        const row = Option.getOrThrow(yield* get(intended));
+        assert.deepStrictEqual(row.itemRef, stored[0]?.itemRef);
+        const counts = yield* rowCounts;
+        assert.strictEqual(counts.deliveries, 1);
+        assert.strictEqual(counts.tasks, 1);
+        assert.deepStrictEqual(
+          world.launches.map(({ deliveryId }) => deliveryId),
+          [intended],
+        );
+      }),
+    ),
+  );
+
   it.effect("stores a running author delivery for the canonical item and queues one launch", () =>
     withWorld((world) =>
       Effect.gen(function* () {

@@ -4,6 +4,7 @@ import * as Layer from "effect/Layer";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as RuntimePolicy from "../../orchestration-v2/RuntimePolicy.ts";
 import { RepositorySet } from "../multirepo/index.ts";
+import * as FactoryAutomaticTurns from "./FactoryAutomaticTurns.ts";
 import * as FactoryChildren from "./FactoryChildren.ts";
 import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
@@ -15,6 +16,7 @@ import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 import * as FactoryWorkComments from "./FactoryWorkComments.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
+import * as FactoryAutomaticTurnStore from "./persistence/FactoryAutomaticTurnStore.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryMigrations from "./persistence/FactoryMigrations.ts";
 import * as FactorySettingsStore from "./persistence/FactorySettingsStore.ts";
@@ -28,11 +30,14 @@ import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 // Factory modules above enter that cycle where native ESM can initialize it (entry.test.ts).
 import * as RuntimeLayer from "../../orchestration-v2/runtimeLayer.ts";
 
+export * as FactoryActivity from "./FactoryActivity.ts";
+export * as FactoryAdmission from "./FactoryAdmission.ts";
 export * as FactoryReactor from "./FactoryReactor.ts";
 export * as FactoryService from "./FactoryService.ts";
 export * as FactorySettings from "./FactorySettings.ts";
 export * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 export * as FactoryWorker from "./FactoryWorker.ts";
+export { needsYou } from "./snapshot.ts";
 export { toolLayer as factoryToolLayer } from "./mcp/handlers.ts";
 export { layerWsRpc, WS_METHOD_TAGS } from "./rpc/handlers.ts";
 export { FactoryToolkit } from "./mcp/tools.ts";
@@ -48,6 +53,7 @@ export const layerPersistence = Layer.mergeAll(
   FactoryTurnSelectionStore.layer,
   FactoryStageRunStore.layer,
   FactoryWorkCommentStore.layer,
+  FactoryAutomaticTurnStore.layer,
 ).pipe(Layer.provide(FactoryMigrations.layer));
 
 /**
@@ -59,8 +65,12 @@ export const layerPersistence = Layer.mergeAll(
  * the Work comments on transitions stay private to the service and worker.
  * server.ts also mounts `layerPersistence` with core and Work persistence, so the ledger migrates
  * with theirs; one build shares the one instance.
+ * Building it installs Factory's automatic turn gate (see `FactoryAutomaticTurns`) into the
+ * installable gate core's producers consult, which the server provides beneath its runtime, until
+ * the build's scope closes.
  */
 export const layerLive = FactoryService.layer.pipe(
+  Layer.merge(FactoryAutomaticTurns.layer),
   Layer.provideMerge(FactoryWorker.layer),
   Layer.provide(
     Layer.mergeAll(

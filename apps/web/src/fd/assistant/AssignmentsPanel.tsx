@@ -17,7 +17,14 @@ import { Button } from "~/components/ui/button";
 import { Badge } from "~/components/ui/badge";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "~/components/ui/popover";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "~/components/ui/menu";
-import { ideaAssignment, availableWorkerThread } from "./workNavigation";
+import {
+  assignmentActions,
+  availableWorkerThread,
+  factoryAssignmentRow,
+  ideaAssignment,
+  ideaCaptureRow,
+  type WorkItemTarget,
+} from "./workNavigation";
 import { readOverview, controlAssignment } from "./commands";
 
 const statusLabels: Record<string, string> = {
@@ -105,6 +112,10 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
     });
     close();
   };
+  const openWork = (target: WorkItemTarget, close: () => void) => {
+    void navigate(target);
+    close();
+  };
   const workerThread = (item: AssistantOverview["assignments"][number] | undefined) =>
     availableWorkerThread(item, threadRef.environmentId, threads);
 
@@ -118,6 +129,7 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
           {(close) =>
             ideas.map((idea) => {
               const threadId = workerThread(ideaAssignment(idea, work));
+              const capture = ideaCaptureRow(idea, threadRef.environmentId);
               const label = (
                 <>
                   <div className="min-w-0 flex-1">
@@ -156,6 +168,19 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                     </Badge>
                     {idea.priorityReason ? (
                       <p className="text-xs text-muted-foreground">{idea.priorityReason}</p>
+                    ) : null}
+                    {capture ? (
+                      <p className="text-xs text-muted-foreground">{capture.text}</p>
+                    ) : null}
+                    {capture?.work ? (
+                      <Button
+                        type="button"
+                        size="xs"
+                        variant="outline"
+                        onClick={() => openWork(capture.work!, close)}
+                      >
+                        Open in Work
+                      </Button>
                     ) : null}
                     <p className="text-xs text-muted-foreground">
                       No worker conversation yet. Continue this idea with the assistant.
@@ -198,25 +223,67 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                   </Badge>
                 </>
               );
-              const actions = (["stop", "resume", "retry", "cancel"] as const).filter((action) =>
-                action === "stop"
-                  ? ["running", "needs-input"].includes(item.state)
-                  : action === "resume"
-                    ? item.state === "stopped"
-                    : action === "retry"
-                      ? item.state === "failed"
-                      : [
-                          "queued",
-                          "running",
-                          "needs-input",
-                          "stopped",
-                          "failed",
-                          "awaiting-verification",
-                        ].includes(item.state),
-              );
+              const actions = assignmentActions(item);
+              const row = factoryAssignmentRow(item, threadRef.environmentId);
               return (
                 <div key={item.assignmentId} className="flex items-start gap-1 py-1">
-                  {threadId ? (
+                  {row ? (
+                    <div className="min-w-0 flex-1 space-y-1 px-2 py-2 text-sm">
+                      <div className="flex items-center gap-2">{label}</div>
+                      {row.delivery ? (
+                        <p className="text-xs text-muted-foreground">{row.delivery}</p>
+                      ) : null}
+                      {row.reasons.map((reason) => (
+                        <p key={reason} className="break-words">
+                          {reason}
+                        </p>
+                      ))}
+                      {[...row.waits, ...row.notices].map((line) => (
+                        <p key={line} className="break-words text-xs text-muted-foreground">
+                          {line}
+                        </p>
+                      ))}
+                      {[...new Set(item.evidence)].map((e) => (
+                        <p key={e} className="break-words text-xs">
+                          {e}
+                        </p>
+                      ))}
+                      <div className="flex flex-wrap gap-1 pt-1">
+                        {row.work ? (
+                          <Button
+                            type="button"
+                            size="xs"
+                            variant="outline"
+                            onClick={() => openWork(row.work!, close)}
+                          >
+                            Open in Work
+                          </Button>
+                        ) : null}
+                        {threadId ? (
+                          <Button
+                            type="button"
+                            size="xs"
+                            variant="outline"
+                            onClick={() => openWorker(threadId, close)}
+                          >
+                            Open thread
+                          </Button>
+                        ) : null}
+                        {row.pullRequestUrl ? (
+                          <Button
+                            size="xs"
+                            variant="outline"
+                            render={
+                              <a href={row.pullRequestUrl} target="_blank" rel="noreferrer" />
+                            }
+                          >
+                            Pull request
+                            <ArrowUpRightIcon />
+                          </Button>
+                        ) : null}
+                      </div>
+                    </div>
+                  ) : threadId ? (
                     <button
                       type="button"
                       className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"

@@ -1,4 +1,10 @@
-import { AuthWorkReadScope, type ProjectId, type RuntimeMode, ThreadId } from "@t3tools/contracts";
+import {
+  AuthWorkReadScope,
+  type ProjectId,
+  type RuntimeMode,
+  type RuntimeRequestId,
+  ThreadId,
+} from "@t3tools/contracts";
 import {
   FACTORY_REPLAN_NOTE_MAX_LENGTH,
   FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
@@ -37,6 +43,7 @@ import {
   WorkService,
   workBranchName,
 } from "../work-management/index.ts";
+import * as FactoryActivity from "./FactoryActivity.ts";
 import * as FactoryChanges from "./FactoryChanges.ts";
 import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryReview from "./FactoryReview.ts";
@@ -211,6 +218,19 @@ export class FactoryDeliveryIdError extends Schema.TaggedError<FactoryDeliveryId
   }
 }
 
+/**
+ * A caller's intended delivery id already names a delivery of another item, kind or ceiling; nothing
+ * was written.
+ */
+export class FactoryDeliveryIdConflictError extends Schema.TaggedError<FactoryDeliveryIdConflictError>()(
+  "FactoryDeliveryIdConflictError",
+  { deliveryId: FactoryDeliveryId },
+) {
+  override get message(): string {
+    return `Factory delivery ${this.deliveryId} already exists for another item, kind or runtime ceiling.`;
+  }
+}
+
 /** No delivery has this id. */
 export class FactoryDeliveryNotFoundError extends Schema.TaggedError<FactoryDeliveryNotFoundError>()(
   "FactoryDeliveryNotFoundError",
@@ -332,6 +352,7 @@ export type FactoryStartError =
   | ThreadLaunch.ThreadLaunchBaseRefError
   | FactoryBranchUnavailableError
   | FactoryDeliveryIdError
+  | FactoryDeliveryIdConflictError
   | FactoryDeliveryStore.FactoryDeliveryActive
   | FactoryStoreError;
 
@@ -376,12 +397,20 @@ export class FactoryService extends Context.Service<
      * which the delivery keeps, none of its threads ever launches or runs broader than that mode
      * (a caller's own, for an agent's start), and a launch on a provider that offers no mode
      * within it fails before anything runs; without one they launch with the project's default.
+     *
+     * With `deliveryId`, which only a server caller passes, the start is idempotent under that
+     * id: a new id is stored as given; one already naming a delivery of this item, kind and
+     * ceiling takes the start step only if it is still queued, and is otherwise returned as it is,
+     * even done or cancelled, whatever Work or the settings say now; one naming any other fails
+     * with `FactoryDeliveryIdConflictError`, writing nothing.
      */
     readonly start: (input: {
       readonly itemRef: WorkItemRef;
       /** Single when absent. A child is started by its parent, never on its own. */
       readonly kind?: Exclude<FactoryDeliveryKind, "child">;
       readonly runtimeModeCeiling?: RuntimeMode;
+      /** The delivery's id, minted by the caller; a random one when absent. */
+      readonly deliveryId?: FactoryDeliveryId;
     }) => Effect.Effect<FactoryDeliveryWithRuns, FactoryStartError>;
     /**
      * Starts the project's next Ready item as a single delivery, through `start`, for MCP and
@@ -486,6 +515,63 @@ export class FactoryService extends Context.Service<
       FactoryDeliveryWithRuns,
       FactoryCancelRefusedError | FactoryDeliveryNotFoundError | FactoryStoreError
     >;
+    /**
+     * Runs an effect that waits for admission (see `FactoryAdmission`), once, for whoever admits
+     * it: only while the delivery awaits effect `effectId`, it is marked waiting and no job of the
+     * delivery is in flight, all read under the delivery's lock. Its job is counted, the mark
+     * cleared and the job queued; it asks the admission port again before it runs. `stale`,
+     * changing nothing, otherwise.
+     */
+    readonly redispatch: (
+      deliveryId: FactoryDeliveryId,
+      effectId: number,
+    ) => Effect.Effect<"dispatched" | "stale", FactoryStoreError>;
+    /**
+     * Makes sure an awaited effect waits marked for admission, never running anything: `deferred`
+     * once it is marked, storing the mark when the effect has neither mark nor job (a deferral
+     * whose mark could not be stored); `running` while a job of the delivery is in flight;
+     * `stale` when the delivery does not await effect `effectId`.
+     */
+    readonly ensureDeferred: (
+      deliveryId: FactoryDeliveryId,
+      effectId: number,
+    ) => Effect.Effect<"deferred" | "running" | "stale", FactoryStoreError>;
+    /**
+     * The root delivery whose family the thread belongs to, read-only: a thread a Factory launch
+     * made belongs to that delivery's root (a child's to its parent), and a thread delegated from
+     * a family thread, an app-owned task's or a provider-native mirror, to its parent's family, at
+     * most eight levels down. Null for any other thread. Fails when a record cannot be read or the
+     * lineage goes deeper.
+     */
+    readonly familyRoot: (
+      threadId: ThreadId,
+    ) => Effect.Effect<FactoryDeliveryId | null, FactoryActivity.FactoryOwnershipReadError>;
+    /**
+     * Whose the runtime request on the thread is, read-only, for a caller policy judging an
+     * answer to it: the root of the thread's family (null for none, as `familyRoot` says), the
+     * request's status, kind, response capability and run, and that run's status and class on the
+     * root's family. Fails when a record cannot be read or the lineage goes deeper.
+     */
+    readonly requestOwnership: (input: {
+      readonly threadId: ThreadId;
+      readonly requestId: RuntimeRequestId;
+    }) => Effect.Effect<
+      FactoryActivity.FactoryRequestOwnership,
+      FactoryActivity.FactoryOwnershipReadError
+    >;
+    /**
+     * What the root delivery's family is doing, read-only (see `FactoryActivity`): its phase,
+     * whether work Factory cannot show to be the owner's is under way or about to start on its
+     * threads, whether an effect waits for admission, what its runs wait for, and whether any of
+     * that could not be read. An unknown delivery is `missing`.
+     */
+    readonly activity: (
+      root: FactoryDeliveryId,
+    ) => Effect.Effect<FactoryActivity.FactoryActivityReport, FactoryStoreError>;
+    /** Where the turn sent as the message is, read-only (see `FactoryActivity.turnRunState`). */
+    readonly turnRunState: FactoryActivity.FactoryActivity["Service"]["turnRunState"];
+    /** Every request still pending on the root's family's threads, read-only. */
+    readonly familyRequests: FactoryActivity.FactoryActivity["Service"]["familyRequests"];
     /**
      * The owner's edit of the plan a parent waits on at the plan gate: `plan`, any value as it
      * arrived, replaces it, and the delivery waits on. The edit is judged under the delivery's
@@ -624,6 +710,7 @@ const make = Effect.gen(function* () {
   const reviews = yield* FactoryReview.FactoryReview;
   const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
   const changes = yield* FactoryChanges.FactoryChanges;
+  const activity = yield* FactoryActivity.FactoryActivity;
   const sql = yield* SqlClient.SqlClient;
   const crypto = yield* Crypto.Crypto;
   const gitContext = yield* Effect.context<FileSystem.FileSystem | GitVcsDriver.GitVcsDriver>();
@@ -678,6 +765,47 @@ const make = Effect.gen(function* () {
       // hold a second delivery.
       const itemRef = yield* work.canonicalRef(input.itemRef);
       const kind = input.kind ?? "single";
+      const { deliveryId: intended } = input;
+      /** The delivery the caller's id already names, if any; another item's is a conflict. */
+      const named = Effect.gen(function* () {
+        if (intended === undefined) return Option.none();
+        const stored = yield* deliveries.get(intended);
+        if (Option.isNone(stored)) return stored;
+        const { itemRef: storedItem, state } = stored.value;
+        return workItemRefString(storedItem) === workItemRefString(itemRef) &&
+          state.kind === kind &&
+          state.runtimeModeCeiling === input.runtimeModeCeiling
+          ? stored
+          : yield* new FactoryDeliveryIdConflictError({ deliveryId: intended });
+      });
+      /**
+       * The start step, for a queued delivery alone: the engine takes it once however many ask,
+       * and one further along is returned as it is.
+       */
+      const started = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
+        delivery.state.status !== "queued"
+          ? withRuns([delivery]).pipe(
+              Effect.map(([found]) => found ?? { ...delivery, stageRuns: [] }),
+            )
+          : // A storage failure here leaves the delivery queued with nothing launched.
+            worker
+              .stepWith(delivery.deliveryId, () =>
+                Effect.succeed({ event: { type: "start" } as const, value: undefined }),
+              )
+              .pipe(
+                Effect.map(
+                  Option.match({
+                    onNone: () => ({ ...delivery, stageRuns: [] }),
+                    onSome: steppedWithRuns,
+                  }),
+                ),
+              );
+      // A delivery the id names needs nothing else to be true: what it was started from may be
+      // gone by now, and a repeat still finds it.
+      if (intended !== undefined) {
+        const existing = yield* itemLocks.withLock(workItemRefString(itemRef), named);
+        if (Option.isSome(existing)) return yield* started(existing.value);
+      }
       const source = (yield* work.resolveSource(itemRef.sourceId)).stored;
       // Owner decision: a parent's tasks become child items only in a Markdown source.
       if (kind === "parent" && source.kind !== "markdown") {
@@ -698,6 +826,9 @@ const make = Effect.gen(function* () {
       // item runs: a delivery stored meanwhile, then cancelled before its launch made its
       // branch, would otherwise leave this start on the branch it chose.
       const queued = yield* Effect.gen(function* () {
+        // A start of the same item and id that got here first holds its row by now.
+        const raced = yield* named;
+        if (Option.isSome(raced)) return raced.value;
         // A new delivery starts over: a cancelled or finished one keeps its branch and worktree.
         const earlier = yield* deliveries.listByItem(itemRef);
         const branch = yield* freshBranchName({
@@ -720,55 +851,60 @@ const make = Effect.gen(function* () {
         }
         yield* launches.checkWorktreeBase({ projectId, workspaceStrategy: workspace });
 
-        const deliveryId = FactoryDeliveryId.make(
-          yield* crypto
-            .randomUUIDv4()
-            .pipe(Effect.mapError((cause) => new FactoryDeliveryIdError({ cause }))),
-        );
+        const deliveryId =
+          intended ??
+          FactoryDeliveryId.make(
+            yield* crypto
+              .randomUUIDv4()
+              .pipe(Effect.mapError((cause) => new FactoryDeliveryIdError({ cause }))),
+          );
         // The insert refuses an item with an active delivery inside its transaction, so of two
         // starts only one is stored, even from another spelling. A single item's task row is
         // written in the same transaction: a refused start adds none, and no stored single item
         // lacks it. A parent's tasks are its approved plan's.
-        return yield* deliveries
-          .insert({
-            deliveryId,
-            projectId,
-            itemRef,
-            // The round limits stay those the delivery started with.
-            state: queuedDeliveryState({
-              kind,
-              branch: workspace.branch,
-              baseRef: workspace.baseRef,
-              limits: {
-                maxFixRounds: limits.maxFixRounds,
-                maxReviewRounds: limits.maxReviewRounds,
-              },
-              ...(input.runtimeModeCeiling === undefined
-                ? {}
-                : { runtimeModeCeiling: input.runtimeModeCeiling }),
+        // The lock held here is the item's, so a start of another item can have stored this id
+        // since the check above; what this transaction reads holds until it commits.
+        return yield* named.pipe(
+          Effect.flatMap(
+            Option.match({
+              onSome: Effect.succeed,
+              onNone: () =>
+                deliveries
+                  .insert({
+                    deliveryId,
+                    projectId,
+                    itemRef,
+                    // The round limits stay those the delivery started with.
+                    state: queuedDeliveryState({
+                      kind,
+                      branch: workspace.branch,
+                      baseRef: workspace.baseRef,
+                      limits: {
+                        maxFixRounds: limits.maxFixRounds,
+                        maxReviewRounds: limits.maxReviewRounds,
+                      },
+                      ...(input.runtimeModeCeiling === undefined
+                        ? {}
+                        : { runtimeModeCeiling: input.runtimeModeCeiling }),
+                    }),
+                  })
+                  .pipe(
+                    Effect.tap(() =>
+                      kind === "single"
+                        ? tasks.insert({ deliveryId, taskId: SINGLE_ITEM_TASK })
+                        : Effect.void,
+                    ),
+                  ),
             }),
-          })
-          .pipe(
-            Effect.tap(() =>
-              kind === "single"
-                ? tasks.insert({ deliveryId, taskId: SINGLE_ITEM_TASK })
-                : Effect.void,
-            ),
-            (write) => changes.transact(write),
-            Effect.catchTags({
-              SqlError: (cause) =>
-                Effect.fail(new FactoryStoreError({ operation: "service.start", cause })),
-            }),
-          );
+          ),
+          (write) => changes.transact(write),
+          Effect.catchTags({
+            SqlError: (cause) =>
+              Effect.fail(new FactoryStoreError({ operation: "service.start", cause })),
+          }),
+        );
       }).pipe((locked) => itemLocks.withLock(workItemRefString(itemRef), locked));
-      // A storage failure here leaves the delivery queued with nothing launched.
-      const started = yield* worker.stepWith(queued.deliveryId, () =>
-        Effect.succeed({ event: { type: "start" } as const, value: undefined }),
-      );
-      return Option.match(started, {
-        onNone: () => ({ ...queued, stageRuns: [] }),
-        onSome: steppedWithRuns,
-      });
+      return yield* started(queued);
     },
   );
 
@@ -1200,6 +1336,14 @@ const make = Effect.gen(function* () {
     stop,
     resume,
     cancel,
+    redispatch: worker.redispatch,
+    ensureDeferred: worker.ensureDeferred,
+    familyRoot: (threadId) =>
+      activity.family(threadId).pipe(Effect.map((family) => family?.root ?? null)),
+    requestOwnership: activity.requestOwnership,
+    activity: activity.activity,
+    turnRunState: activity.turnRunState,
+    familyRequests: activity.familyRequests,
     updatePlan,
     approvePlan,
     rejectPlan,
@@ -1210,4 +1354,5 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(FactoryService, make);
+/** The service, reading its family's activity through its own readers (see `FactoryActivity`). */
+export const layer = Layer.effect(FactoryService, make).pipe(Layer.provide(FactoryActivity.layer));
