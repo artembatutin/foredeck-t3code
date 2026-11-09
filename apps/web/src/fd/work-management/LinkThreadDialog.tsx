@@ -78,7 +78,7 @@ export function LinkThreadDialog({
                   <button
                     type="button"
                     disabled={pending}
-                    className="w-full truncate rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent"
+                    className="w-full truncate rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent cursor-pointer focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring disabled:cursor-default disabled:opacity-64"
                     onClick={() => void link(shell.id)}
                   >
                     {shell.title}

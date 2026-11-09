@@ -44,14 +44,16 @@ const destination = vi.hoisted(() => {
 });
 
 vi.mock("./state", async () => {
-  const { Atom } = await import("effect/reactivity");
+  const { AsyncResult, Atom } = await import("effect/reactivity");
   const yes = Atom.make(true).pipe(Atom.keepAlive);
+  const unread = Atom.make(AsyncResult.initial()).pipe(Atom.keepAlive);
   const command = (label: string) => ({ label, permissionAtom: () => yes });
   return {
     factoryEnvironment: {
       supported: () => yes,
       planning: () => yes,
       deliveries: () => destination.get().deliveries,
+      delivery: () => unread,
       ...Object.fromEntries(
         [
           "start",

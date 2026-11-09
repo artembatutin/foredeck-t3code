@@ -247,6 +247,15 @@ describe("orchestrator replay fixtures", () => {
     }),
   );
 
+  it("replays a registry agent's approval with and without anything longer to offer", () => {
+    const registry = (name: string) =>
+      ORCHESTRATOR_REPLAY_FIXTURES.find((fixture) => fixture.name === name)?.providers.some(
+        (provider) => provider.driver === "acpRegistry",
+      );
+    assert.isTrue(registry("tool_call_read_only_on_request"));
+    assert.isTrue(registry("tool_call_read_only_on_request_once_only"));
+  });
+
   const steeringFixture = ORCHESTRATOR_REPLAY_FIXTURES.find(
     (fixture) => fixture.name === "message_steering",
   );

@@ -1,4 +1,5 @@
 import type { ProviderOptionDescriptor, RuntimeMode } from "@t3tools/contracts";
+import { runtimeModeMeaning } from "@t3tools/shared/fd/approvals";
 
 /**
  * Desktop-oriented effort keywords that don't belong in the phone picker.
@@ -22,7 +23,7 @@ export const RUNTIME_MODE_CHOICES: ReadonlyArray<{
   {
     mode: "auto-accept-edits",
     label: "Auto-accept edits",
-    description: "Auto-approve edits, ask before other actions.",
+    description: "Auto-approve edits. What else still asks depends on the provider.",
   },
   {
     mode: "auto",
@@ -38,10 +39,18 @@ export const RUNTIME_MODE_CHOICES: ReadonlyArray<{
 
 export function runtimeModeChoicesForSupportedModes(
   supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined,
+  driver?: string,
 ) {
-  return supportedRuntimeModes && supportedRuntimeModes.length > 0
-    ? RUNTIME_MODE_CHOICES.filter((choice) => supportedRuntimeModes.includes(choice.mode))
-    : RUNTIME_MODE_CHOICES;
+  const choices =
+    supportedRuntimeModes && supportedRuntimeModes.length > 0
+      ? RUNTIME_MODE_CHOICES.filter((choice) => supportedRuntimeModes.includes(choice.mode))
+      : RUNTIME_MODE_CHOICES;
+  return driver === undefined
+    ? choices
+    : choices.map((choice) => ({
+        ...choice,
+        description: runtimeModeMeaning(choice.mode, driver),
+      }));
 }
 
 export function compatibleRuntimeModeForChoices(

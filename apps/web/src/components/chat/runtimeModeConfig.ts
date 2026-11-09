@@ -12,7 +12,7 @@ export const runtimeModeConfig: Record<
   },
   "auto-accept-edits": {
     label: "Auto-accept edits",
-    description: "Auto-approve edits, ask before other actions.",
+    description: "Auto-approve edits. What else still asks depends on the provider.",
     icon: PenLineIcon,
   },
   auto: {

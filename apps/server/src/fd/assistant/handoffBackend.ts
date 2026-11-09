@@ -1,10 +1,21 @@
 import type {
   AuthEnvironmentScope,
+  AuthSessionId,
+  ModelSelection,
   OrchestrationV2RunStatus,
   ProjectId,
+  ProviderOptionSelectionValue,
   RuntimeMode,
 } from "@t3tools/contracts";
-import type { FactoryDeliveryStatus, FactoryStageName } from "@t3tools/contracts/fd/factory";
+import {
+  type FactoryCommand,
+  type FactoryDeliveryStatus,
+  type FactoryFindingSeverity,
+  type FactoryPendingAction,
+  FactoryReviewedExecution,
+  type FactoryRole,
+  type FactoryStageName,
+} from "@t3tools/contracts/fd/factory";
 import {
   WorkErrorReason,
   type WorkItemId,
@@ -25,6 +36,10 @@ export interface HandoffSource {
   readonly sourceId: WorkSourceId;
   readonly kind: WorkSourceKind;
   readonly label: string;
+  /** Where it writes: its directory, repository or project, which one id can move between. */
+  readonly identity: string;
+  /** Moves with any change to its configuration. */
+  readonly version: number;
 }
 
 export interface HandoffItemRef {
@@ -33,6 +48,17 @@ export interface HandoffItemRef {
 }
 
 /** A Work item as a fresh read of its source shows it. */
+/** What an item's source says of it now, beside what the assistant and Factory hold. */
+export interface HandoffItemSummary {
+  readonly ref: HandoffItemRef;
+  readonly title: string;
+  readonly status: WorkStatus;
+  /** The source's own name for the status, where it has one. */
+  readonly statusName: string | null;
+  /** The human the source assigns it to. */
+  readonly assignee: string | null;
+}
+
 export interface HandoffItem {
   readonly ref: HandoffItemRef;
   readonly key: string;
@@ -68,6 +94,22 @@ export interface HandoffWriter {
   readonly label: string;
 }
 
+/**
+ * The authenticated owner, as the session of their connection says: no MCP caller, which exists only
+ * for a live agent thread, is ever made up for them. `current` reads the grants that session holds
+ * now, none once it is revoked or expired, for a decision that outlasts the request's own check.
+ */
+export interface HandoffOwner {
+  readonly sessionId: AuthSessionId;
+  readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+  readonly current: Effect.Effect<ReadonlyArray<AuthEnvironmentScope> | null>;
+}
+
+/** Whoever a capture writes for: the assistant's own thread, or the owner themselves. */
+export type HandoffActor = Caller | HandoffOwner;
+
+export const isHandoffOwner = (actor: HandoffActor): actor is HandoffOwner => "sessionId" in actor;
+
 /** Work refused or failed the call; `reason` is Work's own category for it. */
 export class HandoffBackendError extends Schema.TaggedError<HandoffBackendError>()(
   "HandoffBackendError",
@@ -82,7 +124,10 @@ export class HandoffBackendError extends Schema.TaggedError<HandoffBackendError>
   }
 }
 
-/** The caller may only read Work: an outside client approved read-only, or a thread in plan mode. */
+/**
+ * The caller may only read Work: an outside client approved read-only, a thread in plan mode, or an
+ * owner's session without the grant.
+ */
 export class HandoffWriteRefused extends Schema.TaggedError<HandoffWriteRefused>()(
   "HandoffWriteRefused",
   {},
@@ -116,6 +161,14 @@ export class HandoffBackend extends Context.Reference<{
     projectId: ProjectId,
   ) => Effect.Effect<ReadonlyArray<HandoffSource>, HandoffBackendError>;
   readonly read: (ref: HandoffItemRef) => Effect.Effect<HandoffItem, HandoffBackendError>;
+  /**
+   * What each item's source says now, for a client to show. It asks each source once and never
+   * fails: an item a source cannot answer for in time is left out, so a tracker that is down costs
+   * the owner that one fact and not the overview. It writes nothing.
+   */
+  readonly summaries: (
+    refs: ReadonlyArray<HandoffItemRef>,
+  ) => Effect.Effect<ReadonlyArray<HandoffItemSummary>>;
   readonly fingerprint: (content: {
     readonly kind: WorkSourceKind;
     readonly title: string;
@@ -129,7 +182,7 @@ export class HandoffBackend extends Context.Reference<{
     HandoffBackendError
   >;
   readonly writer: (
-    caller: Caller,
+    actor: HandoffActor,
   ) => Effect.Effect<HandoffWriter, HandoffWriteRefused | HandoffBackendError>;
   readonly create: (
     writer: HandoffWriter,
@@ -148,6 +201,7 @@ export class HandoffBackend extends Context.Reference<{
   defaultValue: () => ({
     sources: () => unavailable("sources"),
     read: () => unavailable("read"),
+    summaries: () => Effect.succeed([]),
     fingerprint: () => "",
     findByMarker: () => unavailable("find"),
     writer: () => unavailable("writer"),
@@ -217,6 +271,8 @@ export interface HandoffFollow extends HandoffDelivery {
   } | null;
   /** Why it waits on its owner, at a plan gate or blocked; null otherwise. */
   readonly reason: string | null;
+  /** Whether anything of it is under way now, rather than it resting on its owner. */
+  readonly proceeding?: boolean;
   /** The thread it awaits, or else its latest author's. */
   readonly threadId: string | null;
   /** The child it awaits. */
@@ -228,6 +284,8 @@ export interface HandoffFollow extends HandoffDelivery {
     readonly threadId: string | null;
   } | null;
   readonly marked: ReadonlyArray<{ readonly deliveryId: string; readonly effectId: number }>;
+  /** What the delivery itself waits on its owner for, apart from any request on its threads. */
+  readonly ownerActions?: ReadonlyArray<FactoryPendingAction>;
 }
 
 /** A request still pending on a thread of a root's family; see `HandoffFactory.requests`. */
@@ -242,6 +300,17 @@ export interface HandoffRequest {
     readonly class: "factory" | "explicit" | "unknown";
   } | null;
   readonly questions: unknown;
+  /** The thread's own project and mode, which its request is explained under. */
+  readonly projectId?: ProjectId;
+  readonly runtimeMode?: RuntimeMode;
+  /** Why the provider says it asks, when it says. */
+  readonly reason?: string;
+}
+
+/** The requests pending across every root, as one bounded read; `complete` if it read them all. */
+export interface HandoffPendingRequests {
+  readonly byRoot: ReadonlyMap<string, ReadonlyArray<HandoffRequest>>;
+  readonly complete: boolean;
 }
 
 /**
@@ -251,7 +320,7 @@ export interface HandoffRequest {
 export class HandoffFactoryRefused extends Schema.TaggedError<HandoffFactoryRefused>()(
   "HandoffFactoryRefused",
   {
-    operation: Schema.Literals(["start", "stop", "cancel", "resume"]),
+    operation: Schema.Literals(["start", "stop", "cancel", "resume", "rebind"]),
     reason: Schema.Literals([
       "active",
       "not_configured",
@@ -260,11 +329,14 @@ export class HandoffFactoryRefused extends Schema.TaggedError<HandoffFactoryRefu
       "no_free_branch",
       "unsupported_source",
       "item_unavailable",
+      "reviewed_invalid",
       "not_stoppable",
       "not_resumable",
       "pull_request_unknown",
       "ended",
       "not_found",
+      "rebind_refused",
+      "not_owed",
     ]),
     /** The delivery the item already has, for `active`. */
     activeDeliveryId: Schema.optionalKey(Schema.String),
@@ -286,6 +358,8 @@ export class HandoffFactoryRefused extends Schema.TaggedError<HandoffFactoryRefu
         return "Factory plans a parent only from a Markdown Work source.";
       case "item_unavailable":
         return "Work could not serve the item to Factory.";
+      case "reviewed_invalid":
+        return "the owner's review of this delivery is incomplete or no longer matches its project, so it needs a fresh review";
       case "not_stoppable":
         return "Only a running Factory delivery can stop after its step.";
       case "not_resumable":
@@ -296,6 +370,10 @@ export class HandoffFactoryRefused extends Schema.TaggedError<HandoffFactoryRefu
         return "The Factory delivery has already ended.";
       case "not_found":
         return "The Factory delivery does not exist.";
+      case "not_owed":
+        return "The Factory delivery was already resumed since this review, so it took no second resume.";
+      case "rebind_refused":
+        return "The Factory delivery moved on or already stood under this review, so it took nothing new. Review it again.";
     }
   }
 }
@@ -316,6 +394,7 @@ export class HandoffFactoryError extends Schema.TaggedError<HandoffFactoryError>
       "deferral",
       "runState",
       "requests",
+      "review",
     ]),
     cause: Schema.optionalKey(Schema.Defect()),
   },
@@ -347,12 +426,19 @@ export class HandoffFactory extends Context.Reference<{
     readonly item: HandoffItemRef;
     readonly kind: "single" | "parent";
     readonly runtimeModeCeiling: RuntimeMode;
+    /** What the owner reviewed, for a delivery of a review receipt; Factory judges it. */
+    readonly reviewedExecution?: unknown;
   }) => Effect.Effect<HandoffDelivery, HandoffFactoryRefused | HandoffFactoryError>;
   readonly stop: (
     deliveryId: string,
   ) => Effect.Effect<HandoffDelivery, HandoffFactoryRefused | HandoffFactoryError>;
+  /**
+   * With `owedBy`, only as the one resume that review's receipt owes this delivery, judged and taken
+   * in the step of the resume: `not_owed`, changing nothing, once anyone has taken it.
+   */
   readonly resume: (
     deliveryId: string,
+    options?: { readonly owedBy?: string },
   ) => Effect.Effect<HandoffDelivery, HandoffFactoryRefused | HandoffFactoryError>;
   readonly cancel: (
     deliveryId: string,
@@ -378,10 +464,15 @@ export class HandoffFactory extends Context.Reference<{
     readonly threadId: string;
     readonly messageId: string;
   }) => Effect.Effect<"live" | "ended" | "none", HandoffFactoryError>;
-  /** Every request still pending on the root's family's threads. */
+  /** Every request still pending on the root's family's threads, walking all of them. */
   readonly requests: (
     root: string,
   ) => Effect.Effect<ReadonlyArray<HandoffRequest>, HandoffFactoryError>;
+  /**
+   * The requests pending across every root, for what only shows them: it starts from the threads
+   * holding one, so its cost follows those, not how much work any family has done.
+   */
+  readonly pendingRequests: Effect.Effect<HandoffPendingRequests, HandoffFactoryError>;
 }>("t3/fd/assistant/HandoffFactory", {
   defaultValue: () => ({
     verifyConfigured: () => factoryUnavailable("verify"),
@@ -396,5 +487,95 @@ export class HandoffFactory extends Context.Reference<{
     redispatch: () => factoryUnavailable("deferral"),
     runStateOf: () => factoryUnavailable("runState"),
     requests: () => factoryUnavailable("requests"),
+    pendingRequests: factoryUnavailable("requests"),
+  }),
+}) {}
+
+const decodeReviewedExecution = Schema.decodeUnknownEffect(FactoryReviewedExecution);
+
+/** A review as its record kept it, which only decoding proves is still one. */
+export const decodeReviewed = (stored: unknown) =>
+  decodeReviewedExecution(stored).pipe(
+    Effect.mapError((cause) => new HandoffFactoryError({ operation: "review", cause })),
+  );
+
+/** A role's settings as an owner reviews them, and whether its provider offers them now. */
+export interface HandoffReviewRole {
+  readonly selection: ModelSelection;
+  readonly offered: boolean;
+  readonly options: ReadonlyArray<{
+    readonly id: string;
+    readonly value: ProviderOptionSelectionValue;
+    readonly supported: boolean;
+  }>;
+}
+
+/**
+ * What an owner would review for a delivery of a project, as it stands now. `execution` is what a
+ * start would bind, none when `refusal` says why it could not, so the rest can still be shown.
+ */
+export interface HandoffReviewPreview {
+  readonly roles: { readonly [role in FactoryRole]: HandoffReviewRole };
+  readonly verifyCommand: FactoryCommand | null;
+  readonly setupCommand: FactoryCommand | null;
+  readonly limits: {
+    readonly maxFixRounds: number;
+    readonly maxReviewRounds: number;
+    readonly verifyTimeoutMinutes: number;
+  };
+  readonly blockingSeverities: ReadonlyArray<FactoryFindingSeverity>;
+  readonly highRiskEffort: string;
+  readonly pipelineId: string;
+  readonly execution: FactoryReviewedExecution | null;
+  readonly refusal: string | null;
+}
+
+/** The delivery of a family a resume would pick, while nothing of it is under way. */
+export interface HandoffAtRest {
+  readonly deliveryId: string;
+  readonly status: "stopped" | "blocked";
+  readonly effectsIssued: number;
+}
+
+/**
+ * How the owner's review reaches Factory without the assistant importing it: the bridge provides it
+ * beside `HandoffFactory`. `preview` writes nothing, and a project this environment does not have
+ * fails it. `holds` asks whether a review still says what would be bound now, with only reads quick
+ * enough for a transaction, so everything but where publication goes. `atRest` names the delivery a
+ * resume of the root would pick, while it has nothing under way. `rebind` hands that family a fresh
+ * review, keeping what it used, and the named delivery last, which then owes one resume: so that is
+ * owed only once all of it stands under the review. It is idempotent under the review's receipt, and
+ * refused when the named delivery ran on since or the family moved on before ever taking it.
+ * `resumeOwed` says whether that delivery's next resume is still the one its review owes, which only
+ * a resume takes up. The default reaches no Factory, so no review can start anything.
+ */
+export class HandoffReview extends Context.Reference<{
+  readonly preview: (input: {
+    readonly projectId: ProjectId;
+    readonly runtimeCeiling: RuntimeMode;
+  }) => Effect.Effect<HandoffReviewPreview, HandoffFactoryError>;
+  readonly holds: (input: {
+    readonly projectId: ProjectId;
+    /** What the review was resolved under, before the project and providers narrowed it. */
+    readonly runtimeCeiling: RuntimeMode;
+    readonly execution: FactoryReviewedExecution;
+  }) => Effect.Effect<boolean>;
+  readonly atRest: (root: string) => Effect.Effect<HandoffAtRest | null, HandoffFactoryError>;
+  readonly rebind: (input: {
+    readonly root: string;
+    readonly execution: FactoryReviewedExecution;
+    readonly resume: { readonly deliveryId: string; readonly effectsIssued: number };
+  }) => Effect.Effect<void, HandoffFactoryRefused | HandoffFactoryError>;
+  readonly resumeOwed: (input: {
+    readonly deliveryId: string;
+    readonly receiptId: string;
+  }) => Effect.Effect<boolean, HandoffFactoryError>;
+}>("t3/fd/assistant/HandoffReview", {
+  defaultValue: () => ({
+    preview: () => factoryUnavailable("review"),
+    holds: () => Effect.succeed(false),
+    atRest: () => factoryUnavailable("review"),
+    rebind: () => factoryUnavailable("review"),
+    resumeOwed: () => factoryUnavailable("review"),
   }),
 }) {}

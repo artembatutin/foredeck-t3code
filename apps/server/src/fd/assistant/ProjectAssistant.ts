@@ -10,8 +10,15 @@ import {
   ThreadId,
   type ProviderUserInputAnswers,
   type AssistantOverview,
+  type AssistantReviewSnapshot,
+  type AssistantReviewStarted,
   type SpokenReply,
 } from "@t3tools/contracts";
+import {
+  type WorkItemId,
+  workItemRefString,
+  type WorkSourceId,
+} from "@t3tools/contracts/fd/work-management";
 import { isAssistantThread } from "@t3tools/shared/fd/assistant";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -34,6 +41,7 @@ import * as FactoryExecutor from "./FactoryExecutor.ts";
 import * as HandoffAdmission from "./HandoffAdmission.ts";
 import * as HandoffMigrations from "./handoffMigrations.ts";
 import * as Looper from "./Looper.ts";
+import * as OwnerReview from "./ownerReview.ts";
 import * as PortfolioStore from "./PortfolioStore.ts";
 import * as Portfolio from "./portfolio.ts";
 import { Dispatch, OCCUPIED_STATES } from "./dispatch.ts";
@@ -57,7 +65,20 @@ export class ProjectAssistant extends Context.Service<
       ideaId?: string;
       patch: Portfolio.BriefPatch;
       reason?: string;
+      /** The revision an owner edited; another one is refused, overwriting nothing. */
+      expectedRevision?: number;
     }) => Effect.Effect<Portfolio.ProjectBrief, AssistantError>;
+    /** What a start of the idea would capture and run, as it stands now, for its owner to review. */
+    readonly review: (
+      input: OwnerReview.OwnerReviewInput,
+    ) => Effect.Effect<AssistantReviewSnapshot, AssistantError>;
+    /**
+     * Captures and starts exactly what the owner reviewed, or nothing: see `ownerReview`. Repeating
+     * a confirmation converges on what it started, and starts nothing more.
+     */
+    readonly startReview: (
+      input: OwnerReview.OwnerStartInput,
+    ) => Effect.Effect<AssistantReviewStarted, AssistantError>;
     readonly inspect: (
       projectId?: ProjectId,
       ideaId?: string,
@@ -115,6 +136,7 @@ export class ProjectAssistant extends Context.Service<
 
 const isAssistantError = Schema.is(AssistantError);
 const isExecutorRefusal = Schema.is(FactoryExecutor.FactoryExecutorRefusal);
+const isStaleRevision = Schema.is(PortfolioStore.BriefRevisionStale);
 const encodeQuestions = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const failure = (reason: string) => new AssistantError({ reason });
@@ -125,11 +147,13 @@ const protect = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
         ? cause
         : isExecutorRefusal(cause)
           ? new AssistantError({ reason: cause.reason })
-          : new AssistantError({
-              reason:
-                "The assistant operation could not be completed; inspect the assignment before retrying.",
-              cause,
-            }),
+          : HandoffAdmission.isHandoffReviewRequired(cause) || isStaleRevision(cause)
+            ? new AssistantError({ reason: cause.message })
+            : new AssistantError({
+                reason:
+                  "The assistant operation could not be completed; inspect the assignment before retrying.",
+                cause,
+              }),
     ),
   );
 
@@ -604,51 +628,122 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const reviews = yield* OwnerReview.make({
+    withLock: mutex.withPermit,
+    save: (payload) => save({ payload }),
+    dispatchOf: (assignmentId) =>
+      Effect.map(dispatches(), (rows) => rows.find((row) => row.assignmentId === assignmentId)),
+    executor: factoryExecutor,
+  });
+
   return ProjectAssistant.of({
     tick,
+    review: (input) => protect(reviews.snapshot(input)),
+    startReview: (input) => protect(reviews.start(input)),
     overview: protect(
       Effect.gen(function* () {
         const briefs = yield* store.listBriefs();
         const records = yield* dispatches();
         const work = yield* store.listAssignments();
-        return {
-          ideas: yield* Effect.forEach(briefs, (brief) =>
-            factoryExecutor.overviewCapture(brief.projectId, brief.ideaId ?? "legacy").pipe(
-              Effect.map((capture) => ({
-                projectId: brief.projectId,
-                ideaId: brief.ideaId ?? "legacy",
-                goal: brief.goal,
-                brief: Portfolio.renderAssignmentBrief(brief),
-                authorized: brief.executionAuthorized,
-                priority: brief.priority?.rank ?? null,
-                priorityReason: brief.priority?.reason ?? "",
-                ...capture,
-              })),
-            ),
+        const briefOf = (projectId: string, ideaId: string) =>
+          briefs.find(
+            (brief) => brief.projectId === projectId && (brief.ideaId ?? "legacy") === ideaId,
+          );
+        const ideas = yield* Effect.forEach(briefs, (brief) =>
+          factoryExecutor.overviewCapture(brief.projectId, brief.ideaId ?? "legacy").pipe(
+            Effect.map((capture) => ({
+              projectId: brief.projectId,
+              ideaId: brief.ideaId ?? "legacy",
+              goal: brief.goal,
+              brief: Portfolio.renderAssignmentBrief(brief),
+              authorized: brief.executionAuthorized,
+              priority: brief.priority?.rank ?? null,
+              priorityReason: brief.priority?.reason ?? "",
+              ...capture,
+            })),
           ),
-          assignments: yield* Effect.forEach(work, (item) =>
-            Effect.gen(function* () {
-              const record = records.find((r) => r.assignmentId === item.assignmentId);
-              return {
-                assignmentId: item.assignmentId,
-                projectId: item.projectId,
-                ideaId: item.ideaId ?? "legacy",
-                state: item.state,
-                attempt: item.attempt,
-                goal: record?.brief.goal ?? item.assignmentId,
-                brief: record
-                  ? Portfolio.renderAssignmentBrief(record.brief)
-                  : "Legacy assignment; inspect saved project history.",
-                threadId:
-                  record && !record.looper && item.executor !== "factory" ? record.threadId : null,
-                runId: record?.runId ?? null,
-                evidence: item.evidence,
-                notice: item.progress.at(-1)?.text ?? "",
-                executor: item.executor,
-                ...(item.executor === "factory" ? yield* factoryExecutor.overviewOf(item) : {}),
+        );
+        const pending = work.some(({ executor }) => executor === "factory")
+          ? yield* factoryExecutor.overviewPendingRequests
+          : { byRoot: new Map(), complete: true };
+        const assignments = yield* Effect.forEach(work, (item) =>
+          Effect.gen(function* () {
+            const record = records.find((r) => r.assignmentId === item.assignmentId);
+            return {
+              assignmentId: item.assignmentId,
+              projectId: item.projectId,
+              ideaId: item.ideaId ?? "legacy",
+              state: item.state,
+              attempt: item.attempt,
+              goal: record?.brief.goal ?? item.assignmentId,
+              brief: record
+                ? Portfolio.renderAssignmentBrief(record.brief)
+                : "Legacy assignment; inspect saved project history.",
+              threadId:
+                record && !record.looper && item.executor !== "factory" ? record.threadId : null,
+              runId: record?.runId ?? null,
+              evidence: item.evidence,
+              notice: item.progress.at(-1)?.text ?? "",
+              executor: item.executor,
+              ...(item.executor === "factory"
+                ? yield* factoryExecutor.overviewOf(item, pending)
+                : {}),
+            };
+          }),
+        );
+        // The newest live assignments first, then the ideas, then the assignments that ended, which
+        // the panel still lists, since only so many are asked about.
+        const refOf = (item: { readonly sourceId: WorkSourceId; readonly itemId: WorkItemId }) => ({
+          sourceId: item.sourceId,
+          itemId: item.itemId,
+        });
+        const newestFirst = assignments.toReversed();
+        const ended = (state: string) => state === "completed" || state === "cancelled";
+        const sources = yield* factoryExecutor.overviewSources(
+          [
+            ...newestFirst.filter(({ state }) => !ended(state)),
+            ...ideas.map(({ capture }) => ({ workItem: capture?.item ?? undefined })),
+            ...newestFirst.filter(({ state }) => ended(state)),
+          ].flatMap(({ workItem }) => (workItem === undefined ? [] : [refOf(workItem)])),
+        );
+        const factsOf = (item: Parameters<typeof refOf>[0] | null | undefined) => {
+          const summary =
+            item === null || item === undefined
+              ? undefined
+              : sources.get(workItemRefString(refOf(item)));
+          return summary === undefined
+            ? undefined
+            : {
+                title: summary.title,
+                status: summary.status,
+                statusName: summary.statusName,
+                assignee: summary.assignee,
               };
-            }),
-          ),
+        };
+        return {
+          ideas: ideas.map((idea) => {
+            const brief = briefOf(idea.projectId, idea.ideaId);
+            const source = factsOf(idea.capture?.item);
+            return {
+              ...idea,
+              title:
+                source?.title ??
+                (brief === undefined ? idea.goal : WorkCapture.newItemTitle(brief)),
+              ...(source === undefined ? {} : { source }),
+            };
+          }),
+          assignments: assignments.map((assignment) => {
+            const record = records.find((r) => r.assignmentId === assignment.assignmentId);
+            const source = factsOf(assignment.workItem);
+            return {
+              ...assignment,
+              title:
+                source?.title ??
+                (record === undefined ? assignment.goal : WorkCapture.newItemTitle(record.brief)),
+              priority: briefOf(assignment.projectId, assignment.ideaId)?.priority?.rank ?? null,
+              ...(source === undefined ? {} : { source }),
+            };
+          }),
         };
       }),
     ),
@@ -733,6 +828,14 @@ const make = Effect.gen(function* () {
                 }
                 if (!isAssistantThread(input.managerThreadId))
                   return yield* failure("Dispatch requires the project assistant.");
+                // Asked before any route prepares anything. The queue entry below enforces it.
+                if (
+                  yield* admission.ideaReviewed({
+                    projectId: input.projectId,
+                    ideaId: input.ideaId ?? "legacy",
+                  })
+                )
+                  return yield* new HandoffAdmission.HandoffReviewRequired();
                 const brief = yield* currentBrief(input.projectId, input.ideaId);
                 if (
                   !brief.executionAuthorized ||
@@ -1002,14 +1105,18 @@ const make = Effect.gen(function* () {
 export const layerPersistence = Layer.merge(PortfolioStore.layer, WorkCaptureStore.layer).pipe(
   Layer.provide(HandoffMigrations.layer),
 );
-export const layer = Layer.effect(ProjectAssistant, make).pipe(Layer.provide(layerPersistence));
+/** One writer per idea runs in the one capture service a build shares; see `WorkCapture`. */
+const layerCapture = WorkCapture.layer.pipe(Layer.provide(layerPersistence));
+export const layer = Layer.effect(ProjectAssistant, make).pipe(
+  Layer.provide(Layer.merge(layerPersistence, layerCapture)),
+);
 /**
  * The assistant and its Work capture. Captures reach Work through whichever `HandoffBackend` is
  * provided beneath this layer; without one, nothing is captured.
  */
 export const layerLive = Layer.merge(
   layer.pipe(Layer.provide(Looper.layer.pipe(Layer.provide(ProcessRunner.layer)))),
-  WorkCapture.layer.pipe(Layer.provide(layerPersistence)),
+  layerCapture,
 );
 export const workerLayer = Layer.effectDiscard(
   Effect.gen(function* () {

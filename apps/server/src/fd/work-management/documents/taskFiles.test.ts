@@ -13,6 +13,7 @@ import {
   parseNotes,
   parseOptionalFields,
   parseTaskId,
+  splitNotes,
   TASK_ID_PATTERN,
   taskFilename,
 } from "./taskFiles.ts";
@@ -291,6 +292,54 @@ describe("notes", () => {
       appendNote("- ```js\n  code\n  ```\n", line),
       `- \`\`\`js\n  code\n  \`\`\`\n\n## Notes\n${line}\n`,
     );
+  });
+
+  describe("what a comment leaves of a body ending in a fence that never closes", () => {
+    const line = formatNoteLine(ISO, "Artem", "First");
+    const second = formatNoteLine(ISO, "Artem", "Second");
+
+    it.each<[string, string]>([
+      ["with no blank line before it", "Intro\n```\nMust export CSV.\n"],
+      ["with a blank line before it", "Intro\n\n```\nMust export CSV.\n"],
+      ["opening the body", "```\nMust export CSV.\n"],
+      ["with Windows line ends", "Intro\r\n```\r\nMust export CSV.\r\n"],
+      ["holding a Notes heading", "Intro\n```\n## Notes\nMust export CSV.\n"],
+      ["in a list item", "Intro\n- ```js\n  Must export CSV.\n"],
+    ])("keeps the same text %s", (_name, body) => {
+      const once = appendNote(body, line);
+      const twice = appendNote(once, second);
+      assert.notStrictEqual(once, body);
+      const { rest } = splitNotes(body);
+      assert.strictEqual(splitNotes(once).rest, rest);
+      assert.strictEqual(splitNotes(twice).rest, rest);
+      assert.include(rest, "Must export CSV.");
+    });
+
+    it("reads the comments as the section and the fence as the task's", () => {
+      const once = appendNote("Intro\n```\nMust export CSV.\n", line);
+      const { notes, rest } = splitNotes(once);
+      assert.strictEqual(notes, `## Notes\n${line}\n\n`);
+      assert.notInclude(notes, "Must export CSV.");
+      assert.notInclude(rest, line);
+      assert.deepStrictEqual(
+        parseNotes(once).map((comment) => comment.body),
+        ["First"],
+      );
+    });
+
+    it("ends a section written ahead of such a fence by hand there too", () => {
+      const written = "## Notes\n- a (b) first\n```\nMust export CSV.\n";
+      assert.strictEqual(splitNotes(written).notes, "## Notes\n- a (b) first\n");
+      assert.strictEqual(splitNotes(written).rest, "```\nMust export CSV.\n");
+    });
+  });
+
+  it("keeps a closed fence under Notes as Notes, wherever a comment lands around it", () => {
+    const closed = "Intro\n\n## Notes\n- a (b) first\n```\nA pasted log.\n```\n";
+    const line = formatNoteLine(ISO, "Artem", "Next");
+    assert.strictEqual(splitNotes(closed).rest, "Intro\n\n");
+    assert.strictEqual(splitNotes(appendNote(closed, line)).rest, "Intro\n\n");
+    assert.include(splitNotes(closed).notes, "A pasted log.");
   });
 
   it("recognizes fences the way CommonMark does", () => {

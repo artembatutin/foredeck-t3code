@@ -65,6 +65,9 @@ const REVIEW_METADATA_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 // totals are reported incomplete instead.
 const REVIEW_UNTRACKED_MAX_FILES = 5_000;
 const REVIEW_DIFF_FILE_MAX_OUTPUT_BYTES = 1024 * 1024;
+// A push target binds every URL its push goes to, so a list cut short would bind less than goes out.
+const PUSH_URLS_MAX = 32;
+const PUSH_URLS_MAX_OUTPUT_BYTES = 64 * 1024;
 // Patches the clients render are parsed against git's default a/ and b/ path
 // prefixes. A repository or global diff.noprefix or diff.mnemonicPrefix would
 // otherwise leak into the patch and leave every parsed file unnamed.
@@ -945,6 +948,38 @@ export const windowsLongPathConfigEnv = (
   };
 };
 
+/**
+ * `entries` as `GIT_CONFIG_*` variables after any `env` carries, for one command: Git reads them
+ * after every config file. The count is found as `windowsLongPathConfigEnv` finds it, and null comes
+ * back for one Git would reject, which would read none of them.
+ */
+const appendConfigEnv = (
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+  entries: ReadonlyArray<readonly [key: string, value: string]>,
+): NodeJS.ProcessEnv | null => {
+  const countKey =
+    (platform === "win32"
+      ? Object.keys(env).find((key) => key.toUpperCase() === "GIT_CONFIG_COUNT")
+      : undefined) ?? "GIT_CONFIG_COUNT";
+  const inherited = env[countKey];
+  if (
+    inherited !== undefined &&
+    inherited !== "" &&
+    /^[ \t\r\n\v\f]*(?:\+?\d+|-0+)/.exec(inherited)?.[0] !== inherited
+  ) {
+    return null;
+  }
+  const count = inherited === undefined || inherited === "" ? 0 : Number.parseInt(inherited, 10);
+  return Object.fromEntries([
+    [countKey, String(count + entries.length)],
+    ...entries.flatMap(([key, value], index) => [
+      [`GIT_CONFIG_KEY_${count + index}`, key],
+      [`GIT_CONFIG_VALUE_${count + index}`, value],
+    ]),
+  ]);
+};
+
 export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -1619,14 +1654,17 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
   const resolvePushRemoteName = Effect.fn("resolvePushRemoteName")(function* (
     cwd: string,
-    refName: string,
+    refName: string | null,
   ) {
-    const branchPushRemote = yield* runGitStdout(
-      "GitVcsDriver.resolvePushRemoteName.branchPushRemote",
-      cwd,
-      ["config", "--get", `branch.${refName}.pushRemote`],
-      true,
-    ).pipe(Effect.map((stdout) => stdout.trim()));
+    const branchPushRemote =
+      refName === null
+        ? ""
+        : yield* runGitStdout(
+            "GitVcsDriver.resolvePushRemoteName.branchPushRemote",
+            cwd,
+            ["config", "--get", `branch.${refName}.pushRemote`],
+            true,
+          ).pipe(Effect.map((stdout) => stdout.trim()));
     if (branchPushRemote.length > 0) {
       return branchPushRemote;
     }
@@ -2340,6 +2378,202 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     return { commitSha };
   });
 
+  /**
+   * Where a push of `branch` goes, as `pushCurrentBranch` decides it and `resolvePushTarget`
+   * reports it: a requested remote, or with no upstream the remote a push picks, under the branch's
+   * name less any leading remote name; a differently named upstream it was cut from (`own`) is its
+   * base, so it publishes under its own name; tracking its own name or a git-mangled alias of it,
+   * its upstream's head. `none` when no remote is configured; `bare` when its upstream cannot be
+   * read, which leaves the target to a bare `git push`.
+   */
+  const resolvePushDestination = Effect.fn("resolvePushDestination")(function* (
+    cwd: string,
+    branch: string,
+    hasUpstream: boolean,
+    requestedRemoteName: string | null,
+  ) {
+    if (requestedRemoteName) {
+      return {
+        kind: "requested" as const,
+        remoteName: requestedRemoteName,
+        branch: yield* resolvePublishBranchName(cwd, branch),
+      };
+    }
+
+    if (!hasUpstream) {
+      const publishRemoteName = yield* resolvePushRemoteName(cwd, branch);
+      if (!publishRemoteName) return { kind: "none" as const };
+      return {
+        kind: "publish" as const,
+        remoteName: publishRemoteName,
+        branch: yield* resolvePublishBranchName(cwd, branch),
+      };
+    }
+
+    const currentUpstream = yield* resolveCurrentUpstream(cwd).pipe(
+      Effect.orElseSucceed(() => null),
+    );
+    if (!currentUpstream) return { kind: "bare" as const };
+    // A branch tracking a differently named ref was cut from it, the way
+    // `git checkout -b feature origin/dev` and our own worktree flow leave
+    // it. That upstream is the branch's base, not its publish target, and
+    // pushing HEAD onto it would write feature commits to a shared branch
+    // (bare `git push` refuses this under push.default=simple). The one
+    // same-repo tracking setup that legitimately differs is a git-mangled
+    // alias such as local `upstream/effect-atom` for my-org/upstream's
+    // `effect-atom`: the branch name ends in the upstream head while the
+    // upstream ref ends in the branch name.
+    const isAliasOfUpstreamHead =
+      branch === currentUpstream.branchName ||
+      (branch.endsWith(`/${currentUpstream.branchName}`) &&
+        currentUpstream.upstreamRef.endsWith(`/${branch}`));
+    if (!isAliasOfUpstreamHead) {
+      const publishRemoteName = yield* resolvePushRemoteName(cwd, branch).pipe(
+        Effect.orElseSucceed(() => null),
+      );
+      return {
+        kind: "own" as const,
+        remoteName: publishRemoteName ?? currentUpstream.remoteName,
+        branch: yield* resolvePublishBranchName(cwd, branch),
+        base: currentUpstream.branchName,
+      };
+    }
+    return {
+      kind: "upstream" as const,
+      remoteName: currentUpstream.remoteName,
+      branch: currentUpstream.branchName,
+      upstreamRef: currentUpstream.upstreamRef,
+    };
+  });
+
+  /** The remote and branch a destination names; null for one left to a bare push, or none. */
+  const pushTargetOf = (
+    destination: Effect.Success<ReturnType<typeof resolvePushDestination>>,
+  ): Omit<GitVcsDriver.GitPushTarget, "pushUrls"> | null =>
+    destination.kind === "none" || destination.kind === "bare"
+      ? null
+      : { remoteName: destination.remoteName, branch: destination.branch };
+
+  /**
+   * Every URL a push to `remoteName` goes to, as Git itself resolves them for the push: its push
+   * URLs, else its URLs, each with Git's URL rewrites applied once. Fails rather than return part of
+   * the list.
+   */
+  const readPushUrls = Effect.fn("readPushUrls")(function* (cwd: string, remoteName: string) {
+    const args = ["remote", "get-url", "--push", "--all", "--", remoteName];
+    const result = yield* executeGit("GitVcsDriver.readPushUrls", cwd, args, {
+      maxOutputBytes: PUSH_URLS_MAX_OUTPUT_BYTES,
+    });
+    const urls = result.stdout.split("\n").filter((line) => line.length > 0);
+    if (result.stdoutTruncated || urls.length > PUSH_URLS_MAX) {
+      return yield* new GitCommandError({
+        ...gitCommandContext({ operation: "GitVcsDriver.readPushUrls", cwd, args }),
+        detail: "The remote has more push URLs than can be read.",
+      });
+    }
+    return urls;
+  });
+
+  /**
+   * A spelling of a URL that only a rule made for it rewrites. Git rewrites a URL once, by the longest
+   * `insteadOf` prefix it matches, and reads `GIT_CONFIG_*` after every config file, so a rule whose
+   * prefix is the whole spelling outranks any other the repository has or gains: one as long would
+   * have to name a random spelling it never saw. Unrewritten, it is a path that names nothing, so a
+   * Git that ignored the rule would fail rather than reach anything.
+   */
+  const pinSpelling = (cwd: string) =>
+    crypto.randomUUIDv4().pipe(
+      Effect.map((id) => `fd-pinned-url/${id}`),
+      Effect.mapError(
+        (cause) =>
+          new GitCommandError({
+            operation: "GitVcsDriver.pinSpelling",
+            command: "crypto.randomUUIDv4",
+            cwd,
+            detail: "Failed to make a spelling to pin a URL to.",
+            cause,
+          }),
+      ),
+    );
+
+  const pinUrl: GitVcsDriver.GitVcsDriver["Service"]["pinUrl"] = Effect.fn("pinUrl")(
+    function* (cwd, url) {
+      const repository = `${yield* pinSpelling(cwd)}/`;
+      const env = appendConfigEnv(hostPlatform, process.env, [
+        [`url.${url}.insteadOf`, repository],
+      ]);
+      if (env === null) return null;
+      const args = ["ls-remote", "--get-url", "--", repository];
+      const resolved = yield* executeGit("GitVcsDriver.pinUrl", cwd, args, { env });
+      return resolved.stdout.replace(/\r?\n$/, "") === url ? { repository, env } : null;
+    },
+  );
+
+  /**
+   * The environment under which a push to the remote `remoteName` goes to exactly `urls`, in order:
+   * its URL lists cleared and set to spellings only rules made for them rewrite (see `pinSpelling`),
+   * so neither its own settings nor a rewrite rule, as they stand when the push runs, adds or moves
+   * one. Its fetch URL too, so a remote whose section went away stays this remote rather than a path
+   * of that name. Its name and every other setting stay its own, for hooks, credentials, proxies and
+   * the tracking refs the push updates.
+   *
+   * Git before 2.46 appends an empty URL rather than clear a list, and before 2.31 reads none of this,
+   * so Git is first asked where the push would go with stand-ins in place of `urls`: a Git that does
+   * not do all of it answers with what the remote is configured with, which is no stand-in, while
+   * asked with `urls` themselves it could answer with them either way. Null unless it names the
+   * stand-ins exactly.
+   */
+  const pinRemote = Effect.fn("pinRemote")(function* (
+    cwd: string,
+    remoteName: string,
+    urls: ReadonlyArray<string>,
+  ) {
+    const spelling = yield* pinSpelling(cwd);
+    const spellings = urls.map((_, index) => `${spelling}/${index}/`);
+    const pinnedTo = (targets: ReadonlyArray<string>) =>
+      spellings[0] === undefined
+        ? null
+        : appendConfigEnv(hostPlatform, process.env, [
+            [`remote.${remoteName}.url`, ""],
+            [`remote.${remoteName}.url`, spellings[0]],
+            [`remote.${remoteName}.pushurl`, ""],
+            ...spellings.map((pinned) => [`remote.${remoteName}.pushurl`, pinned] as const),
+            ...targets.map(
+              (target, index) => [`url.${target}.insteadOf`, spellings[index] ?? ""] as const,
+            ),
+          ]);
+    const standIns = spellings.map((pinned) => `${pinned}stand-in`);
+    const probe = pinnedTo(standIns);
+    const env = pinnedTo(urls);
+    if (probe === null || env === null) return null;
+    const args = ["remote", "get-url", "--push", "--all", "--", remoteName];
+    const reported = yield* executeGit("GitVcsDriver.pinRemote", cwd, args, {
+      env: probe,
+      maxOutputBytes: PUSH_URLS_MAX_OUTPUT_BYTES,
+    });
+    return reported.stdout === standIns.map((standIn) => `${standIn}\n`).join("") ? env : null;
+  });
+
+  /** Whether a push to `target` would go exactly where `expected` was checked to go. */
+  const goesToExpectedTarget = (
+    cwd: string,
+    target: Omit<GitVcsDriver.GitPushTarget, "pushUrls"> | null,
+    expected: GitVcsDriver.GitPushTarget,
+  ) =>
+    target === null ||
+    target.remoteName !== expected.remoteName ||
+    target.branch !== expected.branch
+      ? Effect.succeed(false)
+      : readPushUrls(cwd, target.remoteName).pipe(
+          Effect.map(
+            (pushUrls) =>
+              pushUrls.length === expected.pushUrls.length &&
+              pushUrls.every((url, index) => url === expected.pushUrls[index]),
+          ),
+          // A remote whose URLs can no longer be read is not shown to be the one checked.
+          Effect.orElseSucceed(() => false),
+        );
+
   const pushCurrentBranch: GitVcsDriver.GitVcsDriver["Service"]["pushCurrentBranch"] = Effect.fn(
     "pushCurrentBranch",
   )(function* (cwd, fallbackBranch, options) {
@@ -2372,14 +2606,26 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       });
     }
     const source = commitSha ?? "HEAD";
+    // Set once the push is bound to a checked target: the push goes to its URLs and no others.
+    let pinned: NodeJS.ProcessEnv | undefined;
+    const pushOptions = () => ({
+      timeoutMs: null,
+      ...(pinned === undefined ? {} : { env: pinned }),
+    });
     const pushTracked = (operation: string, remoteName: string, publishBranch: string) =>
       commitSha === null
-        ? runGit(operation, cwd, ["push", "-u", remoteName, `HEAD:refs/heads/${publishBranch}`], {
-            timeoutMs: null,
-          })
-        : runGit(operation, cwd, ["push", remoteName, `${commitSha}:refs/heads/${publishBranch}`], {
-            timeoutMs: null,
-          }).pipe(
+        ? runGit(
+            operation,
+            cwd,
+            ["push", "-u", remoteName, `HEAD:refs/heads/${publishBranch}`],
+            pushOptions(),
+          )
+        : runGit(
+            operation,
+            cwd,
+            ["push", remoteName, `${commitSha}:refs/heads/${publishBranch}`],
+            pushOptions(),
+          ).pipe(
             Effect.andThen(
               runGit(`${operation}.recordRemote`, cwd, [
                 "config",
@@ -2397,23 +2643,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           );
 
     const requestedRemoteName = options?.remoteName?.trim() || null;
-    if (requestedRemoteName) {
-      const publishBranch = yield* resolvePublishBranchName(cwd, branch);
-      yield* pushTracked(
-        "GitVcsDriver.pushCurrentBranch.pushWithRequestedRemote",
-        requestedRemoteName,
-        publishBranch,
-      );
-      return {
-        status: "pushed" as const,
-        branch,
-        upstreamBranch: `${requestedRemoteName}/${publishBranch}`,
-        setUpstream: true,
-      };
-    }
-
     const hasNoLocalDelta = details.aheadCount === 0 && details.behindCount === 0;
-    if (hasNoLocalDelta && commitSha === null) {
+    if (requestedRemoteName === null && hasNoLocalDelta && commitSha === null) {
       if (details.hasUpstream) {
         return {
           status: "skipped_up_to_date" as const,
@@ -2450,9 +2681,84 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       }
     }
 
-    if (!details.hasUpstream) {
-      const publishRemoteName = yield* resolvePushRemoteName(cwd, branch);
-      if (!publishRemoteName) {
+    const destination = yield* resolvePushDestination(
+      cwd,
+      branch,
+      details.hasUpstream,
+      requestedRemoteName,
+    );
+    const expectedTarget = options?.expectedTarget;
+    if (
+      expectedTarget !== undefined &&
+      !(yield* goesToExpectedTarget(cwd, pushTargetOf(destination), expectedTarget))
+    ) {
+      return yield* new GitCommandError({
+        ...gitCommandContext({
+          operation: "GitVcsDriver.pushCurrentBranch",
+          cwd,
+          args: ["push"],
+        }),
+        reason: "push_target_changed",
+        detail: "The push would not go to the expected remote branch.",
+      });
+    }
+    if (expectedTarget !== undefined) {
+      // What changes from here on, however late, cannot move the push: it takes the URLs checked.
+      const env = yield* pinRemote(cwd, expectedTarget.remoteName, expectedTarget.pushUrls);
+      if (env === null) {
+        return yield* new GitCommandError({
+          ...gitCommandContext({
+            operation: "GitVcsDriver.pushCurrentBranch",
+            cwd,
+            args: ["push"],
+          }),
+          reason: "push_target_unpinnable",
+          detail: "This Git cannot hold the push to the URLs it was checked against.",
+        });
+      }
+      pinned = env;
+    }
+    /**
+     * A bound push reached only its checked URLs, but a target that no longer resolves to them is no
+     * longer the one its caller judged, so the push fails here, before anything the caller does next
+     * with it, such as opening a pull request.
+     */
+    const stillExpected = <A>(result: A) =>
+      expectedTarget === undefined
+        ? Effect.succeed(result)
+        : Effect.gen(function* () {
+            const local = yield* readStatusDetailsLocal(cwd, { includeDivergence: false });
+            const target = pushTargetOf(
+              yield* resolvePushDestination(cwd, branch, local.hasUpstream, requestedRemoteName),
+            );
+            if (yield* goesToExpectedTarget(cwd, target, expectedTarget)) return result;
+            return yield* new GitCommandError({
+              ...gitCommandContext({
+                operation: "GitVcsDriver.pushCurrentBranch",
+                cwd,
+                args: ["push"],
+              }),
+              reason: "push_target_changed",
+              detail:
+                "The push went to the expected remote branch, which is no longer where it goes.",
+            });
+          });
+
+    switch (destination.kind) {
+      case "requested": {
+        yield* pushTracked(
+          "GitVcsDriver.pushCurrentBranch.pushWithRequestedRemote",
+          destination.remoteName,
+          destination.branch,
+        );
+        return yield* stillExpected({
+          status: "pushed" as const,
+          branch,
+          upstreamBranch: `${destination.remoteName}/${destination.branch}`,
+          setUpstream: true,
+        });
+      }
+      case "none":
         return yield* new GitCommandError({
           ...gitCommandContext({
             operation: "GitVcsDriver.pushCurrentBranch",
@@ -2461,44 +2767,20 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           }),
           detail: "Cannot push because no git remote is configured for this repository.",
         });
-      }
-      const publishBranch = yield* resolvePublishBranchName(cwd, branch);
-      yield* pushTracked(
-        "GitVcsDriver.pushCurrentBranch.pushWithUpstream",
-        publishRemoteName,
-        publishBranch,
-      );
-      return {
-        status: "pushed" as const,
-        branch,
-        upstreamBranch: `${publishRemoteName}/${publishBranch}`,
-        setUpstream: true,
-      };
-    }
-
-    const currentUpstream = yield* resolveCurrentUpstream(cwd).pipe(
-      Effect.orElseSucceed(() => null),
-    );
-    if (currentUpstream) {
-      // A branch tracking a differently named ref was cut from it, the way
-      // `git checkout -b feature origin/dev` and our own worktree flow leave
-      // it. That upstream is the branch's base, not its publish target, and
-      // pushing HEAD onto it would write feature commits to a shared branch
-      // (bare `git push` refuses this under push.default=simple). The one
-      // same-repo tracking setup that legitimately differs is a git-mangled
-      // alias such as local `upstream/effect-atom` for my-org/upstream's
-      // `effect-atom`: the branch name ends in the upstream head while the
-      // upstream ref ends in the branch name.
-      const isAliasOfUpstreamHead =
-        branch === currentUpstream.branchName ||
-        (branch.endsWith(`/${currentUpstream.branchName}`) &&
-          currentUpstream.upstreamRef.endsWith(`/${branch}`));
-      if (!isAliasOfUpstreamHead) {
-        const publishRemoteName = yield* resolvePushRemoteName(cwd, branch).pipe(
-          Effect.orElseSucceed(() => null),
+      case "publish": {
+        yield* pushTracked(
+          "GitVcsDriver.pushCurrentBranch.pushWithUpstream",
+          destination.remoteName,
+          destination.branch,
         );
-        const remoteName = publishRemoteName ?? currentUpstream.remoteName;
-        const publishBranch = yield* resolvePublishBranchName(cwd, branch);
+        return yield* stillExpected({
+          status: "pushed" as const,
+          branch,
+          upstreamBranch: `${destination.remoteName}/${destination.branch}`,
+          setUpstream: true,
+        });
+      }
+      case "own": {
         // `-u` retargets the upstream to the published branch, so keep the
         // base recorded first; base resolution reads gh-merge-base before the
         // upstream ref.
@@ -2512,34 +2794,37 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           yield* runGit("GitVcsDriver.pushCurrentBranch.recordMergeBase", cwd, [
             "config",
             `branch.${branch}.gh-merge-base`,
-            currentUpstream.branchName,
+            destination.base,
           ]);
         }
         yield* pushTracked(
           "GitVcsDriver.pushCurrentBranch.pushOwnBranch",
-          remoteName,
-          publishBranch,
+          destination.remoteName,
+          destination.branch,
         );
-        return {
+        return yield* stillExpected({
           status: "pushed" as const,
           branch,
-          upstreamBranch: `${remoteName}/${publishBranch}`,
+          upstreamBranch: `${destination.remoteName}/${destination.branch}`,
           setUpstream: true,
-        };
+        });
       }
-
-      yield* runGit(
-        "GitVcsDriver.pushCurrentBranch.pushUpstream",
-        cwd,
-        ["push", currentUpstream.remoteName, `${source}:refs/heads/${currentUpstream.branchName}`],
-        { timeoutMs: null },
-      );
-      return {
-        status: "pushed" as const,
-        branch,
-        upstreamBranch: currentUpstream.upstreamRef,
-        setUpstream: false,
-      };
+      case "upstream": {
+        yield* runGit(
+          "GitVcsDriver.pushCurrentBranch.pushUpstream",
+          cwd,
+          ["push", destination.remoteName, `${source}:refs/heads/${destination.branch}`],
+          pushOptions(),
+        );
+        return yield* stillExpected({
+          status: "pushed" as const,
+          branch,
+          upstreamBranch: destination.upstreamRef,
+          setUpstream: false,
+        });
+      }
+      case "bare":
+        break;
     }
 
     if (commitSha !== null) {
@@ -2560,6 +2845,20 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       ...(details.upstreamRef ? { upstreamBranch: details.upstreamRef } : {}),
       setUpstream: false,
     };
+  });
+
+  const resolvePushTarget: GitVcsDriver.GitVcsDriver["Service"]["resolvePushTarget"] = Effect.fn(
+    "resolvePushTarget",
+  )(function* (cwd, fallbackBranch) {
+    const details = yield* readStatusDetailsLocal(cwd, { includeDivergence: false });
+    const branch = details.branch ?? fallbackBranch;
+    if (!branch) return null;
+    const target = pushTargetOf(
+      yield* resolvePushDestination(cwd, branch, details.hasUpstream, null),
+    );
+    if (target === null) return null;
+    const pushUrls = yield* readPushUrls(cwd, target.remoteName);
+    return pushUrls.length === 0 ? null : { ...target, pushUrls };
   });
 
   const pullCurrentBranch: GitVcsDriver.GitVcsDriver["Service"]["pullCurrentBranch"] = Effect.fn(
@@ -4187,6 +4486,9 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       withListRefsInvalidation(input.cwd, refreshCheckedOutBranch(input)),
     ensureRemote: (input) => withListRefsInvalidation(input.cwd, ensureRemote(input)),
     resolvePrimaryRemoteName,
+    resolvePushRemoteName,
+    resolvePushTarget,
+    pinUrl,
     resolveDefaultBranchName,
     fetchRemote: (input) => withListRefsInvalidation(input.cwd, fetchRemote(input)),
     remoteExists,

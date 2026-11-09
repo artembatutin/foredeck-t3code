@@ -8,7 +8,7 @@ import {
   ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
-import { WorkItemId } from "@t3tools/contracts/fd/work-management";
+import { WorkItemId, workItemScopeChanged } from "@t3tools/contracts/fd/work-management";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -212,7 +212,7 @@ describe("WorkThreads.start", () => {
         assert.deepStrictEqual(launch.workspaceStrategy, {
           type: "worktree",
           baseRef: "HEAD",
-          branch: `work/${item.ref.itemId}-add-jira-sync`,
+          branch: `feature/${item.ref.itemId}-add-jira-sync`,
           startFromOrigin: false,
         });
         assert.include(launch.initialMessage?.text ?? "", "Change no files");
@@ -224,6 +224,9 @@ describe("WorkThreads.start", () => {
         assert.strictEqual(link?.source, "started");
         assert.strictEqual(link?.snapshot.autoStarted, true);
         assert.strictEqual(link?.snapshot.mode, "scope");
+        // Moving the item to in progress moved its revision, and is not a change of what it asks.
+        assert.strictEqual(link?.snapshot.scopeFingerprint, detail.scopeFingerprint);
+        assert.isFalse(workItemScopeChanged(detail.links[0]!, detail));
         // Work's own starts carry no origin, so clients keep offering the reverse prompts.
         assert.isNull(link?.origin);
         assert.notProperty(detail.links[0], "origin");

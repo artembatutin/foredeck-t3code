@@ -48,8 +48,10 @@ const withoutFreeText = (block: FactoryBlock): FactoryBlock => {
   switch (block.reason) {
     case "unsettled":
     case "invalid_submission":
+    case "allowance_exhausted":
       return { ...block, problems: [] };
     case "effect_failed":
+    case "reviewed_refused":
       return { ...block, detail: "Factory could not complete a step." };
     case "plan_empty":
       return { ...block, note: null };

@@ -6,6 +6,7 @@ import {
   type GitRunStackedActionResult,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2ThreadShell,
+  type PullRequestDetail,
   ProjectId,
   RunId,
   ThreadId,
@@ -40,6 +41,7 @@ import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProcessRunner from "../../processRunner.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
+import * as PullRequestService from "../../pullRequest/PullRequestService.ts";
 import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
@@ -55,6 +57,13 @@ import * as FactorySettings from "./FactorySettings.ts";
 import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 import * as FactoryWorkComments from "./FactoryWorkComments.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
+import { needsYou } from "./snapshot.ts";
+import * as DeliveryHarness from "./testkit/deliveryHarness.ts";
+import {
+  awaitedRun as runAwaited,
+  passingReview as reviewPassing,
+} from "./testkit/followThrough.ts";
+import { failsUntilFixed, offeredModels, reviewNow, setSettings } from "./testkit/reviewed.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
@@ -233,6 +242,19 @@ const fakes = (world: World) =>
         }),
     }),
     Layer.mock(ProjectService.ProjectService)({ getShell: () => Effect.succeedNone }),
+    // The host holds what the last pull request step sent.
+    Layer.mock(PullRequestService.PullRequestService)({
+      invalidate: () => Effect.void,
+      detail: () =>
+        Effect.suspend(() => {
+          const created = world.calls.findLast(({ action }) => action === "create_pr");
+          return Effect.succeed({
+            title: created?.prTitle ?? "",
+            body: created?.prBody ?? "",
+            headBranch: branch,
+          } as unknown as PullRequestDetail);
+        }),
+    }),
   );
 
 /** The real record, which first runs the world's `beforeRecord`. */
@@ -1059,5 +1081,362 @@ describe("FactoryService.resume on the server's real stack", () => {
         );
       }),
     ).pipe(Effect.orDie),
+  );
+});
+
+describe("a reviewed delivery's resume, on the server's real stack", () => {
+  const service = FactoryService.FactoryService;
+  const { authorCommits, drainFactory, stateOf: delivered, withProject } = DeliveryHarness;
+
+  const startReviewed = (
+    world: DeliveryHarness.World,
+    limits: { readonly maxFixRounds: number; readonly maxReviewRounds: number },
+  ) =>
+    Effect.gen(function* () {
+      yield* setSettings(world, { verifyCommand: failsUntilFixed, limits });
+      const reviewed = yield* reviewNow(world);
+      const started = yield* Effect.flatMap(service, (factory) =>
+        factory.start({ itemRef: world.itemRef, reviewedExecution: reviewed }),
+      );
+      return { root: started.deliveryId, reviewed };
+    }).pipe(Effect.orDie);
+
+  const turnsOn = (world: DeliveryHarness.World, threadId: ThreadId) =>
+    world.provider.started.filter((turn) => turn.threadId === threadId).length;
+
+  it.live("spends no more repair rounds across a stop, a rebuild and repeated resumes", () =>
+    withProject(
+      failsUntilFixed,
+      (world) =>
+        Effect.gen(function* () {
+          const { root } = yield* startReviewed(world, { maxFixRounds: 1, maxReviewRounds: 1 });
+          const author = yield* world.launched(root);
+          yield* authorCommits(author.worktreePath, "feat: add the export");
+          yield* world.endRun(author.runId, "completed");
+          // Its one fix round is under way, and the owner asks it to stop.
+          const fix = yield* runAwaited(root);
+          assert.strictEqual(turnsOn(world, author.threadId), 2);
+          yield* Effect.flatMap(service, (factory) => factory.stop(root));
+          yield* authorCommits(author.worktreePath, "fix: try again", "export const x = 2;\n");
+          yield* world.endRun(fix.runId, "completed");
+          assert.strictEqual((yield* delivered(root)).status, "stopped");
+
+          yield* world.rebuild(
+            Effect.gen(function* () {
+              const factory = yield* service;
+              const exhausted = {
+                reason: "allowance_exhausted",
+                allowance: "fix",
+                used: 1,
+                approved: 1,
+                problems: [],
+              } as const;
+              for (let resume = 0; resume < 3; resume += 1) {
+                yield* factory.resume(root);
+                yield* drainFactory;
+                const state = yield* delivered(root);
+                assert.strictEqual(state.status, "blocked");
+                assert.deepStrictEqual(state.block, exhausted);
+                assert.deepStrictEqual(state.rounds, { fix: 1, review: 0 });
+                assert.strictEqual(turnsOn(world, author.threadId), 2);
+                assert.strictEqual(
+                  needsYou(state),
+                  "This delivery used 1 of the 1 fix round its owner approved. Resuming adds none; more takes a fresh review.",
+                );
+              }
+              // Each resume verified afresh, once the first run's failure was forgotten.
+              assert.lengthOf((yield* delivered(root)).receipts, 4);
+            }),
+            { orchestration: true },
+          );
+        }).pipe(Effect.orDie),
+      { providers: offeredModels() },
+    ),
+  );
+
+  it.live("spends no more fix-commit turns across a block, a rebuild and repeated resumes", () =>
+    withProject(
+      failsUntilFixed,
+      (world) =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const { root } = yield* startReviewed(world, { maxFixRounds: 1, maxReviewRounds: 1 });
+          const author = yield* world.launched(root);
+          const dirty = `${author.worktreePath}/export.ts`;
+          yield* fileSystem.writeFileString(dirty, "uncommitted\n");
+          yield* world.endRun(author.runId, "completed");
+          const mechanical = yield* runAwaited(root);
+          assert.strictEqual(turnsOn(world, author.threadId), 2);
+          // The turn leaves the branch as it found it, with no allowance left for another.
+          yield* world.endRun(mechanical.runId, "completed");
+          const exhausted = {
+            reason: "allowance_exhausted",
+            allowance: "fix_commit",
+            used: 1,
+            approved: 1,
+          } as const;
+          assert.deepInclude((yield* delivered(root)).block, exhausted);
+
+          yield* world.rebuild(
+            Effect.gen(function* () {
+              const factory = yield* service;
+              for (let resume = 0; resume < 2; resume += 1) {
+                yield* factory.resume(root);
+                yield* drainFactory;
+                const state = yield* delivered(root);
+                assert.strictEqual(state.status, "blocked");
+                assert.deepInclude(state.block, exhausted);
+                assert.strictEqual(state.fixCommitTurns, 1);
+                assert.strictEqual(turnsOn(world, author.threadId), 2);
+              }
+            }),
+            { orchestration: true },
+          );
+        }).pipe(Effect.orDie),
+      { providers: offeredModels() },
+    ),
+  );
+
+  it.live("spends no more review rounds across a stop, a rebuild and repeated resumes", () =>
+    withProject(
+      failsUntilFixed,
+      (world) =>
+        Effect.gen(function* () {
+          const blocking = {
+            ...reviewPassing(),
+            verdict: "changes-required",
+            findings: [
+              {
+                id: "empty",
+                severity: "high",
+                required: true,
+                file: "export.ts",
+                line: 1,
+                detail: "Empty input crashes.",
+              },
+            ],
+          };
+          const factory = yield* service;
+          yield* setSettings(world, {
+            verifyCommand: DeliveryHarness.verifyCommands.passes,
+            limits: { maxFixRounds: 1, maxReviewRounds: 1 },
+          });
+          const reviewed = yield* reviewNow(world);
+          const { deliveryId: root } = yield* factory.start({
+            itemRef: world.itemRef,
+            reviewedExecution: reviewed,
+          });
+          const author = yield* world.launched(root);
+          yield* authorCommits(author.worktreePath, "feat: add the export");
+          yield* world.endRun(author.runId, "completed");
+          const review = yield* runAwaited(root);
+          yield* factory.submitReview({ threadId: review.threadId, review: blocking });
+          yield* world.endRun(review.runId, "completed");
+          // Its one review round is under way, and the owner asks it to stop.
+          const answer = yield* runAwaited(root);
+          assert.strictEqual(answer.threadId, author.threadId);
+          assert.deepStrictEqual((yield* delivered(root)).rounds, { fix: 0, review: 1 });
+          yield* factory.stop(root);
+          yield* authorCommits(author.worktreePath, "fix: answer it", "export const x = 2;\n");
+          yield* world.endRun(answer.runId, "completed");
+          assert.strictEqual((yield* delivered(root)).status, "stopped");
+          const authorTurns = turnsOn(world, author.threadId);
+          assert.strictEqual(authorTurns, 2);
+
+          yield* world.rebuild(
+            Effect.gen(function* () {
+              const rebuilt = yield* service;
+              for (let resume = 0; resume < 3; resume += 1) {
+                yield* rebuilt.resume(root);
+                yield* drainFactory;
+                // A resume judges the branch afresh, and the reviewer blocks it again.
+                const again = yield* runAwaited(root);
+                yield* rebuilt.submitReview({ threadId: again.threadId, review: blocking });
+                yield* world.endRun(again.runId, "completed");
+                const state = yield* delivered(root);
+                assert.strictEqual(state.status, "blocked");
+                assert.deepStrictEqual(state.block, {
+                  reason: "allowance_exhausted",
+                  allowance: "review",
+                  used: 1,
+                  approved: 1,
+                  problems: [],
+                });
+                assert.deepStrictEqual(state.rounds, { fix: 0, review: 1 });
+                assert.strictEqual(turnsOn(world, author.threadId), authorTurns);
+                assert.strictEqual(
+                  needsYou(state),
+                  "This delivery used 1 of the 1 review round its owner approved. Resuming adds none; more takes a fresh review.",
+                );
+              }
+            }),
+            { orchestration: true },
+          );
+        }).pipe(Effect.orDie),
+      { providers: offeredModels() },
+    ),
+  );
+
+  it.live("keeps a turn charged when it ran though its result was lost", () =>
+    withProject(
+      failsUntilFixed,
+      (world) =>
+        Effect.gen(function* () {
+          const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+          const worker = yield* FactoryWorker.FactoryWorker;
+          const { root } = yield* startReviewed(world, { maxFixRounds: 1, maxReviewRounds: 1 });
+          const author = yield* world.launched(root);
+          yield* authorCommits(author.worktreePath, "feat: add the export");
+          yield* world.endRun(author.runId, "completed");
+          yield* runAwaited(root);
+          const running = yield* delivered(root);
+          assert.deepStrictEqual(running.rounds, { fix: 1, review: 0 });
+
+          // As a restart leaves it: the turn's run exists, and its result was never stored.
+          const effectId = running.effectsIssued;
+          yield* store.update(root, {
+            ...running,
+            awaiting: {
+              type: "effect",
+              effect: {
+                id: effectId,
+                type: "send_repair_turn",
+                kind: "fix-verify",
+                threadId: author.threadId,
+                round: 1,
+              },
+            },
+          });
+          yield* worker.step(root, {
+            type: "effect.failed",
+            effectId,
+            detail: "Factory could not send the fix-verify turn: a server restart interrupted it.",
+          });
+
+          const lost = yield* delivered(root);
+          assert.strictEqual(lost.status, "blocked");
+          assert.deepStrictEqual(lost.rounds, { fix: 1, review: 0 });
+        }).pipe(Effect.orDie),
+      { providers: offeredModels() },
+    ),
+  );
+
+  it.live("adds rounds only under a new receipt, keeping what was used", () =>
+    withProject(
+      failsUntilFixed,
+      (world) =>
+        Effect.gen(function* () {
+          const factory = yield* service;
+          const { root, reviewed } = yield* startReviewed(world, {
+            maxFixRounds: 1,
+            maxReviewRounds: 1,
+          });
+          const author = yield* world.launched(root);
+          yield* authorCommits(author.worktreePath, "feat: add the export");
+          yield* world.endRun(author.runId, "completed");
+          const fix = yield* runAwaited(root);
+          yield* authorCommits(author.worktreePath, "fix: try again", "export const x = 2;\n");
+          yield* world.endRun(fix.runId, "completed");
+          const spent = yield* delivered(root);
+          assert.deepInclude(spent.block, { reason: "allowance_exhausted", allowance: "fix" });
+
+          const allowances = { maxFixRounds: 2, maxReviewRounds: 1, maxFixCommitTurns: 1 };
+          const amend = (input: {
+            readonly receiptId: string;
+            readonly reviewVersion: number;
+            readonly allowances: typeof allowances;
+          }) => factory.amendReviewedAllowance({ deliveryId: root, ...input });
+
+          // The receipt it stands under, as it stands, changes nothing; with more it is refused.
+          const same = {
+            maxFixRounds: 1,
+            maxReviewRounds: 1,
+            maxFixCommitTurns: reviewed.limits.maxFixCommitTurns,
+          };
+          yield* amend({ receiptId: reviewed.receiptId, reviewVersion: 1, allowances: same });
+          assert.deepStrictEqual(yield* delivered(root), spent);
+          const reused = yield* Effect.flip(
+            amend({ receiptId: reviewed.receiptId, reviewVersion: 2, allowances }),
+          );
+          assert.include(reused, {
+            _tag: "FactoryReviewedAmendmentRefusedError",
+            reason: "same_receipt",
+          });
+          const stale = yield* Effect.flip(
+            amend({ receiptId: "receipt-0", reviewVersion: 1, allowances }),
+          );
+          assert.include(stale, { reason: "stale_version" });
+          const lower = yield* Effect.flip(
+            amend({
+              receiptId: "receipt-2",
+              reviewVersion: 2,
+              allowances: { ...allowances, maxFixRounds: 0 },
+            }),
+          );
+          assert.include(lower, { reason: "lower_allowance" });
+          assert.deepStrictEqual(yield* delivered(root), spent);
+
+          const amended = yield* amend({ receiptId: "receipt-2", reviewVersion: 2, allowances });
+          assert.strictEqual(amended.state.reviewedExecution?.receiptId, "receipt-2");
+          assert.deepStrictEqual(amended.state.rounds, { fix: 1, review: 0 });
+          assert.strictEqual(amended.state.limits.maxFixRounds, 2);
+
+          // Exactly the one round it added, then it is spent again.
+          yield* factory.resume(root);
+          yield* drainFactory;
+          yield* runAwaited(root);
+          assert.deepStrictEqual((yield* delivered(root)).rounds, { fix: 2, review: 0 });
+          assert.strictEqual(turnsOn(world, author.threadId), 3);
+
+          // The receipt it replaced authorizes nothing again, under any later version.
+          const reissued = { maxFixRounds: 9, maxReviewRounds: 9, maxFixCommitTurns: 9 };
+          const reuse = amend({
+            receiptId: reviewed.receiptId,
+            reviewVersion: 3,
+            allowances: reissued,
+          });
+          assert.include(yield* Effect.flip(reuse), { reason: "reused_receipt" });
+          const stored = yield* delivered(root);
+          yield* world.rebuild(
+            Effect.gen(function* () {
+              const rebuilt = yield* service;
+              const again = rebuilt.amendReviewedAllowance({
+                deliveryId: root,
+                receiptId: reviewed.receiptId,
+                reviewVersion: 4,
+                allowances: reissued,
+              });
+              assert.include(yield* Effect.flip(again), { reason: "reused_receipt" });
+              assert.deepStrictEqual(yield* delivered(root), stored);
+              assert.strictEqual(stored.reviewedExecution?.receiptId, "receipt-2");
+              assert.deepStrictEqual(stored.supersededReceipts, [reviewed.receiptId]);
+            }),
+            { orchestration: true },
+          );
+        }).pipe(Effect.orDie),
+      { providers: offeredModels() },
+    ),
+  );
+
+  it.live("refuses an amendment for a delivery started without a review, or one that ended", () =>
+    withProject(
+      failsUntilFixed,
+      (world) =>
+        Effect.gen(function* () {
+          const factory = yield* service;
+          const started = yield* factory.start({ itemRef: world.itemRef });
+          const allowances = { maxFixRounds: 9, maxReviewRounds: 9, maxFixCommitTurns: 9 };
+          const refused = yield* Effect.flip(
+            factory.amendReviewedAllowance({
+              deliveryId: started.deliveryId,
+              receiptId: "receipt-2",
+              reviewVersion: 2,
+              allowances,
+            }),
+          );
+          assert.include(refused, { reason: "not_reviewed" });
+        }).pipe(Effect.orDie),
+      { providers: offeredModels() },
+    ),
   );
 });

@@ -1,18 +1,22 @@
+import { ThreadRuntimeModeRefusedError, threadHostRefusal } from "../fd/approvals/index.ts";
 import { requiresMultiRepositoryExecution, supportsRepositories } from "../fd/multirepo/index.ts";
 import { getInitialServerConfig, EnvironmentRpcUnavailableError } from "../rpc/client.ts";
 import type { ThreadId } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
-import { Atom } from "effect/reactivity";
+import { Atom, type AtomRegistry } from "effect/reactivity";
 import {
   WS_METHODS,
   type EnvironmentId,
   type ProjectId,
   type OrchestrationV2ShellSnapshot,
+  type ServerConfig,
 } from "@t3tools/contracts";
+import { pendingAnswerStartsTurn } from "@t3tools/shared/fd/approvals";
 
 import { createOptimisticThreadLifecycle } from "./threadLifecycle.ts";
+import type { ThreadPendingUserInput } from "./threadRequests.ts";
 import * as DateTime from "effect/DateTime";
 
 import {
@@ -144,7 +148,27 @@ export type {
 export function createThreadEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | Crypto.Crypto | R, E>,
   snapshotAtom: (environmentId: EnvironmentId) => Atom.Atom<OrchestrationV2ShellSnapshot | null>,
+  serverConfigsAtom: Atom.Atom<ReadonlyMap<EnvironmentId, ServerConfig>>,
 ) {
+  /** Refuses, before anything is dispatched, a turn the provider's host is known to refuse. */
+  const requireHostAllowedMode = (
+    registry: AtomRegistry.AtomRegistry,
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    turn: Pick<StartThreadTurnInput, "runtimeMode" | "modelSelection" | "bootstrap"> | null = null,
+  ) => {
+    const refusal = threadHostRefusal({
+      snapshot: registry.get(snapshotAtom(environmentId)),
+      providers: registry.get(serverConfigsAtom).get(environmentId)?.providers,
+      threadId,
+      runtimeMode: turn?.runtimeMode,
+      instanceId: (turn?.modelSelection ?? turn?.bootstrap?.createThread?.modelSelection)
+        ?.instanceId,
+    });
+    return refusal === null
+      ? Effect.void
+      : Effect.fail(new ThreadRuntimeModeRefusedError({ threadId, message: refusal.summary }));
+  };
   const requireRepositoryProtocol = (
     snapshot: OrchestrationV2ShellSnapshot | null,
     environmentId: EnvironmentId,
@@ -305,6 +329,7 @@ export function createThreadEnvironmentAtoms<R, E>(
             input.bootstrap?.createThread?.projectId,
             input.requiresRepositoryProtocol,
           );
+          yield* requireHostAllowedMode(registry, environmentId, input.threadId, input);
           return yield* startThreadTurn(input);
         }),
       scheduler,
@@ -324,7 +349,19 @@ export function createThreadEnvironmentAtoms<R, E>(
     }),
     respondToUserInput: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:respond-to-user-input",
-      execute: (input: RespondToThreadUserInputInput) => respondToThreadUserInput(input),
+      // A message-capable answer resolves its request and starts a turn at once, so one the host
+      // would refuse stays pending. A live one continues the turn that asked.
+      execute: (
+        input: RespondToThreadUserInputInput & {
+          readonly responseCapability: ThreadPendingUserInput["responseCapability"];
+        },
+        registry,
+        environmentId,
+      ) =>
+        (pendingAnswerStartsTurn(input.responseCapability)
+          ? requireHostAllowedMode(registry, environmentId, input.threadId)
+          : Effect.void
+        ).pipe(Effect.andThen(respondToThreadUserInput(input))),
       scheduler,
       concurrency,
     }),
@@ -377,7 +414,10 @@ export function createThreadEnvironmentAtoms<R, E>(
           registry.get(snapshotAtom(environmentId)),
           environmentId,
           input.threadId,
-        ).pipe(Effect.andThen(resumeThreadQueue(input))),
+        ).pipe(
+          Effect.andThen(requireHostAllowedMode(registry, environmentId, input.threadId)),
+          Effect.andThen(resumeThreadQueue(input)),
+        ),
       scheduler,
       concurrency,
     }),
@@ -394,7 +434,10 @@ export function createThreadEnvironmentAtoms<R, E>(
           registry.get(snapshotAtom(environmentId)),
           environmentId,
           input.threadId,
-        ).pipe(Effect.andThen(promoteQueuedRun(input))),
+        ).pipe(
+          Effect.andThen(requireHostAllowedMode(registry, environmentId, input.threadId)),
+          Effect.andThen(promoteQueuedRun(input)),
+        ),
       scheduler,
       concurrency,
     }),
@@ -411,7 +454,10 @@ export function createThreadEnvironmentAtoms<R, E>(
           registry.get(snapshotAtom(environmentId)),
           environmentId,
           input.threadId,
-        ).pipe(Effect.andThen(retryWorkspacePreparation(input))),
+        ).pipe(
+          Effect.andThen(requireHostAllowedMode(registry, environmentId, input.threadId)),
+          Effect.andThen(retryWorkspacePreparation(input)),
+        ),
       scheduler,
       concurrency,
     }),

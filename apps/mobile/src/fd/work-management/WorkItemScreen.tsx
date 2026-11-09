@@ -596,7 +596,7 @@ function LoadedItem({
                 >
                   <ListRow
                     label={shell?.title ?? link.threadId}
-                    description={`${RUN_STATE_LABELS[runStateOf(shell)]}${link.run ? ` · last run ${link.run.status}` : ""}${changed ? " · changed since the thread started" : ""}`}
+                    description={`${RUN_STATE_LABELS[runStateOf(shell)]}${link.run ? ` · last run ${link.run.status}` : ""}${changed ? " · requirements changed since the thread started" : ""}`}
                     onPress={() => openThread(environmentId, link.threadId)}
                   />
                   {actions ? (

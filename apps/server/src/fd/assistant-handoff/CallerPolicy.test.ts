@@ -52,7 +52,9 @@ interface World {
   ownership: Ownership;
   delegation: HandoffAdmission.DelegationDecision;
   /** Which read fails, if any. */
-  failing?: "family" | "management" | "ownership" | "slot" | "work";
+  failing?: "family" | "management" | "ownership" | "review" | "slot" | "work";
+  /** Why the delivery's review no longer allows new work from the thread, if it does not. */
+  reviewRefusal?: string;
 }
 
 const reads = { family: 0, ownership: 0, work: 0 };
@@ -126,6 +128,12 @@ const layerOver = (
             ? Effect.fail(readFailure(threadId))
             : Effect.succeed(threadId === outsider ? null : root);
         }),
+      reviewedRefusal: (threadId) =>
+        Effect.suspend(() =>
+          world.failing === "review"
+            ? Effect.fail(readFailure(threadId))
+            : Effect.succeed(world.reviewRefusal),
+        ),
       requestOwnership: ({ threadId }) =>
         Effect.suspend(() => {
           reads.ownership += 1;
@@ -459,6 +467,28 @@ describe("the caller policy's delegation", () => {
       assert.strictEqual(outcome.work, 1);
       // Admitted and run in the admission's bracket, with the handler left interruptible.
       assert.deepStrictEqual(outcome.dispatches, [{ interruptible: true }]);
+    }),
+  );
+
+  it.effect("refuses what the delivery's review no longer allows, before asking admission", () =>
+    Effect.gen(function* () {
+      const outcome = yield* delegate({ ...active, reviewRefusal: "The review moved." }, author);
+      assert.strictEqual(outcome.ran, 0);
+      assert.strictEqual(outcome.work, 0);
+      assert.deepStrictEqual(outcome.dispatches, []);
+      const failure = failureOf(outcome.result);
+      assert.strictEqual(failure?.code, "capability_denied");
+      assert.strictEqual(failure?.message, "This delivery cannot delegate now. The review moved.");
+    }),
+  );
+
+  it.effect("runs nothing when the delivery's review cannot be judged", () =>
+    Effect.gen(function* () {
+      const outcome = yield* delegate({ ...active, failing: "review" }, author);
+      assert.strictEqual(outcome.ran, 0);
+      const failure = failureOf(outcome.result);
+      assert.strictEqual(failure?.code, "orchestration_error");
+      assert.strictEqual(failure?.message, text.readFailure);
     }),
   );
 

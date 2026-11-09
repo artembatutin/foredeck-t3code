@@ -14,6 +14,7 @@ import * as NodeOS from "node:os";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 
 import * as Electron from "electron";
 
@@ -47,6 +48,7 @@ import * as DesktopBackendPool from "./backend/DesktopBackendPool.ts";
 import * as DesktopLocalEnvironmentAuth from "./backend/DesktopLocalEnvironmentAuth.ts";
 import * as DesktopNetworkInterfaces from "./backend/DesktopNetworkInterfaces.ts";
 import * as DesktopEnvironment from "./app/DesktopEnvironment.ts";
+import { readUxPreviewBuildHome } from "./fd/assistant/index.ts";
 import * as DesktopLifecycle from "./app/DesktopLifecycle.ts";
 import * as DesktopLinuxUrlHandler from "./app/DesktopLinuxUrlHandler.ts";
 import * as DesktopShutdown from "./app/DesktopShutdown.ts";
@@ -93,14 +95,23 @@ const layerDesktopEnvironment = Layer.unwrap(
     );
     const platform = yield* HostProcess.Platform;
     const processArch = yield* HostProcess.Architecture;
+    const path = yield* Path.Path;
     return DesktopEnvironment.layer({
       dirname: __dirname,
       homeDirectory: NodeOS.homedir(),
       platform,
       processArch,
       ...metadata,
+      uxPreviewHome: readUxPreviewBuildHome({ ...metadata, path }),
     });
   }),
+).pipe(
+  // A refused UX preview quits before reading any state; Finder shows no log, so say why.
+  Layer.tapError((error) =>
+    DesktopEnvironment.isDesktopUxPreviewHomeRefusedError(error)
+      ? Effect.sync(() => Electron.dialog.showErrorBox("Foredeck UX Preview", error.message))
+      : Effect.void,
+  ),
 );
 
 // The remote runs the exact release this app is on, from its self-contained

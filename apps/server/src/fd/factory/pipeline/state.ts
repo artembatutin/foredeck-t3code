@@ -5,6 +5,7 @@ import type {
   FactoryPlan,
   FactoryPlanTask,
   FactoryReviewDetails,
+  FactoryReviewedExecution,
   FactoryReviewSummary,
   FactoryRole,
   FactoryStageName,
@@ -641,8 +642,9 @@ export type FactoryEvent =
    * An `open_pr` result. `pullRequestThread` is the thread a parent's pull request is linked to,
    * its last child's author's; a single item's is its author's. `watch` is what the worker found
    * and did about the watch on the pull request there (see `FactoryWatchState`); absent when it
-   * watches none. `watchFailure` is set instead when the watch could not start: the pull request
-   * is published all the same, so it is recorded; the text is bounded and safe to show.
+   * watches none. `watchFailure` is set instead when the watch could not start, and
+   * `publicationFailure` when what the host saved was not shown to comply: the pull request is
+   * published all the same, so it is recorded; either text is bounded and safe to show.
    */
   | {
       readonly type: "pr.opened";
@@ -651,6 +653,7 @@ export type FactoryEvent =
       readonly pullRequestThread?: ThreadId;
       readonly watch?: FactoryWatchState;
       readonly watchFailure?: string;
+      readonly publicationFailure?: string;
     }
   /**
    * An `open_pr` result a restart lost after the stage's watch command, recovered by the boot sweep
@@ -729,15 +732,64 @@ export type FactoryEvent =
   | { readonly type: "child.started"; readonly effectId: number; readonly baseline?: string }
   /** A parent's child reports that it ended approved at record. */
   | { readonly type: "child.approved"; readonly deliveryId: FactoryDeliveryId }
-  /** The worker could not carry out the effect; `detail` is bounded and safe to show. */
-  | { readonly type: "effect.failed"; readonly effectId: number; readonly detail: string }
+  /**
+   * The worker could not carry out the effect; `detail` is bounded and safe to show. `unsent` says
+   * the durable record shows its turn never started, so a review's allowance was not spent on it.
+   */
+  | {
+      readonly type: "effect.failed";
+      readonly effectId: number;
+      readonly detail: string;
+      readonly unsent?: true;
+      readonly hostRefused?: FactoryHostRefusal;
+    }
   /**
    * The awaited effect waits for admission (see `FactoryAdmission`): its job ended without
    * running it, and only a redispatch runs it.
    */
   | { readonly type: "admission.deferred"; readonly effectId: number }
   /** The awaited effect that waited for admission is admitted; its redispatched job runs it. */
-  | { readonly type: "admission.granted"; readonly effectId: number };
+  | { readonly type: "admission.granted"; readonly effectId: number }
+  /**
+   * A fresh owner review of a reviewed delivery, judged before it is stepped: these allowances
+   * replace its approved ones under the new receipt, and what it used so far stays counted.
+   */
+  | {
+      readonly type: "reviewed.amended";
+      readonly receiptId: FactoryReviewedExecution["receiptId"];
+      readonly reviewVersion: number;
+      readonly allowances: FactoryReviewedAllowances;
+    }
+  /**
+   * A fresh owner review of the whole of a reviewed delivery at rest, judged before it is stepped:
+   * it runs on this from now on, under its receipt, and what it used so far stays counted.
+   */
+  | {
+      readonly type: "reviewed.rebound";
+      readonly execution: FactoryReviewedExecution;
+      /** The review's confirmation resumes this delivery once; see `reviewResumeOwed`. */
+      readonly owesResume: boolean;
+    }
+  /**
+   * An automatic turn of a reviewed delivery could not run as reviewed, so it did not run. Taken
+   * while the delivery waits on its pull request, where nothing else would show it.
+   */
+  | { readonly type: "reviewed.refused"; readonly detail: string };
+
+/**
+ * The mode a provider's host policy refused and what it could run instead. The block's `detail` is
+ * cut to a sentence for the delivery's reason, so this keeps what the owner chooses among.
+ */
+export interface FactoryHostRefusal {
+  readonly runtimeMode: RuntimeMode;
+  readonly provider: string;
+  readonly driver: string;
+  readonly detail?: string;
+  readonly choose: "resume" | "thread" | "automatic_turn" | "review" | "before_review";
+  readonly alternatives: ReadonlyArray<RuntimeMode>;
+  /** The thread whose turn it refused; a launch's has none yet. */
+  readonly threadId?: ThreadId;
+}
 
 /** The events the reactor observes on a thread; they name the thread, not the delivery. */
 export type FactoryThreadEvent = Extract<
@@ -754,7 +806,12 @@ export type FactoryBlock =
       readonly runStatus: Exclude<FactoryTerminalRunStatus, "completed">;
     }
   | { readonly reason: "thread_deleted"; readonly threadId: ThreadId }
-  | { readonly reason: "effect_failed"; readonly effect: FactoryEffect; readonly detail: string }
+  | {
+      readonly reason: "effect_failed";
+      readonly effect: FactoryEffect;
+      readonly detail: string;
+      readonly hostRefused?: FactoryHostRefusal;
+    }
   | { readonly reason: "unsettled"; readonly problems: ReadonlyArray<string> }
   /**
    * The command ran and failed or timed out with no fix round left, or in a parent's integrate,
@@ -782,6 +839,20 @@ export type FactoryBlock =
   | { readonly reason: "plan_empty"; readonly note: string | null }
   /** Core's watch of the open pull request ended, so its feedback no longer reaches Factory. */
   | { readonly reason: "watch_ended" }
+  /**
+   * A reviewed delivery spent a count its owner approved, across every stop, resume and restart:
+   * `problems` are a fix-commit turn's settle problems; a round's failure is its last receipt or
+   * review.
+   */
+  | {
+      readonly reason: "allowance_exhausted";
+      readonly allowance: FactoryReviewedAllowance;
+      readonly used: number;
+      readonly approved: number;
+      readonly problems: ReadonlyArray<string>;
+    }
+  /** See the `reviewed.refused` event; `detail` is fixed text. */
+  | { readonly reason: "reviewed_refused"; readonly detail: string }
   /** At record, the worktree no longer held the verified, reviewed commit on a clean tree. */
   | {
       readonly reason: "record_mismatch";
@@ -795,6 +866,17 @@ export interface FactoryRoundLimits {
   readonly maxFixRounds: number;
   readonly maxReviewRounds: number;
 }
+
+/** A count a review approves for a delivery as a whole. */
+export type FactoryReviewedAllowance = "fix" | "review" | "fix_commit";
+
+export type FactoryReviewedAllowances = Pick<
+  FactoryReviewedExecution["limits"],
+  "maxFixRounds" | "maxReviewRounds" | "maxFixCommitTurns"
+>;
+
+/** Repairable settle problems a delivery answers with a mechanical turn, unless reviewed for more. */
+export const FIX_COMMIT_TURNS = 1;
 
 /**
  * The project settings' default limits, for a delivery stored without its own. A literal, since
@@ -837,7 +919,10 @@ export interface FactoryDeliveryState {
   /** A parent's planner launch, recorded when it is issued, for the reason `authorLaunch` is. */
   readonly plannerLaunch: FactoryLaunchEffect | null;
   readonly awaiting: FactoryAwaiting | null;
-  /** Fix-commit turns spent on the current task's settle problems since it started or resumed. */
+  /**
+   * Fix-commit turns spent on the current task's settle problems since it started, or for an
+   * unreviewed delivery since it last resumed.
+   */
   readonly fixCommitTurns: number;
   /** Effects issued so far; the next effect's id is one more. */
   readonly effectsIssued: number;
@@ -861,8 +946,26 @@ export interface FactoryDeliveryState {
    */
   readonly runtimeModeCeiling?: RuntimeMode;
   /**
-   * Repair rounds spent on the current task since it started or resumed: fix-verify turns
-   * (`fix`), fix-review turns (`review`).
+   * What its owner reviewed for this delivery, which every effect runs on instead of the project's
+   * settings. A ceiling and never a grant: revocation and stricter policy still stop it. Absent
+   * from a delivery started without a review, which reads the settings as each step runs.
+   */
+  readonly reviewedExecution?: FactoryReviewedExecution;
+  /**
+   * The receipts earlier reviews of this delivery stood under, oldest first, which can never
+   * authorize anything again. Absent until a fresh review replaces the first.
+   */
+  readonly supersededReceipts?: ReadonlyArray<FactoryReviewedExecution["receiptId"]>;
+  /**
+   * The receipt of a fresh review that owes this delivery one resume, set in the step that rebinds
+   * it and cleared by the step of its next resume, whoever asks for it. A repeat of the owner's
+   * confirmation resumes only while this is set, so it finishes one a failure cut short and never
+   * starts work again after a later stop or block.
+   */
+  readonly reviewResumeOwed?: FactoryReviewedExecution["receiptId"];
+  /**
+   * Repair rounds spent on the current task since it started, or for an unreviewed delivery since
+   * it last resumed: fix-verify turns (`fix`), fix-review turns (`review`).
    */
   readonly rounds: { readonly fix: number; readonly review: number };
   /**
@@ -947,6 +1050,15 @@ export const isProceeding = (delivery: FactoryDeliveryState) =>
   (delivery.status === "approved" && delivery.kind !== "child") ||
   (delivery.status === "pr_open" && delivery.awaiting !== null);
 
+/**
+ * Whether anything of the delivery is under way now, as a client reads it. Narrower than
+ * `isProceeding`, which says where the server would move it: a delivery approved before the PR
+ * stage existed reads as proceeding there, though it awaits nothing and nothing opens its pull
+ * request.
+ */
+export const isAdvancing = (delivery: FactoryDeliveryState) =>
+  isProceeding(delivery) && delivery.awaiting !== null;
+
 /** Done and cancelled deliveries never change again. */
 export const isTerminal = (delivery: FactoryDeliveryState) =>
   delivery.status === "done" || delivery.status === "cancelled";
@@ -985,6 +1097,7 @@ export const queuedDeliveryState = (input: {
   readonly limits?: FactoryRoundLimits;
   readonly risk?: FactoryTaskRisk;
   readonly runtimeModeCeiling?: RuntimeMode;
+  readonly reviewedExecution?: FactoryReviewedExecution;
 }): FactoryDeliveryState => ({
   kind: input.kind ?? "single",
   status: "queued",
@@ -1008,6 +1121,7 @@ export const queuedDeliveryState = (input: {
   ...(input.runtimeModeCeiling === undefined
     ? {}
     : { runtimeModeCeiling: input.runtimeModeCeiling }),
+  ...(input.reviewedExecution === undefined ? {} : { reviewedExecution: input.reviewedExecution }),
   rounds: { fix: 0, review: 0 },
   fingerprints: [],
   reviewResponse: null,

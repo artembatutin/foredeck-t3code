@@ -97,10 +97,12 @@ commit ([`FactoryVerifyRunner.ts`](../../apps/server/src/fd/factory/verify/Facto
 The delivery worktree is the code being judged, so letting it supply prompt overrides would let
 the author change the next review's rules. Every launch and follow-up instead reads the applicable
 `.foredeck/factory/prompts/<name>.md` from `ProjectStore.workspaceRoot`, the same canonical
-checkout Work uses. It is read again rather than frozen in the delivery, so the owner can repair
-an unusable override and resume without starting over. Later reviews read `review.md` again;
-integrate reads its own `integrate.md`. Files present only in the delivery worktree have no say.
-See [`FactoryThreadEffects.ts`](../../apps/server/src/fd/factory/FactoryThreadEffects.ts) and
+checkout Work uses. A delivery started without a review reads it again rather than freezing it, so
+the owner can repair an unusable override and resume without starting over; a
+[reviewed delivery](#a-reviewed-delivery-runs-what-its-owner-reviewed) takes only the text its
+owner reviewed. Later reviews read `review.md` again; integrate reads its own `integrate.md`. Files
+present only in the delivery worktree have no say. See
+[`FactoryThreadEffects.ts`](../../apps/server/src/fd/factory/FactoryThreadEffects.ts) and
 [Work's canonical checkout](./work-management.md#canonical-checkout).
 
 An override replaces only a renderer's rules section; server-owned facts, structured fields and
@@ -118,13 +120,165 @@ mode, like Work's thread starts (see [agent grants](./work-management.md#agent-g
 downstream checks a launch against its caller, so Factory applies the ceiling itself, at every
 launch, a resume's replay included: the narrower of it and the project's default at that moment.
 Storing the mode resolved at start instead would let a later launch outrun a default the owner has
-narrowed since. The thread's mode alone is not enough: the server runs a mode a provider does not
+narrowed since. A reviewed delivery runs in the very mode its owner reviewed or not at all, as
+[below](#a-reviewed-delivery-runs-what-its-owner-reviewed). The thread's mode alone is not enough: the server runs a mode a provider does not
 offer as one it does, and without approval-required that can be broader
 ([`RuntimePolicy.ts`](../../apps/server/src/orchestration-v2/RuntimePolicy.ts)). So a capped launch
 asks only for a mode its provider advertises, read from the instance registry as that policy reads
 it, stepping down to the broadest within the bound, and fails before anything runs when none is.
 The ceiling bounds launches only; a turn on an existing thread runs in the mode the thread has,
 which its owner may change.
+
+A host's policy can refuse a mode outright, which `supportedRuntimeModes` must not express: a mode
+missing from it runs as another one, so a refused mode listed there would silently broaden or narrow a
+run instead of explaining why it cannot. Codex reports that policy on the provider snapshot, and a
+launch or a follow-up turn in a mode it refuses fails before anything is dispatched, naming what it
+allows. A turn is judged as well as a launch because a thread's owner can change its mode and a later
+probe can learn a refusal. Nothing steps to another mode for the owner, a reviewed delivery included.
+Only a known refusal counts: a read that failed, or an adapter with no such policy to read, runs as it
+always has. Every automatic turn is judged too, on any thread: Factory's gate fails the consult of one
+the host refuses, dispatching nothing, so its producer asks again by its own means and the next ask after
+the owner's choice runs it. A turn on a delivery's thread is noted on `FactoryChanges`, in memory, and
+listed under its root and the delivery that launched it, judged again on each read. A reviewed delivery's
+review judges it first, and blocks the delivery. A governed agent's delegation is refused the same way.
+
+## A reviewed delivery runs what its owner reviewed
+
+A delivery started from a review receipt carries `reviewedExecution`
+([`reviewedExecution.ts`](../../apps/server/src/fd/factory/reviewedExecution.ts)), and none of its
+effects read `FactorySettings`: its roles' selections with their options (a defaulted role as it
+resolved), its commands, its limits, per-command timeout, severities, effort and pipeline. An owner
+approved those values, so a settings edit must not quietly run something else. A settings edit
+still shapes the next delivery; an assignment queues on its receipt, whose claim copies it onto the
+delivery, so nothing moves in between, and a replay of the start under the same id with another
+review is a conflict. Deliveries started without a receipt stay as this page describes them
+elsewhere and read settings as each step runs. Only the owner's review creates a receipt
+([below](#the-owners-review-compares-late)): `factory_deliver`, `factory.deliveries.start` and
+`assistant_assign` stay receipt-less, and an agent has no tool for it.
+
+A review is a ceiling and never a grant, so freezing it could not be the whole answer. Authority is
+still read at each step: the assistant's admission refuses a revoked brief, capture, manager or
+project as for any managed root, and
+[`checkReviewed`](../../apps/server/src/fd/factory/FactoryThreadEffects.ts) refuses, right before
+any effect but a close-out, a repository other than the one reviewed, a pipeline this server no
+longer ships, a project default narrower than the reviewed mode, or a provider of a role the delivery
+uses no longer offering that mode, even for an effect that runs no agent: narrowing must stop verify
+and publication too, not only the next launch. A launch or turn is also refused for a thread raised
+above the reviewed mode, or a model or option its provider no longer offers. Nothing is substituted
+or stepped down, since a mode nobody reviewed is exactly what this prevents; the delivery blocks,
+naming what differs. The review therefore resolves its ceiling down to what the project and providers
+allow when it is taken.
+
+The repository is bound by where publication goes, asked of what publishes rather than worked out
+in Factory, since a copy of that resolution misses whichever input it does not repeat. Git's driver
+names the remote a push picks, whose push URLs and fetch URLs are kept apart because two remotes
+exchanging URLs leave any one set of them unchanged; a branch's upstream remote, once it has one,
+must name the same destination. The source control provider names the repository its pull request
+would target through `resolveChangeRequestRepository`, the resolver its `createChangeRequest` calls.
+GitHub is the provider that chooses for itself: its answer follows `GH_REPO`, the
+`remote.<name>.gh-resolved` mark `gh repo set-default` leaves, and its precedence among remotes, so
+`origin` need not be the target even when nothing about `origin` changes.
+
+A provider that gives no answer cannot be held to a target, so a reviewed delivery refuses it, when
+the review is taken and before every effect, naming the capability it lacks. No Git setting shows
+what `glab`'s config, `az devops configure` defaults or a Forgejo CLI login choose, so a hash of Git's
+settings proves nothing about GitLab, Azure DevOps or Forgejo. Bitbucket and GitCafe do follow a
+remote, but stay refused until a reviewed delivery needs them and they answer, rather than each
+provider's rules being repeated here. Deliveries without a review are unaffected, and a repository no
+provider hosts binds no target, having no pull request to misdirect.
+
+The binding also holds a hash of all `remote.*` and `url.*` Git settings, which is what can choose
+among remotes through Git. Any change to those blocks until it is restored or the delivery is
+reviewed again, adding an unrelated remote included: refusing a harmless change costs a review, while
+missing a real one publishes somewhere nobody reviewed.
+
+An option is bound the same way: a reviewed option must still be one its model's descriptors offer,
+with a value of its type. Otherwise the delivery blocks, since core would drop or misread what it
+cannot represent. A model listing no descriptors offers no option.
+
+Bound turns always send their role's selection, because a thread's own can drift and core runs a
+turn on it by default. The mechanical fix-commit turn still uses medium for that turn alone. Core
+sends an automatic turn with the thread's selection, so
+[`FactoryAutomaticTurns`](../../apps/server/src/fd/factory/FactoryAutomaticTurns.ts) checks it and
+sets the reviewed selection back first; a turn the review does not allow fails its consult, leaving
+its producer to ask again, and a delivery waiting on its pull request blocks so the owner sees why.
+The trap is that a family holds threads no role names: a reviewer a later review replaced, and
+delegated threads. Both can still be woken, so the delivery is judged before any role is looked up. A
+replaced reviewer keeps its role's selection, known because an author's and a planner's launches are
+recorded and never replaced. A delegated thread has no reviewed selection, its delegator chose it, but
+stays under the reviewed mode; `delegate_task` is refused the same way, since it starts a run.
+A native wake has no producer to ask again and can wait long after it was handed, so it is judged
+when it would run: the kept dispatch carries the check, and one refused then stays kept with its
+demand blocked, rather than being lost, until a later grant finds what it needs restored.
+
+The seven prompt overrides replace Factory's rules, so they are bound too: by hash, or an explicit
+`absent`, from the canonical checkout. What is hashed is what renders, read once, so nothing can
+change between the two. An edit, addition, removal or unusable file blocks before that launch or
+turn, naming only the prompt; restoring its exact bytes lets a resume go on. Only these seven are
+bound. `AGENTS.md` and other repository files are the code under change, not execution settings.
+
+Counts are cumulative, not per resume. A review approves rounds and fix-commit turns for the whole
+delivery, so a resume keeps what was used and forgets only failure fingerprints: stopping and
+resuming must not mint work nobody reviewed. A turn is charged when it is issued, so one whose result
+a restart lost stays charged. A failed one is given back only when the durable record shows it
+started no run: a turn refused for a changed prompt spent nothing, and restoring the prompt has to be
+enough to go on. An exhausted count blocks saying what was used of what was approved, and only a new
+receipt of a later version raises it, through `FactoryService.rebindReviewed` as the owner's review
+applies it, which replaces all of what the delivery runs on and so also takes it past drift that
+blocked it; the delivery remembers the receipts it replaced, so an earlier one can never authorize
+more.
+`verifyTimeoutMinutes` stays the per-command timeout; no aggregate time budget exists to track, or to
+lose across a restart.
+
+A receipt authorizes one attempt, so an idea with any receipt never queues without a new one.
+`enterQueue`, which every receipt-less route passes, and `retryReentry` refuse it in the transaction
+that would write the attempt. The check is the idea's, not the assignment's or the capture's: a fresh
+assignment id, another executor, a legacy assignment of the same idea and a capture abandoned and
+made anew would each miss a narrower one, and run on settings and allowances nobody reviewed. For the
+same reason a receipt is not attached while another assignment of the idea queues. A further attempt
+takes a fresh owner review, which starts from new values and a new receipt.
+
+### The owner's review compares late
+
+[`ownerReview`](../../apps/server/src/fd/assistant/ownerReview.ts) serves a client, not an agent: no
+live MCP caller exists to reuse, so `WorkCapture.captureAsOwner` writes under the session's own grants
+and the session is read again before anything is recorded. A hash checked before the capture would say
+nothing of what its write left or of what moved during its I/O, so a start reads everything again
+afterwards and judges the database's part in the transaction that records authorization, receipt and
+assignment. That part includes the settings and prompt overrides, since Factory's settings writes share
+no lock with the assistant: only a transaction shuts them out. Where publication goes takes Git and a
+provider to ask, so it is asked once more right before that transaction instead, and the captured item
+is read after that, as the last wait before it, since an item is what an owner is most likely to edit.
+Two outside reads cannot be atomic with each other, so a change after the last read of either is left
+to the checks that follow. Nothing here is atomic with a tracker: an item edited after the last read is caught by the
+link's fingerprint before the claim starts anything, and a file or remote by the binding before the
+effect it affects, so a late change can stop a delivery but never run under a review of something else.
+A capture a refused start left stays for recovery with no authority, having cleared the brief's.
+
+The review version has to be stable across the capture it causes, or a retry after a partial failure
+would call its own capture a change. So it holds no capture state, only what the item would say, and
+the capture's identity once one exists: a version taken before there was one stays good for whichever
+capture exists now, since its content is compared anyway, while one taken of a capture is stale once
+that capture is replaced. It holds the latest revision that changed the scope, so a scope that changed
+and came back is a new review even though it reads the same. It also holds the idea's attempts, which
+is what keeps it from being a content hash anyone could replay: when an attempt ends the version moves,
+so only a fresh read, which is the fresh review, gets a new attempt. The confirmation's request id is
+the idempotency key across all of this, so a repeat finds what it did, in `fd_assistant_review_starts`,
+rather than comparing again.
+
+A confirmation that rebinds a delivery at rest also resumes it, and a repeat must finish that if a
+failure cut it short without ever resuming the delivery again. Its status cannot tell the two apart:
+stopped may mean not resumed yet, or resumed and stopped since. So the rebind's step records the resume
+it owes (`reviewResumeOwed`) and the next resume's step clears it, whoever asks for it. A confirmation's
+resume is judged against that record inside the step that resumes, not before it: the assistant's
+resume reads Work first, and one taken by hand during that read would otherwise be taken again.
+
+A parent makes that harder, since rebinding its family takes one step per delivery and any of them can
+fail. Which delivery is resumed is therefore decided when the owner confirms, and stored with how many
+effects it had issued: judged again by a repeat, a child resumed by hand meanwhile would hand the
+obligation on to its parent, and the next stop would be resumed by a confirmation already spent. That
+delivery is rebound last, so a resume owed means the whole family stands under the review, and one that
+ran on since refuses the review altogether rather than take it late.
 
 ## Agents start deliveries with Work's grant
 
@@ -188,20 +342,46 @@ when another entry starts importing it.
 ## Clients refetch on a change epoch
 
 Clients follow `factory.deliveries.subscribe`, an epoch like Work's refresh epoch, and refetch the
-deliveries and settings they show on each value; the stream itself carries no data. Every Factory
-write that changes client-visible state therefore runs through `FactoryChanges.transact`
+deliveries and settings they show on each value; the stream itself carries no data. A listing also
+shows what Work and the assistant hold, and a delivery resting on its pull request writes nothing
+for days, so the epoch sent is the sum of Factory's own, Work's refresh epoch and the assistant's
+priority counter: any of them moving refetches, and a resubscribe with nothing moved answers the
+same value. Every Factory write that changes client-visible state therefore runs through
+`FactoryChanges.transact`
 ([`FactoryChanges.ts`](../../apps/server/src/fd/factory/FactoryChanges.ts)), which moves the epoch
 only once the write has committed, so a refetch on the new value reads it. Today the writers are
 the start's insert, the worker's step (stop, resume, cancel, plan and review submissions and the
 plan gate's actions are steps), the child deliveries a parent's approval stores and the settings
 write; a new writer that bypasses `transact` leaves every client stale until something else moves
-the epoch.
+the epoch. Core's writes reach it the other way: a listing shows the requests pending on a delivery's
+threads, which Factory never writes, so the reactor moves the epoch for a runtime request on a thread
+of a family. That listing starts from the threads holding a request, not from its deliveries, since it
+runs on every step of every delivery, and the assistant's overview shares that read for the same
+reason: walking a family would cost more with every resume, however little waits.
 
 `transact` opens the transaction itself rather than wrap a caller's. `withTransaction` commits
 inside its own uninterruptible mask and raises an interrupt that arrived meanwhile as the mask
 ends, so an effect wrapped around it sees an interrupted exit for a write that committed, and
 would skip the move. Inside `transact`'s mask the write is restored to interruptible, and the
 commit and the move run before any held-off interrupt.
+
+## A listing reads what its items say, without letting them hold it up
+
+Clients refetch deliveries on every step, so `factory.deliveries.list` cannot cost a tracker read per
+delivery, and a tracker that is slow or down cannot cost the owner the list that says their work is
+blocked. `FactoryService.listForClients` therefore asks each source once, through
+`WorkService.currentSummaries`, for deliveries not done or cancelled, since Work's section has its
+item on hand and the Factory page lists no others, gives up after a few seconds, and leaves out what
+it did not get; a client says `Not available` rather than reading that as
+unassigned. The assistant's overview reads the same way. An edit made directly in a tracker moves no
+epoch until Work's sweep sees a changed title or status, and no sweep compares an assignee, so the
+web Factory page also reads again when an owner returns to it and on the live interval. None of this
+writes: an item's status and
+assignee are its source's and a delivery's status is Factory's, so the item's status moves only at
+the merge's close-out, however it reads beside the delivery. Queue rank comes through
+`FactoryAdmission`, since Factory imports nothing of the assistant. It costs no tracker, and every
+delivery takes it through the root's tombstone, not its assignment's link: Work's section goes on
+showing a delivery that ended, or that a retry left behind, and its idea still has its rank.
 
 ## The reactor tail starts at the sweep's position
 
@@ -398,8 +578,8 @@ raising them makes older clients leave out the reviews that use the room.
 ## Repair rounds stop on limits and repeated failures
 
 A failed verify or a blocking review becomes a repair turn on the author thread, then the branch is
-settled and verified again. Each kind counts against its own limit, and a delivery keeps the limits
-it started with, so changing the settings never moves a loop already running. A failure's
+settled and verified again. Each kind counts against its own limit, and every delivery keeps the
+limits it started with, so changing the settings never moves a loop already running. A failure's
 fingerprint hashes the stage, the log tail or the findings to fix, and the tree. Seeing the same
 failure on the same tree again in the current retry allowance stops the loop even with rounds
 left; a changed tree has a different fingerprint (see
@@ -518,9 +698,11 @@ thread: a follow-through round's commits there were never judged by a child's se
 resume settles the branch first, with a fix-commit turn on that thread when it is repairable, and
 the thread's deletion blocks it. Its resume check reads the branch whenever that thread is recorded.
 
-By owner decision an explicit resume grants a fresh retry allowance: repair rounds, the fix-commit
-turn and failure fingerprints start over, while the limits the delivery started with stay, and so
-do its receipts, reviews, stage attempts and approval. The resumed stage gets a new attempt even
+By owner decision an explicit resume of a delivery started without a review grants a fresh retry
+allowance: repair rounds, the fix-commit turn and failure fingerprints start over, while the limits
+the delivery started with stay, and so do its receipts, reviews, stage attempts and approval. A
+[reviewed delivery](#a-reviewed-delivery-runs-what-its-owner-reviewed) keeps its counts instead,
+since what it may spend was approved for the whole delivery. The resumed stage gets a new attempt even
 when its name has not changed: the reactor routes a run's end only to a thread's active attempt,
 and the attempt the delivery stopped or blocked in has ended (see `recordAttempts` in
 [`FactoryWorker.ts`](../../apps/server/src/fd/factory/FactoryWorker.ts)).
@@ -537,20 +719,10 @@ refuses to start unless HEAD is that commit, and the push publishes that commit 
 than HEAD: a commit made while the action runs stays local, and a remote branch the push would
 rewind is refused. Without one, as for every other caller, the push publishes HEAD as it is when it
 runs. [`FactoryPullRequest`](../../apps/server/src/fd/factory/FactoryPullRequest.ts) reads the
-worktree again as its last step before the action, after the item read, and runs it only on the
-approved commit with a clean tree. Afterwards it reads back the commit the branch's upstream holds,
-so a pull request on any other commit is linked but never recorded as the delivery's.
-
-The template names no AI agent, model or provider, but the item's title, link and the verify
-command appear as written. Rendered text that breaks the name or attribution rules settle applies
-to commits ([`publishedText.ts`](../../apps/server/src/fd/factory/git/publishedText.ts)) is never
-published: the effect fails before anything is pushed, and the owner changes the item or the
-command. The rules are Looper's, widened to every provider T3 runs, the well-known assistants and
-model families, and co-authorship credited to an assistant. A name that is also an everyday
-programming word counts only where it can only mean the product: its product forms, its domains,
-a co-author line, or the capitalized name after a word of tool use. So a database cursor is not
-the Cursor editor, and "Co-authored-by: Cursor" is refused.
-No list names every tool; both checks read that one file, so extend it there.
+worktree again as its last step before the action, after the item read and
+[the gate](#every-publication-passes-one-gate), and runs it only on the approved commit with a clean
+tree. Afterwards it reads back the commit the branch's upstream holds, so a pull request on any other
+commit is linked but never recorded as the delivery's.
 
 Passing `threadId` to `GitWorkflowService.runStackedAction` does not link the pull request to the
 thread; the stacked action's RPC handler in `ws.ts` does that afterwards. Factory calls the same
@@ -567,6 +739,111 @@ the PR stage refuses one.
 
 Deliveries approved before the PR stage existed load without a pull request and stay `approved` at
 `record`, awaiting nothing; nothing opens their pull request on its own.
+
+## Every publication passes one gate
+
+New branches are `feature/<key>-<slug>`, the fork's neutral prefix, with AI agent, model and provider
+names left out of the slug. Work names them as well as Factory, and Work imports nothing of Factory,
+so the names themselves are in [`publishedNames`](../../packages/shared/src/fd/publishedNames/index.ts).
+A stored branch is never renamed, whatever its prefix. Titles are one short Conventional line,
+`<type>(<scope>): <key> <summary>`, typed from the settled commits and kept to whole words
+([`prBody.ts`](../../apps/server/src/fd/factory/prompts/prBody.ts)): a cut identifier or address names
+something else, so a first word that cannot fit is refused rather than cut.
+
+[`evaluatePublication`](../../apps/server/src/fd/factory/git/settle.ts) runs before every push and
+pull request and reads what is about to go out, not what settle saw: the branch's prefix, every
+commit of the delivery up to the approved one with its full message and identities, a hook's trailers
+included, and the text ([`publishedText.ts`](../../apps/server/src/fd/factory/git/publishedText.ts)).
+The commits are read by range up to the approved commit, because that is what the action pushes by
+its id.
+
+That range is not all that goes out. A delivery starts at the project's local HEAD, so its baseline
+can sit on commits nobody pushed, and pushing the approved commit publishes them too. The gate
+therefore also judges every other commit the destination lacks
+([`readOutgoingCommits`](../../apps/server/src/fd/factory/git/branchFacts.ts)). This adds to the range
+rather than replacing it: a delivery's own commit is refused even once pushed, while history the
+destination holds from before the delivery is not judged, or no delivery could publish from a base
+with one old commit that breaks these rules. The destination is asked with `ls-remote`, on the URLs
+the push goes to, because a tracking ref says only what a fetch last saw: it can outlive its branch, a
+rewrite of that branch or a change of URL, and a commit it vouched for would then go out unjudged. The
+trap is that Git reports those URLs with its `insteadOf` and `pushInsteadOf` rewrites already applied,
+rewrites a URL again whenever it is handed one, and reads its rules afresh for every command. Handed a
+reported URL A, a read can reach B, through a chain of rules (an alias to A, A to B) or a rule added
+after the push's URLs were read, while the push still reaches A. Checking first that a spelling
+resolves to A binds nothing, since the next command reads the rules again. So each URL is read under a
+spelling that only a rule made for that command rewrites, to that URL
+([`pinUrl`](../../apps/server/src/vcs/GitVcsDriverCore.ts)): Git rewrites once, by the longest rule
+that matches, and reads `GIT_CONFIG_*` after every config file, and no rule the repository has or
+gains can be as long as a random spelling it never saw. The spelling names no remote either: a fetch
+from a configured remote maps what it fetches through that remote's refspecs, which can move its
+tracking refs or force-update a branch, and `--refmap=` drops them as well. A tip this repository
+lacks could hold any commit it has, and without it every delivery would be refused once the remote's
+main moved on, so its objects are fetched from that destination first, writing no ref
+([`readOutgoingCommits`](../../apps/server/src/fd/factory/git/branchFacts.ts)). When the destination
+cannot be read that way, or the push names none, the gate refuses rather than guess.
+
+The branch's own name is not always the one that goes out. Git's driver publishes `feature/x` as `x`
+once a remote is called `feature`, and a branch aliasing its upstream's head (`feature/x` tracking
+`my-org/feature`'s `x`) as that head, so the gate also judges the remote branch the push lands on, by
+the branch's rules. That name is the driver's own answer, `resolvePushTarget` over the decision
+`pushCurrentBranch` makes, not a copy of it here, and the stacked action is bound to it together with
+the push URLs the gate read the destination at: a remote's name says nothing of those, since an edited
+push URL or rewrite rule keeps it. The push reads them again and refuses before writing anything when it
+would land elsewhere. Reading again only narrows the gap, since Git reads its settings anew as the push
+runs, so the push also goes to those URLs and no others: for that command alone, its remote's URL lists
+are cleared and set to spellings that only rules made for them rewrite, as the reads are pinned
+(`pinRemote` in [`GitVcsDriverCore.ts`](../../apps/server/src/vcs/GitVcsDriverCore.ts)). The remote
+keeps its name and every other setting, so hooks, credentials, proxies and tracking refs behave as for
+any push. Clearing a list takes Git 2.46, so Git is first asked where such a push would go, with
+stand-ins for the URLs, and one that answers otherwise is refused before anything is pushed, with the
+reason `push_target_unpinnable`: that Git cannot be held to the URLs, which says nothing of where they
+lead. After the push the target is read once more: one that moved while the push ran is no longer what
+the gate judged, so the action stops there, before its pull request, with the commit only where the
+gate judged. That refusal and the one before writing carry the reason `push_target_changed`. Factory
+reports each reason as a refusal of its own, naming what changed or the Git to update, and what to do,
+while any other Git failure keeps its text hidden. Reading the saved head after `create_pr` is too late
+for this, since the branch is published by then. Another name that keeps to the rules, as an alias can,
+publishes; the pull request's saved head is then held to it.
+
+A refusal names the part, the rule and what to do, never the text that broke it, and Factory changes no
+commit, name or text to get past it. It publishes nothing, but for a destination that moved while the
+push ran, which the push reached only where the gate judged. A human `Co-authored-by`, `Signed-off-by`
+or task reference is not attribution. Name rules are the ones settle applies to commits, so an
+everyday word stays usable: a database cursor is not the Cursor editor, and "Co-authored-by: Cursor"
+is refused. An author or committer names one party, so the bar differs there
+([`identityIsAiTool`](../../apps/server/src/fd/factory/git/publishedText.ts)): "Cursor" and "AI
+Assistant" are refused as identities while "Ada Cursor" and "Ai Nguyen" are people. A credit line
+is judged by who it names too, so `Co-authored-by: Ai Nguyen` and `Signed-off-by: Ada Cursor` pass
+where `Co-authored-by: AI Assistant` and `Co-authored-by: Ada Lovelace and Cursor` do not. A key that
+credits the idea or the report, `Suggested-by` or `Reported-by`, credits a party as much as one for
+the work, so `Suggested-by: Cursor` is refused like `Helped-by: Cursor`. It is read as Git reads it: a
+key can have spaces before its colon, and a trailer continues on the indented lines after it, so a
+line ending in the key can hold the credit on the next. Every party counts, including
+whoever follows the first address, and another credit key inside a credit starts a credit of its own:
+Git takes `Co-authored-by: Cursor` indented under a sign-off as more of that sign-off, where it would
+otherwise pass as part of a person's name. A bare address is one party whole, since
+`ada+cursor@example.com` is one person's mailbox. A slug is judged from the title it came from as
+well, because lowercasing erases what tells "made with Cursor" from an everyday cursor. No list names
+every tool; extend it in `publishedNames`.
+
+Nothing is grandfathered (owner decision). A follow-through push on a recorded pull request passes
+the same gate, so a legacy pull request on `work/...` gets no push and no new pull request and blocks
+with its branch, link and commits as they were; the way forward is a new delivery. A push publishes
+no text, so its gate reads what the pull request says on its host rather than rendering a title,
+under the same rules and the item's key as read from Work, with its head held to the remote branch
+the push lands on, so the push reaches that pull request. That also keeps a resume honest: a block
+over a saved title stays until the title complies. A read of either that fails refuses the push,
+since nothing then shows the pull request complies, so a follow-through push needs the item to be
+readable, as an opening does. The branch and the remote branch are judged first, so a branch that
+cannot publish costs neither read.
+
+After `create_pr` the stage reads back what the host saved through `PullRequestService.detail`, which
+alone carries a body, past its cache. A pull request the action created must hold exactly what was
+sent, modulo line endings and surrounding space; one already open was written by someone else and
+answers only to the rules. It is published by then, so a mismatch or failed read is reported on
+`pr.opened` as `publicationFailure`: the delivery records it, so its merge or close is taken and a
+resume pushes to it rather than opening another, and blocks without starting a watch. Nothing is
+edited on the host, and a host the pull request service cannot read blocks here on every delivery.
 
 ## Follow-through reads the link core's sync stores
 

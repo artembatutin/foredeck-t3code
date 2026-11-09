@@ -1,5 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import {
+  AuthOrchestrationOperateScope,
+  AuthSessionId,
   AuthWorkReadScope,
   AuthWorkWriteScope,
   EnvironmentId,
@@ -21,7 +23,7 @@ import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import type { Caller } from "../../mcp/threadAccess.ts";
-import { ProjectAssistant, WorkCapture } from "../assistant/index.ts";
+import { HandoffBackend, ProjectAssistant, WorkCapture } from "../assistant/index.ts";
 import { type WorkActor, WorkService } from "../work-management/index.ts";
 import * as Factory from "./index.ts";
 import { verifyCommands, withProject, type World } from "./testkit/deliveryHarness.ts";
@@ -280,6 +282,115 @@ describe("capturing an idea in a real Markdown source", () => {
           assert.include((yield* read(ref)).body, "Has a test and a screenshot");
         }).pipe(Effect.orDie),
       ),
+  );
+});
+
+describe("the owner capturing for themselves", () => {
+  const session = (scopes: HandoffBackend.HandoffOwner["scopes"]) =>
+    ({
+      sessionId: AuthSessionId.make("owner-session"),
+      scopes,
+      current: Effect.succeed(scopes),
+    }) satisfies HandoffBackend.HandoffOwner;
+
+  it.live("reads comments past the wire's cap as no edit of a captured item", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const backend = yield* HandoffBackend.HandoffBackend;
+        const work = yield* WorkService.WorkService;
+        yield* revise(world, agreed);
+        const ref = refOf(yield* capture(world));
+        const before = yield* backend.read(ref);
+        assert.strictEqual(
+          before.fingerprint,
+          backend.fingerprint({
+            kind: "markdown",
+            title: before.title,
+            body: before.body,
+          }),
+        );
+
+        for (let comment = 0; comment < 5; comment += 1) {
+          yield* work.addComment(owner, { ref, body: "x".repeat(15_000) });
+        }
+
+        const after = yield* backend.read(ref);
+        assert.isAtLeast(after.body.length, 65_000);
+        assert.notStrictEqual(after.revision, before.revision);
+        assert.strictEqual(after.fingerprint, before.fingerprint);
+      }).pipe(Effect.orDie),
+    ),
+  );
+
+  it.live("writes under their session's own grants, with no assistant thread or caller", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        yield* revise(world, agreed);
+        const captures = yield* WorkCapture.WorkCapture;
+        const result = yield* captures.captureAsOwner({
+          owner: session([AuthWorkReadScope, AuthWorkWriteScope]),
+          projectId: world.projectId,
+          ideaId: "export",
+          kind: "single",
+        });
+        assert.strictEqual(result.outcome, "created");
+        assert.isTrue(result.verified);
+        assert.isFalse(result.executionAuthorized);
+        const item = yield* read(refOf(result));
+        assert.strictEqual(item.body, capturedBody(result.captureId));
+        assert.isUndefined(world.provider.started.at(0));
+      }).pipe(Effect.orDie),
+    ),
+  );
+
+  it.live("is refused without Work's write grant, writing nothing", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        yield* revise(world, agreed);
+        const captures = yield* WorkCapture.WorkCapture;
+        const refused = yield* Effect.flip(
+          captures.captureAsOwner({
+            owner: session([AuthWorkReadScope, AuthOrchestrationOperateScope]),
+            projectId: world.projectId,
+            ideaId: "export",
+            kind: "single",
+          }),
+        );
+        assert.strictEqual(refused._tag, "WorkCaptureRefused");
+        if (refused._tag === "WorkCaptureRefused") assert.strictEqual(refused.reason, "read_only");
+        const sql = yield* SqlClient.SqlClient;
+        assert.deepStrictEqual(yield* sql`SELECT capture_id FROM fd_assistant_work_captures`, []);
+      }).pipe(Effect.orDie),
+    ),
+  );
+
+  it.live("leaves an agent's capture to its own thread and grants", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        yield* revise(world, agreed);
+        const notAssistant = yield* Effect.flip(
+          capture(world, {
+            caller: {
+              ...assistant,
+              scope: {
+                ...assistant.scope,
+                thread: { ...assistant.scope.thread!, threadId: ThreadId.make("worker") },
+              },
+            },
+          }),
+        );
+        assert.include(notAssistant.message, "Only the project assistant");
+        const planMode = yield* Effect.flip(
+          capture(world, {
+            caller: {
+              ...assistant,
+              limits: { runtimeMode: "full-access", interactionMode: "plan" },
+            },
+          }),
+        );
+        assert.include(planMode.message, "can only read");
+      }).pipe(Effect.orDie),
+    ),
   );
 });
 

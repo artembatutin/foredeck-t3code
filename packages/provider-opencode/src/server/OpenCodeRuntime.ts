@@ -1,6 +1,11 @@
 import * as NodeURL from "node:url";
 
-import type { ChatAttachment, ProviderApprovalDecision, RuntimeMode } from "@t3tools/contracts";
+import type {
+  ChatAttachment,
+  ProviderApprovalDecision,
+  ProviderApprovalOption,
+  RuntimeMode,
+} from "@t3tools/contracts";
 import {
   createOpencodeClient,
   type Agent,
@@ -561,6 +566,19 @@ export function buildOpenCodePermissionRules(runtimeMode: RuntimeMode): Permissi
     { permission: "question", pattern: "*", action: "allow" },
   ];
 }
+
+/**
+ * What a permission reply can say, given the patterns its "always" would save. That answer is
+ * OpenCode's own to keep and can outlast this session, so it is never offered as a session choice;
+ * a request naming nothing to save has none to offer. OpenCode has no reply for cancelling.
+ */
+export const openCodeApprovalOptions = (
+  always: ReadonlyArray<string>,
+): ReadonlyArray<ProviderApprovalOption> => [
+  { decision: "decline", label: "Decline" },
+  ...(always.length > 0 ? [{ decision: "acceptAlways", label: "Always allow" } as const] : []),
+  { decision: "accept", label: "Approve" },
+];
 
 export function toOpenCodePermissionReply(
   decision: ProviderApprovalDecision,

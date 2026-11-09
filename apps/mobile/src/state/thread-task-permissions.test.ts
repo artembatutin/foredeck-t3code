@@ -254,7 +254,12 @@ describe("mobile task permissions", () => {
     await requests.onSubmitUserInput();
     expect(state.answer).toHaveBeenCalledWith({
       environmentId: "secondary",
-      input: { threadId: "thread", requestId: "input", answers: { language: "TypeScript" } },
+      input: {
+        threadId: "thread",
+        requestId: "input",
+        answers: { language: "TypeScript" },
+        responseCapability: "live",
+      },
     });
   });
 });

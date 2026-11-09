@@ -76,6 +76,47 @@ describe("FactorySettings", () => {
     }).pipe(Effect.provide(live)),
   );
 
+  it.effect("keeps every role's options exactly through storage and an unrelated save", () =>
+    Effect.gen(function* () {
+      const settings = yield* FactorySettings.FactorySettings;
+      const roles = {
+        planner: {
+          instanceId: "claudeAgent",
+          model: "planner-model",
+          options: [
+            { id: "effort", value: "max" },
+            { id: "fastMode", value: true },
+          ],
+        },
+        author: {
+          instanceId: "claudeAgent",
+          model: "author-model",
+          options: [{ id: "effort", value: "high" }],
+        },
+        // A value no model offers is the owner's to resolve; storage keeps it as it is.
+        reviewer: {
+          instanceId: "codex",
+          model: "reviewer-model",
+          options: [
+            { id: "reasoningEffort", value: "high" },
+            { id: "serviceTier", value: "priority" },
+            { id: "gone", value: "kept" },
+          ],
+        },
+      };
+      const saved = decodeSettings({ roles });
+      yield* settings.set(alpha, saved);
+      assert.deepStrictEqual((yield* settings.get(alpha)).roles, saved.roles);
+
+      const stored = yield* settings.get(alpha);
+      const unrelated = { ...stored, limits: { ...stored.limits, maxFixRounds: 5 } };
+      yield* settings.set(alpha, unrelated);
+      const after = yield* settings.get(alpha);
+      assert.deepStrictEqual(after.roles, saved.roles);
+      assert.strictEqual(after.limits.maxFixRounds, 5);
+    }).pipe(Effect.provide(live)),
+  );
+
   it.effect("requires a verify command before a delivery", () =>
     Effect.gen(function* () {
       const settings = yield* FactorySettings.FactorySettings;

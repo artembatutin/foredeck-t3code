@@ -32,6 +32,7 @@ import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
+import * as PullRequestService from "../../pullRequest/PullRequestService.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkActor, type WorkDomainError, WorkService } from "../work-management/index.ts";
 import { taskOfChild } from "./FactoryChildren.ts";
@@ -44,7 +45,18 @@ import {
   watchStartedBy,
 } from "./followThrough.ts";
 import { readBranchApproval } from "./FactoryRecord.ts";
-import { FactoryBranchReadError, type FactoryWorktreeMissingError } from "./git/branchFacts.ts";
+import {
+  FactoryBranchReadError,
+  type FactoryWorktreeMissingError,
+  readBranchFacts,
+  readOutgoingCommits,
+  readPushTarget,
+} from "./git/branchFacts.ts";
+import {
+  evaluatePublication,
+  evaluateSavedPullRequest,
+  FactoryPublicationProblem,
+} from "./git/settle.ts";
 import { readWorktreeState } from "./git/worktreeState.ts";
 import type { FactoryStoreError } from "./persistence/errors.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
@@ -59,7 +71,6 @@ import type {
 } from "./pipeline/state.ts";
 import {
   type FactoryPullRequestEvidence,
-  pullRequestTextProblems,
   renderPullRequestBody,
   renderPullRequestTitle,
 } from "./prompts/prBody.ts";
@@ -95,31 +106,147 @@ export class FactoryPullRequestUnapprovedError extends Schema.TaggedError<Factor
   }
 }
 
+const MAX_NAMED_PROBLEMS = 3;
+
+const isChangedDestination = ({ target, rule }: FactoryPublicationProblem) =>
+  target === "destination" && rule === "changed";
+
+const quoteBranch = (branch: string) =>
+  JSON.stringify(branch.length > 72 ? `${branch.slice(0, 72)}…` : branch);
+
+const COMMIT_RULE_WORDS = {
+  non_conventional_subject: "has a subject that is not a Conventional Commit",
+  ai_name_in_subject: "names an AI agent, model or provider in its subject",
+  ai_name_in_body: "names an AI agent, model or provider in its message",
+  ai_attribution: "carries generated or assisted attribution",
+  ai_identity: "has an author or committer identity naming an AI agent, model or provider",
+} as const;
+
+const REMOTE_BRANCH_RULE_WORDS = {
+  branch_prefix: "has no feature/, bugfix/, chore/ or docs/ prefix",
+  ai_name_in_branch: "names an AI agent, model or provider",
+  ai_attribution_in_branch: "carries generated or assisted attribution",
+} as const;
+
+/** One problem in words: which part and which rule, never the text that broke it. */
+const describeProblem = (problem: FactoryPublicationProblem, branch: string) => {
+  const named = quoteBranch(branch);
+  switch (problem.target) {
+    case "branch":
+      return {
+        wrong_branch: `its worktree is not on its branch ${named}`,
+        branch_prefix: `its branch ${named} has no feature/, bugfix/, chore/ or docs/ prefix`,
+        ai_name_in_branch: `its branch ${named} names an AI agent, model or provider`,
+        ai_attribution_in_branch: `its branch ${named} carries generated or assisted attribution`,
+      }[problem.rule];
+    case "commits":
+      return {
+        baseline_missing: "the delivery records no commit its branch started from",
+        baseline_not_ancestor: "the commit its branch started from is no longer in its history",
+        no_new_commit: "its branch holds no commit of its own",
+      }[problem.rule];
+    case "commit":
+      return `commit ${problem.commit} ${COMMIT_RULE_WORDS[problem.rule]}`;
+    case "ancestor":
+      return `commit ${problem.commit}, from before this delivery and not yet on its remote, ${COMMIT_RULE_WORDS[problem.rule]}`;
+    case "remote_branch":
+      return `a push of its branch would land on ${quoteBranch(problem.remote)}'s branch ${quoteBranch(problem.branch)}, which ${REMOTE_BRANCH_RULE_WORDS[problem.rule]}`;
+    case "destination":
+      return {
+        unreadable:
+          "Factory could not read what its remote holds, so it cannot tell which commits a push would add",
+        changed:
+          "where a push of its branch goes, its remote, upstream or push URLs, changed after Factory judged what the push would add there",
+        unpinnable:
+          "the Git that runs this project cannot hold a push to only the push URLs Factory judged",
+      }[problem.rule];
+    case "saved_head":
+      return "its head branch on the host is not the remote branch its pushes land on";
+    case "saved_pull_request":
+      return "Factory could not read its saved title, body and head branch from the host";
+    default: {
+      const part = problem.target.replace("_", " ");
+      return {
+        malformed_title: `its ${part} is not one short Conventional line keeping the item's key`,
+        ai_name: `its ${part} names an AI agent, model or provider`,
+        ai_attribution: `its ${part} carries generated or assisted attribution`,
+        differs: `its ${part} is not what Factory sent`,
+      }[problem.rule];
+    }
+  }
+};
+
+const describeProblems = (problems: ReadonlyArray<FactoryPublicationProblem>, branch: string) => {
+  const named = problems.slice(0, MAX_NAMED_PROBLEMS).map((p) => describeProblem(p, branch));
+  const more = problems.length - named.length;
+  return `${named.join("; ")}${more > 0 ? `; and ${more} more` : ""}`;
+};
+
 /**
- * The rendered title or body names an AI agent, model or provider, or carries attribution: the
- * item's text or the verify command brought it in. Nothing was pushed or published.
+ * What the owner can do about what stopped a publication, the hardest first. Factory renames,
+ * rewrites and edits nothing, so a branch that cannot publish takes a new delivery, which starts on
+ * a compliant one.
  */
-export class FactoryPullRequestTextRefusedError extends Schema.TaggedError<FactoryPullRequestTextRefusedError>()(
-  "FactoryPullRequestTextRefusedError",
+const nextAction = (problems: ReadonlyArray<FactoryPublicationProblem>) => {
+  const has = (...targets: ReadonlyArray<FactoryPublicationProblem["target"]>) =>
+    problems.some(({ target, rule }) => targets.includes(target) && rule !== "wrong_branch");
+  if (has("branch")) {
+    return "Factory renames nothing, and any branch, pull request and commits it published stay as they are: cancel this delivery and deliver the item again, which publishes from a compliant branch.";
+  }
+  if (has("ancestor")) {
+    return "Factory changes no commit: correct it on the branch this delivery started from, or put the project's checkout on a commit its remote already holds, then cancel this delivery and deliver the item again.";
+  }
+  if (has("commit", "commits")) {
+    return "Factory changes no commit: correct them on the branch or cancel and deliver the item again, then Resume.";
+  }
+  if (has("remote_branch")) {
+    return "Factory changes no remote, upstream or branch: set up the repository so a push of its branch lands on a branch of the same name, such as by renaming a remote whose name starts the branch's or removing an upstream that renames it, then Resume.";
+  }
+  if (problems.some(isChangedDestination)) {
+    return "Factory pushes only where it judged, and goes no further once that changes: keep or restore the remote, upstream and push URLs its branch should publish to, then Resume, which judges that destination again before pushing.";
+  }
+  if (problems.some(({ target, rule }) => target === "destination" && rule === "unpinnable")) {
+    return "Factory pushes only where it can hold Git to what it judged: update Git on the environment that runs this project to 2.46 or later, then Resume, which judges the destination again before pushing.";
+  }
+  if (has("destination")) {
+    return "Check that its branch has a remote and that Factory can reach it, then Resume.";
+  }
+  if (has("saved_title", "saved_body", "saved_head")) {
+    return "Factory edits nothing on the host: correct the pull request there, then Resume.";
+  }
+  if (has("saved_pull_request")) {
+    return "Check its title, body and head branch on the host and that Factory can reach it, then Resume to read it again.";
+  }
+  if (problems.some(({ target, rule }) => target === "title" && rule === "malformed_title")) {
+    return "Factory cuts a title only between words: change the item so its key and the first word of its title fit on one short line, then Resume.";
+  }
+  if (has("title", "body")) return "Change the item or the verify command, then Resume.";
+  return "Put the worktree back on its branch, then Resume.";
+};
+
+/**
+ * The publication gate refused: nothing was published, but for a changed destination, whose push
+ * may have reached where the gate judged and nowhere else before it stopped. Its message is fixed
+ * text naming what broke which rule and what to do next, safe to show, since it quotes no text but
+ * the branch.
+ */
+export class FactoryPublicationRefusedError extends Schema.TaggedError<FactoryPublicationRefusedError>()(
+  "FactoryPublicationRefusedError",
   {
     deliveryId: FactoryDeliveryId,
-    problems: Schema.Array(
-      Schema.Struct({
-        field: Schema.Literals(["title", "body"]),
-        rule: Schema.Literals(["ai_name", "ai_attribution"]),
-      }),
-    ),
+    branch: Schema.String,
+    problems: Schema.Array(FactoryPublicationProblem),
   },
 ) {
   override get message(): string {
-    const problems = this.problems.map(({ field, rule }) =>
-      rule === "ai_name"
-        ? `its ${field} names an AI agent, model or provider`
-        : `its ${field} carries generated or assisted attribution`,
-    );
-    return `Factory will not publish the pull request for delivery ${this.deliveryId}: ${problems.join("; ")}.`;
+    const published = this.problems.some(isChangedDestination)
+      ? "Factory published nothing it had not judged"
+      : "Factory published nothing";
+    return `${published}: ${describeProblems(this.problems, this.branch)}. ${nextAction(this.problems)}`;
   }
 }
+
+export const isFactoryPublicationRefusedError = Schema.is(FactoryPublicationRefusedError);
 
 /**
  * The branch the stacked action published does not hold the approved commit (or Factory could
@@ -216,7 +343,7 @@ export type FactoryPullRequestError =
   | FactoryPullRequestBasisMissingError
   | FactoryPullRequestUnapprovedError
   | FactoryPullRequestNotOpenedError
-  | FactoryPullRequestTextRefusedError
+  | FactoryPublicationRefusedError
   | FactoryPullRequestPublishedUnapprovedError
   | FactoryWorktreeMissingError
   | FactoryBranchReadError
@@ -228,26 +355,31 @@ export type FactoryPullRequestError =
 /**
  * What the PR stage published: the delivery's pull request and the thread it is linked to, where
  * core's watch wakes with its feedback. A parent has no author thread, so its pull request is
- * linked to its last child's author thread.
+ * linked to its last child's author thread. `publicationFailure` says why what the host saved could
+ * not be held compliant: the pull request is published all the same, so it is recorded, but the
+ * delivery blocks on this text rather than watch it. Safe to show.
  */
 interface FactoryPublishedPullRequest {
   readonly pullRequest: FactoryOpenedPullRequest;
   readonly threadId: ThreadId;
+  readonly publicationFailure?: string;
 }
 
 /**
  * The PR stages' work. Opens the delivery's pull request from its worktree through the stacked
- * Git action (`create_pr`) with the item's title and a body listing the accepted task and its
- * evidence, then links it to the author thread. A parent's is its one pull request: its body lists
- * its whole branch's verify and integrate review, then each child item in plan order with its
+ * Git action (`create_pr`) with a short Conventional title and a body listing the accepted task and
+ * its evidence, then links it to the author thread. A parent's is its one pull request: its body
+ * lists its whole branch's verify and integrate review, then each child item in plan order with its
  * own, and it is linked to the last child's author thread, since a parent has none. A child opens
- * none. Text that names an AI agent, model or provider or carries attribution is never published.
- * The action runs only while the worktree holds the approved commit on a clean tree, and pushes
- * that exact commit, so a commit made meanwhile never reaches the remote. An open pull request for
- * the branch is reported as it is, unchanged. A delivery that recorded its pull request already,
- * in a follow-through round, only pushes its newly approved commit to that pull request's branch.
- * The pull request is then watched on the thread it is linked to, so its feedback wakes that
- * thread. Once someone merged it, closes the delivery out.
+ * none. Every push and pull request first passes `evaluatePublication`, on the branch and every
+ * commit it would publish, read then, and nothing here renames or rewrites them. The action runs
+ * only while the worktree holds the approved commit on a clean tree, and pushes that exact commit,
+ * so a commit made meanwhile never reaches the remote. An open pull request for the branch is
+ * reported as it is, unchanged. What the host saved is read back, and a pull request that does not
+ * comply is recorded with the delivery blocked. A delivery that recorded its pull request already, in
+ * a follow-through round, only pushes its newly approved commit to that pull request's branch, once
+ * what the host saved passes the same gate. The pull request is then watched on the thread it is
+ * linked to, so its feedback wakes that thread. Once someone merged it, closes the delivery out.
  */
 export class FactoryPullRequest extends Context.Service<
   FactoryPullRequest,
@@ -423,6 +555,7 @@ const make = Effect.gen(function* () {
   const events = yield* EventStore.EventStoreV2;
   const crypto = yield* Crypto.Crypto;
   const projectService = yield* ProjectService.ProjectService;
+  const pullRequestDetails = yield* PullRequestService.PullRequestService;
   const work = yield* WorkService.WorkService;
   const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
   const tasks = yield* FactoryTaskStore.FactoryTaskStore;
@@ -580,33 +713,201 @@ const make = Effect.gen(function* () {
       }
     });
 
+  /**
+   * The branch and the remote branch a push of it lands on, every commit of the delivery up to the
+   * approved one and every other commit pushing that one would newly publish there, read now: their
+   * names, messages and identities are the ones that go out, whatever settle saw earlier. By the
+   * commit's id, since that is what the action pushes. The range alone would miss a base nobody
+   * pushed, and what is outgoing alone would let a delivery's own commit off for having been pushed
+   * already, so the gate reads both.
+   */
+  const publicationFacts = (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+    basis: { readonly worktreePath: string; readonly approvedSha: string },
+  ) =>
+    Effect.gen(function* () {
+      const { deliveryId, state } = delivery;
+      if (state.baseline === null) {
+        return yield* new FactoryPublicationRefusedError({
+          deliveryId,
+          branch: state.branch,
+          problems: [{ target: "commits", rule: "baseline_missing" }],
+        });
+      }
+      const facts = yield* readBranchFacts({
+        worktreePath: basis.worktreePath,
+        baselineSha: state.baseline,
+        headSha: basis.approvedSha,
+      }).pipe(Effect.provideContext(context));
+      const target = yield* readPushTarget({
+        worktreePath: basis.worktreePath,
+        branch: state.branch,
+      }).pipe(Effect.provideContext(context));
+      const outgoing =
+        target === null
+          ? null
+          : yield* readOutgoingCommits({
+              worktreePath: basis.worktreePath,
+              target,
+              headSha: basis.approvedSha,
+            }).pipe(Effect.provideContext(context));
+      const own = new Set(facts.commits.map(({ sha }) => sha));
+      return {
+        ...facts,
+        target,
+        ancestry: outgoing === null ? null : outgoing.filter(({ sha }) => !own.has(sha)),
+      };
+    });
+
+  /**
+   * The remote branch and push URLs the gate judged, which the action's push is bound to: it goes to
+   * those URLs alone, so a remote, upstream, push URL or URL rewrite changed after the gate cannot
+   * send it elsewhere. The gate refuses a push that names none, as a destination it cannot read.
+   */
+  const checkedTarget = (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+    facts: { readonly target: GitVcsDriver.GitPushTarget | null },
+  ) =>
+    facts.target === null
+      ? Effect.fail(
+          new FactoryPublicationRefusedError({
+            deliveryId: delivery.deliveryId,
+            branch: delivery.state.branch,
+            problems: [{ target: "destination", rule: "unreadable" }],
+          }),
+        )
+      : Effect.succeed(facts.target);
+
+  /**
+   * The action's push refused because it would no longer go to the target the gate judged, before
+   * writing anything or, when that changed while it pushed, having reached only that target and
+   * before anything after the push; or because the Git that pushes cannot be held to that target's
+   * URLs, before writing anything. Each is a refusal like the gate's, whose fixed text says so and
+   * what to do, where any other Git failure stays one whose text is never shown.
+   */
+  const refusedOffTarget = <A, R>(
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+    action: Effect.Effect<A, GitManagerServiceError, R>,
+  ) =>
+    action.pipe(
+      Effect.catchTags({
+        GitCommandError: (error) => {
+          const rule =
+            error.reason === "push_target_changed"
+              ? "changed"
+              : error.reason === "push_target_unpinnable"
+                ? "unpinnable"
+                : null;
+          return Effect.fail(
+            rule === null
+              ? error
+              : new FactoryPublicationRefusedError({
+                  deliveryId: delivery.deliveryId,
+                  branch: delivery.state.branch,
+                  problems: [{ target: "destination", rule }],
+                }),
+          );
+        },
+      }),
+    );
+
+  /** Fails unless the gate found nothing wrong. */
+  const requirePublishable = (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+    problems: ReadonlyArray<FactoryPublicationProblem>,
+  ) =>
+    problems.length === 0
+      ? Effect.void
+      : Effect.fail(
+          new FactoryPublicationRefusedError({
+            deliveryId: delivery.deliveryId,
+            branch: delivery.state.branch,
+            problems,
+          }),
+        );
+
+  /**
+   * The pull request as its host holds it now, not as a client's read left it in the cache. Null
+   * when it cannot be read, whatever the reason: a host Factory cannot read, or a pull request that
+   * cannot be named, has not been shown to comply.
+   */
+  const readSaved = (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+    pullRequest: FactoryOpenedPullRequest,
+    threadId: ThreadId,
+  ) =>
+    Effect.gen(function* () {
+      const key = yield* pullRequestKey(threadId, pullRequest);
+      if (key === null) return null;
+      const reference = {
+        projectId: delivery.projectId,
+        host: key.host,
+        repository: key.repository,
+        number: pullRequest.number,
+      };
+      yield* pullRequestDetails.invalidate({ reference });
+      return yield* pullRequestDetails.detail(reference);
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("factory could not read a saved pull request", cause).pipe(
+              Effect.as(null),
+            ),
+      ),
+    );
+
   const open: FactoryPullRequest["Service"]["open"] = Effect.fn("FactoryPullRequest.open")(
     function* (delivery, effect) {
-      const { deliveryId, projectId } = delivery;
+      const { deliveryId, projectId, state } = delivery;
       const reader = itemReader(deliveryId);
       const basis =
-        delivery.state.kind === "parent"
-          ? yield* parentBasisOf(delivery)
-          : yield* basisOf(delivery);
+        state.kind === "parent" ? yield* parentBasisOf(delivery) : yield* basisOf(delivery);
       // Derived from the effect, so progress and the thread link name this attempt.
       const actionId = `factory-pr:${deliveryId}:${effect.id}`;
+      const expectedBranch = state.branch;
 
       // A follow-through round publishes its approved commit to the pull request it opened: a
       // push alone, by the commit's id. Asking for a pull request again would open a second one
-      // when the first merged or closed before core's sync stored it.
-      const recorded = delivery.state.pullRequest;
+      // when the first merged or closed before core's sync stored it. The push publishes no text,
+      // so the gate reads what the pull request says on the host instead of rendering anything,
+      // under the item's verified key, which holds a resume to what stopped it, with its head held
+      // to the remote branch the push lands on, so the push reaches it. A legacy branch or pull
+      // request is judged like any other. The branch and commits come first, so a branch that
+      // cannot publish costs no read of the tracker or the host, and again after those, since they
+      // can take long.
+      const recorded = state.pullRequest;
       if (recorded !== null && recorded.outcome === undefined) {
+        const requireLocal = publicationFacts(delivery, basis).pipe(
+          Effect.tap((facts) =>
+            requirePublishable(delivery, evaluatePublication({ facts, expectedBranch })),
+          ),
+          Effect.flatMap((facts) => checkedTarget(delivery, facts)),
+        );
+        yield* requireLocal;
+        const { key } = yield* work.getItem(reader, { ref: delivery.itemRef });
+        const saved = yield* readSaved(delivery, recorded, basis.author);
+        const target = yield* requireLocal;
+        yield* requirePublishable(
+          delivery,
+          saved === null
+            ? [{ target: "saved_pull_request", rule: "unreadable" }]
+            : evaluateSavedPullRequest({ saved, expectedHead: target.branch, key }),
+        );
         yield* requireApproved(deliveryId, basis);
-        yield* gitWorkflow.runStackedAction(
-          {
-            actionId,
-            cwd: basis.worktreePath,
-            action: "push",
-            threadId: basis.author,
-            projectId,
-            expectedHeadSha: basis.approvedSha,
-          },
-          { actionId },
+        yield* refusedOffTarget(
+          delivery,
+          gitWorkflow.runStackedAction(
+            {
+              actionId,
+              cwd: basis.worktreePath,
+              action: "push",
+              threadId: basis.author,
+              projectId,
+              expectedHeadSha: basis.approvedSha,
+            },
+            { actionId, expectedPushTarget: target },
+          ),
         );
         yield* requirePublished(deliveryId, basis);
         return {
@@ -620,48 +921,59 @@ const make = Effect.gen(function* () {
       }
 
       const item = yield* work.getItem(reader, { ref: delivery.itemRef });
-      const prTitle = renderPullRequestTitle(item);
+      // Each child as its item reads now, under its key, as the parent's title is.
+      const children =
+        basis.type === "parent"
+          ? yield* Effect.forEach(basis.children, ({ ref, receipt, review }) =>
+              work.getItem(reader, { ref }).pipe(
+                Effect.map((child) => ({
+                  title: `${child.key}: ${child.title}`,
+                  receipt,
+                  review,
+                })),
+              ),
+            )
+          : [];
+      // After the item reads, which can take long: these are what the action publishes.
+      const facts = yield* publicationFacts(delivery, basis);
+      const prTitle = renderPullRequestTitle(item, facts.commits);
       const prBody =
         basis.type === "single"
           ? renderPullRequestBody({
               item,
               tasks: [{ ...basis.task, title: basis.task.title ?? item.title }],
             })
-          : renderPullRequestBody({
-              item,
-              branch: basis.branch,
-              // Each child as its item reads now, under its key, as the parent's title is.
-              tasks: yield* Effect.forEach(basis.children, ({ ref, receipt, review }) =>
-                work.getItem(reader, { ref }).pipe(
-                  Effect.map((child) => ({
-                    title: `${child.key}: ${child.title}`,
-                    receipt,
-                    review,
-                  })),
-                ),
-              ),
-            });
-      const problems = pullRequestTextProblems({ title: prTitle, body: prBody });
-      if (problems.length > 0) {
-        return yield* new FactoryPullRequestTextRefusedError({ deliveryId, problems });
-      }
+          : renderPullRequestBody({ item, branch: basis.branch, tasks: children });
+      yield* requirePublishable(
+        delivery,
+        evaluatePublication({
+          facts,
+          expectedBranch,
+          text: { title: prTitle, body: prBody, key: item.key },
+        }),
+      );
+      const target = yield* checkedTarget(delivery, facts);
 
       // Read last, so an action that would fail on a moved HEAD never starts.
       yield* requireApproved(deliveryId, basis);
 
-      const result = yield* gitWorkflow.runStackedAction(
-        {
-          actionId,
-          cwd: basis.worktreePath,
-          action: "create_pr",
-          threadId: basis.author,
-          projectId,
-          prTitle,
-          prBody,
-          // Pushed by its id, whatever HEAD becomes while the action runs.
-          expectedHeadSha: basis.approvedSha,
-        },
-        { actionId },
+      const result = yield* refusedOffTarget(
+        delivery,
+        gitWorkflow.runStackedAction(
+          {
+            actionId,
+            cwd: basis.worktreePath,
+            action: "create_pr",
+            threadId: basis.author,
+            projectId,
+            prTitle,
+            prBody,
+            // Pushed by its id, whatever HEAD becomes while the action runs.
+            expectedHeadSha: basis.approvedSha,
+          },
+          // And only to the remote branch and URLs the gate judged.
+          { actionId, expectedPushTarget: target },
+        ),
       );
       const opened = openedPullRequest(result);
       if (opened === undefined) {
@@ -681,7 +993,30 @@ const make = Effect.gen(function* () {
       // The action published the approved commit; read back, so a pull request on any other
       // commit is never recorded as the delivery's.
       yield* requirePublished(deliveryId, basis);
-      return { pullRequest: opened, threadId: basis.author };
+
+      // What the host saved, not what it was asked to save: a host or its automation can change
+      // it, and one already open was written by someone else. Published either way, so a problem
+      // here is reported with the pull request, which the delivery records as it blocks. Nothing
+      // is edited: only the owner decides what a pull request says.
+      const saved = yield* readSaved(delivery, opened, basis.author);
+      const problems: ReadonlyArray<FactoryPublicationProblem> =
+        saved === null
+          ? [{ target: "saved_pull_request", rule: "unreadable" }]
+          : evaluateSavedPullRequest({
+              saved,
+              expectedHead: target.branch,
+              key: item.key,
+              ...(result.pr.status === "created" ? { sent: { title: prTitle, body: prBody } } : {}),
+            });
+      return {
+        pullRequest: opened,
+        threadId: basis.author,
+        ...(problems.length === 0
+          ? {}
+          : {
+              publicationFailure: `Factory opened pull request #${opened.number}, but ${describeProblems(problems, expectedBranch)}. ${nextAction(problems)}`,
+            }),
+      };
     },
   );
 

@@ -1533,6 +1533,19 @@ describe("thread outbox", () => {
     ).toBe(true);
   });
 
+  it("gives a turn the host refuses back to its composer rather than retrying it", () => {
+    expect(
+      resolveThreadOutboxFailureAction({
+        stage: "start-turn",
+        error: {
+          _tag: "ThreadRuntimeModeRefusedError",
+          message: "Codex's host policy refuses Supervised. Choose Auto instead.",
+        },
+        interrupted: false,
+      }),
+    ).toBe("restore");
+  });
+
   it("retains queued messages when settings synchronization fails before startTurn", () => {
     const deterministicFailure = new Error("Thread no longer exists");
 

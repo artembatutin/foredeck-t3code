@@ -40,6 +40,7 @@ import * as ProcessRunner from "../../processRunner.ts";
 import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as SourceControlProviderRegistry from "../../sourceControl/SourceControlProviderRegistry.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService } from "../work-management/index.ts";
@@ -151,6 +152,9 @@ interface World {
 /** Core's queued-run start persists the requested model selection; a receipt replay does not. */
 const fakes = (world: World) =>
   Layer.mergeAll(
+    Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+      resolveLink: () => undefined,
+    }),
     Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
     Layer.mock(ThreadManagement.ThreadManagementService)({
       sendToThread: (input) =>

@@ -7,6 +7,7 @@ import {
   type OrchestrationV2ServerCommand,
   type OrchestrationV2ThreadShell,
   ProjectId,
+  type PullRequestDetail,
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -40,9 +41,11 @@ import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
+import * as PullRequestService from "../../pullRequest/PullRequestService.ts";
 import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as SourceControlProviderRegistry from "../../sourceControl/SourceControlProviderRegistry.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService } from "../work-management/index.ts";
@@ -81,7 +84,7 @@ import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 const projectId = ProjectId.make("project-alpha");
 const parentId = FactoryDeliveryId.make("delivery-parent");
 const sourceId = WorkSourceId.make("7e2aa85e-9347-44ce-b019-cb8dfd365b20");
-const branch = "work/fd-parent";
+const branch = "feature/fd-parent";
 const planner = ThreadId.make("thread-planner");
 const planRun = RunId.make("run-plan");
 const integrateRun = RunId.make("run-integrate");
@@ -124,6 +127,8 @@ const childItems = tasks.map((task, index) => workItem(`fd-child-${index + 1}`, 
 interface World {
   /** The items Work reads, by id; a test may change one before the pull request is written. */
   readonly items: Map<string, WorkItemDetail>;
+  /** The title the host holds, once someone reworded it there. */
+  savedTitle: string | null;
   readonly calls: Array<GitRunStackedActionInput>;
   readonly dispatched: Array<OrchestrationV2ServerCommand>;
 }
@@ -202,6 +207,19 @@ const fakes = (world: World) =>
         }),
     }),
     Layer.mock(ProjectService.ProjectService)({ getShell: () => Effect.succeedNone }),
+    // The host holds what the last `create_pr` sent.
+    Layer.mock(PullRequestService.PullRequestService)({
+      invalidate: () => Effect.void,
+      detail: () =>
+        Effect.suspend(() => {
+          const sent = world.calls.findLast(({ action }) => action === "create_pr");
+          return Effect.succeed({
+            title: world.savedTitle ?? sent?.prTitle ?? "",
+            body: sent?.prBody ?? "",
+            headBranch: branch,
+          } as unknown as PullRequestDetail);
+        }),
+    }),
     fakeGitWorkflow(world),
     // Nothing here verifies, plans, creates children or launches a thread.
     Layer.mock(FactoryVerifyRunner.FactoryVerifyRunner)({}),
@@ -234,6 +252,11 @@ const makeLayer = (world: World) =>
     Layer.provideMerge(FactorySettings.layer),
     Layer.provideMerge(Factory.layerPersistence),
     Layer.provideMerge(SqlitePersistence.layerMemory),
+    Layer.provideMerge(
+      Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+        resolveLink: () => undefined,
+      }),
+    ),
     Layer.provideMerge(GitVcsDriver.layer),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-parent-pr-" })),
     Layer.provideMerge(VcsProcess.layer),
@@ -243,6 +266,7 @@ const makeLayer = (world: World) =>
 const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
   const world: World = {
     items: new Map([parentItem, ...childItems].map((item) => [item.ref.itemId, item])),
+    savedTitle: null,
     calls: [],
     dispatched: [],
   };
@@ -310,9 +334,14 @@ const childReview = (headSha: string, round: number, low: number): FactoryAccept
  * Stores the parent as integrate left it: its plan approved, its children's items recorded on its
  * tasks and each child approved for the commit it made on the branch, the branch verified at the
  * worktree's HEAD (its verify attempt passed) and its integrate reviewer's run awaited. `after`
- * events follow. Returns the worktree with its commits.
+ * events follow. `firstMessage` is its first child's commit message. Returns the worktree with its
+ * commits.
  */
-const seed = (after: ReadonlyArray<FactoryEvent> = []) =>
+const seed = (
+  after: ReadonlyArray<FactoryEvent> = [],
+  firstMessage = "feat: export the table as CSV",
+  rootMessage = "chore: root",
+) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "fd-factory-parent-pr-wt-" });
@@ -323,11 +352,11 @@ const seed = (after: ReadonlyArray<FactoryEvent> = []) =>
     yield* git(cwd, ["init", "-b", "main"]);
     yield* git(cwd, ["remote", "add", "origin", remote]);
     yield* writeFile(cwd, "README.md", "root\n");
-    const base = yield* commitAll(cwd, "chore: root");
+    const base = yield* commitAll(cwd, rootMessage);
     yield* git(cwd, ["switch", "-c", branch]);
     yield* writeFile(cwd, "src/export.ts", "export const csv = 1;\n");
     yield* writeFile(cwd, "src/export.test.ts", "// covers the export\n");
-    const firstCommit = yield* commitAll(cwd, "feat: export the table as CSV");
+    const firstCommit = yield* commitAll(cwd, firstMessage);
     yield* writeFile(cwd, "src/export.ts", "export const header = 'id,name';\n");
     const secondCommit = yield* commitAll(cwd, "fix: write the header row first");
     const commits = [firstCommit, secondCommit];
@@ -597,7 +626,8 @@ describe("a parent's pull request", () => {
         assert.strictEqual(input?.projectId, projectId);
         assert.strictEqual(input?.threadId, childAuthors[1]);
         assert.strictEqual(input?.expectedHeadSha, approval.headSha);
-        assert.strictEqual(input?.prTitle, "fd-parent: Add the export button");
+        // Its item's title, typed from every commit on its branch: the feature over the fix.
+        assert.strictEqual(input?.prTitle, "feat: fd-parent Add the export button");
         assert.strictEqual(
           input?.prBody,
           [
@@ -671,6 +701,160 @@ describe("a parent's pull request", () => {
     ),
   );
 
+  it.effect("refuses a commit on its whole branch, an earlier child's included", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const trailer = "Co-authored-by: GitHub Copilot <copilot@example.com>";
+        const { cwd, commits, evidenceDir } = yield* seed(
+          [],
+          `feat: export the table as CSV\n\n${trailer}`,
+        );
+        const [firstCommit] = commits;
+        yield* reviewPasses;
+
+        yield* reviewRunEnds;
+
+        const state = yield* stateOf(parentId);
+        assert.strictEqual(state.status, "blocked");
+        assert.strictEqual(state.stage, "pr");
+        assert.isNull(state.pullRequest);
+        // Approved, but nothing reached the remote, whichever child's commit it was.
+        assert.deepStrictEqual(yield* approvalFiles(evidenceDir), ["approval.json"]);
+        assert.deepStrictEqual(world.calls, []);
+        assert.strictEqual(yield* publishedOf(cwd), "");
+        const detail =
+          state.block?.reason === "effect_failed" ? state.block.detail : assert.fail("No block.");
+        assert.include(detail, `commit ${firstCommit?.headSha.slice(0, 12)} names an AI agent`);
+        assert.notInclude(detail, trailer);
+        // Its commit stays as it was.
+        assert.include(
+          yield* git(cwd, ["log", "-1", "--format=%B", firstCommit?.headSha ?? ""]),
+          trailer,
+        );
+      }),
+    ),
+  );
+
+  it.effect("refuses a commit from before its branch that its remote does not hold yet", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const trailer = "Generated-by: a release tool";
+        const { cwd } = yield* seed([], undefined, `chore: root\n\n${trailer}`);
+        const root = yield* git(cwd, ["rev-list", "--max-parents=0", "HEAD"]);
+        yield* reviewPasses;
+
+        yield* reviewRunEnds;
+
+        const state = yield* stateOf(parentId);
+        assert.strictEqual(state.status, "blocked");
+        assert.isNull(state.pullRequest);
+        assert.deepStrictEqual(world.calls, []);
+        assert.strictEqual(yield* publishedOf(cwd), "");
+        const detail =
+          state.block?.reason === "effect_failed" ? state.block.detail : assert.fail("No block.");
+        assert.include(
+          detail,
+          `commit ${root.slice(0, 12)}, from before this delivery and not yet on its remote`,
+        );
+        assert.notInclude(detail, trailer);
+      }),
+    ),
+  );
+
+  it.effect("publishes once its remote holds that commit, as a base others share", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const { cwd } = yield* seed([], undefined, "chore: root\n\nGenerated-by: a release tool");
+        yield* git(cwd, ["push", "origin", "main"]);
+        yield* reviewPasses;
+
+        yield* reviewRunEnds;
+
+        assert.strictEqual((yield* stateOf(parentId)).status, "pr_open");
+        assert.strictEqual(world.calls[0]?.action, "create_pr");
+      }),
+    ),
+  );
+
+  it.effect("pushes to its pull request only while the saved title keeps the parent's key", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const { cwd, receipt } = yield* seed();
+        yield* reviewPasses;
+        yield* reviewRunEnds;
+        assert.strictEqual(world.calls.length, 1);
+        const pullRequests = yield* FactoryPullRequest.FactoryPullRequest;
+        const effect = { id: 8, type: "open_pr" } as const;
+
+        // Conventional, and even a child's key would not do: the parent's item is its subject.
+        for (const title of ["feat: unrelated change", "feat: fd-child-1 export the table"]) {
+          world.savedTitle = title;
+          assert.deepStrictEqual(
+            yield* Effect.flip(pullRequests.open(yield* storedParent, effect)),
+            new FactoryPullRequest.FactoryPublicationRefusedError({
+              deliveryId: parentId,
+              branch,
+              problems: [{ target: "saved_title", rule: "malformed_title" }],
+            }),
+          );
+          assert.strictEqual(world.calls.length, 1);
+        }
+        assert.strictEqual(yield* publishedOf(cwd), receipt.headSha);
+
+        world.savedTitle = "feat: fd-parent an owner's own words";
+        yield* pullRequests.open(yield* storedParent, effect);
+        assert.deepStrictEqual(
+          world.calls.map(({ action }) => action),
+          ["create_pr", "push"],
+        );
+      }),
+    ),
+  );
+
+  it.effect("refuses a follow-through push on a recorded legacy branch", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const { cwd, receipt } = yield* seed();
+        yield* reviewPasses;
+        yield* reviewRunEnds;
+        assert.strictEqual(world.calls.length, 1);
+        const legacy = "work/fd-parent";
+        yield* git(cwd, ["branch", "-m", branch, legacy]);
+        yield* git(cwd, ["branch", "--set-upstream-to", `origin/${branch}`]);
+        const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+        const opened = yield* storedParent;
+        const recorded = opened.state.pullRequest ?? assert.fail("No pull request.");
+        yield* deliveries.update(parentId, {
+          ...opened.state,
+          branch: legacy,
+          pullRequest: { ...recorded, headBranch: legacy },
+        });
+        const before = yield* storedParent;
+
+        const pullRequests = yield* FactoryPullRequest.FactoryPullRequest;
+        const error = yield* Effect.flip(pullRequests.open(before, { id: 8, type: "open_pr" }));
+
+        assert.deepStrictEqual(
+          error,
+          new FactoryPullRequest.FactoryPublicationRefusedError({
+            deliveryId: parentId,
+            branch: legacy,
+            problems: [{ target: "branch", rule: "branch_prefix" }],
+          }),
+        );
+        assert.include(error.message, "cancel this delivery and deliver the item again");
+        // No push and no pull request; its refs, link and children are as they were.
+        assert.strictEqual(world.calls.length, 1);
+        assert.strictEqual(yield* publishedOf(cwd), receipt.headSha);
+        assert.deepStrictEqual(yield* storedParent, before);
+        assert.strictEqual(before.state.pullRequest?.url, prUrl);
+        for (const childId of children) {
+          assert.strictEqual((yield* stateOf(childId)).status, "approved");
+        }
+      }),
+    ),
+  );
+
   it.effect("publishes nothing when a child's title names an AI tool", () =>
     withWorld((world) =>
       Effect.gen(function* () {
@@ -685,11 +869,6 @@ describe("a parent's pull request", () => {
         const state = yield* stateOf(parentId);
         assert.strictEqual(state.status, "blocked");
         assert.strictEqual(state.stage, "pr");
-        assert.deepStrictEqual(state.block, {
-          reason: "effect_failed",
-          effect: { id: 8, type: "open_pr" },
-          detail: "Factory could not open the pull request (FactoryPullRequestTextRefusedError).",
-        });
         assert.isNull(state.pullRequest);
         // Record approved the branch, but nothing reached the remote.
         assert.deepStrictEqual(yield* approvalFiles(evidenceDir), ["approval.json"]);
@@ -701,13 +880,17 @@ describe("a parent's pull request", () => {
         const error = yield* Effect.flip(
           pullRequests.open(yield* storedParent, { id: 8, type: "open_pr" }),
         );
-        assert.deepStrictEqual(
-          error,
-          new FactoryPullRequest.FactoryPullRequestTextRefusedError({
-            deliveryId: parentId,
-            problems: [{ field: "body", rule: "ai_name" }],
-          }),
-        );
+        const refusal = new FactoryPullRequest.FactoryPublicationRefusedError({
+          deliveryId: parentId,
+          branch,
+          problems: [{ target: "body", rule: "ai_name" }],
+        });
+        assert.deepStrictEqual(error, refusal);
+        assert.deepStrictEqual(state.block, {
+          reason: "effect_failed",
+          effect: { id: 8, type: "open_pr" },
+          detail: `Factory could not open the pull request. ${refusal.message}`,
+        });
         assert.deepStrictEqual(world.calls, []);
       }),
     ),

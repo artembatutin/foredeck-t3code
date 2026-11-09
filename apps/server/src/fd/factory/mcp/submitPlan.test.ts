@@ -34,6 +34,7 @@ import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
 import * as ProviderInstanceRegistry from "../../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
+import * as SourceControlProviderRegistry from "../../../sourceControl/SourceControlProviderRegistry.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../../vcs/VcsProcess.ts";
 import { WorkService } from "../../work-management/index.ts";
@@ -132,6 +133,11 @@ const layer = FactoryService.layer.pipe(
   Layer.provideMerge(FactorySettings.layer),
   Layer.provideMerge(Factory.layerPersistence),
   Layer.provideMerge(SqlitePersistence.layerMemory),
+  Layer.provideMerge(
+    Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+      resolveLink: () => undefined,
+    }),
+  ),
   Layer.provideMerge(GitVcsDriver.layer),
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-plan-mcp-" })),
   Layer.provideMerge(VcsProcess.layer),

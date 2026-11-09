@@ -72,6 +72,12 @@ const supportedRuntimeModesByInstance = new Map<ProviderInstanceId, ReadonlyArra
   [grokInstanceId, ["approval-required", "auto", "full-access"]],
   [cloudInstanceId, ["full-access"]],
 ]);
+// Its host's policy refuses Supervised, as Codex reports one allowing only never and on-request.
+const refusingInstanceId = ProviderInstanceId.make("host-refuses-supervised");
+const runtimeModeRestrictionsByInstance = new Map<
+  ProviderInstanceId,
+  ServerProvider["runtimeModeRestrictions"]
+>([[refusingInstanceId, [{ runtimeMode: "approval-required", status: "disallowed" }]]]);
 const providerInstanceFor = (instanceId: ProviderInstanceId) =>
   ({
     instanceId,
@@ -89,6 +95,7 @@ const providerInstanceFor = (instanceId: ProviderInstanceId) =>
     snapshot: {
       getSnapshot: Effect.succeed({
         supportedRuntimeModes: supportedRuntimeModesByInstance.get(instanceId),
+        runtimeModeRestrictions: runtimeModeRestrictionsByInstance.get(instanceId),
       } as ServerProvider),
     },
   }) as unknown as ProviderInstance;
@@ -209,6 +216,23 @@ it.layer(layerTest)("RuntimePolicyV2", (it) => {
       assert.equal(yield* modeFor(grokInstanceId, "full-access"), "full-access");
       // A provider that advertises no restriction runs every mode as stored.
       assert.equal(yield* modeFor(providerInstanceId, "auto-accept-edits"), "auto-accept-edits");
+    }),
+  );
+
+  it.effect("runs a mode its host refuses as stored, so a refusal never becomes a fallback", () =>
+    Effect.gen(function* () {
+      const policy = yield* RuntimePolicy.RuntimePolicyV2;
+      const now = yield* DateTime.now;
+      const selection = { instanceId: refusingInstanceId, model: "default" };
+      const resolved = yield* policy.resolve({
+        thread: {
+          ...makeThread({ now, worktreePath: null, runtimeMode: "approval-required" }),
+          providerInstanceId: refusingInstanceId,
+          modelSelection: selection,
+        },
+        modelSelection: selection,
+      });
+      assert.equal(resolved.runtimeMode, "approval-required");
     }),
   );
 

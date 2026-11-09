@@ -158,8 +158,17 @@ function bindProviderContext(
     return provider;
   }
 
+  const { resolveChangeRequestRepository } = provider;
   return SourceControlProvider.SourceControlProvider.of({
     ...provider,
+    ...(resolveChangeRequestRepository === undefined
+      ? {}
+      : {
+          resolveChangeRequestRepository: (input: {
+            readonly cwd: string;
+            readonly context?: SourceControlProvider.SourceControlProviderContext;
+          }) => resolveChangeRequestRepository({ ...input, context: input.context ?? context }),
+        }),
     listChangeRequests: (input) =>
       provider.listChangeRequests({
         ...input,

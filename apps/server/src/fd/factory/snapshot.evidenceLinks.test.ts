@@ -115,6 +115,7 @@ const stored = (
     status,
   },
   stageRuns,
+  stageAttempts: {},
   createdAt: at(0),
   updatedAt: at(59),
 });

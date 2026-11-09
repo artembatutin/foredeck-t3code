@@ -95,6 +95,13 @@ export interface GitActionProgressReporter {
 export interface GitRunStackedActionOptions {
   readonly actionId?: string;
   readonly progressReporter?: GitActionProgressReporter;
+  /**
+   * The remote, branch and push URLs the action's push must go to, as the caller read them with
+   * `GitVcsDriver.resolvePushTarget` and checked them: the push fails before writing anything,
+   * with the reason `push_target_changed`, when it would go elsewhere. A pull request action given
+   * one always pushes, so it is checked.
+   */
+  readonly expectedPushTarget?: GitVcsDriver.GitPushTarget;
 }
 
 export interface GitRemoteStatusOptions extends GitVcsDriver.GitRemoteStatusOptions {
@@ -3034,6 +3041,7 @@ export const make = Effect.gen(function* () {
         const initialStatus = yield* gitCore.statusDetails(input.cwd);
         const wantsCommit = isCommitAction(input.action);
         const { expectedHeadSha } = input;
+        const expectedPushTarget = options?.expectedPushTarget;
         // With an expected commit the branch is always pushed, by that commit's id: the push is a
         // no-op when the remote already holds it and is refused when it would rewind the remote,
         // so the pull request never holds anything else.
@@ -3043,6 +3051,7 @@ export const make = Effect.gen(function* () {
           input.action === "commit_push_pr" ||
           (input.action === "create_pr" &&
             (expectedHeadSha !== undefined ||
+              expectedPushTarget !== undefined ||
               !initialStatus.hasUpstream ||
               initialStatus.aheadCount > 0));
         const wantsPr = input.action === "create_pr" || input.action === "commit_push_pr";
@@ -3194,7 +3203,14 @@ export const make = Effect.gen(function* () {
                   gitCore.pushCurrentBranch(
                     input.cwd,
                     currentBranch,
-                    expectedHeadSha === undefined ? undefined : { commitSha: expectedHeadSha },
+                    expectedHeadSha === undefined && expectedPushTarget === undefined
+                      ? undefined
+                      : {
+                          ...(expectedHeadSha === undefined ? {} : { commitSha: expectedHeadSha }),
+                          ...(expectedPushTarget === undefined
+                            ? {}
+                            : { expectedTarget: expectedPushTarget }),
+                        },
                   ),
                 ),
               )

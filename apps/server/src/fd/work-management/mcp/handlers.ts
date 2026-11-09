@@ -1,5 +1,10 @@
 import { OrchestratorMcpFailure, type ProjectId, type ThreadId } from "@t3tools/contracts";
-import { WorkItemId, WorkMcpFailure, WorkSourceId } from "@t3tools/contracts/fd/work-management";
+import {
+  WorkItemId,
+  workItemScopeChanged,
+  WorkMcpFailure,
+  WorkSourceId,
+} from "@t3tools/contracts/fd/work-management";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -171,11 +176,11 @@ export const toolLayer = McpToolAccess.toLayer(WorkToolkit, {
             linkedAt: link.linkedAt,
             state,
             lastRun: link.run,
-            changedSinceStart: link.snapshot.revision !== detail.revision,
+            changedSinceStart: workItemScopeChanged(link, detail),
           })),
         ),
       );
-      const { links: _links, capabilities, ...item } = detail;
+      const { links: _links, capabilities, scopeFingerprint: _scope, ...item } = detail;
       return {
         ...item,
         ref: `${ref.sourceId}:${ref.itemId}`,

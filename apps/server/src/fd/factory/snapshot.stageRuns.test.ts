@@ -47,6 +47,7 @@ import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import { queuedDeliveryState } from "./pipeline/state.ts";
 import { wsHandlers } from "./rpc/handlers.ts";
+import { unusedCommandSetup as commands } from "./testkit/commandSetup.ts";
 import { toFactoryDelivery } from "./snapshot.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 import {
@@ -236,6 +237,7 @@ const longDelivery = (
     threads: { author, reviewer },
   },
   stageRuns,
+  stageAttempts: {},
   createdAt: "2026-10-24T09:00:00.000Z",
   updatedAt: "2026-10-24T12:00:00.000Z",
 });
@@ -543,7 +545,7 @@ describe("stage attempts of listed deliveries", () => {
       yield* seed;
       const factory = yield* FactoryService.FactoryService;
       const settings = yield* FactorySettings.FactorySettings;
-      const rpc = wsHandlers({ factory, settings, startup: readyStartup });
+      const rpc = wsHandlers({ factory, settings, commands, startup: readyStartup });
       const expected = Option.getOrThrow(yield* factory.get(ids.old));
       const snapshot = toFactoryDelivery(expected);
       expect(snapshot.stageRuns.map(({ stage, outcome }) => [stage, outcome])).toEqual([
@@ -581,7 +583,7 @@ describe("stage attempts of listed deliveries", () => {
       }
       const factory = yield* FactoryService.FactoryService;
       const settings = yield* FactorySettings.FactorySettings;
-      const rpc = wsHandlers({ factory, settings, startup: readyStartup });
+      const rpc = wsHandlers({ factory, settings, commands, startup: readyStartup });
 
       const snapshot = yield* rpc[FACTORY_WS_METHODS.factoryDeliveriesGet]({ deliveryId: ids.mid });
       expect(snapshot.stageRuns).toHaveLength(FACTORY_SNAPSHOT_STAGE_RUNS_MAX);

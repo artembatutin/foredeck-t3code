@@ -1,7 +1,13 @@
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- a synchronous hash keeps this module pure.
 import * as NodeCrypto from "node:crypto";
 
-import { IsoDateTime, ProjectId, TrimmedNonEmptyString } from "@t3tools/contracts";
+import {
+  ASSISTANT_TITLE_MAX,
+  AssistantBriefTitle,
+  IsoDateTime,
+  ProjectId,
+  TrimmedNonEmptyString,
+} from "@t3tools/contracts";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import type { Mutable } from "effect/Types";
@@ -13,16 +19,24 @@ const Priority = Schema.Struct({
 });
 export type Priority = typeof Priority.Type;
 
-/** The agreed, environment-local brief for one project. */
+/**
+ * The agreed, environment-local brief for one project. `constraints` and `decisions` are durable
+ * scope, delivered as written and never reclassified by their text. `conversationNotes` hold what
+ * only this conversation needs, which no Work item and no worker receives. `title` is an optional
+ * short title, which counts as scope once set. Authorization is only `executionAuthorized`, and a
+ * review receipt: saving it as a decision or constraint would change the scope it authorizes.
+ */
 export const ProjectBrief = Schema.Struct({
   projectId: ProjectId,
   ideaId: Schema.optionalKey(Schema.String),
+  title: Schema.optionalKey(Schema.String),
   goal: Schema.String,
   acceptanceCriteria: Schema.Array(Schema.String),
   constraints: Schema.Array(Schema.String),
   decisions: Schema.optionalKey(Schema.Array(Schema.String)),
   priority: Schema.NullOr(Priority),
   openQuestions: Schema.Array(Schema.String),
+  conversationNotes: Schema.optionalKey(Schema.Array(Schema.String)),
   executionAuthorized: Schema.Boolean,
   revision: Schema.Int,
   updatedAt: IsoDateTime,
@@ -31,12 +45,15 @@ export type ProjectBrief = typeof ProjectBrief.Type;
 
 /** Fields to change. Absent keys keep their value; `priority: null` makes the project unranked. */
 export const BriefPatch = Schema.Struct({
+  /** Blank removes it, so the title derives from the goal again. */
+  title: Schema.optionalKey(AssistantBriefTitle),
   goal: Schema.optionalKey(Schema.String),
   acceptanceCriteria: Schema.optionalKey(Schema.Array(Schema.String)),
   constraints: Schema.optionalKey(Schema.Array(Schema.String)),
   decisions: Schema.optionalKey(Schema.Array(Schema.String)),
   priority: Schema.optionalKey(Schema.NullOr(Priority)),
   openQuestions: Schema.optionalKey(Schema.Array(Schema.String)),
+  conversationNotes: Schema.optionalKey(Schema.Array(Schema.String)),
   executionAuthorized: Schema.optionalKey(Schema.Boolean),
 });
 export type BriefPatch = typeof BriefPatch.Type;
@@ -49,11 +66,13 @@ const listChange = <const Field extends string>(field: Field) =>
   });
 
 export const BriefChange = Schema.Union([
+  Schema.Struct({ field: Schema.Literal("title"), previous: Schema.String, next: Schema.String }),
   Schema.Struct({ field: Schema.Literal("goal"), previous: Schema.String, next: Schema.String }),
   listChange("acceptanceCriteria"),
   listChange("constraints"),
   listChange("decisions"),
   listChange("openQuestions"),
+  listChange("conversationNotes"),
   Schema.Struct({
     field: Schema.Literal("priority"),
     previous: Schema.NullOr(Priority),
@@ -83,6 +102,15 @@ const normalizeList = (items: ReadonlyArray<string>) =>
 
 const sameList = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>
   left.length === right.length && left.every((item, index) => item === right[index]);
+
+/** The fields of a brief its worker and its Work item state: changing one needs a new review. */
+const SCOPE_FIELDS: ReadonlySet<BriefChange["field"]> = new Set([
+  "title",
+  "goal",
+  "acceptanceCriteria",
+  "constraints",
+  "decisions",
+]);
 
 const samePriority = (left: Priority | null, right: Priority | null) =>
   left === null || right === null
@@ -121,6 +149,12 @@ export function reviseBrief(
   const changes: Array<BriefChange> = [];
   const next: Mutable<ProjectBrief> = { ...base };
 
+  const title = patch.title?.trim();
+  if (title !== undefined && title !== (base.title ?? "")) {
+    if (title === "") delete next.title;
+    else next.title = title;
+    changes.push({ field: "title", previous: base.title ?? "", next: title });
+  }
   const goal = patch.goal?.trim();
   if (goal !== undefined && goal !== base.goal) {
     next.goal = goal;
@@ -131,6 +165,7 @@ export function reviseBrief(
     "constraints",
     "openQuestions",
     "decisions",
+    "conversationNotes",
   ] as const) {
     const value = patch[field];
     if (value === undefined) continue;
@@ -149,9 +184,7 @@ export function reviseBrief(
       changes.push({ field: "priority", previous: base.priority, next: priority });
     }
   }
-  const scopeChanged = changes.some((change) =>
-    ["goal", "acceptanceCriteria", "constraints", "decisions"].includes(change.field),
-  );
+  const scopeChanged = changes.some((change) => SCOPE_FIELDS.has(change.field));
   const authorized = patch.executionAuthorized ?? (scopeChanged ? false : undefined);
   if (authorized !== undefined && authorized !== base.executionAuthorized) {
     next.executionAuthorized = authorized;
@@ -490,11 +523,12 @@ const renderList = (
 /**
  * The text a worker receives: one project's agreed goal, acceptance criteria, constraints and
  * open questions. Priority and its reason are portfolio-relative and often mention other
- * projects, so they stay with the manager.
+ * projects, and conversation notes are not scope, so they all stay with the manager.
  */
 export function renderAssignmentBrief(brief: ProjectBrief): string {
   return [
     `Project brief for ${brief.projectId}, idea ${brief.ideaId ?? "legacy"}. This is the complete agreed scope for this assignment.`,
+    ...(brief.title === undefined ? [] : [`Title:\n${brief.title}`]),
     `Goal:\n${brief.goal || "(none recorded)"}`,
     renderList("Acceptance criteria", brief.acceptanceCriteria, (index) => `${index + 1}.`),
     renderList("Constraints", brief.constraints, () => "-"),
@@ -507,10 +541,27 @@ export function renderAssignmentBrief(brief: ProjectBrief): string {
 
 /**
  * The hash a capture records of the brief it was made from: of what a worker is told, so a change
- * of priority or authorization alone never changes it.
+ * of priority, authorization or conversation notes alone never changes it.
  */
 export const briefScopeHash = (brief: ProjectBrief): string =>
   NodeCrypto.createHash("sha256").update(renderAssignmentBrief(brief)).digest("hex");
+
+/**
+ * A short title for a goal: its first line, cut at the last word boundary that fits (or, for one
+ * long word, wherever fits), never through a surrogate pair. The goal keeps every word.
+ */
+export function shortTitleOf(goal: string): string {
+  const line = goal.split(/\r?\n/).find((candidate) => candidate.trim() !== "") ?? "";
+  const whole = line.trim();
+  if (whole.length <= ASSISTANT_TITLE_MAX) return whole;
+  const window = whole.slice(0, ASSISTANT_TITLE_MAX - 1);
+  // A word that ends just where the window does fits whole.
+  const boundary = /\s/.test(whole.charAt(window.length)) ? window.length : window.search(/\s\S*$/);
+  let end = boundary > 0 ? boundary : window.length;
+  const last = whole.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${whole.slice(0, end).trimEnd()}…`;
+}
 
 export const MANAGER_SUMMARY_LIMITS = { projects: 8, charactersPerProject: 600 } as const;
 
@@ -518,7 +569,8 @@ const TERMINAL_STATES: ReadonlySet<AssignmentState> = new Set(["completed", "can
 
 const oneLine = (text: string) => text.replace(/\s+/g, " ").trim();
 
-function truncate(text: string, limit: number): string {
+/** At most `limit` characters, the cut marked, and never through a surrogate pair. */
+export function truncate(text: string, limit: number): string {
   if (text.length <= limit) return text;
   let end = Math.max(0, limit - 1);
   const last = text.charCodeAt(end - 1);

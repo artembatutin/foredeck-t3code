@@ -310,6 +310,54 @@ describe("GitHubIssuesSource", () => {
     }),
   );
 
+  it.effect("fingerprints a body past the wire cap whole", () =>
+    Effect.gen(function* () {
+      const read = (body: string) =>
+        Effect.gen(function* () {
+          const api = stubApi(() =>
+            Effect.succeed(
+              JSON.stringify({
+                data: {
+                  repository: {
+                    issue: {
+                      ...issue(4),
+                      body,
+                      subIssues: { nodes: [] },
+                      blocking: { nodes: [] },
+                      comments: { totalCount: 0, nodes: [] },
+                    },
+                  },
+                },
+              }),
+            ),
+          );
+          const adapter = yield* adapterWith(api);
+          return yield* adapter.get(runtime, WorkItemId.make("4"));
+        });
+      const before = yield* read(`${"a".repeat(70_000)} Writes CSV.`);
+      const after = yield* read(`${"a".repeat(70_000)} Writes CSV and PDF.`);
+      assert.isTrue(before.bodyTruncated);
+      assert.strictEqual(after.body, before.body);
+      assert.notStrictEqual(after.scopeFingerprint, before.scopeFingerprint);
+    }),
+  );
+
+  it.effect("leaves the fingerprint off the summary a write answers with", () =>
+    Effect.gen(function* () {
+      const api = stubApi(() => Effect.succeed(detailBody(4)));
+      const adapter = yield* adapterWith(api);
+      const updated = yield* adapter.setStatus(
+        runtime,
+        {
+          ref: { sourceId, itemId: WorkItemId.make("4") },
+          status: "done",
+        },
+        owner,
+      );
+      assert.notProperty(updated, "scopeFingerprint");
+    }),
+  );
+
   it.effect("falls back to basic fields when an older server lacks dependency fields", () =>
     Effect.gen(function* () {
       const api = stubApi((call) =>

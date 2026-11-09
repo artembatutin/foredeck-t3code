@@ -45,6 +45,7 @@ import {
   type OrchestrationV2TurnItem,
   type OrchestrationV2UserInputQuestion,
   type ProviderApprovalDecision,
+  type ProviderApprovalOption,
   type ProviderInstanceId,
   type OrchestrationV2ProviderTurnTokenUsage,
 } from "@t3tools/contracts";
@@ -1443,6 +1444,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 requestId,
                 requestKind: piApprovalRequestKind(title),
                 prompt: recordString(event, "message") ?? title,
+                options: PI_APPROVAL_OPTIONS,
               }
             : {
                 ...itemBase,
@@ -3410,6 +3412,14 @@ function piQuestion(
     options,
   };
 }
+
+/** What a confirm dialog can answer; the session choice is T3's own `sessionApprovals`. */
+const PI_APPROVAL_OPTIONS: ReadonlyArray<ProviderApprovalOption> = [
+  { decision: "cancel", label: "Cancel" },
+  { decision: "decline", label: "Decline" },
+  { decision: "acceptForSession", label: "Always allow this session" },
+  { decision: "accept", label: "Approve" },
+];
 
 function piUiResponse(
   pending: PendingPiPrompt,

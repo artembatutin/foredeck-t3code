@@ -12,6 +12,7 @@ import {
   FactoryDeliveryStatus,
   FactoryPlan,
   FactoryReviewDetails,
+  FactoryReviewedExecution,
   FactoryReviewSummary,
   FactoryRole,
   FactoryStageName,
@@ -161,6 +162,17 @@ const StoredBlock = Schema.Union([
     reason: Schema.Literal("effect_failed"),
     effect: StoredEffect,
     detail: Schema.String,
+    hostRefused: Schema.optionalKey(
+      Schema.Struct({
+        runtimeMode: RuntimeMode,
+        provider: Schema.String,
+        driver: Schema.String,
+        detail: Schema.optionalKey(Schema.String),
+        choose: Schema.Literals(["resume", "thread", "automatic_turn", "review", "before_review"]),
+        alternatives: Schema.Array(RuntimeMode),
+        threadId: Schema.optionalKey(ThreadId),
+      }),
+    ),
   }),
   Schema.Struct({ reason: Schema.Literal("unsettled"), problems: Problems }),
   Schema.Struct({ reason: Schema.Literal("verify_failed") }),
@@ -178,6 +190,15 @@ const StoredBlock = Schema.Union([
   Schema.Struct({ reason: Schema.Literal("invalid_submission"), problems: Problems }),
   Schema.Struct({ reason: Schema.Literal("plan_empty"), note: Schema.NullOr(Schema.String) }),
   Schema.Struct({ reason: Schema.Literal("watch_ended") }),
+  // Added with reviewed deliveries.
+  Schema.Struct({
+    reason: Schema.Literal("allowance_exhausted"),
+    allowance: Schema.Literals(["fix", "review", "fix_commit"]),
+    used: NonNegativeInt,
+    approved: NonNegativeInt,
+    problems: Problems,
+  }),
+  Schema.Struct({ reason: Schema.Literal("reviewed_refused"), detail: Schema.String }),
   Schema.Struct({
     reason: Schema.Literal("record_mismatch"),
     expected: Schema.Struct(StoredCommit),
@@ -245,6 +266,11 @@ const StoredDeliveryState = Schema.Struct({
   // Added with runtime ceilings: absent from rows stored before them and from deliveries started
   // without one, which launch with the project's default as before.
   runtimeModeCeiling: Schema.optionalKey(RuntimeMode),
+  // Added with reviewed deliveries: absent from every delivery started without a review, which
+  // reads the project's settings as each step runs.
+  reviewedExecution: Schema.optionalKey(FactoryReviewedExecution),
+  supersededReceipts: Schema.optionalKey(Schema.Array(Schema.String)),
+  reviewResumeOwed: Schema.optionalKey(Schema.String),
   rounds: Schema.Struct({ fix: NonNegativeInt, review: NonNegativeInt }).pipe(
     Schema.withDecodingDefault(Effect.succeed({ fix: 0, review: 0 })),
   ),

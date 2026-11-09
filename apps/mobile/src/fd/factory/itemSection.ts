@@ -5,6 +5,8 @@ import {
   type FactoryDeliveryFamily,
   factoryDeliveryView,
   type FactoryDeliveryView,
+  factoryPendingActionDestination,
+  factoryPendingActionTarget,
 } from "@t3tools/client-runtime/fd/factory";
 import {
   type AtomCommandResult,
@@ -33,6 +35,35 @@ export interface MobileFactoryDestination {
  */
 export const mobileFactorySection = (input: MobileFactoryDestination): FactoryDeliveryView | null =>
   factoryDeliveryView({ ...input, connected: input.connectionState === "connected" });
+
+interface MobileNamedEntity {
+  readonly id: string;
+  readonly environmentId: EnvironmentId;
+  readonly title: string;
+}
+
+/**
+ * The section's pending actions with each one's target by name and where it is decided, since a
+ * family's approvals otherwise read alike until they are opened. Names come from this environment.
+ */
+export const mobilePendingActionRows = (input: {
+  readonly environmentId: EnvironmentId;
+  readonly view: FactoryDeliveryView;
+  readonly shownItem: WorkItemRef;
+  readonly projects: ReadonlyArray<MobileNamedEntity>;
+  readonly threads: ReadonlyArray<MobileNamedEntity>;
+}) => {
+  const titleIn = (entries: ReadonlyArray<MobileNamedEntity>, id: string) =>
+    entries.find((entry) => entry.id === id && entry.environmentId === input.environmentId)?.title;
+  return input.view.pendingActions.rows.map((row) => ({
+    ...row,
+    target: factoryPendingActionTarget(row, {
+      project: (id) => titleIn(input.projects, id),
+      thread: (id) => titleIn(input.threads, id),
+    }),
+    destination: factoryPendingActionDestination(row, input.shownItem),
+  }));
+};
 
 /** What an open cancel confirmation was opened for: a delivery, and what it said cancelling ends. */
 export interface MobileCancelConfirmation {

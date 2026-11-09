@@ -23,6 +23,7 @@ import {
   hasProviderUsageLimits,
   isUsageLimitsCommand,
 } from "@t3tools/shared/usageLimits";
+import { runtimeModeRefusal } from "@t3tools/shared/fd/approvals";
 import { StackActions, useFocusEffect, useNavigation } from "@react-navigation/native";
 import type { ReactNode } from "react";
 import {
@@ -559,10 +560,16 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     provider: selectedProviderStatus,
     runtimeMode: currentRuntimeMode,
   });
+  // A refusal the provider read from its host stops the send and leaves the mode to the owner.
+  const hostRefusal =
+    selectedProviderStatus === null
+      ? null
+      : runtimeModeRefusal(selectedProviderStatus, currentRuntimeMode);
   const sendBlockedReason =
     (queuedEdit?.saving === true ? "Saving…" : null) ??
     props.sendBlockedReason ??
     repositoryBlockedReason ??
+    hostRefusal?.summary ??
     (pendingPastedTextAttachmentCount > 0 ? "Attaching pasted text" : null) ??
     attachmentBlockReason;
   const canSend =
@@ -833,6 +840,13 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
 
         {repositoryBlockedReason ? (
           <Text className="px-3 py-2 text-xs text-muted-foreground">{repositoryBlockedReason}</Text>
+        ) : null}
+        {hostRefusal !== null ? (
+          <Pressable accessibilityRole="button" className="px-3 py-2" onPress={openSettings}>
+            <Text className="text-xs text-foreground">
+              {hostRefusal.summary} Nothing was sent. Open settings to choose.
+            </Text>
+          </Pressable>
         ) : null}
         {selectedProviderStatus?.compatibilityAdvisory?.message &&
         (selectedProviderStatus.compatibilityAdvisory.status === "unsupported" ||

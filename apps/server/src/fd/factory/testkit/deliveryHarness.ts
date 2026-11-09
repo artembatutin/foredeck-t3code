@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert } from "@effect/vitest";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   AuthSettingsWriteScope,
   AuthWorkReadScope,
@@ -7,6 +8,7 @@ import {
   CommandId,
   type GitRunStackedActionInput,
   type GitRunStackedActionResult,
+  type PullRequestDetail,
   MessageId,
   NodeId,
   type OrchestrationV2ProviderThread,
@@ -18,9 +20,12 @@ import {
   ProviderTurnId,
   type RunId,
   RuntimeRequestId,
+  SourceControlProviderKind,
   TurnItemId,
+  type ProviderRequestKind,
   type RuntimeMode,
   type ServerProvider,
+  type ServerProviderRuntimeModeRestriction,
   type ThreadId,
   type VcsRemoveWorktreeInput,
 } from "@t3tools/contracts";
@@ -36,6 +41,7 @@ import * as ProviderContinuationRequests from "@t3tools/provider-core/server/Pro
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
+import * as GitHubSourceControlProvider from "@t3tools/source-control-github/server/GitHubSourceControlProvider";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -49,6 +55,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import type { ChildProcess } from "effect/process";
 
 import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../../../config.ts";
@@ -78,13 +85,16 @@ import * as ProjectCloneTracker from "../../../project/ProjectCloneTracker.ts";
 import * as ProjectEnrichmentService from "../../../project/ProjectEnrichmentService.ts";
 import * as ProjectFaviconResolver from "../../../project/ProjectFaviconResolver.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
+import * as PullRequestService from "../../../pullRequest/PullRequestService.ts";
 import * as ProjectSetupScriptRunner from "../../../project/ProjectSetupScriptRunner.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
 import * as WorktreeSetupTracker from "../../../project/WorktreeSetupTracker.ts";
 import * as ProviderInstanceRegistry from "../../../provider/ProviderInstanceRegistry.ts";
+import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as ProviderRegistryMock from "../../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerActivation from "../../../serverActivation.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
+import * as ServerSourceControlHost from "../../../sourceControl/ServerSourceControlHost.ts";
 import * as SourceControlProviderRegistry from "../../../sourceControl/SourceControlProviderRegistry.ts";
 import * as TerminalManager from "../../../terminal/Manager.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
@@ -99,6 +109,7 @@ import * as WorkManagement from "../../work-management/index.ts";
 import * as FactoryReactor from "../FactoryReactor.ts";
 import * as Factory from "../index.ts";
 import type { StoredFactoryDelivery } from "../persistence/FactoryDeliveryStore.ts";
+import { spawningThrough } from "./gitProcesses.ts";
 
 /**
  * A single-item delivery on the server's real orchestration stack: a Git project with a Markdown
@@ -477,6 +488,86 @@ const makeFakeProvider = Effect.gen(function* () {
       return requestId;
     });
 
+  /** Asks the owner to approve one action during the turn, as a provider's approval request. */
+  const askApproval = (
+    turn: ProviderAdapter.ProviderAdapterV2TurnInput,
+    requestKind: ProviderRequestKind,
+    prompt: string,
+    reason?: string,
+  ) =>
+    Effect.gen(function* () {
+      questions += 1;
+      const now = yield* DateTime.now;
+      const native = `approval:${turn.attemptId}:${questions}`;
+      const requestId = RuntimeRequestId.make(`request:${native}`);
+      const nodeId = NodeId.make(`node:${native}`);
+      const providerSessionId = turn.providerThread.providerSessionId;
+      if (providerSessionId === null) return yield* Effect.die("The turn has no provider session.");
+      const nativeItemRef = { driver, nativeId: native, strength: "strong" as const };
+      yield* Queue.offer(events, {
+        type: "node.updated",
+        driver,
+        node: {
+          id: nodeId,
+          threadId: turn.threadId,
+          runId: turn.runId,
+          parentNodeId: turn.rootNodeId,
+          rootNodeId: turn.rootNodeId,
+          kind: "approval_request",
+          status: "waiting",
+          countsForRun: false,
+          providerThreadId: turn.providerThread.id,
+          providerTurnId: providerTurnId(turn),
+          nativeItemRef,
+          runtimeRequestId: requestId,
+          checkpointScopeId: null,
+          startedAt: now,
+          completedAt: null,
+        },
+      });
+      yield* Queue.offer(events, {
+        type: "turn_item.updated",
+        driver,
+        turnItem: {
+          id: TurnItemId.make(`item:${native}`),
+          threadId: turn.threadId,
+          runId: turn.runId,
+          nodeId,
+          providerThreadId: turn.providerThread.id,
+          providerTurnId: providerTurnId(turn),
+          nativeItemRef,
+          parentItemId: null,
+          ordinal: 10 + questions,
+          status: "waiting",
+          title: null,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          type: "approval_request",
+          requestId,
+          requestKind,
+          prompt,
+          ...(reason === undefined ? {} : { reason }),
+        },
+      });
+      yield* Queue.offer(events, {
+        type: "runtime_request.updated",
+        driver,
+        runtimeRequest: {
+          id: requestId,
+          nodeId,
+          providerTurnId: providerTurnId(turn),
+          nativeRequestRef: nativeItemRef,
+          kind: requestKind,
+          status: "pending",
+          responseCapability: { type: "live", providerSessionId },
+          createdAt: now,
+          resolvedAt: null,
+        },
+      });
+      return requestId;
+    });
+
   return {
     adapter,
     started,
@@ -488,6 +579,7 @@ const makeFakeProvider = Effect.gen(function* () {
     startCommand,
     reportSubagent,
     ask,
+    askApproval,
   };
 });
 
@@ -572,8 +664,46 @@ export interface CommentCall {
   readonly input: WorkCommentInput;
 }
 
-/** The pull request the fake PR service opens for any branch. */
+/** The pull request the fake PR service opens for a world's first branch. */
 export const fakePullRequest = { number: 7, url: "https://github.com/acme/alpha/pull/7" };
+
+/**
+ * The fake host's pull requests, one per branch as a real host's are: the first is
+ * `fakePullRequest` and each later branch takes the next number. Saved as `create_pr` sent them.
+ */
+const hostedPullRequests = () => {
+  const byBranch = new Map<
+    string,
+    {
+      readonly number: number;
+      readonly url: string;
+      title: string;
+      body: string;
+    }
+  >();
+  return {
+    of: (branch: string) => {
+      const known = byBranch.get(branch);
+      if (known !== undefined) return known;
+      const number = fakePullRequest.number + byBranch.size;
+      const hosted = {
+        number,
+        url: `https://github.com/acme/alpha/pull/${number}`,
+        title: "",
+        body: "",
+      };
+      byBranch.set(branch, hosted);
+      return hosted;
+    },
+    byNumber: (number: number) => [...byBranch].find(([, hosted]) => hosted.number === number),
+    reword: (number: number, title: string) => {
+      for (const hosted of byBranch.values()) {
+        if (hosted.number === number) hosted.title = title;
+      }
+    },
+  };
+};
+type HostedPullRequests = ReturnType<typeof hostedPullRequests>;
 
 const projectEnrichment = ProjectEnrichmentService.layer.pipe(
   Layer.provide(
@@ -617,28 +747,41 @@ const gitWorkflow = GitWorkflow.layer.pipe(
  * The fake PR service: the Git workflow Factory's PR stages call. Its stacked action records the
  * call with the worktree's HEAD and branch at that moment, pushes to the project's bare `origin`
  * the way `create_pr` does (the expected commit by its id, tracked as the branch's upstream, or
- * HEAD when given none), and reports the pull request open. A worktree removal is recorded, then
- * run by the real git driver.
+ * HEAD when given none), and reports the pull request open. With `publishing.throughDriver` it
+ * pushes through the Git driver's own push instead, bound to the target Factory checked, as the
+ * real action does: a push that would go anywhere else fails before writing anything, and nothing
+ * is reported open. A worktree removal is recorded, then run by the real git driver.
  */
 const fakePullRequests = (
   calls: Array<PullRequestCall>,
   removals: Array<VcsRemoveWorktreeInput>,
   hooks: Array<Effect.Effect<void>>,
+  hosted: HostedPullRequests,
+  publishing: World["publishing"],
 ) =>
   Layer.unwrap(
     Effect.map(GitVcsDriver.GitVcsDriver, (git) => {
       const read = (cwd: string, args: ReadonlyArray<string>) =>
-        git
-          .execute({ operation: "test.pr", cwd, args, timeoutMs: 30_000 })
-          .pipe(Effect.map((result) => result.stdout.trim()));
+        git.execute({ operation: "test.pr", cwd, args, timeoutMs: 30_000 }).pipe(
+          Effect.map((result) => result.stdout.trim()),
+          Effect.orDie,
+        );
       return Layer.mock(GitWorkflow.GitWorkflowService)({
-        runStackedAction: (input) =>
+        runStackedAction: (input, options) =>
           Effect.gen(function* () {
             const head = yield* read(input.cwd, ["rev-parse", "HEAD"]);
             const branch = yield* read(input.cwd, ["branch", "--show-current"]);
             calls.push({ input, head, branch });
             for (const hook of hooks.splice(0)) yield* hook;
-            if (input.expectedHeadSha === undefined) {
+            const expectedTarget = options?.expectedPushTarget;
+            if (publishing.throughDriver === true && expectedTarget !== undefined) {
+              yield* git.pushCurrentBranch(input.cwd, null, {
+                ...(input.expectedHeadSha === undefined
+                  ? {}
+                  : { commitSha: input.expectedHeadSha }),
+                expectedTarget,
+              });
+            } else if (input.expectedHeadSha === undefined) {
               yield* read(input.cwd, ["push", "-u", "origin", `HEAD:refs/heads/${branch}`]);
             } else {
               yield* read(input.cwd, [
@@ -648,6 +791,11 @@ const fakePullRequests = (
               ]);
               yield* read(input.cwd, ["branch", "--set-upstream-to", `origin/${branch}`]);
             }
+            const pullRequest = hosted.of(branch);
+            if (input.action === "create_pr") {
+              pullRequest.title = input.prTitle ?? "";
+              pullRequest.body = input.prBody ?? "";
+            }
             return {
               action: input.action,
               branch: { status: "skipped_not_requested" },
@@ -655,18 +803,59 @@ const fakePullRequests = (
               push: { status: "pushed", branch, setUpstream: true },
               pr: {
                 status: "created",
-                ...fakePullRequest,
+                number: pullRequest.number,
+                url: pullRequest.url,
                 baseBranch: "main",
                 headBranch: branch,
                 ...(input.prTitle === undefined ? {} : { title: input.prTitle }),
               },
               toast: { title: "Created pull request", cta: { kind: "none" } },
             } satisfies GitRunStackedActionResult;
-          }).pipe(Effect.orDie),
+          }),
         removeWorktree: (input) =>
           Effect.sync(() => removals.push(input)).pipe(Effect.andThen(git.removeWorktree(input))),
       });
     }),
+  );
+
+/** What the fake host saved of a pull request: what `create_pr` sent, on the branch it holds. */
+const fakeSavedPullRequests = (hosted: HostedPullRequests) =>
+  Layer.mock(PullRequestService.PullRequestService)({
+    invalidate: () => Effect.void,
+    detail: ({ number }) =>
+      Effect.suspend(() => {
+        const [headBranch, saved] =
+          hosted.byNumber(number) ?? assert.fail(`The host holds no pull request #${number}.`);
+        return Effect.succeed({
+          title: saved.title,
+          body: saved.body,
+          headBranch,
+        } as unknown as PullRequestDetail);
+      }),
+  });
+
+/**
+ * The registry the server builds, on its real host, with GitHub's real provider: it reads the
+ * checkout for what its pull request would target. Its API is reachable by no test, since pull
+ * requests go through the fake PR service, and a remote it does not host has no provider.
+ */
+const sourceControlRegistry = (environment: World["hostEnvironment"]) =>
+  Layer.effect(
+    SourceControlProviderRegistry.SourceControlProviderRegistry,
+    Effect.gen(function* () {
+      return yield* SourceControlProviderRegistry.makeWithProviders([
+        {
+          kind: SourceControlProviderKind.make("github"),
+          provider: yield* GitHubSourceControlProvider.make,
+          discovery: yield* GitHubSourceControlProvider.makeDiscovery,
+        },
+      ]);
+    }),
+  ).pipe(
+    Layer.provide(ServerSourceControlHost.layer),
+    Layer.provide(VcsDriverRegistry.layer),
+    Layer.provide(Layer.mock(GitHubApi.GitHubApi)({})),
+    Layer.provide(Layer.sync(HostProcess.Environment, () => ({ ...environment }))),
   );
 
 const projectService = ProjectService.layer.pipe(
@@ -766,31 +955,69 @@ const downReactor: typeof factoryReactor = Layer.succeed(
  * The fake provider's instance as the instance registry holds it. The runtime policy and Factory
  * read only its advertised runtime modes; none advertised means it runs any mode it is given.
  */
-const providerInstances = (supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined) => {
-  // A test stub: only the snapshot's runtime modes are ever read.
-  const snapshot = { instanceId, driver, supportedRuntimeModes } as ServerProvider;
+const providerInstances = (
+  supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined,
+  hostPolicy: HostPolicy | undefined,
+) => {
+  // A test stub: only the snapshot's runtime modes and what its host says of them are ever read.
+  const snapshot = Effect.sync(
+    () =>
+      ({
+        instanceId,
+        driver,
+        supportedRuntimeModes,
+        ...(hostPolicy === undefined ? {} : { runtimeModeRestrictions: hostPolicy.restrictions }),
+      }) as ServerProvider,
+  );
   const instance = {
     instanceId,
-    snapshot: { getSnapshot: Effect.succeed(snapshot) },
+    snapshot: { getSnapshot: snapshot },
   } as unknown as ProviderInstance;
   return Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
     getInstance: (id) => Effect.succeed(id === instanceId ? instance : undefined),
   });
 };
 
+/** What the provider's host says of its modes, which a test can change as it runs. */
+export interface HostPolicy {
+  restrictions: ReadonlyArray<ServerProviderRuntimeModeRestriction>;
+}
+
+/** The registry clients and a launch read, saying what the provider's host says now. */
+const withHostPolicy =
+  (hostPolicy: HostPolicy): ProviderRegistryWrapper =>
+  (service) => ({
+    ...service,
+    getProviders: service.getProviders.pipe(
+      Effect.map((providers) => {
+        const said = { instanceId, driver, runtimeModeRestrictions: hostPolicy.restrictions };
+        return providers.some((provider) => provider.instanceId === instanceId)
+          ? providers.map((provider) =>
+              provider.instanceId === instanceId ? { ...provider, ...said } : provider,
+            )
+          : [...providers, { models: [], ...said } as unknown as ServerProvider];
+      }),
+    ),
+  });
+
 /** What the server's layers are built from. */
 interface ServerInput {
   readonly provider: FakeProvider;
   readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
+  readonly hostPolicy: HostPolicy | undefined;
   readonly providers: ReadonlyArray<ServerProvider> | undefined;
   readonly pullRequestCalls: Array<PullRequestCall>;
   readonly worktreeRemovals: Array<VcsRemoveWorktreeInput>;
+  readonly hostedPullRequests: HostedPullRequests;
   readonly publishHooks: Array<Effect.Effect<void>>;
+  readonly publishing: World["publishing"];
+  readonly gitProcesses: World["gitProcesses"];
   readonly factoryDispatch: World["factoryDispatch"];
   readonly processes: World["processes"];
   readonly setupScripts: World["setupScripts"];
   readonly commentCalls: Array<CommentCall>;
   readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
+  readonly wrapProviders: ProviderRegistryWrapper | undefined;
   readonly manualReactor: boolean;
   readonly admission: typeof Factory.FactoryAdmission.FactoryAdmission.Service | undefined;
   readonly handoff: HandoffOption | undefined;
@@ -798,6 +1025,7 @@ interface ServerInput {
   readonly assistantFactory: FactoryPortWrapper | undefined;
   readonly automaticTurnGate: boolean;
   readonly gateConsults: GateConsults | undefined;
+  readonly hostEnvironment: World["hostEnvironment"];
   readonly root: string;
   readonly t3Home: string;
   /** The harness's one database, already built: every build of the server shares it. */
@@ -866,7 +1094,7 @@ const coreLayer = (input: ServerInput) => {
   const serverConfig = ServerConfig.layerTest(input.root, input.t3Home);
   const runtimePolicy = RuntimePolicy.layerFromProjectStore.pipe(
     Layer.provide(RepositorySet.layerDefault),
-    Layer.provide(providerInstances(input.supportedRuntimeModes)),
+    Layer.provide(providerInstances(input.supportedRuntimeModes, input.hostPolicy)),
     Layer.provide(ProjectStore.layer),
     Layer.provide(database),
     Layer.provide(serverConfig),
@@ -889,6 +1117,7 @@ const coreLayer = (input: ServerInput) => {
     Layer.provideMerge(projectService),
     Layer.provideMerge(ThreadManagement.layer),
     Layer.provideMerge(orchestration),
+    Layer.provideMerge(sourceControlRegistry(input.hostEnvironment)),
     Layer.provideMerge(
       Layer.mergeAll(
         ProjectStore.layer,
@@ -896,7 +1125,13 @@ const coreLayer = (input: ServerInput) => {
         CommandReceiptStore.layer,
         IdAllocator.layer,
         hookedProcessRunner(input.processes),
-        GitVcsDriver.layer,
+        GitVcsDriver.layer.pipe(
+          Layer.provide(
+            spawningThrough(
+              (command) => input.gitProcesses.before?.(command) ?? Effect.succeed(command),
+            ),
+          ),
+        ),
         // The thread launches' own, which Factory follows a launch without a run on.
         WorktreeSetupTracker.layer,
       ),
@@ -960,10 +1195,30 @@ const factoryLayer = (input: ServerInput, handoff: ReturnType<typeof handoffLaye
     Layer.provide(factoryOrchestrator(input.factoryDispatch)),
     Layer.provide(factoryThreads(input.factoryDispatch)),
     Layer.provide(
-      fakePullRequests(input.pullRequestCalls, input.worktreeRemovals, input.publishHooks),
+      fakePullRequests(
+        input.pullRequestCalls,
+        input.worktreeRemovals,
+        input.publishHooks,
+        input.hostedPullRequests,
+        input.publishing,
+      ),
     ),
-    Layer.provide(ProviderRegistryMock.layer(input.providers)),
-    Layer.provide(providerInstances(input.supportedRuntimeModes)),
+    Layer.provide(fakeSavedPullRequests(input.hostedPullRequests)),
+    Layer.provide(
+      input.wrapProviders === undefined && input.hostPolicy === undefined
+        ? ProviderRegistryMock.layer(input.providers)
+        : Layer.effect(
+            ProviderRegistry.ProviderRegistry,
+            Effect.map(ProviderRegistry.ProviderRegistry, (service) => {
+              const said =
+                input.hostPolicy === undefined
+                  ? service
+                  : withHostPolicy(input.hostPolicy)(service);
+              return input.wrapProviders === undefined ? said : input.wrapProviders(said);
+            }),
+          ).pipe(Layer.provide(ProviderRegistryMock.layer(input.providers))),
+    ),
+    Layer.provide(providerInstances(input.supportedRuntimeModes, input.hostPolicy)),
     Layer.provide(
       input.handoff !== undefined
         ? handoff
@@ -972,6 +1227,10 @@ const factoryLayer = (input: ServerInput, handoff: ReturnType<typeof handoffLaye
           : Layer.succeed(Factory.FactoryAdmission.FactoryAdmission, input.admission),
     ),
   );
+
+type ProviderRegistryWrapper = (
+  service: ProviderRegistry.ProviderRegistry["Service"],
+) => ProviderRegistry.ProviderRegistry["Service"];
 
 /** Wraps the thread service the project assistant alone sees; see `withProject`. */
 type ThreadServiceWrapper = (
@@ -999,7 +1258,7 @@ const assistantLayer = (input: ServerInput, handoff: ReturnType<typeof handoffLa
         : Layer.effect(
             HandoffBackend.HandoffFactory,
             Effect.map(HandoffBackend.HandoffFactory, input.assistantFactory),
-          ).pipe(Layer.provide(AssistantHandoff.layerFactory)),
+          ).pipe(Layer.provideMerge(AssistantHandoff.layerFactory)),
     ),
     Layer.provide(handoff),
     Layer.provide(
@@ -1131,7 +1390,7 @@ export const threadProjection = (threadId: ThreadId) =>
   );
 
 /** What a test body runs with: the server layers and the platform. */
-type Services =
+export type Services =
   | Layer.Success<ReturnType<typeof coreLayer>>
   | Layer.Success<ReturnType<typeof factoryLayer>>
   | Layer.Success<ReturnType<typeof assistantLayer>>
@@ -1156,8 +1415,15 @@ export interface World {
   readonly itemTitle: string;
   /** `git status` of the project root once the item is committed. */
   readonly rootStatus: string;
+  /**
+   * The server process's environment as its source control providers read it. The core takes it
+   * when it builds, so a change takes effect at a `rebuild` with `orchestration`, as at a restart.
+   */
+  readonly hostEnvironment: Record<string, string>;
   /** Every stacked action the fake PR service ran, in order. */
   readonly pullRequestCalls: ReadonlyArray<PullRequestCall>;
+  /** Rewords a pull request on the fake host, as someone could there at any time. */
+  readonly rewordPullRequest: (number: number, title: string) => void;
   /** Every worktree removal Factory asked the Git workflow for, in order. */
   readonly worktreeRemovals: ReadonlyArray<VcsRemoveWorktreeInput>;
   /**
@@ -1165,6 +1431,20 @@ export interface World {
    * the PR stage awaits its result.
    */
   readonly publishHooks: Array<Effect.Effect<void>>;
+  /**
+   * How the fake PR service pushes, when set: with `throughDriver`, through the Git driver's own
+   * push bound to the target Factory checked, which refuses to push anywhere else.
+   */
+  readonly publishing: { throughDriver?: boolean | undefined };
+  /**
+   * Hands each process the server's Git driver starts to `before` first, when set, as
+   * `spawningThrough` does: a test can run Git as an older one would.
+   */
+  readonly gitProcesses: {
+    before?:
+      | ((command: ChildProcess.StandardCommand) => Effect.Effect<ChildProcess.StandardCommand>)
+      | undefined;
+  };
   /**
    * Run before each command Factory's services dispatch to the orchestrator (`before`), before
    * each thread shell they read from it (`beforeShell`), and before each interrupt they ask a
@@ -1273,10 +1553,16 @@ export const withProject = <A, E>(
     readonly limits?: { readonly maxFixRounds?: number; readonly maxReviewRounds?: number };
     /** The runtime modes the provider advertises; none, so it runs any, when absent. */
     readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
+    /** What the provider's host says of its modes; absent, as for any adapter but one. */
+    readonly hostPolicy?: HostPolicy;
     /** Model options Factory can select for its turns. */
     readonly providers?: ReadonlyArray<ServerProvider>;
+    /** The title of the item the project's source holds; the export button by default. */
+    readonly itemTitle?: string;
     /** Wraps the Work service the server runs with, to fail some of its calls. */
     readonly work?: (service: WorkServiceShape) => WorkServiceShape;
+    /** Wraps the provider registry Factory reads, to act while one of its reads runs. */
+    readonly wrapProviders?: ProviderRegistryWrapper;
     /** Factory's reactor runs only inside `world.boot`; see there. */
     readonly manualReactor?: boolean;
     /** The admission port Factory is built with, rebuilds included; its default otherwise. */
@@ -1311,8 +1597,12 @@ export const withProject = <A, E>(
     yield* fileSystem.makeDirectory(root);
     const provider = yield* makeFakeProvider;
     const pullRequestCalls: Array<PullRequestCall> = [];
+    const hostEnvironment: World["hostEnvironment"] = {};
     const worktreeRemovals: Array<VcsRemoveWorktreeInput> = [];
+    const hosted = hostedPullRequests();
     const publishHooks: Array<Effect.Effect<void>> = [];
+    const publishing: World["publishing"] = {};
+    const gitProcesses: World["gitProcesses"] = {};
     const factoryDispatch: World["factoryDispatch"] = {};
     const processes: World["processes"] = {};
     const setupScripts: World["setupScripts"] = {};
@@ -1321,15 +1611,20 @@ export const withProject = <A, E>(
       {
         provider,
         supportedRuntimeModes: options.supportedRuntimeModes,
+        hostPolicy: options.hostPolicy,
         providers: options.providers,
         pullRequestCalls,
         worktreeRemovals,
+        hostedPullRequests: hosted,
         publishHooks,
+        publishing,
+        gitProcesses,
         factoryDispatch,
         processes,
         setupScripts,
         commentCalls,
         wrapWork: options.work ?? ((service) => service),
+        wrapProviders: options.wrapProviders,
         manualReactor: options.manualReactor === true,
         admission: options.admission,
         handoff: options.handoff,
@@ -1337,6 +1632,7 @@ export const withProject = <A, E>(
         assistantFactory: options.assistantFactory,
         automaticTurnGate: options.automaticTurnGate === true,
         gateConsults: options.gateConsults,
+        hostEnvironment,
         root,
         t3Home,
         // One database for every build of the server, as a T3 home keeps across restarts.
@@ -1370,7 +1666,7 @@ export const withProject = <A, E>(
       });
       const item = yield* workService.createItem(owner, {
         sourceId: source.sourceId,
-        title: "Add the export button",
+        title: options.itemTitle ?? "Add the export button",
       });
       yield* git(root, ["add", "-A"]);
       yield* git(root, [...identity, "commit", "--no-verify", "-m", "docs: add the export task"]);
@@ -1503,9 +1799,13 @@ export const withProject = <A, E>(
         itemKey: item.key,
         itemTitle: item.title,
         rootStatus,
+        hostEnvironment,
         pullRequestCalls,
+        rewordPullRequest: hosted.reword,
         worktreeRemovals,
         publishHooks,
+        publishing,
+        gitProcesses,
         factoryDispatch,
         processes,
         setupScripts,

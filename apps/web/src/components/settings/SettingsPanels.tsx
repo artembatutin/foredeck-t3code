@@ -3145,6 +3145,15 @@ export function GeneralSettingsPanel() {
             />
           }
         />
+        <SettingsRow
+          title="Previous projects"
+          description="Reopen setup to find and import projects and conversations from Claude Code and Codex."
+          control={
+            <Button size="sm" variant="outline" onClick={() => void navigate({ to: "/welcome" })}>
+              Find previous projects
+            </Button>
+          }
+        />
       </SettingsSection>
 
       <SettingsSection id="confirmations" title="Confirmations">

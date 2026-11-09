@@ -73,15 +73,59 @@ describe("factoryFleet", () => {
       deliveryId: "b-waiting",
       projectId: projectB,
       itemRef: { sourceId, itemId: "item-b-waiting" },
+      // No source was read, so its id stands in for its title.
+      title: "item-b-waiting",
+      nextAction: {
+        title: "Waiting for your decision",
+        detail: "Factory is waiting for your decision.",
+        forYou: true,
+        readyForReview: false,
+      },
+      facts: [
+        { key: "source", label: "Work status", value: "Not available" },
+        { key: "queue", label: "Queue priority", value: "Not set" },
+        { key: "assignee", label: "Human assignee", value: "Not available" },
+        { key: "delivery", label: "Factory delivery", value: "Waiting for you · Plan approval" },
+      ],
       status: "Waiting for you",
       stage: "Plan approval",
       // The server sent no reason, so the shared fallback stands.
       needsYou: "Factory is waiting for your decision.",
+      branch: undefined,
+      updatedAt: "2026-10-26T09:00:00.000Z",
       readOnly: false,
     });
     expect(rows[1]!.needsYou).toBe("Verify failed twice with the same failure.");
     expect(rows[2]).toMatchObject({ status: "Running", stage: "Author", needsYou: undefined });
     expect(rows[3]).toMatchObject({ status: "PR open", needsYou: undefined });
+  });
+
+  it("names an item by what its source says, beside what its delivery says", () => {
+    const [row] = factoryFleet([
+      env(envA, [
+        delivery("a", "2026-10-26T10:00:00.000Z", {
+          status: "pr_open",
+          proceeding: false,
+          pullRequest: { number: 7, url: "https://github.com/acme/alpha/pull/7" },
+          queuePriority: 2,
+          source: {
+            key: "#7",
+            title: "Format durations",
+            status: "todo",
+            statusName: null,
+            assignee: "Sam",
+          },
+        }),
+      ]),
+    ]);
+    expect(row?.title).toBe("Format durations");
+    expect(row?.nextAction.title).toBe("Ready for your review");
+    expect(Object.fromEntries(row!.facts.map((fact) => [fact.label, fact.value]))).toEqual({
+      "Work status": "To do",
+      "Queue priority": "P2",
+      "Human assignee": "Sam",
+      "Factory delivery": "PR open",
+    });
   });
 
   it("orders ties the same whatever the input order", () => {

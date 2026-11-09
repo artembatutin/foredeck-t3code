@@ -57,8 +57,12 @@ function usageRecord(row: {
 const readDatabase = Effect.fn("devinUsage.readDatabase")(function* (sinceMs: number) {
   const sql = yield* SqlClient.SqlClient;
   yield* sql.unsafe("PRAGMA busy_timeout = 100");
+  // A node is stored after its message is created, so nodes stored more than a
+  // day (clock slack) before the window cannot hold window messages.
   const [range] = yield* sql.unsafe<{ first: number | null; last: number | null }>(
-    "SELECT MIN(row_id) AS first, MAX(row_id) AS last FROM message_nodes",
+    `SELECT (SELECT MIN(row_id) FROM message_nodes WHERE created_at >= ?) AS first,
+       MAX(row_id) AS last FROM message_nodes`,
+    [Math.floor(sinceMs / 1000) - 86_400],
   );
   const records: UsageRecord[] = [];
   const seen = new Set<string>();

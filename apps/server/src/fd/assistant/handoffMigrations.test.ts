@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import { ProjectId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
@@ -52,6 +53,7 @@ const HANDOFF_TABLES = [
   "fd_assistant_admissions",
   "fd_assistant_dispositions",
   "fd_assistant_grant_history",
+  "fd_assistant_review_receipts",
 ] as const;
 
 const toAssignment = "assignment_id -> fd_assistant_assignments.assignment_id";
@@ -62,8 +64,8 @@ const HANDOFF_KEYS = {
   fd_assistant_work_captures: { unique: ["capture_id", "project_id, idea_id"], foreignKeys: [] },
   fd_assistant_capture_events: { unique: ["capture_id, sequence"], foreignKeys: [] },
   fd_assistant_factory_links: {
-    unique: ["assignment_id", "delivery_id"],
-    foreignKeys: [toAssignment],
+    unique: ["assignment_id", "delivery_id", "receipt_id WHERE receipt_id IS NOT NULL"],
+    foreignKeys: [toAssignment, "receipt_id -> fd_assistant_review_receipts.receipt_id"],
   },
   fd_assistant_managed_roots: {
     unique: ["assignment_id WHERE state IN ('active', 'ending')", "root_delivery_id"],
@@ -95,6 +97,10 @@ const HANDOFF_KEYS = {
     foreignKeys: [toAssignment, toRoot],
   },
   fd_assistant_grant_history: { unique: [], foreignKeys: [] },
+  fd_assistant_review_receipts: {
+    unique: ["assignment_id, attempt", "receipt_id"],
+    foreignKeys: [toAssignment],
+  },
 };
 
 const keysOf = (table: string) =>
@@ -244,6 +250,9 @@ describe("runAssistantMigrations", () => {
       assert.deepStrictEqual(yield* HandoffMigrations.runAssistantMigrations(), [
         [1, "AssistantWorkCaptures"],
         [2, "AssistantFactoryHandoff"],
+        [3, "AssistantReviewReceipts"],
+        [4, "AssistantOwnerReview"],
+        [5, "AssistantReviewResumeTarget"],
       ]);
       assert.deepStrictEqual(yield* assistantLedger, assistantManifest);
       assert.deepStrictEqual(yield* coreLedger, core);
@@ -259,10 +268,12 @@ describe("runAssistantMigrations", () => {
           ["index", "fd_assistant_admission_demands_effect"],
           ["index", "fd_assistant_admission_demands_wake"],
           ["index", "fd_assistant_admissions_turn"],
+          ["index", "fd_assistant_factory_links_receipt"],
           ["index", "fd_assistant_grant_history_assignment"],
           ["index", "fd_assistant_managed_roots_live"],
           ["table", "fd_assistant_admission_demands"],
           ["table", "fd_assistant_admissions"],
+          ["table", "fd_assistant_brief_details"],
           ["table", "fd_assistant_capture_events"],
           ["table", "fd_assistant_dispositions"],
           ["table", "fd_assistant_factory_links"],
@@ -270,12 +281,18 @@ describe("runAssistantMigrations", () => {
           ["table", "fd_assistant_managed_roots"],
           ["table", "fd_assistant_migrations"],
           ["table", "fd_assistant_queue_positions"],
+          ["table", "fd_assistant_review_receipts"],
+          ["table", "fd_assistant_review_starts"],
           ["table", "fd_assistant_scheduler"],
           ["table", "fd_assistant_slots"],
           ["table", "fd_assistant_work_captures"],
           ["trigger", "fd_assistant_grant_history_bound"],
           ["trigger", "fd_assistant_managed_roots_kept"],
           ["trigger", "fd_assistant_managed_roots_moves"],
+          ["trigger", "fd_assistant_review_receipts_frozen"],
+          ["trigger", "fd_assistant_review_receipts_kept"],
+          ["trigger", "fd_assistant_review_starts_frozen"],
+          ["trigger", "fd_assistant_review_starts_kept"],
         ],
       );
       const keys: Record<string, unknown> = {};
@@ -292,6 +309,139 @@ describe("runAssistantMigrations", () => {
       assert.deepStrictEqual(yield* handoffRows, rows);
       assert.deepStrictEqual(yield* assistantLedger, assistantManifest);
       assert.deepStrictEqual(yield* coreLedger, core);
+    }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+  );
+});
+
+describe("the review receipts migration", () => {
+  it.effect("appends after a ledger at 2, keeping its links, each with no receipt", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* Migrator.make({})({
+        loader: Migrator.fromRecord(
+          Object.fromEntries(
+            HandoffMigrations.assistantMigrationEntries
+              .filter(([id]) => id <= 2)
+              .map(([id, name, migration]) => [`${id}_${name}`, migration]),
+          ),
+        ),
+        table: HandoffMigrations.ASSISTANT_MIGRATIONS_TABLE,
+      });
+      yield* sql`INSERT INTO fd_assistant_assignments ${sql.insert({
+        assignment_id: "a-1",
+        project_id: "project-1",
+        idea_id: "idea-1",
+        executor: "factory",
+        attempt: 1,
+        state: "cancelled",
+        worker_refs_json: "[]",
+        progress_json: "[]",
+        evidence_json: "[]",
+        created_at: "2026-10-29T12:00:00.000Z",
+        updated_at: "2026-10-29T12:00:00.000Z",
+      })}`;
+      yield* sql`INSERT INTO fd_assistant_factory_links ${sql.insert({
+        assignment_id: "a-1",
+        capture_id: "capture-1",
+        source_id: "source-1",
+        item_id: "item-1",
+        kind: "single",
+        scope_hash: "scope",
+        item_fingerprint: "fingerprint",
+        runtime_mode: "full-access",
+        delivery_id: "root-1",
+        control: "none",
+        created_at: "2026-10-29T12:00:00.000Z",
+        updated_at: "2026-10-29T12:00:00.000Z",
+      })}`;
+
+      assert.deepStrictEqual(yield* HandoffMigrations.runAssistantMigrations(), [
+        [3, "AssistantReviewReceipts"],
+        [4, "AssistantOwnerReview"],
+        [5, "AssistantReviewResumeTarget"],
+      ]);
+      const [link] = yield* sql<{
+        readonly delivery_id: string;
+        readonly receipt_id: string | null;
+      }>`SELECT delivery_id, receipt_id FROM fd_assistant_factory_links`;
+      assert.deepStrictEqual(link, { delivery_id: "root-1", receipt_id: null });
+    }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+  );
+
+  it.effect("keeps a receipt once stored, and lets one attempt have only one", () =>
+    Effect.gen(function* () {
+      yield* HandoffMigrations.runAssistantMigrations();
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`INSERT INTO fd_assistant_assignments ${sql.insert({
+        assignment_id: "a-1",
+        project_id: "project-1",
+        idea_id: "idea-1",
+        executor: "factory",
+        attempt: 1,
+        state: "queued",
+        worker_refs_json: "[]",
+        progress_json: "[]",
+        evidence_json: "[]",
+        created_at: "2026-10-29T12:00:00.000Z",
+        updated_at: "2026-10-29T12:00:00.000Z",
+      })}`;
+      const receipt = (receiptId: string) =>
+        sql`INSERT INTO fd_assistant_review_receipts ${sql.insert({
+          receipt_id: receiptId,
+          assignment_id: "a-1",
+          attempt: 1,
+          review_version: 1,
+          execution_json: "{}",
+          created_at: "2026-10-29T12:00:00.000Z",
+        })}`;
+      yield* receipt("receipt-1");
+
+      assert.strictEqual((yield* Effect.flip(receipt("receipt-2")))._tag, "SqlError");
+      const changed = sql`UPDATE fd_assistant_review_receipts SET review_version = 2`;
+      assert.strictEqual((yield* Effect.flip(changed))._tag, "SqlError");
+      const deleted = sql`DELETE FROM fd_assistant_review_receipts`;
+      assert.strictEqual((yield* Effect.flip(deleted))._tag, "SqlError");
+    }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+  );
+});
+
+describe("the owner review migration", () => {
+  it.effect("keeps every confirmation as it was recorded", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* HandoffMigrations.runAssistantMigrations();
+      yield* sql`INSERT INTO fd_assistant_assignments ${sql.insert({
+        assignment_id: "a-1",
+        project_id: "project-1",
+        idea_id: "idea-1",
+        executor: "factory",
+        attempt: 1,
+        state: "queued",
+        worker_refs_json: "[]",
+        progress_json: "[]",
+        evidence_json: "[]",
+        created_at: "2026-10-29T12:00:00.000Z",
+        updated_at: "2026-10-29T12:00:00.000Z",
+      })}`;
+      yield* sql`INSERT INTO fd_assistant_review_starts ${sql.insert({
+        request_id: "request-1",
+        project_id: "project-1",
+        idea_id: "idea-1",
+        review_version: "version",
+        receipt_id: "receipt-1",
+        assignment_id: "a-1",
+        attempt: 1,
+        numbered_version: 1,
+        kind: "attempt",
+        execution_json: "{}",
+        created_at: "2026-10-29T12:00:00.000Z",
+      })}`;
+      const update = sql`UPDATE fd_assistant_review_starts SET receipt_id = 'other'`;
+      const remove = sql`DELETE FROM fd_assistant_review_starts`;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(update)));
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(remove)));
+      const rows = yield* sql`SELECT request_id FROM fd_assistant_review_starts`;
+      assert.lengthOf(rows, 1);
     }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
   );
 });

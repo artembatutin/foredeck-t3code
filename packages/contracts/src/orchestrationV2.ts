@@ -1575,6 +1575,8 @@ export const OrchestrationV2TurnItem = Schema.Union([
     appName: Schema.optional(Schema.String),
     /** Approval choices advertised by the provider (#8058). */
     options: Schema.optional(Schema.Array(ProviderApprovalOption)),
+    /** Why the provider says it asks, when it says; absent means it gave no reason. */
+    reason: Schema.optional(Schema.String),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -2369,6 +2371,8 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     appName: Schema.optional(Schema.String),
     /** Approval choices advertised by the provider (#8058). */
     options: Schema.optional(Schema.Array(ProviderApprovalOption)),
+    /** Why the provider says it asks, when it says; absent means it gave no reason. */
+    reason: Schema.optional(Schema.String),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
@@ -3558,6 +3562,11 @@ export class OrchestrationV2DispatchCommandError extends Schema.TaggedError<Orch
     commandType: Schema.String,
     message: Schema.String,
     detail: Schema.optional(Schema.String),
+    /**
+     * This command id holds a rejected receipt, so the server refuses it for good: the command
+     * changed nothing, and another attempt needs another id. Older servers leave it out.
+     */
+    previouslyRejected: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}

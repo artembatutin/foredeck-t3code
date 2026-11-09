@@ -153,6 +153,34 @@ it.effect("routes GitHub remotes to the GitHub provider", () =>
   }),
 );
 
+it.effect("answers a pull request's target with the context the provider was detected by", () =>
+  Effect.gen(function* () {
+    // `git remote -v` reads nothing here, so only the bound context can name the repository.
+    const registry = yield* makeRegistry({
+      remotes: [{ name: "origin", url: "git@github.com:acme/web.git" }],
+    });
+    const { provider } = yield* registry.resolveHandle({ cwd: "/repo" });
+    if (provider.resolveChangeRequestRepository === undefined) {
+      return assert.fail("GitHub chooses its target, so it can name it.");
+    }
+    assert.strictEqual(
+      yield* provider.resolveChangeRequestRepository({ cwd: "/repo" }),
+      "github.com/acme/web",
+    );
+  }),
+);
+
+it.effect("leaves a pull request's target unanswered for a provider that cannot name it", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({
+      remotes: [{ name: "origin", url: "git@gitlab.com:acme/web.git" }],
+    });
+    const { provider } = yield* registry.resolveHandle({ cwd: "/repo" });
+    assert.strictEqual(provider.kind, "gitlab");
+    assert.isUndefined(provider.resolveChangeRequestRepository);
+  }),
+);
+
 it.effect("routes directly by provider kind for remote-first workflows", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry({

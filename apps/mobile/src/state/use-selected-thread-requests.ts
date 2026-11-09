@@ -319,6 +319,7 @@ export function useSelectedThreadRequests() {
         threadId: selectedThreadShell.id,
         requestId: activePendingUserInput.requestId,
         answers: activePendingUserInputAnswers,
+        responseCapability: activePendingUserInput.responseCapability,
         ...(attachmentsByQuestionId.size > 0
           ? { attachmentsByQuestionId: Object.fromEntries(attachmentsByQuestionId) }
           : {}),

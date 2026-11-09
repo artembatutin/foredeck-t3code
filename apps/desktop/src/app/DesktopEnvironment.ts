@@ -1,4 +1,9 @@
-import { isAssistantPreviewVersion, ASSISTANT_PREVIEW_HOME } from "@t3tools/shared/fd/assistant";
+import {
+  isAssistantPreviewVersion,
+  isUxPreviewVersion,
+  ASSISTANT_PREVIEW_HOME,
+  UX_PREVIEW_PRODUCT_NAME,
+} from "@t3tools/shared/fd/assistant";
 import { FOREDECK_PRODUCT_NAME } from "@t3tools/shared/fd/branding";
 import type {
   DesktopAppBranding,
@@ -12,7 +17,9 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 
+import { resolveUxPreviewHome } from "../fd/assistant/index.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopConfig from "./DesktopConfig.ts";
 import { resolveLinuxDesktopEntryName } from "./DesktopEarlyElectronStartup.ts";
@@ -30,7 +37,30 @@ export interface MakeDesktopEnvironmentInput {
   readonly isPackaged: boolean;
   readonly resourcesPath: string;
   readonly runningUnderArm64Translation: boolean;
+  /** The home a packaged UX preview's build metadata names; see `readUxPreviewBuildHome`. */
+  readonly uxPreviewHome?: string | undefined;
 }
+
+export class DesktopUxPreviewHomeRefusedError extends Schema.TaggedError<DesktopUxPreviewHomeRefusedError>()(
+  "DesktopUxPreviewHomeRefusedError",
+  {
+    reason: Schema.Literals(["missing-home", "conflicting-home", "development-origin"]),
+    home: Schema.NullOr(Schema.String),
+  },
+) {
+  override get message(): string {
+    if (this.reason === "missing-home") {
+      return "This UX preview build names no home of its own. Rebuild it with the UX preview build helper.";
+    }
+    const conflict =
+      this.reason === "conflicting-home"
+        ? "T3CODE_HOME names another home"
+        : "A development server origin is set";
+    return `${conflict}; this UX preview runs only on ${this.home ?? "its own home"}. Unset it, or start the preview with the UX preview launch helper.`;
+  }
+}
+
+export const isDesktopUxPreviewHomeRefusedError = Schema.is(DesktopUxPreviewHomeRefusedError);
 
 export class DesktopEnvironment extends Context.Service<
   DesktopEnvironment,
@@ -113,6 +143,11 @@ export function resolveDesktopAppBranding(input: {
   readonly appVersion: string;
 }): DesktopAppBranding {
   const stageLabel = resolveDesktopAppStageLabel(input);
+  // A UX preview goes by its product name, so neither About nor the runtime name (which Electron
+  // also gives its Keychain entry) reads as the everyday app's.
+  if (!input.isDevelopment && isUxPreviewVersion(input.appVersion)) {
+    return { baseName: UX_PREVIEW_PRODUCT_NAME, stageLabel, displayName: UX_PREVIEW_PRODUCT_NAME };
+  }
   return {
     baseName: APP_BASE_NAME,
     stageLabel,
@@ -152,12 +187,31 @@ function resolveDesktopRuntimeInfo(input: {
 
 const make = Effect.fn("desktop.environment.make")(function* (
   input: MakeDesktopEnvironmentInput,
-): Effect.fn.Return<DesktopEnvironment["Service"], Config.ConfigError, Path.Path> {
+): Effect.fn.Return<
+  DesktopEnvironment["Service"],
+  Config.ConfigError | DesktopUxPreviewHomeRefusedError,
+  Path.Path
+> {
   const path = yield* Path.Path;
   const config = yield* DesktopConfig.DesktopConfig;
   const homeDirectory = input.homeDirectory;
   const devServerUrl = config.devServerUrl;
   const isDevelopment = Option.isSome(devServerUrl);
+  // Decided before any path below exists, so a refused preview reads no state at all.
+  const uxPreview = resolveUxPreviewHome({
+    isPackaged: input.isPackaged,
+    appVersion: input.appVersion,
+    buildHome: input.uxPreviewHome,
+    inheritedHome: Option.getOrUndefined(config.t3Home),
+    developmentOrigin: isDevelopment,
+  });
+  if (uxPreview._tag === "Refused") {
+    return yield* new DesktopUxPreviewHomeRefusedError({
+      reason: uxPreview.reason,
+      home: uxPreview.home,
+    });
+  }
+  const t3Home = uxPreview._tag === "Home" ? Option.some(uxPreview.home) : config.t3Home;
   const appDataDirectory =
     input.platform === "win32"
       ? Option.getOrElse(config.appDataDirectory, () =>
@@ -169,7 +223,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
   const baseDir = resolveDesktopBaseDir({
     homeDirectory,
     joinPath: path.join,
-    t3Home: Option.orElse(config.t3Home, () =>
+    t3Home: Option.orElse(t3Home, () =>
       input.isPackaged && isAssistantPreviewVersion(input.appVersion)
         ? Option.some(path.join(homeDirectory, ASSISTANT_PREVIEW_HOME))
         : Option.none(),
@@ -190,7 +244,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
     baseDir,
     isDevelopment,
     joinPath: path.join,
-    t3Home: config.t3Home,
+    t3Home,
   });
   const linuxApplicationsDir = path.join(
     Option.getOrElse(config.xdgDataHome, () => path.join(homeDirectory, ".local", "share")),

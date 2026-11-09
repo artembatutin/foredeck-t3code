@@ -14,7 +14,7 @@ import {
   DEV_PROXIED_PATH_PREFIXES,
 } from "@t3tools/shared/devProxy";
 
-import { loadRepoEnv } from "../../scripts/lib/public-config";
+import { loadRepoEnv, resolveWebBuildOrigins } from "../../scripts/lib/public-config";
 import { thirdPartyLicensesPlugin } from "../../scripts/lib/third-party-licenses";
 import { tailwindPlugins } from "./vite/tailwind";
 
@@ -27,14 +27,12 @@ Object.assign(process.env, repoEnv);
 // a developer with either URL in their `.env` gets it back here. Baking it then
 // pins the client to localhost and breaks every non-localhost origin — the
 // exact failure single-origin mode exists to prevent, and an invisible one
-// since the page still loads.
-const isSingleOriginDev = process.env.T3CODE_SINGLE_ORIGIN_DEV === "1";
+// since the page still loads. The UX preview build sets it for the same reason.
+const { wsUrl: configuredWsUrl, httpUrl: configuredHttpUrl } = resolveWebBuildOrigins(process.env);
 
 const port = Number(process.env.PORT ?? 5733);
 const explicitHost = process.env.HOST?.trim();
 const host = explicitHost || "localhost";
-const configuredWsUrl = isSingleOriginDev ? undefined : process.env.VITE_WS_URL?.trim();
-const configuredHttpUrl = isSingleOriginDev ? undefined : process.env.VITE_HTTP_URL?.trim();
 const configuredRelayUrl = repoEnv.VITE_T3CODE_RELAY_URL?.trim() || "";
 const configuredClerkPublishableKey = repoEnv.VITE_CLERK_PUBLISHABLE_KEY?.trim() || "";
 const configuredClerkJwtTemplate = repoEnv.VITE_CLERK_JWT_TEMPLATE?.trim() || "";

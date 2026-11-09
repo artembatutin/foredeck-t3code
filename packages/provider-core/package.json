@@ -183,6 +183,10 @@
       "types": "./src/server/usageLimits.ts",
       "import": "./src/server/usageLimits.ts"
     },
+    "./fd/image-attachments": {
+      "types": "./src/fd/image-attachments/index.ts",
+      "import": "./src/fd/image-attachments/index.ts"
+    },
     "./fd/multirepo": {
       "types": "./src/fd/multirepo/index.ts",
       "import": "./src/fd/multirepo/index.ts"

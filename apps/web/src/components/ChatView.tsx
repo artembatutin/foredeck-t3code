@@ -12,6 +12,7 @@ import { RepositorySelector, openRepositoryFile, useRepositoryWorkspace } from "
 import { ThreadFind, ThreadFindCanvas, type ThreadFindControls } from "./chat/ThreadFindProvider";
 import { isAssistantThread } from "@t3tools/shared/fd/assistant";
 import { AssignmentsPanel } from "~/fd/assistant";
+import { composerRuntimeModeRefusal } from "~/fd/approvals";
 import { THREAD_FIND_BAR_RESERVED_HEIGHT } from "./chat/ThreadFindBar";
 import { usageLimitRecoveryBannerItem } from "./chat/UsageLimitRecoveryBanner";
 import {
@@ -1763,11 +1764,18 @@ export default function ChatView(props: ChatViewProps) {
   });
   const threadDetailLoading = threadSyncPhase === "loading";
   // Latest provider-reported context usage (#8144): the newest report wins;
-  // stale turns keep the meter alive between turns.
-  const activeThreadLiveTokenUsage = useMemo(
-    () => latestProviderTurnTokenUsage(serverProjection?.providerTurns ?? []),
-    [serverProjection?.providerTurns],
-  );
+  // stale turns keep the meter alive between turns. Only the active provider
+  // thread counts: after a provider switch, an earlier provider's last report
+  // would otherwise hide the new one's thread-level usage.
+  const activeProviderThreadId = serverProjection?.thread.activeProviderThreadId ?? null;
+  const activeThreadLiveTokenUsage = useMemo(() => {
+    const turns = serverProjection?.providerTurns ?? [];
+    return latestProviderTurnTokenUsage(
+      activeProviderThreadId === null
+        ? turns
+        : turns.filter((turn) => turn.providerThreadId === activeProviderThreadId),
+    );
+  }, [activeProviderThreadId, serverProjection?.providerTurns]);
   const serverVisibleTurnItems = useThreadVisibleTurnItems(routeThreadDetailRef);
   const serverThreadHistory = useThreadHistory(routeThreadDetailRef);
   const threadHistoryControls = useMemo<MessagesTimelineHistoryControls | undefined>(() => {
@@ -9501,7 +9509,9 @@ export default function ChatView(props: ChatViewProps) {
         setThreadError(threadIdForSend, `Provider for ${selection.model} is unavailable.`);
         return;
       }
-      const providerBlockReason = getAntigravitySendBlockReason(provider.snapshot, selection.model);
+      const providerBlockReason =
+        getAntigravitySendBlockReason(provider.snapshot, selection.model) ??
+        composerRuntimeModeRefusal({ provider: provider.snapshot, runtimeMode })?.summary;
       if (providerBlockReason) {
         setThreadError(threadIdForSend, providerBlockReason);
         return;
@@ -10396,6 +10406,7 @@ export default function ChatView(props: ChatViewProps) {
           threadId: activeThreadId,
           requestId,
           answers: providerAnswers,
+          responseCapability: pendingInput.responseCapability,
           ...(attachmentsByQuestionId.size > 0
             ? { attachmentsByQuestionId: Object.fromEntries(attachmentsByQuestionId) }
             : {}),

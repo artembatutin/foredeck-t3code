@@ -1,17 +1,27 @@
 import { assert, describe, it } from "@effect/vitest";
-import type { RunId, RuntimeRequestId } from "@t3tools/contracts";
+import {
+  AuthWorkReadScope,
+  AuthWorkWriteScope,
+  ProviderInstanceId,
+  type RunId,
+  type RuntimeRequestId,
+} from "@t3tools/contracts";
+import { workItemScopeChanged } from "@t3tools/contracts/fd/work-management";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 
 import * as AutomaticTurnGate from "../../orchestration-v2/AutomaticTurnGate.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import { HandoffAdmission, ProjectAssistant } from "../assistant/index.ts";
+import { WorkService } from "../work-management/index.ts";
 import * as Factory from "./index.ts";
 import {
   drainFactory,
   drainOrchestration,
   fakePullRequest,
   stateOf,
+  threadProjection,
   verifyCommands,
   withProject,
   authorCommits,
@@ -58,6 +68,15 @@ import {
  */
 
 const factoryService = Factory.FactoryService.FactoryService;
+const WorkManagementService = WorkService.WorkService;
+/** The owner reading the item, as their client does. */
+const workOwner = {
+  id: "session:owner",
+  grants: [AuthWorkReadScope],
+  label: "owner",
+};
+/** The owner editing the item in Work. */
+const workWriter = { ...workOwner, grants: [AuthWorkReadScope, AuthWorkWriteScope] };
 
 type Spy = ReturnType<typeof spyOnFactoryPort>;
 const options = (spy: Spy) => ({
@@ -305,6 +324,264 @@ describe("a Factory assignment followed through its delivery", () => {
             failing.on
               ? Effect.die("The task file could not be written.")
               : service.setStatus(actor, input),
+        }),
+      },
+    );
+  });
+});
+
+describe("what a delivery's status shows on the real stack", () => {
+  const WRITES = ["createItem", "updateItem", "setStatus", "addComment", "setLink"] as const;
+
+  it.live(
+    "reads a To do item's open delivery as separate facts, writing nothing to show them",
+    () => {
+      const spy = spyOnFactoryPort();
+      const writes: Array<string> = [];
+      return withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const assistant = yield* ProjectAssistant.ProjectAssistant;
+            yield* startAssistantThread(world);
+            const root = yield* claimed(world, "export");
+            yield* assistant.revise({
+              projectId: world.projectId,
+              ideaId: "export",
+              patch: { priority: { rank: 1, reason: "First" } },
+            });
+            const opened = yield* runToPullRequest(world, root);
+            yield* tick;
+            yield* drainFactory;
+
+            const factory = yield* factoryService;
+            const before = [...writes];
+            const messagesBefore = (yield* threadProjection(opened.threadId)).messages.length;
+
+            const { assignments } = yield* assistant.overview;
+            const [row] = assignments;
+            assert.strictEqual(row?.factory?.status, "pr_open");
+            assert.strictEqual(row?.factory?.pullRequestUrl, fakePullRequest.url);
+            assert.isFalse(row?.factory?.proceeding);
+            assert.strictEqual(row?.priority, 1);
+            assert.strictEqual(row?.source?.status, "todo");
+            assert.isNull(row?.source?.assignee);
+
+            const [listed] = yield* factory.listForClients({});
+            assert.strictEqual(listed?.state.status, "pr_open");
+            assert.strictEqual(listed?.source?.status, "todo");
+            assert.strictEqual(listed?.queuePriority, 1);
+
+            const work = yield* WorkManagementService;
+            const item = yield* work.getItem(workOwner, { ref: listed!.itemRef });
+            assert.strictEqual(item.status, "todo");
+            assert.isNull(item.assignee);
+
+            // Reading all of that wrote to no source and sent no thread a message.
+            assert.deepStrictEqual(writes, before);
+            assert.strictEqual(
+              (yield* threadProjection(opened.threadId)).messages.length,
+              messagesBefore,
+            );
+
+            // Factory's own progress comments are not changed requirements on either link.
+            for (const link of item.links) assert.isFalse(workItemScopeChanged(link, item));
+            assert.isAbove(item.links.length, 0);
+          }),
+        {
+          ...options(spy),
+          work: (service) => {
+            const spied = { ...service };
+            for (const name of WRITES) {
+              const write = service[name] as (
+                ...args: ReadonlyArray<unknown>
+              ) => Effect.Effect<never>;
+              (spied as Record<string, unknown>)[name] = (...args: ReadonlyArray<unknown>) =>
+                Effect.suspend(() => {
+                  writes.push(name);
+                  return write(...args);
+                });
+            }
+            return spied;
+          },
+        },
+      );
+    },
+  );
+
+  it.live("reads a listing's new facts when its item or rank changes, the delivery idle", () => {
+    const spy = spyOnFactoryPort();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const assistant = yield* ProjectAssistant.ProjectAssistant;
+          const factory = yield* factoryService;
+          const work = yield* WorkManagementService;
+          yield* startAssistantThread(world);
+          const root = yield* claimed(world, "export");
+          yield* runToPullRequest(world, root);
+          yield* tick;
+          yield* drainFactory;
+
+          const epoch = factory.listingChanges.pipe(Stream.runHead, Effect.map(Option.getOrThrow));
+          const listed = Effect.map(factory.listForClients({}), ([delivery]) => delivery!);
+          const { itemRef } = yield* listed;
+          const idle = () =>
+            Effect.gen(function* () {
+              const { state } = yield* listed;
+              assert.strictEqual(state.status, "pr_open");
+              assert.isNull(state.awaiting);
+            });
+          yield* idle();
+          const factoryEpoch = factory.subscribe.pipe(
+            Stream.runHead,
+            Effect.map(Option.getOrThrow),
+          );
+          const factoryAtStart = yield* factoryEpoch;
+
+          // A source-only edit: Factory itself writes nothing, and its own epoch stays put.
+          const beforeStatus = yield* epoch;
+          yield* work.setStatus(workWriter, { ref: itemRef, status: "in_progress" });
+          assert.isAbove(yield* epoch, beforeStatus);
+          assert.strictEqual((yield* listed).source?.status, "in_progress");
+
+          const beforeAssignee = yield* epoch;
+          yield* work.updateItem(workWriter, { ref: itemRef, assignee: "sam" });
+          assert.isAbove(yield* epoch, beforeAssignee);
+          assert.strictEqual((yield* listed).source?.assignee, "sam");
+
+          // The assistant's rank, through the service its owner and agents revise it with.
+          const beforeRank = yield* epoch;
+          yield* assistant.revise({
+            projectId: world.projectId,
+            ideaId: "export",
+            patch: { priority: { rank: 4, reason: "Later" } },
+          });
+          assert.isAbove(yield* epoch, beforeRank);
+          assert.strictEqual((yield* listed).queuePriority, 4);
+
+          yield* idle();
+          assert.strictEqual(yield* factoryEpoch, factoryAtStart);
+        }),
+      options(spy),
+    );
+  });
+
+  /** A ranked idea's delivery, run to its open pull request; returns what reads its facts. */
+  const rankedToPullRequest = (world: World) =>
+    Effect.gen(function* () {
+      const assistant = yield* ProjectAssistant.ProjectAssistant;
+      const factory = yield* factoryService;
+      yield* startAssistantThread(world);
+      const root = yield* claimed(world, "export");
+      yield* assistant.revise({
+        projectId: world.projectId,
+        ideaId: "export",
+        patch: { priority: { rank: 1, reason: "First" } },
+      });
+      const opened = yield* runToPullRequest(world, root);
+      yield* tick;
+      return {
+        root,
+        opened,
+        rankOf: (deliveryId: string) =>
+          Effect.map(
+            factory.listForClients({}),
+            (deliveries) =>
+              deliveries.find((delivery) => delivery.deliveryId === deliveryId)?.queuePriority,
+          ),
+        overviewRank: Effect.map(assistant.overview, ({ assignments }) => assignments[0]?.priority),
+      };
+    });
+
+  it.live.each(["merged", "closed"] as const)(
+    "keeps the rank of a delivery whose pull request %s, the same as the assistant's",
+    (outcome) => {
+      const spy = spyOnFactoryPort();
+      return withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const { root, opened, rankOf, overviewRank } = yield* rankedToPullRequest(world);
+            yield* syncPullRequest(
+              opened.threadId,
+              yield* linkOf(opened.threadId, fakePullRequest.number),
+              outcome,
+            );
+            yield* drainFactory;
+            assert.strictEqual(
+              (yield* stateOf(root)).status,
+              outcome === "merged" ? "done" : "cancelled",
+            );
+            yield* tick;
+            assert.strictEqual((yield* managedRootOf(root))?.state, "retired");
+
+            assert.strictEqual(yield* rankOf(root), 1);
+            assert.strictEqual(yield* overviewRank, 1);
+
+            // Its idea's rank moves on, and both go on reading the same.
+            const assistant = yield* ProjectAssistant.ProjectAssistant;
+            yield* assistant.revise({
+              projectId: world.projectId,
+              ideaId: "export",
+              patch: { priority: { rank: 3, reason: "Later" } },
+            });
+            assert.strictEqual(yield* rankOf(root), 3);
+            assert.strictEqual(yield* overviewRank, 3);
+          }),
+        options(spy),
+      );
+    },
+  );
+
+  it.live("keeps the rank of a delivery a retry left behind, whose link names it no more", () => {
+    const spy = spyOnFactoryPort();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const { root, rankOf } = yield* rankedToPullRequest(world);
+          yield* controlAssignment("export", "cancel");
+          yield* drainFactory;
+          assert.strictEqual((yield* stateOf(root)).status, "cancelled");
+          yield* tick;
+          assert.strictEqual((yield* assignmentOf("export")).state, "cancelled");
+
+          // Queued again, it has no delivery yet: Work still shows the cancelled one.
+          yield* controlAssignment("export", "retry");
+          assert.strictEqual(yield* rankOf(root), 1);
+
+          yield* tick;
+          const next = yield* rootIdOf("export");
+          assert.notStrictEqual(next, root);
+          assert.strictEqual(yield* rankOf(root), 1);
+          assert.strictEqual(yield* rankOf(next), 1);
+        }),
+      options(spy),
+    );
+  });
+
+  it.live("shows the rest of the overview when a Work source cannot answer", () => {
+    const spy = spyOnFactoryPort();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          yield* startAssistantThread(world);
+          yield* claimed(world, "export");
+          const { assignments } = yield* Effect.flatMap(
+            ProjectAssistant.ProjectAssistant,
+            (assistant) => assistant.overview,
+          );
+          assert.strictEqual(assignments[0]?.assignmentId, "export");
+          assert.notProperty(assignments[0], "source");
+        }),
+      {
+        ...options(spy),
+        work: (service) => ({
+          ...service,
+          currentSummaries: () => Effect.die("The tracker is down."),
         }),
       },
     );
@@ -650,6 +927,81 @@ describe("a Factory assignment revoked mid-delivery", () => {
           yield* drainFactory;
           yield* reviewPasses(world, root);
           assert.strictEqual((yield* stateOf(root)).status, "pr_open");
+        }),
+      options(spy),
+    );
+  });
+});
+
+describe("a Factory assignment with no review receipt", () => {
+  it.live("still retries into a new delivery once cancelled, as it always has", () => {
+    const spy = spyOnFactoryPort();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          yield* startAssistantThread(world);
+          const root = yield* claimed(world, "export");
+          const author = yield* world.launched(root);
+          assert.notProperty(yield* stateOf(root), "reviewedExecution");
+          yield* controlAssignment("export", "cancel");
+          yield* drainFactory;
+          yield* world.endRun(author.runId, "cancelled");
+          yield* tick;
+          assert.strictEqual((yield* assignmentOf("export")).state, "cancelled");
+
+          const retried = yield* controlAssignment("export", "retry");
+          assert.strictEqual(retried.state, "queued");
+          assert.strictEqual(retried.attempt, 2);
+          yield* tick;
+          assert.notStrictEqual(yield* rootIdOf("export"), root);
+        }),
+      options(spy),
+    );
+  });
+
+  it.live("still takes a fresh assignment id once cancelled, starting it exactly once", () => {
+    const spy = spyOnFactoryPort();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          yield* startAssistantThread(world);
+          const root = yield* claimed(world, "export");
+          const author = yield* world.launched(root);
+          yield* controlAssignment("export", "cancel");
+          yield* drainFactory;
+          yield* world.endRun(author.runId, "cancelled");
+          yield* tick;
+          assert.strictEqual((yield* assignmentOf("export")).state, "cancelled");
+
+          const fresh = {
+            assignmentId: "export-again",
+            projectId: world.projectId,
+            ideaId: "export",
+            executor: "factory",
+            managerThreadId: assistantThread,
+            modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            looperConfig: null,
+          } as const;
+          const assistant = yield* ProjectAssistant.ProjectAssistant;
+          assert.strictEqual((yield* assistant.enqueue(fresh)).state, "queued");
+          // A repeat of the same request is the same assignment.
+          assert.strictEqual((yield* assistant.enqueue(fresh)).state, "queued");
+          yield* tick;
+
+          const started = yield* rootIdOf("export-again");
+          assert.notStrictEqual(started, root);
+          assert.notProperty(yield* stateOf(started), "reviewedExecution");
+          const factory = yield* factoryService;
+          assert.lengthOf(yield* factory.list({ projectId: world.projectId }), 2);
+          assert.isFalse(
+            yield* Effect.flatMap(HandoffAdmission.HandoffAdmission, (admission) =>
+              admission.ideaReviewed({ projectId: world.projectId, ideaId: "export" }),
+            ),
+          );
         }),
       options(spy),
     );

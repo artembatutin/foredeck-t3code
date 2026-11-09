@@ -38,10 +38,12 @@ import * as ThreadManagement from "../../orchestration-v2/ThreadManagementServic
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProcessRunner from "../../processRunner.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
+import * as PullRequestService from "../../pullRequest/PullRequestService.ts";
 import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerActivation from "../../serverActivation.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as SourceControlProviderRegistry from "../../sourceControl/SourceControlProviderRegistry.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as Work from "../work-management/index.ts";
 import * as FactoryAdmission from "./FactoryAdmission.ts";
@@ -128,6 +130,7 @@ const serverServices = Layer.mergeAll(
         Effect.andThen(Effect.die("Factory must not open a pull request here.")),
       ),
   }),
+  Layer.mock(PullRequestService.PullRequestService)({}),
   Layer.mock(ServerSettings.ServerSettingsService)({}),
   Layer.mock(GitVcsDriver.GitVcsDriver)({}),
   ProviderRegistryMock.layer(),
@@ -147,6 +150,11 @@ const factoryLayersOverGate = (activation: Deferred.Deferred<void>) =>
     Layer.provideMerge(Factory.layerLive),
     Layer.provideMerge(RuntimeLayer.layerEventSink),
     Layer.provide(serverServices),
+    Layer.provide(
+      Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+        resolveLink: () => undefined,
+      }),
+    ),
     Layer.provide(Layer.succeed(ServerActivation.ServerActivation, Deferred.await(activation))),
   );
 const factoryLayers = (activation: Deferred.Deferred<void>) =>

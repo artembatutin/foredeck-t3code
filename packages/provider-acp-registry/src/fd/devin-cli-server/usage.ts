@@ -46,6 +46,8 @@ export function normalizeDevinUsage(
   const cost = reportedCreditCost(meta["cognition.ai/responseDimensions"], "session");
   return {
     ...usage,
+    // Devin starts native compactions itself; see `devinCompaction`.
+    compactsAutomatically: true,
     ...(input === undefined ? {} : { lastInputTokens: input }),
     ...(output === undefined ? {} : { lastOutputTokens: output }),
     ...(cached === undefined ? {} : { lastCachedInputTokens: cached }),
@@ -53,27 +55,47 @@ export function normalizeDevinUsage(
   };
 }
 
-/** Observed local completion stats carry per-turn usage before session/prompt returns. */
-export const registerDevinUsage = (context: AcpAdapterV2ExtensionContext) =>
-  context.runtime.handleExtNotification(
-    "_cognition.ai/agent_stopped",
-    Schema.Struct({ sessionId: Schema.String, stats: Schema.Unknown }),
-    (notice) => {
-      const stats = record(notice.stats);
-      const cost = reportedCreditCost(stats.responseDimensions, "turn");
-      const input = count(stats.inputTokens),
-        output = count(stats.outputTokens),
-        tools = count(stats.toolCalls),
-        duration = count(stats.totalTimeMs);
-      return context.reportUsage({
-        sessionId: notice.sessionId,
-        usage: {
-          ...(input === undefined ? {} : { lastInputTokens: input }),
-          ...(output === undefined ? {} : { lastOutputTokens: output }),
-          ...(tools === undefined ? {} : { toolUses: tools }),
-          ...(duration === undefined ? {} : { durationMs: duration }),
-          ...(cost ? { cost } : {}),
+function turnUsage(stats: unknown): Partial<ThreadTokenUsageSnapshot> {
+  const row = record(stats);
+  const cost = reportedCreditCost(row.responseDimensions, "turn");
+  const input = count(row.inputTokens),
+    output = count(row.outputTokens),
+    tools = count(row.toolCalls),
+    duration = count(row.totalTimeMs);
+  return {
+    ...(input === undefined ? {} : { lastInputTokens: input }),
+    ...(output === undefined ? {} : { lastOutputTokens: output }),
+    ...(tools === undefined ? {} : { toolUses: tools }),
+    ...(duration === undefined ? {} : { durationMs: duration }),
+    ...(cost ? { cost } : {}),
+  };
+}
+
+/**
+ * Observed local completion stats carry per-turn usage before session/prompt returns.
+ * A later `usage_update` replaces the whole snapshot, so the last turn's stats are
+ * kept per session and fill whatever that update leaves out; a reported session
+ * cost still wins over the last turn's.
+ */
+export function makeDevinUsage() {
+  const lastTurnBySession = new Map<string, Partial<ThreadTokenUsageSnapshot>>();
+  return {
+    normalizeUsage: (
+      notification: Acp.SessionNotification,
+      usage: ThreadTokenUsageSnapshot,
+    ): ThreadTokenUsageSnapshot => ({
+      ...lastTurnBySession.get(notification.sessionId),
+      ...normalizeDevinUsage(notification, usage),
+    }),
+    registerExtensions: (context: AcpAdapterV2ExtensionContext) =>
+      context.runtime.handleExtNotification(
+        "_cognition.ai/agent_stopped",
+        Schema.Struct({ sessionId: Schema.String, stats: Schema.Unknown }),
+        (notice) => {
+          const usage = turnUsage(notice.stats);
+          lastTurnBySession.set(notice.sessionId, usage);
+          return context.reportUsage({ sessionId: notice.sessionId, usage });
         },
-      });
-    },
-  );
+      ),
+  };
+}

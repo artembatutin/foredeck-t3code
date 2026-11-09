@@ -2990,6 +2990,16 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         yield* answer(4, "file-change", "accept");
         yield* awaitUntil(() => harness.terminalEvents().length === 3, "turn 3");
         assert.lengthOf(requests(), 4);
+        // Each says what it can answer, so no client has to offer a session choice on a guess.
+        const offered = harness.events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "approval_request"
+            ? [event.turnItem.options?.map((option) => option.decision)]
+            : [],
+        );
+        assert.isNotEmpty(offered);
+        for (const decisions of offered) {
+          assert.deepEqual(decisions, ["cancel", "decline", "acceptForSession", "accept"]);
+        }
       }).pipe(
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),

@@ -374,11 +374,30 @@ export const WorkThreadLink = Schema.Struct({
     mode: ForwardCompatibleOptional(WorkThreadMode),
     /** Work moved the item to `in_progress` on start, so a failed run may offer to undo it. */
     autoStarted: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+    /**
+     * What the item said when the thread was linked, as its detail's `scopeFingerprint` reads it.
+     * Written once with the link. Links stored before it have none.
+     */
+    scopeFingerprint: Schema.optionalKey(Schema.String),
   }),
   /** The last terminal run outcome the server saw: the item-side trace of a stop or failure. */
   run: Schema.NullOr(Schema.Struct({ status: Schema.String, at: IsoDateTime })),
 });
 export type WorkThreadLink = typeof WorkThreadLink.Type;
+
+/**
+ * Whether what the item asks for changed since the thread was linked to it. Only a title or body
+ * edit moves a fingerprint: a comment, Notes, a status or an assignee moves the revision alone, and
+ * the revision stays what a write is guarded by. Without both fingerprints there is nothing to
+ * compare, so a link stored before they existed never claims a change.
+ */
+export const workItemScopeChanged = (
+  link: { readonly snapshot: { readonly scopeFingerprint?: string | undefined } },
+  item: { readonly scopeFingerprint?: string | undefined },
+): boolean =>
+  link.snapshot.scopeFingerprint !== undefined &&
+  item.scopeFingerprint !== undefined &&
+  link.snapshot.scopeFingerprint !== item.scopeFingerprint;
 
 export const WorkItemChild = Schema.Struct({
   itemId: WorkItemId,
@@ -404,6 +423,11 @@ export const WorkItemDetail = Schema.Struct({
   capabilities: WorkSourceCapabilities,
   /** The Markdown file's project-relative path. */
   locator: Schema.optionalKey(Schema.String),
+  /**
+   * A hash of all the item says without its comments, however much of it `body` holds. Absent from
+   * older servers, and while its source cannot read it cleanly (`invalid`).
+   */
+  scopeFingerprint: Schema.optionalKey(Schema.String),
 });
 export type WorkItemDetail = typeof WorkItemDetail.Type;
 

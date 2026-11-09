@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import {
   WorkItemId,
   WorkSourceId,
@@ -7,6 +7,7 @@ import {
 } from "@t3tools/contracts/fd/work-management";
 
 import {
+  changedSinceLink,
   defaultWorkWorkspace,
   itemInView,
   linkPrompts,
@@ -15,9 +16,12 @@ import {
   runStateOf,
   type WorkThreadShell,
   workBranchPreview,
+  workItemLinkTarget,
+  workItemOwningProject,
   workItemReferenceText,
   writeWorkListPreferences,
 } from "./model.ts";
+import { workViewStatuses } from "./paging.ts";
 
 const sourceId = WorkSourceId.make("6f9b1c2e-3d4a-4b5c-8d6e-7f8091a2b3c4");
 const ref = { sourceId, itemId: WorkItemId.make("fd-7k3qa2") };
@@ -72,6 +76,104 @@ describe("itemInView", () => {
     expect(itemInView("active", todo, ["needs-input"])).toBe(true);
     expect(itemInView("done", { status: "cancelled", blocked: false }, [])).toBe(true);
     expect(itemInView("all", { status: "unknown", blocked: true }, [])).toBe(true);
+  });
+});
+
+describe("workItemLinkTarget", () => {
+  const target = (environmentId: string) =>
+    workItemLinkTarget({
+      environmentId: EnvironmentId.make(environmentId),
+      projectId: ProjectId.make("project-a"),
+      ref,
+    });
+
+  it("names the exact project of each environment, the item and the All view", () => {
+    expect(target("env-a")).toEqual({
+      to: "/work",
+      search: {
+        project: "env-a:project-a",
+        item: `${sourceId}:fd-7k3qa2`,
+        view: "all",
+      },
+    });
+    expect(target("env-b")).toEqual({
+      to: "/work",
+      search: {
+        project: "env-b:project-a",
+        item: `${sourceId}:fd-7k3qa2`,
+        view: "all",
+      },
+    });
+  });
+
+  it("opens a view that shows what Ready hides, and asks the server for every status", () => {
+    const { view } = target("env-a").search;
+    const active = { status: "todo", blocked: false } as const;
+    const inProgress = { status: "in_progress", blocked: false } as const;
+    const done = { status: "done", blocked: false } as const;
+    const cancelled = { status: "cancelled", blocked: false } as const;
+    const captured = { status: "todo", blocked: false } as const;
+
+    expect(itemInView("ready", active, ["working"])).toBe(false);
+    expect(itemInView("ready", inProgress, [])).toBe(false);
+    expect(itemInView("ready", done, [])).toBe(false);
+
+    expect(itemInView(view, active, ["working"])).toBe(true);
+    expect(itemInView(view, inProgress, [])).toBe(true);
+    expect(itemInView(view, done, [])).toBe(true);
+    expect(itemInView(view, cancelled, [])).toBe(true);
+    expect(itemInView(view, captured, [])).toBe(true);
+    expect(workViewStatuses(view)).toBeUndefined();
+  });
+});
+
+describe("workItemOwningProject", () => {
+  const owner = ProjectId.make("item-project");
+  const elsewhere = WorkSourceId.make("7e2aa85e-9347-44ce-b019-cb8dfd365b20");
+
+  it("reads the project from the item's source, whichever others are listed", () => {
+    expect(
+      workItemOwningProject(
+        [
+          { sourceId: elsewhere, projectId: ProjectId.make("thread-project") },
+          { sourceId, projectId: owner },
+        ],
+        ref,
+      ),
+    ).toBe(owner);
+  });
+
+  it("names no project for a source it does not hold, rather than guess", () => {
+    expect(workItemOwningProject([], ref)).toBeUndefined();
+    expect(workItemOwningProject([{ sourceId: elsewhere, projectId: owner }], ref)).toBeUndefined();
+  });
+});
+
+describe("changedSinceLink", () => {
+  const baselined = (scopeFingerprint: string) =>
+    link({
+      snapshot: {
+        key: "fd-7k3qa2",
+        title: "T",
+        status: "todo",
+        url: null,
+        revision: "r1",
+        autoStarted: false,
+        scopeFingerprint,
+      },
+    });
+
+  it("reads what the item says, not its revision, which every comment and status moves", () => {
+    expect(changedSinceLink(baselined("scope"), { scopeFingerprint: "scope" })).toBe(false);
+    expect(changedSinceLink(baselined("scope"), { scopeFingerprint: "edited" })).toBe(true);
+  });
+
+  it("never claims a change for a link stored without a baseline", () => {
+    expect(changedSinceLink(link(), { scopeFingerprint: "edited" })).toBe(false);
+  });
+
+  it("claims none from an older server that sends no fingerprint", () => {
+    expect(changedSinceLink(baselined("scope"), {})).toBe(false);
   });
 });
 

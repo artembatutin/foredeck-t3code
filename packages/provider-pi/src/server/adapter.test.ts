@@ -2991,6 +2991,11 @@ describe("PiAdapterV2", () => {
       );
       if (pending.type !== "turn_item.updated" || pending.turnItem.type !== "approval_request")
         return;
+      assert.deepEqual(
+        pending.turnItem.options?.map((option) => option.decision),
+        ["cancel", "decline", "acceptForSession", "accept"],
+        "the choices are the confirm dialog's and T3's own session rule",
+      );
       const requestId = pending.turnItem.requestId;
       yield* TestClock.adjust(Duration.seconds(1));
       yield* takeEvent(

@@ -155,6 +155,34 @@ describe("work MCP tools", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("says an item changed for an edit of what it asks, and not for a comment", () =>
+    Effect.gen(function* () {
+      const { call, item } = yield* setup({ runtimeMode: "full-access" });
+      yield* call("work_start_thread", { item: refOf(item), mode: "plan" });
+      const changed = call("work_read", { item: refOf(item) }).pipe(
+        Effect.map(({ result }) => {
+          const read = result as {
+            readonly revision: string;
+            readonly links: ReadonlyArray<{ readonly changedSinceStart: boolean }>;
+          };
+          return { revision: read.revision, flag: read.links[0]?.changedSinceStart, read };
+        }),
+      );
+      assert.isFalse((yield* changed).flag);
+      assert.notProperty((yield* changed).read, "scopeFingerprint");
+      yield* call("work_comment", { item: refOf(item), body: "Progress." });
+      assert.isFalse((yield* changed).flag);
+      yield* call("work_update", { item: refOf(item), priority: "high" });
+      assert.isFalse((yield* changed).flag);
+      yield* call("work_update", {
+        item: refOf(item),
+        title: "Ship it soon",
+        expectedRevision: (yield* changed).revision,
+      });
+      assert.isTrue((yield* changed).flag);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("signs agent comments and disarms bot handles", () =>
     Effect.gen(function* () {
       const { call, item, markdown } = yield* setup({ runtimeMode: "full-access" });

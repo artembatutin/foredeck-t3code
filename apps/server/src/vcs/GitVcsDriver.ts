@@ -193,6 +193,18 @@ export interface GitPushResult {
   setUpstream?: boolean | undefined;
 }
 
+/** The remote a branch push goes to, the branch it lands on there and where Git sends it. */
+export interface GitPushTarget {
+  readonly remoteName: string;
+  readonly branch: string;
+  /**
+   * Every URL a push to the remote goes to, in Git's order, as `git remote get-url --push --all`
+   * reports them: with its URL rewrites applied once, as the push applies them. A remote name alone
+   * says nothing of these, since an edited push URL or rewrite rule keeps the name.
+   */
+  readonly pushUrls: ReadonlyArray<string>;
+}
+
 export interface GitRangeContext {
   commitSummary: string;
   diffSummary: string;
@@ -337,8 +349,44 @@ export class GitVcsDriver extends Context.Service<
          * while the push runs is never published. A remote branch it would rewind is refused.
          */
         readonly commitSha?: string;
+        /**
+         * Push to exactly this target, the one a caller read with `resolvePushTarget` and checked:
+         * refuse before writing anything unless the push resolves to it, push to its push URLs and
+         * no others, whatever a remote, push URL or URL rewrite says by then, and fail afterwards
+         * when the push no longer resolves to it. Both refusals' reason is `push_target_changed`.
+         * A Git that cannot be held to those URLs (before 2.46) is refused before writing anything,
+         * with the reason `push_target_unpinnable`.
+         */
+        readonly expectedTarget?: GitPushTarget;
       },
     ) => Effect.Effect<GitPushResult, GitCommandError>;
+    /**
+     * Where `pushCurrentBranch` would push the checked-out branch (or `fallbackBranch` on a
+     * detached HEAD), decided as it decides, with the push URLs of that remote; null when it would
+     * name no target: no remote, a remote with no URL, or an upstream it cannot read, which it
+     * leaves to a bare `git push`. Fails when the URLs cannot all be read. Reads only, and never
+     * fetches.
+     */
+    readonly resolvePushTarget: (
+      cwd: string,
+      fallbackBranch: string | null,
+    ) => Effect.Effect<GitPushTarget | null, GitCommandError>;
+    /**
+     * A repository argument for Git commands in `cwd` that reaches exactly `url`, as a target's push
+     * URLs come, with the environment to run those commands under. Git rewrites a URL each time it
+     * is handed one, so handing `url` back could reach another repository, and a rewrite rule
+     * added between two commands would move the second. Under this, no setting of the
+     * repository's, then or later, can. It names no configured remote, so a fetch maps no ref
+     * through one. Null when this Git does not resolve it to `url` (one before 2.31 ignores the
+     * environment). Reads only.
+     */
+    readonly pinUrl: (
+      cwd: string,
+      url: string,
+    ) => Effect.Effect<
+      { readonly repository: string; readonly env: NodeJS.ProcessEnv } | null,
+      GitCommandError
+    >;
     readonly readRangeContext: (
       cwd: string,
       baseRef: string,
@@ -382,6 +430,15 @@ export class GitVcsDriver extends Context.Service<
     ) => Effect.Effect<GitRefreshCheckedOutBranchResult, GitCommandError>;
     readonly ensureRemote: (input: GitEnsureRemoteInput) => Effect.Effect<string, GitCommandError>;
     readonly resolvePrimaryRemoteName: (cwd: string) => Effect.Effect<string, GitCommandError>;
+    /**
+     * The remote a push of `refName` with no upstream picks: the branch's `pushRemote`, then
+     * `remote.pushDefault`, then the primary remote. Null when there is none; a null `refName`
+     * names no branch yet.
+     */
+    readonly resolvePushRemoteName: (
+      cwd: string,
+      refName: string | null,
+    ) => Effect.Effect<string | null, GitCommandError>;
     readonly resolveDefaultBranchName: (
       cwd: string,
       remoteName: string,

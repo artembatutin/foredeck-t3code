@@ -169,7 +169,9 @@ import { assertToolCallReadOnlyCursorOutput } from "./tool_call_read_only/cursor
 import { toolCallReadOnlyInput } from "./tool_call_read_only/input.ts";
 import {
   assertToolCallReadOnlyOnRequestGrokOutput,
+  assertToolCallReadOnlyOnRequestOnceOnlyOutput,
   assertToolCallReadOnlyOnRequestOutput,
+  assertToolCallReadOnlyOnRequestRegistryOutput,
 } from "./tool_call_read_only_on_request/output.ts";
 import { toolCallReadOnlyOnRequestInput } from "./tool_call_read_only_on_request/input.ts";
 import {
@@ -757,7 +759,23 @@ export const ORCHESTRATOR_REPLAY_FIXTURES: ReadonlyArray<OrchestratorReplayFixtu
         ),
         modelSelection: ACP_REGISTRY_MODEL_SELECTION,
         runtimePolicyOverride: READ_ONLY_ON_REQUEST_POLICY,
-        assertOutput: assertToolCallReadOnlyOnRequestOutput,
+        assertOutput: assertToolCallReadOnlyOnRequestRegistryOutput,
+      },
+    ],
+  },
+  {
+    name: "tool_call_read_only_on_request_once_only",
+    buildInput: toolCallReadOnlyOnRequestInput,
+    providers: [
+      {
+        driver: ProviderDriverKind.make("acpRegistry"),
+        transcriptFile: new URL(
+          "./tool_call_read_only_on_request/registry_once_only_transcript.ndjson",
+          import.meta.url,
+        ),
+        modelSelection: ACP_REGISTRY_MODEL_SELECTION,
+        runtimePolicyOverride: READ_ONLY_ON_REQUEST_POLICY,
+        assertOutput: assertToolCallReadOnlyOnRequestOnceOnlyOutput,
       },
     ],
   },

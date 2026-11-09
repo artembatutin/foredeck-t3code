@@ -13,9 +13,11 @@ import {
   MAX_PROGRESS_NOTES,
   newAssignment,
   type ProjectBrief,
+  briefScopeHash,
   renderAssignmentBrief,
   renderManagerSummary,
   reviseBrief,
+  shortTitleOf,
   transitionAssignment,
 } from "./portfolio.ts";
 
@@ -403,5 +405,121 @@ describe("bounded rendering", () => {
     assert.include(tight, "## project-alpha");
     assert.notInclude(tight, "BRAVO-GOAL-MARKER");
     assert.include(tight, "(1 more project not shown.)");
+  });
+});
+
+describe("what a brief states and what only its conversation needs", () => {
+  const projectId = ProjectId.make("project-a");
+  /** A brief saved before titles and notes existed, with a constraint that reads like anything. */
+  const stored: ProjectBrief = {
+    projectId,
+    ideaId: "export",
+    goal: "Add the export button",
+    acceptanceCriteria: ["Exports CSV", "Has a test"],
+    constraints: ["Authorized by the owner on Tuesday"],
+    decisions: ["Use the toolbar"],
+    priority: null,
+    openQuestions: ["Which delimiter?"],
+    executionAuthorized: true,
+    revision: 3,
+    updatedAt: AT,
+  };
+  const revise = (brief: ProjectBrief, patch: BriefPatch) =>
+    reviseBrief(brief, { projectId, ideaId: "export", patch, reason: null, at: LATER });
+
+  it("hashes a brief without the new fields to the very bytes it always did", () => {
+    // Worked out apart from this code, over the text `renderAssignmentBrief` always rendered.
+    assert.strictEqual(
+      briefScopeHash(stored),
+      "3823ee7011d0e8851017688d44101e68bf9814166020c884a33e7288c9d1f82f",
+    );
+  });
+
+  it("keeps notes out of the scope, the authorization and what a worker reads", () => {
+    const { brief, revision } = revise(stored, { conversationNotes: ["Only discuss for now."] });
+    assert.deepStrictEqual(brief.conversationNotes, ["Only discuss for now."]);
+    assert.isTrue(brief.executionAuthorized);
+    assert.strictEqual(briefScopeHash(brief), briefScopeHash(stored));
+    assert.notInclude(renderAssignmentBrief(brief), "Only discuss for now.");
+    assert.deepStrictEqual(revision?.changes, [
+      { field: "conversationNotes", previous: [], next: ["Only discuss for now."] },
+    ]);
+  });
+
+  it("records authorization as authorization alone, so it does not undo itself", () => {
+    const unauthorized = { ...stored, executionAuthorized: false };
+    const { brief, revision } = revise(unauthorized, { executionAuthorized: true });
+    assert.isTrue(brief.executionAuthorized);
+    assert.deepStrictEqual(brief.constraints, stored.constraints);
+    assert.deepStrictEqual(brief.decisions, stored.decisions);
+    assert.strictEqual(briefScopeHash(brief), briefScopeHash(stored));
+    assert.deepStrictEqual(revision?.changes, [
+      { field: "executionAuthorized", previous: false, next: true },
+    ]);
+    // Saving it again is no change at all.
+    assert.isUndefined(revise(brief, { executionAuthorized: true }).revision);
+  });
+
+  it("leaves stored constraints and decisions as they read, however they read", () => {
+    const { brief } = revise(stored, { conversationNotes: ["A note"], priority: null });
+    assert.deepStrictEqual(brief.constraints, ["Authorized by the owner on Tuesday"]);
+    assert.deepStrictEqual(brief.decisions, ["Use the toolbar"]);
+  });
+
+  it("clears authorization once a title or a restriction changes, and not for a note", () => {
+    for (const patch of [
+      { title: "Export" },
+      { goal: "Add the import button" },
+      { acceptanceCriteria: ["Imports CSV"] },
+      { constraints: [] },
+      { decisions: [] },
+    ] satisfies ReadonlyArray<BriefPatch>) {
+      const { brief } = revise(stored, patch);
+      assert.isFalse(brief.executionAuthorized, JSON.stringify(patch));
+      assert.notStrictEqual(briefScopeHash(brief), briefScopeHash(stored), JSON.stringify(patch));
+    }
+    assert.isTrue(revise(stored, { conversationNotes: ["Later"] }).brief.executionAuthorized);
+  });
+
+  it("removes a title saved blank, whose absence hashes as if it was never set", () => {
+    const titled = revise(stored, { title: "  Export  " }).brief;
+    assert.strictEqual(titled.title, "Export");
+    assert.include(renderAssignmentBrief(titled), "Title:\nExport");
+    const cleared = revise(titled, { title: " " }).brief;
+    assert.isUndefined(cleared.title);
+    assert.strictEqual(briefScopeHash(cleared), briefScopeHash(stored));
+  });
+});
+
+describe("a goal's short title", () => {
+  it("is a short goal's first line as it stands", () => {
+    assert.strictEqual(
+      shortTitleOf("  Add the export button  \nIt belongs up top."),
+      "Add the export button",
+    );
+    assert.strictEqual(shortTitleOf("\n\n  First real line\nNext"), "First real line");
+  });
+
+  it("cuts a long line at a word boundary, within the bound", () => {
+    const goal = `${"word ".repeat(100)}end`;
+    const title = shortTitleOf(goal);
+    assert.isAtMost(title.length, 80);
+    assert.isTrue(title.endsWith("word…"));
+    assert.isFalse(title.includes("  "));
+  });
+
+  it("keeps a word that ends just where the room does", () => {
+    const fits = `${"a".repeat(30)} ${"b".repeat(48)}`;
+    assert.strictEqual(fits.length, 79);
+    assert.strictEqual(shortTitleOf(`${fits} more words`), `${fits}…`);
+  });
+
+  it("cuts one long word where it fits, never through a surrogate pair", () => {
+    const astral = "\u{1F680}".repeat(60);
+    const title = shortTitleOf(astral);
+    assert.isAtMost(title.length, 80);
+    const last = title.charCodeAt(title.length - 2);
+    assert.isFalse(last >= 0xd800 && last <= 0xdbff);
+    assert.strictEqual(title, `${"\u{1F680}".repeat(39)}…`);
   });
 });

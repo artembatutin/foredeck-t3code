@@ -17,7 +17,7 @@ const layer = GitVcsDriver.layer.pipe(
   Layer.provideMerge(NodeServices.layer),
 );
 
-const base = "work/fd-aaaaaa-add-the-export-button";
+const base = "feature/fd-aaaaaa-add-the-export-button";
 const isUnavailable = Schema.is(FactoryBranchUnavailableError);
 
 const git = (cwd: string, args: ReadonlyArray<string>) =>
@@ -76,6 +76,20 @@ describe("freshBranchName", () => {
       assert.strictEqual(yield* fresh(cwd, [base]), `${base}-2`);
       yield* git(cwd, ["branch", `${base}-2`]);
       assert.strictEqual(yield* fresh(cwd, [base]), `${base}-3`);
+    }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
+
+  it.effect("leaves a stored legacy branch alone, and gives a new delivery a neutral one", () =>
+    Effect.gen(function* () {
+      const cwd = yield* repository;
+      // An earlier delivery of the item stored this branch; nothing renames or takes it over.
+      const legacy = "work/fd-aaaaaa-add-the-export-button";
+      yield* git(cwd, ["branch", legacy]);
+      assert.strictEqual(yield* fresh(cwd, [legacy]), base);
+      assert.strictEqual(
+        yield* git(cwd, ["branch", "--list", legacy, "--format=%(refname)"]),
+        `refs/heads/${legacy}`,
+      );
     }).pipe(Effect.scoped, Effect.provide(layer)),
   );
 

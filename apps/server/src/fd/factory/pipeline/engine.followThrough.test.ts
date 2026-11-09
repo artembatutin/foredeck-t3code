@@ -893,6 +893,26 @@ describe("Factory engine: a pull request published whose watch could not start",
     expect(unwatched.followThrough).toBeUndefined();
   });
 
+  it("records the pull request and blocks on what the host saved, watching nothing", () => {
+    const refused =
+      "Factory opened pull request #42, but its saved title is not what Factory sent. Factory edits nothing on the host: correct the pull request there, then Resume.";
+    const saved = advance(opening, {
+      type: "pr.opened",
+      effectId: 6,
+      pullRequest,
+      publicationFailure: refused,
+    }).delivery;
+    expect(saved).toEqual({
+      ...opening,
+      status: "blocked",
+      awaiting: null,
+      pullRequest,
+      block: { reason: "effect_failed", effect: { id: 6, type: "open_pr" }, detail: refused },
+    });
+    expect(saved.followThrough).toBeUndefined();
+    expect(advance(saved, closed).delivery.status).toBe("cancelled");
+  });
+
   it("takes that pull request's merge or close while blocked", () => {
     expect(advance(unwatched, closed).delivery.status).toBe("cancelled");
     const closing = advance(unwatched, merged);

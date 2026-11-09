@@ -239,6 +239,7 @@ const callerThread = ThreadId.make("factory-thread:delivery-managed:1");
 const layerGovernedServices = Layer.mergeAll(
   Layer.mock(FactoryService.FactoryService)({
     familyRoot: (threadId) => Effect.succeed(threadId === callerThread ? managedRoot : null),
+    reviewedRefusal: () => Effect.succeed(undefined),
   }),
   Layer.mock(HandoffAdmission.HandoffAdmission)({
     instanceId: "instance",

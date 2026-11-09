@@ -19,7 +19,9 @@ import * as CodexErrors from "effect-codex-app-server/errors";
 import type {
   CodexSettings,
   CustomModelSetting,
+  RuntimeMode,
   ServerProvider,
+  ServerProviderRuntimeModeRestriction,
   ServerProviderState,
   ModelCapabilities,
   ProviderOptionDescriptor,
@@ -54,6 +56,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import packageJson from "../../package.json" with { type: "json" };
 const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnError);
 const RATE_LIMITS_PROBE_TIMEOUT_MS = 3_000;
+const CONFIG_REQUIREMENTS_PROBE_TIMEOUT_MS = 3_000;
 
 type CodexRateLimitsProbe =
   | {
@@ -85,6 +88,7 @@ export interface CodexAppServerProviderSnapshot {
   readonly version: string | undefined;
   readonly models: ReadonlyArray<ServerProviderModel>;
   readonly skills: ReadonlyArray<ServerProviderSkill>;
+  readonly runtimeModeRestrictions?: ReadonlyArray<ServerProviderRuntimeModeRestriction>;
 }
 
 const REASONING_EFFORT_LABELS: Readonly<Record<string, string>> = {
@@ -104,6 +108,83 @@ const DEFAULT_SERVICE_TIER_ID = "default";
 const SERVICE_TIER_DESCRIPTIONS: Readonly<Record<string, string>> = {
   ultrafast: "Even faster, more expensive",
 };
+
+/**
+ * The approval policy and sandbox each runtime mode runs under, which a host's requirements are
+ * judged against. The adapter sends these on each turn (`buildCodexTurnStartParams`); a test holds
+ * the two together, since the adapter imports this module.
+ */
+export const CODEX_RUNTIME_MODE_POLICIES: Readonly<
+  Record<
+    RuntimeMode,
+    {
+      readonly approvalPolicy: "untrusted" | "on-request" | "never";
+      readonly sandboxMode: CodexSchema.V2ConfigRequirementsReadResponse__SandboxMode;
+    }
+  >
+> = {
+  "approval-required": { approvalPolicy: "untrusted", sandboxMode: "read-only" },
+  "auto-accept-edits": { approvalPolicy: "on-request", sandboxMode: "workspace-write" },
+  auto: { approvalPolicy: "on-request", sandboxMode: "workspace-write" },
+  "full-access": { approvalPolicy: "never", sandboxMode: "danger-full-access" },
+};
+
+const CODEX_RUNTIME_MODES = Object.keys(CODEX_RUNTIME_MODE_POLICIES) as ReadonlyArray<RuntimeMode>;
+
+const allModes = (status: ServerProviderRuntimeModeRestriction["status"]) =>
+  CODEX_RUNTIME_MODES.map((runtimeMode) => ({ runtimeMode, status }));
+
+/**
+ * What Codex's requirements say of each runtime mode. A mode is refused only on what the lists
+ * name: a mode whose approval policy is missing from a list holding a granular policy is unknown,
+ * since this cannot say whether that granular policy would take it.
+ */
+export function codexRuntimeModeRestrictions(
+  response: CodexSchema.V2ConfigRequirementsReadResponse,
+): ReadonlyArray<ServerProviderRuntimeModeRestriction> {
+  const requirements = response.requirements;
+  if (requirements === null || requirements === undefined) return allModes("allowed");
+  const approvals = requirements.allowedApprovalPolicies ?? null;
+  const sandboxes = requirements.allowedSandboxModes ?? null;
+  const namedApprovals = approvals?.filter((policy) => typeof policy === "string") ?? [];
+  return CODEX_RUNTIME_MODES.map((runtimeMode) => {
+    const { approvalPolicy, sandboxMode } = CODEX_RUNTIME_MODE_POLICIES[runtimeMode];
+    if (sandboxes !== null && !sandboxes.includes(sandboxMode)) {
+      return {
+        runtimeMode,
+        status: "disallowed",
+        detail: `It allows only these sandboxes: ${sandboxes.join(", ") || "none"}, and this mode needs ${sandboxMode}.`,
+      };
+    }
+    if (approvals === null || namedApprovals.includes(approvalPolicy)) {
+      return { runtimeMode, status: "allowed" };
+    }
+    if (namedApprovals.length < approvals.length) return { runtimeMode, status: "unknown" };
+    return {
+      runtimeMode,
+      status: "disallowed",
+      detail: `It allows only these approval policies: ${namedApprovals.join(", ") || "none"}, and this mode needs ${approvalPolicy}.`,
+    };
+  });
+}
+
+/**
+ * Reads the host's requirements for the snapshot. An enrichment like usage: a failure or a slow
+ * answer, from an older Codex without the method included, reads as unknown and costs nothing else.
+ */
+export const readCodexRuntimeModeRestrictions = (
+  client: Pick<CodexClient.CodexAppServerClient["Service"], "request">,
+) =>
+  client.request("configRequirements/read", undefined).pipe(
+    Effect.map(codexRuntimeModeRestrictions),
+    Effect.timeoutOption(Duration.millis(CONFIG_REQUIREMENTS_PROBE_TIMEOUT_MS)),
+    Effect.map(Option.getOrElse(() => allModes("unknown"))),
+    Effect.catch((cause) =>
+      Effect.logDebug("Codex requirements read failed.", { cause }).pipe(
+        Effect.as(allModes("unknown")),
+      ),
+    ),
+  );
 
 function reasoningEffortLabel(reasoningEffort: string): string {
   return REASONING_EFFORT_LABELS[reasoningEffort] ?? reasoningEffort;
@@ -492,13 +573,17 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
   const versionMatch = initialize.userAgent.match(/\/([^\s]+)/);
   const version = versionMatch ? versionMatch[1] : undefined;
 
-  const accountResponse = yield* client.request("account/read", {});
+  const [accountResponse, runtimeModeRestrictions] = yield* Effect.all(
+    [client.request("account/read", {}), readCodexRuntimeModeRestrictions(client)],
+    { concurrency: "unbounded" },
+  );
   if (!accountResponse.account && accountResponse.requiresOpenaiAuth) {
     return {
       account: accountResponse,
       version,
       models: appendCustomCodexModels([], input.customModels ?? []),
       skills: [],
+      runtimeModeRestrictions,
     } satisfies CodexAppServerProviderSnapshot;
   }
 
@@ -545,6 +630,7 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
       appendCustomCodexModels(models, input.customModels ?? []),
     ),
     skills: parseCodexSkillsListResponse(skillsResponse, input.cwd),
+    runtimeModeRestrictions,
   } satisfies CodexAppServerProviderSnapshot;
 });
 
@@ -755,7 +841,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
             checkedAt,
           });
 
-  return buildServerProvider({
+  const provider = buildServerProvider({
     presentation: CODEX_PRESENTATION,
     enabled: codexSettings.enabled,
     checkedAt,
@@ -783,6 +869,9 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
       ...(managedAuth ? {} : { usageLimits }),
     },
   });
+  return snapshot.runtimeModeRestrictions === undefined
+    ? provider
+    : { ...provider, runtimeModeRestrictions: [...snapshot.runtimeModeRestrictions] };
 });
 
 // NOTE: the singleton `CodexProviderLive` Layer has been removed as part of

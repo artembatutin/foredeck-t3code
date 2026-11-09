@@ -5,7 +5,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { factoryFleetNotices, factoryFleetRowTarget } from "./fleetView";
 
 describe("factoryFleetRowTarget", () => {
-  it("opens the row's item in the Work page of the delivery's project", () => {
+  it("opens the row's item in the All view of the delivery's project", () => {
     const sourceId = WorkSourceId.make("6f9b1c2e-3d4a-4b5c-8d6e-7f8091a2b3c4");
     expect(
       factoryFleetRowTarget({
@@ -18,6 +18,7 @@ describe("factoryFleetRowTarget", () => {
       search: {
         project: "env-b:project-b",
         item: "6f9b1c2e-3d4a-4b5c-8d6e-7f8091a2b3c4:fd-7k3qa2",
+        view: "all",
       },
     });
   });
@@ -66,7 +67,7 @@ describe("factoryFleetNotices", () => {
       failed: "Could not read deliveries on Server.",
       // An id stands in for a server with no label.
       disconnected: "Not connected to env-c; its deliveries are not shown.",
-      empty: "No active deliveries.",
+      empty: "No active deliveries",
     });
     expect(
       factoryFleetNotices(
@@ -76,7 +77,7 @@ describe("factoryFleetNotices", () => {
     ).toMatchObject({
       failed: null,
       disconnected: "Not connected to Laptop, Server; their deliveries are not shown.",
-      empty: "No active deliveries.",
+      empty: "No active deliveries",
     });
   });
 });

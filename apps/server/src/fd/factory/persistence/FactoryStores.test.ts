@@ -406,6 +406,29 @@ describe("FactoryStageRunStore", () => {
     }).pipe(Effect.provide(persistence)),
   );
 
+  it.effect("totals each delivery's attempts per stage, whatever a window of them holds", () =>
+    Effect.gen(function* () {
+      yield* seedDeliveries;
+      const runs = yield* FactoryStageRunStore.FactoryStageRunStore;
+      yield* runs.append({ deliveryId: delivery1, stage: "review" });
+      for (let round = 0; round < 3; round += 1) {
+        yield* runs.append({ deliveryId: delivery1, stage: "verify" });
+        yield* runs.append({ deliveryId: delivery1, stage: "repair" });
+      }
+      yield* runs.append({ deliveryId: delivery2, stage: "integrate" });
+
+      const window = yield* runs.listNewestByDeliveries({ deliveryIds: [delivery1], limit: 2 });
+      assert.notInclude(
+        (window.get(delivery1) ?? []).map(({ stage }) => stage),
+        "review",
+      );
+      const totals = yield* runs.attemptTotals([delivery1, delivery2]);
+      assert.deepStrictEqual(totals.get(delivery1), { review: 1, verify: 3, repair: 3 });
+      assert.deepStrictEqual(totals.get(delivery2), { integrate: 1 });
+      assert.strictEqual((yield* runs.attemptTotals([])).size, 0);
+    }).pipe(Effect.provide(persistence)),
+  );
+
   it.effect("refuses a second active attempt on one thread", () =>
     Effect.gen(function* () {
       yield* seedDeliveries;

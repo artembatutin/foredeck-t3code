@@ -12,7 +12,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
-import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
+import { type WorkItemRef, workItemScopeChanged } from "@t3tools/contracts/fd/work-management";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
 import * as DateTime from "effect/DateTime";
@@ -36,6 +36,7 @@ import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as SourceControlProviderRegistry from "../../sourceControl/SourceControlProviderRegistry.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import * as WorkManagement from "../work-management/index.ts";
@@ -187,6 +188,11 @@ const makeLayer = (world: World) =>
     Layer.provide(Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({})),
     Layer.provideMerge(fakes(world)),
     Layer.provideMerge(SqlitePersistence.layerMemory),
+    Layer.provideMerge(
+      Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+        resolveLink: () => undefined,
+      }),
+    ),
     Layer.provideMerge(GitVcsDriver.layer),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-work-link-" })),
     Layer.provideMerge(VcsProcess.layer),
@@ -292,6 +298,11 @@ describe("FactoryThreadEffects Work links", () => {
           url: item.url,
           revision: item.revision,
           autoStarted: false,
+          scopeFingerprint: WorkManagement.workItemScopeFingerprint(
+            yield* Effect.flatMap(WorkManagement.WorkService.WorkService, (work) =>
+              work.getItem(owner, { ref: item.ref }),
+            ),
+          ),
         });
         // Listed with the item's open threads too, and found from the thread.
         assert.deepStrictEqual(yield* listLinks({}), links);
@@ -299,6 +310,201 @@ describe("FactoryThreadEffects Work links", () => {
       }),
     ),
   );
+
+  it.effect("does not read Factory's progress comments as changed requirements", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        const item = yield* makeProject(world);
+        yield* launchAuthor(deliveryOf(item.ref));
+        const work = yield* WorkManagement.WorkService.WorkService;
+        const read = work.getItem(owner, { ref: item.ref });
+        const before = yield* read;
+        assert.isFalse(workItemScopeChanged(before.links[0]!, before));
+
+        // A real Markdown source keeps the comment in the body's Notes, moving its revision.
+        yield* work.addComment(owner, { ref: item.ref, body: "Factory: the verify passed." });
+        const commented = yield* read;
+        assert.notStrictEqual(commented.revision, before.revision);
+        assert.isFalse(workItemScopeChanged(commented.links[0]!, commented));
+
+        yield* work.updateItem(owner, {
+          ref: item.ref,
+          expectedRevision: commented.revision,
+          title: "Add the export and import buttons",
+        });
+        const edited = yield* read;
+        assert.isTrue(workItemScopeChanged(edited.links[0]!, edited));
+      }),
+    ),
+  );
+
+  describe("a Markdown item whose code fence never closes", () => {
+    const requirement = "Must write CSV.";
+
+    /** The project's item with that body, and what reads it. */
+    const fencedItem = (world: World) =>
+      Effect.gen(function* () {
+        const item = yield* makeProject(world);
+        const work = yield* WorkManagement.WorkService.WorkService;
+        yield* work.updateItem(owner, {
+          ref: item.ref,
+          expectedRevision: item.revision,
+          body: ["Export.", "```", requirement, ""].join("\n"),
+        });
+        return { item, work, read: work.getItem(owner, { ref: item.ref }) };
+      });
+
+    it.effect("reads a comment that creates Notes ahead of it as no changed requirement", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const { item, work, read } = yield* fencedItem(world);
+          yield* launchAuthor(deliveryOf(item.ref));
+          const before = yield* read;
+          assert.notInclude(before.body, "## Notes");
+
+          yield* work.addComment(owner, { ref: item.ref, body: "Progress." });
+
+          const after = yield* read;
+          assert.include(after.body, "## Notes");
+          assert.notStrictEqual(after.revision, before.revision);
+          assert.isFalse(workItemScopeChanged(after.links[0]!, after));
+        }),
+      ),
+    );
+
+    it.effect("reads an edit inside it as one, for a link made before the comment or after", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const { item, work, read } = yield* fencedItem(world);
+          yield* launchAuthor(deliveryOf(item.ref));
+          yield* work.addComment(owner, { ref: item.ref, body: "Progress." });
+          const later = ThreadId.make("thread-linked-later");
+          world.threads.set(later, world.threads.values().next().value!);
+          yield* work.setLink(owner, { ref: item.ref, threadId: later, action: "link" });
+          const commented = yield* read;
+          assert.lengthOf(commented.links, 2);
+          for (const link of commented.links) {
+            assert.isFalse(workItemScopeChanged(link, commented));
+          }
+
+          yield* work.updateItem(owner, {
+            ref: item.ref,
+            expectedRevision: commented.revision,
+            body: commented.body.replace(requirement, "Must write CSV and PDF."),
+          });
+
+          const edited = yield* read;
+          for (const link of edited.links) {
+            assert.isTrue(workItemScopeChanged(link, edited));
+          }
+        }),
+      ),
+    );
+  });
+
+  describe("a Markdown item past the wire's cap", () => {
+    const rewrite = (world: World, locator: string, edit: (text: string) => string) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const file = path.join(world.root, locator);
+        yield* fileSystem.writeFileString(file, edit(yield* fileSystem.readFileString(file)));
+        yield* Effect.flatMap(WorkManagement.WorkService.WorkService, (work) =>
+          work.refresh(owner, {}),
+        );
+      });
+
+    it.effect("reads a comment that grows it across the cap as no changed requirement", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const item = yield* makeProject(world);
+          const work = yield* WorkManagement.WorkService.WorkService;
+          const read = work.getItem(owner, { ref: item.ref });
+          yield* work.updateItem(owner, {
+            ref: item.ref,
+            expectedRevision: item.revision,
+            body: "a".repeat(65_000),
+          });
+          yield* launchAuthor(deliveryOf(item.ref));
+          const before = yield* read;
+          assert.isFalse(before.bodyTruncated);
+          assert.isFalse(workItemScopeChanged(before.links[0]!, before));
+
+          yield* work.addComment(owner, { ref: item.ref, body: "x".repeat(1_000) });
+
+          const after = yield* read;
+          assert.isTrue(after.bodyTruncated);
+          assert.notStrictEqual(after.revision, before.revision);
+          assert.isFalse(workItemScopeChanged(after.links[0]!, after));
+          // What judges a capture or a delivery's opening reads the same value.
+          assert.strictEqual(
+            WorkManagement.workItemScopeFingerprint(after),
+            before.links[0]?.snapshot.scopeFingerprint,
+          );
+        }),
+      ),
+    );
+
+    it.effect("reads an edit of criteria past the cap as a changed requirement", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const item = yield* makeProject(world);
+          const work = yield* WorkManagement.WorkService.WorkService;
+          const read = work.getItem(owner, { ref: item.ref });
+          const { locator } = yield* read;
+          const longNotes = Array.from(
+            { length: 40 },
+            () => `- 2026-10-20T10:40:00Z (owner) ${"n".repeat(2_000)}`,
+          ).join("\n");
+          yield* rewrite(
+            world,
+            locator!,
+            (text) =>
+              `${text.trimEnd()}\n\n## Notes\n${longNotes}\n\n## Acceptance criteria\n\n1. Writes CSV.\n`,
+          );
+          yield* launchAuthor(deliveryOf(item.ref));
+          const before = yield* read;
+          assert.isTrue(before.bodyTruncated);
+          assert.notInclude(before.body, "Acceptance criteria");
+          assert.isFalse(workItemScopeChanged(before.links[0]!, before));
+
+          // A comment past the cap asks nothing new.
+          yield* work.addComment(owner, { ref: item.ref, body: "Progress." });
+          const commented = yield* read;
+          assert.notStrictEqual(commented.revision, before.revision);
+          assert.isFalse(workItemScopeChanged(commented.links[0]!, commented));
+
+          yield* rewrite(world, locator!, (text) =>
+            text.replace("1. Writes CSV.", "1. Writes CSV and PDF."),
+          );
+          const edited = yield* read;
+          assert.strictEqual(edited.body, commented.body);
+          assert.isTrue(workItemScopeChanged(edited.links[0]!, edited));
+        }),
+      ),
+    );
+
+    it.effect("claims no change for a file it can no longer read cleanly", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const item = yield* makeProject(world);
+          const work = yield* WorkManagement.WorkService.WorkService;
+          const read = work.getItem(owner, { ref: item.ref });
+          const { locator } = yield* read;
+          yield* launchAuthor(deliveryOf(item.ref));
+
+          yield* rewrite(world, locator!, (text) =>
+            text.replace("status: todo", "status: nonsense"),
+          );
+
+          const broken = yield* read;
+          assert.isNotNull(broken.invalid);
+          assert.notProperty(broken, "scopeFingerprint");
+          assert.isFalse(workItemScopeChanged(broken.links[0]!, broken));
+        }),
+      ),
+    );
+  });
 
   it.effect("keeps one link when the same launch effect runs again", () =>
     withWorld((world) =>

@@ -13,6 +13,7 @@ import {
   ProviderSessionId,
   ProviderThreadId,
   RunId,
+  type RuntimeMode,
   RuntimeRequestId,
   SourceControlProviderKind,
   ThreadId,
@@ -26,6 +27,7 @@ import * as ProviderContinuationRequests from "@t3tools/provider-core/server/Pro
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -52,7 +54,8 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as FactoryActivity from "./FactoryActivity.ts";
 import * as FactoryAdmission from "./FactoryAdmission.ts";
 import * as FactoryAutomaticTurns from "./FactoryAutomaticTurns.ts";
-import { launchThreadId } from "./FactoryThreadEffects.ts";
+import * as FactoryChanges from "./FactoryChanges.ts";
+import * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import { FactoryStoreError } from "./persistence/errors.ts";
@@ -73,10 +76,12 @@ import {
   drainOrchestration,
   ended,
   fakePullRequest,
+  type HostPolicy,
   runReached,
   stateOf,
   threadProjection,
   verifyCommands,
+  type World,
   withProject,
 } from "./testkit/deliveryHarness.ts";
 import {
@@ -1228,7 +1233,7 @@ interface Faults {
 
 const focusedProject = ProjectId.make("project-focused");
 const focusedDelivery = FactoryDeliveryId.make("delivery-focused");
-const focusedThread = launchThreadId(focusedDelivery, 1);
+const focusedThread = FactoryThreadEffects.launchThreadId(focusedDelivery, 1);
 const focusedRun = RunId.make("run-focused-launch");
 const focusedProviderThread = ProviderThreadId.make("provider-thread-focused");
 
@@ -1304,10 +1309,15 @@ const focusedStack = (faults: Faults, port: typeof FactoryAdmission.FactoryAdmis
         CommandReceiptStore.layer,
         EffectOutbox.layer,
         Layer.mock(FactoryWorker.FactoryWorker)({ jobsInFlight: () => Effect.succeed(0) }),
+        Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({
+          prepareReviewedTurn: () => Effect.void,
+          checkThreadHostPolicy: () => Effect.void,
+        }),
         decisions,
         manager,
         threads,
         IdAllocator.layer,
+        FactoryChanges.layer,
       ),
     ),
     Layer.provideMerge(
@@ -1407,6 +1417,329 @@ const triedAtLeast = (faults: Faults, count: number) =>
     Effect.flatMap((tried) => (tried >= count ? Effect.void : Effect.txRetry)),
     Effect.tx,
   );
+
+describe("Factory's gate when the host's policy refuses a thread's mode", () => {
+  /** As Codex reports a policy allowing only `never` and `on-request`: Supervised is refused. */
+  const refusesSupervised = (): HostPolicy => ({
+    restrictions: [
+      {
+        runtimeMode: "approval-required",
+        status: "disallowed",
+        detail: "It allows only these approval policies: never, on-request.",
+      },
+      { runtimeMode: "auto-accept-edits", status: "allowed" },
+      { runtimeMode: "auto", status: "allowed" },
+      { runtimeMode: "full-access", status: "allowed" },
+    ],
+  });
+
+  let modeChanges = 0;
+  /** The owner sets the thread's mode, as the composer's menu does. */
+  const setThreadMode = (threadId: ThreadId, runtimeMode: RuntimeMode) =>
+    Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+      orchestrator.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make(`owner-sets-mode:${(modeChanges += 1)}`),
+        threadId,
+        runtimeMode,
+      }),
+    ).pipe(Effect.orDie);
+
+  /** The consult failed for its producer to ask again, because the host refuses the mode. */
+  const refused = <A>(
+    consulted: Effect.Effect<A, AutomaticTurnGate.AutomaticTurnDecisionError>,
+    label: string,
+  ) =>
+    Effect.gen(function* () {
+      const failure = yield* Effect.flip(consulted);
+      assert.strictEqual(failure.stage, "admission", label);
+      const { cause } = failure;
+      if (!FactoryThreadEffects.isFactoryRuntimeModeRefusedError(cause)) {
+        return assert.fail(`${label} failed for another reason.`);
+      }
+      assert.include(cause.message, "host policy refuses Supervised", label);
+    });
+
+  /** What a listing shows of the host's refusals for the delivery. */
+  const refusalRows = (world: World, deliveryId: FactoryDeliveryId) =>
+    Effect.gen(function* () {
+      const factory = yield* Factory.FactoryService.FactoryService;
+      const listed = yield* factory.listForClients({ projectId: world.projectId });
+      return (
+        listed
+          .find((delivery) => delivery.deliveryId === deliveryId)
+          ?.pendingActions?.items.filter(({ kind }) => kind === "host_policy") ?? []
+      );
+    });
+
+  it.live(
+    "dispatches no kind on an unreviewed delivery's threads, and runs each once the owner chooses",
+    () => {
+      const { reached, port } = recordingPort("never");
+      return withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            ranInline.length = 0;
+            const author = yield* world.start;
+            const delegate = yield* delegateFrom(author.threadId, author.runId);
+            const wake = turns.pullRequestWake(
+              author.threadId,
+              { host: "github.com", repository: "acme/alpha", ...fakePullRequest },
+              "2026-10-29T09:00:00.000Z",
+            );
+            const presented = [
+              wake,
+              ...(yield* fiveKinds(author.threadId, author.runId, delegate)),
+              // A delegated thread is no role's, and is refused the same way.
+              ...(yield* fiveKinds(delegate.childThreadId, delegate.runId, delegate)),
+            ];
+            // Nothing is refused while the mode is one the host allows.
+            assert.deepStrictEqual(yield* refusalRows(world, author.deliveryId), []);
+            assert.deepStrictEqual(
+              yield* consult(turns.restartContinuation(author.threadId, author.runId)),
+              AutomaticTurnGate.ran(undefined),
+            );
+            ranInline.length = 0;
+
+            yield* setThreadMode(author.threadId, "approval-required");
+            yield* setThreadMode(delegate.childThreadId, "approval-required");
+            yield* drainOrchestration;
+            const threads = [author.threadId, delegate.childThreadId];
+            const before = yield* Effect.forEach(threads, (id) => threadProjection(id));
+            const started = world.provider.started.length;
+
+            for (const turn of presented) yield* refused(consult(turn), turn.kind);
+
+            assert.deepStrictEqual(ranInline, []);
+            assert.deepStrictEqual(reached, []);
+            assert.lengthOf(world.provider.started, started);
+            assert.deepStrictEqual(yield* recordedTurns, []);
+            // Refused rather than stepped: each thread is as its owner left it.
+            const after = yield* Effect.forEach(threads, (id) => threadProjection(id));
+            assert.deepStrictEqual(
+              after.map(({ thread }) => [thread.runtimeMode, thread.modelSelection]),
+              before.map(({ thread }) => [thread.runtimeMode, thread.modelSelection]),
+            );
+            assert.deepStrictEqual(
+              after.map(({ runs }) => runs.length),
+              before.map(({ runs }) => runs.length),
+            );
+            assert.strictEqual((yield* stateOf(author.deliveryId)).status, "running");
+
+            // It says so where the delivery is listed: one row a thread, however often it asked.
+            const rows = yield* refusalRows(world, author.deliveryId);
+            assert.sameMembers(
+              rows.map(({ threadId }) => threadId),
+              threads,
+            );
+            for (const row of rows) {
+              assert.strictEqual(row.runtimeMode, "approval-required");
+              assert.strictEqual(row.projectId, world.projectId);
+              assert.strictEqual(row.refused?.choose, "automatic_turn");
+              assert.deepStrictEqual(row.refused?.alternatives, [
+                "auto-accept-edits",
+                "auto",
+                "full-access",
+              ]);
+            }
+
+            // The owner chooses. The row goes as soon as it is read, and the next ask runs it.
+            yield* setThreadMode(author.threadId, "auto-accept-edits");
+            yield* setThreadMode(delegate.childThreadId, "auto-accept-edits");
+            yield* drainOrchestration;
+            assert.deepStrictEqual(yield* refusalRows(world, author.deliveryId), []);
+            for (const turn of presented) {
+              assert.deepStrictEqual(yield* consult(turn), AutomaticTurnGate.ran(undefined));
+            }
+            assert.deepStrictEqual(
+              ranInline,
+              presented.map(({ messageId }) => messageId),
+            );
+            yield* world.endRun(delegate.runId, "completed");
+            yield* world.endRun(author.runId, "completed");
+          }),
+        { admission: port, automaticTurnGate: true, hostPolicy: refusesSupervised() },
+      );
+    },
+    120_000,
+  );
+
+  it.live("refuses a thread of no delivery too, which no listing could show", () => {
+    const { reached, port } = recordingPort("active");
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          ranInline.length = 0;
+          const elsewhere = yield* ownerFolder(world);
+          const owned = yield* world.ownerThreadAt(elsewhere, "Look around the project.");
+          yield* setThreadMode(owned.threadId, "approval-required");
+          yield* drainOrchestration;
+          const task = { childThreadId: ThreadId.make("thread-asking"), taskId: questionTask };
+          const presented = yield* fiveKinds(owned.threadId, owned.runId, task);
+          for (const turn of presented) yield* refused(consult(turn), turn.kind);
+          assert.deepStrictEqual(ranInline, []);
+          assert.deepStrictEqual(reached, []);
+          const changes = yield* FactoryChanges.FactoryChanges;
+          assert.strictEqual((yield* changes.refusedTurns).size, 0);
+          yield* world.endRun(owned.runId, "completed");
+        }),
+      { admission: port, automaticTurnGate: true, hostPolicy: refusesSupervised() },
+    );
+  });
+
+  it.live("keeps a managed root's turn from its manager, and a kept wake from running", () => {
+    const reached: Array<AutomaticTurnGate.AutomaticTurn["kind"]> = [];
+    const kept: Array<{
+      /** Runs the kept dispatch, saying whether it ran. */
+      readonly dispatch: Effect.Effect<boolean>;
+      readonly allowed: Effect.Effect<boolean> | undefined;
+    }> = [];
+    const port: typeof FactoryAdmission.FactoryAdmission.Service = {
+      ...FactoryAdmission.FactoryAdmission.defaultValue(),
+      management: () => Effect.succeed("active"),
+      automaticTurn: (turn) =>
+        Effect.sync(() => {
+          reached.push(turn.turn.kind);
+          if (turn.via === "hand") {
+            kept.push({
+              dispatch: Effect.map(Effect.exit(turn.dispatch), Exit.isSuccess),
+              allowed: turn.allowed,
+            });
+          }
+          return AutomaticTurnGate.notNow("deferred");
+        }),
+    };
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          ranInline.length = 0;
+          const author = yield* world.start;
+          const task = { childThreadId: ThreadId.make("thread-asking"), taskId: questionTask };
+          const presented = yield* fiveKinds(author.threadId, author.runId, task);
+          const wake = presented.find(({ kind }) => kind === "background_wake");
+          const others = presented.filter(({ kind }) => kind !== "background_wake");
+          yield* setThreadMode(author.threadId, "approval-required");
+          yield* drainOrchestration;
+
+          for (const turn of others) yield* refused(consult(turn), turn.kind);
+          assert.deepStrictEqual(reached, []);
+
+          // A native wake is kept by the manager, and judged again when it would run.
+          assert.deepStrictEqual(
+            yield* consult(wake ?? assert.fail("No wake.")),
+            AutomaticTurnGate.notNow("deferred"),
+          );
+          const [held] = kept;
+          assert.isFalse(yield* held?.allowed ?? assert.fail("The wake was not kept."));
+          assert.isFalse(yield* held?.dispatch ?? assert.fail("The wake was not kept."));
+          assert.deepStrictEqual(ranInline, []);
+          assert.lengthOf(yield* refusalRows(world, author.deliveryId), 1);
+
+          yield* setThreadMode(author.threadId, "auto-accept-edits");
+          yield* drainOrchestration;
+          assert.isTrue(yield* held?.allowed ?? assert.fail("The wake was not kept."));
+          assert.isTrue(yield* held?.dispatch ?? assert.fail("The wake was not kept."));
+          assert.deepStrictEqual(ranInline, [wake?.messageId]);
+          for (const turn of others) {
+            assert.deepStrictEqual(yield* consult(turn), AutomaticTurnGate.notNow("deferred"));
+          }
+          assert.deepStrictEqual(reached, ["background_wake", ...others.map(({ kind }) => kind)]);
+          assert.deepStrictEqual(yield* refusalRows(world, author.deliveryId), []);
+          yield* world.endRun(author.runId, "completed");
+        }),
+      { admission: port, automaticTurnGate: true, hostPolicy: refusesSupervised() },
+    );
+  });
+
+  it.live("leaves a retired root's turn to be declined, which needs no judging", () => {
+    const { reached, port } = recordingPort("retired");
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const author = yield* world.start;
+          yield* setThreadMode(author.threadId, "approval-required");
+          yield* drainOrchestration;
+          assert.deepStrictEqual(
+            yield* consult(turns.restartContinuation(author.threadId, author.runId)),
+            AutomaticTurnGate.notNow("deferred"),
+          );
+          assert.lengthOf(reached, 1);
+          yield* world.endRun(author.runId, "completed");
+        }),
+      { admission: port, automaticTurnGate: true, hostPolicy: refusesSupervised() },
+    );
+  });
+
+  it.live(
+    "the watch reactor's real wake starts no run, and the next sweep's does once chosen",
+    () => {
+      const { reached, port } = recordingPort("never");
+      return withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const opened = yield* openSingle(world);
+            const link = yield* linkOf(opened.threadId, fakePullRequest.number);
+            const before = (yield* threadProjection(opened.threadId).pipe(Effect.orDie)).runs
+              .length;
+            const started = world.provider.started.length;
+            const at = DateTime.formatIso(yield* DateTime.now);
+            const reactor = yield* PullRequestWatchReactor.make.pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  NodeServices.layer,
+                  Layer.mock(PullRequestService.PullRequestService)({
+                    detail: () => Effect.succeed(failingPullRequest(link, at)),
+                    activity: () =>
+                      Effect.succeed({
+                        comments: [],
+                        commentCount: 0,
+                        commentsTruncated: false,
+                        reviewThreads: [],
+                        commits: [],
+                      }),
+                  }),
+                ),
+              ),
+            );
+            yield* setThreadMode(opened.threadId, "approval-required");
+            yield* drainOrchestration;
+
+            yield* reactor.sweep;
+            yield* drainOrchestration;
+            assert.strictEqual(
+              (yield* threadProjection(opened.threadId).pipe(Effect.orDie)).runs.length,
+              before,
+            );
+            assert.lengthOf(world.provider.started, started);
+            // The wake kept its place: the watch recorded no progress, so the next sweep asks again.
+            assert.deepStrictEqual((yield* linkOf(opened.threadId, link.number)).watch, link.watch);
+            const rows = yield* refusalRows(world, opened.deliveryId);
+            assert.deepStrictEqual(
+              rows.map(({ threadId }) => threadId),
+              [opened.threadId],
+            );
+
+            yield* setThreadMode(opened.threadId, "auto-accept-edits");
+            yield* drainOrchestration;
+            yield* reactor.sweep;
+            yield* drainOrchestration;
+            assert.strictEqual(
+              (yield* threadProjection(opened.threadId).pipe(Effect.orDie)).runs.length,
+              before + 1,
+            );
+            assert.deepStrictEqual(reached, []);
+            assert.deepStrictEqual(yield* refusalRows(world, opened.deliveryId), []);
+          }),
+        { admission: port, automaticTurnGate: true, hostPolicy: refusesSupervised() },
+      );
+    },
+  );
+});
 
 describe("Factory's gate when it cannot decide", () => {
   it.effect("runs nothing and fails the consult when a read or the record fails", () => {

@@ -11,20 +11,23 @@ import {
   ThreadId,
   type OrchestrationV2Command,
   type OrchestrationV2ShellSnapshot,
+  type ServerConfig,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { Atom, AtomRegistry } from "effect/reactivity";
+import { Atom, AtomRegistry, type AsyncResult } from "effect/reactivity";
 
 import * as EnvironmentRegistry from "../connection/registry.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
+import type { StartThreadTurnInput } from "../operations/commands.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import { createThreadEnvironmentAtoms } from "./threadCommands.ts";
 
@@ -120,12 +123,228 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* () {
     ),
   );
   const snapshotAtom = Atom.family((_environmentId: EnvironmentId) => Atom.make(SNAPSHOT));
-  const commands = createThreadEnvironmentAtoms(runtime, snapshotAtom);
+  const serverConfigsAtom = Atom.make<ReadonlyMap<EnvironmentId, ServerConfig>>(new Map());
+  const commands = createThreadEnvironmentAtoms(runtime, snapshotAtom, serverConfigsAtom);
   const registry = AtomRegistry.make();
   yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
   const visibleAtom = commands.snapshotAtom(ENVIRONMENT_ID);
   registry.mount(visibleAtom);
-  return { registry, commands, snapshotAtom, visibleAtom, requests };
+  return { registry, commands, snapshotAtom, serverConfigsAtom, visibleAtom, requests };
+});
+
+type Harness = Effect.Success<ReturnType<typeof makeHarness>>;
+
+describe("commands that start a turn in a mode the provider's host refuses", () => {
+  /** SNAPSHOT's thread runs in Full access on this provider, whose host refuses that mode. */
+  const refusing = {
+    instanceId: ProviderInstanceId.make("codex"),
+    driver: "codex",
+    displayName: "Codex",
+    supportedRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"],
+    runtimeModeRestrictions: [
+      { runtimeMode: "approval-required", status: "allowed" },
+      { runtimeMode: "auto-accept-edits", status: "allowed" },
+      { runtimeMode: "full-access", status: "disallowed" },
+    ],
+  };
+  const withProviders = (h: Harness, providers: ReadonlyArray<unknown>) =>
+    h.registry.set(
+      h.serverConfigsAtom,
+      new Map([[ENVIRONMENT_ID, { providers } as unknown as ServerConfig]]),
+    );
+  const MESSAGE = {
+    messageId: MessageId.make("message"),
+    role: "user" as const,
+    text: "Continue",
+    attachments: [],
+  };
+  const expectRefused = (h: Harness, result: AsyncResult.AsyncResult<unknown, unknown>) =>
+    Effect.gen(function* () {
+      if (result._tag !== "Failure") return expect.fail("The command was not refused.");
+      expect(Cause.pretty(result.cause)).toContain("Codex's host policy refuses Full access.");
+      expect(Cause.pretty(result.cause)).toContain(
+        "Choose Supervised or Auto-accept edits instead.",
+      );
+      expect(yield* Queue.size(h.requests)).toBe(0);
+    });
+  /** Runs a command against a server that takes whatever is dispatched, and says what was. */
+  const dispatching = <A>(
+    h: Harness,
+    command: Effect.Effect<AsyncResult.AsyncResult<A, unknown>>,
+  ) =>
+    Effect.gen(function* () {
+      const commands: Array<OrchestrationV2Command> = [];
+      const server = yield* Queue.take(h.requests).pipe(
+        Effect.flatMap(({ command: sent, reply }) => {
+          commands.push(sent);
+          return Deferred.succeed(reply, { sequence: commands.length + 1 });
+        }),
+        Effect.forever,
+        Effect.forkChild,
+      );
+      const result = yield* command;
+      yield* Fiber.interrupt(server);
+      expect(result._tag).toBe("Success");
+      return commands;
+    });
+  const turnStarted = (commands: ReadonlyArray<OrchestrationV2Command>) =>
+    commands.some(({ type }) => type === "message.dispatch");
+
+  it.effect("starts no turn on the thread's mode, a new thread's or another provider's", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      withProviders(h, [refusing]);
+      const start = (input: Partial<StartThreadTurnInput>) =>
+        Effect.promise(() =>
+          h.commands.startTurn.run(h.registry, {
+            environmentId: ENVIRONMENT_ID,
+            input: {
+              threadId: THREAD_ID,
+              message: MESSAGE,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              dispatchMode: "start",
+              ...input,
+            },
+          }),
+        );
+
+      yield* expectRefused(h, yield* start({}));
+      yield* expectRefused(
+        h,
+        yield* start({
+          threadId: ThreadId.make("thread-new"),
+          bootstrap: {
+            createThread: {
+              projectId: ProjectId.make("project"),
+              title: "New thread",
+              modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              createdAt: "2026-09-12T10:00:00.000Z",
+            },
+          },
+        }),
+      );
+
+      // A mode the owner has just chosen goes, as does a provider whose policy allows the mode.
+      expect(turnStarted(yield* dispatching(h, start({ runtimeMode: "auto-accept-edits" })))).toBe(
+        true,
+      );
+      expect(
+        turnStarted(
+          yield* dispatching(
+            h,
+            start({
+              modelSelection: { instanceId: ProviderInstanceId.make("other"), model: "other-1" },
+            }),
+          ),
+        ),
+      ).toBe(true);
+    }),
+  );
+
+  it.effect.each(["resume", "promote", "retry"] as const)(
+    "dispatches nothing to %s a thread's queue",
+    (action) =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        withProviders(h, [refusing]);
+        const target = { environmentId: ENVIRONMENT_ID };
+        const result = yield* Effect.promise(() =>
+          action === "resume"
+            ? h.commands.resumeThreadQueue.run(h.registry, {
+                ...target,
+                input: { threadId: THREAD_ID },
+              })
+            : action === "promote"
+              ? h.commands.promoteQueuedRun.run(h.registry, {
+                  ...target,
+                  input: {
+                    threadId: THREAD_ID,
+                    queuedRunId: RunId.make("queued"),
+                    targetRunId: RunId.make("target"),
+                  },
+                })
+              : h.commands.retryWorkspacePreparation.run(h.registry, {
+                  ...target,
+                  input: { threadId: THREAD_ID, runId: RunId.make("run") },
+                }),
+        );
+        yield* expectRefused(h, result);
+      }),
+  );
+
+  const answer = (h: Harness, responseCapability: "live" | "message") =>
+    Effect.promise(() =>
+      h.commands.respondToUserInput.run(h.registry, {
+        environmentId: ENVIRONMENT_ID,
+        input: {
+          threadId: THREAD_ID,
+          requestId: USER_INPUT.id,
+          answers: { format: "CSV" },
+          responseCapability,
+        },
+      }),
+    );
+
+  it.effect("leaves a message-capable question pending, until the owner chooses a mode", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      withProviders(h, [refusing]);
+
+      // Core would resolve the request and start a turn: nothing reaches it, so it stays pending.
+      yield* expectRefused(h, yield* answer(h, "message"));
+
+      h.registry.set(h.snapshotAtom(ENVIRONMENT_ID), {
+        ...SNAPSHOT,
+        threads: [{ ...SNAPSHOT.threads[0]!, runtimeMode: "auto-accept-edits" }],
+      });
+      const [command, ...others] = yield* dispatching(h, answer(h, "message"));
+      expect(others).toEqual([]);
+      expect(command).toMatchObject({
+        type: "runtime-request.respond",
+        requestId: USER_INPUT.id,
+        answers: { format: "CSV" },
+      });
+      expect(command).not.toHaveProperty("responseCapability");
+    }),
+  );
+
+  it.effect("goes on with a live answer, which continues the turn that asked", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      withProviders(h, [refusing]);
+      const commands = yield* dispatching(h, answer(h, "live"));
+      expect(commands.map(({ type }) => type)).toEqual(["runtime-request.respond"]);
+    }),
+  );
+
+  it.effect.each([
+    {
+      name: "no restriction read",
+      providers: [{ ...refusing, runtimeModeRestrictions: undefined }],
+    },
+    {
+      name: "an unknown restriction",
+      providers: [
+        {
+          ...refusing,
+          runtimeModeRestrictions: [{ runtimeMode: "full-access", status: "unknown" }],
+        },
+      ],
+    },
+    { name: "no provider read", providers: [] },
+  ])("runs as ever with $name", ({ providers }) =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      withProviders(h, providers);
+      const commands = yield* dispatching(h, answer(h, "message"));
+      expect(commands.map(({ type }) => type)).toEqual(["runtime-request.respond"]);
+    }),
+  );
 });
 
 describe("remote thread lifecycle commands", () => {

@@ -997,11 +997,7 @@ function ThreadRouteContent(
         onOpenPullRequest={openPullRequest}
       />
 
-      <LinkedWorkRow
-        environmentId={selectedThread.environmentId}
-        threadId={selectedThread.id}
-        projectId={selectedThread.projectId}
-      />
+      <LinkedWorkRow environmentId={selectedThread.environmentId} threadId={selectedThread.id} />
 
       <ThreadPane>
         <ThreadDetailScreen

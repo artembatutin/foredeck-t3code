@@ -390,10 +390,13 @@ export type VcsPullResult = typeof VcsPullResult.Type;
 
 // RPC / domain errors
 
-// Well-known git failures, recognized from stderr at the driver and carried as
-// a closed set of diagnostic tags. Git's stderr itself stays off the error: it
-// echoes argv and remote URLs, which can hold credentials. The tag names the
-// cause for logs and callers; it does not select a message.
+// Well-known git failures, recognized at the driver (most from stderr) and
+// carried as a closed set of diagnostic tags. Git's stderr itself stays off the
+// error: it echoes argv and remote URLs, which can hold credentials. The tag
+// names the cause for logs and callers; it does not select a message.
+// `push_target_changed` is the driver's own refusal of a push bound to a target
+// it would no longer go to, and `push_target_unpinnable` of one this Git cannot
+// hold to the target's URLs; only a server-side caller can ask for either.
 export const GitCommandFailureReason = Schema.Literals([
   "authentication_failed",
   "branch_already_exists",
@@ -401,6 +404,8 @@ export const GitCommandFailureReason = Schema.Literals([
   "host_key_unverified",
   "not_a_repository",
   "path_already_exists",
+  "push_target_changed",
+  "push_target_unpinnable",
   "remote_unreachable",
   "tag_would_be_clobbered",
 ]);

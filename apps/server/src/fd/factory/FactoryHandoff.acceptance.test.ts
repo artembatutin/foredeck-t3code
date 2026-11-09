@@ -1342,7 +1342,8 @@ describe("fair progress against two feedback-heavy roots", () => {
               if ((yield* assignmentOf("third")).state !== "queued") break;
               for (const { root, thread } of feedback) {
                 // Each round's feedback arrives whether or not a slot is there for it.
-                const link = yield* linkOf(thread, fakePullRequest.number);
+                const opened = (yield* stateOf(root)).pullRequest;
+                const link = yield* linkOf(thread, opened?.number ?? assert.fail("No PR."));
                 const wake = yield* wakeThroughGate(thread, link);
                 if (wake.outcome._tag !== "Ran") continue;
                 assert.strictEqual((yield* slotOf(root))?.state, "held");

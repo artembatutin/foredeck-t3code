@@ -38,6 +38,7 @@ import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 import * as FactoryWorkCommentStore from "./persistence/FactoryWorkCommentStore.ts";
 import { transitionComment } from "./pipeline/comments.ts";
 import { isFactoryPromptOverrideError } from "./prompts/overrides.ts";
+import { isFactoryReviewedExecutionRefusedError } from "./reviewedExecution.ts";
 import { advance } from "./pipeline/engine.ts";
 import { failureFingerprint } from "./pipeline/fingerprint.ts";
 import {
@@ -164,6 +165,7 @@ export class FactoryWorker extends Context.Service<
       Option.Option<{
         readonly delivery: FactoryDeliveryStore.StoredFactoryDelivery;
         readonly stageRuns: ReadonlyArray<FactoryStageRunStore.StoredFactoryStageRun>;
+        readonly stageAttempts: FactoryStageRunStore.FactoryStageAttempts;
         readonly value: A;
       }>,
       E | FactoryStoreError
@@ -354,20 +356,47 @@ const refusalDetail = (effect: FactoryEffect, category: FactoryAdmission.Factory
 /**
  * The `effect.failed` detail: what failed and the failure's tag. Never its message or cause,
  * which can carry command output or provider text, except a setup failure's message, which is
- * fixed text naming how the command ended, or a prompt override's message naming only the prompt.
- * A launch whose opening was refused reads as a refused effect does.
+ * fixed text naming how the command ended, a prompt override's message naming only the prompt, a
+ * publication's refusal, which is fixed text naming the rule broken and what to do, a reviewed
+ * delivery's refusal, which is fixed text naming what differs from its review, or a host policy's
+ * refusal, naming the mode and what that policy allows. A launch whose opening was refused reads as
+ * a refused effect does.
  */
 const failureDetail = (effect: FactoryEffect, cause: Cause.Cause<unknown>) => {
   const error = Option.getOrUndefined(Cause.findErrorOption(cause));
   if (FactoryAdmission.isFactoryOpeningRefusedError(error)) {
     return refusalDetail(effect, error.category);
   }
-  if (FactoryVerifyRunner.isFactorySetupFailedError(error) || isFactoryPromptOverrideError(error)) {
+  if (
+    FactoryVerifyRunner.isFactorySetupFailedError(error) ||
+    FactoryPullRequest.isFactoryPublicationRefusedError(error) ||
+    isFactoryPromptOverrideError(error) ||
+    isFactoryReviewedExecutionRefusedError(error) ||
+    FactoryThreadEffects.isFactoryRuntimeModeRefusedError(error)
+  ) {
     return `Factory could not ${describeEffect(effect)}. ${error.message}`;
   }
   const tag = typeof error === "object" && error !== null && "_tag" in error ? error._tag : null;
   const kind = typeof tag === "string" && SAFE_TAG.test(tag) ? tag : "unexpected error";
   return `Factory could not ${describeEffect(effect)} (${kind}).`;
+};
+
+/** What a host policy refused, for the owner to choose among, when that is what failed. */
+const hostRefusalOf = (cause: Cause.Cause<unknown>) => {
+  const error = Option.getOrUndefined(Cause.findErrorOption(cause));
+  if (!FactoryThreadEffects.isFactoryRuntimeModeRefusedError(error)) return {};
+  const { runtimeMode, provider, driver, detail, choose, alternatives, threadId } = error;
+  return {
+    hostRefused: {
+      runtimeMode,
+      provider,
+      driver,
+      ...(detail === undefined ? {} : { detail }),
+      choose,
+      alternatives,
+      ...(threadId === undefined ? {} : { threadId }),
+    },
+  };
 };
 
 /**
@@ -395,7 +424,8 @@ const outcomeOf = (state: FactoryDeliveryState): FactoryStageOutcome => {
     const reason = state.block?.reason;
     return reason === "verify_failed" ||
       reason === "review_changes_required" ||
-      reason === "repeated_failure"
+      reason === "repeated_failure" ||
+      (state.block?.reason === "allowance_exhausted" && state.block.allowance !== "fix_commit")
       ? "failed"
       : "blocked";
   }
@@ -520,8 +550,10 @@ const make = Effect.gen(function* () {
         return yield* new FactoryStageCommandError({ stage });
       }
       // Read when the command runs, not when the delivery started: a verify command removed
-      // since then fails the effect before anything runs.
-      const runSettings = yield* settings.requireDeliverySettings(delivery.projectId);
+      // since then fails the effect before anything runs. A reviewed delivery runs what its owner
+      // reviewed, whatever the settings say now.
+      const { reviewedExecution: reviewed } = delivery.state;
+      const runSettings = reviewed ?? (yield* settings.requireDeliverySettings(delivery.projectId));
       return yield* verifyRunner.run({
         deliveryId: delivery.deliveryId,
         worktreePath,
@@ -532,9 +564,9 @@ const make = Effect.gen(function* () {
   /**
    * What an author's launch runs in its worktree before its opening turn (see
    * `FactoryThreadEffects.launchThread`): the project's setup command, as the settings read when
-   * the launch runs name it, under the verify timeout, then a check that the delivery still
-   * awaits the launch, so a delivery cancelled while setup ran gets no opening turn. None for any
-   * other launch, or without a setup command.
+   * the launch runs name it or as its owner reviewed it, under the verify timeout, then a check
+   * that the delivery still awaits the launch, so a delivery cancelled while setup ran gets no
+   * opening turn. None for any other launch, or without a setup command.
    */
   const openingSetup = (
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,
@@ -542,7 +574,8 @@ const make = Effect.gen(function* () {
   ) =>
     Effect.gen(function* () {
       if (effect.role !== "author") return undefined;
-      const { setupCommand, limits } = yield* settings.get(delivery.projectId);
+      const { setupCommand, limits } =
+        delivery.state.reviewedExecution ?? (yield* settings.get(delivery.projectId));
       if (setupCommand === null) return undefined;
       const { deliveryId } = delivery;
       return (worktreePath: string) =>
@@ -655,11 +688,12 @@ const make = Effect.gen(function* () {
         );
       case "open_pr":
         return pullRequests.open(delivery, effect).pipe(
-          Effect.map(({ pullRequest, threadId }): FactoryEvent => ({
+          Effect.map(({ pullRequest, threadId, publicationFailure }): FactoryEvent => ({
             type: "pr.opened",
             effectId: effect.id,
             pullRequest,
             pullRequestThread: threadId,
+            ...(publicationFailure === undefined ? {} : { publicationFailure }),
           })),
         );
       case "close_out":
@@ -770,6 +804,29 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  /**
+   * A reviewed delivery's failed effect, saying when its turn never started, read from the durable
+   * record: however it failed, from a refusal to a restart that lost its job, nothing else tells
+   * the turn that ran from the turn that did not.
+   */
+  const withUnsentTurn = (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+    event: FactoryEvent,
+  ): Effect.Effect<FactoryEvent> =>
+    Effect.gen(function* () {
+      const { reviewedExecution, awaiting } = delivery.state;
+      if (
+        event.type !== "effect.failed" ||
+        reviewedExecution === undefined ||
+        awaiting?.type !== "effect" ||
+        awaiting.effect.id !== event.effectId
+      ) {
+        return event;
+      }
+      const sent = yield* threads.chargedTurnSent(delivery, awaiting.effect);
+      return sent ? event : { ...event, unsent: true as const };
+    });
+
   const stepLocked = Effect.fn("FactoryWorker.step")(function* (
     deliveryId: FactoryDeliveryId,
     event: FactoryEvent,
@@ -777,7 +834,7 @@ const make = Effect.gen(function* () {
     const current = yield* deliveries.get(deliveryId);
     if (Option.isNone(current)) return current;
     const before = current.value.state;
-    const next = advance(before, event);
+    const next = advance(before, yield* withUnsentTurn(current.value, event));
     // The engine hands back the very same state for an event the delivery does not await.
     if (next.delivery === before && next.effects.length === 0) return current;
 
@@ -1176,9 +1233,11 @@ const make = Effect.gen(function* () {
             deliveryIds: [deliveryId],
             limit: FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
           });
+          const totals = yield* stageRuns.attemptTotals([deliveryId]);
           return Option.some({
             delivery: stored.value,
             stageRuns: runs.get(deliveryId) ?? [],
+            stageAttempts: totals.get(deliveryId) ?? {},
             value,
           });
         }),
@@ -1234,7 +1293,8 @@ const make = Effect.gen(function* () {
    * only once the pull request is stored, so none falls in between, and one committed before is
    * taken here, the end of a watch included. A watch core ended is not started again here. A
    * watch that cannot start is reported with the pull request, which is published either way and
-   * is recorded.
+   * is recorded. A pull request that does not comply as saved starts none: a resume decides, and
+   * its feedback must not wake an agent first.
    */
   const openedPullRequest = (job: Job, event: Extract<FactoryEvent, { type: "pr.opened" }>) => {
     const { deliveryId } = job.delivery;
@@ -1255,7 +1315,9 @@ const make = Effect.gen(function* () {
           return yield* stepLocked(deliveryId, event);
         }
         // `open` always names the thread it linked the pull request to.
-        if (pullRequestThread === undefined) return yield* stepLocked(deliveryId, event);
+        if (pullRequestThread === undefined || event.publicationFailure !== undefined) {
+          return yield* stepLocked(deliveryId, event);
+        }
         const watched = yield* Effect.exit(
           Effect.suspend(() => pullRequests.watch(current, effect, pullRequest, pullRequestThread)),
         );
@@ -1639,17 +1701,29 @@ const make = Effect.gen(function* () {
   };
 
   /**
-   * Runs an effect once the admission port admits it, and feeds its result back. A refusal is fed
-   * back as the effect's failure, and a deferral feeds nothing (see `defer`). Suspended, so an
-   * executor that throws while building its effect fails the effect like any other failure, as
-   * does a port that cannot decide. Interruption (shutdown) feeds nothing.
+   * Whether a reviewed delivery may run the effect, read as late as can be: a close-out only
+   * finishes what the owner's merge began, so like admission it is never asked.
+   */
+  const reviewedGate = ({ delivery, effect }: Job) =>
+    delivery.state.reviewedExecution === undefined || effect.type === "close_out"
+      ? Effect.void
+      : threads.checkReviewed(delivery, effect);
+
+  /**
+   * Runs an effect once the admission port admits it and a reviewed delivery's review still allows
+   * it, and feeds its result back. A refusal is fed back as the effect's failure, and a deferral
+   * feeds nothing (see `defer`). Suspended, so an executor that throws while building its effect
+   * fails the effect like any other failure, as does a port that cannot decide. Interruption
+   * (shutdown) feeds nothing.
    */
   const runJob = (job: Job) =>
     Effect.suspend(() => admit(job)).pipe(
       Effect.flatMap((decision) => {
         switch (decision.type) {
           case "proceed":
-            return Effect.suspend(() => execute(job));
+            return Effect.suspend(() => reviewedGate(job)).pipe(
+              Effect.andThen(Effect.suspend(() => execute(job))),
+            );
           case "refuse":
             return Effect.succeed(refused(job.effect, decision.category));
           case "defer":
@@ -1663,6 +1737,7 @@ const make = Effect.gen(function* () {
               type: "effect.failed",
               effectId: job.effect.id,
               detail: failureDetail(job.effect, cause),
+              ...hostRefusalOf(cause),
             }),
       ),
       Effect.flatMap((event) => (event === undefined ? Effect.void : feed(job, event))),

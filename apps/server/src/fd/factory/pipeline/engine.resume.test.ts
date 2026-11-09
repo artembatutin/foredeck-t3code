@@ -676,3 +676,46 @@ describe("resume requests that change nothing", () => {
     expect(step.effects).toEqual([]);
   });
 });
+
+// A review's counts are cumulative (see `engine.reviewedBudget.test.ts`); these stay as they were.
+describe("a resume of a delivery started without a review", () => {
+  const problems = ["Worktree has uncommitted or untracked changes."];
+  const checked = (
+    settle: NonNullable<FactoryResumeCheck["worktree"]>["settle"],
+  ): FactoryResumeCheck => ({
+    deletedThreads: [],
+    unrecordedAuthorRunEnded: false,
+    worktree: { settle, commit: { headSha: head, tree }, approvedSha: null },
+  });
+  const spent: FactoryDeliveryState = {
+    ...queuedDeliveryState({ branch: "fd/item-7", baseRef: "HEAD" }),
+    stage: "verify",
+    worktreePath,
+    baseline,
+    threads: { author },
+    effectsIssued: 3,
+    rounds: { fix: 2, review: 1 },
+    fixCommitTurns: 1,
+    fingerprints: ["fingerprint-1"],
+  };
+
+  it("grants a fresh allowance of every count", () => {
+    const { delivery } = advance(
+      { ...spent, status: "stopped", checkpoint: "verify" },
+      { type: "resume", check: checked({ status: "settled" }) },
+    );
+    expect(delivery.status).toBe("running");
+    expect(delivery.rounds).toEqual({ fix: 0, review: 0 });
+    expect(delivery.fixCommitTurns).toBe(0);
+    expect(delivery.fingerprints).toEqual([]);
+  });
+
+  it("gives every resume its one fix-commit turn", () => {
+    const { delivery, effects } = advance(
+      { ...spent, status: "blocked", block: { reason: "unsettled", problems } },
+      { type: "resume", check: checked({ status: "repairable", problems }) },
+    );
+    expect(effects.map(({ type }) => type)).toEqual(["send_fix_commit_turn"]);
+    expect(delivery.fixCommitTurns).toBe(1);
+  });
+});

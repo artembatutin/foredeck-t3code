@@ -115,6 +115,14 @@ const everyBlock = {
     actual: { headSha: "d".repeat(40), tree, clean: false },
     differences: ["head_changed", "not_reviewed", "tree_dirty"],
   },
+  allowance_exhausted: {
+    reason: "allowance_exhausted",
+    allowance: "fix",
+    used: 2,
+    approved: 2,
+    problems: [],
+  },
+  reviewed_refused: { reason: "reviewed_refused", detail: "The review no longer holds." },
 } satisfies {
   readonly [Reason in FactoryBlock["reason"]]: Extract<FactoryBlock, { reason: Reason }>;
 };

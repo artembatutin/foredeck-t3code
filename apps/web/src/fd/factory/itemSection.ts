@@ -8,7 +8,7 @@ import {
 } from "@t3tools/client-runtime/fd/factory";
 import type { EnvironmentId } from "@t3tools/contracts";
 import type { FactoryDelivery, FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
-import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
+import type { WorkItemRef, WorkItemSummary } from "@t3tools/contracts/fd/work-management";
 
 import { buildThreadRouteParams } from "../../threadRoutes";
 import { deliveriesWithStarted, factoryDeliverable, type FactoryStartedDelivery } from "./deliver";
@@ -41,6 +41,8 @@ export function factoryItemSection(input: {
   /** Every delivery a start in this session returned, counted until the list holds it. */
   readonly started: ReadonlyArray<FactoryStartedDelivery>;
   readonly permitted: FactoryItemPermissions;
+  /** The item as the Work page read it, for what its source says now. */
+  readonly item?: Pick<WorkItemSummary, "status" | "nativeStatus" | "assignee">;
 }): FactoryItemSectionView | null {
   const deliveries = deliveriesWithStarted(input);
   if (!input.supported || deliveries === null) return null;
@@ -51,6 +53,18 @@ export function factoryItemSection(input: {
     deliver,
     delivery: {
       ...delivery,
+      nextAction: {
+        ...delivery.nextAction,
+        reviewThread:
+          delivery.nextAction.reviewThread === null
+            ? null
+            : buildThreadRouteParams(
+                scopeThreadRef(
+                  delivery.nextAction.reviewThread.environmentId,
+                  delivery.nextAction.reviewThread.threadId,
+                ),
+              ),
+      },
       timeline: delivery.timeline.map((row) => ({
         ...row,
         thread:

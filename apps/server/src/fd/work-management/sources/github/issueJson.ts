@@ -9,6 +9,7 @@ import {
 import * as Schema from "effect/Schema";
 
 import { COMMENTS_MAX, BODY_MAX_CHARS, truncateText } from "../../model/bounds.ts";
+import { workItemContentFingerprint } from "../../model/scope.ts";
 import { fromGitHubState, type GitHubStateReason } from "../../model/status.ts";
 import type { WorkSourceItemDetail } from "../WorkSourceAdapter.ts";
 
@@ -248,7 +249,8 @@ export const toComment = (comment: CommentJson): WorkComment => ({
 });
 
 export const toDetail = (sourceId: WorkSourceId, issue: IssueDetailJson): WorkSourceItemDetail => {
-  const body = truncateText(issue.body ?? "", BODY_MAX_CHARS);
+  const whole = issue.body ?? "";
+  const body = truncateText(whole, BODY_MAX_CHARS);
   const comments: Array<WorkComment> = nodes(issue.comments).slice(-COMMENTS_MAX).map(toComment);
   const children: Array<WorkItemChild> = nodes(issue.subIssues).map((child) => ({
     itemId: WorkItemId.make(String(child.number)),
@@ -261,6 +263,13 @@ export const toDetail = (sourceId: WorkSourceId, issue: IssueDetailJson): WorkSo
     body: body.text,
     bodyTruncated: body.truncated,
     bodyFidelity: "exact",
+    scopeFingerprint: workItemContentFingerprint({
+      kind: "github",
+      title: issue.title,
+      body: whole,
+      bodyTruncated: false,
+      bodyFidelity: "exact",
+    }),
     comments,
     commentsTruncated: issue.comments.totalCount > comments.length,
     children,

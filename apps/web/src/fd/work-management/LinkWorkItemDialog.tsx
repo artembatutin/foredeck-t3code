@@ -163,10 +163,12 @@ function LinkWorkItemDialog({
                   <button
                     type="button"
                     disabled={pending || !canLink}
-                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent"
+                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent cursor-pointer focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring disabled:cursor-default disabled:opacity-64"
                     onClick={() => void link(item)}
                   >
-                    <span className="shrink-0 text-muted-foreground text-xs">{item.key}</span>
+                    <span className="shrink-0 font-mono text-muted-foreground text-xs">
+                      {item.key}
+                    </span>
                     <span className="min-w-0 flex-1 truncate">{item.title}</span>
                     <WorkStatusBadge status={item.status} />
                   </button>

@@ -6,7 +6,11 @@ import {
   ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
-import { type FactoryDeliveryId, FactoryProjectSettings } from "@t3tools/contracts/fd/factory";
+import {
+  FACTORY_WS_METHODS,
+  type FactoryDeliveryId,
+  FactoryProjectSettings,
+} from "@t3tools/contracts/fd/factory";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -26,6 +30,7 @@ import { liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
 import * as ProjectStore from "../../../orchestration-v2/ProjectStore.ts";
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
+import * as ServerRuntimeStartup from "../../../serverRuntimeStartup.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import { workBranchName, WorkService } from "../../work-management/index.ts";
 import * as FactoryChildren from "../FactoryChildren.ts";
@@ -39,6 +44,8 @@ import * as FactoryThreadEffects from "../FactoryThreadEffects.ts";
 import * as FactoryWorkComments from "../FactoryWorkComments.ts";
 import * as FactoryWorker from "../FactoryWorker.ts";
 import * as Factory from "../index.ts";
+import { wsHandlers } from "../rpc/handlers.ts";
+import { unusedCommandSetup as commands } from "../testkit/commandSetup.ts";
 import {
   drainFactory,
   drainOrchestration,
@@ -180,6 +187,8 @@ describe("factory_deliver from a live thread", () => {
         assert.strictEqual(state.status, "running");
         assert.strictEqual(state.stage, "author");
         assert.strictEqual(state.runtimeModeCeiling, "auto-accept-edits");
+        // An agent's start carries no owner's review: it reads the settings as each step runs.
+        assert.notProperty(state, "reviewedExecution");
         assert.strictEqual(state.branch, itemBranch(world));
         // The author runs in a new worktree of the delivery's branch, in the caller's mode.
         const { thread } = yield* threadProjection(author.threadId);
@@ -193,6 +202,31 @@ describe("factory_deliver from a live thread", () => {
         const turn = world.provider.started.find((started) => started.runId === author.runId);
         assert.strictEqual(turn?.runtimePolicy.runtimeMode, "auto-accept-edits");
         assert.lengthOf(yield* deliveriesOf(world), 1);
+      }),
+    ),
+  );
+});
+
+describe("a client's start, over the Factory RPC", () => {
+  it.live("stores no owner's review, so the delivery reads the settings as each step runs", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const handlers = wsHandlers({
+          factory: yield* FactoryService.FactoryService,
+          settings: yield* FactorySettings.FactorySettings,
+          commands,
+          // Ready, so a client's command runs at once.
+          startup: ServerRuntimeStartup.ServerRuntimeStartup.of({
+            awaitCommandReady: Effect.void,
+            markHttpListening: Effect.void,
+            enqueueCommand: (effect) => effect,
+          }),
+        });
+        const { deliveryId } = yield* handlers[FACTORY_WS_METHODS.factoryDeliveriesStart]({
+          itemRef: world.itemRef,
+        });
+        yield* world.launched(deliveryId);
+        assert.notProperty(yield* stateOf(deliveryId), "reviewedExecution");
       }),
     ),
   );

@@ -10,7 +10,6 @@ import {
   authorCommits,
   drainFactory,
   drainOrchestration,
-  fakePullRequest,
   stateOf,
   verifyCommands,
   withProject,
@@ -244,7 +243,8 @@ describe("a parent, from its plan to its merge", () => {
             yield* world.endRun(integrate.runId, "completed");
             assert.strictEqual((yield* stateOf(root)).status, "pr_open");
             // One pull request for the whole branch, beside the other assignment's own.
-            const { branch } = yield* stateOf(root);
+            const { branch, pullRequest } = yield* stateOf(root);
+            const opened = pullRequest ?? assert.fail("No pull request.");
             assert.lengthOf(
               world.pullRequestCalls.filter((call) => call.branch === branch),
               1,
@@ -254,16 +254,9 @@ describe("a parent, from its plan to its merge", () => {
             yield* tick;
             assert.strictEqual((yield* assignmentOf("big")).state, "needs-input");
             assert.isUndefined(yield* slotOf(root));
-            assert.include(
-              yield* noticesOf("big"),
-              `PR ${fakePullRequest.url} open; review and merge.`,
-            );
+            assert.include(yield* noticesOf("big"), `PR ${opened.url} open; review and merge.`);
             const followed = secondAuthor.threadId;
-            yield* syncPullRequest(
-              followed,
-              yield* linkOf(followed, fakePullRequest.number),
-              "merged",
-            );
+            yield* syncPullRequest(followed, yield* linkOf(followed, opened.number), "merged");
             yield* drainFactory;
             assert.strictEqual((yield* stateOf(root)).status, "done");
             for (const child of children) {

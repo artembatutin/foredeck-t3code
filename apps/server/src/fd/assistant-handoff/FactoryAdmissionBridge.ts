@@ -157,6 +157,7 @@ export const make = Effect.gen(function* () {
               ),
             ),
             ...(turn.drop === undefined ? {} : { drop: turn.drop }),
+            ...(turn.allowed === undefined ? {} : { allowed: turn.allowed }),
           }
         : undefined;
     return Effect.gen(function* () {
@@ -206,6 +207,20 @@ export const make = Effect.gen(function* () {
     deferredDemand,
     authorizeOpening,
     automaticTurn,
+    queueChanges: admission.queueChanges,
+    queuePriorities: (roots) =>
+      admission.queuePriorities(roots).pipe(
+        Effect.map(
+          (priorities) =>
+            new Map(
+              roots.flatMap((root) => {
+                const priority = priorities.get(root);
+                return priority === undefined ? [] : [[root, priority] as const];
+              }),
+            ),
+        ),
+        Effect.mapError(readFailed(roots[0] ?? "")),
+      ),
   });
 });
 

@@ -116,6 +116,15 @@ const plannerThreads = (calls: PlannerCalls) =>
       launchedLiveRuns: Effect.die("live runs read not scripted"),
       // Every run is still going; its end arrives as a step.
       runEnded: () => Effect.succeedNone,
+      checkReviewed: () => Effect.die("reviewed check not scripted"),
+      chargedTurnSent: () => Effect.die("charged turn not scripted"),
+      resolveReviewedExecution: () => Effect.die("reviewed execution not scripted"),
+      previewReviewedExecution: () => Effect.die("reviewed execution not scripted"),
+      deliveryExecution: () => Effect.die("reviewed execution not scripted"),
+      reviewedExecutionHolds: () => Effect.die("reviewed execution not scripted"),
+      checkThreadHostPolicy: () => Effect.die("host policy not scripted"),
+      checkReviewedThread: () => Effect.die("reviewed turn not scripted"),
+      prepareReviewedTurn: () => Effect.die("reviewed turn not scripted"),
       interruptRun: (_delivery, { threadId }) =>
         Effect.sync(() => calls.interrupted.push(threadId)),
     }),

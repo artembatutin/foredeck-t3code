@@ -74,6 +74,7 @@ import {
 import { attributeComment } from "./model/attribution.ts";
 import { AGENT_COMMENT_MAX_CHARS, OPEN_LINKS_MAX } from "./model/bounds.ts";
 import { canonicalItemId } from "./model/itemId.ts";
+import { workItemLinkScope } from "./model/scope.ts";
 import * as WorkLinkStore from "./persistence/WorkLinkStore.ts";
 import * as WorkSourceStore from "./persistence/WorkSourceStore.ts";
 import { directoriesOverlap } from "./sources/sourceRoot.ts";
@@ -103,6 +104,11 @@ const decodeListKey = Schema.decodeSync(ListCacheKey);
 const ItemCacheKey = Schema.fromJsonString(Schema.Tuple([WorkSourceId, WorkItemId, Schema.Number]));
 const encodeItemKey = Schema.encodeSync(ItemCacheKey);
 const decodeItemKey = Schema.decodeSync(ItemCacheKey);
+const SummariesCacheKey = Schema.fromJsonString(
+  Schema.Tuple([WorkSourceId, Schema.Array(WorkItemId), Schema.Number]),
+);
+const encodeSummariesKey = Schema.encodeSync(SummariesCacheKey);
+const decodeSummariesKey = Schema.decodeSync(SummariesCacheKey);
 
 /** A source as the service hands it to an adapter, plus its stored record. */
 export interface ResolvedSource {
@@ -202,6 +208,14 @@ export class WorkService extends Context.Service<
     readonly watchableSources: Effect.Effect<ReadonlyArray<WatchableSource>, WorkDomainError>;
     /** Current summaries for linked items of one source, read without interactive reserve. */
     readonly snapshots: (
+      sourceId: WorkSourceId,
+      itemIds: ReadonlyArray<WorkItemId>,
+    ) => Effect.Effect<ReadonlyArray<WorkItemSummary>, WorkDomainError>;
+    /**
+     * What a status listing shows of items: `snapshots` kept like the item cache, so a list a client
+     * refetches on every delivery step asks a tracker at most once per interval. It writes nothing.
+     */
+    readonly currentSummaries: (
       sourceId: WorkSourceId,
       itemIds: ReadonlyArray<WorkItemId>,
     ) => Effect.Effect<ReadonlyArray<WorkItemSummary>, WorkDomainError>;
@@ -813,7 +827,13 @@ const make = Effect.gen(function* () {
       const itemLinks = yield* links
         .listByItem(ref.sourceId, ref.itemId)
         .pipe(Effect.mapError(storeFailure));
-      return { ...detail, links: itemLinks.map(toLink), capabilities: adapter.capabilities };
+      const { scopeFingerprint: _read, ...read } = detail;
+      return {
+        ...read,
+        links: itemLinks.map(toLink),
+        capabilities: adapter.capabilities,
+        ...workItemLinkScope(detail),
+      };
     });
 
   const listPeople: WorkService["Service"]["listPeople"] = (actor, query) =>
@@ -1035,6 +1055,7 @@ const make = Effect.gen(function* () {
             url: detail.url,
             revision: detail.revision,
             autoStarted: false,
+            ...workItemLinkScope(detail),
           },
         })
         .pipe(Effect.mapError(storeFailure));
@@ -1072,6 +1093,7 @@ const make = Effect.gen(function* () {
             url: detail.url,
             revision: detail.revision,
             autoStarted: false,
+            ...workItemLinkScope(detail),
           },
         })
         .pipe(Effect.mapError(storeFailure));
@@ -1120,6 +1142,24 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const summariesCache = yield* Cache.makeWith(
+    (key: string) => {
+      const [sourceId, itemIds] = decodeSummariesKey(key);
+      return snapshots(sourceId, itemIds);
+    },
+    { capacity: CACHE_CAPACITY, timeToLive: liveFor(ITEM_TTL) },
+  );
+
+  const currentSummaries: WorkService["Service"]["currentSummaries"] = (sourceId, itemIds) =>
+    currentEpoch.pipe(
+      Effect.flatMap((at) =>
+        Cache.get(
+          summariesCache,
+          encodeSummariesKey([sourceId, [...new Set(itemIds)].toSorted(), at]),
+        ),
+      ),
+    );
+
   const retireProject: WorkService["Service"]["retireProject"] = (projectId) =>
     Effect.gen(function* () {
       // Tombstones keep their links until their project goes; a tombstone's token is released too.
@@ -1158,6 +1198,7 @@ const make = Effect.gen(function* () {
     resolveSource,
     watchableSources,
     snapshots,
+    currentSummaries,
     retireProject,
     bumpEpoch,
     canonicalRef,

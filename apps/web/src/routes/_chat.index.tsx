@@ -4,6 +4,7 @@ import { createFileRoute, Link, useRouter } from "@tanstack/react-router";
 import { LinkIcon, PlusIcon } from "lucide-react";
 import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 
+import { useAssistantOpenPending } from "~/fd/assistant";
 import { isLocalEnvironmentDisabled } from "../localEnvironment";
 import { isElectron } from "../env";
 import { NoProjectsHero } from "../components/NoProjectsHero";
@@ -45,6 +46,7 @@ function IndexDraftLanding() {
   const threads = useThreadShells();
   const bootstrapped = useAllEnvironmentShellsBootstrapped();
   const handleNewThread = useNewThreadHandler();
+  const assistantOpening = useAssistantOpenPending();
   const router = useRouter();
   // Read at effect time: this page stays mounted while a navigation away from
   // "/" is still loading, but the router already points at the new location.
@@ -63,6 +65,10 @@ function IndexDraftLanding() {
   useEffect(() => {
     // Starting a draft after the user has left would replace the page they picked.
     if (mostRecentProject === null || startingRef.current || !isStillOnIndex()) {
+      return;
+    }
+    // An Assistant open publishes its scratch project before the thread it is about to show.
+    if (assistantOpening) {
       return;
     }
     const projectRef = scopeProjectRef(mostRecentProject.environmentId, mostRecentProject.id);
@@ -84,7 +90,7 @@ function IndexDraftLanding() {
         startingRef.current = false;
         setStartState((state) => ({ ...state, failed: true }));
       });
-  }, [handleNewThread, mostRecentProject, startState.retryRequest]);
+  }, [assistantOpening, handleNewThread, mostRecentProject, startState.retryRequest]);
 
   if (!bootstrapped) {
     return null;

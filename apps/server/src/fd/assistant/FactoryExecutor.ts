@@ -1,11 +1,18 @@
 import {
+  type AssistantOverview,
   type ProjectId,
   type ProviderInteractionMode,
   RuntimeRequestId,
   type RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
+import {
+  boundedPendingActions,
+  FACTORY_PENDING_REASON_MAX,
+  type FactoryPendingAction,
+} from "@t3tools/contracts/fd/factory";
 import { workItemRefString } from "@t3tools/contracts/fd/work-management";
+import { isOwnerDecidedRequest, pendingRequestNotice } from "@t3tools/shared/fd/approvals";
 import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -48,6 +55,10 @@ const NEVER_STARTED_STOP = "Not started; cancel removes it from the queue";
 const PENDING_RESUME_STOP =
   "Waiting for a project assistant slot to resume; nothing runs until then. Cancel ends it.";
 const RESUME_KEEPS_ID = "Resume keeps this assignment's delivery; a retry would replace it.";
+const RESUME_MOVED_ON =
+  "This delivery moved on since the review was confirmed, so it was not resumed. Review it again.";
+const RETRY_NEEDS_REVIEW =
+  "Not retried: the owner's review authorized one attempt of this idea, and it has been used. A new attempt needs a fresh owner review.";
 
 /** The note a queued orphan's cancel leaves when its authority no longer holds (D4). */
 const orphanNotice = (root: string, because: string) =>
@@ -83,6 +94,11 @@ const demandNotice = (demand: HandoffAdmission.Demand) => {
     ? `${turn} is waiting for a project assistant slot. T3 cannot tell whether it came from the delivery or from your own turn, so it counts as the delivery's.${answer}`
     : `${turn} is waiting for a project assistant slot.${answer}`;
 };
+
+type OverviewCapture = Pick<AssistantOverview["ideas"][number], "capture">;
+
+/** How many Work items an overview asks their sources about, whatever it lists. */
+const OVERVIEW_SOURCES_MAX = 100;
 
 /** How many of a root's waits, and of its dispositions, the overview words as notices. */
 const OVERVIEW_NOTICES_MAX = 5;
@@ -208,6 +224,12 @@ type Launch =
 
 type Claim = NonNullable<HandoffAdmission.FactoryAssignment["claim"]>;
 
+/** The one resume a fresh review owes one delivery of a family. */
+interface ReviewResumeOwed {
+  readonly deliveryId: string;
+  readonly receiptId: string;
+}
+
 /**
  * What a Factory assignment's enqueue found: the link it writes, from its capture, and the fresh
  * read of the item that confirmed it, which the enqueue's transaction judges once more.
@@ -263,12 +285,16 @@ export const make = Effect.gen(function* () {
       }),
     );
 
-  /** Why the claim's recheck refuses (F, then the verify command), or undefined when it holds. */
+  /**
+   * Why the claim's recheck refuses (F, then the verify command), or undefined when it holds. A
+   * review carries its own verify command, so settings changed since cannot refuse it.
+   */
   const recheck = (assignment: HandoffAdmission.FactoryAssignment, projectId: ProjectId) =>
     Effect.gen(function* () {
       const fresh = yield* readWork(assignment.item);
       const category = yield* admission.authority(assignment.assignmentId, fresh);
       if (category !== undefined) return REFUSED_BECAUSE[category];
+      if (assignment.reviewed !== null) return undefined;
       return (yield* factory.verifyConfigured(projectId)) ? undefined : NOT_CONFIGURED;
     });
 
@@ -365,7 +391,7 @@ export const make = Effect.gen(function* () {
       return yield* adopt(assignment, root, read.value.value);
     });
 
-  /** The claim's start, under the id and ceiling it was queued with. */
+  /** The claim's start, under the id, ceiling and review it was queued with. */
   const callStart = (assignment: HandoffAdmission.FactoryAssignment, root: string) =>
     factory
       .start({
@@ -373,6 +399,9 @@ export const make = Effect.gen(function* () {
         item: assignment.item,
         kind: assignment.kind,
         runtimeModeCeiling: assignment.runtimeMode,
+        ...(assignment.reviewed === null
+          ? {}
+          : { reviewedExecution: assignment.reviewed.execution }),
       })
       .pipe(
         Effect.map((delivery): Launch => ({ type: "started", delivery })),
@@ -794,14 +823,22 @@ export const make = Effect.gen(function* () {
   const requestNotices = (assignmentId: string, root: string) =>
     Effect.gen(function* () {
       for (const request of yield* factory.requests(root)) {
-        if (request.run?.class === "explicit") continue;
+        if (request.run?.class === "explicit" || !isOwnerDecidedRequest(request.kind)) continue;
         yield* noteOnce(
           assignmentId,
-          request.kind !== "user_input"
-            ? `Thread ${request.threadId} needs a permission decision. Open that thread's approval UI; question tools cannot grant permission.`
-            : request.capability === "live" && request.run?.class === "factory"
-              ? `Owner question from thread ${request.threadId}: ${encodeQuestions(request.questions).slice(0, 4000)}. Reply through assistant_answer with its exact request ID ${request.requestId}.`
-              : `A question on thread ${request.threadId} waits for an answer. Answer it in that thread.`,
+          pendingRequestNotice({
+            threadId: request.threadId,
+            requestId: request.requestId,
+            kind: request.kind,
+            runClass: request.run?.class ?? null,
+            runtimeMode: request.runtimeMode ?? null,
+            capability: request.capability,
+            reason: request.reason,
+            questions:
+              request.kind === "user_input"
+                ? encodeQuestions(request.questions).slice(0, 4000)
+                : null,
+          }),
         );
       }
     });
@@ -989,6 +1026,7 @@ export const make = Effect.gen(function* () {
     current: Portfolio.Assignment,
     assignment: HandoffAdmission.FactoryAssignment,
     root: string,
+    owed: ReviewResumeOwed | undefined,
   ) =>
     Effect.gen(function* () {
       switch (current.state) {
@@ -1018,14 +1056,18 @@ export const make = Effect.gen(function* () {
       }
       const delivery = Option.getOrUndefined(read.value);
       const fresh = yield* readWork(assignment.item);
-      const verified = yield* Effect.exit(factory.verifyConfigured(current.projectId));
-      if (Exit.isFailure(verified)) {
-        return yield* refusal(
-          "Factory's settings could not be read, so nothing was resumed. Try again.",
-        );
+      // A review carries its own verify command, so settings changed since cannot refuse it.
+      if (assignment.reviewed === null) {
+        const verified = yield* Effect.exit(factory.verifyConfigured(current.projectId));
+        if (Exit.isFailure(verified)) {
+          return yield* refusal(
+            "Factory's settings could not be read, so nothing was resumed. Try again.",
+          );
+        }
+        if (!verified.value) return yield* refusal(`Not resumed: ${NOT_CONFIGURED}.`);
       }
-      if (!verified.value) return yield* refusal(`Not resumed: ${NOT_CONFIGURED}.`);
       if (delivery === undefined || delivery.status === "queued") {
+        if (owed !== undefined) return yield* refusal(RESUME_MOVED_ON);
         // A root parked before its first start waits in the queue again. Only a fair grant
         // re-claims it, and that claim's recheck starts this same id.
         if (current.state !== "stopped") {
@@ -1067,13 +1109,29 @@ export const make = Effect.gen(function* () {
           `Factory delivery ${root} is ${delivery.status}, so it cannot resume.`,
         );
       }
+      if (owed !== undefined && target !== owed.deliveryId) {
+        return yield* refusal(RESUME_MOVED_ON);
+      }
       const category = yield* admission.authority(assignment.assignmentId, fresh);
       if (category !== undefined) {
         return yield* refusal(`Not resumed: ${REFUSED_BECAUSE[category]}.`);
       }
       // The full recheck: what it restored enters the fair order again, at a fresh position.
       yield* admission.recheckBlocked({ root, work: fresh, force: true });
-      yield* factory.resume(target);
+      if (owed === undefined) {
+        yield* factory.resume(target);
+      } else {
+        const taken = yield* factory.resume(target, { owedBy: owed.receiptId }).pipe(
+          Effect.as(true),
+          Effect.catchTags({
+            HandoffFactoryRefused: (refused) =>
+              refused.reason === "not_owed" ? Effect.succeed(false) : Effect.fail(refused),
+          }),
+        );
+        // Someone else's resume took it while this one read Work: whatever it does now, it does
+        // without this confirmation.
+        if (!taken) return current;
+      }
       yield* admission.setControl(assignment.assignmentId, "none");
       if (current.state === "running") return current;
       return yield* move(assignment.assignmentId, {
@@ -1089,7 +1147,7 @@ export const make = Effect.gen(function* () {
         (current.state !== "failed" && current.state !== "cancelled") ||
         assignment.root?.state !== "retired"
       ) {
-        return yield* refusal(RESUME_KEEPS_ID);
+        return yield* refusal(assignment.reviewed === null ? RESUME_KEEPS_ID : RETRY_NEEDS_REVIEW);
       }
       const entered = yield* admission.retryReentry({
         assignmentId: assignment.assignmentId,
@@ -1104,6 +1162,8 @@ export const make = Effect.gen(function* () {
           return yield* refusal(
             "Another assignment uses this capture, or this one has not ended, so nothing was retried.",
           );
+        case "review_required":
+          return yield* refusal(RETRY_NEEDS_REVIEW);
       }
     });
 
@@ -1240,8 +1300,46 @@ export const make = Effect.gen(function* () {
       return request.threadId;
     });
 
+  /**
+   * What the delivery waits on someone for, from one read the whole overview shares: nothing here
+   * writes, an ended delivery asks nothing, and requests that could not be read say so rather than
+   * read as none.
+   */
+  const overviewPendingActions = (
+    root: string,
+    projectId: ProjectId,
+    follow: HandoffBackend.HandoffFollow | null,
+    pending: HandoffBackend.HandoffPendingRequests,
+  ) => {
+    if (follow === null || isEnded(follow.status)) return undefined;
+    const actions: ReadonlyArray<FactoryPendingAction> = [
+      ...(follow.ownerActions ?? []),
+      ...(pending.byRoot.get(root) ?? [])
+        .filter(({ kind }) => isOwnerDecidedRequest(kind))
+        .map((request) => ({
+          kind: request.kind,
+          runClass: request.run?.class ?? null,
+          runtimeMode: request.runtimeMode ?? null,
+          threadId: ThreadId.make(request.threadId),
+          projectId: request.projectId ?? projectId,
+          requestId: request.requestId,
+          capability: request.capability,
+          ...(request.reason === undefined
+            ? {}
+            : { reason: request.reason.slice(0, FACTORY_PENDING_REASON_MAX) }),
+        })),
+    ];
+    return actions.length === 0 && pending.complete
+      ? undefined
+      : boundedPendingActions(actions, pending.complete);
+  };
+
   /** The delivery as the overview shows it; a failed read reads as `unknown`, a missing row as none. */
-  const overviewDelivery = (root: string) =>
+  const overviewDelivery = (
+    root: string,
+    projectId: ProjectId,
+    pending: HandoffBackend.HandoffPendingRequests,
+  ) =>
     Effect.gen(function* () {
       const read = yield* factory
         .follow(root)
@@ -1259,6 +1357,7 @@ export const make = Effect.gen(function* () {
       const blocked = waiting.filter(({ blockedReason }) => blockedReason !== null).length;
       const ended = yield* admission.dispositions(root, OVERVIEW_NOTICES_MAX);
       const threadId = child?.threadId ?? follow?.threadId ?? null;
+      const pendingActions = overviewPendingActions(root, projectId, follow, pending);
       return {
         deliveryId: root,
         status: Option.isNone(read) ? ("unknown" as const) : (shown?.status ?? null),
@@ -1269,7 +1368,12 @@ export const make = Effect.gen(function* () {
         endedDispositions: ended.count,
         notices: [...waiting.slice(-OVERVIEW_NOTICES_MAX).map(demandNotice), ...ended.notices],
         pullRequestUrl: follow?.pullRequest?.url ?? null,
+        ...(follow?.pullRequest?.outcome == null
+          ? {}
+          : { pullRequestOutcome: follow.pullRequest.outcome }),
+        ...(follow?.proceeding === undefined ? {} : { proceeding: follow.proceeding }),
         threadId: threadId === null ? null : ThreadId.make(threadId),
+        ...(pendingActions === undefined ? {} : { pendingActions }),
       };
     });
 
@@ -1282,10 +1386,11 @@ export const make = Effect.gen(function* () {
 
     /**
      * What the overview adds to a Factory assignment: its Work item and its delivery, once it has
-     * one. Reads only what the assistant and Factory store, never a Work source. A read that fails
-     * leaves its part out, so one assignment never costs the owner the others.
+     * one. Reads only what the assistant and Factory store; what its Work source says comes from
+     * `overviewSources`, for the whole overview at once. A read that fails leaves its part out, so
+     * one assignment never costs the owner the others.
      */
-    overviewOf: (current: Portfolio.Assignment) =>
+    overviewOf: (current: Portfolio.Assignment, pending: HandoffBackend.HandoffPendingRequests) =>
       Effect.gen(function* () {
         const assignment = yield* admission.factoryAssignment(current.assignmentId);
         if (assignment === undefined) return {};
@@ -1298,21 +1403,40 @@ export const make = Effect.gen(function* () {
           key: recorded?.itemKey ?? null,
           url: recorded?.itemUrl ?? null,
         };
+        const reviewed = assignment.reviewed !== null;
         return assignment.deliveryId === null
-          ? { workItem }
-          : { workItem, factory: yield* overviewDelivery(assignment.deliveryId) };
+          ? { workItem, reviewed }
+          : {
+              workItem,
+              reviewed,
+              factory: yield* overviewDelivery(assignment.deliveryId, current.projectId, pending),
+            };
       }).pipe(
         deferred("overview"),
         Effect.map((fields) => fields ?? {}),
       ),
+
+    /**
+     * What is pending across every root, read once for a whole overview however many assignments
+     * it shows, and bounded by the threads holding a request. A failed read says it is incomplete.
+     */
+    overviewPendingRequests: factory.pendingRequests.pipe(
+      Effect.catchTags({
+        HandoffFactoryError: () =>
+          Effect.succeed<HandoffBackend.HandoffPendingRequests>({
+            byRoot: new Map(),
+            complete: false,
+          }),
+      }),
+    ),
 
     /** An idea's Work capture for the overview, when it has one and it can be read. */
     overviewCapture: (projectId: ProjectId, ideaId: string) =>
       captures.get(projectId, ideaId).pipe(
         Effect.map(
           Option.match({
-            onNone: () => ({}),
-            onSome: ({ state, sourceId, itemId, itemKey, itemUrl }) => ({
+            onNone: (): OverviewCapture => ({}),
+            onSome: ({ state, sourceId, itemId, itemKey, itemUrl }): OverviewCapture => ({
               capture: {
                 state,
                 item: itemId === null ? null : { sourceId, itemId, key: itemKey, url: itemUrl },
@@ -1323,6 +1447,25 @@ export const make = Effect.gen(function* () {
         deferred("overview"),
         Effect.map((fields) => fields ?? {}),
       ),
+
+    /**
+     * What Work sources say of the items an overview shows, keyed by `sourceId:itemId`, for at most
+     * the first `OVERVIEW_SOURCES_MAX` of them: the overview names live ones first.
+     */
+    overviewSources: (refs: ReadonlyArray<HandoffBackend.HandoffItemRef>) =>
+      work
+        .summaries(
+          [...new Map(refs.map((ref) => [workItemRefString(ref), ref])).values()].slice(
+            0,
+            OVERVIEW_SOURCES_MAX,
+          ),
+        )
+        .pipe(
+          Effect.map(
+            (summaries) =>
+              new Map(summaries.map((summary) => [workItemRefString(summary.ref), summary])),
+          ),
+        ),
 
     /** The captured item's fresh read, for an enqueue, taken before the assistant's lock. */
     readCaptured: (projectId: ProjectId, ideaId: string) =>
@@ -1433,8 +1576,15 @@ export const make = Effect.gen(function* () {
         }
       }),
 
-    /** A control of a Factory assignment (note 6.8), under the assistant's lock. */
-    control: (current: Portfolio.Assignment, action: "stop" | "resume" | "retry" | "cancel") =>
+    /**
+     * A control of a Factory assignment (note 6.8), under the assistant's lock. With `owed`, a resume
+     * is refused unless it would pick that very delivery, and is that review's one resume or none.
+     */
+    control: (
+      current: Portfolio.Assignment,
+      action: "stop" | "resume" | "retry" | "cancel",
+      options: { readonly owed?: ReviewResumeOwed } = {},
+    ) =>
       Effect.gen(function* () {
         const assignment = yield* admission.factoryAssignment(current.assignmentId);
         if (assignment === undefined) return yield* refusal("Assignment not found.");
@@ -1463,7 +1613,7 @@ export const make = Effect.gen(function* () {
           case "cancel":
             return yield* cancel(current, assignment, root);
           case "resume":
-            return yield* resume(current, assignment, root);
+            return yield* resume(current, assignment, root, options.owed);
           case "retry":
             return yield* retry(current, assignment);
         }

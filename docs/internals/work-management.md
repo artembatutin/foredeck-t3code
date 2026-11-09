@@ -26,7 +26,10 @@ different name under an id is refused instead of skipped (see
 ## Links live in Work, not on the thread
 
 Thread links are rows in `fd_work_thread_links`, never fields on the thread
-shell, so core projections and upstream merges stay untouched. Item ids are
+shell, so core projections and upstream merges stay untouched. A link's thread
+and item need not share a project: linking does not compare them, and the project
+assistant's thread lives in the scratch project. An item's project is its source's,
+so read it from the source, never from the thread. Item ids are
 canonicalized per source kind (`model/itemId.ts`) before they key locks, caches
 or link rows, because trackers accept several spellings of one item. A link is
 written before a thread launch so a concurrent start of the same item sees it,
@@ -50,9 +53,19 @@ Settling is the owner saying the thread is finished, so
 unsettling does not bring the link back. The thread event tail is live only: a
 sweep at boot and every five minutes recovers outcomes committed while the
 reactor was not listening, drops links the tail missed and refreshes the
-displayed snapshot fields. A snapshot's revision stays the item as the thread
-first saw it (or as the automatic start left it), the baseline for "Changed since
-the thread started". Nothing polls item lists.
+displayed snapshot fields. Nothing polls item lists.
+
+"Changed since the thread started" compares scope fingerprints, never revisions:
+a revision moves for every comment, Markdown note, status and assignee, which is
+what guards a write but says nothing of what the item asks for, so Factory's own
+progress comments would otherwise read as changed requirements. A link stores its
+fingerprint once when it is written, and the display refresh leaves it alone. A
+link stored before fingerprints existed has none and never claims a change, since
+nothing says what its thread saw. Each source takes the fingerprint from the whole
+body, before cutting that for the wire: a bounded body cannot see an edit past the
+cut, and a comment growing a Markdown task across the cap would flip its truncation
+and read as a change. Everything that judges an item reads this one value, so a
+capture and a delivery's opening see what a link does.
 
 ## Canonical checkout
 

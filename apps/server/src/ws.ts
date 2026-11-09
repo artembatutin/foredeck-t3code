@@ -27,6 +27,7 @@ import { rpcInitialItems } from "./rpcInitialItems.ts";
 import { subscribeChatGptHandoff } from "./provider/CodexChatGptHandoff.ts";
 import { subscribeCodexAuthCallback } from "./provider/CodexAuthCallback.ts";
 import {
+  AssistantReviewRpcs,
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
   AcpRegistryOperationError,
   CommandId,
@@ -107,6 +108,7 @@ import {
   type TerminalEvent,
   type TerminalMetadataStreamEvent,
   type PullRequestRef,
+  RpcScopeAuthorization,
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
@@ -117,7 +119,7 @@ import {
   HttpServerRespondable,
   HttpServerResponse,
 } from "effect/http";
-import { RpcSerialization, RpcServer } from "effect/rpc";
+import { RpcGroup, RpcSerialization, RpcServer } from "effect/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as ServerConfig from "./config.ts";
@@ -560,12 +562,20 @@ const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 
 // Middleware added later wraps middleware added earlier, so instrumentation wraps authorization.
 const ServerWsRpcGroup = WsRpcGroup.middleware(RpcInstrumentation);
-// Work's and Factory's handlers come from their own layers; one handler object over every method
-// is too deep.
+// Work's, Factory's and the owner's review's handlers come from their own layers; one handler
+// object over every method is too deep. How deep shows only by chance: it depends on what each
+// checker cached first, so an edit elsewhere can flip it, and only `tsc-rs --singleThreaded` tells.
 const CoreServerWsRpcGroup = ServerWsRpcGroup.omit(
   ...WorkManagement.WS_METHOD_TAGS,
   ...Factory.WS_METHOD_TAGS,
+  WS_METHODS.assistantReviewGet,
+  WS_METHODS.assistantReviewRevise,
+  WS_METHODS.assistantReviewStart,
 );
+// In core's order: instrumentation wraps authorization.
+const AssistantReviewServerRpcGroup = RpcGroup.make(...AssistantReviewRpcs)
+  .middleware(RpcScopeAuthorization)
+  .middleware(RpcInstrumentation);
 // When a resuming client's cursor is more than this many events behind the
 // current head, skip the per-event catch-up replay and send a fresh shell
 // snapshot instead. Replaying each intervening event costs a shell refetch;
@@ -639,6 +649,12 @@ export function shouldUseBoundedThreadSnapshot(input: {
 }): boolean {
   return input.acceptBoundedSnapshot === true;
 }
+
+/** Tells a client when a dispatch failed on a rejected receipt, which its command id can never pass. */
+export const dispatchRejectionField = (cause: { readonly _tag: string }) =>
+  cause._tag === "OrchestratorCommandPreviouslyRejectedError"
+    ? ({ previouslyRejected: true } as const)
+    : {};
 
 // Optional client identity announced on the /ws upgrade URL next to wsTicket.
 // Lenient by design: absent or malformed values degrade to {} so a connection
@@ -1213,6 +1229,41 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
     );
   },
 );
+
+/** The owner's review of an idea, for one authenticated WebSocket session. */
+const layerAssistantReviewRpc = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
+  AssistantReviewServerRpcGroup.toLayer(
+    Effect.gen(function* () {
+      const assistant = yield* ProjectAssistant.ProjectAssistant;
+      const sessions = yield* SessionStore.SessionStore;
+      const assistantError = (error: ProjectAssistant.AssistantError) =>
+        new AssistantOperationError({ message: error.message });
+      return AssistantReviewServerRpcGroup.of({
+        [WS_METHODS.assistantReviewGet]: (input) =>
+          assistant.review(input).pipe(Effect.mapError(assistantError)),
+        [WS_METHODS.assistantReviewRevise]: (input) =>
+          assistant.revise(input).pipe(Effect.asVoid, Effect.mapError(assistantError)),
+        [WS_METHODS.assistantReviewStart]: (input) =>
+          assistant
+            .startReview({
+              ...input,
+              owner: {
+                sessionId: currentSession.sessionId,
+                scopes: currentSession.scopes,
+                current: sessions.listActive().pipe(
+                  Effect.map(
+                    (active) =>
+                      active.find(({ sessionId }) => sessionId === currentSession.sessionId)
+                        ?.scopes ?? null,
+                  ),
+                  Effect.orElseSucceed(() => null),
+                ),
+              },
+            })
+            .pipe(Effect.mapError(assistantError)),
+      });
+    }),
+  );
 
 const layerWsRpc = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
@@ -1932,6 +1983,7 @@ const layerWsRpc = (
                       commandType: command.type,
                       message: detail ?? "Failed to dispatch orchestration V2 command",
                       ...(detail === undefined ? {} : { detail }),
+                      ...dispatchRejectionField(cause),
                       cause,
                     });
                   }),
@@ -3452,6 +3504,7 @@ export const layer = Layer.unwrap(
                 repositoryWorkspace,
                 repositoryClient,
               ),
+              layerAssistantReviewRpc(session),
               WorkManagement.layerWsRpc(session),
               Factory.layerWsRpc,
             ).pipe(

@@ -1,3 +1,4 @@
+import { FactoryPromptName } from "@t3tools/contracts/fd/factory";
 import * as Schema from "effect/Schema";
 
 export const MAX_PROMPT_OVERRIDE_BYTES = 64 * 1024;
@@ -5,15 +6,7 @@ export const MAX_PROMPT_OVERRIDE_BYTES = 64 * 1024;
 export class FactoryPromptOverrideError extends Schema.TaggedError<FactoryPromptOverrideError>()(
   "FactoryPromptOverrideError",
   {
-    prompt: Schema.Literals([
-      "plan",
-      "author",
-      "review",
-      "fix-verify",
-      "fix-review",
-      "fix-commit",
-      "integrate",
-    ]),
+    prompt: FactoryPromptName,
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
@@ -22,5 +15,4 @@ export class FactoryPromptOverrideError extends Schema.TaggedError<FactoryPrompt
   }
 }
 
-export type FactoryPromptName = FactoryPromptOverrideError["prompt"];
 export const isFactoryPromptOverrideError = Schema.is(FactoryPromptOverrideError);

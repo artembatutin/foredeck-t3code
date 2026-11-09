@@ -1,4 +1,4 @@
-import { type RuntimeRequestId, type ScopedThreadRef } from "@t3tools/contracts";
+import { type RuntimeMode, type RuntimeRequestId, type ScopedThreadRef } from "@t3tools/contracts";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { type PendingUserInput } from "../../session-logic";
 import {
@@ -9,6 +9,7 @@ import { CheckIcon } from "lucide-react";
 import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collapsible";
 import { cn } from "~/lib/utils";
 import { ComposerBanner } from "./ComposerBanner";
+import { pendingAnswerRefusal, type RuntimeModePolicyProvider } from "../../fd/approvals";
 import ChatMarkdown from "../ChatMarkdown";
 
 interface PendingUserInputPanelProps {
@@ -17,6 +18,11 @@ interface PendingUserInputPanelProps {
   cwd: string | undefined;
   threadRef: ScopedThreadRef;
   disabled?: boolean;
+  /** What the answer's turn would run on, for an answer that starts one. */
+  turn?: {
+    readonly provider: RuntimeModePolicyProvider | null | undefined;
+    readonly threadMode: RuntimeMode;
+  };
   respondingRequestIds: RuntimeRequestId[];
   answers: Record<string, PendingUserInputDraftAnswer>;
   questionIndex: number;
@@ -30,6 +36,7 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
   cwd,
   threadRef,
   disabled = false,
+  turn,
   respondingRequestIds,
   answers,
   questionIndex,
@@ -47,7 +54,15 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
       prompt={activePrompt}
       cwd={cwd}
       threadRef={threadRef}
-      disabled={disabled}
+      // A refused answer waits, and can still be dismissed.
+      disabled={
+        disabled ||
+        (turn !== undefined &&
+          pendingAnswerRefusal({
+            responseCapability: activePrompt.responseCapability,
+            ...turn,
+          }) !== null)
+      }
       isResponding={respondingRequestIds.includes(activePrompt.requestId)}
       answers={answers}
       questionIndex={questionIndex}

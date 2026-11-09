@@ -66,6 +66,41 @@ export function assertToolCallReadOnlyOnRequestOutput(
   }
 }
 
+// A registry agent has no flavor of its own to word its choices, so its approval lists exactly what
+// its request does: its allow-always under its own name, which T3 cannot call a session choice.
+export function assertToolCallReadOnlyOnRequestRegistryOutput(
+  result: OrchestratorV2ScenarioResult,
+  transcript: ProviderReplayTranscript,
+) {
+  assertToolCallReadOnlyOnRequestOutput(result, transcript);
+  const approval = projectionFor(result, transcript.scenario).turnItems.find(
+    (item) => item.type === "approval_request",
+  );
+  assert.deepEqual(approval?.type === "approval_request" ? approval.options : [], [
+    { decision: "cancel", label: "Cancel" },
+    { decision: "decline", label: "Decline" },
+    { decision: "acceptAlways", label: "Allow for session" },
+    { decision: "accept", label: "Approve" },
+  ]);
+}
+
+// Asked by an agent with nothing longer to offer, the approval lists nothing longer, where a client
+// offering its own session choice would come back cancelled with a grant already recorded.
+export function assertToolCallReadOnlyOnRequestOnceOnlyOutput(
+  result: OrchestratorV2ScenarioResult,
+  transcript: ProviderReplayTranscript,
+) {
+  assertToolCallReadOnlyOnRequestOutput(result, transcript);
+  const approval = projectionFor(result, transcript.scenario).turnItems.find(
+    (item) => item.type === "approval_request",
+  );
+  assert.deepEqual(approval?.type === "approval_request" ? approval.options : [], [
+    { decision: "cancel", label: "Cancel" },
+    { decision: "decline", label: "Decline" },
+    { decision: "accept", label: "Approve" },
+  ]);
+}
+
 // T3 advertises no client fs or terminal to Grok, so Grok reads and writes the
 // workspace itself and gates the write with its own permission prompt: T3
 // answers that prompt (the shared assertion pins it as the only request) and

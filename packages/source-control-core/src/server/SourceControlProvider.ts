@@ -150,6 +150,16 @@ export class SourceControlProvider extends Context.Service<
     }) => Effect.Effect<RepositoryIdentity, SourceControlProviderError>;
     /** Optional capability for issue and change-request subjects. */
     readonly resolveLink?: ResolveSourceControlLink;
+    /**
+     * The repository `createChangeRequest` would open a change request against now, by the same
+     * resolution it makes, named so that two answers compare. Absent means the provider cannot say,
+     * as when its CLI decides from its own configuration: a caller that must hold publication to one
+     * repository has to refuse it.
+     */
+    readonly resolveChangeRequestRepository?: (input: {
+      readonly cwd: string;
+      readonly context?: SourceControlProviderContext;
+    }) => Effect.Effect<string, SourceControlProviderError>;
     readonly listChangeRequests: (input: {
       readonly cwd: string;
       readonly context?: SourceControlProviderContext;

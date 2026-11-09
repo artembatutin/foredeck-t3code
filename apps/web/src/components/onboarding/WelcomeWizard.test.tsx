@@ -146,6 +146,7 @@ it("enters the workspace after a partial import and warns after navigation finis
   await act(async () => root.render(<WelcomeWizard localAvailable onDone={onDone} />));
   await click("Continue");
   await click("Continue");
+  await click("Find previous projects");
   await click("Import 1 project");
   expect(onDone).toHaveBeenCalledWith({
     environmentId: EnvironmentId.make("test-env"),
@@ -181,6 +182,7 @@ it.each([
     await act(async () => root.render(<WelcomeWizard localAvailable onDone={onDone} />));
     await click("Continue");
     await click("Continue");
+    await click("Find previous projects");
     await click("Import 1 project");
     expect(onDone).toHaveBeenCalledOnce();
     if (warning === null && importedCount > 0) {
@@ -204,6 +206,7 @@ it("keeps setup open when saving completion fails and preserves the import warni
   await act(async () => root.render(<WelcomeWizard localAvailable onDone={onDone} />));
   await click("Continue");
   await click("Continue");
+  await click("Find previous projects");
   await click("Import 1 project");
   expect(onDone).not.toHaveBeenCalled();
   expect(mocks.toast).toHaveBeenCalledWith(

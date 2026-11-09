@@ -3,6 +3,7 @@ import type { WorkStatus } from "@t3tools/contracts/fd/work-management";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
 import {
   type AutomaticTurn,
@@ -146,8 +147,8 @@ export const isFactoryOpeningRefusedError = Schema.is(FactoryOpeningRefusedError
  * work, `unknown` when nothing shows whose it is. `retired` when the root's management has ended
  * or is ending. The turn is presented as the gate was given it: `admit` runs `dispatch` inline or
  * not at all, `hand` (a native wake, whose output exists only in memory) may also keep `dispatch`,
- * which needs nothing more, to run later, or `drop` it, which clears the adapter's offer and exists
- * only when the offer can be cleared.
+ * which needs nothing more but what `allowed` asks, to run later, or `drop` it, which clears the
+ * adapter's offer and exists only when the offer can be cleared.
  */
 export type FactoryAutomaticTurn<A, E, R> = {
   readonly root: FactoryDeliveryId;
@@ -164,6 +165,11 @@ export type FactoryAutomaticTurn<A, E, R> = {
       readonly turn: BackgroundWakeTurn;
       readonly dispatch: Effect.Effect<A, E>;
       readonly drop?: Effect.Effect<void>;
+      /**
+       * Whether a kept `dispatch` may still run, asked right before it is admitted; refused, it
+       * stays kept, blocked until its root is restored. Absent, nothing holds it back.
+       */
+      readonly allowed?: Effect.Effect<boolean>;
     }
 );
 
@@ -204,8 +210,19 @@ export class FactoryAdmission extends Context.Reference<{
   readonly automaticTurn: <A, E, R>(
     turn: FactoryAutomaticTurn<A, E, R>,
   ) => Effect.Effect<AutomaticTurnOutcome<A>, E | AutomaticTurnDecisionError, R>;
+  /**
+   * The manager's queue rank for each root it manages or ever managed, null for one it has not
+   * ranked. Any other root is left out. For a listing to show; nothing is decided by it.
+   */
+  readonly queuePriorities: (
+    roots: ReadonlyArray<FactoryDeliveryId>,
+  ) => Effect.Effect<ReadonlyMap<FactoryDeliveryId, number | null>, FactoryAdmissionReadError>;
+  /** A counter that rises when a queue rank may have changed: its value now, then each move. */
+  readonly queueChanges: Stream.Stream<number>;
 }>("t3/fd/factory/FactoryAdmission", {
   defaultValue: () => ({
+    queuePriorities: () => Effect.succeed(new Map()),
+    queueChanges: Stream.concat(Stream.succeed(0), Stream.never),
     management: () => Effect.succeed("never"),
     enter: () => Effect.succeed(proceed),
     deferredDemand: () => Effect.succeed(false),

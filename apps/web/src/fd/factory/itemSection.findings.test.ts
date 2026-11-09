@@ -17,14 +17,16 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 const destination = vi.hoisted(() => ({ deliveries: undefined as unknown }));
 
 vi.mock("./state", async () => {
-  const { Atom } = await import("effect/reactivity");
+  const { AsyncResult, Atom } = await import("effect/reactivity");
   const yes = Atom.make(true).pipe(Atom.keepAlive);
+  const unread = Atom.make(AsyncResult.initial()).pipe(Atom.keepAlive);
   const command = { permissionAtom: () => yes };
   return {
     factoryEnvironment: {
       supported: () => yes,
       planning: () => yes,
       deliveries: () => destination.deliveries,
+      delivery: () => unread,
       start: command,
       stop: command,
       resume: command,

@@ -3,8 +3,14 @@ import {
   type OrchestrationV2ThreadShell,
   ProjectId,
   ProviderInstanceId,
+  RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
+import {
+  FACTORY_PENDING_ACTIONS_MAX,
+  FACTORY_PENDING_REASON_MAX,
+  type FactoryReviewedExecution,
+} from "@t3tools/contracts/fd/factory";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -65,6 +71,9 @@ interface FakeItem {
   fingerprint: string;
   status: "todo" | "in_progress" | "done" | "cancelled";
   readable: boolean;
+  /** What its source titles it; `An item` unless a test says. */
+  title?: string;
+  assignee?: string | null;
 }
 
 type Status = HandoffBackend.HandoffDelivery["status"];
@@ -98,6 +107,20 @@ const makeFakes = () => {
         >)
       | undefined,
     launches: [] as Array<Launches.ThreadLaunchInput>,
+    /** Every message or command a thread was sent, which no status read or mirror may do. */
+    dispatched: [] as Array<unknown>,
+    /** What each overview asked Work sources about. */
+    summaryReads: [] as Array<ReadonlyArray<string>>,
+    /** What the delivery's `follow` reports beyond its status, while a test sets it. */
+    followed: undefined as Partial<HandoffBackend.HandoffFollow> | undefined,
+    /** What is pending on the family's threads, and whether reading that fails. */
+    requests: [] as Array<HandoffBackend.HandoffRequest>,
+    requestsFail: false,
+    /** How many times a family's whole history was walked, and pending requests read at once. */
+    familyScans: 0,
+    pendingReads: 0,
+    /** Every Looper configuration prepared, in order. */
+    looperPrepares: [] as Array<string>,
   };
   return fakes;
 };
@@ -238,13 +261,29 @@ const factoryPort = (fakes: Fakes): typeof HandoffBackend.HandoffFactory.Service
                 threadId: null,
                 child: null,
                 marked: [],
+                ...fakes.followed,
               }),
         );
       }),
     ensureDeferred: () => Effect.succeed("stale"),
     redispatch: () => Effect.succeed("stale"),
     runStateOf: () => Effect.succeed("ended"),
-    requests: () => Effect.succeed([]),
+    requests: () =>
+      Effect.sync(() => {
+        fakes.familyScans += 1;
+        return fakes.requests;
+      }),
+    pendingRequests: Effect.suspend(() => {
+      fakes.pendingReads += 1;
+      return fakes.requestsFail
+        ? Effect.fail(new HandoffBackend.HandoffFactoryError({ operation: "requests" }))
+        : Effect.succeed({
+            byRoot: new Map(
+              [...fakes.deliveries.keys()].map((id) => [id, fakes.requests] as const),
+            ),
+            complete: true,
+          });
+    }),
     activity: (id) =>
       Effect.sync(() => {
         const status = fakes.deliveries.get(id);
@@ -264,6 +303,24 @@ const factoryPort = (fakes: Fakes): typeof HandoffBackend.HandoffFactory.Service
 };
 
 const workPort = (fakes: Fakes): Partial<typeof HandoffBackend.HandoffBackend.Service> => ({
+  summaries: (refs) =>
+    Effect.sync(() => {
+      fakes.summaryReads.push(refs.map(({ itemId }) => itemId));
+      return refs.flatMap((ref) => {
+        const item = fakes.items.get(ref.itemId);
+        return item === undefined || !item.readable
+          ? []
+          : [
+              {
+                ref,
+                title: item.title ?? "An item",
+                status: item.status,
+                statusName: null,
+                assignee: item.assignee ?? null,
+              },
+            ];
+      });
+    }),
   read: (ref) =>
     Effect.andThen(
       runOnce(fakes, "onRead"),
@@ -336,8 +393,26 @@ const layerOf = (fakes: Fakes, probe?: typeof HandoffAdmission.HandoffAdmissionP
       // An ordinary worker's thread is unknown here, so its launch stays unconfirmed.
       getThreadShell: (id) =>
         Effect.suspend(() => Effect.succeed(id === managerId ? fakes.manager : null)),
+      dispatch: (input) =>
+        Effect.suspend(() => {
+          fakes.dispatched.push(input);
+          return Effect.die("A thread was sent something this test does not expect.");
+        }),
     }),
-    Layer.mock(Looper.Looper)({}),
+    Layer.mock(Looper.Looper)({
+      prepare: (configPath, projectRoot) =>
+        Effect.sync(() => {
+          fakes.looperPrepares.push(configPath);
+          return {
+            configPath,
+            projectRoot,
+            worktree: "/isolated/loop",
+            runtimeDir: "/runtime/loop",
+            configHash: "hash",
+            goalHash: "goal",
+          };
+        }),
+    }),
     Layer.mock(Projects.ProjectService)({
       getById: (id) =>
         Effect.suspend(() =>
@@ -1415,6 +1490,379 @@ describe("a start's outcomes", () => {
     );
   });
 
+  describe("under a review receipt", () => {
+    const execution = {
+      receiptId: "receipt-1",
+      reviewVersion: 1,
+      roles: { planner: modelSelection, author: modelSelection, reviewer: modelSelection },
+      verifyCommand: { executable: "vp", args: ["test"] },
+      setupCommand: null,
+      limits: {
+        maxFixRounds: 1,
+        maxReviewRounds: 1,
+        maxFixCommitTurns: 1,
+        verifyTimeoutMinutes: 5,
+      },
+      blockingSeverities: ["high"],
+      highRiskEffort: "xhigh",
+      pipelineId: "standard",
+      repository: {
+        projectId: alpha,
+        workspaceRoot: "/repo",
+        publication: {
+          push: [],
+          head: [],
+          provider: "unknown",
+          repository: null,
+          remoteConfig: "reviewed-config",
+        },
+      },
+      runtimeCeiling: "approval-required",
+      promptOverrides: {
+        plan: "absent",
+        author: "absent",
+        review: "absent",
+        "fix-verify": "absent",
+        "fix-review": "absent",
+        "fix-commit": "absent",
+        integrate: "absent",
+      },
+    } satisfies FactoryReviewedExecution;
+
+    const attached = (fakes: Fakes, idea: string) =>
+      Effect.gen(function* () {
+        yield* agreed(fakes, idea);
+        const admission = yield* admissionService;
+        assert.strictEqual(
+          yield* admission.attachReviewReceipt({ assignmentId: idea, execution }),
+          "attached",
+        );
+      });
+
+    it.effect("refuses a failed assignment's retry, which starts no new delivery", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* attached(fakes, "idea");
+          fakes.onStart = () => Effect.succeed("refuse");
+          yield* tick;
+          const first = (yield* linkOf("idea"))!.delivery_id!;
+          assert.strictEqual(yield* stateOf("idea"), "failed");
+          fakes.onStart = undefined;
+          const starts = fakes.calls.length;
+
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            const refused = yield* Effect.flip(control("idea", "retry"));
+            assert.include(refused.message, "fresh owner review");
+          }
+          yield* tick;
+
+          assert.strictEqual(yield* stateOf("idea"), "failed");
+          assert.strictEqual((yield* linkOf("idea"))!.delivery_id, first);
+          assert.isUndefined(yield* positionOf("idea"));
+          assert.deepStrictEqual(yield* rootOf(first), { state: "retired", reason: "failed" });
+          assert.lengthOf(fakes.calls, starts);
+        }),
+      );
+    });
+
+    it.effect("asks for a fresh review rather than naming a resume, while it has not ended", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* attached(fakes, "idea");
+          yield* tick;
+          const refused = yield* Effect.flip(control("idea", "retry"));
+          assert.include(refused.message, "fresh owner review");
+          assert.strictEqual(yield* stateOf("idea"), "running");
+        }),
+      );
+    });
+
+    it.effect("overview calls reviewed only an assignment that holds a receipt", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          const assistant = yield* service;
+          const admission = yield* admissionService;
+          yield* agreed(fakes, "legacy");
+          yield* agree(fakes, "idea");
+          yield* assign("idea", "bound");
+          assert.strictEqual(
+            yield* admission.attachReviewReceipt({ assignmentId: "bound", execution }),
+            "attached",
+          );
+          const { assignments } = yield* assistant.overview;
+          const reviewedOf = (assignmentId: string) =>
+            assignments.find((item) => item.assignmentId === assignmentId)?.reviewed;
+          assert.strictEqual(reviewedOf("legacy"), false);
+          assert.strictEqual(reviewedOf("bound"), true);
+        }),
+      );
+    });
+
+    it.effect("starts on what was reviewed even with no verify command any more", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* attached(fakes, "idea");
+          fakes.verify = false;
+          yield* tick;
+          assert.strictEqual(yield* stateOf("idea"), "running");
+        }),
+      );
+    });
+
+    /** Each way `assistant_assign` reaches the queue; only Factory's asks the executor anything. */
+    const ROUTES = [
+      { route: "Factory", executor: "factory", looperConfig: null },
+      { route: "an omitted executor", executor: undefined, looperConfig: null },
+      { route: "a Looper configuration", executor: undefined, looperConfig: "/config/loop.json" },
+    ] as const;
+
+    const assignBy = (assignmentId: string, { executor, looperConfig }: (typeof ROUTES)[number]) =>
+      Effect.flatMap(service, (assistant) =>
+        assistant.enqueue({
+          assignmentId,
+          projectId: alpha,
+          ideaId: "idea",
+          ...(executor === undefined ? {} : { executor }),
+          managerThreadId: managerId,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          looperConfig,
+        }),
+      );
+
+    /** How the reviewed attempt ended, each by the state a further attempt is judged from. */
+    const ENDINGS = [
+      {
+        ending: "failed at its start",
+        state: "failed",
+        end: (fakes: Fakes) =>
+          Effect.gen(function* () {
+            fakes.onStart = () => Effect.succeed("refuse");
+            yield* tick;
+            fakes.onStart = undefined;
+          }),
+      },
+      {
+        ending: "cancelled before its claim",
+        state: "cancelled",
+        end: () => control("idea", "cancel"),
+      },
+      {
+        ending: "cancelled while it ran",
+        state: "cancelled",
+        end: () =>
+          Effect.gen(function* () {
+            yield* tick;
+            yield* control("idea", "cancel");
+            yield* tick;
+          }),
+      },
+      {
+        ending: "completed",
+        state: "completed",
+        end: (fakes: Fakes) =>
+          Effect.gen(function* () {
+            yield* tick;
+            fakes.deliveries.set((yield* linkOf("idea"))!.delivery_id!, "done");
+            yield* tick;
+          }),
+      },
+    ] as const;
+
+    describe.each(ENDINGS)("once its attempt $ending", ({ state, end }) => {
+      it.effect.each(ROUTES)("refuses a fresh assignment id through $route", (route) => {
+        const fakes = makeFakes();
+        return withFakes(
+          fakes,
+          Effect.gen(function* () {
+            yield* attached(fakes, "idea");
+            yield* end(fakes);
+            assert.strictEqual(yield* stateOf("idea"), state);
+            const rows = yield* enqueueRows;
+            const calls = fakes.calls.length;
+
+            // Authorizing the idea again through the legacy path changes nothing.
+            yield* Effect.flatMap(service, (assistant) =>
+              assistant.revise({
+                projectId: alpha,
+                ideaId: "idea",
+                patch: { executionAuthorized: true },
+              }),
+            );
+            for (const assignmentId of ["fresh", "fresh", "fresher"]) {
+              const refused = yield* Effect.flip(assignBy(assignmentId, route));
+              assert.include(refused.message, "fresh owner review");
+            }
+            yield* tick;
+
+            assert.deepStrictEqual(yield* enqueueRows, rows);
+            assert.isUndefined(yield* stateOf("fresh"));
+            assert.isUndefined(yield* positionOf("fresh"));
+            assert.isUndefined(yield* linkOf("fresh"));
+            assert.lengthOf(fakes.calls, calls);
+            assert.deepStrictEqual(fakes.looperPrepares, []);
+          }),
+        );
+      });
+    });
+
+    it.effect("answers a replayed assignment id with what it holds, starting nothing", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* attached(fakes, "idea");
+          yield* control("idea", "cancel");
+          const rows = yield* enqueueRows;
+          const replayed = yield* assign("idea");
+          assert.strictEqual(replayed.state, "cancelled");
+          assert.deepStrictEqual(yield* enqueueRows, rows);
+        }),
+      );
+    });
+
+    it.effect("refuses the queue's own entry, for the bound assignment and any other", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* attached(fakes, "idea");
+          yield* control("idea", "cancel");
+          const admission = yield* admissionService;
+          const sql = yield* sqlOf;
+          yield* sql`INSERT INTO fd_assistant_assignments ${sql.insert({
+            assignment_id: "direct",
+            project_id: alpha,
+            idea_id: "idea",
+            executor: "factory",
+            state: "draft",
+            attempt: 0,
+            worker_refs_json: "[]",
+            progress_json: "[]",
+            evidence_json: "[]",
+            created_at: at,
+            updated_at: at,
+          })}`;
+          for (const assignmentId of ["idea", "direct"]) {
+            const refused = yield* Effect.flip(admission.enterQueue(assignmentId));
+            assert.strictEqual(refused._tag, "HandoffReviewRequired");
+            assert.isUndefined(yield* positionOf(assignmentId));
+          }
+        }),
+      );
+    });
+
+    it.effect("refuses an earlier receipt-less assignment's retry of the same capture", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* agree(fakes, "idea");
+          yield* assign("idea", "older");
+          yield* tick;
+          yield* control("older", "cancel");
+          yield* tick;
+          assert.strictEqual(yield* stateOf("older"), "cancelled");
+          const older = (yield* linkOf("older"))!.delivery_id!;
+          assert.deepStrictEqual(yield* rootOf(older), { state: "retired", reason: "cancelled" });
+
+          yield* assign("idea", "reviewed");
+          const admission = yield* admissionService;
+          assert.strictEqual(
+            yield* admission.attachReviewReceipt({ assignmentId: "reviewed", execution }),
+            "attached",
+          );
+          const rows = yield* enqueueRows;
+          const calls = fakes.calls.length;
+
+          const refused = yield* Effect.flip(control("older", "retry"));
+          assert.include(refused.message, "fresh owner review");
+          assert.strictEqual(yield* stateOf("older"), "cancelled");
+          assert.strictEqual((yield* linkOf("older"))!.delivery_id, older);
+          assert.deepStrictEqual(yield* enqueueRows, rows);
+          assert.lengthOf(fakes.calls, calls);
+        }),
+      );
+    });
+
+    it.effect("refuses an ordinary worker's retry of the idea, rolling its move back", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* agree(fakes, "idea");
+          yield* assignBy("ordinary", ROUTES[1]);
+          const assistant = yield* service;
+          yield* assistant.control({
+            assignmentId: "ordinary",
+            managerThreadId: managerId,
+            action: "cancel",
+          });
+          const sql = yield* sqlOf;
+          yield* sql`UPDATE fd_assistant_assignments SET state = 'failed'
+            WHERE assignment_id = 'ordinary'`;
+          yield* assign("idea", "reviewed");
+          const admission = yield* admissionService;
+          assert.strictEqual(
+            yield* admission.attachReviewReceipt({ assignmentId: "reviewed", execution }),
+            "attached",
+          );
+
+          const position = yield* positionOf("ordinary");
+          const refused = yield* Effect.flip(control("ordinary", "retry"));
+          assert.include(refused.message, "fresh owner review");
+          assert.strictEqual(yield* stateOf("ordinary"), "failed");
+          assert.deepStrictEqual(yield* positionOf("ordinary"), position);
+        }),
+      );
+    });
+
+    it.effect("is not attached while another assignment of the idea still queues", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* agree(fakes, "idea");
+          yield* assignBy("ordinary", ROUTES[1]);
+          yield* assign("idea", "reviewed");
+          const admission = yield* admissionService;
+          const attach = admission.attachReviewReceipt({ assignmentId: "reviewed", execution });
+          assert.strictEqual(yield* attach, "refused");
+          assert.isFalse(yield* admission.ideaReviewed({ projectId: alpha, ideaId: "idea" }));
+
+          yield* control("ordinary", "cancel");
+          assert.strictEqual(yield* attach, "attached");
+        }),
+      );
+    });
+
+    it.effect.each(ROUTES)("leaves an idea with no receipt to queue through $route", (route) => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* agree(fakes, "idea");
+          const queued = yield* assignBy("fresh", route);
+          assert.strictEqual(queued.state, "queued");
+          assert.isDefined(yield* positionOf("fresh"));
+          assert.deepStrictEqual(
+            fakes.looperPrepares,
+            route.looperConfig === null ? [] : [route.looperConfig],
+          );
+        }),
+      );
+    });
+  });
+
   it.effect("mints a new id only by retrying a failed assignment, whose root stays retired", () => {
     const fakes = makeFakes();
     return withFakes(
@@ -1465,6 +1913,391 @@ describe("a start's outcomes", () => {
         fakes.items.get("item-other")!.fingerprint = "edited";
         assert.include((yield* Effect.flip(control("other", "retry"))).message, "Not retried");
         assert.strictEqual(yield* stateOf("other"), "failed");
+      }),
+    );
+  });
+});
+
+describe("what the overview shows of an assignment", () => {
+  const overview = Effect.flatMap(service, (assistant) => assistant.overview);
+  const url = "https://github.com/acme/alpha/pull/7";
+
+  describe("what it waits on someone for", () => {
+    const pending = (index: number): HandoffBackend.HandoffRequest => ({
+      threadId: `thread-${index}`,
+      requestId: `request-${index}`,
+      kind: index % 2 === 0 ? "command" : "user_input",
+      capability: "live",
+      run: { status: "running", class: "factory" },
+      questions: null,
+      runtimeMode: "auto-accept-edits",
+    });
+    const claimed = (fakes: Fakes) =>
+      Effect.gen(function* () {
+        yield* agreed(fakes, "export", 1);
+        yield* tick;
+        const root = (yield* linkOf("export"))!.delivery_id!;
+        fakes.deliveries.set(root, "running");
+        return root;
+      });
+
+    it.effect("lists a family's requests with where each is decided, up to the bound", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* claimed(fakes);
+          fakes.requests = Array.from({ length: 13 }, (_, index) => pending(index));
+          const dispatched = fakes.dispatched.length;
+
+          const shown = (yield* overview).assignments[0]?.factory?.pendingActions;
+          assert.strictEqual(shown?.items.length, FACTORY_PENDING_ACTIONS_MAX);
+          assert.strictEqual(shown?.omitted, 3);
+          assert.isTrue(shown?.complete);
+          assert.deepStrictEqual(shown?.items[0], {
+            kind: "command",
+            runClass: "factory",
+            runtimeMode: "auto-accept-edits",
+            threadId: ThreadId.make("thread-0"),
+            projectId: alpha,
+            requestId: "request-0",
+            capability: "live",
+          });
+          // Reading it again reads the same, sends nothing and answers nothing.
+          assert.deepStrictEqual((yield* overview).assignments[0]?.factory?.pendingActions, shown);
+          assert.strictEqual(fakes.dispatched.length, dispatched);
+          assert.deepStrictEqual(
+            shown && shown.items.length + shown.omitted,
+            fakes.requests.length,
+          );
+        }),
+      );
+    });
+
+    it.effect("reads what is pending once, however many assignments it shows", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* claimed(fakes);
+          yield* agreed(fakes, "import", 2);
+          yield* tick;
+          const root = (yield* linkOf("import"))!.delivery_id!;
+          fakes.deliveries.set(root, "running");
+          fakes.requests = [pending(0)];
+          fakes.familyScans = 0;
+          fakes.pendingReads = 0;
+
+          const { assignments } = yield* overview;
+          assert.lengthOf(assignments, 2);
+          for (const assignment of assignments) {
+            assert.lengthOf(assignment.factory?.pendingActions?.items ?? [], 1);
+          }
+          // Never a walk of each family's whole history, which grows with every resume.
+          assert.strictEqual(fakes.pendingReads, 1);
+          assert.strictEqual(fakes.familyScans, 0);
+        }),
+      );
+    });
+
+    it.effect("reads nothing of what is pending without a Factory assignment", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* overview;
+          assert.strictEqual(fakes.pendingReads, 0);
+          assert.strictEqual(fakes.familyScans, 0);
+        }),
+      );
+    });
+
+    it.effect("carries a provider's own reason, cut to what crosses the wire", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* claimed(fakes);
+          fakes.requests = [{ ...pending(0), reason: "x".repeat(FACTORY_PENDING_REASON_MAX + 9) }];
+          assert.lengthOf(
+            (yield* overview).assignments[0]?.factory?.pendingActions?.items[0]?.reason ?? "",
+            FACTORY_PENDING_REASON_MAX,
+          );
+        }),
+      );
+    });
+
+    it.effect("puts the delivery's own wait first, however many requests there are", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* claimed(fakes);
+          fakes.requests = Array.from({ length: 12 }, (_, index) => pending(index));
+          fakes.followed = {
+            ownerActions: [
+              {
+                kind: "plan_gate",
+                runClass: null,
+                runtimeMode: null,
+                threadId: null,
+                projectId: alpha,
+                requestId: null,
+                capability: "live",
+              },
+            ],
+          };
+          const shown = (yield* overview).assignments[0]?.factory?.pendingActions;
+          assert.strictEqual(shown?.items[0]?.kind, "plan_gate");
+          assert.strictEqual(shown?.omitted, 3);
+        }),
+      );
+    });
+
+    it.effect("leaves out what no one decides, which has no thread UI to send them to", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* claimed(fakes);
+          fakes.requests = [
+            { ...pending(0), kind: "dynamic_tool_call" },
+            { ...pending(2), kind: "auth_refresh" },
+          ];
+          assert.isUndefined((yield* overview).assignments[0]?.factory?.pendingActions);
+        }),
+      );
+    });
+
+    it.effect("says when its requests could not be read, rather than showing none", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          yield* claimed(fakes);
+          fakes.requestsFail = true;
+          assert.deepStrictEqual((yield* overview).assignments[0]?.factory?.pendingActions, {
+            items: [],
+            omitted: 0,
+            complete: false,
+          });
+        }),
+      );
+    });
+
+    it.effect("leaves the field out while nothing waits, and once the delivery has ended", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          const root = yield* claimed(fakes);
+          assert.isUndefined((yield* overview).assignments[0]?.factory?.pendingActions);
+          fakes.requests = [pending(0)];
+          fakes.deliveries.set(root, "done");
+          assert.isUndefined((yield* overview).assignments[0]?.factory?.pendingActions);
+        }),
+      );
+    });
+
+    it.effect("refuses to answer a permission request, sending nothing", () => {
+      const fakes = makeFakes();
+      return withFakes(
+        fakes,
+        Effect.gen(function* () {
+          const assistant = yield* service;
+          yield* claimed(fakes);
+          fakes.requests = [pending(0)];
+          const dispatched = fakes.dispatched.length;
+          const failure = yield* Effect.flip(
+            assistant.answer({
+              assignmentId: "export",
+              managerThreadId: managerId,
+              requestId: RuntimeRequestId.make("request-0"),
+              answers: { format: "CSV" },
+            }),
+          );
+          assert.include(failure.message, "question tools cannot grant permission");
+          assert.strictEqual(fakes.dispatched.length, dispatched);
+        }),
+      );
+    });
+  });
+
+  it.effect("keeps a To do item, its rank and its open pull request as separate facts", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        yield* agreed(fakes, "export", 1);
+        yield* tick;
+        const root = (yield* linkOf("export"))!.delivery_id!;
+        fakes.deliveries.set(root, "pr_open");
+        fakes.followed = {
+          pullRequest: { url, outcome: null },
+          proceeding: false,
+          stage: "pr",
+        };
+        fakes.items.get("item-export")!.title = "Export the table";
+        fakes.items.get("item-export")!.assignee = "Sam";
+
+        const { assignments, ideas } = yield* overview;
+        assert.deepInclude(assignments[0], {
+          title: "Export the table",
+          priority: 1,
+          goal: "Deliver export",
+          source: {
+            title: "Export the table",
+            status: "todo",
+            statusName: null,
+            assignee: "Sam",
+          },
+        });
+        assert.deepInclude(assignments[0]?.factory, {
+          status: "pr_open",
+          stage: "pr",
+          pullRequestUrl: url,
+          proceeding: false,
+        });
+        assert.strictEqual(ideas[0]?.title, "Export the table");
+        assert.strictEqual(ideas[0]?.priority, 1);
+      }),
+    );
+  });
+
+  it.effect("reports the delivery as it is now, whatever its assignment last mirrored", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        yield* agreed(fakes, "export");
+        yield* tick;
+        const root = (yield* linkOf("export"))!.delivery_id!;
+        fakes.deliveries.set(root, "running");
+        yield* tick;
+        const running = (yield* overview).assignments[0];
+        assert.strictEqual(running?.factory?.status, "running");
+        const mirrored = running?.notice ?? "";
+        assert.notInclude(mirrored, "PR");
+
+        // The delivery moved on, and no tick has written that down yet.
+        fakes.deliveries.set(root, "pr_open");
+        fakes.followed = { pullRequest: { url, outcome: null }, proceeding: false };
+        const current = (yield* overview).assignments[0];
+        assert.strictEqual(current?.factory?.status, "pr_open");
+        assert.strictEqual(current?.notice, mirrored);
+      }),
+    );
+  });
+
+  it.effect("dispatches no thread message, however the mirror moves", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        yield* agreed(fakes, "export");
+        yield* tick;
+        const root = (yield* linkOf("export"))!.delivery_id!;
+        const launches = fakes.launches.length;
+        for (const status of ["running", "stopping", "stopped", "blocked", "waiting"] as const) {
+          fakes.deliveries.set(root, status);
+          yield* tick;
+          yield* overview;
+        }
+        fakes.deliveries.set(root, "pr_open");
+        fakes.followed = { pullRequest: { url, outcome: null }, proceeding: false };
+        yield* tick;
+        yield* overview;
+        assert.strictEqual(yield* stateOf("export"), "needs-input");
+        assert.deepStrictEqual(fakes.dispatched, []);
+        assert.strictEqual(fakes.launches.length, launches);
+      }),
+    );
+  });
+
+  it.effect("names a row by its short title, leaving the goal whole", () => {
+    const fakes = makeFakes();
+    const goal = `${"Format durations exactly everywhere the app shows one. ".repeat(6)}Keep seconds.`;
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const assistant = yield* service;
+        yield* assistant.revise({ projectId: alpha, ideaId: "long", patch: { goal } });
+        const [idea] = (yield* overview).ideas;
+        assert.strictEqual(idea?.goal, goal);
+        assert.isAtMost(idea?.title?.length ?? 0, 80);
+        assert.isTrue(idea?.title?.startsWith("Format durations"));
+
+        yield* assistant.revise({
+          projectId: alpha,
+          ideaId: "long",
+          patch: { title: "Format durations" },
+        });
+        assert.strictEqual((yield* overview).ideas[0]?.title, "Format durations");
+      }),
+    );
+  });
+
+  it.effect("keeps a legacy item's long title as it stands, and the rest when it fails", () => {
+    const fakes = makeFakes();
+    const stored = `${"A very long title from before short titles. ".repeat(10)}End`;
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        yield* agreed(fakes, "legacy");
+        fakes.items.get("item-legacy")!.title = stored;
+        assert.strictEqual((yield* overview).ideas[0]?.title, stored);
+
+        // A source that cannot answer costs the row its facts, and nothing else.
+        fakes.items.get("item-legacy")!.readable = false;
+        const { assignments, ideas } = yield* overview;
+        assert.notProperty(assignments[0], "source");
+        assert.notProperty(ideas[0], "source");
+        assert.strictEqual(assignments[0]?.goal, "Deliver legacy");
+        assert.strictEqual(assignments[0]?.title, "Deliver legacy");
+      }),
+    );
+  });
+
+  it.effect("asks a source about a live assignment first, and an ended one last", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        yield* agreed(fakes, "first");
+        yield* agreed(fakes, "second");
+        yield* control("first", "cancel");
+        assert.strictEqual(yield* stateOf("first"), "cancelled");
+        yield* overview;
+        // The live assignment, then the other captured idea, each asked about once.
+        assert.deepStrictEqual(fakes.summaryReads.at(-1), ["item-second", "item-first"]);
+      }),
+    );
+  });
+
+  it.effect("reads an ended assignment's own item, which its idea no longer captures", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        const sql = yield* sqlOf;
+        yield* agreed(fakes, "export", 1);
+        yield* control("export", "cancel");
+        assert.strictEqual(yield* stateOf("export"), "cancelled");
+        // The idea was captured anew since: the row's item is no longer its idea's.
+        fakes.items.set(WorkItemId.make("item-recaptured"), {
+          fingerprint: "print-recaptured",
+          status: "todo",
+          readable: true,
+        });
+        yield* sql`UPDATE fd_assistant_work_captures SET item_id = 'item-recaptured'
+          WHERE idea_id = 'export'`;
+        fakes.items.get("item-export")!.status = "cancelled";
+
+        const { assignments, ideas } = yield* overview;
+        assert.deepStrictEqual(fakes.summaryReads.at(-1), ["item-recaptured", "item-export"]);
+        assert.strictEqual(assignments[0]?.source?.status, "cancelled");
+        assert.strictEqual(assignments[0]?.priority, 1);
+        assert.strictEqual(ideas[0]?.source?.status, "todo");
       }),
     );
   });

@@ -35,6 +35,7 @@ import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as SourceControlProviderRegistry from "../../sourceControl/SourceControlProviderRegistry.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService } from "../work-management/index.ts";
@@ -93,6 +94,9 @@ interface World {
 // Factory reads only these fields of the launch result, the thread records and the send result.
 const fakes = (world: World) =>
   Layer.mergeAll(
+    Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+      resolveLink: () => undefined,
+    }),
     Layer.mock(ThreadLaunch.ThreadLaunchService)({
       launch: (input) =>
         Effect.sync(() => {
@@ -134,7 +138,15 @@ const fakes = (world: World) =>
             );
           }
           return Effect.succeed({
-            thread: { id: threadId, worktreePath: world.worktreePath, deletedAt: null },
+            thread: {
+              id: threadId,
+              worktreePath: world.worktreePath,
+              deletedAt: null,
+              modelSelection: {
+                instanceId: ProviderInstanceId.make("codex"),
+                model: "planner-model",
+              },
+            },
             runs: [{ id: planRun, status: "running" }],
             messages: world.messages,
           });

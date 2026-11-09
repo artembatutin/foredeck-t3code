@@ -1217,3 +1217,58 @@ it.effect.each([
     );
   },
 );
+
+it.effect.each([
+  {
+    name: "the fork gh marks as base",
+    resolved: "remote.origin.gh-resolved base",
+    env: "",
+    expected: "me/web",
+  },
+  { name: "the parent with no mark", resolved: "", env: "", expected: "acme/web" },
+  {
+    name: "GH_REPO over a mark",
+    resolved: "remote.origin.gh-resolved base",
+    env: "chosen/repo",
+    expected: "chosen/repo",
+  },
+])("names the repository a pull request would target: $name", ({ resolved, env, expected }) => {
+  const targets: string[] = [];
+  const { layer } = harness({
+    remotes: remotesOutput(
+      ["origin", "git@github.com:me/web.git"],
+      ["upstream", "git@github.com:acme/web.git"],
+    ),
+    resolved,
+    api: {
+      rest: (input) =>
+        Effect.sync(() => {
+          targets.push(`${input.host}/${input.path}`);
+          return restResponse({});
+        }),
+    },
+  });
+  return Effect.gen(function* () {
+    const provider = yield* GitHubSourceControlProvider.make;
+    if (provider.resolveChangeRequestRepository === undefined) {
+      return assert.fail("GitHub chooses its target, so it can name it.");
+    }
+    const fs = yield* FileSystem.FileSystem;
+    const bodyFile = yield* fs.makeTempFileScoped();
+    yield* fs.writeFileString(bodyFile, "Body");
+    const answer = yield* provider.resolveChangeRequestRepository({ cwd: "/repo" });
+    yield* provider.createChangeRequest({
+      cwd: "/repo",
+      baseRefName: "main",
+      headSelector: "me:feature",
+      title: "PR",
+      bodyFile,
+    });
+    assert.strictEqual(answer, `github.com/${expected}`);
+    assert.deepStrictEqual(targets, [`github.com/repos/${expected}/pulls`]);
+  }).pipe(
+    Effect.provide(layer),
+    Effect.provideService(HostProcess.Environment, { GH_REPO: env }),
+    Effect.scoped,
+  );
+});

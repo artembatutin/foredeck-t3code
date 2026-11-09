@@ -38,8 +38,9 @@ const destination = vi.hoisted(() => {
 });
 
 vi.mock("./state", async () => {
-  const { Atom } = await import("effect/reactivity");
+  const { AsyncResult, Atom } = await import("effect/reactivity");
   const supported = Atom.make(true).pipe(Atom.keepAlive);
+  const unread = Atom.make(AsyncResult.initial()).pipe(Atom.keepAlive);
   const command = (label: Command) => ({
     label,
     permissionAtom: () => destination.get().permitted[label],
@@ -49,6 +50,7 @@ vi.mock("./state", async () => {
       supported: () => supported,
       planning: () => supported,
       deliveries: () => destination.get().deliveries,
+      delivery: () => unread,
       start: command("start"),
       stop: command("stop"),
       resume: command("resume"),

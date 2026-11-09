@@ -20,6 +20,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import type { WorkActor } from "../../authority.ts";
 import { MAX_TASK_DOCUMENT_BYTES, revisionOf } from "../../documents/taskDocument.ts";
+import { workItemContentFingerprint } from "../../model/scope.ts";
 import type { WorkSourceAdapter, WorkSourceRuntime } from "../WorkSourceAdapter.ts";
 import * as MarkdownSource from "./MarkdownSource.ts";
 
@@ -199,6 +200,13 @@ describe("MarkdownSource", () => {
         body: "Keep the selected source.\n",
         bodyTruncated: false,
         bodyFidelity: "exact",
+        scopeFingerprint: workItemContentFingerprint({
+          kind: "markdown",
+          title: created.title,
+          body: "Keep the selected source.\n",
+          bodyTruncated: false,
+          bodyFidelity: "exact",
+        }),
         comments: [],
         commentsTruncated: false,
         children: [],
@@ -799,6 +807,90 @@ describe("MarkdownSource", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  describe("the scope fingerprint of a body past the wire cap", () => {
+    const longNotes = Array.from(
+      { length: 40 },
+      () => `- ${EPOCH} (Artem) ${"n".repeat(2_000)}`,
+    ).join("\n");
+
+    it.effect("stays when a comment alone grows the body across the cap", () =>
+      Effect.gen(function* () {
+        const { adapter, runtime, writeTask } = yield* setup;
+        yield* writeTask("fd-aaaaaa.md", ROWS, `${"a".repeat(65_000)}\n`);
+        const before = yield* adapter.get(runtime, alphaRef.itemId);
+        assert.isFalse(before.bodyTruncated);
+
+        yield* adapter.comment(runtime, alphaRef.itemId, "x".repeat(1_000), actor);
+
+        const after = yield* adapter.get(runtime, alphaRef.itemId);
+        assert.isTrue(after.bodyTruncated);
+        assert.notStrictEqual(after.revision, before.revision);
+        assert.strictEqual(after.scopeFingerprint, before.scopeFingerprint);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    );
+
+    it.effect("stays for a comment on a body already past the cap", () =>
+      Effect.gen(function* () {
+        const { adapter, runtime, writeTask } = yield* setup;
+        yield* writeTask("fd-aaaaaa.md", ROWS, `${"a".repeat(70_000)}\n\n## Notes\n${longNotes}\n`);
+        const before = yield* adapter.get(runtime, alphaRef.itemId);
+        yield* adapter.comment(runtime, alphaRef.itemId, "More.", actor);
+        const after = yield* adapter.get(runtime, alphaRef.itemId);
+        assert.notStrictEqual(after.revision, before.revision);
+        assert.strictEqual(after.scopeFingerprint, before.scopeFingerprint);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    );
+
+    it.effect("moves for an edit of criteria past the cap, which the served body cannot show", () =>
+      Effect.gen(function* () {
+        const { adapter, runtime, writeTask } = yield* setup;
+        const task = (criterion: string) =>
+          `Export.\n\n## Notes\n${longNotes}\n\n## Acceptance criteria\n\n1. ${criterion}\n`;
+        yield* writeTask("fd-aaaaaa.md", ROWS, task("Writes CSV."));
+        const before = yield* adapter.get(runtime, alphaRef.itemId);
+        assert.isTrue(before.bodyTruncated);
+        assert.notInclude(before.body, "Acceptance criteria");
+
+        yield* writeTask("fd-aaaaaa.md", ROWS, task("Writes CSV and PDF."));
+
+        const after = yield* adapter.get(runtime, alphaRef.itemId);
+        assert.strictEqual(after.body, before.body);
+        assert.notStrictEqual(after.scopeFingerprint, before.scopeFingerprint);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    );
+
+    it.effect("moves for an edit of a long description past the cap", () =>
+      Effect.gen(function* () {
+        const { adapter, runtime, writeTask } = yield* setup;
+        yield* writeTask("fd-aaaaaa.md", ROWS, `${"a".repeat(70_000)} Writes CSV.\n`);
+        const before = yield* adapter.get(runtime, alphaRef.itemId);
+        yield* writeTask("fd-aaaaaa.md", ROWS, `${"a".repeat(70_000)} Writes CSV and PDF.\n`);
+        const after = yield* adapter.get(runtime, alphaRef.itemId);
+        assert.strictEqual(after.body, before.body);
+        assert.notStrictEqual(after.scopeFingerprint, before.scopeFingerprint);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    );
+
+    it.effect("is what an item of the same text written whole fingerprints", () =>
+      Effect.gen(function* () {
+        const { adapter, runtime, writeTask } = yield* setup;
+        const body = `${"a".repeat(70_000)}\n`;
+        yield* writeTask("fd-aaaaaa.md", ROWS, body);
+        const read = yield* adapter.get(runtime, alphaRef.itemId);
+        assert.strictEqual(
+          read.scopeFingerprint,
+          workItemContentFingerprint({
+            kind: "markdown",
+            title: "Alpha",
+            body,
+            bodyTruncated: false,
+            bodyFidelity: "exact",
+          }),
+        );
+      }).pipe(Effect.provide(NodeServices.layer)),
+    );
+  });
+
   it.effect(
     "serves a body cut at the wire cap on a code point boundary, with its notes intact",
     () =>
@@ -874,6 +966,58 @@ describe("MarkdownSource", () => {
       assert.include(yield* readTask("fd-aaaaaa.md"), `${tail}\n\n## Notes\n`);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+  describe("the scope fingerprint of a body whose code fence never closes", () => {
+    const body = "Export.\n```\nMust write CSV.\n";
+
+    it.effect("stays through comments, which Notes takes ahead of the fence", () =>
+      Effect.gen(function* () {
+        const { adapter, runtime, writeTask, readTask } = yield* setup;
+        yield* writeTask("fd-aaaaaa.md", ROWS, body);
+        const before = yield* adapter.get(runtime, alphaRef.itemId);
+
+        yield* adapter.comment(runtime, alphaRef.itemId, "First", actor);
+        const once = yield* adapter.get(runtime, alphaRef.itemId);
+        assert.notStrictEqual(once.revision, before.revision);
+        assert.strictEqual(once.scopeFingerprint, before.scopeFingerprint);
+        // The comment landed ahead of the fence, as the case needs.
+        assert.isBelow(
+          (yield* readTask("fd-aaaaaa.md")).indexOf("## Notes"),
+          (yield* readTask("fd-aaaaaa.md")).indexOf("```"),
+        );
+
+        yield* adapter.comment(runtime, alphaRef.itemId, "Second", actor);
+        const twice = yield* adapter.get(runtime, alphaRef.itemId);
+        assert.strictEqual(twice.scopeFingerprint, before.scopeFingerprint);
+        assert.deepStrictEqual(
+          twice.comments.map((comment) => comment.body),
+          ["First", "Second"],
+        );
+      }).pipe(Effect.provide(NodeServices.layer)),
+    );
+
+    it.effect("moves for an edit inside the fence, after a comment as before one", () =>
+      Effect.gen(function* () {
+        const { adapter, runtime, writeTask } = yield* setup;
+        yield* writeTask("fd-aaaaaa.md", ROWS, body);
+        yield* adapter.comment(runtime, alphaRef.itemId, "First", actor);
+        const commented = yield* adapter.get(runtime, alphaRef.itemId);
+
+        yield* writeTask(
+          "fd-aaaaaa.md",
+          ROWS,
+          commented.body.replace("Must write CSV.", "Must write CSV and PDF."),
+        );
+
+        const edited = yield* adapter.get(runtime, alphaRef.itemId);
+        assert.deepStrictEqual(
+          edited.comments.map((comment) => comment.body),
+          ["First"],
+        );
+        assert.notStrictEqual(edited.scopeFingerprint, commented.scopeFingerprint);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    );
+  });
 
   it.effect("adds comments to a body whose code fence never closes", () =>
     Effect.gen(function* () {

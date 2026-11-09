@@ -33,6 +33,7 @@ import { RepositorySet } from "../multirepo/index.ts";
 import { requireGrants, type WorkActor } from "./authority.ts";
 import { type WorkDomainError, WorkInvalid, WorkUnavailable } from "./errors.ts";
 import { renderWorkPrompt, workBranchName, workThreadTitle } from "./model/prompt.ts";
+import { workItemLinkScope } from "./model/scope.ts";
 import * as WorkLinkStore from "./persistence/WorkLinkStore.ts";
 import * as WorkService from "./WorkService.ts";
 
@@ -227,6 +228,7 @@ const make = Effect.gen(function* () {
       const commandId = CommandId.make(
         `work-start:${input.ref.sourceId}:${input.ref.itemId}:${threadId}`,
       );
+      const scope = workItemLinkScope(item);
 
       // Written first so a concurrent start (after this lock) or a crash both see the attempt,
       // and reserved until the launch ends so the link sweep never takes a slow launch for a
@@ -246,6 +248,7 @@ const make = Effect.gen(function* () {
             revision: item.revision,
             mode: input.mode,
             autoStarted: false,
+            ...scope,
           },
         })
         .pipe(Effect.mapError(storeFailure));
@@ -317,6 +320,9 @@ const make = Effect.gen(function* () {
                 revision: updated.revision,
                 mode: input.mode,
                 autoStarted: true,
+                // The write was conditional on the item the thread started from, and moved only
+                // its status, so what the thread saw stays what it is compared with.
+                ...scope,
               }),
             ),
             Effect.catchCause((cause) =>

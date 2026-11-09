@@ -11,6 +11,11 @@ export const FactoryCapability = Schema.Struct({
    * Absent from servers from before planning, which serve neither.
    */
   planning: Schema.optionalKey(Schema.Boolean),
+  /**
+   * Discovering and validating verify and setup commands (`factory.commands.*`). Absent from servers
+   * from before them, where the settings form offers only its editor.
+   */
+  commandSetup: Schema.optionalKey(Schema.Boolean),
 });
 export type FactoryCapability = typeof FactoryCapability.Type;
 
@@ -18,6 +23,8 @@ export interface FactorySupport {
   readonly version: typeof FACTORY_VERSION;
   /** Whether the server serves the plan gate; a client offers no plan action when it does not. */
   readonly planning: boolean;
+  /** Whether the server discovers and validates commands; a client offers neither when not. */
+  readonly commandSetup: boolean;
 }
 
 /**
@@ -29,7 +36,11 @@ export function factorySupport(capabilities: {
 }): FactorySupport | undefined {
   const { factory } = capabilities;
   return factory?.version === FACTORY_VERSION
-    ? { version: FACTORY_VERSION, planning: factory.planning === true }
+    ? {
+        version: FACTORY_VERSION,
+        planning: factory.planning === true,
+        commandSetup: factory.commandSetup === true,
+      }
     : undefined;
 }
 
@@ -37,4 +48,8 @@ export function factorySupport(capabilities: {
  * The capability this release's server advertises. It lives here, not in the server feature, so
  * the environment descriptor imports a constant rather than the whole Factory runtime.
  */
-export const FACTORY_CAPABILITY: FactoryCapability = { version: FACTORY_VERSION, planning: true };
+export const FACTORY_CAPABILITY: FactoryCapability = {
+  version: FACTORY_VERSION,
+  planning: true,
+  commandSetup: true,
+};

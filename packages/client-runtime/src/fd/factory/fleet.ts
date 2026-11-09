@@ -6,7 +6,11 @@ import {
   FACTORY_STAGE_LABELS,
   FACTORY_STATUS_LABELS,
   factoryCapacityNote,
+  type FactoryItemFact,
+  factoryItemFacts,
   factoryNeedsYou,
+  factoryNextAction,
+  type FactoryNextAction,
 } from "./model.ts";
 
 /** One environment's part of the fleet: whether it serves Factory, and its deliveries once read. */
@@ -25,6 +29,12 @@ export interface FactoryFleetRow {
   readonly deliveryId: FactoryDeliveryId;
   readonly projectId: ProjectId;
   readonly itemRef: WorkItemRef;
+  /** Its Work item's title, or its id when its source could not be read. */
+  readonly title: string;
+  /** What it comes to now, read from its current state. */
+  readonly nextAction: FactoryNextAction;
+  /** The item's status, queue priority, assignee and delivery, each labelled as itself. */
+  readonly facts: ReadonlyArray<FactoryItemFact>;
   readonly status: string;
   /** The current stage; undefined before the first stage starts. */
   readonly stage: string | undefined;
@@ -32,6 +42,10 @@ export interface FactoryFleetRow {
   readonly needsYou: string | undefined;
   /** That it waits for a project assistant slot, which asks nothing of its owner. */
   readonly capacityNote: string | undefined;
+  /** The delivery's branch, once it has one. */
+  readonly branch: string | undefined;
+  /** When the delivery last changed, as the server reports it. */
+  readonly updatedAt: string;
   /** A status or stage this build does not know: shown, but nothing is offered on it. */
   readonly readOnly: boolean;
 }
@@ -61,10 +75,25 @@ const row = ({ environmentId, delivery }: Listed): FactoryFleetRow => ({
   deliveryId: delivery.deliveryId,
   projectId: delivery.projectId,
   itemRef: delivery.itemRef,
+  title: delivery.source?.title ?? delivery.itemRef.itemId,
+  nextAction: factoryNextAction({
+    status: delivery.status,
+    needsYou: delivery.needsYou,
+    child: delivery.parentId !== undefined,
+    pullRequest: delivery.pullRequest,
+    proceeding: delivery.proceeding,
+  }),
+  facts: factoryItemFacts({
+    source: delivery.source,
+    queuePriority: delivery.queuePriority,
+    delivery: { status: delivery.status, stage: delivery.stage?.name },
+  }),
   status: FACTORY_STATUS_LABELS[delivery.status],
   stage: delivery.stage === undefined ? undefined : FACTORY_STAGE_LABELS[delivery.stage.name],
   needsYou: factoryNeedsYou(delivery),
   capacityNote: factoryCapacityNote(delivery),
+  branch: delivery.branch,
+  updatedAt: delivery.updatedAt,
   readOnly:
     delivery.status === "unknown" ||
     delivery.stage?.name === "unknown" ||

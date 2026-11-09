@@ -237,10 +237,17 @@ const bodyLines = function* (text: string): Generator<BodyLine, void> {
   }
 };
 
-/** Locates the `## Notes` section; headings inside fenced code blocks are prose, not sections. */
+/**
+ * Locates the `## Notes` section; headings inside fenced code blocks are prose, not sections. A
+ * fence that never closes ends it: `appendNote` creates the section ahead of such a fence so the
+ * fence cannot swallow a note, and the fence is still the task's text.
+ */
 const findNotes = (body: string): NotesSection | undefined => {
   let section: Omit<NotesSection, "end"> | undefined;
+  let openFence: number | undefined;
   for (const line of bodyLines(body)) {
+    if (line.opensFence) openFence = line.start;
+    else if (line.closesFence) openFence = undefined;
     if (line.fenced) continue;
     if (section === undefined) {
       if (line.content.trimEnd() === NOTES_HEADING) {
@@ -254,19 +261,41 @@ const findNotes = (body: string): NotesSection | undefined => {
       return { ...section, end: line.start };
     }
   }
-  return section === undefined ? undefined : { ...section, end: body.length };
+  return section === undefined ? undefined : { ...section, end: openFence ?? body.length };
+};
+
+/** Where a code fence that never closes opens, if the text ends inside one. */
+const unterminatedFence = (text: string): number | undefined => {
+  let openFence: number | undefined;
+  for (const line of bodyLines(text)) {
+    if (line.opensFence) openFence = line.start;
+    else if (line.closesFence) openFence = undefined;
+  }
+  return openFence;
+};
+
+/**
+ * The text without blank lines before a fence that never closes, which say nothing of what it asks
+ * and which `appendNote` can leave there when it creates a section ahead of the fence.
+ */
+const withoutBlanksBeforeOpenFence = (text: string): string => {
+  const at = unterminatedFence(text);
+  if (at === undefined) return text;
+  const before = text.slice(0, at).trimEnd();
+  return before === "" ? text.slice(at) : `${before}\n${text.slice(at)}`;
 };
 
 /**
  * The body without its `## Notes` section, and that section as written, heading included: the
  * comments Work keeps in a task file, apart from what the task says. `notes` is empty when the
- * body has no such section.
+ * body has no such section. `rest` reads the same before and after a comment creates or grows the
+ * section, so it can be compared; `notes` is what a writer replacing the rest keeps.
  */
 export const splitNotes = (body: string): { readonly rest: string; readonly notes: string } => {
   const section = findNotes(body);
-  if (section === undefined) return { rest: body, notes: "" };
+  if (section === undefined) return { rest: withoutBlanksBeforeOpenFence(body), notes: "" };
   return {
-    rest: body.slice(0, section.start) + body.slice(section.end),
+    rest: withoutBlanksBeforeOpenFence(body.slice(0, section.start) + body.slice(section.end)),
     notes: body.slice(section.start, section.end),
   };
 };
@@ -309,11 +338,7 @@ export const appendNote = (
 ): string => {
   const section = findNotes(body);
   if (section === undefined) {
-    let openAt: number | undefined;
-    for (const current of bodyLines(body)) {
-      if (current.opensFence) openAt = current.start;
-      else if (current.closesFence) openAt = undefined;
-    }
+    const openAt = unterminatedFence(body);
     let prefix = openAt === undefined ? body : body.slice(0, openAt);
     const rest = openAt === undefined ? "" : body.slice(openAt);
     if (prefix !== "" && !prefix.endsWith("\n")) prefix += newline;

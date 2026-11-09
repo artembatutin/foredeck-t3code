@@ -1,6 +1,14 @@
-import type { ServerConfig, ThreadId } from "@t3tools/contracts";
+import type { ProjectId, ServerConfig, ThreadId } from "@t3tools/contracts";
+import {
+  classifyPendingAction,
+  PENDING_ACTION_LABELS,
+  pendingActionProvenance,
+  pendingActionReason,
+} from "@t3tools/shared/fd/approvals";
 import {
   type FactoryDelivery,
+  type FactoryPendingAction,
+  type FactoryPendingActions,
   type FactoryFindingSeverity,
   type FactoryReviewSummary,
   type FactoryStageRunSummary,
@@ -8,7 +16,7 @@ import {
   type FactoryVerifyReceiptSummary,
   factorySupport,
 } from "@t3tools/contracts/fd/factory";
-import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
+import type { WorkItemRef, WorkStatus } from "@t3tools/contracts/fd/work-management";
 
 /**
  * Pure Factory presentation rules shared by web and mobile, so both surfaces agree on what a
@@ -83,6 +91,208 @@ export const FACTORY_CAPACITY_WAIT_NOTE = "Waiting for a project assistant slot"
 export const factoryCapacityNote = (
   delivery: Pick<FactoryDelivery, "capacityWait">,
 ): string | undefined => (delivery.capacityWait === true ? FACTORY_CAPACITY_WAIT_NOTE : undefined);
+
+/** A link only a browser should open; `new URL` cannot judge this on React Native. */
+export const factoryLinkableUrl = (url: string | null | undefined): string | null =>
+  url !== null && url !== undefined && /^https?:\/\/\S+$/i.test(url.trim()) ? url.trim() : null;
+
+/** What a delivery comes to now, and what if anything it asks of its owner. */
+export interface FactoryNextAction {
+  readonly title: string;
+  readonly detail: string;
+  /** Whether it waits on the owner; everything else moves on, or is over, by itself. */
+  readonly forYou: boolean;
+  /** Its pull request is open with nothing else under way, so it waits for the owner's review. */
+  readonly readyForReview: boolean;
+}
+
+const nothingFromYou = (title: string, detail: string): FactoryNextAction => ({
+  title,
+  detail,
+  forYou: false,
+  readyForReview: false,
+});
+
+const fromYou = (title: string, detail: string): FactoryNextAction => ({
+  title,
+  detail,
+  forYou: true,
+  readyForReview: false,
+});
+
+const FOLLOWING_UP = nothingFromYou(
+  "Following up on the pull request",
+  "Factory is working on its feedback, and pushes only what passes verify and review. Nothing is needed from you.",
+);
+
+const NEW_DELIVERY =
+  "Delivering the item again, on web or desktop, starts a new one on its own branch.";
+
+/**
+ * What a delivery comes to now, from its status alone, on every surface. An open pull request is
+ * never completed: it reads as ready for review only with nothing else under way, and only a merge
+ * Factory has closed out reads as done. `pullRequest` and `proceeding` are absent from a server
+ * from before they were reported, and nothing here claims more than that server said.
+ */
+export const factoryNextAction = (delivery: {
+  readonly status: FactoryStatus;
+  readonly needsYou?: string | null | undefined;
+  /** A child ends approved, since its parent's pull request carries its work. */
+  readonly child?: boolean;
+  readonly pullRequest?: { readonly outcome?: string | undefined } | undefined;
+  readonly proceeding?: boolean | undefined;
+}): FactoryNextAction => {
+  const { status, pullRequest, proceeding } = delivery;
+  const outcome = pullRequest?.outcome;
+  const reason = delivery.needsYou?.trim() || undefined;
+  switch (status) {
+    case "queued":
+      return nothingFromYou(
+        "Waiting to start",
+        "Factory starts it when it can. Nothing is needed from you.",
+      );
+    case "running":
+      return pullRequest !== undefined && outcome === undefined
+        ? FOLLOWING_UP
+        : nothingFromYou("Factory is working", "Nothing is needed from you.");
+    case "stopping":
+      return nothingFromYou(
+        "Stopping after this step",
+        "The step under way finishes first. Resume takes the stop back.",
+      );
+    case "stopped":
+      return fromYou("Stopped", "Resume when you want it to go on, or cancel it.");
+    case "blocked":
+      return fromYou(
+        "Blocked",
+        `${reason ?? "Factory blocked this delivery."} Fix what it names if needed, then resume or cancel it.`,
+      );
+    case "waiting":
+      return fromYou(
+        "Waiting for your decision",
+        reason ?? "Factory is waiting for your decision.",
+      );
+    case "approved":
+      if (delivery.child === true) {
+        return nothingFromYou("Approved", "Its parent's pull request carries this work.");
+      }
+      if (pullRequest !== undefined) return FOLLOWING_UP;
+      if (proceeding === false) {
+        return fromYou(
+          "Approved, with no pull request",
+          `It was approved before Factory opened pull requests, so nothing opens one on its own. ${NEW_DELIVERY}`,
+        );
+      }
+      return proceeding === true
+        ? nothingFromYou("Opening the pull request", "Nothing is needed from you.")
+        : nothingFromYou("Approved", "This server does not say what comes next.");
+    case "pr_open":
+      if (outcome === "merged") {
+        return nothingFromYou(
+          "Merged, finishing up",
+          "Factory is marking the item done and removing its worktree.",
+        );
+      }
+      if (proceeding === true) return FOLLOWING_UP;
+      return {
+        title: "Ready for your review",
+        detail:
+          "Its pull request is open and nothing else is running. Merge it on its host when you are satisfied; Factory never merges.",
+        forYou: true,
+        readyForReview: true,
+      };
+    case "done":
+      return nothingFromYou(
+        "Done",
+        outcome === "merged"
+          ? "Its pull request merged and the item is closed out."
+          : "This delivery has finished.",
+      );
+    case "cancelled":
+      return nothingFromYou(
+        "Cancelled",
+        `${outcome === "closed" ? "Its pull request closed without merging. " : ""}Its branch, worktree and commits stay. ${NEW_DELIVERY}`,
+      );
+    case "unknown":
+      return nothingFromYou(
+        "Unknown status",
+        "This build cannot read this delivery's status. Update the app to control it.",
+      );
+  }
+};
+
+/** One labelled fact about a delivered item. */
+export interface FactoryItemFact {
+  readonly key: "source" | "queue" | "assignee" | "delivery";
+  readonly label: string;
+  readonly value: string;
+}
+
+const WORK_STATUS_LABELS: Record<WorkStatus, string> = {
+  todo: "To do",
+  in_progress: "In progress",
+  done: "Done",
+  cancelled: "Cancelled",
+  unknown: "Unknown",
+};
+
+const NOT_READ = "Not available";
+
+/**
+ * What every surface says of a delivered item, as separate facts, since they are: its Work source's
+ * status and human assignee, the assistant's queue priority, which is not the item's own priority,
+ * and Factory's delivery status, which never moves the item's status until its pull request merges.
+ * A fact that could not be read says so, rather than reading as unassigned or unranked.
+ */
+export const factoryItemFacts = (input: {
+  /** What the source says; null or undefined when it was not read. */
+  readonly source:
+    | {
+        readonly status: WorkStatus;
+        readonly statusName?: string | null | undefined;
+        readonly assignee: string | null;
+      }
+    | null
+    | undefined;
+  readonly queuePriority: number | null | undefined;
+  /** Null until a delivery row exists. */
+  readonly delivery:
+    | { readonly status: FactoryStatus; readonly stage?: FactoryStage | null | undefined }
+    | null
+    | undefined;
+}): ReadonlyArray<FactoryItemFact> => {
+  const { source, queuePriority, delivery } = input;
+  const stage = delivery?.stage ?? undefined;
+  return [
+    {
+      key: "source",
+      label: "Work status",
+      value:
+        source === null || source === undefined
+          ? NOT_READ
+          : (source.statusName ?? WORK_STATUS_LABELS[source.status]),
+    },
+    {
+      key: "queue",
+      label: "Queue priority",
+      value:
+        queuePriority === null || queuePriority === undefined ? "Not set" : `P${queuePriority}`,
+    },
+    {
+      key: "assignee",
+      label: "Human assignee",
+      value: source === null || source === undefined ? NOT_READ : (source.assignee ?? "Unassigned"),
+    },
+    {
+      key: "delivery",
+      label: "Factory delivery",
+      value:
+        delivery === null || delivery === undefined
+          ? "Not started"
+          : `${FACTORY_STATUS_LABELS[delivery.status]}${stage === undefined ? "" : ` · ${FACTORY_STAGE_LABELS[stage]}`}`,
+    },
+  ];
+};
 
 export interface FactoryControls {
   readonly stop: boolean;
@@ -324,4 +534,94 @@ export const factoryReviewNotes = (review: FactoryReviewSummary): FactoryReviewN
     ...more(omitted.missingEvidence, "missing evidence entry", "missing evidence entries"),
   ];
   return { notes, omitted: left.length === 0 ? undefined : `Not shown: ${listed(left)}.` };
+};
+
+/** One thing a delivery waits on someone for, as every surface lists it. */
+export interface FactoryPendingActionRow {
+  readonly key: string;
+  /** What deciding it amounts to, such as a provider or session permission. */
+  readonly label: string;
+  readonly reason: string;
+  /** Who is asking. */
+  readonly provenance: string;
+  readonly projectId: ProjectId;
+  /** The thread it is decided on; null when it is decided on a delivery. */
+  readonly threadId: ThreadId | null;
+  /** The Work item whose delivery decides it, when a delivery does. */
+  readonly item: WorkItemRef | null;
+}
+
+export interface FactoryPendingActionsView {
+  readonly rows: ReadonlyArray<FactoryPendingActionRow>;
+  /** What the rows do not say: how many more, or that the requests could not be read. */
+  readonly note: string | undefined;
+}
+
+const pendingActionRow = (
+  action: FactoryPendingAction,
+  index: number,
+): FactoryPendingActionRow => ({
+  key: `${action.kind}:${action.threadId ?? "delivery"}:${action.requestId ?? index}`,
+  label: PENDING_ACTION_LABELS[classifyPendingAction(action)],
+  reason: pendingActionReason(action),
+  provenance: pendingActionProvenance(action),
+  projectId: action.projectId,
+  threadId: action.threadId,
+  item: action.item ?? null,
+});
+
+/**
+ * Where a row is decided, from the item a surface already shows, if any: its thread, a delivery's
+ * other item such as a parent's awaited child, or nowhere further than this surface.
+ */
+export const factoryPendingActionDestination = (
+  row: Pick<FactoryPendingActionRow, "threadId" | "item">,
+  shownItem: WorkItemRef | null,
+):
+  | { readonly type: "thread"; readonly threadId: ThreadId }
+  | { readonly type: "item"; readonly item: WorkItemRef }
+  | { readonly type: "here" } => {
+  if (row.threadId !== null) return { type: "thread", threadId: row.threadId };
+  if (row.item === null) return { type: "here" };
+  return shownItem !== null &&
+    shownItem.sourceId === row.item.sourceId &&
+    shownItem.itemId === row.item.itemId
+    ? { type: "here" }
+    : { type: "item", item: row.item };
+};
+
+/** A row's target by name, or by id where this client does not know the name. */
+export const factoryPendingActionTarget = (
+  row: Pick<FactoryPendingActionRow, "projectId" | "threadId">,
+  names: {
+    readonly project: (projectId: ProjectId) => string | undefined;
+    readonly thread: (threadId: ThreadId) => string | undefined;
+  },
+): string => {
+  const project = `Project: ${names.project(row.projectId) ?? row.projectId}`;
+  return row.threadId === null
+    ? project
+    : `${project} · Thread: ${names.thread(row.threadId) ?? row.threadId}`;
+};
+
+/**
+ * What a delivery waits on someone for, on every client. It only words what the server read, so
+ * showing it writes nothing and answers nothing: a decision is made where its row links.
+ */
+export const factoryPendingActions = (
+  pending: FactoryPendingActions | undefined,
+): FactoryPendingActionsView => {
+  if (pending === undefined) return { rows: [], note: undefined };
+  const notes = [
+    ...(pending.omitted === 0
+      ? []
+      : [`${pending.omitted} more ${pending.omitted === 1 ? "is" : "are"} not listed here.`]),
+    ...(pending.complete
+      ? []
+      : ["The requests on its threads could not all be read, so there may be others."]),
+  ];
+  return {
+    rows: pending.items.map(pendingActionRow),
+    note: notes.length === 0 ? undefined : notes.join(" "),
+  };
 };

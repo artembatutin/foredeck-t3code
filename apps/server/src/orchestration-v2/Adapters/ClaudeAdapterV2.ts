@@ -79,6 +79,7 @@ import {
   type OrchestrationV2TurnItem,
   type OrchestrationV2WebSearchResult,
   type ProviderApprovalDecision,
+  type ProviderApprovalOption,
   ProviderDriverKind,
   type ProviderInstanceId,
   type ProviderRequestKind,
@@ -2553,6 +2554,14 @@ function parentToolUseIdFromSdkMessage(message: SDKMessage): string | null {
     ? message.parent_tool_use_id
     : null;
 }
+
+/** What a permission callback can answer; the session choice adds session-scoped rules. */
+const CLAUDE_APPROVAL_OPTIONS: ReadonlyArray<ProviderApprovalOption> = [
+  { decision: "cancel", label: "Cancel" },
+  { decision: "decline", label: "Decline" },
+  { decision: "acceptForSession", label: "Always allow this session" },
+  { decision: "accept", label: "Approve" },
+];
 
 export function permissionResultFromDecision(input: {
   readonly toolName: string;
@@ -5701,8 +5710,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly requestKind: OrchestrationV2RuntimeRequest["kind"];
           readonly prompt?: string;
           readonly questions?: ReadonlyArray<OrchestrationV2UserInputQuestion>;
+          readonly reason?: string | undefined;
         }) {
           const createdAt = yield* DateTime.now;
+          const reason = input.reason?.trim();
           const requestId = yield* idAllocator.allocate.runtimeRequest({
             driver: CLAUDE_PROVIDER,
             providerTurnId: input.context.providerTurnId,
@@ -5784,6 +5795,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   requestId,
                   requestKind: input.requestKind as ProviderRequestKind,
                   ...(input.prompt === undefined ? {} : { prompt: input.prompt }),
+                  options: CLAUDE_APPROVAL_OPTIONS,
+                  ...(reason ? { reason } : {}),
                 }
               : {
                   type: "user_input_request" as const,
@@ -8301,6 +8314,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             nativeRequestId,
             requestKind,
             prompt,
+            reason: callbackOptions.decisionReason,
           });
           const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
           yield* Ref.update(pendingRuntimeRequests, (current) => {

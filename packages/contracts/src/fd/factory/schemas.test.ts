@@ -5,11 +5,13 @@ import type * as FactoryEntry from "@t3tools/contracts/fd/factory";
 import {
   FactoryDelivery,
   FactoryDeliveryId,
+  FactoryDeliveryStartInput,
   FactoryDeliveryStatus,
   FactoryPlan,
   FactoryPlanTask,
   FactoryProjectSettings,
   FactoryReview,
+  FactoryReviewedExecution,
   FactoryStageKind,
   FactoryStageName,
   FactoryTaskId,
@@ -448,5 +450,167 @@ describe("FactoryDelivery", () => {
   it("still rejects a snapshot that does not name its delivery or item", () => {
     expect(() => decode({ ...snapshot, deliveryId: undefined })).toThrow();
     expect(() => decode({ ...snapshot, itemRef: { sourceId: uuid } })).toThrow();
+  });
+});
+
+describe("what a delivery reports beyond its status", () => {
+  const decode = Schema.decodeUnknownSync(FactoryDelivery);
+  const older = {
+    deliveryId: "delivery-1",
+    projectId: "project-1",
+    itemRef: { sourceId: uuid, itemId: "fd-aaaaaa" },
+    childIds: [],
+    status: "pr_open",
+    rounds: { fix: 0, review: 1 },
+    threads: {},
+    receipts: [],
+    reviews: [],
+    createdAt: "2026-10-24T09:00:00.000Z",
+    updatedAt: "2026-10-24T09:00:00.000Z",
+  };
+  const allowance = {
+    counted: "whole_delivery",
+    verificationFixes: { used: 0, limit: 2, remaining: 2 },
+    reviewFollowUps: { used: 1, limit: 2, remaining: 1 },
+    fixCommitTurns: { used: 0, limit: 1, remaining: 1 },
+    attempts: { verify: 2, review: 2 },
+  };
+
+  it("reads an older server's delivery, which reports none of it", () => {
+    const decoded = decode(older);
+    for (const key of ["allowance", "pullRequest", "proceeding", "source", "queuePriority"]) {
+      expect(decoded).not.toHaveProperty(key);
+    }
+  });
+
+  it("reads it from a server that does", () => {
+    const decoded = decode({
+      ...older,
+      allowance,
+      pullRequest: { number: 7, url: "https://github.com/a/b/pull/7", outcome: "merged" },
+      proceeding: true,
+      source: { key: "#7", title: "Ship", status: "todo", statusName: null, assignee: "Sam" },
+      queuePriority: 1,
+    });
+    expect(decoded.allowance?.counted).toBe("whole_delivery");
+    expect(decoded.pullRequest?.outcome).toBe("merged");
+    expect(decoded.source?.assignee).toBe("Sam");
+    expect(decoded.queuePriority).toBe(1);
+  });
+
+  it("reads a newer server's words as unknown, keeping the rest", () => {
+    const decoded = decode({
+      ...older,
+      allowance: { ...allowance, counted: "per_task" },
+      pullRequest: { number: 7, url: "https://github.com/a/b/pull/7", outcome: "reverted" },
+      source: { key: "#7", title: "Ship", status: "triage", statusName: null, assignee: null },
+    });
+    expect(decoded.allowance?.counted).toBe("unknown");
+    expect(decoded.pullRequest?.outcome).toBe("unknown");
+    expect(decoded.source?.status).toBe("unknown");
+  });
+
+  it("leaves out what it cannot read, rather than fail the delivery", () => {
+    const decoded = decode({ ...older, allowance: { counted: 1 }, pullRequest: { number: "x" } });
+    expect(decoded.status).toBe("pr_open");
+    expect(decoded.allowance).toBeUndefined();
+    expect(decoded.pullRequest).toBeUndefined();
+  });
+});
+
+describe("the reviewed execution contract", () => {
+  const reviewed = {
+    receiptId: "receipt-1",
+    reviewVersion: 1,
+    roles: {
+      planner: { instanceId: "codex", model: "plan-model" },
+      author: { instanceId: "codex", model: "author-model" },
+      reviewer: { instanceId: "codex", model: "review-model" },
+    },
+    verifyCommand: { executable: "vp", args: ["test"] },
+    setupCommand: null,
+    limits: { maxFixRounds: 2, maxReviewRounds: 2, maxFixCommitTurns: 1, verifyTimeoutMinutes: 30 },
+    blockingSeverities: ["high"],
+    highRiskEffort: "xhigh",
+    pipelineId: "standard",
+    repository: {
+      projectId: "project-1",
+      workspaceRoot: "/repo",
+      publication: {
+        push: [],
+        head: [],
+        provider: "unknown",
+        repository: null,
+        remoteConfig: "reviewed-config",
+      },
+    },
+    runtimeCeiling: "auto-accept-edits",
+    promptOverrides: {
+      plan: "absent",
+      author: "absent",
+      review: "a".repeat(64),
+      "fix-verify": "absent",
+      "fix-review": "absent",
+      "fix-commit": "absent",
+      integrate: "absent",
+    },
+  };
+  const decode = Schema.decodeUnknownSync(FactoryReviewedExecution);
+
+  it("holds per-command timeouts and count limits, and no aggregate time budget", () => {
+    expect(Object.keys(FactoryReviewedExecution.fields.limits.fields).toSorted()).toEqual([
+      "maxFixCommitTurns",
+      "maxFixRounds",
+      "maxReviewRounds",
+      "verifyTimeoutMinutes",
+    ]);
+    expect(Object.keys(FactoryReviewedExecution.fields).toSorted()).toEqual([
+      "blockingSeverities",
+      "highRiskEffort",
+      "limits",
+      "pipelineId",
+      "promptOverrides",
+      "receiptId",
+      "repository",
+      "reviewVersion",
+      "roles",
+      "runtimeCeiling",
+      "setupCommand",
+      "verifyCommand",
+    ]);
+  });
+
+  it("takes a complete review, keeping what its role options say", () => {
+    const withOptions = {
+      ...reviewed,
+      roles: {
+        ...reviewed.roles,
+        author: {
+          instanceId: "codex",
+          model: "author-model",
+          options: [{ id: "effort", value: "high" }],
+        },
+      },
+    };
+    expect(decode(withOptions).roles.author.options).toEqual([{ id: "effort", value: "high" }]);
+  });
+
+  it.each(Object.keys(reviewed))("refuses a review without %s", (field) => {
+    const { [field as keyof typeof reviewed]: _, ...partial } = reviewed;
+    expect(() => decode(partial)).toThrow();
+  });
+
+  it("refuses a role that did not resolve, or a prompt without a hash or absent marker", () => {
+    expect(() => decode({ ...reviewed, roles: { ...reviewed.roles, author: null } })).toThrow();
+    expect(() =>
+      decode({
+        ...reviewed,
+        promptOverrides: { ...reviewed.promptOverrides, plan: "text of the prompt" },
+      }),
+    ).toThrow();
+  });
+
+  it("is no part of a client's start", () => {
+    expect(Object.keys(FactoryDeliveryStartInput.fields).toSorted()).toEqual(["itemRef", "kind"]);
   });
 });

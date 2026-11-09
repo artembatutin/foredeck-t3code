@@ -52,6 +52,36 @@ const LABELS = {
 };
 
 describe("mobileFleetRows", () => {
+  it("names an item by its source's title, and says what its delivery comes to", () => {
+    const [row] = mobileFleetRows(
+      [
+        {
+          environmentId: envA,
+          supported: true,
+          deliveries: [
+            delivery("ready", "2026-10-26T08:00:00.000Z", {
+              status: "pr_open",
+              proceeding: false,
+              source: {
+                key: "fd-1",
+                title: "Format durations",
+                status: "todo",
+                statusName: null,
+                assignee: null,
+              },
+            }),
+          ],
+        },
+      ],
+      LABELS,
+    );
+    expect(row).toMatchObject({
+      item: "Format durations",
+      nextAction: "Ready for your review",
+      status: "PR open",
+    });
+  });
+
   it("carries the shared slot wait without counting it as needing you or moving the row", () => {
     const rows = mobileFleetRows(
       [
@@ -93,6 +123,7 @@ describe("mobileFleetRows", () => {
       key: "env-a:blocked",
       project: "Foredeck",
       item: "item-blocked",
+      nextAction: "Blocked",
       status: "Blocked",
       stage: "Verify",
       needsYou: "Verify failed twice with the same failure.",

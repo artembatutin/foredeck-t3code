@@ -642,12 +642,15 @@ export const spyOnFactoryPort = () => {
     failGet: boolean;
     failStop: boolean;
     failCancel: boolean;
+    /** Fails the next resume, before Factory takes it or once it has with the answer lost. */
+    failResume: "before" | "after" | undefined;
     verifiesAnyway: boolean;
   } = {
     onStart: undefined,
     failGet: false,
     failStop: false,
     failCancel: false,
+    failResume: undefined,
     verifiesAnyway: false,
   };
   const wrap = (
@@ -677,10 +680,16 @@ export const spyOnFactoryPort = () => {
           ? Effect.fail(new HandoffBackend.HandoffFactoryError({ operation: "stop" }))
           : service.stop(id);
       }),
-    resume: (id) =>
+    resume: (id, options) =>
       Effect.suspend(() => {
         calls.push(`resume:${id}`);
-        return service.resume(id);
+        const failing = control.failResume;
+        control.failResume = undefined;
+        const lost = new HandoffBackend.HandoffFactoryError({ operation: "resume" });
+        if (failing === "before") return Effect.fail(lost);
+        return failing === "after"
+          ? Effect.andThen(service.resume(id, options), Effect.fail(lost))
+          : service.resume(id, options);
       }),
     cancel: (id) =>
       Effect.suspend(() => {
@@ -1147,9 +1156,12 @@ export const itemCount = (world: World) =>
   }).pipe(Effect.orDie);
 
 /** Stands in for Work's error, which only Work's own modules may construct. */
-class FakeWorkUnavailable extends Schema.TaggedError<FakeWorkUnavailable>()("WorkUnavailable", {
-  detail: Schema.String,
-}) {}
+export class FakeWorkUnavailable extends Schema.TaggedError<FakeWorkUnavailable>()(
+  "WorkUnavailable",
+  {
+    detail: Schema.String,
+  },
+) {}
 
 /**
  * Work as the server runs it, whose reads for the assistant's admission and capture fail while

@@ -62,6 +62,7 @@ import {
   LABELS_MAX,
   truncateText,
 } from "../../model/bounds.ts";
+import { workItemContentFingerprint } from "../../model/scope.ts";
 import {
   parseSourceDirectory,
   resolveSourceRoute,
@@ -132,6 +133,8 @@ interface IndexedFile {
   /** The body as served, cut at the wire cap; a write re-reads the file for the whole text. */
   readonly body: string;
   readonly bodyTruncated: boolean;
+  /** Taken from the whole body, Notes apart, before `body` was cut. */
+  readonly scopeFingerprint: string;
   readonly comments: ReadonlyArray<WorkComment>;
   readonly commentsTruncated: boolean;
   readonly fields: TaskOptionalFields;
@@ -234,6 +237,13 @@ const indexFile = (filename: string, document: TaskDocument, stamp: FileStamp): 
     status: document.item?.status ?? "unknown",
     body: body.text,
     bodyTruncated: body.truncated,
+    scopeFingerprint: workItemContentFingerprint({
+      kind: "markdown",
+      title,
+      body: fullBody,
+      bodyTruncated: false,
+      bodyFidelity: "exact",
+    }),
     comments: comments.items,
     commentsTruncated: comments.truncated,
     fields,
@@ -261,6 +271,13 @@ const indexUnread = (
     status: "unknown",
     body: "",
     bodyTruncated: false,
+    scopeFingerprint: workItemContentFingerprint({
+      kind: "markdown",
+      title,
+      body: "",
+      bodyTruncated: false,
+      bodyFidelity: "exact",
+    }),
     comments: [],
     commentsTruncated: false,
     fields: parseOptionalFields(NO_FIELDS),
@@ -750,6 +767,7 @@ export const make: Effect.Effect<
         body: file.body,
         bodyTruncated: file.bodyTruncated,
         bodyFidelity: "exact" as const,
+        scopeFingerprint: file.scopeFingerprint,
         comments: file.comments,
         commentsTruncated: file.commentsTruncated,
         children: others

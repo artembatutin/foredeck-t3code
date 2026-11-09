@@ -401,6 +401,7 @@ function LoadedWorkItem({
         ) : null}
 
         <div className="flex flex-wrap items-center gap-2">
+          <span className="text-muted-foreground text-xs">Work status</span>
           <Menu>
             <MenuTrigger
               disabled={!writable || (statusOptions.length === 0 && item.transitions.length === 0)}
@@ -554,7 +555,7 @@ function LoadedWorkItem({
                   {changedSinceLink(link, item) ? (
                     <div className="flex items-center gap-2 text-xs">
                       <span className="text-muted-foreground">
-                        Changed since the thread started.
+                        Requirements changed since the thread started.
                       </span>
                       <Button size="xs" variant="outline" onClick={() => sendUpdate(link)}>
                         Send update to thread

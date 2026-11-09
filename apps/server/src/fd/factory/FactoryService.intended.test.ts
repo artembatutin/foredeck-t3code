@@ -16,6 +16,7 @@ import {
   withProject,
   type World,
 } from "./testkit/deliveryHarness.ts";
+import { offeredModels, reviewNow } from "./testkit/reviewed.ts";
 
 /**
  * `FactoryService.start` under an id its caller minted, on the real stack: the id a retry converges
@@ -61,6 +62,61 @@ const restoreStep = Effect.flatMap(
 );
 
 const branches = (world: World) => git(world.root, ["branch", "--list"]);
+
+describe("FactoryService.start with a caller's delivery id and a review", () => {
+  const startReviewed = (world: World, reviewedExecution: unknown) =>
+    Effect.flatMap(factoryService, (factory) =>
+      factory.start({ itemRef: world.itemRef, deliveryId: intended, reviewedExecution }),
+    );
+
+  it.live("takes a replay of the same review, and calls another review a conflict", () =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const reviewed = yield* reviewNow(world);
+          yield* startReviewed(world, reviewed);
+          yield* world.launched(intended);
+          const before = yield* stateOf(intended);
+
+          const repeated = yield* startReviewed(world, reviewed);
+          assert.deepStrictEqual(repeated.state, before);
+
+          for (const other of [
+            { ...reviewed, receiptId: "receipt-2" },
+            { ...reviewed, highRiskEffort: "low" },
+            { ...reviewed, limits: { ...reviewed.limits, maxFixRounds: 9 } },
+            { ...reviewed, verifyCommand: verifyCommands.fails },
+            { ...reviewed, runtimeCeiling: "approval-required" },
+          ]) {
+            const conflict = yield* Effect.flip(startReviewed(world, other));
+            assert.strictEqual(conflict._tag, "FactoryDeliveryIdConflictError");
+          }
+          // Nor does a start without a review take it, or one with a review take an unreviewed one.
+          const bare = yield* Effect.flip(startIntended(world));
+          assert.strictEqual(bare._tag, "FactoryDeliveryIdConflictError");
+
+          assert.deepStrictEqual(yield* stateOf(intended), before);
+          assert.lengthOf(yield* deliveriesOf(world), 1);
+        }),
+      { providers: offeredModels() },
+    ),
+  );
+
+  it.live("calls a review of a delivery started without one a conflict", () =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          yield* startIntended(world);
+          const conflict = yield* Effect.flip(startReviewed(world, yield* reviewNow(world)));
+          assert.strictEqual(conflict._tag, "FactoryDeliveryIdConflictError");
+          assert.notProperty(yield* stateOf(intended), "reviewedExecution");
+        }),
+      { providers: offeredModels() },
+    ),
+  );
+});
 
 describe("FactoryService.start with a caller's delivery id", () => {
   it.live(

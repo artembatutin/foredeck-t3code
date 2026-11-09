@@ -11,6 +11,7 @@ import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as DesktopAssets from "./DesktopAssets.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopUserData from "./DesktopUserData.ts";
+import { isUxPreviewVersion } from "@t3tools/shared/fd/assistant";
 import { previewProfilePath } from "../fd/assistant/index.ts";
 
 const COMMIT_HASH_PATTERN = /^[0-9a-f]{7,40}$/i;
@@ -32,10 +33,13 @@ export class DesktopAppIdentity extends Context.Service<
   }
 >()("@t3tools/desktop/app/DesktopAppIdentity") {}
 
-const normalizeCommitHash = (value: string): Option.Option<string> => {
+const normalizeCommitHash = (
+  value: string,
+  length: number = COMMIT_HASH_DISPLAY_LENGTH,
+): Option.Option<string> => {
   const trimmed = value.trim();
   return COMMIT_HASH_PATTERN.test(trimmed)
-    ? Option.some(trimmed.slice(0, COMMIT_HASH_DISPLAY_LENGTH).toLowerCase())
+    ? Option.some(trimmed.slice(0, length).toLowerCase())
     : Option.none();
 };
 
@@ -47,6 +51,8 @@ export const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const userDataContext = yield* Effect.context<FileSystem.FileSystem | Path.Path>();
   const commitHashCache = yield* Ref.make<Option.Option<Option.Option<string>>>(Option.none());
+  // A UX preview's About names the exact commit its build embedded, never one a launch claims.
+  const uxPreview = environment.isPackaged && isUxPreviewVersion(environment.appVersion);
 
   const resolveEmbeddedCommitHash = Effect.gen(function* () {
     const packageJsonPath = environment.path.join(environment.appRoot, "package.json");
@@ -56,7 +62,9 @@ export const make = Effect.gen(function* () {
       onSome: (value) =>
         decodeAppPackageMetadata(value).pipe(
           Effect.map((parsed) =>
-            Option.fromNullishOr(parsed.t3codeCommitHash).pipe(Option.flatMap(normalizeCommitHash)),
+            Option.fromNullishOr(parsed.t3codeCommitHash).pipe(
+              Option.flatMap((hash) => normalizeCommitHash(hash, uxPreview ? 40 : undefined)),
+            ),
           ),
           Effect.orElseSucceed(() => Option.none<string>()),
         ),
@@ -69,7 +77,9 @@ export const make = Effect.gen(function* () {
       return cached.value;
     }
 
-    const override = Option.flatMap(environment.commitHashOverride, normalizeCommitHash);
+    const override = uxPreview
+      ? Option.none<string>()
+      : Option.flatMap(environment.commitHashOverride, (hash) => normalizeCommitHash(hash));
     if (Option.isSome(override)) {
       yield* Ref.set(commitHashCache, Option.some(override));
       return override;
@@ -95,9 +105,12 @@ export const make = Effect.gen(function* () {
     const commitHash = yield* resolveAboutCommitHash;
     // Electron removes spaces from this name to build the native User-Agent
     // product token, but leaves parentheses intact. Keep the runtime name valid
-    // without rewriting preview sessions (which breaks Turnstile, #7110).
+    // without rewriting preview sessions (which breaks Turnstile, #7110). A UX preview goes by
+    // its bare product name, with no stage label added.
     yield* electronApp.setName(
-      `${environment.branding.baseName} ${environment.branding.stageLabel}`,
+      uxPreview
+        ? environment.branding.baseName
+        : `${environment.branding.baseName} ${environment.branding.stageLabel}`,
     );
     yield* electronApp.setAboutPanelOptions({
       applicationName: environment.displayName,

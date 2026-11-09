@@ -615,7 +615,8 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   // Core Services
   // With its Factory port, so it starts its assignments' deliveries through Factory.
   Layer.provideMerge(ProjectAssistant.layerLive.pipe(Layer.provide(AssistantHandoff.layerFactory))),
-  Layer.provideMerge(Factory.layerLive),
+  // With the pull request service, whose reads say what a host saved of what Factory published.
+  Layer.provideMerge(Factory.layerLive.pipe(Layer.provide(layerPullRequestService))),
   // Beneath the assistant, which captures through its Work port, and Factory, which asks its
   // admission port before a managed root's work runs.
   Layer.provideMerge(layerAssistantHandoff),

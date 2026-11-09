@@ -9,6 +9,8 @@ import {
 } from "@t3tools/contracts";
 import {
   WorkItemId,
+  type WorkItemRef,
+  workItemScopeChanged,
   WorkSourceId,
   type WorkThreadLink,
 } from "@t3tools/contracts/fd/work-management";
@@ -24,6 +26,7 @@ import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import type { WorkActor } from "./authority.ts";
 import { WorkRateLimited, WorkUnauthenticated, type WorkDomainError } from "./errors.ts";
+import { workItemScopeFingerprint } from "./model/scope.ts";
 import * as WorkLinkStore from "./persistence/WorkLinkStore.ts";
 import * as WorkSourceStore from "./persistence/WorkSourceStore.ts";
 import type { WorkSourceAdapter } from "./sources/WorkSourceAdapter.ts";
@@ -931,6 +934,7 @@ describe("WorkService links", () => {
         url: null,
         revision: item.revision,
         autoStarted: false,
+        scopeFingerprint: workItemScopeFingerprint(yield* work.getItem(owner, { ref })),
       });
       assert.isNull(byItem.links[0]?.run);
 
@@ -1107,6 +1111,9 @@ describe("WorkService links for other modules", () => {
               url: null,
               revision: item.revision,
               autoStarted: false,
+              scopeFingerprint: workItemScopeFingerprint(
+                yield* work.getItem(reader, { ref: item.ref }),
+              ),
             },
             null,
           ],
@@ -1268,5 +1275,199 @@ describe("WorkService links for other modules", () => {
         [[thread, { status: "failed", at: DateTime.formatIso(ended) }]],
       );
     }).pipe(Effect.provide(layer));
+  });
+
+  describe("a link's scope baseline", () => {
+    const thread = ThreadId.make("thread-linked");
+    const notes = "## Notes\n\n- 2026-10-20T10:40:00Z (bot) Verify passed.\n";
+
+    /** The item's one link and whether it reads as changed, with the revision moved or not. */
+    const reading = (ref: WorkItemRef) =>
+      Effect.flatMap(WorkService.WorkService, (work) =>
+        work.getItem(owner, { ref }).pipe(
+          Effect.map((detail) => ({
+            changed: workItemScopeChanged(detail.links[0]!, detail),
+            revisionMoved: detail.links[0]!.snapshot.revision !== detail.revision,
+            detail,
+          })),
+        ),
+      );
+
+    it.effect(
+      "moves for a title or body edit, and for no comment, Notes, status or assignee",
+      () => {
+        const markdown = fakeAdapter("markdown");
+        const harness = seeded(markdown.adapter);
+        harness.threads.set(thread, threadShell(thread, alpha));
+        return Effect.gen(function* () {
+          const work = yield* WorkService.WorkService;
+          const source = yield* work.saveSource(owner, {
+            projectId: alpha,
+            label: "Tasks",
+            config: markdownConfig("tasks"),
+          });
+          const item = yield* work.createItem(owner, {
+            sourceId: source.sourceId,
+            title: "Ship it",
+            body: "Export CSV.\n",
+          });
+          const read = () => reading(item.ref);
+          yield* work.setLink(owner, { ref: item.ref, threadId: thread, action: "link" });
+          const linked = yield* read();
+          assert.isFalse(linked.changed);
+          assert.isFalse(linked.revisionMoved);
+          assert.strictEqual(
+            linked.detail.links[0]?.snapshot.scopeFingerprint,
+            linked.detail.scopeFingerprint,
+          );
+
+          yield* work.addComment(owner, { ref: item.ref, body: "Progress." });
+          assert.isFalse((yield* read()).changed);
+
+          yield* work.setStatus(owner, { ref: item.ref, status: "in_progress" });
+          const started = yield* read();
+          assert.isFalse(started.changed);
+          assert.isTrue(started.revisionMoved);
+
+          yield* work.updateItem(owner, { ref: item.ref, assignee: "someone" });
+          assert.isFalse((yield* read()).changed);
+
+          // A Markdown comment lands in the body's Notes, which moves the revision and no scope.
+          yield* work.updateItem(owner, {
+            ref: item.ref,
+            expectedRevision: (yield* read()).detail.revision,
+            body: `Export CSV.\n\n${notes}`,
+          });
+          assert.isFalse((yield* read()).changed);
+
+          yield* work.updateItem(owner, {
+            ref: item.ref,
+            expectedRevision: (yield* read()).detail.revision,
+            body: `Export CSV and PDF.\n\n${notes}`,
+          });
+          assert.isTrue((yield* read()).changed);
+
+          yield* work.updateItem(owner, {
+            ref: item.ref,
+            expectedRevision: (yield* read()).detail.revision,
+            body: `Export CSV.\n\n${notes}`,
+          });
+          assert.isFalse((yield* read()).changed);
+
+          yield* work.updateItem(owner, {
+            ref: item.ref,
+            expectedRevision: (yield* read()).detail.revision,
+            title: "Ship it soon",
+          });
+          assert.isTrue((yield* read()).changed);
+        }).pipe(Effect.provide(harness.layer));
+      },
+    );
+
+    it.effect("never claims a change for a link stored without one", () => {
+      const markdown = fakeAdapter("markdown");
+      const harness = seeded(markdown.adapter);
+      return Effect.gen(function* () {
+        const work = yield* WorkService.WorkService;
+        const store = yield* WorkLinkStore.WorkLinkStore;
+        const source = yield* work.saveSource(owner, {
+          projectId: alpha,
+          label: "Tasks",
+          config: markdownConfig("tasks"),
+        });
+        const item = yield* work.createItem(owner, { sourceId: source.sourceId, title: "Ship it" });
+        yield* store.link({
+          ...item.ref,
+          threadId: thread,
+          source: "started",
+          snapshot: {
+            key: item.key,
+            title: item.title,
+            status: item.status,
+            url: item.url,
+            revision: "an older revision",
+            autoStarted: false,
+          },
+        });
+        yield* work.updateItem(owner, {
+          ref: item.ref,
+          expectedRevision: item.revision,
+          title: "Ship it soon",
+        });
+        const { changed, revisionMoved } = yield* reading(item.ref);
+        assert.isTrue(revisionMoved);
+        assert.isFalse(changed);
+      }).pipe(Effect.provide(harness.layer));
+    });
+
+    it.effect("is written by a launch's link, from the read the launch renders", () => {
+      const markdown = fakeAdapter("markdown");
+      const harness = seeded(markdown.adapter);
+      return Effect.gen(function* () {
+        const work = yield* WorkService.WorkService;
+        const source = yield* work.saveSource(owner, {
+          projectId: alpha,
+          label: "Tasks",
+          config: markdownConfig("tasks"),
+        });
+        const item = yield* work.createItem(owner, { sourceId: source.sourceId, title: "Ship it" });
+        const { scopeFingerprint } = yield* work.getItem(owner, { ref: item.ref });
+        yield* work.linkLaunch(
+          { ref: item.ref, threadId: thread, origin: "factory" },
+          Effect.sync(() => harness.threads.set(thread, threadShell(thread, alpha))),
+        );
+        const { links } = yield* work.listLinks(owner, { threadId: thread });
+        assert.strictEqual(links[0]?.snapshot.scopeFingerprint, scopeFingerprint);
+        assert.isDefined(scopeFingerprint);
+      }).pipe(Effect.provide(harness.layer));
+    });
+  });
+
+  describe("currentSummaries", () => {
+    it.effect("asks a source once per interval and again after a write, writing nothing", () => {
+      const markdown = fakeAdapter("markdown");
+      const harness = seeded(markdown.adapter);
+      return Effect.gen(function* () {
+        const work = yield* WorkService.WorkService;
+        const source = yield* work.saveSource(owner, {
+          projectId: alpha,
+          label: "Tasks",
+          config: markdownConfig("tasks"),
+        });
+        const one = yield* work.createItem(owner, { sourceId: source.sourceId, title: "One" });
+        const two = yield* work.createItem(owner, { sourceId: source.sourceId, title: "Two" });
+        const ids = [one.ref.itemId, two.ref.itemId];
+        const titles = (summaries: ReadonlyArray<{ readonly title: string }>) =>
+          summaries.map(({ title }) => title);
+
+        assert.deepStrictEqual(titles(yield* work.currentSummaries(source.sourceId, ids)), [
+          "One",
+          "Two",
+        ]);
+        // However a caller orders them, the same items are the same read.
+        yield* work.currentSummaries(source.sourceId, ids.toReversed());
+        assert.strictEqual(markdown.count("snapshots"), 1);
+
+        yield* TestClock.adjust("16 seconds");
+        yield* work.currentSummaries(source.sourceId, ids);
+        assert.strictEqual(markdown.count("snapshots"), 2);
+
+        yield* work.updateItem(owner, {
+          ref: one.ref,
+          expectedRevision: one.revision,
+          title: "One, renamed",
+        });
+        assert.deepStrictEqual(titles(yield* work.currentSummaries(source.sourceId, ids)), [
+          "One, renamed",
+          "Two",
+        ]);
+        assert.strictEqual(markdown.count("snapshots"), 3);
+        // The two creates and the one rename above are all the writes there were.
+        assert.strictEqual(markdown.count("create"), 2);
+        assert.strictEqual(markdown.count("update"), 1);
+        assert.strictEqual(markdown.count("setStatus"), 0);
+        assert.strictEqual(markdown.count("comment"), 0);
+      }).pipe(Effect.provide(harness.layer));
+    });
   });
 });

@@ -103,6 +103,20 @@ export function loadRepoEnv({
   };
 }
 
+/**
+ * The backend origins a web build bakes in, read from its environment once `loadRepoEnv` has
+ * merged the env files under it. `T3CODE_SINGLE_ORIGIN_DEV=1` bakes neither, so the client uses
+ * its own origin: removing `VITE_HTTP_URL` or `VITE_WS_URL` from the environment is not enough,
+ * because a `.env` or `.env.local` that names one restores it.
+ */
+export function resolveWebBuildOrigins(env: Environment): {
+  readonly httpUrl: string | undefined;
+  readonly wsUrl: string | undefined;
+} {
+  if (env.T3CODE_SINGLE_ORIGIN_DEV === "1") return { httpUrl: undefined, wsUrl: undefined };
+  return { httpUrl: env.VITE_HTTP_URL?.trim(), wsUrl: env.VITE_WS_URL?.trim() };
+}
+
 export function resolvePublicConfig(...sources: readonly Environment[]): T3CodePublicConfig {
   return {
     clerkPublishableKey: firstNonEmpty(

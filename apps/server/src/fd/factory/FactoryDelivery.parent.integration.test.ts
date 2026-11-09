@@ -261,7 +261,7 @@ describe("Factory parent delivery end to end", () => {
           assert.strictEqual(call?.input.cwd, worktreePath);
           assert.strictEqual(call?.input.threadId, authors.at(-1));
           assert.strictEqual(call?.input.expectedHeadSha, approval.headSha);
-          assert.strictEqual(call?.input.prTitle, `${world.itemKey}: ${world.itemTitle}`);
+          assert.strictEqual(call?.input.prTitle, `feat: ${world.itemKey} ${world.itemTitle}`);
           const body = call?.input.prBody ?? "";
           const listed = childItems.map(
             ({ key, title }, index) => `${index + 1}. ${key}: ${title}`,

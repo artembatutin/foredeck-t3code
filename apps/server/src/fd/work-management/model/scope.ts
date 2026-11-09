@@ -29,13 +29,13 @@ const normalized = (text: string) =>
     .replace(/\n+$/, "");
 
 /**
- * A fingerprint of what the item says: its title and its body without comments, with whether the
- * read holds all of the body and all of its content. Two reads of an unedited item fingerprint
+ * A fingerprint of what the given text says: its title and its body without comments, with whether
+ * it holds all of the body and all of its content. Two readings of an unedited item fingerprint
  * equally, however many comments were added in between or how the source spells line ends, so a
- * changed fingerprint means someone changed what the item asks for. Accepts an item rendered for
- * writing as well as one read back.
+ * changed fingerprint means someone changed what the item asks for. A source takes this from the
+ * whole body, before it cuts that for the wire.
  */
-export const workItemScopeFingerprint = (item: ScopedItem): string =>
+export const workItemContentFingerprint = (item: ScopedItem): string =>
   NodeCrypto.createHash("sha256")
     .update(
       JSON.stringify([
@@ -46,6 +46,27 @@ export const workItemScopeFingerprint = (item: ScopedItem): string =>
       ]),
     )
     .digest("hex");
+
+/**
+ * The fingerprint of an item as read or as rendered for writing. A read carries the one its source
+ * took from the whole body, which wins: its bounded text cannot see an edit past the cut, and a
+ * comment growing a Markdown task across the cap would read as a change to what it asks. An item
+ * rendered for writing is whole already, so reads back the same.
+ */
+export const workItemScopeFingerprint = (
+  item: ScopedItem & Partial<Pick<WorkItemDetail, "scopeFingerprint">>,
+): string => item.scopeFingerprint ?? workItemContentFingerprint(item);
+
+/**
+ * What a link keeps and a read reports of an item. Nothing for an item its source cannot read
+ * cleanly, whose text says nothing of what it asks: a broken file is not a changed requirement.
+ */
+export const workItemLinkScope = (
+  item: ScopedItem &
+    Partial<Pick<WorkItemDetail, "scopeFingerprint">> &
+    Pick<WorkItemDetail, "invalid">,
+): { readonly scopeFingerprint?: string } =>
+  item.invalid === null ? { scopeFingerprint: workItemScopeFingerprint(item) } : {};
 
 /**
  * The comments section the item keeps in its body, as written: a Markdown task's `## Notes`, or

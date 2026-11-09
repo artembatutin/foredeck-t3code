@@ -8,6 +8,7 @@ import { AcpProviderCapabilitiesV2 } from "@t3tools/provider-acp/server/adapter"
 import * as Effect from "effect/Effect";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import { makeUnavailableUsageLimits } from "@t3tools/provider-core/server/usageLimits";
 
 import { DEVIN_DRIVER_KIND, DEFAULT_DEVIN_SETTINGS, DevinSettings } from "../devin/index.ts";
 import {
@@ -21,9 +22,10 @@ import {
   normalizeDevinToolCall,
 } from "../../server/devinAcp.ts";
 import { readDevinModels } from "./models.ts";
-import { normalizeDevinUsage, registerDevinUsage } from "./usage.ts";
+import { makeDevinUsage } from "./usage.ts";
 import { devinUsageReader } from "./history.ts";
 import { devinCompaction } from "./compaction.ts";
+import { devinPromptFailure } from "./failure.ts";
 import { makeDevinTextGeneration, readDevinTextGenerationSupport } from "./textGeneration.ts";
 import {
   devinModelSupportsImages,
@@ -59,34 +61,51 @@ export const DevinAdapterV2Driver = makeAcpRegistryAdapterDriver({
   normalizeCommands: normalizeDevinCommands,
   authenticateOnAuthRequired: false,
   prepareProcessEnvironment: prepareDevinEnvironment,
-  flavor: (settings, environment) => ({
-    capabilities: DevinProviderCapabilitiesV2,
-    ...devinCompaction,
-    normalizeUsage: normalizeDevinUsage,
-    registerExtensions: (context) =>
-      devinCompaction.registerExtensions!(context).pipe(
-        Effect.andThen(registerDevinUsage(context)),
-      ),
-    supportsCompaction: true,
-    requireAdvertisedCompaction: true,
-    preparePrompt: prepareDevinWorkspacePrompt(settings, environment),
-    modelSupportsImages: devinModelSupportsImages,
-    commandPromptsAreVerbatim: true,
-    deferFinalizeForBackgroundWork: true,
-    clientCapabilitiesMeta: {
-      "cognition.ai/subagentSupport": true,
-      "cognition.ai/messageGrouping": true,
-    },
-    normalizeSessionUpdate: normalizeDevinSessionUpdate,
-    normalizeToolCall: normalizeDevinToolCall,
-    extractSubagentUpdate: extractDevinSubagentUpdate,
-  }),
+  flavor: (settings, environment) => {
+    const usage = makeDevinUsage();
+    return {
+      capabilities: DevinProviderCapabilitiesV2,
+      ...devinCompaction,
+      promptFailure: devinPromptFailure,
+      normalizeUsage: usage.normalizeUsage,
+      registerExtensions: (context) =>
+        devinCompaction.registerExtensions!(context).pipe(
+          Effect.andThen(usage.registerExtensions(context)),
+        ),
+      supportsCompaction: true,
+      requireAdvertisedCompaction: true,
+      preparePrompt: prepareDevinWorkspacePrompt(settings, environment),
+      modelSupportsImages: devinModelSupportsImages,
+      commandPromptsAreVerbatim: true,
+      deferFinalizeForBackgroundWork: true,
+      clientCapabilitiesMeta: {
+        "cognition.ai/subagentSupport": true,
+        "cognition.ai/messageGrouping": true,
+      },
+      normalizeSessionUpdate: normalizeDevinSessionUpdate,
+      normalizeToolCall: normalizeDevinToolCall,
+      extractSubagentUpdate: extractDevinSubagentUpdate,
+    };
+  },
 });
 export type DevinAdapterV2DriverEnv = AcpRegistryAdapterV2DriverEnv;
+
+// The CLI shows plan quota only interactively; its ACP stream carries per-turn credits.
+const DEVIN_USAGE_URL = "https://app.devin.ai/settings/usage";
 
 const presentDevinSnapshot = (snapshot: ServerProvider): ServerProvider => ({
   ...snapshot,
   displayName: snapshot.displayName ?? "Devin CLI",
+  // ACP `usage_update` reports used and maximum context tokens.
+  reportsContextWindow: true,
+  usageLimits: snapshot.usageLimits ?? {
+    ...makeUnavailableUsageLimits({
+      checkedAt: snapshot.checkedAt,
+      reason: "unsupported",
+      message: "Devin tracks plan quota and credits on your account. Open its usage settings.",
+    }),
+    externalUsage: { label: "Devin usage", url: DEVIN_USAGE_URL },
+  },
   showInteractionModeToggle: snapshot.models.some((model) =>
     model.capabilities?.optionDescriptors?.some(
       (option) => option.type === "select" && option.options.some((choice) => choice.id === "plan"),

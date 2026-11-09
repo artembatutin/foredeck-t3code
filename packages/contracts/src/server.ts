@@ -248,6 +248,17 @@ export const ServerProviderUpdateState = Schema.Struct({
 });
 export type ServerProviderUpdateState = typeof ServerProviderUpdateState.Type;
 
+/**
+ * What a provider's host policy says of one runtime mode. `disallowed` is known refusal, with what
+ * the policy allows in `detail`; `unknown` is a provider that could not say, never permission.
+ */
+export const ServerProviderRuntimeModeRestriction = Schema.Struct({
+  runtimeMode: RuntimeMode,
+  status: Schema.Literals(["allowed", "disallowed", "unknown"]),
+  detail: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(200))),
+});
+export type ServerProviderRuntimeModeRestriction = typeof ServerProviderRuntimeModeRestriction.Type;
+
 export const ServerProvider = Schema.Struct({
   // Routing key for the configured instance this snapshot represents. This
   // is the only stable identity consumers may use for provider routing.
@@ -267,6 +278,13 @@ export const ServerProvider = Schema.Struct({
   // meter once its activities load. Clients reserve the meter's space on it.
   reportsContextWindow: Schema.optional(Schema.Boolean),
   supportedRuntimeModes: Schema.optional(ForwardCompatibleArray(RuntimeMode)),
+  // What the host's own policy says of each mode, kept apart from
+  // `supportedRuntimeModes` because a mode missing there runs as another one
+  // (see RuntimePolicy), while a refused mode must only ever be explained.
+  // Absent means nobody knows: see `providerRuntimeModeRestriction`.
+  runtimeModeRestrictions: Schema.optional(
+    ForwardCompatibleArray(ServerProviderRuntimeModeRestriction),
+  ),
   multiRepository: Schema.optional(
     Schema.Struct({ runtimeModes: ForwardCompatibleArray(RuntimeMode) }),
   ),
@@ -342,6 +360,19 @@ export type ServerProviders = typeof ServerProviders.Type;
  */
 export const isProviderAvailable = (snapshot: ServerProvider): boolean =>
   snapshot.availability !== "unavailable";
+
+/**
+ * What the provider's host policy says of `runtimeMode`. Only Codex reads such a policy, so every
+ * other adapter leaves the field out, as does a server from before it, and each reads as unknown.
+ */
+export const providerRuntimeModeRestriction = (
+  snapshot: Pick<ServerProvider, "runtimeModeRestrictions">,
+  runtimeMode: RuntimeMode,
+): ServerProviderRuntimeModeRestriction =>
+  snapshot.runtimeModeRestrictions?.find((entry) => entry.runtimeMode === runtimeMode) ?? {
+    runtimeMode,
+    status: "unknown",
+  };
 
 /**
  * Treat an absent `supportsTextGeneration` as supported so legacy

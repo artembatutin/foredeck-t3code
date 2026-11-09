@@ -7,6 +7,7 @@ import {
   acceptedPlan,
   acceptedReview,
   blocked,
+  FIX_COMMIT_TURNS,
   followedThread,
   isTerminal,
   isTurnEffect,
@@ -31,14 +32,12 @@ import type {
   FactoryPlanJudgment,
   FactoryRepairedStage,
   FactoryResumeCheck,
+  FactoryReviewedAllowance,
   FactoryReviewJudgment,
   FactorySettleResult,
   FactoryWatchState,
 } from "./state.ts";
 import { stageHandler } from "./stages/registry.ts";
-
-/** Repairable settle problems get this many mechanical fix-commit turns before the delivery blocks. */
-const FIX_COMMIT_TURNS = 1;
 
 /**
  * Invalid plan or review submissions a round answers with a corrected retry before the delivery
@@ -103,11 +102,23 @@ const beginReview = (delivery: FactoryDeliveryState): FactoryAdvance => {
     : begin(next, standardStages.review);
 };
 
+/** The block for a reviewed delivery that spent a count its owner approved. */
+const exhaustedAllowance = (
+  allowance: FactoryReviewedAllowance,
+  used: number,
+  approved: number,
+  problems: ReadonlyArray<string> = [],
+): FactoryBlock => ({ reason: "allowance_exhausted", allowance, used, approved, problems });
+
+/** The mechanical fix-commit turns a delivery may spend: a review's, or the fixed one. */
+const fixCommitAllowance = ({ reviewedExecution }: FactoryDeliveryState) =>
+  reviewedExecution?.limits.maxFixCommitTurns ?? FIX_COMMIT_TURNS;
+
 /**
  * Answers a failed verify or a blocking review with the next repair round on the author thread.
  * The failure's fingerprint is recorded; one the task already recorded blocks instead, since the
  * round before saw the same failure on the same tree. With the stage's rounds spent, the delivery
- * blocks with `exhausted`.
+ * blocks with `exhausted`, or for a reviewed one saying what it used of what its owner approved.
  */
 const repair = (
   delivery: FactoryDeliveryState,
@@ -130,8 +141,14 @@ const repair = (
   const spent = fixing ? rounds.fix : rounds.review;
   // The author thread exists from the author stage on; verify and review come after it.
   const { author } = delivery.threads;
-  if (spent >= (fixing ? limits.maxFixRounds : limits.maxReviewRounds) || author === undefined) {
-    return blocked(recorded, failure.exhausted);
+  const approved = fixing ? limits.maxFixRounds : limits.maxReviewRounds;
+  if (spent >= approved || author === undefined) {
+    return blocked(
+      recorded,
+      delivery.reviewedExecution !== undefined && author !== undefined
+        ? exhaustedAllowance(fixing ? "fix" : "review", spent, approved)
+        : failure.exhausted,
+    );
   }
   const round = spent + 1;
   return enter(recorded, "repair", (current) =>
@@ -152,17 +169,45 @@ const repair = (
 };
 
 /**
+ * A reviewed delivery with the count of a turn that never started given back. A count is charged
+ * when its turn is issued, so a turn lost after it was sent stays charged whatever came of its
+ * result, and one refused first must not spend what its owner approved: restoring what it was
+ * refused for has to be enough to go on.
+ */
+const refunded = (delivery: FactoryDeliveryState, effect: FactoryEffect): FactoryDeliveryState => {
+  if (delivery.reviewedExecution === undefined) return delivery;
+  const { rounds, fixCommitTurns } = delivery;
+  switch (effect.type) {
+    case "send_fix_commit_turn":
+      return { ...delivery, fixCommitTurns: Math.max(0, fixCommitTurns - 1) };
+    case "send_repair_turn":
+      return {
+        ...delivery,
+        rounds:
+          effect.kind === "fix-verify"
+            ? { ...rounds, fix: Math.max(0, rounds.fix - 1) }
+            : { ...rounds, review: Math.max(0, rounds.review - 1) },
+      };
+    default:
+      return delivery;
+  }
+};
+
+/**
  * A resumed delivery's fresh retry allowance (owner decision): repair rounds, fix-commit turns
- * and failure fingerprints start over, and its limits stay. Receipts, reviews and approvals stay
- * as its history; none is taken for the commit the resume finds.
+ * and failure fingerprints start over, and its limits stay. A reviewed delivery's counts are what
+ * its owner approved for the whole delivery, so a resume keeps them and only forgets fingerprints:
+ * more rounds take a new review (see `reviewed.amended`). Receipts, reviews and approvals stay as
+ * its history; none is taken for the commit the resume finds.
  */
 const resumed = (delivery: FactoryDeliveryState): FactoryDeliveryState => ({
   ...delivery,
   status: "running",
   block: null,
   checkpoint: null,
-  fixCommitTurns: 0,
-  rounds: { fix: 0, review: 0 },
+  ...(delivery.reviewedExecution === undefined
+    ? { fixCommitTurns: 0, rounds: { fix: 0, review: 0 } }
+    : {}),
   fingerprints: [],
   // The owner's resume is the decision to watch the pull request again (see `pr.opened`).
   ...(delivery.followThrough === undefined
@@ -187,10 +232,23 @@ const resumeBranch = (
     return blocked(delivery, { reason: "unsettled", problems: settle.problems });
   }
   if (settle.status === "repairable") {
+    const reviewed = delivery.reviewedExecution !== undefined;
+    const approved = fixCommitAllowance(delivery);
+    if (reviewed && delivery.fixCommitTurns >= approved) {
+      return blocked(
+        delivery,
+        exhaustedAllowance("fix_commit", delivery.fixCommitTurns, approved, settle.problems),
+      );
+    }
     const checkpoint = delivery.checkpoint ?? delivery.stage;
-    // The turn counts as the one fix-commit turn: a branch it leaves unsettled blocks.
+    // The turn counts as the one fix-commit turn: a branch it leaves unsettled blocks. A reviewed
+    // delivery counts it against what its owner approved.
     return issue(
-      { ...resumed(delivery), stage: "repair", fixCommitTurns: FIX_COMMIT_TURNS },
+      {
+        ...resumed(delivery),
+        stage: "repair",
+        fixCommitTurns: reviewed ? delivery.fixCommitTurns + 1 : FIX_COMMIT_TURNS,
+      },
       {
         type: "send_fix_commit_turn",
         threadId: thread,
@@ -718,6 +776,51 @@ const fold = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvan
       const { admissionWait: _, ...granted } = delivery;
       return step(granted);
     }
+    case "reviewed.amended": {
+      const { reviewedExecution, supersededReceipts = [] } = delivery;
+      if (
+        reviewedExecution === undefined ||
+        reviewedExecution.receiptId === event.receiptId ||
+        supersededReceipts.includes(event.receiptId)
+      ) {
+        return unchanged(delivery);
+      }
+      const { maxFixRounds, maxReviewRounds, maxFixCommitTurns } = event.allowances;
+      return step({
+        ...delivery,
+        supersededReceipts: [...supersededReceipts, reviewedExecution.receiptId],
+        limits: { maxFixRounds, maxReviewRounds },
+        reviewedExecution: {
+          ...reviewedExecution,
+          receiptId: event.receiptId,
+          reviewVersion: event.reviewVersion,
+          limits: { ...reviewedExecution.limits, maxFixRounds, maxReviewRounds, maxFixCommitTurns },
+        },
+      });
+    }
+    case "reviewed.rebound": {
+      const { reviewedExecution, supersededReceipts = [] } = delivery;
+      if (
+        reviewedExecution === undefined ||
+        reviewedExecution.receiptId === event.execution.receiptId ||
+        supersededReceipts.includes(event.execution.receiptId)
+      ) {
+        return unchanged(delivery);
+      }
+      const { maxFixRounds, maxReviewRounds } = event.execution.limits;
+      return step({
+        ...delivery,
+        supersededReceipts: [...supersededReceipts, reviewedExecution.receiptId],
+        limits: { maxFixRounds, maxReviewRounds },
+        runtimeModeCeiling: event.execution.runtimeCeiling,
+        reviewedExecution: event.execution,
+        ...(event.owesResume ? { reviewResumeOwed: event.execution.receiptId } : {}),
+      });
+    }
+    case "reviewed.refused":
+      return delivery.status === "pr_open" && delivery.awaiting === null
+        ? blocked(delivery, { reason: "reviewed_refused", detail: event.detail })
+        : unchanged(delivery);
     case "start": {
       if (delivery.status !== "queued") return unchanged(delivery);
       const started = {
@@ -734,7 +837,7 @@ const fold = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvan
       return delivery.status === "running"
         ? step({ ...delivery, status: "stopping" })
         : unchanged(delivery);
-    case "resume":
+    case "resume": {
       // Stopping, the delivery runs on: what it awaits is still coming, so nothing is issued.
       if (delivery.status === "stopping") return step({ ...delivery, status: "running" });
       if (
@@ -743,17 +846,20 @@ const fold = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvan
       ) {
         return unchanged(delivery);
       }
+      // Whatever this one finds, it is the resume a fresh review owed.
+      const { reviewResumeOwed: _taken, ...resuming } = delivery;
       // The pull request merged and nothing else is left to judge: the close-out runs again.
-      if (closeOutFailed(delivery)) {
-        return issue({ ...resumed(delivery), status: "pr_open" }, { type: "close_out" });
+      if (closeOutFailed(resuming)) {
+        return issue({ ...resumed(resuming), status: "pr_open" }, { type: "close_out" });
       }
-      if (delivery.kind !== "parent") return resume(delivery, event.check);
-      if (delivery.pullRequestThread !== undefined) {
-        return resumeFollowThrough(delivery, event.check, delivery.pullRequestThread);
+      if (resuming.kind !== "parent") return resume(resuming, event.check);
+      if (resuming.pullRequestThread !== undefined) {
+        return resumeFollowThrough(resuming, event.check, resuming.pullRequestThread);
       }
-      return delivery.planApproved
-        ? resumeApproved(delivery)
-        : resumePlanning(delivery, event.check);
+      return resuming.planApproved
+        ? resumeApproved(resuming)
+        : resumePlanning(resuming, event.check);
+    }
     case "cancel":
       return isTerminal(delivery)
         ? unchanged(delivery)
@@ -1058,7 +1164,8 @@ const fold = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvan
       if (result.status === "settled") {
         return enter(delivery, "verify", (current) => begin(current, standardStages.verify));
       }
-      if (result.status === "repairable" && delivery.fixCommitTurns < FIX_COMMIT_TURNS) {
+      const approved = fixCommitAllowance(delivery);
+      if (result.status === "repairable" && delivery.fixCommitTurns < approved) {
         return issue(
           { ...delivery, fixCommitTurns: delivery.fixCommitTurns + 1 },
           {
@@ -1069,7 +1176,12 @@ const fold = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvan
           },
         );
       }
-      return blocked(delivery, { reason: "unsettled", problems: result.problems });
+      return blocked(
+        delivery,
+        result.status === "repairable" && delivery.reviewedExecution !== undefined
+          ? exhaustedAllowance("fix_commit", delivery.fixCommitTurns, approved, result.problems)
+          : { reason: "unsettled", problems: result.problems },
+      );
     }
 
     case "command.finished": {
@@ -1180,12 +1292,9 @@ const fold = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvan
       // Published either way: the pull request is the delivery's, so a resume publishes to it
       // again rather than open another, and its merge or close is taken.
       const recorded = published(delivery, event);
-      if (event.watchFailure !== undefined) {
-        return blocked(recorded, {
-          reason: "effect_failed",
-          effect: open,
-          detail: event.watchFailure,
-        });
+      const failure = event.publicationFailure ?? event.watchFailure;
+      if (failure !== undefined) {
+        return blocked(recorded, { reason: "effect_failed", effect: open, detail: failure });
       }
       const next: FactoryDeliveryState = { ...recorded, status: "pr_open", awaiting: null };
       // A watch core ended is not started again on its own.
@@ -1238,10 +1347,11 @@ const fold = (delivery: FactoryDeliveryState, event: FactoryEvent): FactoryAdvan
 
     case "effect.failed":
       return awaiting?.type === "effect" && awaiting.effect.id === event.effectId
-        ? blocked(delivery, {
+        ? blocked(event.unsent === true ? refunded(delivery, awaiting.effect) : delivery, {
             reason: "effect_failed",
             effect: awaiting.effect,
             detail: event.detail,
+            ...(event.hostRefused === undefined ? {} : { hostRefused: event.hostRefused }),
           })
         : unchanged(delivery);
   }

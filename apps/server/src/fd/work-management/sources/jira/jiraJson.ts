@@ -11,6 +11,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import { BODY_MAX_CHARS, COMMENTS_MAX, truncateText } from "../../model/bounds.ts";
+import { workItemContentFingerprint } from "../../model/scope.ts";
 import { fromJiraStatusCategory } from "../../model/status.ts";
 import type { WorkSourceItemDetail } from "../WorkSourceAdapter.ts";
 import { adfToMarkdown } from "./adf.ts";
@@ -305,24 +306,37 @@ export const toComment = (comment: CommentJson): WorkComment => ({
   updatedAt: comment.updated ? normalizeTimestamp(comment.updated) : null,
 });
 
+const encodeDocument = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+
 export const toDetail = (
   sourceId: WorkSourceId,
   siteOrigin: string,
   issue: IssueJson,
   comments: typeof CommentsResponse.Type,
 ): WorkSourceItemDetail => {
-  const body = adfToMarkdown(issue.fields.description ?? null);
+  const description = issue.fields.description ?? null;
+  const body = adfToMarkdown(description);
   const bounded = truncateText(body.markdown, BODY_MAX_CHARS);
+  const summary = toSummary(sourceId, siteOrigin, issue);
   // Comments arrive newest first; the detail shows them oldest first like every other source.
   const shown: Array<WorkComment> = comments.comments
     .toReversed()
     .slice(-COMMENTS_MAX)
     .map(toComment);
   return {
-    ...toSummary(sourceId, siteOrigin, issue),
+    ...summary,
     body: bounded.text,
     bodyTruncated: bounded.truncated,
     bodyFidelity: body.lossy ? "lossy" : "exact",
+    scopeFingerprint: workItemContentFingerprint({
+      kind: "jira",
+      title: summary.title,
+      // A lossy body's Markdown holds placeholders, so an edit of what they stand for, such as a
+      // table's cell, shows only in the document itself.
+      body: body.lossy ? encodeDocument(description) : body.markdown,
+      bodyTruncated: false,
+      bodyFidelity: body.lossy ? "lossy" : "exact",
+    }),
     comments: shown,
     commentsTruncated: (comments.total ?? comments.comments.length) > shown.length,
     children: (issue.fields.subtasks ?? []).map((subtask) => ({

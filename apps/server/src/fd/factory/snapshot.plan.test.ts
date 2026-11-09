@@ -72,6 +72,7 @@ const stored = (state: FactoryDeliveryState): FactoryDeliveryWithRuns => ({
   parentId: null,
   state,
   stageRuns: [],
+  stageAttempts: {},
   createdAt: "2026-10-24T09:00:00.000Z",
   updatedAt: "2026-10-24T10:06:00.000Z",
 });

@@ -20,8 +20,14 @@ export { callerPolicyText } from "./CallerPolicy.ts";
 /** The assistant's Work port over Work's service, which it needs. */
 export const layerBackend = Layer.effect(HandoffBackend.HandoffBackend, WorkBackend.make);
 
-/** The assistant's Factory port over Factory's service and settings, which it needs. */
-export const layerFactory = Layer.effect(HandoffBackend.HandoffFactory, FactoryBackend.make);
+/**
+ * The assistant's Factory port and the owner's review over Factory's service and settings, which
+ * they need.
+ */
+export const layerFactory = Layer.merge(
+  Layer.effect(HandoffBackend.HandoffFactory, FactoryBackend.make),
+  Layer.effect(HandoffBackend.HandoffReview, FactoryBackend.makeReview),
+);
 
 /**
  * Factory's admission port over the assistant's admission of the roots it manages, and the

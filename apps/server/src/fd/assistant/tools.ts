@@ -56,7 +56,7 @@ export const AssistantToolkit = Toolkit.make(
   Tool.make("assistant_revise_brief", {
     ...common,
     description:
-      "Persist an agreed project brief or correction. Save goals, criteria, constraints, questions, priority rank/reason and explicit execution authorization. Ask about ambiguous priority. A change does not interrupt workers; queued work with changed scope needs a new assignment.",
+      "Persist an agreed project brief or correction. Save goals, a short title of at most 80 characters, criteria, constraints, questions, priority rank/reason and explicit execution authorization. Constraints and decisions are durable scope: delivered to the Work item and the worker exactly as saved, and changing one clears authorization. Keep anything that only matters to this conversation, such as how to discuss the idea or a temporary instruction, in conversationNotes, which never reach the Work item, the worker or the scope. Record authorization only as executionAuthorized; writing it into a decision or constraint changes the very scope it authorizes. Ask about ambiguous priority. A change does not interrupt workers; queued work with changed scope needs a new assignment.",
     parameters: Schema.Struct({
       projectId: ProjectId,
       ideaId: TrimmedNonEmptyString,
@@ -107,7 +107,7 @@ export const AssistantToolkit = Toolkit.make(
   Tool.make("assistant_capture_work", {
     ...capturing,
     description:
-      "Only when the owner explicitly asks, create or update the one Work item that records an idea's saved brief: titled from the goal, with the goal, numbered acceptance criteria, constraints, decisions and open questions. Pass sourceId when the project has several Work sources (ask the owner which); kind parent, for a goal Factory should plan into tasks, needs a Markdown source. It never starts, queues or authorizes work, and a capture that changes the item clears execution authorization until the owner has reviewed it in Work. An item edited in Work since its capture is refused unless overwrite is true. For an uncertain capture, recoverItem adopts the item id the owner found.",
+      "Only when the owner explicitly asks, create or update the one Work item that records an idea's saved brief: with the goal, numbered acceptance criteria, constraints, decisions and open questions, never its conversation notes. A new item takes the brief's short title or one of at most 80 characters from its goal, and an existing item keeps its title unless the brief names a new one. Pass sourceId when the project has several Work sources (ask the owner which); kind parent, for a goal Factory should plan into tasks, needs a Markdown source. It never starts, queues or authorizes work, and a capture that changes the item clears execution authorization until the owner has reviewed it in Work. An item edited in Work since its capture is refused unless overwrite is true. For an uncertain capture, recoverItem adopts the item id the owner found.",
     parameters: Schema.Struct({
       projectId: ProjectId,
       ideaId: TrimmedNonEmptyString,

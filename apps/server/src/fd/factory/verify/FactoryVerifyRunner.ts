@@ -7,7 +7,7 @@ import {
   FactoryVerifyReceipt,
 } from "@t3tools/contracts/fd/factory";
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import { resolveSpawnCommand } from "@t3tools/shared/shell";
+import { type ResolvedSpawnCommand, resolveSpawnCommand } from "@t3tools/shared/shell";
 import type * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -16,13 +16,13 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as ProcessRunner from "../../../processRunner.ts";
 import type * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
-import type { FactoryDeliverySettings } from "../FactorySettings.ts";
 import type { FactoryBranchReadError, FactoryWorktreeMissingError } from "../git/branchFacts.ts";
 import { readWorktreeState } from "../git/worktreeState.ts";
 import type { FactoryCommandOutcome, FactoryReceiptRefusal } from "../pipeline/state.ts";
@@ -31,7 +31,7 @@ import * as FactoryEvidence from "./FactoryEvidence.ts";
 /** The verify command could not be started or read. Its output stays in `cause`, never the message. */
 export class FactoryVerifyCommandError extends Schema.TaggedError<FactoryVerifyCommandError>()(
   "FactoryVerifyCommandError",
-  { path: Schema.String, cause: Schema.Defect() },
+  { path: Schema.String, cause: Schema.optional(Schema.Defect()) },
 ) {
   override get message(): string {
     return `Factory could not run the verify command in worktree ${this.path}.`;
@@ -95,10 +95,44 @@ const encodeReceipt = Schema.encodeEffect(Schema.fromJsonString(FactoryVerifyRec
 const BUFFERED_OUTPUT_BYTES = 64 * 1024;
 
 /**
+ * How a Factory command resolves for a run starting in `cwd`. Every run goes through this, and so
+ * does the settings form's validation, so a check can never pass a command a run would resolve
+ * otherwise. A relative path or PATH directory means relative to where the run starts, never to the
+ * server's own directory, or a Windows lookup would judge a file the command never meant.
+ */
+export const resolveFactoryCommand = Effect.fnUntraced(function* (
+  command: FactoryCommand,
+  cwd: string,
+) {
+  const path = yield* Path.Path;
+  const { executable, args } = command;
+  const explicit = executable.includes("/") || executable.includes("\\");
+  return yield* resolveSpawnCommand(explicit ? path.resolve(cwd, executable) : executable, args, {
+    cwd,
+  });
+});
+
+/**
+ * Whether a Windows lookup found nothing and handed back the name it was given. Such a name is not
+ * for a run to start: the process runner would look it up again with no `cwd`, from the server's own
+ * directory, where it could find a batch script and start it through a shell.
+ */
+const missedOnWindows = Effect.fnUntraced(function* (resolved: ResolvedSpawnCommand) {
+  const bare = !resolved.command.includes("/") && !resolved.command.includes("\\");
+  return bare && (yield* HostProcess.Platform) === "win32";
+});
+
+/** What a verify run runs, from a project's settings or a delivery's review. */
+interface FactoryVerifySettings {
+  readonly verifyCommand: FactoryCommand;
+  readonly limits: { readonly verifyTimeoutMinutes: number };
+}
+
+/**
  * Identifies the settings a receipt was made under: the verify command and its timeout, the
  * settings that change what a run proves. Equal settings always hash equally.
  */
-export const verifySettingsHash = (settings: FactoryDeliverySettings): string =>
+export const verifySettingsHash = (settings: FactoryVerifySettings): string =>
   NodeCrypto.createHash("sha256")
     .update(
       JSON.stringify([
@@ -124,7 +158,7 @@ export class FactoryVerifyRunner extends Context.Service<
     readonly run: (input: {
       readonly deliveryId: FactoryDeliveryId;
       readonly worktreePath: string;
-      readonly settings: FactoryDeliverySettings;
+      readonly settings: FactoryVerifySettings;
     }) => Effect.Effect<FactoryCommandOutcome, FactoryVerifyRunError>;
     /**
      * Runs the setup command in the worktree, its output streamed into `setup-<n>.log` in the
@@ -142,6 +176,7 @@ export class FactoryVerifyRunner extends Context.Service<
 
 const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const processRunner = yield* ProcessRunner.ProcessRunner;
   const evidence = yield* FactoryEvidence.FactoryEvidence;
   const platform = `${yield* HostProcess.Platform}-${yield* HostProcess.Architecture}`;
@@ -227,12 +262,15 @@ const make = Effect.gen(function* () {
       // On Windows the process runner hands `.cmd` and `.bat` files to `cmd.exe` as one command
       // line. Refuse those before anything runs, and pass on the resolved path so the process
       // runner cannot resolve the command differently.
-      const resolved = yield* resolveSpawnCommand(
-        input.settings.verifyCommand.executable,
-        input.settings.verifyCommand.args,
-      );
+      const resolved = yield* resolveFactoryCommand(
+        input.settings.verifyCommand,
+        input.worktreePath,
+      ).pipe(Effect.provideService(Path.Path, path));
       if (resolved.shell) {
         return yield* new FactoryVerifyShellRequiredError({ path: input.worktreePath });
+      }
+      if (yield* missedOnWindows(resolved)) {
+        return yield* new FactoryVerifyCommandError({ path: input.worktreePath });
       }
 
       const before = yield* readWorktree(input.worktreePath);
@@ -302,8 +340,12 @@ const make = Effect.gen(function* () {
     setup: Effect.fn("FactoryVerifyRunner.setup")(function* (input) {
       const { command, timeoutMinutes } = input;
       // A Windows batch script runs only through a shell, which Factory never uses.
-      const resolved = yield* resolveSpawnCommand(command.executable, command.args);
-      if (resolved.shell) return yield* new FactorySetupFailedError({ ending: "not_run" });
+      const resolved = yield* resolveFactoryCommand(command, input.worktreePath).pipe(
+        Effect.provideService(Path.Path, path),
+      );
+      if (resolved.shell || (yield* missedOnWindows(resolved))) {
+        return yield* new FactorySetupFailedError({ ending: "not_run" });
+      }
       const files = yield* evidence.nextRun(input.deliveryId, "setup");
       const { code, timedOut } = yield* runLogged({
         executable: resolved.command,

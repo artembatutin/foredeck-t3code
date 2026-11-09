@@ -118,6 +118,20 @@ function runtimePolicy(
   });
 }
 
+describe("what an OpenCode permission request offers", () => {
+  it("offers its always only when it names something to save, and never as a session choice", () => {
+    const saves = OpenCodeRuntime.openCodeApprovalOptions(["git status *"]);
+    assert.deepStrictEqual(
+      saves.map((option) => option.decision),
+      ["decline", "acceptAlways", "accept"],
+    );
+    assert.deepStrictEqual(
+      OpenCodeRuntime.openCodeApprovalOptions([]).map((option) => option.decision),
+      ["decline", "accept"],
+    );
+  });
+});
+
 function permissionAction(rules: ReturnType<typeof openCodePermissionRules>, permission: string) {
   return rules.findLast((rule) => rule.permission === "*" || rule.permission === permission)
     ?.action;

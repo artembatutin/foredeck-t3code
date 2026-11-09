@@ -17,6 +17,7 @@ type EnvironmentPatch = Record<string, string>;
 interface ShellEnvironmentConfig {
   readonly env: NodeJS.ProcessEnv;
   readonly platform: NodeJS.Platform;
+  readonly homeDirectory?: string;
 }
 
 interface WindowsProbeOptions {
@@ -182,6 +183,17 @@ const knownWindowsCliDirs = (env: NodeJS.ProcessEnv): ReadonlyArray<string> => [
     }),
   ),
 ];
+
+// Per-user install locations (installer scripts, pipx, uv). A GUI launch whose
+// login-shell probe fails or returns a partial PATH would otherwise miss them.
+const userCommandDirs = (homeDirectory: string | undefined): ReadonlyArray<string> =>
+  trimNonEmpty(homeDirectory).pipe(
+    Option.filter((home) => home.startsWith("/")),
+    Option.match({
+      onNone: () => [],
+      onSome: (home) => [`${home}/.local/bin`, `${home}/bin`],
+    }),
+  );
 
 const startMarker = (name: string) => `__T3CODE_ENV_${name}_START__`;
 const endMarker = (name: string) => `__T3CODE_ENV_${name}_END__`;
@@ -421,9 +433,23 @@ const installPosixEnvironment = Effect.fn("desktop.shellEnvironment.installPosix
       config.platform === "darwin" && Option.isNone(shellPath)
         ? yield* readLaunchctlPath
         : Option.none<string>();
+    const recoveredPath = shellPath.pipe(Option.orElse(() => launchctlPath));
+    const inheritedPath = readEnvPath(config.env);
+    // Without any PATH the OS default search applies; a lone fallback would replace it.
+    const fallbackDirs: string[] = [];
+    if (Option.isSome(recoveredPath) || Option.isSome(inheritedPath)) {
+      for (const directory of userCommandDirs(config.homeDirectory)) {
+        const isDirectory = yield* fileSystem.stat(directory).pipe(
+          Effect.map((info) => info.type === "Directory"),
+          Effect.orElseSucceed(() => false),
+        );
+        if (isDirectory) fallbackDirs.push(directory);
+      }
+    }
     const mergedPath = mergePaths(config.platform, [
-      shellPath.pipe(Option.orElse(() => launchctlPath)),
-      readEnvPath(config.env),
+      recoveredPath,
+      inheritedPath,
+      ...fallbackDirs.map(Option.some),
     ]);
 
     if (Option.isSome(mergedPath)) {
@@ -540,6 +566,7 @@ export const make = Effect.gen(function* () {
     installShellEnvironment({
       env: process.env,
       platform: environment.platform,
+      homeDirectory: environment.homeDirectory,
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),

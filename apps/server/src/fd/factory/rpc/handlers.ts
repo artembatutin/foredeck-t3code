@@ -10,6 +10,7 @@ import * as RpcGroup from "effect/rpc/RpcGroup";
 
 import { RpcInstrumentation } from "../../../observability/RpcInstrumentation.ts";
 import * as ServerRuntimeStartup from "../../../serverRuntimeStartup.ts";
+import * as FactoryCommandSetup from "../FactoryCommandSetup.ts";
 import * as FactoryService from "../FactoryService.ts";
 import * as FactorySettings from "../FactorySettings.ts";
 import { toFactoryDelivery } from "../snapshot.ts";
@@ -43,9 +44,10 @@ const forDelivery = <A, E>(deliveryId: FactoryDeliveryId, effect: Effect.Effect<
 export const wsHandlers = (input: {
   readonly factory: FactoryService.FactoryService["Service"];
   readonly settings: FactorySettings.FactorySettings["Service"];
+  readonly commands: FactoryCommandSetup.FactoryCommandSetup["Service"];
   readonly startup: ServerRuntimeStartup.ServerRuntimeStartup["Service"];
 }) => {
-  const { factory, settings, startup } = input;
+  const { factory, settings, commands, startup } = input;
   // Direct WebSocket calls are not gated on command readiness, so delivery controls and the plan
   // gate's actions, which run and interrupt threads, queue like core's commands.
   const command = (
@@ -59,6 +61,10 @@ export const wsHandlers = (input: {
       settings
         .set(payload.projectId, payload.settings)
         .pipe(Effect.as(payload.settings), Effect.mapError(toFactoryError)),
+    [FACTORY_WS_METHODS.factoryCommandsDiscover]: ({ projectId }) =>
+      commands.discover(projectId).pipe(Effect.mapError(toFactoryError)),
+    [FACTORY_WS_METHODS.factoryCommandsValidate]: ({ projectId, command }) =>
+      commands.validate({ projectId, command }).pipe(Effect.mapError(toFactoryError)),
     [FACTORY_WS_METHODS.factoryDeliveriesStart]: ({ itemRef, kind }) =>
       Effect.annotateCurrentSpan({
         "work.source_id": itemRef.sourceId,
@@ -78,7 +84,7 @@ export const wsHandlers = (input: {
       forDelivery(
         deliveryId,
         snapshot(
-          factory.get(deliveryId).pipe(
+          factory.getForClient(deliveryId).pipe(
             Effect.flatMap(
               Option.match({
                 onNone: () =>
@@ -90,11 +96,11 @@ export const wsHandlers = (input: {
         ),
       ),
     [FACTORY_WS_METHODS.factoryDeliveriesList]: (query) =>
-      factory.list(query).pipe(
+      factory.listForClients(query).pipe(
         Effect.map((deliveries) => ({ deliveries: deliveries.map(toFactoryDelivery) })),
         Effect.mapError(toFactoryError),
       ),
-    [FACTORY_WS_METHODS.factoryDeliveriesSubscribe]: () => factory.subscribe,
+    [FACTORY_WS_METHODS.factoryDeliveriesSubscribe]: () => factory.listingChanges,
     [FACTORY_WS_METHODS.factoryPlanUpdate]: ({ deliveryId, plan }) =>
       forDelivery(deliveryId, command(factory.updatePlan({ deliveryId, plan }))),
     [FACTORY_WS_METHODS.factoryPlanApprove]: ({ deliveryId }) =>
@@ -111,7 +117,8 @@ export const layerWsRpc = FactoryServerRpcGroup.toLayer(
   Effect.gen(function* () {
     const factory = yield* FactoryService.FactoryService;
     const settings = yield* FactorySettings.FactorySettings;
+    const commands = yield* FactoryCommandSetup.FactoryCommandSetup;
     const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
-    return wsHandlers({ factory, settings, startup });
+    return wsHandlers({ factory, settings, commands, startup });
   }),
 );

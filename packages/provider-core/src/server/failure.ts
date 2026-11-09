@@ -15,6 +15,10 @@ import * as Cause from "effect/Cause";
 
 import * as IdAllocator from "./IdAllocator.ts";
 import * as Schema from "effect/Schema";
+import {
+  isProviderImageInputError,
+  ProviderImageInputError,
+} from "../fd/image-attachments/index.ts";
 
 /** Raised when portable history does not fit the target provider's context window. */
 export class ContextHandoffBudgetError extends Schema.TaggedError<ContextHandoffBudgetError>()(
@@ -43,6 +47,9 @@ function causeMessage(cause: unknown): string | undefined {
         continue;
       }
       if (typeof cause !== "object") break;
+      if (isProviderImageInputError(cause)) {
+        return new ProviderImageInputError({ reason: cause.reason }).message;
+      }
       switch ((cause as Record<string, unknown>)._tag) {
         case "ContextHandoffBudgetError":
           return new ContextHandoffBudgetError().message;

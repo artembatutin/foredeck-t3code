@@ -59,6 +59,7 @@ import * as FactoryDeliveryStore from "../persistence/FactoryDeliveryStore.ts";
 import { advance } from "../pipeline/engine.ts";
 import { type FactoryEvent, queuedDeliveryState } from "../pipeline/state.ts";
 import * as FactoryVerifyRunner from "../verify/FactoryVerifyRunner.ts";
+import { unusedCommandSetup as commands } from "../testkit/commandSetup.ts";
 import { wsHandlers } from "./handlers.ts";
 
 const projectId = ProjectId.make("project-alpha");
@@ -118,24 +119,36 @@ describe("Factory plan RPC errors", () => {
         startNext: () => unexpected,
         get: () => unexpected,
         list: () => unexpected,
+        getForClient: () => unexpected,
+        listForClients: () => unexpected,
+        refusedTurnActions: () => unexpected,
         listByItem: () => unexpected,
         stop: () => unexpected,
         resume: () => unexpected,
         cancel: () => unexpected,
         redispatch: () => unexpected,
         familyRoot: () => unexpected,
+        reviewedRefusal: () => unexpected,
         requestOwnership: () => unexpected,
         activity: () => unexpected,
         ensureDeferred: () => unexpected,
         turnRunState: () => unexpected,
         familyRequests: () => unexpected,
+        pendingRequests: unexpected,
         updatePlan: () => unexpected,
         approvePlan: () => unexpected,
         rejectPlan: () => unexpected,
         replan: () => unexpected,
         submitPlan: () => unexpected,
         submitReview: () => unexpected,
+        resolveReviewedExecution: () => unexpected,
+        previewReviewedExecution: () => unexpected,
+        reviewedExecutionHolds: () => unexpected,
+        amendReviewedAllowance: () => unexpected,
+        rebindReviewed: () => unexpected,
+        resumeOwedByReview: () => unexpected,
         subscribe: Stream.die("not called in this test"),
+        listingChanges: Stream.die("not called in this test"),
         ...actions,
       }),
       settings: FactorySettings.FactorySettings.of({
@@ -143,6 +156,7 @@ describe("Factory plan RPC errors", () => {
         set: () => unexpected,
         requireDeliverySettings: () => unexpected,
       }),
+      commands,
       startup: readyStartup,
     });
   type Handlers = ReturnType<typeof handlersOver>;
@@ -290,6 +304,15 @@ const plannerThreads = (calls: PlannerCalls, release: Deferred.Deferred<void>) =
       launchedLiveRuns: Effect.die("live runs read not scripted"),
       // Every run is still going; its end arrives as a step.
       runEnded: () => Effect.succeedNone,
+      checkReviewed: () => Effect.die("reviewed check not scripted"),
+      chargedTurnSent: () => Effect.die("charged turn not scripted"),
+      resolveReviewedExecution: () => Effect.die("reviewed execution not scripted"),
+      previewReviewedExecution: () => Effect.die("reviewed execution not scripted"),
+      deliveryExecution: () => Effect.die("role execution not scripted"),
+      reviewedExecutionHolds: () => Effect.die("reviewed execution not scripted"),
+      checkThreadHostPolicy: () => Effect.die("host policy not scripted"),
+      checkReviewedThread: () => Effect.die("reviewed turn not scripted"),
+      prepareReviewedTurn: () => Effect.die("reviewed turn not scripted"),
       interruptRun: (_delivery, { threadId }) =>
         Effect.sync(() => calls.interrupted.push(threadId)),
     }),
@@ -367,7 +390,7 @@ describe("Factory plan RPC handlers over the real service", () => {
         const factory = yield* FactoryService.FactoryService;
         const settings = yield* FactorySettings.FactorySettings;
         const worker = yield* FactoryWorker.FactoryWorker;
-        const rpc = wsHandlers({ factory, settings, startup: readyStartup });
+        const rpc = wsHandlers({ factory, settings, commands, startup: readyStartup });
         const epoch = factory.subscribe.pipe(Stream.runHead, Effect.map(Option.getOrThrow));
         /** Runs a refused call: its wire reason, with the epoch where it was. */
         const refusedWith = (call: Effect.Effect<object, FactoryError>) =>
@@ -489,30 +512,43 @@ describe("Factory plan RPC authorization", () => {
           startNext: () => unexpected,
           get: () => unexpected,
           list: () => unexpected,
+          getForClient: () => unexpected,
+          listForClients: () => unexpected,
+          refusedTurnActions: () => unexpected,
           listByItem: () => unexpected,
           stop: () => unexpected,
           resume: () => unexpected,
           cancel: () => unexpected,
           redispatch: () => unexpected,
           familyRoot: () => unexpected,
+          reviewedRefusal: () => unexpected,
           requestOwnership: () => unexpected,
           activity: () => unexpected,
           ensureDeferred: () => unexpected,
           turnRunState: () => unexpected,
           familyRequests: () => unexpected,
+          pendingRequests: unexpected,
           updatePlan: () => notFound("update"),
           approvePlan: () => unexpected,
           rejectPlan: () => notFound("reject"),
           replan: () => notFound("replan"),
           submitPlan: () => unexpected,
           submitReview: () => unexpected,
+          resolveReviewedExecution: () => unexpected,
+          previewReviewedExecution: () => unexpected,
+          reviewedExecutionHolds: () => unexpected,
+          amendReviewedAllowance: () => unexpected,
+          rebindReviewed: () => unexpected,
+          resumeOwedByReview: () => unexpected,
           subscribe: Stream.die("not called in this test"),
+          listingChanges: Stream.die("not called in this test"),
         }),
         settings: FactorySettings.FactorySettings.of({
           get: () => unexpected,
           set: () => unexpected,
           requireDeliverySettings: () => unexpected,
         }),
+        commands,
         startup: readyStartup,
       });
       const client = yield* RpcTest.makeClient(group).pipe(
@@ -619,7 +655,9 @@ describe("Factory plan RPCs over the wire", () => {
       Effect.provideService(RpcServer.Protocol, protocol),
       Effect.provide(
         Layer.mergeAll(
-          group.toLayer(Effect.succeed(wsHandlers({ factory, settings, startup: readyStartup }))),
+          group.toLayer(
+            Effect.succeed(wsHandlers({ factory, settings, commands, startup: readyStartup })),
+          ),
           RpcAuthorization.layer(AuthEnvironmentScope.literals),
         ),
       ),

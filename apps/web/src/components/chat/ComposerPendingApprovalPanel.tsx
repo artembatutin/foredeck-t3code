@@ -1,16 +1,20 @@
+import type { RuntimeMode } from "@t3tools/contracts";
 import { memo } from "react";
+import { approvalChoiceNote, approvalChoices, pendingApprovalReason } from "../../fd/approvals";
 import { type PendingApproval } from "../../session-logic";
 import { cn } from "~/lib/utils";
 
 interface ComposerPendingApprovalPanelProps {
   approval: PendingApproval;
   pendingCount: number;
+  runtimeMode: RuntimeMode;
   className?: string;
 }
 
 export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprovalPanel({
   approval,
   pendingCount,
+  runtimeMode,
   className,
 }: ComposerPendingApprovalPanelProps) {
   const Detail = approval.requestKind === "mcp-elicitation" ? "span" : "code";
@@ -63,6 +67,15 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
           ? "Provider process is gone — interrupt or restart the run to respond."
           : approval.detail || fallbackLabel}
       </Detail>
+      <span className="text-2xs text-muted-foreground">
+        {pendingApprovalReason({
+          kind: approval.requestKind,
+          runtimeMode,
+          reason: approval.reason,
+          detail: approval.detail,
+        })}{" "}
+        {approvalChoiceNote(approvalChoices(approval.options))}
+      </span>
     </span>
   );
 });

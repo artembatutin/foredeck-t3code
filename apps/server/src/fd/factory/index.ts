@@ -6,6 +6,7 @@ import * as RuntimePolicy from "../../orchestration-v2/RuntimePolicy.ts";
 import { RepositorySet } from "../multirepo/index.ts";
 import * as FactoryAutomaticTurns from "./FactoryAutomaticTurns.ts";
 import * as FactoryChildren from "./FactoryChildren.ts";
+import * as FactoryCommandSetup from "./FactoryCommandSetup.ts";
 import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
 import * as FactoryReactor from "./FactoryReactor.ts";
@@ -37,7 +38,9 @@ export * as FactoryService from "./FactoryService.ts";
 export * as FactorySettings from "./FactorySettings.ts";
 export * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 export * as FactoryWorker from "./FactoryWorker.ts";
+export { isAdvancing } from "./pipeline/state.ts";
 export { needsYou } from "./snapshot.ts";
+export { ownerPendingActions, withRefusedTurns } from "./pendingActions.ts";
 export { toolLayer as factoryToolLayer } from "./mcp/handlers.ts";
 export { layerWsRpc, WS_METHOD_TAGS } from "./rpc/handlers.ts";
 export { FactoryToolkit } from "./mcp/tools.ts";
@@ -60,8 +63,8 @@ export const layerPersistence = Layer.mergeAll(
  * The Factory service, settings and worker over Factory persistence, for transports and the
  * reactor. Needs Work's service, the orchestration application (thread launches, management and
  * the orchestrator), the project store and service, server settings and config, the provider
- * registry (for model options), the Git workflow (for pull requests), the git driver and the
- * process runner. The thread, verify, plan, child, review, record and pull request effects and
+ * registry (for model options), the Git workflow (for pull requests), the pull request service
+ * (for what a host saved of them), the git driver and the process runner. The thread, verify, plan, child, review, record and pull request effects and
  * the Work comments on transitions stay private to the service and worker.
  * server.ts also mounts `layerPersistence` with core and Work persistence, so the ledger migrates
  * with theirs; one build shares the one instance.
@@ -89,6 +92,7 @@ export const layerLive = FactoryService.layer.pipe(
     ),
   ),
   Layer.provide(FactoryEvidence.layer),
+  Layer.provideMerge(FactoryCommandSetup.layer),
   Layer.provideMerge(FactorySettings.layer),
   Layer.provideMerge(layerPersistence),
   Layer.provide(ProjectionStore.layer),

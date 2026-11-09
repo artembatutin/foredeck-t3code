@@ -2,11 +2,14 @@ import { IsoDateTime, ProjectId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlSchema from "effect/sql/SqlSchema";
+import type * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import * as Portfolio from "./portfolio.ts";
 
@@ -16,6 +19,16 @@ class PortfolioStoreError extends Schema.TaggedError<PortfolioStoreError>()("Por
 }) {
   override get message(): string {
     return `Assistant portfolio operation '${this.operation}' failed.`;
+  }
+}
+
+/** A revise named a revision the brief has moved on from; nothing was written. */
+export class BriefRevisionStale extends Schema.TaggedError<BriefRevisionStale>()(
+  "BriefRevisionStale",
+  { expected: Schema.Int, current: Schema.Int },
+) {
+  override get message(): string {
+    return "This idea changed since you opened it, so your edit was not saved. Review what it says now and edit again.";
   }
 }
 
@@ -32,6 +45,8 @@ const StringList = Schema.fromJsonString(Schema.Array(Schema.String));
 const BriefDbRow = Schema.Struct({
   projectId: ProjectId,
   ideaId: Schema.String,
+  title: Schema.NullOr(Schema.String),
+  conversationNotes: Schema.NullOr(StringList),
   decisions: StringList,
   goal: Schema.String,
   acceptanceCriteria: StringList,
@@ -57,13 +72,23 @@ const AssignmentDbRow = Schema.Struct({
   evidence: StringList,
 });
 
-const toBrief = ({ priorityRank, priorityReason, ...row }: BriefDbRow): Portfolio.ProjectBrief => ({
+const toBrief = ({
+  priorityRank,
+  priorityReason,
+  title,
+  conversationNotes,
+  ...row
+}: BriefDbRow): Portfolio.ProjectBrief => ({
   ...row,
+  ...(title === null ? {} : { title }),
+  ...(conversationNotes === null ? {} : { conversationNotes }),
   priority: priorityRank === null ? null : { rank: priorityRank, reason: priorityReason ?? "" },
 });
 
 const toBriefRow = ({ priority, ...brief }: Portfolio.ProjectBrief): BriefDbRow => ({
   ...brief,
+  title: brief.title ?? null,
+  conversationNotes: brief.conversationNotes ?? null,
   ideaId: brief.ideaId ?? "legacy",
   decisions: brief.decisions ?? [],
   priorityRank: priority?.rank ?? null,
@@ -82,6 +107,11 @@ export class PortfolioStore extends Context.Service<
       projectId: ProjectId,
       ideaId?: string,
     ) => Effect.Effect<Option.Option<Portfolio.ProjectBrief>, PortfolioStoreError>;
+    /**
+     * A counter that rises once a revised brief's priority has committed: its value now, then each
+     * move. It starts over with each server process, for whoever shows a queue rank to follow.
+     */
+    readonly priorityChanges: Stream.Stream<number>;
     /** Briefs in priority order; unranked projects last. */
     readonly listBriefs: () => Effect.Effect<
       ReadonlyArray<Portfolio.ProjectBrief>,
@@ -89,14 +119,16 @@ export class PortfolioStore extends Context.Service<
     >;
     /**
      * Record the changed fields as one revision, creating the brief if needed. An unchanged
-     * patch returns the stored brief and records nothing.
+     * patch returns the stored brief and records nothing. With `expectedRevision`, a brief at any
+     * other revision is refused and left as it is; a brief not yet saved stands at revision 0.
      */
     readonly reviseBrief: (input: {
       readonly projectId: ProjectId;
       readonly ideaId?: string;
       readonly patch: Portfolio.BriefPatch;
       readonly reason?: string | null;
-    }) => Effect.Effect<Portfolio.ProjectBrief, PortfolioStoreError>;
+      readonly expectedRevision?: number;
+    }) => Effect.Effect<Portfolio.ProjectBrief, PortfolioStoreError | BriefRevisionStale>;
     /** Revisions oldest first, each with the previous and next value of every changed field. */
     readonly listRevisions: (
       projectId: ProjectId,
@@ -133,6 +165,7 @@ export class PortfolioStore extends Context.Service<
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const priorityEpoch = yield* SubscriptionRef.make(0);
 
   const mapError =
     (operation: string) =>
@@ -149,21 +182,25 @@ const make = Effect.gen(function* () {
     Result: BriefDbRow,
     execute: ({ projectId, ideaId }) => sql`
       SELECT
-        project_id AS "projectId",
-        idea_id AS "ideaId",
-        decisions_json AS decisions,
-        goal,
-        acceptance_criteria_json AS "acceptanceCriteria",
-        constraints_json AS "constraints",
-        priority_rank AS "priorityRank",
-        priority_reason AS "priorityReason",
-        open_questions_json AS "openQuestions",
-        execution_authorized AS "executionAuthorized",
-        revision,
-        updated_at AS "updatedAt"
-      FROM fd_assistant_project_briefs
-      WHERE ${sql.and([...(projectId === undefined ? [] : [sql`project_id = ${projectId}`]), ...(ideaId === undefined ? [] : [sql`idea_id = ${ideaId}`])])}
-      ORDER BY priority_rank IS NULL, priority_rank, project_id
+        b.project_id AS "projectId",
+        b.idea_id AS "ideaId",
+        d.title,
+        d.conversation_notes_json AS "conversationNotes",
+        b.decisions_json AS decisions,
+        b.goal,
+        b.acceptance_criteria_json AS "acceptanceCriteria",
+        b.constraints_json AS "constraints",
+        b.priority_rank AS "priorityRank",
+        b.priority_reason AS "priorityReason",
+        b.open_questions_json AS "openQuestions",
+        b.execution_authorized AS "executionAuthorized",
+        b.revision,
+        b.updated_at AS "updatedAt"
+      FROM fd_assistant_project_briefs b
+      LEFT JOIN fd_assistant_brief_details d
+        ON d.project_id = b.project_id AND d.idea_id = b.idea_id
+      WHERE ${sql.and([...(projectId === undefined ? [] : [sql`b.project_id = ${projectId}`]), ...(ideaId === undefined ? [] : [sql`b.idea_id = ${ideaId}`])])}
+      ORDER BY b.priority_rank IS NULL, b.priority_rank, b.project_id
     `,
   });
 
@@ -209,6 +246,23 @@ const make = Effect.gen(function* () {
         execution_authorized = excluded.execution_authorized,
         revision = excluded.revision,
         updated_at = excluded.updated_at
+    `,
+  });
+
+  /** Kept apart from the brief's row, whose table belongs to core's migrations. */
+  const upsertDetails = SqlSchema.void({
+    Request: BriefDbRow,
+    execute: (row) => sql`
+      INSERT INTO fd_assistant_brief_details (
+        project_id,
+        idea_id,
+        title,
+        conversation_notes_json
+      )
+      VALUES (${row.projectId}, ${row.ideaId}, ${row.title}, ${row.conversationNotes})
+      ON CONFLICT (project_id, idea_id) DO UPDATE SET
+        title = excluded.title,
+        conversation_notes_json = excluded.conversation_notes_json
     `,
   });
 
@@ -333,21 +387,63 @@ const make = Effect.gen(function* () {
   // Each write runs as one immediate transaction, so a read-decide-write cannot interleave
   // with another writer, in this process or another.
   const reviseBrief: PortfolioStore["Service"]["reviseBrief"] = (input) =>
-    Effect.gen(function* () {
-      const at = yield* now;
-      const current = yield* readBrief(input.projectId, input.ideaId);
-      const { brief, revision } = Portfolio.reviseBrief(Option.getOrUndefined(current), {
-        projectId: input.projectId,
-        ideaId: input.ideaId ?? "legacy",
-        patch: input.patch,
-        reason: input.reason ?? null,
-        at,
-      });
-      if (revision === undefined) return brief;
-      yield* upsertBrief(toBriefRow(brief));
-      yield* insertRevision(revision);
-      return brief;
-    }).pipe(sql.withTransaction, mapError("reviseBrief"));
+    // Committing and moving run together, as `FactoryChanges.transact` does, so an interrupt during
+    // the commit cannot leave a rank that changed unannounced.
+    Effect.uninterruptibleMask((restore) =>
+      Effect.onExit(
+        sql.withTransaction(
+          restore(
+            Effect.gen(function* () {
+              const at = yield* now;
+              const current = yield* readBrief(input.projectId, input.ideaId);
+              const stored = Option.match(current, {
+                onNone: () => 0,
+                onSome: (brief) => brief.revision,
+              });
+              if (input.expectedRevision !== undefined && input.expectedRevision !== stored) {
+                return yield* new BriefRevisionStale({
+                  expected: input.expectedRevision,
+                  current: stored,
+                });
+              }
+              const { brief, revision } = Portfolio.reviseBrief(Option.getOrUndefined(current), {
+                projectId: input.projectId,
+                ideaId: input.ideaId ?? "legacy",
+                patch: input.patch,
+                reason: input.reason ?? null,
+                at,
+              });
+              if (revision === undefined) return { brief, reranked: false };
+              yield* upsertBrief(toBriefRow(brief));
+              if (
+                revision.changes.some(
+                  ({ field }) => field === "title" || field === "conversationNotes",
+                )
+              ) {
+                yield* upsertDetails(toBriefRow(brief));
+              }
+              yield* insertRevision(revision);
+              return {
+                brief,
+                reranked: revision.changes.some(({ field }) => field === "priority"),
+              };
+            }),
+          ),
+        ),
+        (exit) =>
+          Exit.isSuccess(exit) && exit.value.reranked
+            ? SubscriptionRef.update(priorityEpoch, (value) => value + 1)
+            : Effect.void,
+      ),
+    ).pipe(
+      Effect.map(({ brief }) => brief),
+      Effect.catchTags({
+        SqlError: (cause) =>
+          Effect.fail(new PortfolioStoreError({ operation: "reviseBrief", cause })),
+        SchemaError: (cause) =>
+          Effect.fail(new PortfolioStoreError({ operation: "reviseBrief", cause })),
+      }),
+    );
 
   const createAssignment: PortfolioStore["Service"]["createAssignment"] = (input) =>
     Effect.gen(function* () {
@@ -393,6 +489,7 @@ const make = Effect.gen(function* () {
         mapError("listBriefs"),
       ),
     reviseBrief,
+    priorityChanges: SubscriptionRef.changes(priorityEpoch),
     listRevisions: (projectId, ideaId = "legacy") =>
       selectRevisions({ projectId, ideaId }).pipe(mapError("listRevisions")),
     createAssignment,

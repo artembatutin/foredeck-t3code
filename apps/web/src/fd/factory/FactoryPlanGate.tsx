@@ -30,7 +30,13 @@ import {
   settleFactoryPlanSave,
 } from "@t3tools/client-runtime/fd/factory";
 import type { FactoryTaskId } from "@t3tools/contracts/fd/factory";
-import { ArrowDownIcon, ArrowUpIcon, XIcon } from "lucide-react";
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  CircleAlertIcon,
+  TriangleAlertIcon,
+  XIcon,
+} from "lucide-react";
 import { type ReactNode, useState } from "react";
 
 import {
@@ -42,6 +48,7 @@ import {
   AlertDialogPopup,
   AlertDialogTitle,
 } from "../../components/ui/alert-dialog";
+import { Alert, AlertAction, AlertDescription } from "../../components/ui/alert";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
@@ -159,7 +166,10 @@ export function FactoryPlanGate({
   const offered = gate.offered;
   const tasks = draft.tasks;
   return (
-    <section className="space-y-2 rounded-md border p-2" aria-label="Plan">
+    <section
+      className="space-y-3 rounded-lg border border-border/60 bg-card/40 p-3"
+      aria-label="Plan"
+    >
       <div className="flex flex-wrap items-center gap-2">
         <h4 className="font-medium text-sm">Plan</h4>
         <span className="text-muted-foreground text-xs">
@@ -172,30 +182,33 @@ export function FactoryPlanGate({
         </p>
       ) : null}
       {state === "changed" ? (
-        <div className="space-y-1 text-xs">
-          <p className="text-warning-foreground">
+        <Alert variant="warning">
+          <TriangleAlertIcon />
+          <AlertDescription>
             The plan changed while you were editing it. Keep your edits over the new plan, or use
             the new plan as it is.
-          </p>
-          <div className="flex flex-wrap gap-2">
-            <Button
-              size="xs"
-              variant="outline"
-              disabled={pending !== null}
-              onClick={() => edit(reapplyFactoryPlanEdits)}
-            >
-              Keep my edits
-            </Button>
-            <Button
-              size="xs"
-              variant="ghost"
-              disabled={pending !== null}
-              onClick={() => edit(discardFactoryPlanEdits)}
-            >
-              Use the new plan
-            </Button>
-          </div>
-        </div>
+          </AlertDescription>
+          <AlertAction>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={pending !== null}
+                onClick={() => edit(reapplyFactoryPlanEdits)}
+              >
+                Keep my edits
+              </Button>
+              <Button
+                size="xs"
+                variant="ghost"
+                disabled={pending !== null}
+                onClick={() => edit(discardFactoryPlanEdits)}
+              >
+                Use the new plan
+              </Button>
+            </div>
+          </AlertAction>
+        </Alert>
       ) : null}
       <ol className="space-y-2" aria-label="Planned tasks">
         {tasks.map((task, position) => (
@@ -211,12 +224,28 @@ export function FactoryPlanGate({
           />
         ))}
       </ol>
-      {refusal !== null ? <p className="text-destructive text-xs">{refusal.message}</p> : null}
-      <div className="flex flex-wrap gap-2">
+      {refusal !== null ? (
+        <Alert variant="error">
+          <CircleAlertIcon />
+          <AlertDescription>{refusal.message}</AlertDescription>
+        </Alert>
+      ) : null}
+      <div className="flex flex-wrap items-center gap-2">
+        {offered.approve ? (
+          <Button
+            size="xs"
+            disabled={pending !== null || !actions.approve}
+            onClick={() => ask("approve")}
+          >
+            Approve plan
+          </Button>
+        ) : null}
         {offered.update ? (
           <>
             <Button
               size="xs"
+              // Approving is the gate's decision; saving edits is the step before it.
+              variant={offered.approve ? "outline" : "default"}
               disabled={pending !== null || save._tag !== "Save"}
               onClick={() => void submit()}
             >
@@ -231,15 +260,6 @@ export function FactoryPlanGate({
               Discard edits
             </Button>
           </>
-        ) : null}
-        {offered.approve ? (
-          <Button
-            size="xs"
-            disabled={pending !== null || !actions.approve}
-            onClick={() => ask("approve")}
-          >
-            Approve plan
-          </Button>
         ) : null}
         {actions.replan ? (
           <Button
@@ -386,12 +406,18 @@ function PlanTask({
     entry.criterion >= 1 && entry.criterion <= criteria ? [] : [index],
   );
   return (
-    <li className="space-y-2 rounded-md border p-2 text-xs">
+    <li className="space-y-2.5 rounded-md border border-border/60 bg-background p-3 text-xs">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="font-medium">Task {number}</span>
+        <span className="font-medium text-foreground text-sm">Task {number}</span>
         <span className="font-mono text-muted-foreground">{id}</span>
-        <Badge variant="outline">{task.base.kind}</Badge>
-        {task.base.risk === "high" ? <Badge variant="warning">High risk</Badge> : null}
+        <Badge size="sm" variant="outline">
+          {task.base.kind}
+        </Badge>
+        {task.base.risk === "high" ? (
+          <Badge size="sm" variant="warning">
+            High risk
+          </Badge>
+        ) : null}
         <div className="flex-1" />
         <Button
           size="icon-xs"
@@ -453,7 +479,7 @@ function PlanTask({
           return (
             // Criteria are numbered by position, and test plan entries name them by it.
             // oxlint-disable-next-line react/no-array-index-key -- a criterion is its position
-            <div key={index} className="space-y-1 rounded-md border p-2">
+            <div key={index} className="space-y-1.5 border-l border-border/70 ps-3">
               <div className="flex items-start gap-2">
                 <span className="pt-1">{criterion}.</span>
                 <Textarea

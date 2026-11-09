@@ -538,3 +538,48 @@ not authorization to publish upstream identities. No production secrets, replace
 domains, speculative product features, or empty customization packages are needed for
 this foundation. The next product decision is which foredeck-t3 behavior to add and
 which clients it must support; it does not block source development.
+
+## Local development build
+
+A local development build is a macOS build of this checkout installed as
+`/Applications/Foredeck.app`: product and executable name Foredeck, bundle `com.foredeck.ux.preview`,
+URL scheme `foredeck-ux-preview`, a browser profile under its home and no update feed. Its version is
+`<server version>-dev.<UTC date>.<run>`; About shows it and the full source commit. It runs only on
+the T3 home baked into its build: opened from Finder it needs no wrapper, and it refuses to start
+when `T3CODE_HOME` names another home or a development server is set. Builds from before it was named
+Foredeck carry `-uxpreview.` versions and keep the same home guard. Assistant preview (`-preview.`)
+builds, `/Applications/Foredeck Assistant Preview.app` and its `~/.foredeck-assistant-preview` home
+are left as they are.
+
+Its stage installs the accepted `pnpm-lock.yaml` resolution with `--frozen-lockfile`: every
+transitive package and registered patch the shipped roots reach is copied into the stage's own
+lockfile, and the build fails when what pnpm installed, or a patch file, differs from the accepted
+lock. `stage-closure.json` beside the artifact records what was verified. The closure ships
+`typescript@7.0.2`, which `electron-webauthn`'s peer resolves to in the accepted lock and the
+ordinary stage leaves out. When `iconutil` fails, the build writes the icon with the lock's pinned
+`sharp` and checks it; other builds still fail on `iconutil`. The build is unsigned.
+
+From a clean checkout of the commit to build, with an evidence directory outside it whose
+`desktop-home` becomes the build's home:
+
+```sh
+foredeck_evidence=/absolute/path/to/evidence
+node scripts/fd/uxPreview.ts build --evidence-dir "$foredeck_evidence"
+node scripts/fd/uxPreview.ts install --evidence-dir "$foredeck_evidence"
+node scripts/fd/uxPreview.ts check --evidence-dir "$foredeck_evidence"
+node scripts/fd/uxPreview.ts launch --evidence-dir "$foredeck_evidence"
+```
+
+`build` refuses uncommitted changes and a home inside `~/.t3` or the assistant preview's home,
+always compiles the checkout (an inherited `T3CODE_DESKTOP_SKIP_BUILD` or
+`T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR` is overridden), and builds without development origins or
+credentials: the web client bakes no backend origin even when `.env` or `.env.local` names one. It
+records the version, commit, home and archive hash in `ux-preview-build/<version>/manifest.json`;
+use `--run 2` for another build that day and `--arch x64` on Intel. `install` checks the archive
+hash and the extracted app against that record before copying it to `/Applications/Foredeck.app`,
+and replaces only an app at that path with this build's bundle id; another app there, such as the
+everyday foredeck-t3, is refused and left in place. `check` compares the installed app's bundle,
+name, version, commit, home, URL scheme and update feed with the record.
+`launch` refuses an inherited `T3CODE_HOME` naming another home before reading or starting
+anything, clears `VITE_*` origins, `T3CODE_DEV_AUTH_TOKEN` and `ELECTRON_RUN_AS_NODE`, then starts
+the checked app with exactly its home.

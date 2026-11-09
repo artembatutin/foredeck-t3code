@@ -1,4 +1,5 @@
 import { ProjectId, ProviderInteractionMode, RuntimeMode, ThreadId } from "@t3tools/contracts";
+import { FactoryReviewedExecution } from "@t3tools/contracts/fd/factory";
 import type { WorkItemId, WorkSourceId, WorkStatus } from "@t3tools/contracts/fd/work-management";
 import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import * as Context from "effect/Context";
@@ -9,6 +10,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import type * as Stream from "effect/Stream";
 
 import type { AutomaticTurn } from "../../orchestration-v2/AutomaticTurnGate.ts";
 import { exceededDispatchModeLimit } from "../../orchestration-v2/DispatchModeLimit.ts";
@@ -175,10 +177,17 @@ export interface FactoryAssignment {
   readonly captureId: string;
   readonly item: ItemRef;
   readonly kind: "single" | "parent";
+  readonly scopeHash: string;
   readonly itemFingerprint: string;
   readonly runtimeMode: RuntimeMode;
   readonly deliveryId: string | null;
   readonly control: "none" | "stop" | "cancel";
+  /**
+   * The review this assignment's one attempt runs under, which its start copies onto the delivery:
+   * the receipt's execution as stored, null if it no longer parses, for Factory to judge; null for
+   * an assignment queued without a review.
+   */
+  readonly reviewed: { readonly receiptId: string; readonly execution: unknown } | null;
   readonly root: {
     readonly state: "active" | "ending" | "retired";
     readonly reason: RetiredReason | null;
@@ -195,6 +204,44 @@ export interface FactoryAssignment {
     readonly mine: boolean;
   } | null;
 }
+
+/** One assignment of an idea, as an owner's review judges what a start would do. */
+export interface IdeaAttempt {
+  readonly assignmentId: string;
+  readonly executor: string;
+  readonly attempt: number;
+  readonly state: AssignmentState;
+  /** Its current attempt's receipt; null for one queued without a review. */
+  readonly receiptId: string | null;
+  readonly deliveryId: string | null;
+  readonly rootState: "active" | "ending" | "retired" | null;
+}
+
+/** What an owner's confirmation did, kept so repeating it finds that instead of doing it again. */
+export interface ReviewStart {
+  readonly requestId: string;
+  readonly projectId: string;
+  readonly ideaId: string;
+  readonly reviewVersion: string;
+  readonly receiptId: string;
+  readonly assignmentId: string;
+  readonly attempt: number;
+  readonly kind: "attempt" | "amendment";
+  readonly execution: unknown;
+  /** What an amendment resumes, as it stood when confirmed; null for an attempt, or if unreadable. */
+  readonly resume: ReviewResume | null;
+}
+
+/**
+ * The one delivery of its family an amendment resumes, and the effects it had issued when the owner
+ * confirmed: more than that means it ran on since, and the confirmation no longer describes it.
+ */
+export const ReviewResume = Schema.Struct({
+  root: Schema.String,
+  deliveryId: Schema.String,
+  effectsIssued: Schema.Int,
+});
+export type ReviewResume = typeof ReviewResume.Type;
 
 export type ClaimResult =
   | {
@@ -254,6 +301,12 @@ export interface KeptDispatch {
   readonly dispatch: Effect.Effect<void>;
   /** Clears the adapter's offer; only an offer that can be cleared has it. */
   readonly drop?: Effect.Effect<void>;
+  /**
+   * Whether Factory still lets it run, asked outside any transaction right before its grant is
+   * decided. False blocks its demand as `revoked`, keeping the dispatch until a later grant asks
+   * again, as a root whose authority fails does.
+   */
+  readonly allowed?: Effect.Effect<boolean>;
 }
 
 export class HandoffAdmissionError extends Schema.TaggedError<HandoffAdmissionError>()(
@@ -282,6 +335,22 @@ export class HandoffAdmissionError extends Schema.TaggedError<HandoffAdmissionEr
       : `The project assistant's admission could not ${this.operation} for delivery ${this.root}.`;
   }
 }
+
+/**
+ * The idea already ran under an owner's review, whichever assignment and executor that was, so
+ * queuing it without one would run it on settings and allowances nobody reviewed. Nothing was
+ * queued; a further attempt takes a fresh owner review.
+ */
+export class HandoffReviewRequired extends Schema.TaggedError<HandoffReviewRequired>()(
+  "HandoffReviewRequired",
+  {},
+) {
+  override get message(): string {
+    return "Nothing was queued: this idea ran under the owner's review, which authorized one attempt. A new attempt needs a fresh owner review, whatever its assignment ID or executor.";
+  }
+}
+
+export const isHandoffReviewRequired = Schema.is(HandoffReviewRequired);
 
 /**
  * Where tests hold the admission path still: `admitted` right after an admitting transaction
@@ -325,6 +394,16 @@ export class HandoffAdmission extends Context.Service<
     readonly instanceId: string;
     /** The root's management, read now; a failed read is never taken as `never`. */
     readonly management: (root: string) => Effect.Effect<Management, HandoffAdmissionError>;
+    /**
+     * The queue rank of each root's idea, null for one with no rank, whether the root is running,
+     * has ended or a retry left it behind. A root the assistant never claimed is left out. For a
+     * client to show; the fair order reads ranks itself.
+     */
+    readonly queuePriorities: (
+      roots: ReadonlyArray<string>,
+    ) => Effect.Effect<ReadonlyMap<string, number | null>, HandoffAdmissionError>;
+    /** A counter that rises after a queue rank changes: its value now, then each move. */
+    readonly queueChanges: Stream.Stream<number>;
     /** The root's slot as it stands now: held, reserved for a demand, or none. */
     readonly slot: (
       root: string,
@@ -451,6 +530,65 @@ export class HandoffAdmission extends Context.Service<
       readonly itemFingerprint: string;
       readonly runtimeMode: RuntimeMode;
     }) => Effect.Effect<void, HandoffAdmissionError>;
+    /**
+     * Binds a queued assignment that was never claimed to a review of its one attempt, storing the
+     * receipt, in the same transaction as its enqueue. The owner's flow queues through
+     * `queueReviewed` instead, for an idea that may already have run under a review. `refused`,
+     * writing nothing, for an assignment in any other state, one already bound, a
+     * receipt already used, a review broader than the mode its link was queued under, or another
+     * assignment of the idea still queued, which would then run on no review.
+     */
+    readonly attachReviewReceipt: (input: {
+      readonly assignmentId: string;
+      readonly execution: FactoryReviewedExecution;
+    }) => Effect.Effect<"attached" | "refused", HandoffAdmissionError>;
+    /**
+     * Queues the attempt an owner's review authorized, with its receipt, in the transaction that
+     * records their confirmation: a `draft` assignment's first, writing its link, or the next of a
+     * failed or cancelled one whose root has retired, whose link then names what this review says.
+     * The only way into the queue for an idea that ran under a review. `refused`, writing nothing,
+     * for any other state, a receipt already used, a review broader than `link.runtimeMode`, or
+     * another assignment of the idea that has not ended.
+     */
+    readonly queueReviewed: (input: {
+      readonly assignmentId: string;
+      readonly link: {
+        readonly captureId: string;
+        readonly item: ItemRef;
+        readonly kind: "single" | "parent";
+        readonly scopeHash: string;
+        readonly itemFingerprint: string;
+        readonly runtimeMode: RuntimeMode;
+      };
+      readonly execution: FactoryReviewedExecution;
+    }) => Effect.Effect<"queued" | "refused", HandoffAdmissionError>;
+    /** Every assignment of the idea, oldest first. */
+    readonly ideaAttempts: (input: {
+      readonly projectId: string;
+      readonly ideaId: string;
+    }) => Effect.Effect<ReadonlyArray<IdeaAttempt>, HandoffAdmissionError>;
+    /** What an owner's confirmation under this request id did, if it took effect. */
+    readonly reviewStartOf: (
+      requestId: string,
+    ) => Effect.Effect<ReviewStart | undefined, HandoffAdmissionError>;
+    /** Records a confirmation that took effect, in the transaction that did it. */
+    readonly recordReviewStart: (
+      start: Omit<ReviewStart, "execution"> & { readonly execution: FactoryReviewedExecution },
+    ) => Effect.Effect<void, HandoffAdmissionError>;
+    /** The number the idea's next review takes: above every one an earlier review held. */
+    readonly nextReviewVersion: (input: {
+      readonly projectId: string;
+      readonly ideaId: string;
+    }) => Effect.Effect<number, HandoffAdmissionError>;
+    /**
+     * Whether a review receipt was ever stored for an attempt of the idea. Keyed by the idea rather
+     * than its capture, since abandoning a capture mints a new id for the same idea, and a receipt
+     * outlives both. A further attempt of such an idea takes a fresh owner review.
+     */
+    readonly ideaReviewed: (input: {
+      readonly projectId: string;
+      readonly ideaId: string;
+    }) => Effect.Effect<boolean, HandoffAdmissionError>;
     /** Whether an assignment that has not ended, other than `except`, uses the capture. */
     readonly captureInUse: (input: {
       readonly captureId: string;
@@ -476,8 +614,14 @@ export class HandoffAdmission extends Context.Service<
     readonly revocation: (
       assignmentId: string,
     ) => Effect.Effect<BlockedReason | undefined, HandoffAdmissionError>;
-    /** Enters the assignment into the fair order at a fresh position. */
-    readonly enterQueue: (assignmentId: string) => Effect.Effect<void, HandoffAdmissionError>;
+    /**
+     * Enters the assignment into the fair order at a fresh position. Every receipt-less way into
+     * the queue passes here, so an idea that ran under a review is refused here, writing nothing,
+     * whichever route asked, and its caller's transaction rolls back with the refusal.
+     */
+    readonly enterQueue: (
+      assignmentId: string,
+    ) => Effect.Effect<void, HandoffAdmissionError | HandoffReviewRequired>;
     /** Takes the assignment out of the fair order. */
     readonly leaveQueue: (assignmentId: string) => Effect.Effect<void, HandoffAdmissionError>;
     /**
@@ -489,7 +633,9 @@ export class HandoffAdmission extends Context.Service<
     /**
      * Requeues a Factory assignment whose root ended, for a new delivery: its link no longer names
      * a root, and the next claim mints a new id, once the fresh read confirms it as `authority`
-     * does and nothing else that has not ended uses the capture. Writes nothing otherwise.
+     * does and nothing else that has not ended uses the capture. Writes nothing otherwise. A review
+     * receipt authorizes one attempt, so an assignment of an idea that ran under one is
+     * `review_required`, whatever else holds: only a fresh owner review can authorize another.
      */
     readonly retryReentry: (input: {
       readonly assignmentId: string;
@@ -497,7 +643,8 @@ export class HandoffAdmission extends Context.Service<
     }) => Effect.Effect<
       | { readonly type: "queued" }
       | { readonly type: "refused"; readonly category: BlockedReason }
-      | { readonly type: "contended" },
+      | { readonly type: "contended" }
+      | { readonly type: "review_required" },
       HandoffAdmissionError
     >;
     /**
@@ -721,6 +868,7 @@ interface LinkRow {
   readonly runtime_mode: string;
   readonly delivery_id: string | null;
   readonly control: "none" | "stop" | "cancel";
+  readonly receipt_id: string | null;
 }
 
 interface SlotRow {
@@ -870,6 +1018,13 @@ const dispositionOf = (
       : identity.threadId,
 });
 
+const encodeReviewedExecution = Schema.encodeEffect(
+  Schema.fromJsonString(FactoryReviewedExecution),
+);
+const parseReceiptExecution = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
+const parseReviewResume = Schema.decodeUnknownOption(Schema.fromJsonString(ReviewResume));
+const encodeReviewResume = Schema.encodeEffect(Schema.fromJsonString(ReviewResume));
+
 const TERMINAL_ASSIGNMENT: ReadonlySet<string> = new Set(["completed", "cancelled"]);
 const isRuntimeMode = Schema.is(RuntimeMode);
 const isInteractionMode = Schema.is(ProviderInteractionMode);
@@ -946,7 +1101,7 @@ const make = Effect.gen(function* () {
   const readLink = (assignmentId: string) =>
     Effect.map(
       sql<LinkRow>`SELECT assignment_id, capture_id, source_id, item_id, kind, scope_hash,
-          item_fingerprint, runtime_mode, delivery_id, control
+          item_fingerprint, runtime_mode, delivery_id, control, receipt_id
         FROM fd_assistant_factory_links WHERE assignment_id = ${assignmentId}`,
       (rows) => rows[0],
     );
@@ -2178,6 +2333,34 @@ const make = Effect.gen(function* () {
       return true;
     }).pipe(transact("claim"));
 
+  const queuePriorities: HandoffAdmission["Service"]["queuePriorities"] = (roots) =>
+    Effect.gen(function* () {
+      if (roots.length === 0) return new Map<string, number | null>();
+      // Through the roots' tombstones, not the links: a link names only its assignment's current
+      // root, and clients go on showing the delivery a retry left behind.
+      const rows = yield* sql<{
+        readonly root_delivery_id: string;
+        readonly project_id: string;
+        readonly idea_id: string;
+      }>`SELECT r.root_delivery_id, a.project_id, a.idea_id
+        FROM fd_assistant_managed_roots r
+        JOIN fd_assistant_assignments a ON a.assignment_id = r.assignment_id
+        WHERE r.root_delivery_id IN ${sql.in(roots)}`;
+      const briefs = yield* portfolio.listBriefs();
+      const ranks = new Map(
+        briefs.map((brief) => [
+          `${brief.projectId}\0${brief.ideaId ?? "legacy"}`,
+          brief.priority?.rank ?? null,
+        ]),
+      );
+      return new Map(
+        rows.map(({ root_delivery_id, project_id, idea_id }) => [
+          root_delivery_id,
+          ranks.get(`${project_id}\0${idea_id}`) ?? null,
+        ]),
+      );
+    }).pipe(failed("read"));
+
   const factoryAssignment: HandoffAdmission["Service"]["factoryAssignment"] = (assignmentId) =>
     // A dispatch that returned and could not be marked is no dispatch still running. One that
     // cannot be marked again still reads as running, and the caller waits for the next pass.
@@ -2192,16 +2375,29 @@ const make = Effect.gen(function* () {
           link.delivery_id === null
             ? undefined
             : (yield* admissionsOf(link.delivery_id)).find(({ kind }) => kind === "claim");
+        const [receipt] =
+          link.receipt_id === null
+            ? []
+            : yield* sql<{ readonly execution_json: string }>`SELECT execution_json
+                FROM fd_assistant_review_receipts WHERE receipt_id = ${link.receipt_id}`;
         return {
           assignmentId,
           captureId: link.capture_id,
           item: itemOf(link),
           kind: link.kind,
+          scopeHash: link.scope_hash,
           itemFingerprint: link.item_fingerprint,
           // Written from a caller's own runtime mode, by `createLink`.
           runtimeMode: link.runtime_mode as RuntimeMode,
           deliveryId: link.delivery_id,
           control: link.control,
+          reviewed:
+            link.receipt_id === null
+              ? null
+              : {
+                  receiptId: link.receipt_id,
+                  execution: Option.getOrNull(parseReceiptExecution(receipt?.execution_json)),
+                },
           root: root === undefined ? null : { state: root.state, reason: root.reason },
           slot:
             slot === undefined
@@ -2243,6 +2439,266 @@ const make = Effect.gen(function* () {
       })}`;
     }).pipe(transact("claim"));
 
+  const attachReviewReceipt: HandoffAdmission["Service"]["attachReviewReceipt"] = ({
+    assignmentId,
+    execution,
+  }) =>
+    Effect.gen(function* () {
+      const link = yield* readLink(assignmentId);
+      const assignment = yield* assignmentState(assignmentId);
+      const [used] = yield* sql<{ readonly receipt_id: string }>`SELECT receipt_id
+        FROM fd_assistant_review_receipts
+        WHERE receipt_id = ${execution.receiptId}
+          OR (assignment_id = ${assignmentId} AND attempt = ${assignment?.attempt ?? 0})`;
+      const [queuedBeside] = yield* sql<{ readonly used: number }>`SELECT 1 AS used
+        FROM fd_assistant_assignments own
+        JOIN fd_assistant_assignments other
+          ON other.project_id = own.project_id AND other.idea_id = own.idea_id
+        WHERE own.assignment_id = ${assignmentId} AND other.assignment_id <> own.assignment_id
+          AND other.state = 'queued'
+        LIMIT 1`;
+      if (
+        link === undefined ||
+        assignment?.state !== "queued" ||
+        link.delivery_id !== null ||
+        link.receipt_id !== null ||
+        !isRuntimeMode(link.runtime_mode) ||
+        exceededDispatchModeLimit(
+          { runtimeMode: link.runtime_mode, interactionMode: "default" },
+          { runtimeMode: execution.runtimeCeiling, interactionMode: "default" },
+        ) !== undefined ||
+        used !== undefined ||
+        queuedBeside !== undefined
+      ) {
+        return "refused" as const;
+      }
+      const at = yield* now;
+      yield* sql`INSERT INTO fd_assistant_review_receipts ${sql.insert({
+        receipt_id: execution.receiptId,
+        assignment_id: assignmentId,
+        attempt: assignment.attempt,
+        review_version: execution.reviewVersion,
+        execution_json: yield* encodeReviewedExecution(execution),
+        created_at: at,
+      })}`;
+      yield* sql`UPDATE fd_assistant_factory_links
+        SET receipt_id = ${execution.receiptId}, updated_at = ${at}
+        WHERE assignment_id = ${assignmentId}`;
+      return "attached" as const;
+    }).pipe(transact("claim"));
+
+  const queueReviewed: HandoffAdmission["Service"]["queueReviewed"] = ({
+    assignmentId,
+    link: next,
+    execution,
+  }) =>
+    Effect.gen(function* () {
+      const assignment = yield* assignmentState(assignmentId);
+      const link = yield* readLink(assignmentId);
+      const [used] = yield* sql<{ readonly receipt_id: string }>`SELECT receipt_id
+        FROM fd_assistant_review_receipts WHERE receipt_id = ${execution.receiptId}`;
+      const [beside] = yield* sql<{ readonly used: number }>`SELECT 1 AS used
+        FROM fd_assistant_assignments own
+        JOIN fd_assistant_assignments other
+          ON other.project_id = own.project_id AND other.idea_id = own.idea_id
+        WHERE own.assignment_id = ${assignmentId} AND other.assignment_id <> own.assignment_id
+          AND other.state NOT IN ('completed', 'cancelled', 'failed')
+        LIMIT 1`;
+      const root =
+        link?.delivery_id === undefined || link.delivery_id === null
+          ? undefined
+          : yield* readRoot(link.delivery_id);
+      const fresh = assignment?.state === "draft" && link === undefined;
+      const again =
+        (assignment?.state === "failed" || assignment?.state === "cancelled") &&
+        link !== undefined &&
+        (root === undefined || root.state === "retired");
+      if (
+        assignment === undefined ||
+        (!fresh && !again) ||
+        used !== undefined ||
+        beside !== undefined ||
+        exceededDispatchModeLimit(
+          { runtimeMode: next.runtimeMode, interactionMode: "default" },
+          { runtimeMode: execution.runtimeCeiling, interactionMode: "default" },
+        ) !== undefined
+      ) {
+        return "refused" as const;
+      }
+      const at = yield* now;
+      const moved = yield* portfolio.transitionAssignment({
+        assignmentId,
+        event: fresh
+          ? { type: "queue" }
+          : {
+              type: "retry-delivery",
+              note:
+                root === undefined
+                  ? "The owner reviewed this idea again, for a new delivery."
+                  : `The owner reviewed this idea again, for a new delivery; Factory delivery ${root.root_delivery_id} stays as it ended.`,
+            },
+      });
+      // Its row is what the link below names, so it goes first.
+      yield* sql`INSERT INTO fd_assistant_review_receipts ${sql.insert({
+        receipt_id: execution.receiptId,
+        assignment_id: assignmentId,
+        attempt: moved.attempt,
+        review_version: execution.reviewVersion,
+        execution_json: yield* encodeReviewedExecution(execution),
+        created_at: at,
+      })}`;
+      const stated = {
+        capture_id: next.captureId,
+        source_id: next.item.sourceId,
+        item_id: next.item.itemId,
+        kind: next.kind,
+        scope_hash: next.scopeHash,
+        item_fingerprint: next.itemFingerprint,
+        runtime_mode: next.runtimeMode,
+        delivery_id: null,
+        control: "none" as const,
+        receipt_id: execution.receiptId,
+        updated_at: at,
+      };
+      if (fresh) {
+        yield* sql`INSERT INTO fd_assistant_factory_links ${sql.insert({
+          assignment_id: assignmentId,
+          created_at: at,
+          ...stated,
+        })}`;
+      } else {
+        yield* sql`UPDATE fd_assistant_factory_links SET ${sql.update(stated)}
+          WHERE assignment_id = ${assignmentId}`;
+      }
+      yield* positionAt(assignmentId, yield* freshSeq);
+      return "queued" as const;
+    }).pipe(transact("claim"));
+
+  const ideaAttempts: HandoffAdmission["Service"]["ideaAttempts"] = ({ projectId, ideaId }) =>
+    sql<{
+      readonly assignment_id: string;
+      readonly executor: string;
+      readonly attempt: number;
+      readonly state: AssignmentState;
+      readonly receipt_id: string | null;
+      readonly delivery_id: string | null;
+      readonly root_state: "active" | "ending" | "retired" | null;
+    }>`SELECT a.assignment_id, a.executor, a.attempt, a.state, l.receipt_id, l.delivery_id,
+        r.state AS root_state
+      FROM fd_assistant_assignments a
+      LEFT JOIN fd_assistant_factory_links l ON l.assignment_id = a.assignment_id
+      LEFT JOIN fd_assistant_managed_roots r ON r.root_delivery_id = l.delivery_id
+      WHERE a.project_id = ${projectId} AND a.idea_id = ${ideaId}
+      ORDER BY a.created_at, a.assignment_id`.pipe(
+      Effect.map((rows) =>
+        rows.map((row) => ({
+          assignmentId: row.assignment_id,
+          executor: row.executor,
+          attempt: row.attempt,
+          state: row.state,
+          receiptId: row.receipt_id,
+          deliveryId: row.delivery_id,
+          rootState: row.root_state,
+        })),
+      ),
+      failed("read"),
+    );
+
+  const reviewStartOf: HandoffAdmission["Service"]["reviewStartOf"] = (requestId) =>
+    sql<{
+      readonly request_id: string;
+      readonly project_id: string;
+      readonly idea_id: string;
+      readonly review_version: string;
+      readonly receipt_id: string;
+      readonly assignment_id: string;
+      readonly attempt: number;
+      readonly kind: "attempt" | "amendment";
+      readonly execution_json: string;
+      readonly resume_json: string | null;
+    }>`SELECT request_id, project_id, idea_id, review_version, receipt_id, assignment_id, attempt,
+        kind, execution_json, resume_json
+      FROM fd_assistant_review_starts WHERE request_id = ${requestId}`.pipe(
+      Effect.map(([row]) =>
+        row === undefined
+          ? undefined
+          : {
+              requestId: row.request_id,
+              projectId: row.project_id,
+              ideaId: row.idea_id,
+              reviewVersion: row.review_version,
+              receiptId: row.receipt_id,
+              assignmentId: row.assignment_id,
+              attempt: row.attempt,
+              kind: row.kind,
+              execution: Option.getOrNull(parseReceiptExecution(row.execution_json)),
+              resume:
+                row.resume_json === null
+                  ? null
+                  : Option.getOrNull(parseReviewResume(row.resume_json)),
+            },
+      ),
+      failed("read"),
+    );
+
+  const recordReviewStart: HandoffAdmission["Service"]["recordReviewStart"] = (start) =>
+    Effect.gen(function* () {
+      yield* sql`INSERT INTO fd_assistant_review_starts ${sql.insert({
+        request_id: start.requestId,
+        project_id: start.projectId,
+        idea_id: start.ideaId,
+        review_version: start.reviewVersion,
+        receipt_id: start.receiptId,
+        assignment_id: start.assignmentId,
+        attempt: start.attempt,
+        numbered_version: start.execution.reviewVersion,
+        kind: start.kind,
+        execution_json: yield* encodeReviewedExecution(start.execution),
+        resume_json: start.resume === null ? null : yield* encodeReviewResume(start.resume),
+        created_at: yield* now,
+      })}`;
+    }).pipe(transact("claim"));
+
+  const nextReviewVersion: HandoffAdmission["Service"]["nextReviewVersion"] = ({
+    projectId,
+    ideaId,
+  }) =>
+    sql<{ readonly latest: number | null }>`SELECT MAX(latest) AS latest FROM (
+        SELECT MAX(r.review_version) AS latest FROM fd_assistant_review_receipts r
+        JOIN fd_assistant_assignments a ON a.assignment_id = r.assignment_id
+        WHERE a.project_id = ${projectId} AND a.idea_id = ${ideaId}
+        UNION ALL
+        SELECT MAX(numbered_version) FROM fd_assistant_review_starts
+        WHERE project_id = ${projectId} AND idea_id = ${ideaId}
+      )`.pipe(
+      Effect.map(([row]) => (row?.latest ?? 0) + 1),
+      failed("read"),
+    );
+
+  const receiptOfIdea = (projectId: string, ideaId: string) =>
+    Effect.map(
+      sql<{ readonly used: number }>`SELECT 1 AS used
+        FROM fd_assistant_review_receipts r
+        JOIN fd_assistant_assignments a ON a.assignment_id = r.assignment_id
+        WHERE a.project_id = ${projectId} AND a.idea_id = ${ideaId}
+        LIMIT 1`,
+      (rows) => rows.length > 0,
+    );
+
+  /** Whether the idea this assignment works on ran under a review, by this assignment or another. */
+  const assignmentIdeaReviewed = (assignmentId: string) =>
+    Effect.gen(function* () {
+      const [own] = yield* sql<{
+        readonly project_id: string;
+        readonly idea_id: string;
+      }>`SELECT project_id, idea_id FROM fd_assistant_assignments
+        WHERE assignment_id = ${assignmentId}`;
+      return own !== undefined && (yield* receiptOfIdea(own.project_id, own.idea_id));
+    });
+
+  const ideaReviewed: HandoffAdmission["Service"]["ideaReviewed"] = ({ projectId, ideaId }) =>
+    receiptOfIdea(projectId, ideaId).pipe(failed("read"));
+
   const captureInUse: HandoffAdmission["Service"]["captureInUse"] = (input) =>
     sql<{ readonly used: number }>`SELECT 1 AS used
       FROM fd_assistant_factory_links l
@@ -2281,9 +2737,15 @@ const make = Effect.gen(function* () {
       ON CONFLICT (assignment_id) DO UPDATE SET seq = excluded.seq, overtaken = 0`;
 
   const enterQueue: HandoffAdmission["Service"]["enterQueue"] = (assignmentId) =>
-    Effect.flatMap(freshSeq, (seq) => positionAt(assignmentId, seq)).pipe(
-      Effect.asVoid,
+    Effect.gen(function* () {
+      if (yield* assignmentIdeaReviewed(assignmentId)) return false;
+      yield* positionAt(assignmentId, yield* freshSeq);
+      return true;
+    }).pipe(
       transact("claim"),
+      Effect.flatMap((entered) =>
+        entered ? Effect.void : Effect.fail(new HandoffReviewRequired()),
+      ),
     );
 
   const leaveQueue: HandoffAdmission["Service"]["leaveQueue"] = (assignmentId) =>
@@ -2308,6 +2770,9 @@ const make = Effect.gen(function* () {
   const retryReentry: HandoffAdmission["Service"]["retryReentry"] = (input) =>
     Effect.gen(function* () {
       const contended = { type: "contended" } as const;
+      if (yield* assignmentIdeaReviewed(input.assignmentId)) {
+        return { type: "review_required" } as const;
+      }
       const link = yield* readLink(input.assignmentId);
       const assignment = yield* assignmentState(input.assignmentId);
       const root =
@@ -2451,10 +2916,19 @@ const make = Effect.gen(function* () {
       } as const;
     }).pipe(transact("reserve"));
 
+  /** Whether the demand's kept wake may run, asked only for the read that can admit it. */
+  const keptAllowed = (demandId: number) =>
+    Effect.flatMap(readDemand(demandId), (demand) => {
+      const entry = demand?.message_id == null ? undefined : kept.get(demand.message_id);
+      return entry?.allowed ?? Effect.succeed(true);
+    });
+
   const redeliverNative: HandoffAdmission["Service"]["redeliverNative"] = (demandId, work) =>
     Effect.uninterruptible(
       Effect.gen(function* () {
         const stale = { type: "stale" } as const;
+        const allowed =
+          work === undefined ? true : yield* keptAllowed(demandId).pipe(failed("grant"));
         const decided = yield* Effect.gen(function* () {
           const demand = yield* readDemand(demandId);
           if (demand?.kind !== "background_wake" || demand.state !== "reserved") return stale;
@@ -2483,7 +2957,10 @@ const make = Effect.gen(function* () {
           if (category === undefined && work === undefined) {
             return { type: "needs_work", item: itemOf(link) } as const;
           }
-          const refusal = category ?? (work === undefined ? undefined : freshness(link, work));
+          const refusal =
+            category ??
+            (work === undefined ? undefined : freshness(link, work)) ??
+            (allowed ? undefined : ("revoked" as const));
           if (refusal !== undefined) {
             // Blocked, it waits with its dispatch kept until the root is restored.
             yield* blockDemand(demand, refusal);
@@ -3094,8 +3571,17 @@ const make = Effect.gen(function* () {
     claim,
     claimOrdinary,
     factoryAssignment,
+    queuePriorities,
+    queueChanges: portfolio.priorityChanges,
     dispositions,
     createLink,
+    attachReviewReceipt,
+    queueReviewed,
+    ideaAttempts,
+    reviewStartOf,
+    recordReviewStart,
+    nextReviewVersion,
+    ideaReviewed,
     captureInUse,
     setControl,
     authority: authorityOf,

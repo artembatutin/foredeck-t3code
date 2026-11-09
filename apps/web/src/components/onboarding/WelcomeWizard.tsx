@@ -106,7 +106,8 @@ import { formatRelativeTime } from "../../timestampFormat";
  * onboarding overhaul spec: connection choice → sign-in/pair (remote paths) →
  * managed Codex setup or an inline CLI terminal → project import → main screen.
  * Every step past the connection gate is skippable; the whole wizard is
- * re-runnable by clearing the flag.
+ * re-runnable by clearing the flag or visiting /welcome, which Settings offers.
+ * The import step reads no previous projects until the owner asks to find them.
  */
 
 type WizardStep = "connection" | "agents" | "import";
@@ -135,6 +136,8 @@ export function WelcomeWizard({
     resumeEnvironmentId ? [resumeEnvironmentId] : [],
   );
   const [isImporting, setIsImporting] = useState(false);
+  // Scanning reads every agent session on the selected computers, so it waits for the owner.
+  const [findPrevious, setFindPrevious] = useState(false);
   const finishingPromiseRef = useRef<Promise<boolean> | null>(null);
   const completionErrorToastIdRef = useRef<ReturnType<typeof toastManager.add> | null>(null);
   const primaryEnvironment = usePrimaryEnvironment();
@@ -159,11 +162,10 @@ export function WelcomeWizard({
   }, [environments]);
   const selectedIds =
     selection ?? new Set(primaryEnvironment ? [primaryEnvironment.environmentId] : []);
-  const scans = useProjectScans(step === "import" ? setupIds : NO_ENVIRONMENTS);
+  const scanning = step === "import" && findPrevious;
+  const scans = useProjectScans(scanning ? setupIds : NO_ENVIRONMENTS);
   const isLoadingProjects =
-    step === "import" &&
-    scans.every((scan) => scan.data === null) &&
-    scans.some((scan) => scan.isPending);
+    scanning && scans.every((scan) => scan.data === null) && scans.some((scan) => scan.isPending);
   const startSetup = (ids: readonly EnvironmentId[]) => {
     if (ids.length === 0) return;
     setSetupIds(ids);
@@ -276,12 +278,17 @@ export function WelcomeWizard({
             />
           ) : step === "agents" ? (
             <AgentsStep environmentIds={setupIds} onContinue={() => setStep("import")} />
-          ) : (
+          ) : findPrevious ? (
             <ImportStep
               scans={scans}
               isImporting={isImporting}
               setIsImporting={setIsImporting}
               onDone={finish}
+            />
+          ) : (
+            <ImportChoiceStep
+              onStartFresh={() => void finish()}
+              onFindPrevious={() => setFindPrevious(true)}
             />
           )}
         </WizardPanel>
@@ -1190,6 +1197,34 @@ function AgentInstallTerminal({
 }
 
 // ── Step 4: import ───────────────────────────────────────────
+
+/** Offered before any scan, so starting fresh never reads another tool's projects. */
+function ImportChoiceStep({
+  onStartFresh,
+  onFindPrevious,
+}: {
+  readonly onStartFresh: () => void;
+  readonly onFindPrevious: () => void;
+}) {
+  return (
+    <StepShell
+      title="Your projects"
+      description="Start with no projects, or look for projects and conversations from Claude Code and Codex on your selected computers."
+    >
+      <p className="mt-3 text-sm text-muted-foreground">
+        You can find previous projects later in Settings, under Projects &amp; threads.
+      </p>
+      <div className="mt-6 flex flex-wrap items-center justify-end gap-3">
+        <Button variant="outline" onClick={onFindPrevious}>
+          Find previous projects
+        </Button>
+        <Button autoFocus onClick={onStartFresh}>
+          Start fresh
+        </Button>
+      </div>
+    </StepShell>
+  );
+}
 
 const IMPORT_PERMISSION_MESSAGE = "This connection cannot import projects or thread history.";
 

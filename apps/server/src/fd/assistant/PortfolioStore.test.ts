@@ -8,9 +8,11 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Stream from "effect/Stream";
 
 import { runMigrations } from "../../persistence/Migrations.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
+import * as HandoffMigrations from "./handoffMigrations.ts";
 import type { AssignmentEvent } from "./portfolio.ts";
 import * as PortfolioStore from "./PortfolioStore.ts";
 import portfolioMigration from "./migration.ts";
@@ -74,6 +76,8 @@ describe("migration 064", () => {
       yield* sql`INSERT INTO fd_assistant_brief_revisions VALUES (${alpha}, 1, '[]', 'Original decision', '2026-10-16T12:00:00.000Z')`;
       yield* sql`INSERT INTO fd_assistant_assignments VALUES ('keep', ${alpha}, 'foredeck', 1, 'draft', '[]', '[]', '[]', '2026-10-16T12:00:00.000Z', '2026-10-16T12:00:00.000Z')`;
       yield* runMigrations();
+      // The store reads a brief's details from the assistant's own ledger, which runs after core.
+      yield* HandoffMigrations.runAssistantMigrations();
       const brief = Option.getOrThrow(yield* store.getBrief(alpha));
       assert.equal(brief.ideaId, "legacy");
       assert.equal(brief.goal, "Keep this brief");
@@ -117,6 +121,121 @@ describe("migration 064", () => {
       assert.deepStrictEqual(portfolioTables(after), PORTFOLIO_TABLES);
       assert.deepStrictEqual(yield* runMigrations(), []);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+});
+
+describe("a brief's title and conversation notes", () => {
+  it.effect("persist apart from the brief across a restart, and a bare brief has neither", () =>
+    Effect.gen(function* () {
+      const dbPath = yield* tempDatabase;
+      const written = yield* Effect.gen(function* () {
+        const store = yield* PortfolioStore.PortfolioStore;
+        const bare = yield* store.reviseBrief({
+          projectId: alpha,
+          ideaId: "bare",
+          patch: { goal: "Export" },
+        });
+        assert.isFalse("title" in bare);
+        assert.isFalse("conversationNotes" in bare);
+        return yield* store.reviseBrief({
+          projectId: alpha,
+          ideaId: "full",
+          patch: {
+            goal: "Export",
+            title: "Export reports",
+            conversationNotes: ["Only discussing for now"],
+          },
+        });
+      }).pipe(Effect.provide(persistenceAt(dbPath)));
+
+      yield* Effect.gen(function* () {
+        const store = yield* PortfolioStore.PortfolioStore;
+        assert.deepStrictEqual(yield* store.getBrief(alpha, "full"), Option.some(written));
+        const bare = Option.getOrThrow(yield* store.getBrief(alpha, "bare"));
+        assert.isFalse("title" in bare);
+        assert.isFalse("conversationNotes" in bare);
+
+        // Removed again, it reads as a brief that never had one.
+        const cleared = yield* store.reviseBrief({
+          projectId: alpha,
+          ideaId: "full",
+          patch: { title: "" },
+        });
+        assert.isFalse("title" in cleared);
+        assert.deepStrictEqual(yield* store.getBrief(alpha, "full"), Option.some(cleared));
+        const notes = (yield* store.listRevisions(alpha, "full")).at(0);
+        assert.deepStrictEqual(
+          notes?.changes.find(({ field }) => field === "conversationNotes"),
+          { field: "conversationNotes", previous: [], next: ["Only discussing for now"] },
+        );
+      }).pipe(Effect.provide(persistenceAt(dbPath)));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("refuses an edit of a revision the brief moved on from, overwriting nothing", () =>
+    Effect.gen(function* () {
+      const store = yield* PortfolioStore.PortfolioStore;
+      const first = yield* store.reviseBrief({
+        projectId: alpha,
+        ideaId: "export",
+        expectedRevision: 0,
+        patch: { goal: "Export" },
+      });
+      const second = yield* store.reviseBrief({
+        projectId: alpha,
+        ideaId: "export",
+        expectedRevision: first.revision,
+        patch: { goal: "Export reports" },
+      });
+      const refused = yield* Effect.flip(
+        store.reviseBrief({
+          projectId: alpha,
+          ideaId: "export",
+          expectedRevision: first.revision,
+          patch: { goal: "Export everything" },
+        }),
+      );
+      assert.strictEqual(refused._tag, "BriefRevisionStale");
+      assert.include(refused.message, "was not saved");
+      assert.deepStrictEqual(yield* store.getBrief(alpha, "export"), Option.some(second));
+      assert.lengthOf(yield* store.listRevisions(alpha, "export"), 2);
+    }).pipe(Effect.provide(memoryStore)),
+  );
+});
+
+describe("a brief's priority changes", () => {
+  const rank = (value: number, reason = "Ranked") => ({ rank: value, reason });
+
+  it.effect("rise only once a rank has committed, and move for nothing else", () =>
+    Effect.gen(function* () {
+      const store = yield* PortfolioStore.PortfolioStore;
+      const counter = store.priorityChanges.pipe(Stream.runHead, Effect.map(Option.getOrThrow));
+      const revise = (patch: Parameters<typeof store.reviseBrief>[0]["patch"]) =>
+        store.reviseBrief({ projectId: alpha, ideaId: "export", patch });
+
+      const start = yield* counter;
+      yield* revise({ goal: "Export", conversationNotes: ["A note"] });
+      assert.strictEqual(yield* counter, start);
+
+      const ranked = yield* revise({ priority: rank(1) });
+      assert.strictEqual(yield* counter, start + 1);
+      // Saving what it already says is no change.
+      yield* revise({ priority: rank(1) });
+      assert.strictEqual(yield* counter, start + 1);
+      yield* revise({ priority: null });
+      assert.strictEqual(yield* counter, start + 2);
+
+      // A write that is refused or rolled back says nothing moved.
+      yield* Effect.flip(
+        store.reviseBrief({
+          projectId: alpha,
+          ideaId: "export",
+          expectedRevision: ranked.revision - 1,
+          patch: { priority: rank(2) },
+        }),
+      );
+      assert.strictEqual(yield* counter, start + 2);
+    }).pipe(Effect.provide(memoryStore)),
   );
 });
 

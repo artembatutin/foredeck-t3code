@@ -1,7 +1,6 @@
 import type { FactoryFleetRow, FactoryFleetState } from "@t3tools/client-runtime/fd/factory";
-import { scopedProjectKey, scopeProjectRef } from "@t3tools/client-runtime/environment";
+import { workItemLinkTarget } from "@t3tools/client-runtime/fd/work-management";
 import type { EnvironmentId } from "@t3tools/contracts";
-import { workItemRefString } from "@t3tools/contracts/fd/work-management";
 
 /**
  * Where a fleet row leads: its item in the Work page, in the delivery's own project, through the
@@ -9,13 +8,12 @@ import { workItemRefString } from "@t3tools/contracts/fd/work-management";
  */
 export const factoryFleetRowTarget = (
   row: Pick<FactoryFleetRow, "environmentId" | "projectId" | "itemRef">,
-) => ({
-  to: "/work" as const,
-  search: {
-    project: scopedProjectKey(scopeProjectRef(row.environmentId, row.projectId)),
-    item: workItemRefString(row.itemRef),
-  },
-});
+) =>
+  workItemLinkTarget({
+    environmentId: row.environmentId,
+    projectId: row.projectId,
+    ref: row.itemRef,
+  });
 
 /** What the Factory page says about its servers, beside the rows. */
 export interface FactoryFleetNotices {
@@ -46,6 +44,6 @@ export function factoryFleetNotices(
         : `Not connected to ${names(fleet.disconnected)}; ${
             fleet.disconnected.length === 1 ? "its" : "their"
           } deliveries are not shown.`,
-    empty: fleet.environments.length > 0 ? "No active deliveries." : null,
+    empty: fleet.environments.length > 0 ? "No active deliveries" : null,
   };
 }

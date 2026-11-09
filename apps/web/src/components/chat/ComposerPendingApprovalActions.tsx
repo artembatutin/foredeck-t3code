@@ -8,6 +8,7 @@ import { EllipsisIcon, TriangleAlertIcon } from "lucide-react";
 import { Button } from "../ui/button";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { approvalChoices, approvalOptionLabel } from "../../fd/approvals";
 import { composerFloatingLayerProps } from "./composerEventScope";
 
 interface ComposerPendingApprovalActionsProps {
@@ -22,21 +23,15 @@ interface ComposerPendingApprovalActionsProps {
   ) => Promise<unknown>;
 }
 
-const DEFAULT_APPROVAL_OPTIONS = [
-  { decision: "cancel", label: "Cancel" },
-  { decision: "decline", label: "Decline" },
-  { decision: "acceptForSession", label: "Always allow this session" },
-  { decision: "accept", label: "Approve" },
-] satisfies ReadonlyArray<ProviderApprovalOption>;
-
 export const ComposerPendingApprovalActions = memo(function ComposerPendingApprovalActions({
   requestId,
   isResponding,
   canRespond,
   disabled = false,
-  options = DEFAULT_APPROVAL_OPTIONS,
+  options: supplied,
   onRespondToApproval,
 }: ComposerPendingApprovalActionsProps) {
+  const options = approvalChoices(supplied);
   const primaryOptions = options.filter(
     (option) => option.decision === "decline" || option.decision === "accept",
   );
@@ -61,7 +56,7 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
             }}
           >
             {option.warning ? <TriangleAlertIcon className="size-3 shrink-0" /> : null}
-            <span className="max-w-40 truncate">{option.label}</span>
+            <span className="max-w-40 truncate">{approvalOptionLabel(option)}</span>
           </Button>
         );
         return option.warning ? (
@@ -96,7 +91,9 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
                   className="mb-1 last:mb-0"
                 >
                   {option.warning ? <TriangleAlertIcon className="size-3 text-warning" /> : null}
-                  <span className="min-w-0 whitespace-normal wrap-break-word">{option.label}</span>
+                  <span className="min-w-0 whitespace-normal wrap-break-word">
+                    {approvalOptionLabel(option)}
+                  </span>
                 </MenuItem>
               );
               return option.warning ? (

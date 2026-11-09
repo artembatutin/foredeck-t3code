@@ -38,6 +38,7 @@ import * as ProcessRunner from "../../processRunner.ts";
 import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as SourceControlProviderRegistry from "../../sourceControl/SourceControlProviderRegistry.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService } from "../work-management/index.ts";
@@ -261,6 +262,11 @@ const makeLayer = (world: World) =>
     Layer.provideMerge(FactorySettings.layer),
     Layer.provideMerge(Factory.layerPersistence),
     Layer.provideMerge(SqlitePersistence.layerMemory),
+    Layer.provideMerge(
+      Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+        resolveLink: () => undefined,
+      }),
+    ),
     Layer.provideMerge(GitVcsDriver.layer),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-repair-" })),
     Layer.provideMerge(VcsProcess.layer),

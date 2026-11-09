@@ -419,6 +419,10 @@
       "types": "./src/pullRequestMarkdown.ts",
       "default": "./src/pullRequestMarkdown.ts"
     },
+    "./fd/approvals": {
+      "types": "./src/fd/approvals/index.ts",
+      "default": "./src/fd/approvals/index.ts"
+    },
     "./fd/multirepo": {
       "types": "./src/fd/multirepo/index.ts",
       "default": "./src/fd/multirepo/index.ts"

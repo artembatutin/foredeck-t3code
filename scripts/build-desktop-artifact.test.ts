@@ -21,9 +21,11 @@ import {
   parseWslRuntimeArchiveMembers,
   DesktopDmgBackgroundSourceMissingError,
   createStageWorkspaceConfig,
+  createFrozenStageWorkspaceConfig,
   createStagePatchedDependencies,
   readWorkspaceConfig,
   createBuildConfig,
+  isDesktopPreviewVersion,
   DESKTOP_ELECTRON_LANGUAGES,
   DESKTOP_FILE_EXCLUSIONS,
   DESKTOP_EXTRA_RESOURCES,
@@ -65,7 +67,10 @@ import {
   resolveMockUpdateServerUrl,
   resolvePackageManagerUserAgent,
   stageLinuxIconSize,
+  stageMacIcons,
   stageDesktopDmgBackground,
+  resolveUxPreviewBuildHome,
+  UxPreviewBuildInputError,
   stageResourceMonitor,
   stageLinuxCaptureHelper,
   stageWslRuntimeArchive,
@@ -95,6 +100,7 @@ import {
   wslRuntimeArchiveStem,
 } from "./build-desktop-artifact.ts";
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
+import { icnsProblems } from "./fd/icns.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 
@@ -275,6 +281,12 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
   it("switches desktop packaging product names to nightly for nightly builds", () => {
     assert.equal(resolveDesktopProductName("0.0.17"), "foredeck-t3");
     assert.equal(resolveDesktopProductName("0.0.17-nightly.20260413.42"), "foredeck-t3 (Nightly)");
+    assert.equal(resolveDesktopProductName("0.0.45-dev.20261103.1"), "Foredeck");
+    assert.equal(resolveDesktopProductName("0.0.45-uxpreview.20261102.1"), "Foredeck");
+    assert.equal(
+      resolveDesktopProductName("0.0.45-preview.20261017.2"),
+      "Foredeck Assistant Preview",
+    );
   });
 
   it("switches desktop packaging icons to the nightly artwork for nightly versions", () => {
@@ -2562,5 +2574,169 @@ it("ignores trailing separators", () => {
   assert.deepStrictEqual(
     ancestorNodeModulesPaths("C:\\tmp\\probe\\app\\", "\\"),
     ancestorNodeModulesPaths("C:\\tmp\\probe\\app", "\\"),
+  );
+});
+
+it.layer(NodeServices.layer)("the UX preview build", (it) => {
+  const devVersion = "0.0.45-dev.20261103.1";
+  // Built before development builds were named Foredeck; it keeps the same identity and guards.
+  const legacyVersion = "0.0.45-uxpreview.20261102.1";
+  const withEnv = (env: Record<string, string>) =>
+    Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env })));
+  const feeds = {
+    T3CODE_DESKTOP_UPDATE_REPOSITORY: "artembatutin/foredeck-t3code",
+    GITHUB_REPOSITORY: "artembatutin/foredeck-t3code",
+  };
+  const macConfig = (version: string) =>
+    createBuildConfig("mac", "zip", version, false, false, undefined, undefined).pipe(
+      withEnv(feeds),
+    );
+
+  it.effect("packages as Foredeck, with no update feed, beside unchanged previews", () =>
+    Effect.gen(function* () {
+      for (const uxVersion of [devVersion, legacyVersion]) {
+        const ux = yield* macConfig(uxVersion);
+        assert.equal(ux.appId, "com.foredeck.ux.preview");
+        assert.equal(ux.productName, "Foredeck");
+        // No executable name of its own, so electron-builder names it Contents/MacOS/Foredeck.
+        assert.notProperty(ux.mac, "executableName");
+        assert.notProperty(ux, "publish");
+        assert.isTrue(isDesktopPreviewVersion(uxVersion));
+        assert.deepStrictEqual((ux.mac as { protocols: unknown }).protocols, [
+          { name: "Foredeck", schemes: ["foredeck-ux-preview"] },
+        ]);
+        assert.equal(resolveDesktopUpdateChannel(uxVersion), "latest");
+        assert.deepStrictEqual(
+          resolveDesktopBuildIconAssets(uxVersion),
+          resolveDesktopBuildIconAssets("0.0.45"),
+        );
+        assert.deepStrictEqual(resolveDesktopBuildIconAssets(uxVersion), {
+          macIconPng: BRAND_ASSET_PATHS.productionMacIconPng,
+          linuxIconPng: BRAND_ASSET_PATHS.productionLinuxIconPng,
+          windowsIconIco: BRAND_ASSET_PATHS.productionWindowsIconIco,
+        });
+      }
+
+      const assistant = yield* macConfig("0.0.45-preview.20261017.2");
+      assert.equal(assistant.appId, "com.foredeck.assistant.preview");
+      assert.equal(assistant.productName, "Foredeck Assistant Preview");
+      assert.notProperty(assistant, "publish");
+      assert.deepStrictEqual((assistant.mac as { protocols: unknown }).protocols, []);
+      const ordinary = yield* macConfig("0.0.45");
+      assert.equal(ordinary.appId, "com.t3tools.t3code");
+      assert.property(ordinary, "publish");
+    }),
+  );
+
+  it.effect("requires a macOS build and the absolute home it bakes in", () =>
+    Effect.gen(function* () {
+      const home = "/evidence/desktop-home";
+      assert.equal(
+        yield* resolveUxPreviewBuildHome("mac").pipe(withEnv({ T3CODE_UX_PREVIEW_HOME: home })),
+        home,
+      );
+      for (const env of [{}, { T3CODE_UX_PREVIEW_HOME: "relative/home" }]) {
+        const missing = yield* Effect.flip(resolveUxPreviewBuildHome("mac").pipe(withEnv(env)));
+        assert.instanceOf(missing, UxPreviewBuildInputError);
+        assert.equal(missing.reason, "home");
+      }
+      const linux = yield* Effect.flip(
+        resolveUxPreviewBuildHome("linux").pipe(withEnv({ T3CODE_UX_PREVIEW_HOME: home })),
+      );
+      assert.instanceOf(linux, UxPreviewBuildInputError);
+      assert.equal(linux.reason, "platform");
+    }),
+  );
+
+  it("installs from a workspace config that steers no resolution, unlike the ordinary stage", () => {
+    const patchedDependencies = {
+      "node-pty@1.2.0-beta.15": "patches/node-pty@1.2.0-beta.15.patch",
+    };
+    const frozen = createFrozenStageWorkspaceConfig({
+      platform: "mac",
+      arch: "arm64",
+      allowBuilds: { "node-pty": true },
+      patchedDependencies,
+    });
+    assert.deepStrictEqual(frozen, {
+      supportedArchitectures: { os: ["darwin"], cpu: ["arm64"] },
+      allowBuilds: { "node-pty": true },
+      patchedDependencies,
+    });
+    assert.deepStrictEqual(STAGE_INSTALL_ARGS, ["install", "--prod"]);
+    assert.property(
+      createStageWorkspaceConfig({ platform: "mac", arch: "arm64" }),
+      "packageExtensions",
+    );
+  });
+
+  /** Runs `sips` and `iconutil` as stubs that write nothing; `iconutil` exits with `exitCode`. */
+  const iconTools = (
+    commands: Array<{ readonly command: string; readonly args: ReadonlyArray<string> }>,
+    iconutilExitCode: number,
+  ) =>
+    Layer.succeed(
+      ChildProcessSpawner.ChildProcessSpawner,
+      ChildProcessSpawner.make((command) => {
+        const child = command as unknown as {
+          readonly command: string;
+          readonly args: ReadonlyArray<string>;
+        };
+        commands.push({ command: child.command, args: child.args });
+        return Effect.succeed(mockProcess(child.command === "iconutil" ? iconutilExitCode : 0));
+      }),
+    );
+
+  const macIconStage = Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const repoRoot = yield* path.fromFileUrl(new URL("..", import.meta.url));
+    const stageResourcesDir = yield* fs.makeTempDirectoryScoped({ prefix: "fd-ux-icon-" });
+    return {
+      stageResourcesDir,
+      sourcePng: path.join(repoRoot, BRAND_ASSET_PATHS.productionMacIconPng),
+      icns: path.join(stageResourcesDir, "icon.icns"),
+    };
+  });
+
+  it.effect("writes a validated icon with the pinned converter when iconutil fails", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const { stageResourcesDir, sourcePng, icns } = yield* macIconStage;
+      const commands: Array<{ readonly command: string; readonly args: ReadonlyArray<string> }> =
+        [];
+      yield* stageMacIcons(stageResourcesDir, sourcePng, false, true).pipe(
+        Effect.provide(iconTools(commands, 1)),
+      );
+      assert.deepStrictEqual(icnsProblems(yield* fs.readFile(icns)), []);
+      // The converter runs in process: no wrapper or other tool was looked up on PATH.
+      assert.deepStrictEqual([...new Set(commands.map(({ command }) => command))].sort(), [
+        "iconutil",
+        "sips",
+      ]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps iconutil's icon when it succeeds, and ordinary builds fail with it", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const { stageResourcesDir, sourcePng, icns } = yield* macIconStage;
+      const commands: Array<{ readonly command: string; readonly args: ReadonlyArray<string> }> =
+        [];
+      yield* stageMacIcons(stageResourcesDir, sourcePng, false, true).pipe(
+        Effect.provide(iconTools(commands, 0)),
+      );
+      const iconutil = commands.filter(({ command }) => command === "iconutil");
+      assert.lengthOf(iconutil, 1);
+      assert.strictEqual(iconutil[0]?.args.at(-1), icns);
+      assert.isFalse(yield* fs.exists(icns), "nothing but iconutil wrote the icon");
+
+      const failed = yield* Effect.flip(
+        stageMacIcons(stageResourcesDir, sourcePng, false).pipe(Effect.provide(iconTools([], 1))),
+      );
+      assert.instanceOf(failed, BuildCommandFailedError);
+      assert.equal(failed.command, "iconutil icns");
+      assert.isFalse(yield* fs.exists(icns));
+    }).pipe(Effect.scoped),
   );
 });

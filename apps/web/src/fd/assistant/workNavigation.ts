@@ -1,12 +1,15 @@
-import { scopedProjectKey, scopeProjectRef } from "@t3tools/client-runtime/environment";
 import {
   FACTORY_CAPACITY_WAIT_NOTE,
-  FACTORY_STAGE_LABELS,
-  FACTORY_STATUS_LABELS,
+  type FactoryItemFact,
+  factoryItemFacts,
+  factoryLinkableUrl,
+  type FactoryNextAction,
+  factoryNextAction,
+  factoryPendingActions,
+  type FactoryPendingActionsView,
 } from "@t3tools/client-runtime/fd/factory";
-import { workItemRouteParams } from "@t3tools/client-runtime/fd/work-management";
+import { workItemLinkTarget } from "@t3tools/client-runtime/fd/work-management";
 import type { AssistantOverview, EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
-import { workItemRefString } from "@t3tools/contracts/fd/work-management";
 
 type Assignment = AssistantOverview["assignments"][number];
 type Idea = AssistantOverview["ideas"][number];
@@ -61,9 +64,10 @@ const ordinaryAccepts = (action: AssignmentAction, state: string) =>
  * The server's table for a Factory assignment (`FactoryExecutor.control`). Stop and cancel before a
  * delivery runs are saved as intents. Past that, Factory only stops a running delivery and only
  * resumes one that is stopping, stopped or blocked, and a root stopped before its first start
- * resumes through the queue. Retry needs a root that ended; a never-claimed assignment has none.
+ * resumes through the queue. Retry needs a root that ended, which a never-claimed assignment lacks,
+ * and no review.
  */
-const factoryAccepts = (action: AssignmentAction, { state, factory }: Assignment) => {
+const factoryAccepts = (action: AssignmentAction, { state, factory, reviewed }: Assignment) => {
   const status = factory?.status ?? null;
   const ended = status === "done" || status === "cancelled";
   switch (action) {
@@ -79,7 +83,10 @@ const factoryAccepts = (action: AssignmentAction, { state, factory }: Assignment
         ? ["running", "needs-input", "stopping", "stopped"].includes(state)
         : state === "stopped" && factory !== undefined && (status === null || status === "queued");
     case "retry":
-      return factory !== undefined && (state === "failed" || state === "cancelled");
+      // An attempt run under a review is followed only by a fresh review, never a retry.
+      return (
+        reviewed !== true && factory !== undefined && (state === "failed" || state === "cancelled")
+      );
     case "cancel":
       return (
         !ended &&
@@ -106,37 +113,38 @@ export const assignmentActions = (item: Assignment): ReadonlyArray<AssignmentAct
   );
 
 /** Where a Work item opens: the Work page's item, in the item's own project. */
-const workItemTarget = (environmentId: EnvironmentId, projectId: ProjectId, item: WorkItem) => {
-  const ref = { sourceId: item.sourceId, itemId: item.itemId };
-  const params = workItemRouteParams({ environmentId, projectId, ref });
-  return {
-    to: "/work" as const,
-    search: {
-      project: scopedProjectKey(scopeProjectRef(params.environmentId, params.projectId)),
-      item: workItemRefString(ref),
-    },
-  };
-};
+const workItemTarget = (environmentId: EnvironmentId, projectId: ProjectId, item: WorkItem) =>
+  workItemLinkTarget({
+    environmentId,
+    projectId,
+    ref: { sourceId: item.sourceId, itemId: item.itemId },
+  });
 
 export type WorkItemTarget = ReturnType<typeof workItemTarget>;
 
-const httpUrl = (url: string | null | undefined) => {
-  if (!url) return null;
-  try {
-    const { protocol } = new URL(url);
-    return protocol === "https:" || protocol === "http:" ? url : null;
-  } catch {
-    return null;
-  }
-};
+/**
+ * What a row is called: the short title the server sends, its Work item's where it is captured,
+ * and what an older server sends otherwise. The goal stays whole in the row's own `goal`.
+ */
+export const portfolioRowTitle = (
+  row: { readonly title?: string | undefined; readonly goal: string },
+  fallback: string,
+) => row.title?.trim() || row.goal || fallback;
 
 const counted = (count: number, one: string, many: string) =>
   count === 0 ? [] : [`${count} automatic ${count === 1 ? one : many}.`];
 
 /** A Factory assignment's row, beyond what every assignment shows. */
 export interface FactoryAssignmentRow {
-  /** Factory's own status and stage; undefined until a delivery row exists. */
-  readonly delivery: string | undefined;
+  /**
+   * What its delivery comes to now, read from its current state however its assignment's chat
+   * reads; null until a delivery row exists.
+   */
+  readonly nextAction: FactoryNextAction | null;
+  /** What it waits on someone for, each with where that is decided. */
+  readonly pendingActions: FactoryPendingActionsView;
+  /** The item's status, queue priority, assignee and delivery, each labelled as itself. */
+  readonly facts: ReadonlyArray<FactoryItemFact>;
   /** Why it is where it is and what to do, as the server wrote it. */
   readonly reasons: ReadonlyArray<string>;
   /** What is waiting, none of which asks anything of the owner. */
@@ -147,6 +155,8 @@ export interface FactoryAssignmentRow {
   readonly work: WorkItemTarget | null;
   /** Null without a pull request, or for a URL a link should not open. */
   readonly pullRequestUrl: string | null;
+  /** Its current attempt runs under the owner's review; never true of one queued without it. */
+  readonly reviewed: boolean;
 }
 
 /** The row of a Factory assignment; null for any other executor, whose row stays as it was. */
@@ -165,10 +175,26 @@ export function factoryAssignmentRow(
   const waiting = factory?.automaticWaits.waiting ?? 0;
   const blocked = factory?.automaticWaits.blocked ?? 0;
   return {
-    delivery:
+    pendingActions: factoryPendingActions(factory?.pendingActions),
+    nextAction:
       status === null
-        ? undefined
-        : `Factory: ${FACTORY_STATUS_LABELS[status]}${stage === null ? "" : ` · ${FACTORY_STAGE_LABELS[stage]}`}`,
+        ? null
+        : factoryNextAction({
+            status,
+            needsYou: factory?.needsYou,
+            pullRequest:
+              factory?.pullRequestUrl === null || factory?.pullRequestUrl === undefined
+                ? undefined
+                : factory.pullRequestOutcome === undefined
+                  ? {}
+                  : { outcome: factory.pullRequestOutcome },
+            proceeding: factory?.proceeding,
+          }),
+    facts: factoryItemFacts({
+      source: item.source,
+      queuePriority: item.priority,
+      delivery: status === null ? null : { status, stage },
+    }),
     reasons: [
       // A mirrored note quotes the delivery's reason and adds what to do about it.
       ...(needsYou === "" || notice.includes(needsYou) ? [] : [needsYou]),
@@ -194,8 +220,29 @@ export function factoryAssignmentRow(
     ],
     notices,
     work: workItem === undefined ? null : workItemTarget(environmentId, item.projectId, workItem),
-    pullRequestUrl: httpUrl(factory?.pullRequestUrl),
+    pullRequestUrl: factoryLinkableUrl(factory?.pullRequestUrl),
+    reviewed: item.reviewed === true,
   };
+}
+
+/**
+ * An idea's facts, once it is captured: what its Work source says, the assistant's rank, and how
+ * its latest assignment's delivery stands. Null for an idea with no capture, which has no item.
+ */
+export function ideaFacts(
+  idea: Idea,
+  assignment: Assignment | undefined,
+): ReadonlyArray<FactoryItemFact> | null {
+  if (idea.capture === undefined) return null;
+  const { factory } = assignment ?? {};
+  return factoryItemFacts({
+    source: idea.source,
+    queuePriority: idea.priority,
+    delivery:
+      factory === undefined || factory.status === null
+        ? null
+        : { status: factory.status, stage: factory.stage },
+  });
 }
 
 /** What an idea's row says of its Work capture, and where its item opens. */

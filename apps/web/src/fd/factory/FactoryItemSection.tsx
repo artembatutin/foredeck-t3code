@@ -1,11 +1,12 @@
 import { useAtomValue } from "@effect/atom-react";
-import { FACTORY_CANCEL_TEXT } from "@t3tools/client-runtime/fd/factory";
+import { FACTORY_CANCEL_TEXT, factoryExecutionView } from "@t3tools/client-runtime/fd/factory";
+import { workItemLinkTarget } from "@t3tools/client-runtime/fd/work-management";
 import type { AtomCommandResult } from "@t3tools/client-runtime/state/runtime";
-import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
-import type { FactoryDelivery } from "@t3tools/contracts/fd/factory";
+import type { EnvironmentId, ProjectId, ScopedThreadRef } from "@t3tools/contracts";
+import type { FactoryDelivery, FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemSummary } from "@t3tools/contracts/fd/work-management";
 import { useNavigate } from "@tanstack/react-router";
-import { FactoryIcon } from "lucide-react";
+import { ArrowUpRightIcon, FactoryIcon } from "lucide-react";
 import { useState } from "react";
 
 import {
@@ -19,6 +20,11 @@ import {
 } from "../../components/ui/alert-dialog";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
+import { useDiffPanelStore } from "../../diffPanelStore";
+import { PendingActionsList } from "../approvals";
+import { useRightPanelStore } from "../../rightPanelStore";
+import { useProjects, useThreadShells } from "../../state/entities";
+import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { factoryErrorText, factoryParentDeliverable } from "./deliver";
 import { FactoryPlanGate } from "./FactoryPlanGate";
@@ -35,13 +41,16 @@ import { factoryEnvironment } from "./state";
 interface FactoryItemSectionProps {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
-  readonly item: Pick<WorkItemSummary, "ref" | "key">;
+  readonly item: Pick<WorkItemSummary, "ref" | "key"> &
+    Partial<Pick<WorkItemSummary, "status" | "nativeStatus" | "assignee">>;
 }
 
 /**
  * The Work item detail's Factory section: Deliver (as a parent too where the server plans), and
- * the item's current delivery with its timeline and controls, and its plan while it waits at the
- * plan gate. Renders nothing on a server without Factory. Mounted by the Work route; while
+ * the item's current delivery: what it comes to now and what it asks of the owner first, then the
+ * item's facts, its counts, its controls, its timeline, and its plan while it waits at the plan
+ * gate. It reads the delivery's current state, so a chat message from earlier in the delivery is
+ * contradicted here rather than edited. Renders nothing on a server without Factory. Mounted by the Work route; while
  * mounted it reports its item as the one the palette's Deliver acts on.
  */
 export function FactoryItemSection(props: FactoryItemSectionProps) {
@@ -59,6 +68,8 @@ type Action = "start" | "stop" | "resume" | "cancel";
 
 function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps) {
   const navigate = useNavigate();
+  const projects = useProjects();
+  const threads = useThreadShells();
   const target = { environmentId, projectId, itemRef: item.ref };
   useReportOpenWorkItem({ ...target, key: item.key });
   const { destination, deliveriesQuery } = useFactoryDeliverState(target);
@@ -88,6 +99,11 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
     itemRef: item.ref,
     ...destination,
     permitted,
+    ...(item.status === undefined || item.nativeStatus === undefined || item.assignee === undefined
+      ? {}
+      : {
+          item: { status: item.status, nativeStatus: item.nativeStatus, assignee: item.assignee },
+        }),
   });
   const cancelling = cancelConfirmationTarget(view, confirmingCancel);
   // Adjusted during render: a confirmation whose delivery was replaced, can no longer be
@@ -131,13 +147,19 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
     ...destination,
     permitted: planPermitted,
   });
+  /** Opens the thread whose checkout holds the pull request's changes, on all of them. */
+  const reviewChanges = (thread: ScopedThreadRef) => {
+    useDiffPanelStore.getState().selectGitScope(thread, "branch");
+    useRightPanelStore.getState().open(thread, "diff");
+    void navigate({ to: "/$environmentId/$threadId", params: thread });
+  };
 
   return (
     <section className="space-y-2" aria-label="Factory">
       <div className="flex flex-wrap items-center gap-2">
         <h3 className="font-medium text-sm">Factory</h3>
         {delivery !== null ? (
-          <Badge variant={delivery.needsYou === undefined ? "outline" : "warning"}>
+          <Badge variant={delivery.nextAction.forYou ? "warning" : "outline"}>
             {delivery.label}
           </Badge>
         ) : null}
@@ -167,18 +189,104 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
           </Button>
         ) : null}
       </div>
-      {delivery?.needsYou !== undefined ? (
-        <p className="text-sm text-warning-foreground">{delivery.needsYou}</p>
+      {delivery !== null ? (
+        <div
+          className="space-y-1 rounded-md border p-2 text-sm"
+          aria-label="What this delivery needs next"
+        >
+          <p className={delivery.nextAction.forYou ? "font-medium" : "text-muted-foreground"}>
+            {delivery.nextAction.title}
+          </p>
+          <p className="text-muted-foreground text-xs">{delivery.nextAction.detail}</p>
+          {delivery.nextAction.evidence !== null ? (
+            <dl className="grid grid-cols-[max-content_1fr] gap-x-2 text-xs">
+              <dt className="text-muted-foreground">Verified commit</dt>
+              <dd className="font-mono">{delivery.nextAction.evidence.verifiedCommit}</dd>
+              <dt className="text-muted-foreground">Verify</dt>
+              <dd>{delivery.nextAction.evidence.verify}</dd>
+              <dt className="text-muted-foreground">Independent review</dt>
+              <dd>{delivery.nextAction.evidence.review}</dd>
+            </dl>
+          ) : null}
+          {delivery.nextAction.pullRequestUrl !== null ||
+          delivery.nextAction.reviewThread !== null ? (
+            <div className="flex flex-wrap gap-2 pt-1">
+              {delivery.nextAction.pullRequestUrl !== null ? (
+                <Button
+                  size="xs"
+                  render={
+                    <a href={delivery.nextAction.pullRequestUrl} target="_blank" rel="noreferrer" />
+                  }
+                >
+                  Open pull request
+                  <ArrowUpRightIcon />
+                </Button>
+              ) : null}
+              {delivery.nextAction.reviewThread !== null ? (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={() => {
+                    const { reviewThread } = delivery.nextAction;
+                    if (reviewThread !== null) reviewChanges(reviewThread);
+                  }}
+                >
+                  Review changes
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {delivery !== null ? (
+        <PendingActionsList
+          pending={delivery.pendingActions}
+          shownItem={item.ref}
+          projectName={(id) =>
+            projects.find((project) => project.id === id && project.environmentId === environmentId)
+              ?.title
+          }
+          threadName={(id) =>
+            threads.find((thread) => thread.id === id && thread.environmentId === environmentId)
+              ?.title
+          }
+          onOpenThread={(threadId) =>
+            void navigate({
+              to: "/$environmentId/$threadId",
+              params: { environmentId, threadId },
+            })
+          }
+          onOpenItem={(ref, itemProjectId) =>
+            void navigate(workItemLinkTarget({ environmentId, projectId: itemProjectId, ref }))
+          }
+        />
+      ) : null}
+      {delivery !== null ? (
+        <dl className="grid grid-cols-[max-content_1fr] gap-x-2 text-xs" aria-label="Item facts">
+          {delivery.facts.map((fact) => (
+            <div key={fact.key} className="contents">
+              <dt className="text-muted-foreground">{fact.label}</dt>
+              <dd>{fact.value}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : null}
+      {delivery !== null ? (
+        <DeliveryRoles environmentId={environmentId} deliveryId={delivery.deliveryId} />
       ) : null}
       {delivery?.capacityNote !== undefined ? (
         <p className="text-muted-foreground text-sm">{delivery.capacityNote}</p>
       ) : null}
       {delivery !== null && control !== null ? (
         <>
-          <p className="text-muted-foreground text-xs">
-            {delivery.branch === undefined ? "" : `${delivery.branch} · `}
-            Fix rounds {delivery.rounds.fix} · Review rounds {delivery.rounds.review}
-          </p>
+          <div className="space-y-0.5 text-muted-foreground text-xs" aria-label="Delivery counts">
+            {delivery.branch === undefined ? null : <p>{delivery.branch}</p>}
+            <p>
+              {delivery.counters.lines.map((line) => `${line.label}: ${line.text}`).join(" · ")}
+            </p>
+            {delivery.counters.attempts !== undefined ? <p>{delivery.counters.attempts}</p> : null}
+            {delivery.counters.scope !== undefined ? <p>{delivery.counters.scope}</p> : null}
+          </div>
           {delivery.controls.stop || delivery.controls.resume || delivery.controls.cancel ? (
             <div className="flex flex-wrap gap-2">
               {delivery.controls.stop ? (
@@ -228,6 +336,9 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
               ) : null}
             </div>
           ) : null}
+          {delivery.controlsNote !== undefined ? (
+            <p className="text-muted-foreground text-xs">{delivery.controlsNote}</p>
+          ) : null}
         </>
       ) : null}
       {error !== null ? <p className="text-destructive text-sm">{error}</p> : null}
@@ -249,7 +360,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
               <div className="flex items-center gap-2">
                 <span className="font-medium">{row.stage}</span>
                 {row.round !== null ? (
-                  <span className="text-muted-foreground">Round {row.round}</span>
+                  <span className="text-muted-foreground">Attempt {row.round}</span>
                 ) : null}
                 <span className="text-muted-foreground">{row.outcome}</span>
                 <div className="flex-1" />
@@ -327,6 +438,48 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
         </AlertDialogPopup>
       </AlertDialog>
     </section>
+  );
+}
+
+/**
+ * What each role of the delivery runs on, requested and as its provider reported it. It takes its own
+ * read of the one delivery on screen, since a listing does not carry it; until that answers, and on a
+ * server from before it, this shows nothing.
+ */
+function DeliveryRoles({
+  environmentId,
+  deliveryId,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly deliveryId: FactoryDeliveryId;
+}) {
+  const { data } = useEnvironmentQuery(
+    factoryEnvironment.delivery({ environmentId, input: { deliveryId } }),
+  );
+  const view = data === null ? null : factoryExecutionView(data);
+  if (view === null) return null;
+  return (
+    <div className="space-y-1 text-xs" aria-label="What each role runs on">
+      <dl className="grid grid-cols-[max-content_1fr] gap-x-2">
+        {view.roles.map((role) => (
+          <div key={role.key} className="contents">
+            <dt className="text-muted-foreground">
+              {role.label} · {role.binding}
+            </dt>
+            <dd>{role.reviewed ?? role.requested}</dd>
+            {role.reviewed !== undefined ? (
+              <>
+                <dt className="text-muted-foreground">Requested</dt>
+                <dd>{role.requested}</dd>
+              </>
+            ) : null}
+            <dt className="text-muted-foreground">Provider reported</dt>
+            <dd>{role.acknowledged}</dd>
+          </div>
+        ))}
+      </dl>
+      <p className="text-muted-foreground">{view.note}</p>
+    </div>
   );
 }
 

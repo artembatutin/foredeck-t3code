@@ -495,6 +495,10 @@
       "types": "./src/fd/assistant/index.ts",
       "import": "./src/fd/assistant/index.ts"
     },
+    "./fd/approvals": {
+      "types": "./src/fd/approvals/index.ts",
+      "import": "./src/fd/approvals/index.ts"
+    },
     "./fd/appearance": {
       "types": "./src/fd/appearance/index.ts",
       "import": "./src/fd/appearance/index.ts"
@@ -502,6 +506,10 @@
     "./fd/branding": {
       "types": "./src/fd/branding/index.ts",
       "import": "./src/fd/branding/index.ts"
+    },
+    "./fd/publishedNames": {
+      "types": "./src/fd/publishedNames/index.ts",
+      "import": "./src/fd/publishedNames/index.ts"
     }
   },
   "scripts": {

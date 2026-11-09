@@ -1,5 +1,25 @@
 import { assert, it } from "@effect/vitest";
+import { assistantInstructionsForThread } from "./index.ts";
+import { AssistantToolkit } from "./tools.ts";
 import { assistantToolRefusal } from "./toolPolicy.ts";
+
+it("tells an agent which words are scope and that authorization is only authorization", () => {
+  const revise = AssistantToolkit.tools.assistant_revise_brief.description ?? "";
+  assert.include(revise, "durable scope");
+  assert.include(revise, "conversationNotes");
+  assert.include(revise, "never reach the Work item, the worker or the scope");
+  assert.include(revise, "Record authorization only as executionAuthorized");
+  const capture = AssistantToolkit.tools.assistant_capture_work.description ?? "";
+  assert.include(capture, "never its conversation notes");
+  assert.include(capture, "at most 80 characters");
+  assert.include(capture, "keeps its title");
+  const role = assistantInstructionsForThread("fd-assistant-owner") ?? "";
+  assert.include(role, "conversationNotes");
+  assert.include(role, "never as a decision or constraint");
+  // The owner's start is theirs: no tool of the assistant's reaches it.
+  assert.isFalse(Object.keys(AssistantToolkit.tools).some((name) => name.includes("authoriz")));
+  assert.isFalse(Object.keys(AssistantToolkit.tools).some((name) => name.includes("review")));
+});
 it("routes manager worker mutations through the queue without restricting ordinary project agents", () => {
   for (const name of [
     "t3_thread_launch",

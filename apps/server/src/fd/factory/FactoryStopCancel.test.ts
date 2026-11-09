@@ -64,7 +64,7 @@ import { endTurnOnly, providerTurnRunning } from "./testkit/familyThreads.ts";
 
 const projectId = ProjectId.make("project-alpha");
 /** `workBranchName` of the item below. */
-const itemBranch = "work/fd-aaaaaa-add-the-export-button";
+const itemBranch = "feature/fd-aaaaaa-add-the-export-button";
 const sourceId = WorkSourceId.make("7e2aa85e-9347-44ce-b019-cb8dfd365b20");
 const itemRef: WorkItemRef = { sourceId, itemId: WorkItemId.make("fd-aaaaaa") };
 // FactoryService reads only these fields of the item.
@@ -310,7 +310,7 @@ const verifying = (world: World) =>
       itemRef,
       state: events.reduce(
         (state, event) => advance(state, event).delivery,
-        queuedDeliveryState({ branch: "work/fd-aaaaaa", baseRef: "HEAD" }),
+        queuedDeliveryState({ branch: "feature/fd-aaaaaa", baseRef: "HEAD" }),
       ),
     });
     const runs = yield* FactoryStageRunStore.FactoryStageRunStore;
@@ -614,7 +614,7 @@ describe("FactoryService.cancel", () => {
         ];
         const state = events.reduce(
           (current, event) => advance(current, event).delivery,
-          queuedDeliveryState({ branch: "work/fd-aaaaaa", baseRef: "HEAD" }),
+          queuedDeliveryState({ branch: "feature/fd-aaaaaa", baseRef: "HEAD" }),
         );
         assert.strictEqual(state.status, "blocked");
         assert.isNull(state.awaiting);

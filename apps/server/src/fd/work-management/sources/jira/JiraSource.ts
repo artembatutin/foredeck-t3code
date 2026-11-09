@@ -665,6 +665,7 @@ const summaryOf = (detail: ReturnType<typeof toDetail>): WorkItemSummary => {
     body: _body,
     bodyTruncated: _bodyTruncated,
     bodyFidelity: _bodyFidelity,
+    scopeFingerprint: _scopeFingerprint,
     comments: _comments,
     commentsTruncated: _commentsTruncated,
     children: _children,

@@ -16,7 +16,7 @@ import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as AssistantHandoff from "../assistant-handoff/index.ts";
 import { WorkService } from "../work-management/index.ts";
 import * as HandoffBackend from "./handoffBackend.ts";
-import type { BriefPatch } from "./portfolio.ts";
+import { type BriefPatch, briefScopeHash } from "./portfolio.ts";
 import * as PortfolioStore from "./PortfolioStore.ts";
 import * as ProjectAssistant from "./ProjectAssistant.ts";
 import * as WorkCapture from "./WorkCapture.ts";
@@ -29,21 +29,29 @@ const tasks: HandoffBackend.HandoffSource = {
   sourceId: WorkSourceId.make("11111111-1111-4111-8111-111111111111"),
   kind: "markdown",
   label: "Tasks",
+  identity: ".foredeck/work",
+  version: 1,
 };
 const plans: HandoffBackend.HandoffSource = {
   sourceId: WorkSourceId.make("33333333-3333-4333-8333-333333333333"),
   kind: "markdown",
   label: "Plans",
+  identity: ".foredeck/plans",
+  version: 1,
 };
 const issues: HandoffBackend.HandoffSource = {
   sourceId: WorkSourceId.make("22222222-2222-4222-8222-222222222222"),
   kind: "github",
   label: "Issues",
+  identity: "github.com/owner/alpha",
+  version: 1,
 };
 const tickets: HandoffBackend.HandoffSource = {
   sourceId: WorkSourceId.make("44444444-4444-4444-8444-444444444444"),
   kind: "jira",
   label: "Tickets",
+  identity: "acme.atlassian.net/ALPHA",
+  version: 1,
 };
 
 /** A thread's MCP caller, as `readCaller` builds it: only its scope and limits are read here. */
@@ -165,6 +173,7 @@ const makeWork = (sources: ReadonlyArray<HandoffBackend.HandoffSource>) => {
   };
   const backend: Backend = {
     sources: () => Effect.sync(() => state.sources),
+    summaries: () => Effect.succeed([]),
     read: (ref) =>
       Effect.suspend(() => {
         calls.read += 1;
@@ -385,6 +394,229 @@ describe("capturing an idea as a Work item", () => {
         assert.strictEqual(result.outcome, "created");
         assert.isFalse(result.executionAuthorized);
         assert.strictEqual((yield* revisionsOf()).length, before);
+      }),
+    ),
+  );
+});
+
+describe("an item's title", () => {
+  const criteria = ["Exports CSV"];
+
+  it.effect.each([
+    {
+      name: "a long single line",
+      goal: `${"Export every report to the finance team ".repeat(10)}today`,
+      ends: "team…",
+    },
+    {
+      name: "a long first line of several",
+      goal: `${"Export every report to the finance team ".repeat(10)}\nThe toolbar gets it.`,
+      ends: "team…",
+    },
+    { name: "one long astral word", goal: "\u{1F680}".repeat(100), ends: "…" },
+  ])("is short for $name, whose whole goal stays in the body", ({ goal, ends }) =>
+    withDatabase(
+      Effect.gen(function* () {
+        const work = makeWork([tasks]);
+        const { service } = yield* instance(fakeBackend(work));
+        yield* revise({ goal, acceptanceCriteria: criteria });
+        yield* service.capture(input());
+        const [item] = work.items;
+        assert.isAtMost(item!.title.length, 80);
+        assert.isTrue(item!.title.endsWith(ends));
+        const last = item!.title.charCodeAt(item!.title.length - 2);
+        assert.isFalse(last >= 0xd800 && last <= 0xdbff);
+        assert.include(item!.body, `## Goal\n\n${goal.trim()}`);
+        assert.include(item!.body, "1. Exports CSV");
+      }),
+    ),
+  );
+
+  it.effect("is the one the brief names, and notes never reach the item", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const work = makeWork([tasks]);
+        const { service } = yield* instance(fakeBackend(work));
+        yield* revise({
+          title: "CSV export",
+          goal: "Add the export button",
+          acceptanceCriteria: criteria,
+          conversationNotes: ["Only discuss for now, do not implement."],
+        });
+        yield* service.capture(input());
+        const [item] = work.items;
+        assert.strictEqual(item!.title, "CSV export");
+        assert.notInclude(item!.body, "Only discuss");
+      }),
+    ),
+  );
+
+  it.effect("stays as an existing item has it, moving neither fingerprint nor authorization", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const work = makeWork([tasks]);
+        const { service } = yield* instance(fakeBackend(work));
+        const goal = "x ".repeat(249).concat("end");
+        const brief = yield* revise({ goal, acceptanceCriteria: criteria });
+        // As an earlier build captured it: its title the goal's first 500 characters.
+        const created = yield* service.capture(input());
+        const stored = (yield* captureOf())!;
+        const legacyTitle = goal.slice(0, 498);
+        const [item] = work.items;
+        item!.title = legacyTitle;
+        const print = JSON.stringify([legacyTitle, item!.body]);
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`UPDATE fd_assistant_work_captures
+          SET content_hash = ${print}, item_fingerprint = ${print}
+          WHERE capture_id = ${stored.captureId}`;
+        yield* revise({ executionAuthorized: true });
+        const authorized = yield* briefOf();
+        assert.strictEqual(created.kind, "single");
+        assert.strictEqual(brief.goal, goal);
+
+        const again = yield* service.capture(input());
+        assert.strictEqual(again.outcome, "unchanged");
+        assert.isTrue(again.executionAuthorized);
+        assert.strictEqual(item!.title, legacyTitle);
+        assert.deepStrictEqual(work.calls.update, []);
+        const after = yield* briefOf();
+        assert.strictEqual(after.revision, authorized.revision);
+        assert.isTrue(after.executionAuthorized);
+        assert.strictEqual((yield* captureOf())?.itemFingerprint, print);
+
+        // A later goal keeps that title; the item says the new goal under it, as a change of what
+        // it says needs reviewing again.
+        yield* revise({ goal: `${goal} more`, executionAuthorized: true });
+        const updated = yield* service.capture(input());
+        assert.strictEqual(updated.outcome, "updated");
+        assert.strictEqual(item!.title, legacyTitle);
+        assert.include(item!.body, "more");
+        assert.isFalse((yield* briefOf()).executionAuthorized);
+      }),
+    ),
+  );
+
+  it.effect("moves once the owner edits it, which needs authorizing again", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const work = makeWork([tasks]);
+        const { service } = yield* instance(fakeBackend(work));
+        yield* revise({ goal: "Add the export button", acceptanceCriteria: criteria });
+        yield* service.capture(input());
+        yield* revise({ executionAuthorized: true });
+        const [item] = work.items;
+        assert.strictEqual(item!.title, "Add the export button");
+
+        yield* revise({ title: "CSV export" });
+        assert.isFalse((yield* briefOf()).executionAuthorized);
+        yield* revise({ executionAuthorized: true });
+        const updated = yield* service.capture(input());
+        assert.strictEqual(updated.outcome, "updated");
+        assert.strictEqual(item!.title, "CSV export");
+      }),
+    ),
+  );
+
+  /** An item captured one way, and the edit that leaves it saying just what it says. */
+  const TITLE_ONLY = [
+    { name: "naming the title it already has", first: {}, edit: "Add the export button" },
+    { name: "clearing the title it was captured under", first: { title: "CSV export" }, edit: "" },
+  ];
+
+  it.effect.each(TITLE_ONLY)("records $name, writing nothing to Work", ({ first, edit }) =>
+    withDatabase(
+      Effect.gen(function* () {
+        const work = makeWork([tasks]);
+        const { service } = yield* instance(fakeBackend(work));
+        yield* revise({ ...first, goal: "Add the export button", acceptanceCriteria: criteria });
+        const created = yield* service.capture(input());
+        const before = (yield* captureOf())!;
+        const [item] = work.items;
+        const titled = item!.title;
+
+        const edited = yield* revise({ title: edit });
+        assert.notStrictEqual(briefScopeHash(edited), before.scopeHash);
+
+        const again = yield* service.capture(input());
+        assert.strictEqual(again.outcome, "unchanged");
+        assert.isFalse(again.executionAuthorized);
+        assert.deepStrictEqual(work.calls.update, []);
+        assert.strictEqual(item!.title, titled);
+        assert.strictEqual(item!.revision, 1);
+        const after = (yield* captureOf())!;
+        assert.strictEqual(after.scopeHash, briefScopeHash(edited));
+        assert.strictEqual(after.briefRevision, edited.revision);
+        assert.strictEqual(after.itemFingerprint, before.itemFingerprint);
+        assert.strictEqual(after.contentHash, before.contentHash);
+
+        // Repeating it finds nothing left to record.
+        const events = yield* eventsOf(created.captureId);
+        assert.strictEqual((yield* service.capture(input())).outcome, "unchanged");
+        assert.deepStrictEqual(yield* eventsOf(created.captureId), events);
+      }),
+    ),
+  );
+
+  it.effect.each(TITLE_ONLY)(
+    "keeps an authorization given after $name, there being nothing new to review",
+    ({ first, edit }) =>
+      withDatabase(
+        Effect.gen(function* () {
+          const work = makeWork([tasks]);
+          const { service } = yield* instance(fakeBackend(work));
+          yield* revise({ ...first, goal: "Add the export button", acceptanceCriteria: criteria });
+          yield* service.capture(input());
+          assert.isFalse((yield* revise({ title: edit })).executionAuthorized);
+          const authorized = yield* revise({ executionAuthorized: true });
+
+          const again = yield* service.capture(input());
+          assert.strictEqual(again.outcome, "unchanged");
+          assert.isTrue(again.executionAuthorized);
+          const after = yield* briefOf();
+          assert.strictEqual(after.revision, authorized.revision);
+          assert.isTrue(after.executionAuthorized);
+          assert.strictEqual((yield* captureOf())?.scopeHash, briefScopeHash(after));
+        }),
+      ),
+  );
+
+  it.effect.each(TITLE_ONLY)(
+    "records $name along with another kind of delivery, which needs authorizing again",
+    ({ first, edit }) =>
+      withDatabase(
+        Effect.gen(function* () {
+          const work = makeWork([tasks]);
+          const { service } = yield* instance(fakeBackend(work));
+          yield* revise({ ...first, goal: "Add the export button", acceptanceCriteria: criteria });
+          yield* service.capture(input());
+          yield* revise({ title: edit });
+          yield* revise({ executionAuthorized: true });
+
+          const parent = yield* service.capture(input({ kind: "parent" }));
+          assert.strictEqual(parent.outcome, "updated");
+          assert.strictEqual(parent.kind, "parent");
+          assert.isFalse(parent.executionAuthorized);
+          assert.deepStrictEqual(work.calls.update, []);
+          const after = yield* briefOf();
+          assert.isFalse(after.executionAuthorized);
+          assert.strictEqual((yield* captureOf())?.scopeHash, briefScopeHash(after));
+        }),
+      ),
+  );
+
+  it.effect("goes back to the brief's own when an edited item is overwritten", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const work = makeWork([tasks]);
+        const { service } = yield* instance(fakeBackend(work));
+        yield* revise({ goal: "Add the export button", acceptanceCriteria: criteria });
+        yield* service.capture(input());
+        const [item] = work.items;
+        item!.title = "Someone renamed this in Work";
+        const refused = yield* Effect.flip(service.capture(input()));
+        assert.strictEqual(refused._tag, "WorkCaptureRefused");
+        yield* service.capture(input({ overwrite: true }));
+        assert.strictEqual(item!.title, "Add the export button");
       }),
     ),
   );

@@ -184,3 +184,62 @@ it("restores old text answers without mutating history or replacing unchanged ro
   expect(project(answered)).toBe(result);
   expect(project({ ...answered, visibleTurnItems: [...rows] })[0]).toBe(result[0]);
 });
+
+describe("a pending approval's reason", () => {
+  const projectionWith = (reason?: string) => {
+    const approvalId = RuntimeRequestId.make("approval");
+    const approvalNode = NodeId.make("approval-node");
+    return {
+      ...v2Projection,
+      runtimeRequests: [
+        {
+          id: approvalId,
+          nodeId: approvalNode,
+          providerTurnId: null,
+          nativeRequestRef: null,
+          kind: "command",
+          status: "pending",
+          responseCapability: {
+            type: "live",
+            providerSessionId: ProviderSessionId.make("session"),
+          },
+          createdAt: v2Now,
+          resolvedAt: null,
+        },
+      ],
+      turnItems: [
+        {
+          id: TurnItemId.make("approval-item"),
+          threadId: "thread" as never,
+          runId: null,
+          nodeId: approvalNode,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 1,
+          status: "waiting",
+          title: null,
+          startedAt: v2Now,
+          completedAt: null,
+          updatedAt: v2Now,
+          type: "approval_request",
+          requestId: approvalId,
+          requestKind: "command",
+          prompt: "rm -rf build",
+          ...(reason === undefined ? {} : { reason }),
+        },
+      ],
+    } as unknown as OrchestrationV2ThreadProjection;
+  };
+
+  it("carries what the provider said, apart from what it asks", () => {
+    expect(
+      derivePendingThreadRequests(projectionWith("Needs network.")).approvals[0],
+    ).toMatchObject({ detail: "rm -rf build", reason: "Needs network." });
+  });
+
+  it("leaves it out when the provider said nothing", () => {
+    expect(derivePendingThreadRequests(projectionWith()).approvals[0]).not.toHaveProperty("reason");
+  });
+});

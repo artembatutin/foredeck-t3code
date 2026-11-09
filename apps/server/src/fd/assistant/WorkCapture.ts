@@ -201,6 +201,9 @@ interface CapturedItem {
   readonly url: string | null;
 }
 
+/** What a capture decides on, whoever asked for it. */
+type CaptureRequest = Omit<CaptureInput, "caller">;
+
 export interface CaptureResult {
   readonly captureId: string;
   /**
@@ -245,6 +248,14 @@ export class WorkCapture extends Context.Service<
   {
     readonly capture: (input: CaptureInput) => Effect.Effect<CaptureResult, WorkCaptureError>;
     /**
+     * `capture` for the authenticated owner, whose review needs no thread of the assistant's:
+     * written under their session's own grants, refused as `read_only` without Work's write
+     * grant. Joins the idea's running writer as any capture does.
+     */
+    readonly captureAsOwner: (
+      input: Omit<CaptureInput, "caller"> & { readonly owner: HandoffBackend.HandoffOwner },
+    ) => Effect.Effect<CaptureResult, WorkCaptureError>;
+    /**
      * Drops the idea's capture, keeping its history and its item, so the next capture mints a new
      * id and creates a new item. Refused while its writer runs or an unended Factory assignment
      * uses it.
@@ -260,8 +271,6 @@ export class WorkCapture extends Context.Service<
   }
 >()("t3/fd/assistant/WorkCapture") {}
 
-const TITLE_MAX = 512;
-
 /** What a captured item's description opens with. */
 const markerOf = (captureId: string) =>
   `Captured by the Foredeck project assistant as ${captureId}.`;
@@ -270,16 +279,6 @@ const markerOf = (captureId: string) =>
 const opensWithMarker = (body: string, captureId: string) =>
   (body.split("\n", 1)[0] ?? "").trim() === markerOf(captureId);
 
-/** The goal's first line, cut to Work's title bound without splitting a surrogate pair. */
-const titleOf = (goal: string) => {
-  const line = (goal.split(/\r?\n/, 1)[0] ?? "").trim();
-  if (line.length <= TITLE_MAX) return line;
-  let end = TITLE_MAX - 1;
-  const last = line.charCodeAt(end - 1);
-  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
-  return `${line.slice(0, end)}…`;
-};
-
 const section = (title: string, items: ReadonlyArray<string>, numbered: boolean) =>
   `## ${title}\n\n${
     items.length === 0
@@ -287,9 +286,16 @@ const section = (title: string, items: ReadonlyArray<string>, numbered: boolean)
       : items.map((item, index) => `${numbered ? `${index + 1}.` : "-"} ${item}`).join("\n")
   }`;
 
-/** The item as the brief states it. */
-const render = (brief: Portfolio.ProjectBrief, captureId: string) => ({
-  title: titleOf(brief.goal),
+/**
+ * The item as the brief states it, under `title`. Conversation notes are not scope, so an item never
+ * holds them.
+ */
+export const renderCaptured = (
+  brief: Portfolio.ProjectBrief,
+  captureId: string,
+  title: string,
+) => ({
+  title,
   body: [
     markerOf(captureId),
     `## Goal\n\n${brief.goal}`,
@@ -299,6 +305,14 @@ const render = (brief: Portfolio.ProjectBrief, captureId: string) => ({
     section("Open questions", brief.openQuestions, false),
   ].join("\n\n"),
 });
+
+/**
+ * The title a new item takes: the one the owner named, or a short one from its goal. An item already
+ * captured keeps its own instead (see `update`), so its fingerprint does not move and authorization
+ * is not cleared on its account.
+ */
+export const newItemTitle = (brief: Portfolio.ProjectBrief) =>
+  brief.title ?? Portfolio.shortTitleOf(brief.goal);
 
 const versionOf = ({ captureId, sequence }: WorkCaptureStore.StoredCapture) => ({
   captureId,
@@ -351,6 +365,47 @@ const workFailed = (error: HandoffBackend.HandoffBackendError) =>
   new WorkCaptureFailed({ stage: "work", workReason: error.reason, cause: error });
 const storageFailed = (cause: unknown) => new WorkCaptureFailed({ stage: "storage", cause });
 
+/**
+ * The source a capture writes to: its own, the one asked for, or the project's only one. Decides on
+ * `kind` too, since a parent's tasks need a Markdown source.
+ */
+export const captureSource = (
+  sources: ReadonlyArray<HandoffBackend.HandoffSource>,
+  requested: WorkSourceId | undefined,
+  stored: Option.Option<WorkCaptureStore.StoredCapture>,
+  kind: CaptureKind,
+): Result.Result<HandoffBackend.HandoffSource, WorkCaptureRefused> => {
+  const pick = (): Result.Result<HandoffBackend.HandoffSource, WorkCaptureRefused> => {
+    if (Option.isSome(stored)) {
+      if (requested !== undefined && requested !== stored.value.sourceId) {
+        return Result.fail(refused("source_changed"));
+      }
+      const own = sources.find((source) => source.sourceId === stored.value.sourceId);
+      return own === undefined ? Result.fail(refused("source_inactive")) : Result.succeed(own);
+    }
+    if (sources.length === 0) return Result.fail(refused("no_sources"));
+    if (requested !== undefined) {
+      const named = sources.find((source) => source.sourceId === requested);
+      return named === undefined
+        ? Result.fail(refused("unknown_source", sources))
+        : Result.succeed(named);
+    }
+    const [only, ...others] = sources;
+    return only === undefined || others.length > 0
+      ? Result.fail(refused("several_sources", sources))
+      : Result.succeed(only);
+  };
+  const picked = pick();
+  return Result.isSuccess(picked) && kind === "parent" && picked.success.kind !== "markdown"
+    ? Result.fail(
+        refused(
+          "tracker_parent",
+          sources.filter((source) => source.kind === "markdown"),
+        ),
+      )
+    : picked;
+};
+
 const assistantOnly = (caller: Caller) => {
   const threadId = caller.scope.thread?.threadId;
   return threadId !== undefined && isAssistantThread(threadId)
@@ -373,8 +428,8 @@ const make = Effect.gen(function* () {
 
   const keyOf = (projectId: ProjectId, ideaId: string) => `${projectId}\0${ideaId}`;
 
-  const writerOf = (caller: Caller) =>
-    backend.writer(caller).pipe(
+  const writerOf = (actor: HandoffBackend.HandoffActor) =>
+    backend.writer(actor).pipe(
       Effect.catchTags({
         HandoffWriteRefused: () => Effect.fail(refused("read_only")),
         HandoffBackendError: (error) => Effect.fail(workFailed(error)),
@@ -394,32 +449,6 @@ const make = Effect.gen(function* () {
         }),
       ),
     );
-
-  /** The source the capture writes to: its own, the one asked for, or the project's only one. */
-  const sourceFor = (
-    sources: ReadonlyArray<HandoffBackend.HandoffSource>,
-    requested: WorkSourceId | undefined,
-    stored: Option.Option<WorkCaptureStore.StoredCapture>,
-  ) => {
-    if (Option.isSome(stored)) {
-      if (requested !== undefined && requested !== stored.value.sourceId) {
-        return Effect.fail(refused("source_changed"));
-      }
-      const own = sources.find((source) => source.sourceId === stored.value.sourceId);
-      return own === undefined ? Effect.fail(refused("source_inactive")) : Effect.succeed(own);
-    }
-    if (sources.length === 0) return Effect.fail(refused("no_sources"));
-    if (requested !== undefined) {
-      const named = sources.find((source) => source.sourceId === requested);
-      return named === undefined
-        ? Effect.fail(refused("unknown_source", sources))
-        : Effect.succeed(named);
-    }
-    const [only, ...others] = sources;
-    return only === undefined || others.length > 0
-      ? Effect.fail(refused("several_sources", sources))
-      : Effect.succeed(only);
-  };
 
   const clearAuthorization = (capture: WorkCaptureStore.CaptureFields, key: string | null) =>
     portfolio.reviseBrief({
@@ -597,7 +626,7 @@ const make = Effect.gen(function* () {
    * capture uncertain: the source may hold the item all the same.
    */
   const create = (
-    input: CaptureInput,
+    input: CaptureRequest,
     brief: Portfolio.ProjectBrief,
     source: HandoffBackend.HandoffSource,
     writer: HandoffBackend.HandoffWriter,
@@ -605,7 +634,7 @@ const make = Effect.gen(function* () {
     captureId: string,
   ) =>
     Effect.gen(function* () {
-      const content = render(brief, captureId);
+      const content = renderCaptured(brief, captureId, newItemTitle(brief));
       const claimed = yield* captures
         .write({
           expected: expected === null ? null : versionOf(expected),
@@ -678,7 +707,7 @@ const make = Effect.gen(function* () {
 
   /** A capture no writer can still be writing: find its item by the marker, or create it once. */
   const reconcile = (
-    input: CaptureInput,
+    input: CaptureRequest,
     brief: Portfolio.ProjectBrief,
     source: HandoffBackend.HandoffSource,
     writer: HandoffBackend.HandoffWriter,
@@ -729,7 +758,7 @@ const make = Effect.gen(function* () {
 
   /** Brings a recorded item up to date with the brief, unless someone else changed it. */
   const update = (
-    input: CaptureInput,
+    input: CaptureRequest,
     brief: Portfolio.ProjectBrief,
     source: HandoffBackend.HandoffSource,
     writer: HandoffBackend.HandoffWriter,
@@ -738,7 +767,6 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       if (capture.itemId === null) return yield* Effect.die("A captured capture names its item.");
       const ref = { sourceId: capture.sourceId, itemId: capture.itemId };
-      const content = render(brief, capture.captureId);
       const item = yield* backend
         .read(ref)
         .pipe(
@@ -756,6 +784,16 @@ const make = Effect.gen(function* () {
         key: item.key,
         url: item.url,
       };
+      const edited =
+        capture.itemFingerprint !== null && item.fingerprint !== capture.itemFingerprint;
+      // Only a title a read confirmed is the capture's to keep; an item edited or never confirmed
+      // goes back to what a new item would say.
+      const keepsTitle = capture.itemFingerprint !== null && !edited;
+      const content = renderCaptured(
+        brief,
+        capture.captureId,
+        brief.title ?? (keepsTitle ? item.title : Portfolio.shortTitleOf(brief.goal)),
+      );
       const intended = fingerprintOf(source, content);
       if (capture.itemFingerprint === null) {
         // No read has confirmed the item since it was written (its read-back failed, an update's
@@ -783,27 +821,30 @@ const make = Effect.gen(function* () {
         }
         if (input.overwrite !== true) return yield* refused("item_unconfirmed");
       }
-      const edited =
-        capture.itemFingerprint !== null && item.fingerprint !== capture.itemFingerprint;
       const sameContent = intended === capture.contentHash;
       const sameKind = input.kind === capture.kind;
       if (capture.itemFingerprint !== null && !edited && sameContent) {
-        if (sameKind)
+        const scopeHash = Portfolio.briefScopeHash(brief);
+        if (sameKind && scopeHash === capture.scopeHash) {
           return done(resultOf(capture, current, "unchanged", brief.executionAuthorized));
-        // The item says the same; delivering it as another kind still needs authorizing again.
+        }
+        // The item says the same, but a title can move in or out of the brief without moving what
+        // the item says: the capture then records the brief it stands for, with nothing written and
+        // nothing new to review. Delivering it as another kind still needs authorizing again.
         const recorded = yield* commit(
           capture,
-          { ...fieldsOf(capture), kind: input.kind },
+          { ...fieldsOf(capture), kind: input.kind, scopeHash, briefRevision: brief.revision },
           "updated",
           {
-            detail: "kind",
-            clear: true,
+            detail: sameKind ? "scope" : "kind",
+            clear: !sameKind,
             authorized: brief.executionAuthorized,
           },
         );
         return Option.match(recorded, {
           onNone: () => again(),
-          onSome: ({ saved, authorized }) => done(resultOf(saved, current, "updated", authorized)),
+          onSome: ({ saved, authorized }) =>
+            done(resultOf(saved, current, sameKind ? "unchanged" : "updated", authorized)),
         });
       }
       if (edited && input.overwrite !== true) return yield* refused("external_edit");
@@ -876,7 +917,7 @@ const make = Effect.gen(function* () {
    * input's until an item is adopted.
    */
   const decide = (
-    input: CaptureInput,
+    input: CaptureRequest,
     writer: HandoffBackend.HandoffWriter,
     recoverItem: WorkItemId | undefined,
   ) =>
@@ -886,13 +927,9 @@ const make = Effect.gen(function* () {
         .get(input.projectId, input.ideaId)
         .pipe(Effect.mapError(storageFailed));
       const sources = yield* backend.sources(input.projectId).pipe(Effect.mapError(workFailed));
-      const source = yield* sourceFor(sources, input.sourceId, stored);
-      if (input.kind === "parent" && source.kind !== "markdown") {
-        return yield* refused(
-          "tracker_parent",
-          sources.filter(({ kind }) => kind === "markdown"),
-        );
-      }
+      const source = yield* Effect.fromResult(
+        captureSource(sources, input.sourceId, stored, input.kind),
+      );
       if (Option.isNone(stored)) {
         if (recoverItem !== undefined) return yield* refused("recover_unneeded");
         const uuid = yield* randomUuidV4;
@@ -914,7 +951,7 @@ const make = Effect.gen(function* () {
       return yield* reconcile(input, brief, source, writer, capture);
     });
 
-  const run = (input: CaptureInput, writer: HandoffBackend.HandoffWriter) =>
+  const run = (input: CaptureRequest, writer: HandoffBackend.HandoffWriter) =>
     Effect.gen(function* () {
       // What an earlier step found, reported when nothing more had to be written.
       let found: "recovered" | "verified" | undefined;
@@ -967,10 +1004,8 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const capture: WorkCapture["Service"]["capture"] = (input) =>
+  const joined = (input: CaptureRequest, writer: HandoffBackend.HandoffWriter) =>
     Effect.gen(function* () {
-      yield* assistantOnly(input.caller);
-      const writer = yield* writerOf(input.caller);
       const key = keyOf(input.projectId, input.ideaId);
       for (;;) {
         const slot = yield* slotFor(key, run(input, writer));
@@ -979,6 +1014,15 @@ const make = Effect.gen(function* () {
         yield* Deferred.await(slot.done);
       }
     });
+
+  const capture: WorkCapture["Service"]["capture"] = (input) =>
+    Effect.gen(function* () {
+      yield* assistantOnly(input.caller);
+      return yield* joined(input, yield* writerOf(input.caller));
+    });
+
+  const captureAsOwner: WorkCapture["Service"]["captureAsOwner"] = ({ owner, ...input }) =>
+    Effect.flatMap(writerOf(owner), (writer) => joined(input, writer));
 
   const abandon: WorkCapture["Service"]["abandon"] = (input) =>
     Effect.gen(function* () {
@@ -1036,7 +1080,7 @@ const make = Effect.gen(function* () {
       );
     });
 
-  return WorkCapture.of({ capture, abandon });
+  return WorkCapture.of({ capture, captureAsOwner, abandon });
 });
 
 export const layer = Layer.effect(WorkCapture, make);

@@ -3,6 +3,8 @@ import { describe, expect, it } from "@effect/vitest";
 import { ProjectId } from "@t3tools/contracts";
 import {
   FACTORY_WS_METHODS,
+  type FactoryCommandDiscovery,
+  type FactoryCommandValidation,
   FactoryDeliveryId,
   FactoryError,
   FactorySettingsSetInput,
@@ -22,6 +24,7 @@ import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
 import { type WorkDomainError, WorkService } from "../../work-management/index.ts";
 import * as FactoryChanges from "../FactoryChanges.ts";
 import * as FactoryChildren from "../FactoryChildren.ts";
+import * as FactoryCommandSetup from "../FactoryCommandSetup.ts";
 import * as FactoryPlanning from "../FactoryPlanning.ts";
 import * as FactoryReview from "../FactoryReview.ts";
 import * as FactoryService from "../FactoryService.ts";
@@ -32,6 +35,7 @@ import * as Factory from "../index.ts";
 import { FactoryStoreError } from "../persistence/errors.ts";
 import * as FactoryDeliveryStore from "../persistence/FactoryDeliveryStore.ts";
 import { queuedDeliveryState } from "../pipeline/state.ts";
+import { unusedCommandSetup as commands } from "../testkit/commandSetup.ts";
 import { wsHandlers } from "./handlers.ts";
 
 const alpha = ProjectId.make("project-alpha");
@@ -57,6 +61,115 @@ const onTheWire = (error: unknown) => {
   return encodeError(error as FactoryError);
 };
 
+describe("what a client's reads follow", () => {
+  it.effect("is the epoch that also moves for what a listing shows beside a delivery", () => {
+    const unset = Effect.die("not called in this test");
+    const factory = new Proxy(
+      {
+        subscribe: Stream.die("Factory's own epoch misses a Work edit or a queue rank."),
+        listingChanges: Stream.make(7, 8),
+      },
+      { get: (target, key) => (key in target ? target[key as keyof typeof target] : () => unset) },
+    ) as unknown as FactoryService.FactoryService["Service"];
+    const rpc = wsHandlers({
+      factory,
+      settings: FactorySettings.FactorySettings.of({
+        get: () => unset,
+        set: () => unset,
+        requireDeliverySettings: () => unset,
+      }),
+      commands,
+      startup: readyStartup,
+    });
+    return rpc[FACTORY_WS_METHODS.factoryDeliveriesSubscribe]().pipe(
+      Stream.runCollect,
+      Effect.map((values) => expect(Array.from(values)).toEqual([7, 8])),
+    );
+  });
+});
+
+describe("what the settings form asks of a checkout", () => {
+  const unset = Effect.die("not called in this test");
+  const factory = new Proxy(
+    {},
+    { get: () => () => unset },
+  ) as unknown as FactoryService.FactoryService["Service"];
+  const settings = FactorySettings.FactorySettings.of({
+    get: () => unset,
+    set: () => unset,
+    requireDeliverySettings: () => unset,
+  });
+  const command = { executable: "pnpm", args: ["run", "test"] };
+
+  it.effect("hands each method to its one service method and answers what that says", () =>
+    Effect.gen(function* () {
+      const asked: Array<unknown> = [];
+      const discovery: FactoryCommandDiscovery = {
+        scripts: "none",
+        packageManager: null,
+        lockfiles: [],
+        proposals: [],
+        omittedScripts: 0,
+      };
+      const validation: FactoryCommandValidation = {
+        status: "found",
+        resolvedPath: "/bin/x",
+        message: "Found.",
+      };
+      const rpc = wsHandlers({
+        factory,
+        settings,
+        commands: FactoryCommandSetup.FactoryCommandSetup.of({
+          discover: (projectId) => {
+            asked.push(projectId);
+            return Effect.succeed(discovery);
+          },
+          validate: (input) => {
+            asked.push(input);
+            return Effect.succeed(validation);
+          },
+        }),
+        startup: readyStartup,
+      });
+      expect(yield* rpc[FACTORY_WS_METHODS.factoryCommandsDiscover]({ projectId: alpha })).toBe(
+        discovery,
+      );
+      expect(
+        yield* rpc[FACTORY_WS_METHODS.factoryCommandsValidate]({ projectId: alpha, command }),
+      ).toBe(validation);
+      expect(asked).toEqual([alpha, { projectId: alpha, command }]);
+    }),
+  );
+
+  it.effect("maps a project it does not have to the wire's error, from both", () =>
+    Effect.gen(function* () {
+      const missing = new FactoryThreadEffects.FactoryProjectMissingError({ projectId: alpha });
+      const rpc = wsHandlers({
+        factory,
+        settings,
+        commands: FactoryCommandSetup.FactoryCommandSetup.of({
+          discover: () => Effect.fail(missing),
+          validate: () => Effect.fail(missing),
+        }),
+        startup: readyStartup,
+      });
+      const notFound = { _tag: "FactoryError", reason: "not_found" };
+      expect(
+        onTheWire(
+          yield* Effect.flip(rpc[FACTORY_WS_METHODS.factoryCommandsDiscover]({ projectId: alpha })),
+        ),
+      ).toMatchObject(notFound);
+      expect(
+        onTheWire(
+          yield* Effect.flip(
+            rpc[FACTORY_WS_METHODS.factoryCommandsValidate]({ projectId: alpha, command }),
+          ),
+        ),
+      ).toMatchObject(notFound);
+    }),
+  );
+});
+
 describe("Factory RPC errors", () => {
   const unexpected = Effect.die("not called in this test");
   const stubFactory = (
@@ -67,6 +180,9 @@ describe("Factory RPC errors", () => {
       startNext: () => unexpected,
       get: () => unexpected,
       list: () => unexpected,
+      getForClient: () => unexpected,
+      listForClients: () => unexpected,
+      refusedTurnActions: () => unexpected,
       listByItem: () => unexpected,
       stop: () => unexpected,
       resume: () => unexpected,
@@ -75,7 +191,9 @@ describe("Factory RPC errors", () => {
       ensureDeferred: () => unexpected,
       turnRunState: () => unexpected,
       familyRequests: () => unexpected,
+      pendingRequests: unexpected,
       familyRoot: () => unexpected,
+      reviewedRefusal: () => unexpected,
       requestOwnership: () => unexpected,
       activity: () => unexpected,
       updatePlan: () => unexpected,
@@ -84,7 +202,14 @@ describe("Factory RPC errors", () => {
       replan: () => unexpected,
       submitPlan: () => unexpected,
       submitReview: () => unexpected,
+      resolveReviewedExecution: () => unexpected,
+      previewReviewedExecution: () => unexpected,
+      reviewedExecutionHolds: () => unexpected,
+      amendReviewedAllowance: () => unexpected,
+      rebindReviewed: () => unexpected,
+      resumeOwedByReview: () => unexpected,
       subscribe: Stream.die("not called in this test"),
+      listingChanges: Stream.die("not called in this test"),
       ...overrides,
     });
   const stubSettings = FactorySettings.FactorySettings.of({
@@ -102,7 +227,7 @@ describe("Factory RPC errors", () => {
   const handlersOver = (
     factory: Partial<FactoryService.FactoryService["Service"]>,
     startup = readyStartup,
-  ) => wsHandlers({ factory: stubFactory(factory), settings: stubSettings, startup });
+  ) => wsHandlers({ factory: stubFactory(factory), settings: stubSettings, commands, startup });
   type Handlers = ReturnType<typeof handlersOver>;
   interface ErrorCase {
     readonly name: string;
@@ -353,7 +478,7 @@ describe("Factory RPC handlers over real stores", () => {
   const handlers = Effect.gen(function* () {
     const factory = yield* FactoryService.FactoryService;
     const settings = yield* FactorySettings.FactorySettings;
-    return wsHandlers({ factory, settings, startup: readyStartup });
+    return wsHandlers({ factory, settings, commands, startup: readyStartup });
   });
 
   /** Stores a queued delivery; the test clock moves a second after each, so none share a time. */

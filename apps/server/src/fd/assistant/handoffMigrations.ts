@@ -298,9 +298,89 @@ const AssistantFactoryHandoff = Effect.gen(function* () {
     END`;
 });
 
+const AssistantReviewReceipts = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  // What an owner reviewed for one attempt of an assignment, in full, kept as it was confirmed:
+  // while the assignment queues it holds what the claim's start copies onto the delivery.
+  yield* sql`CREATE TABLE fd_assistant_review_receipts (
+    receipt_id TEXT PRIMARY KEY NOT NULL,
+    assignment_id TEXT NOT NULL REFERENCES fd_assistant_assignments (assignment_id),
+    attempt INTEGER NOT NULL,
+    review_version INTEGER NOT NULL,
+    execution_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (assignment_id, attempt)
+  )`;
+  yield* sql`CREATE TRIGGER fd_assistant_review_receipts_kept
+    BEFORE DELETE ON fd_assistant_review_receipts
+    BEGIN
+      SELECT RAISE(ABORT, 'Assistant review receipts are never deleted.');
+    END`;
+  yield* sql`CREATE TRIGGER fd_assistant_review_receipts_frozen
+    BEFORE UPDATE ON fd_assistant_review_receipts
+    BEGIN
+      SELECT RAISE(ABORT, 'Assistant review receipts never change.');
+    END`;
+  // Null for an assignment queued without a review, which keeps its legacy behavior. A receipt
+  // authorizes one attempt, so no two links name one.
+  yield* sql`ALTER TABLE fd_assistant_factory_links
+    ADD COLUMN receipt_id TEXT REFERENCES fd_assistant_review_receipts (receipt_id)`;
+  yield* sql`CREATE UNIQUE INDEX fd_assistant_factory_links_receipt
+    ON fd_assistant_factory_links (receipt_id)
+    WHERE receipt_id IS NOT NULL`;
+});
+
+const AssistantOwnerReview = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  // A brief's optional short title and conversation notes. Core's migrations own the briefs' own
+  // table; a brief with neither has no row here.
+  yield* sql`CREATE TABLE fd_assistant_brief_details (
+    project_id TEXT NOT NULL,
+    idea_id TEXT NOT NULL,
+    title TEXT,
+    conversation_notes_json TEXT,
+    PRIMARY KEY (project_id, idea_id)
+  ) WITHOUT ROWID`;
+  // One row per owner confirmation that took effect, so repeating it finds what it did. An
+  // amendment's receipt lives here alone: it serves an attempt that already has its receipt.
+  yield* sql`CREATE TABLE fd_assistant_review_starts (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    project_id TEXT NOT NULL,
+    idea_id TEXT NOT NULL,
+    review_version TEXT NOT NULL,
+    receipt_id TEXT NOT NULL UNIQUE,
+    assignment_id TEXT NOT NULL REFERENCES fd_assistant_assignments (assignment_id),
+    attempt INTEGER NOT NULL,
+    numbered_version INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('attempt', 'amendment')),
+    execution_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )`;
+  yield* sql`CREATE TRIGGER fd_assistant_review_starts_kept
+    BEFORE DELETE ON fd_assistant_review_starts
+    BEGIN
+      SELECT RAISE(ABORT, 'Assistant review starts are never deleted.');
+    END`;
+  yield* sql`CREATE TRIGGER fd_assistant_review_starts_frozen
+    BEFORE UPDATE ON fd_assistant_review_starts
+    BEGIN
+      SELECT RAISE(ABORT, 'Assistant review starts never change.');
+    END`;
+});
+
+const AssistantReviewResumeTarget = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  // Which delivery of its family an amendment resumes, and how far that delivery had run, decided
+  // when it is confirmed. A repeat judged by what the family looks like then could resume another.
+  yield* sql`ALTER TABLE fd_assistant_review_starts ADD COLUMN resume_json TEXT`;
+});
+
 export const assistantMigrationEntries = [
   [1, "AssistantWorkCaptures", AssistantWorkCaptures],
   [2, "AssistantFactoryHandoff", AssistantFactoryHandoff],
+  [3, "AssistantReviewReceipts", AssistantReviewReceipts],
+  [4, "AssistantOwnerReview", AssistantOwnerReview],
+  [5, "AssistantReviewResumeTarget", AssistantReviewResumeTarget],
 ] as const;
 
 const run = Migrator.make({});

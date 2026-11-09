@@ -6,14 +6,29 @@ import {
   type OrchestrationV2Run,
   ProjectId,
   ProviderInstanceId,
+  type ProviderOptionDescriptor,
   type RunId,
   RuntimeMode,
+  type ServerProvider,
   ThreadId,
   type VcsListRefsResult,
   type WorktreeSetupSnapshot,
+  providerRuntimeModeRestriction,
 } from "@t3tools/contracts";
-import { FactoryDeliveryId, FactoryRole } from "@t3tools/contracts/fd/factory";
+import {
+  type FactoryDeliveryExecution,
+  FactoryDeliveryId,
+  type FactoryPromptName,
+  type FactoryReviewedExecution,
+  FactoryRole,
+  type FactoryRoleExecution,
+} from "@t3tools/contracts/fd/factory";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import {
+  RUNTIME_MODE_CHOICE_TEXT,
+  runtimeModeRefusal,
+  runtimeModeRefusalText,
+} from "@t3tools/shared/fd/approvals";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { getProviderOptionCurrentValue, modelSelectionsEqual } from "@t3tools/shared/model";
 import * as Context from "effect/Context";
@@ -22,6 +37,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
@@ -39,6 +55,7 @@ import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegist
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import { getAutoBootstrapThreadModelSelection } from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as SourceControlProviderRegistry from "../../sourceControl/SourceControlProviderRegistry.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkActor, WorkService, workItemScopeFingerprint } from "../work-management/index.ts";
 import * as FactoryAdmission from "./FactoryAdmission.ts";
@@ -59,8 +76,13 @@ import {
   adoptedRuns,
   type FactoryEffect,
   type FactoryEvent,
+  type FactoryLaunchEffect,
   type FactoryTerminalRunStatus,
+  FIX_COMMIT_TURNS,
   isTerminalRunStatus,
+  isTurnEffect,
+  unrecordedAuthorLaunch,
+  unrecordedPlannerLaunch,
 } from "./pipeline/state.ts";
 import { childItemFingerprint } from "./plan/childItem.ts";
 import { authorThreadTitle, renderAuthorPrompt } from "./prompts/author.ts";
@@ -68,11 +90,7 @@ import { renderFixCommitPrompt } from "./prompts/fixCommit.ts";
 import { renderFixReviewPrompt } from "./prompts/fixReview.ts";
 import { renderFixVerifyPrompt } from "./prompts/fixVerify.ts";
 import { integrateThreadTitle, renderIntegratePrompt } from "./prompts/integrate.ts";
-import {
-  FactoryPromptOverrideError,
-  type FactoryPromptName,
-  MAX_PROMPT_OVERRIDE_BYTES,
-} from "./prompts/overrides.ts";
+import { FactoryPromptOverrideError, MAX_PROMPT_OVERRIDE_BYTES } from "./prompts/overrides.ts";
 import {
   planThreadTitle,
   renderPlanPrompt,
@@ -85,6 +103,15 @@ import {
   reviewThreadTitle,
 } from "./prompts/review.ts";
 import { renderReviewFollowUpPrompt } from "./prompts/reviewFollowUp.ts";
+import { pipelines } from "./pipeline/definitions.ts";
+import {
+  FactoryReviewedExecutionRefusedError,
+  type FactoryReviewedPreview,
+  publicationTargetUnbound,
+  reviewedContentHash,
+  sameReviewedExecution,
+  reviewedRoleOf,
+} from "./reviewedExecution.ts";
 import { findingsToFix } from "./review/validate.ts";
 import { readLogTail } from "./verify/logTail.ts";
 
@@ -109,6 +136,41 @@ export class FactoryRuntimeModeUnavailableError extends Schema.TaggedError<Facto
     return `Provider ${this.instanceId} offers no runtime mode within ${this.runtimeMode}, the broadest this delivery's ${this.role} may launch with.`;
   }
 }
+
+/**
+ * The provider's host policy is known to refuse the mode a role would run in, so nothing ran and no
+ * mode changed: another mode is for the owner to choose, never for Factory to step to.
+ */
+export class FactoryRuntimeModeRefusedError extends Schema.TaggedError<FactoryRuntimeModeRefusedError>()(
+  "FactoryRuntimeModeRefusedError",
+  {
+    /** The role whose thread it is; a delegated thread has none. */
+    role: Schema.optional(FactoryRole),
+    instanceId: ProviderInstanceId,
+    runtimeMode: RuntimeMode,
+    provider: Schema.String,
+    driver: Schema.String,
+    alternatives: Schema.Array(RuntimeMode),
+    detail: Schema.optional(Schema.String),
+    /** How the owner chooses another: a reviewed delivery's mode changes only by a new review. */
+    choose: Schema.Literals(["resume", "thread", "automatic_turn", "review", "before_review"]),
+    /** The thread whose turn it refused; a launch's has none yet. */
+    threadId: Schema.optional(ThreadId),
+  },
+) {
+  // A delivery's reason is cut to a sentence or two, so what the policy allows stays with the rest
+  // of the refusal on the block, and this keeps to what the owner has to do.
+  override get message(): string {
+    const { summary } = runtimeModeRefusalText({
+      provider: this.provider,
+      mode: this.runtimeMode,
+      alternatives: this.alternatives,
+    });
+    return `${summary} Nothing ran and no mode changed. ${RUNTIME_MODE_CHOICE_TEXT[this.choose]}`;
+  }
+}
+
+export const isFactoryRuntimeModeRefusedError = Schema.is(FactoryRuntimeModeRefusedError);
 
 /** The ref does not name a commit in the directory, or git could not read it. */
 export class FactoryBaselineError extends Schema.TaggedError<FactoryBaselineError>()(
@@ -198,6 +260,10 @@ export const launchDeliveryId = (threadId: ThreadId) => {
 const launchMessageId = (deliveryId: FactoryDeliveryId, effectId: number) =>
   MessageId.make(`factory-launch-message:${deliveryId}:${effectId}`);
 
+/** The message of a follow-up turn an effect sends; its id derives from the effect. */
+const turnMessageId = (kind: string, deliveryId: FactoryDeliveryId, effectId: number) =>
+  MessageId.make(`factory-${kind}-message:${deliveryId}:${effectId}`);
+
 /** Every message Factory sends: a launch's first message, or a turn's (see `sendTurn`). */
 const FACTORY_MESSAGE = /^factory-[a-z-]+-message:/;
 
@@ -228,6 +294,12 @@ type FactoryThreadLaunch = Omit<
 interface FactoryThreadEffectFailure {
   readonly _tag: string;
 }
+
+/** What keeps a project from a reviewed delivery, in its error's own fixed words. */
+const reviewRefusalText = (failure: FactoryThreadEffectFailure) =>
+  "message" in failure && typeof failure.message === "string"
+    ? failure.message
+    : "This project cannot run a reviewed delivery right now.";
 
 /**
  * Carries out the thread effects for `FactoryWorker`: launching a role's thread and sending a
@@ -302,6 +374,106 @@ export class FactoryThreadEffects extends Context.Service<
       delivery: StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "send_review_follow_up_turn" }>,
     ) => Effect.Effect<{ readonly runId: RunId }, FactoryThreadEffectFailure>;
+    /**
+     * Whether a reviewed delivery may run `effect`, as everything it depends on stands now, for
+     * the worker to ask right before running it; nothing to judge for an unreviewed delivery. A
+     * review is a ceiling, never a grant: a repository or publication target other than the one
+     * reviewed, a pipeline gone from this server, a project default narrower than the reviewed
+     * mode, or a provider of a role it uses no longer offering that mode refuses any effect, and a
+     * launch or turn is also refused for a model or option its provider no longer offers, or a
+     * thread broader than the reviewed mode.
+     */
+    readonly checkReviewed: (
+      delivery: StoredFactoryDelivery,
+      effect: FactoryEffect,
+    ) => Effect.Effect<void, FactoryThreadEffectFailure>;
+    /**
+     * Whether the durable record shows that a turn whose count a review charges (a repair or
+     * fix-commit turn) started a run. Any other effect, and a read that fails, counts as sent, so
+     * doubt never gives a count back.
+     */
+    readonly chargedTurnSent: (
+      delivery: StoredFactoryDelivery,
+      effect: FactoryEffect,
+    ) => Effect.Effect<boolean>;
+    /**
+     * What an owner would review for a delivery of the project under `runtimeCeiling`, as the
+     * settings and prompt overrides stand now, to store on a review receipt: each role's selection
+     * as it resolves, and the ceiling narrowed to the project's default and to what the roles'
+     * providers offer. Refused without a verify command, with an unusable prompt override, when a
+     * role's provider offers no mode within the ceiling, or when the source control provider cannot
+     * name the repository its pull request would target.
+     */
+    readonly resolveReviewedExecution: (input: {
+      readonly projectId: ProjectId;
+      readonly receiptId: FactoryReviewedExecution["receiptId"];
+      readonly reviewVersion: number;
+      readonly runtimeCeiling: RuntimeMode;
+    }) => Effect.Effect<FactoryReviewedExecution, FactoryThreadEffectFailure>;
+    /**
+     * What an owner reviewing the project sees now: the settings, every role as it resolves with
+     * whether its provider offers its model and options, and what a start would bind, or the text
+     * saying why nothing could be, so a project that cannot run yet can still be shown. Writes
+     * nothing. Fails only for a project this environment does not have or settings it cannot read.
+     */
+    readonly previewReviewedExecution: (input: {
+      readonly projectId: ProjectId;
+      readonly runtimeCeiling: RuntimeMode;
+    }) => Effect.Effect<FactoryReviewedPreview, FactoryThreadEffectFailure>;
+    /**
+     * What each role the delivery launches runs on, as a client shows it: what its latest turn asked
+     * for, as core recorded it on the run, or with no thread yet what `launchSelection` would ask,
+     * beside what a review bound and whatever its provider reported for that thread. A parent launches
+     * no author, so each child's own delivery says that. An ended delivery launches nothing more, so
+     * it lists only the threads it ran. Writes nothing.
+     */
+    readonly deliveryExecution: (
+      delivery: StoredFactoryDelivery,
+    ) => Effect.Effect<FactoryDeliveryExecution, FactoryThreadEffectFailure>;
+    /**
+     * Whether the review still says what `resolveReviewedExecution` would bind now, reading only the
+     * database and files beside it, so a transaction can ask with nothing slower than a read held
+     * open: everything but where publication goes, which takes asking Git and the source control
+     * provider. A read that fails, or a project that cannot run, is no longer what was reviewed.
+     */
+    readonly reviewedExecutionHolds: (input: {
+      readonly projectId: ProjectId;
+      /** What the review was resolved under, before the project and providers narrowed it. */
+      readonly runtimeCeiling: RuntimeMode;
+      readonly execution: FactoryReviewedExecution;
+    }) => Effect.Effect<boolean>;
+    /**
+     * Whether a reviewed delivery's review still allows new work on `threadId`, a thread of the
+     * family `launchedBy` made it part of: `checkReviewed`'s judgment of the delivery, then of the
+     * thread by the role its launch made it for, a current role's or a replaced reviewer's. A
+     * delegated thread has no role, and stays under the reviewed mode as its own provider offers
+     * it. Nothing to judge for a delivery without a review.
+     */
+    readonly checkReviewedThread: (
+      threadId: ThreadId,
+      launchedBy: FactoryDeliveryId,
+    ) => Effect.Effect<void, FactoryThreadEffectFailure>;
+    /**
+     * Refuses a turn nobody sent just now on `threadId`, with `FactoryRuntimeModeRefusedError`, when
+     * the host's policy refuses the mode it would run in, on the provider it would run on. Any
+     * delivery's or none's, reviewed or not, since a refused turn is doomed whoever's it is: an
+     * automatic turn's gate asks, and a managed agent's delegation. It only reads, and leaves both
+     * as they are; a thread that no longer exists is left for the dispatch to report.
+     */
+    readonly checkThreadHostPolicy: (
+      threadId: ThreadId,
+      launchedBy: FactoryDeliveryId | null,
+    ) => Effect.Effect<void, FactoryThreadEffectFailure>;
+    /**
+     * Prepares an automatic turn about to run on `threadId`: `checkReviewedThread`'s judgment, then
+     * a role's thread's selection set back to the reviewed one, since core runs such a turn with the
+     * thread's selection. The review names no selection for a delegated thread. Refused, changing
+     * nothing, as `checkReviewedThread` refuses.
+     */
+    readonly prepareReviewedTurn: (
+      threadId: ThreadId,
+      launchedBy: FactoryDeliveryId,
+    ) => Effect.Effect<void, FactoryThreadEffectFailure>;
     /** What became of the launch effect's thread and its first run. */
     readonly launchState: (
       delivery: StoredFactoryDelivery,
@@ -403,6 +575,23 @@ const offeredWithin = (bound: RuntimeMode, offered: ReadonlyArray<RuntimeMode> |
         .filter((mode) => runtimeModeRank[mode] < runtimeModeRank[bound])
         .toSorted((left, right) => runtimeModeRank[right] - runtimeModeRank[left])[0];
 
+/** A thread's own record, as a turn reads it. */
+type ThreadRead = Effect.Effect<
+  ProjectionStore.ProjectionRecords<never>,
+  ProjectionStore.ProjectionStoreV2Error
+>;
+
+/** Whose thread each kind of follow-up turn goes to. */
+const TURN_ROLES = {
+  "fix-commit": "author",
+  "fix-verify": "author",
+  "fix-review": "author",
+  "plan-retry": "planner",
+  replan: "planner",
+  "review-retry": "reviewer",
+  "review-follow-up": "reviewer",
+} as const satisfies Record<string, FactoryRole>;
+
 /** Factory reads its delivery's item and writes nothing to Work under this actor. */
 const itemReader = (deliveryId: FactoryDeliveryId): WorkActor => ({
   id: `factory:${deliveryId}`,
@@ -442,6 +631,40 @@ const restoreMechanicalSelection = (
   };
 };
 
+/**
+ * A role's selection in the order Work's thread starts use, with the role's profile as the explicit
+ * choice. A planner or reviewer without a profile of its own uses the author's.
+ */
+const roleSelection = (
+  roles: { readonly [role in FactoryRole]: ModelSelection | null },
+  role: FactoryRole,
+  projectDefault: ModelSelection | null | undefined,
+): ModelSelection =>
+  (role === "author" ? roles.author : (roles[role] ?? roles.author)) ??
+  projectDefault ??
+  getAutoBootstrapThreadModelSelection();
+
+/**
+ * Whether a model's descriptors offer each option a selection names, with a value of its type. A
+ * model that lists no descriptors offers none: an option it cannot represent would not run as
+ * reviewed.
+ */
+const offersOptions = (
+  selection: ModelSelection,
+  descriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
+) =>
+  (selection.options ?? []).every(({ id, value }) => {
+    const descriptor = descriptors?.find((candidate) => candidate.id === id);
+    if (descriptor === undefined) return false;
+    return descriptor.type === "select"
+      ? descriptor.options.some((option) => option.id === value)
+      : typeof value === "boolean";
+  });
+
+/** Whether two sorted lists of remote URLs name the same targets. */
+const sameUrls = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>
+  left.length === right.length && left.every((url, index) => url === right[index]);
+
 const make = Effect.gen(function* () {
   const launches = yield* ThreadLaunch.ThreadLaunchService;
   const threads = yield* ThreadManagement.ThreadManagementService;
@@ -456,6 +679,7 @@ const make = Effect.gen(function* () {
   const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
   const tasks = yield* FactoryTaskStore.FactoryTaskStore;
   const git = yield* GitVcsDriver.GitVcsDriver;
+  const sourceControl = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
   const providers = yield* ProviderRegistry.ProviderRegistry;
   const providerInstances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
   // Core owns this manager. A missing runtime capability fails only a turn that needs it.
@@ -534,11 +758,33 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const projectOverride = (projectId: ProjectId, prompt: FactoryPromptName) =>
+  /**
+   * The rules of `prompt` for the delivery's next launch or turn: the override as it reads now, or
+   * for a reviewed delivery only the very text its owner reviewed. A file edited, added, removed or
+   * unusable since is refused naming only the prompt, so restoring its exact bytes lets a resume
+   * go on. What is hashed is what renders, read once, and only these seven files are ever bound.
+   */
+  const overrideOf = (delivery: StoredFactoryDelivery, root: string, prompt: FactoryPromptName) =>
     Effect.gen(function* () {
+      const { reviewedExecution: reviewed } = delivery.state;
+      if (reviewed === undefined) return yield* readOverride(root, prompt);
+      const refuse = (cause?: unknown) =>
+        new FactoryReviewedExecutionRefusedError({
+          reason: "prompt",
+          prompt,
+          ...(cause === undefined ? {} : { cause }),
+        });
+      const text = yield* readOverride(root, prompt).pipe(Effect.mapError(refuse));
+      const hash = text === undefined ? "absent" : reviewedContentHash(text);
+      return hash === reviewed.promptOverrides[prompt] ? text : yield* refuse();
+    });
+
+  const projectOverride = (delivery: StoredFactoryDelivery, prompt: FactoryPromptName) =>
+    Effect.gen(function* () {
+      const { projectId } = delivery;
       const project = Option.getOrUndefined(yield* projects.get(projectId));
       if (project === undefined) return yield* new FactoryProjectMissingError({ projectId });
-      return yield* readOverride(project.workspaceRoot, prompt);
+      return yield* overrideOf(delivery, project.workspaceRoot, prompt);
     });
 
   /**
@@ -686,14 +932,94 @@ const make = Effect.gen(function* () {
       return current;
     });
 
-  const turnSelection = (delivery: StoredFactoryDelivery, threadId: ThreadId, round: number) =>
+  /**
+   * The selection a reviewed role's thread goes back to after any drift: what its owner reviewed,
+   * with the native effort a mechanical turn on that thread found the review inheriting. A provider
+   * that keeps an omitted effort would otherwise stay on the mechanical turn's after the review's
+   * selection is sent again.
+   */
+  const reviewedSelection = (
+    reviewed: FactoryReviewedExecution,
+    role: FactoryRole,
+    threadId: ThreadId,
+  ) =>
+    Effect.map(turnSelections.list(threadId), (saved): ModelSelection => {
+      const selection = reviewed.roles[role];
+      const inherited = saved
+        .filter(
+          ({ before, mechanical }) =>
+            mechanical !== null &&
+            before.instanceId === selection.instanceId &&
+            before.model === selection.model,
+        )
+        .flatMap(({ before }) => before.options ?? [])
+        .filter(({ id }) => !selection.options?.some((option) => option.id === id));
+      return inherited.length === 0
+        ? selection
+        : { ...selection, options: [...(selection.options ?? []), ...inherited] };
+    });
+
+  /**
+   * The selection of a turn of `role` on its thread in `round`. A reviewed delivery sends its
+   * role's reviewed selection however the thread drifted, escalated only to the reviewed effort;
+   * an unreviewed one sends a selection only when the turn changes the thread's.
+   */
+  const turnSelection = (
+    delivery: StoredFactoryDelivery,
+    role: FactoryRole,
+    threadId: ThreadId,
+    round: number,
+  ) =>
     Effect.gen(function* () {
+      const { reviewedExecution: reviewed } = delivery.state;
+      if (reviewed !== undefined) {
+        return yield* escalated(
+          delivery,
+          yield* reviewedSelection(reviewed, role, threadId),
+          round,
+          reviewed.highRiskEffort,
+        );
+      }
       const { thread } = yield* projections.getThreadRecords(threadId, []);
       const before = yield* beforeMechanical(threadId, thread.modelSelection);
       const { highRiskEffort } = yield* factorySettings.get(delivery.projectId);
       const selection = yield* escalated(delivery, before, round, highRiskEffort);
       return selection === thread.modelSelection ? undefined : selection;
     });
+
+  /**
+   * What a role's launch asks for. A launch starts a first round, so only a high-risk task escalates
+   * it. A review's roles hold what they resolved to.
+   */
+  const launchSelection = (
+    delivery: StoredFactoryDelivery,
+    role: FactoryRole,
+    projectDefault: ModelSelection | null | undefined,
+  ) =>
+    Effect.gen(function* () {
+      const { roles, highRiskEffort } =
+        delivery.state.reviewedExecution ?? (yield* factorySettings.get(delivery.projectId));
+      return yield* escalated(
+        delivery,
+        roleSelection(roles, role, projectDefault),
+        1,
+        highRiskEffort,
+      );
+    });
+
+  /**
+   * The selection of a retry or replan turn: a reviewed delivery's as `turnSelection` says for the
+   * round it retries, and none otherwise, so the turn runs on the thread's own.
+   */
+  const retrySelection = (
+    delivery: StoredFactoryDelivery,
+    role: FactoryRole,
+    threadId: ThreadId,
+    round: number,
+  ) =>
+    delivery.state.reviewedExecution === undefined
+      ? Effect.void
+      : turnSelection(delivery, role, threadId, round);
 
   const nativeThinking = Effect.fnUntraced(function* (threadId: ThreadId, before: ModelSelection) {
     if (Option.isNone(sessions) || Option.isNone(runtimePolicy))
@@ -786,13 +1112,22 @@ const make = Effect.gen(function* () {
   const fixCommitSelection = (
     delivery: StoredFactoryDelivery,
     effect: { readonly id: number; readonly threadId: ThreadId },
+    threadRead: ThreadRead,
   ) =>
     Effect.gen(function* () {
       const key = { deliveryId: delivery.deliveryId, effectId: effect.id };
+      const { reviewedExecution: reviewed } = delivery.state;
+      // A reviewed turn never runs on the thread's own selection, which may have drifted.
+      const sent = (selection: {
+        readonly before: ModelSelection;
+        readonly mechanical: ModelSelection | null;
+      }) => selection.mechanical ?? (reviewed === undefined ? undefined : selection.before);
       const saved = yield* turnSelections.get(key);
-      if (Option.isSome(saved)) return saved.value.mechanical ?? undefined;
-      const { thread } = yield* projections.getThreadRecords(effect.threadId, []);
-      const before = yield* beforeMechanical(effect.threadId, thread.modelSelection);
+      if (Option.isSome(saved)) return sent(saved.value);
+      const before =
+        reviewed !== undefined
+          ? yield* reviewedSelection(reviewed, "author", effect.threadId)
+          : yield* beforeMechanical(effect.threadId, (yield* threadRead).thread.modelSelection);
       const available = yield* providers.getProviders;
       const provider = available.find((provider) => provider.instanceId === before.instanceId);
       const descriptors = provider?.models.find((model) => model.slug === before.model)
@@ -825,14 +1160,64 @@ const make = Effect.gen(function* () {
         mechanical: mechanical === before ? null : mechanical,
       });
       // Read back the winner if the same effect was dispatched concurrently.
-      return (yield* turnSelections.get(key)).pipe(Option.getOrThrow).mechanical ?? undefined;
+      return sent((yield* turnSelections.get(key)).pipe(Option.getOrThrow));
+    });
+
+  /** A provider instance's snapshot, read where a run's runtime policy reads it. */
+  const instanceSnapshot = (instanceId: ProviderInstanceId) =>
+    Effect.gen(function* () {
+      const instance = yield* providerInstances.getInstance(instanceId);
+      return instance === undefined ? undefined : yield* instance.snapshot.getSnapshot;
+    });
+
+  /** The modes a provider instance advertises. */
+  const offeredModes = (instanceId: ProviderInstanceId) =>
+    Effect.map(instanceSnapshot(instanceId), (snapshot) => snapshot?.supportedRuntimeModes);
+
+  /**
+   * Fails when `snapshot`, the provider's as its caller already read it, says its host policy
+   * refuses the mode `role` would run in, before anything is dispatched. Only what the provider read
+   * counts, so an unknown policy launches as it always has; and it only refuses, since stepping to
+   * another mode is what nobody chose.
+   */
+  const refuseHostDisallowed = (
+    snapshot: ServerProvider | undefined,
+    role: FactoryRole | undefined,
+    instanceId: ProviderInstanceId,
+    runtimeMode: RuntimeMode,
+    choose: FactoryRuntimeModeRefusedError["choose"],
+    options: { readonly ceiling?: RuntimeMode; readonly threadId?: ThreadId } = {},
+  ) =>
+    Effect.gen(function* () {
+      const { ceiling, threadId } = options;
+      if (snapshot === undefined) return;
+      const refusal = runtimeModeRefusal(snapshot, runtimeMode);
+      if (refusal === null) return;
+      const { detail } = providerRuntimeModeRestriction(snapshot, runtimeMode);
+      return yield* new FactoryRuntimeModeRefusedError({
+        ...(role === undefined ? {} : { role }),
+        instanceId,
+        runtimeMode,
+        provider: snapshot.displayName ?? snapshot.driver,
+        driver: snapshot.driver,
+        // A delivery capped by its starter cannot be raised by a project default.
+        alternatives: refusal.alternatives
+          .map(({ mode }) => mode)
+          .filter(
+            (mode) => ceiling === undefined || runtimeModeRank[mode] <= runtimeModeRank[ceiling],
+          ),
+        ...(detail === undefined ? {} : { detail }),
+        choose,
+        ...(threadId === undefined ? {} : { threadId }),
+      });
     });
 
   /**
    * The runtime mode a launch of `role` on `instanceId` asks for. Without a ceiling, the project's
    * default, as for any thread. With one, the narrower of the two, stepped down to a mode the
    * provider offers, so the run is never broader than either; a provider offering none within
-   * fails the launch before anything is dispatched.
+   * fails the launch before anything is dispatched. A reviewed delivery launches in the very mode
+   * its owner reviewed: `checkReviewed` refuses it when that no longer holds.
    */
   const launchRuntimeMode = (
     delivery: StoredFactoryDelivery,
@@ -841,17 +1226,14 @@ const make = Effect.gen(function* () {
     projectDefault: RuntimeMode,
   ) =>
     Effect.gen(function* () {
+      if (delivery.state.reviewedExecution !== undefined) {
+        return delivery.state.reviewedExecution.runtimeCeiling;
+      }
       const ceiling = delivery.state.runtimeModeCeiling;
       if (ceiling === undefined) return projectDefault;
       const bound =
         runtimeModeRank[ceiling] < runtimeModeRank[projectDefault] ? ceiling : projectDefault;
-      // Read where the run's runtime policy reads it when the provider starts the turn.
-      const instance = yield* providerInstances.getInstance(instanceId);
-      const offered =
-        instance === undefined
-          ? undefined
-          : (yield* instance.snapshot.getSnapshot).supportedRuntimeModes;
-      const mode = offeredWithin(bound, offered);
+      const mode = offeredWithin(bound, yield* offeredModes(instanceId));
       return (
         mode ??
         (yield* new FactoryRuntimeModeUnavailableError({ role, instanceId, runtimeMode: bound }))
@@ -1166,7 +1548,8 @@ const make = Effect.gen(function* () {
       const basis = role === "reviewer" ? yield* reviewBasis(delivery) : null;
       const project = Option.getOrUndefined(yield* projects.get(projectId));
       if (project === undefined) return yield* new FactoryProjectMissingError({ projectId });
-      const rulesOverride = yield* readOverride(
+      const rulesOverride = yield* overrideOf(
+        delivery,
         project.workspaceRoot,
         role === "reviewer"
           ? basis?.tasks === null
@@ -1181,7 +1564,6 @@ const make = Effect.gen(function* () {
         project.projectId,
         project,
       ).settings;
-      const { roles, highRiskEffort } = yield* factorySettings.get(projectId);
       const item = yield* work.getItem(itemReader(deliveryId), { ref: delivery.itemRef });
       // What the manager is asked about: this very read, which the opening renders. A child's
       // launch also says whether its item still says what its parent's frozen task does.
@@ -1219,22 +1601,26 @@ const make = Effect.gen(function* () {
           ? yield* resolveCommit(project.workspaceRoot, workspace.baseRef)
           : yield* resolveCommit(workspace.worktreePath, "HEAD");
 
-      // The order Work's thread starts use, with the role's profile as the explicit choice. A
-      // planner or reviewer without a profile of its own uses the author's. A launch starts a
-      // first round, so only a high-risk task escalates it.
-      const modelSelection = yield* escalated(
-        delivery,
-        (role === "author" ? roles.author : (roles[role] ?? roles.author)) ??
-          resolved.defaultModelSelection ??
-          getAutoBootstrapThreadModelSelection(),
-        1,
-        highRiskEffort,
-      );
+      const modelSelection = yield* launchSelection(delivery, role, resolved.defaultModelSelection);
       const runtimeMode = yield* launchRuntimeMode(
         delivery,
         role,
         modelSelection.instanceId,
         resolved.defaultRuntimeMode,
+      );
+      // The snapshot clients read, so a composer and a launch agree. Every launch reads it already,
+      // for its effort, and an uncapped one reads nothing else of its provider.
+      yield* refuseHostDisallowed(
+        (yield* providers.getProviders).find(
+          (provider) => provider.instanceId === modelSelection.instanceId,
+        ),
+        role,
+        modelSelection.instanceId,
+        runtimeMode,
+        state.reviewedExecution === undefined ? "resume" : "review",
+        state.reviewedExecution === undefined && state.runtimeModeCeiling !== undefined
+          ? { ceiling: state.runtimeModeCeiling }
+          : {},
       );
       // A task's reviewer judges its commits; a parent's integrate reviewer its whole branch, by
       // every approved task's criteria.
@@ -1430,29 +1816,37 @@ const make = Effect.gen(function* () {
   const sendTurn = (
     delivery: StoredFactoryDelivery,
     effect: { readonly id: number; readonly threadId: ThreadId },
-    kind:
-      | "fix-commit"
-      | "plan-retry"
-      | "replan"
-      | "review-retry"
-      | "fix-verify"
-      | "fix-review"
-      | "review-follow-up",
+    kind: keyof typeof TURN_ROLES,
     text: string,
-    modelSelection?: ModelSelection,
+    modelSelection?: ModelSelection | void,
+    threadRead: ThreadRead = projections.getThreadRecords(effect.threadId, []),
   ) =>
     Effect.gen(function* () {
-      let selection = modelSelection;
+      let selection = modelSelection ?? undefined;
+      const { thread } = yield* threadRead;
       if (selection === undefined && kind !== "fix-commit") {
-        const { thread } = yield* projections.getThreadRecords(effect.threadId, []);
         const restored = yield* beforeMechanical(effect.threadId, thread.modelSelection);
         if (restored !== thread.modelSelection) selection = restored;
       }
+      // The provider this turn would run on and the mode it would run in, as its run would resolve
+      // them; refusing here leaves both as they are, and queues nothing.
+      const { instanceId } = selection ?? thread.modelSelection;
+      const snapshot = (yield* providers.getProviders).find(
+        (provider) => provider.instanceId === instanceId,
+      );
+      yield* refuseHostDisallowed(
+        snapshot,
+        TURN_ROLES[kind],
+        instanceId,
+        RuntimePolicy.providerRuntimeMode(thread.runtimeMode, snapshot?.supportedRuntimeModes),
+        delivery.state.reviewedExecution === undefined ? "thread" : "review",
+        { threadId: effect.threadId },
+      );
       return yield* ThreadMessageIntake.sendToThread({
         projectId: delivery.projectId,
         commandId: CommandId.make(`factory-${kind}:${delivery.deliveryId}:${effect.id}`),
         threadId: effect.threadId,
-        messageId: MessageId.make(`factory-${kind}-message:${delivery.deliveryId}:${effect.id}`),
+        messageId: turnMessageId(kind, delivery.deliveryId, effect.id),
         text,
         attachments: [],
         ...(selection === undefined ? {} : { modelSelection: selection }),
@@ -1487,7 +1881,7 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const { deliveryId, state } = delivery;
       const missing = new FactoryTurnBasisMissingError({ deliveryId, turn: effect.kind });
-      const rulesOverride = yield* projectOverride(delivery.projectId, effect.kind);
+      const rulesOverride = yield* projectOverride(delivery, effect.kind);
       if (effect.kind === "fix-verify") {
         const receipt = state.receipts.at(-1);
         if (receipt === undefined) return yield* missing;
@@ -1503,7 +1897,8 @@ const make = Effect.gen(function* () {
       const accepted = state.reviews.at(-1);
       if (accepted === undefined) return yield* missing;
       const evidence = yield* readReviewEvidence(accepted.evidencePath);
-      const { blockingSeverities } = yield* factorySettings.get(delivery.projectId);
+      const { blockingSeverities } =
+        state.reviewedExecution ?? (yield* factorySettings.get(delivery.projectId));
       return renderFixReviewPrompt({
         headSha: accepted.summary.headSha,
         findings: findingsToFix(evidence.review, blockingSeverities),
@@ -1528,7 +1923,7 @@ const make = Effect.gen(function* () {
       const evidence = yield* readReviewEvidence(previous.evidencePath);
       const response = state.reviewResponse;
       return renderReviewFollowUpPrompt({
-        rulesOverride: yield* projectOverride(delivery.projectId, "review"),
+        rulesOverride: yield* projectOverride(delivery, "review"),
         round: basis.round,
         branch: state.branch,
         baseline: basis.baseline,
@@ -1585,12 +1980,635 @@ const make = Effect.gen(function* () {
         ),
     ).pipe(Effect.map((runs) => runs.flat()));
 
+  /**
+   * Where a publication from `cwd` would go now, each destination by its role (see
+   * `FactoryReviewedExecution`), asked of what publishes rather than worked out here: Git's driver
+   * for the remote a push picks, the provider for the repository its pull request targets. Whatever
+   * else may choose a remote reads `remoteConfig`, which is why all of it is bound. `tracked` is the
+   * same of the branch's upstream remote once it has one, since a push can go there instead and the
+   * pull request's head is read from it.
+   */
+  const publicationOf = (cwd: string, branch: string | null) =>
+    Effect.gen(function* () {
+      const lines = (args: ReadonlyArray<string>) =>
+        git
+          .execute({
+            operation: "FactoryThreadEffects.publicationOf",
+            cwd,
+            args: [...args],
+            allowNonZeroExit: true,
+            timeoutMs: 30_000,
+          })
+          .pipe(
+            Effect.map(({ exitCode, stdout }) =>
+              exitCode === 0 ? stdout.split("\n").filter((line) => line.length > 0) : [],
+            ),
+          );
+      const urls = (remote: string | null, flags: ReadonlyArray<string>) =>
+        remote === null
+          ? Effect.succeed<ReadonlyArray<string>>([])
+          : Effect.map(lines(["remote", "get-url", ...flags, "--", remote]), (found) =>
+              [...new Set(found)].toSorted(),
+            );
+      const picked = yield* git.resolvePushRemoteName(cwd, branch);
+      const upstream =
+        branch === null ? null : yield* git.readConfigValue(cwd, `branch.${branch}.remote`);
+      const { provider } = yield* sourceControl.resolveHandle({ cwd });
+      return {
+        push: yield* urls(picked, ["--push", "--all"]),
+        head: yield* urls(picked, ["--all"]),
+        provider: provider.kind,
+        repository:
+          provider.resolveChangeRequestRepository === undefined
+            ? null
+            : yield* provider.resolveChangeRequestRepository({ cwd }),
+        remoteConfig: reviewedContentHash(
+          (yield* lines(["config", "--get-regexp", "^(remote|url)\\."])).join("\n"),
+        ),
+        tracked:
+          upstream === null || upstream === "."
+            ? null
+            : {
+                push: yield* urls(upstream, ["--push", "--all"]),
+                head: yield* urls(upstream, ["--all"]),
+              },
+      };
+    });
+
+  /** The project's default runtime mode as a new thread of it takes it now. */
+  const projectDefaults = (
+    project: { readonly projectId: ProjectId } & Parameters<typeof resolveProjectSettings>[2],
+  ) =>
+    Effect.map(
+      serverSettings.getSettings,
+      (settings) => resolveProjectSettings(settings, project.projectId, project).settings,
+    );
+
+  /**
+   * Refuses what any effect of the delivery depends on: its repository and publication target, its
+   * pipeline, the project's default mode and what the providers of the roles it uses offer. It reads
+   * where publication runs, its worktree once it has one; a target that cannot be read, or that its
+   * provider cannot name, is refused.
+   */
+  const checkReviewedDelivery = (
+    { projectId, state }: StoredFactoryDelivery,
+    reviewed: FactoryReviewedExecution,
+  ) =>
+    Effect.gen(function* () {
+      const project = Option.getOrUndefined(yield* projects.get(projectId));
+      const { repository } = reviewed;
+      const refuse = (reason: "repository" | "pipeline") =>
+        new FactoryReviewedExecutionRefusedError({ reason });
+      if (
+        project === undefined ||
+        repository.projectId !== projectId ||
+        repository.workspaceRoot !== project.workspaceRoot
+      ) {
+        return yield* refuse("repository");
+      }
+      const publication = yield* publicationOf(
+        state.worktreePath ?? project.workspaceRoot,
+        state.branch,
+      ).pipe(Effect.orElseSucceed(() => undefined));
+      if (publication !== undefined && publicationTargetUnbound(publication)) {
+        return yield* new FactoryReviewedExecutionRefusedError({
+          reason: "publication_target",
+          provider: publication.provider,
+        });
+      }
+      const bound = repository.publication;
+      if (
+        publication === undefined ||
+        !sameUrls(publication.push, bound.push) ||
+        !sameUrls(publication.head, bound.head) ||
+        publication.provider !== bound.provider ||
+        publication.repository !== bound.repository ||
+        publication.remoteConfig !== bound.remoteConfig ||
+        (publication.tracked !== null &&
+          (!sameUrls(publication.tracked.push, bound.push) ||
+            !sameUrls(publication.tracked.head, bound.head)))
+      ) {
+        return yield* refuse("repository");
+      }
+      if (!pipelines.has(reviewed.pipelineId)) return yield* refuse("pipeline");
+      const { defaultRuntimeMode } = yield* projectDefaults(project);
+      if (runtimeModeRank[defaultRuntimeMode] < runtimeModeRank[reviewed.runtimeCeiling]) {
+        return yield* new FactoryReviewedExecutionRefusedError({
+          reason: "project_default",
+          runtimeMode: reviewed.runtimeCeiling,
+        });
+      }
+      // A parent plans; every delivery's later turns are an author's and a reviewer's.
+      const used =
+        state.kind === "parent" ? FactoryRole.literals : (["author", "reviewer"] as const);
+      for (const role of used) {
+        yield* checkOfferedMode(reviewed.roles[role].instanceId, reviewed.runtimeCeiling, role);
+      }
+    });
+
+  /**
+   * Refuses a mode the provider no longer offers, which it would run as another, for a role's
+   * thread or, with none, a delegated one.
+   */
+  const checkOfferedMode = (
+    instanceId: ProviderInstanceId,
+    runtimeMode: RuntimeMode,
+    role: FactoryRole | undefined,
+  ) =>
+    Effect.gen(function* () {
+      const modes = yield* offeredModes(instanceId);
+      if (modes !== undefined && modes.length > 0 && !modes.includes(runtimeMode)) {
+        return yield* new FactoryReviewedExecutionRefusedError({
+          reason: "provider_mode",
+          ...(role === undefined ? {} : { role }),
+          instanceId,
+          runtimeMode,
+        });
+      }
+    });
+
+  /** Refuses a role's selection its provider no longer offers, or a mode it would not run in. */
+  const checkReviewedRole = (
+    reviewed: FactoryReviewedExecution,
+    role: FactoryRole,
+    runtimeMode: RuntimeMode,
+  ) =>
+    Effect.gen(function* () {
+      const { instanceId, model } = reviewed.roles[role];
+      const offered = (yield* providers.getProviders)
+        .find((provider) => provider.instanceId === instanceId)
+        ?.models.find(({ slug }) => slug === model);
+      if (offered === undefined) {
+        return yield* new FactoryReviewedExecutionRefusedError({
+          reason: "model",
+          role,
+          instanceId,
+          model,
+        });
+      }
+      if (!offersOptions(reviewed.roles[role], offered.capabilities?.optionDescriptors)) {
+        return yield* new FactoryReviewedExecutionRefusedError({
+          reason: "options",
+          role,
+          instanceId,
+        });
+      }
+      yield* checkOfferedMode(instanceId, runtimeMode, role);
+    });
+
+  /**
+   * The mode a turn would run in on the thread, refusing one broader than the review, for a role's
+   * thread or, with none, a delegated one.
+   */
+  const reviewedThreadMode = (
+    reviewed: FactoryReviewedExecution,
+    role: FactoryRole | undefined,
+    threadId: ThreadId,
+  ) =>
+    Effect.gen(function* () {
+      const { runtimeMode } = (yield* projections.getThreadRecords(threadId, [])).thread;
+      if (runtimeModeRank[runtimeMode] > runtimeModeRank[reviewed.runtimeCeiling]) {
+        return yield* new FactoryReviewedExecutionRefusedError({
+          reason: "thread_mode",
+          ...(role === undefined ? {} : { role }),
+          runtimeMode: reviewed.runtimeCeiling,
+        });
+      }
+      return runtimeMode;
+    });
+
+  /** Refuses an automatic turn or a delegation of a reviewed delivery in a mode its host refuses. */
+  const refuseReviewedHostDisallowed = (instanceId: ProviderInstanceId, runtimeMode: RuntimeMode) =>
+    Effect.gen(function* () {
+      const snapshot = yield* instanceSnapshot(instanceId);
+      if (snapshot === undefined || runtimeModeRefusal(snapshot, runtimeMode) === null) return;
+      return yield* new FactoryReviewedExecutionRefusedError({
+        reason: "host_policy",
+        instanceId,
+        runtimeMode,
+        provider: snapshot.displayName ?? snapshot.driver,
+      });
+    });
+
+  /**
+   * The role this delivery's launch made the thread for. An author's or a planner's launch is
+   * recorded as it is issued and never replaced, so any other launch of the delivery is a
+   * reviewer's, which a later review's launch leaves in no role. None for a thread no launch of the
+   * delivery made, which is a delegated one.
+   */
+  const launchedRole = (
+    { deliveryId, state }: StoredFactoryDelivery,
+    threadId: ThreadId,
+  ): FactoryRole | undefined => {
+    const current = FactoryRole.literals.find((role) => state.threads[role] === threadId);
+    if (current !== undefined) return current;
+    if (launchDeliveryId(threadId) !== deliveryId) return undefined;
+    const madeBy = (launch: FactoryLaunchEffect | undefined) =>
+      launch !== undefined && launchThreadId(deliveryId, launch.id) === threadId;
+    if (madeBy(unrecordedAuthorLaunch(state))) return "author";
+    if (madeBy(unrecordedPlannerLaunch(state))) return "planner";
+    return "reviewer";
+  };
+
+  /** Refuses what the review no longer allows on the thread; returns the role it judged it by. */
+  const judgeReviewedThread = (
+    delivery: StoredFactoryDelivery,
+    reviewed: FactoryReviewedExecution,
+    threadId: ThreadId,
+  ) =>
+    Effect.gen(function* () {
+      yield* checkReviewedDelivery(delivery, reviewed);
+      const role = launchedRole(delivery, threadId);
+      const runtimeMode = yield* reviewedThreadMode(reviewed, role, threadId);
+      const { thread } = yield* projections.getThreadRecords(threadId, []);
+      yield* refuseReviewedHostDisallowed(
+        role === undefined ? thread.modelSelection.instanceId : reviewed.roles[role].instanceId,
+        runtimeMode,
+      );
+      if (role !== undefined) {
+        yield* checkReviewedRole(reviewed, role, runtimeMode);
+        return role;
+      }
+      yield* checkOfferedMode(thread.modelSelection.instanceId, runtimeMode, undefined);
+      return undefined;
+    });
+
+  const checkReviewed: FactoryThreadEffects["Service"]["checkReviewed"] = (delivery, effect) =>
+    Effect.gen(function* () {
+      const { reviewedExecution: reviewed } = delivery.state;
+      if (reviewed === undefined) return;
+      yield* checkReviewedDelivery(delivery, reviewed);
+      const role = reviewedRoleOf(effect);
+      if (role === undefined) return;
+      yield* checkReviewedRole(
+        reviewed,
+        role,
+        isTurnEffect(effect)
+          ? yield* reviewedThreadMode(reviewed, role, effect.threadId)
+          : reviewed.runtimeCeiling,
+      );
+    });
+
+  const checkThreadHostPolicy: FactoryThreadEffects["Service"]["checkThreadHostPolicy"] = (
+    threadId,
+    launchedBy,
+  ) =>
+    Effect.gen(function* () {
+      const { thread } = yield* projections.getThreadRecords(threadId, []);
+      const delivery =
+        launchedBy === null ? undefined : Option.getOrUndefined(yield* deliveries.get(launchedBy));
+      const { instanceId } = thread.modelSelection;
+      const snapshot = (yield* providers.getProviders).find(
+        (provider) => provider.instanceId === instanceId,
+      );
+      yield* refuseHostDisallowed(
+        snapshot,
+        delivery === undefined ? undefined : launchedRole(delivery, threadId),
+        instanceId,
+        RuntimePolicy.providerRuntimeMode(thread.runtimeMode, snapshot?.supportedRuntimeModes),
+        delivery?.state.reviewedExecution === undefined ? "automatic_turn" : "review",
+        { threadId },
+      );
+    }).pipe(Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.void }));
+
+  const checkReviewedThread: FactoryThreadEffects["Service"]["checkReviewedThread"] = (
+    threadId,
+    launchedBy,
+  ) =>
+    Effect.gen(function* () {
+      const delivery = Option.getOrUndefined(yield* deliveries.get(launchedBy));
+      const reviewed = delivery?.state.reviewedExecution;
+      if (delivery === undefined || reviewed === undefined) return;
+      yield* judgeReviewedThread(delivery, reviewed, threadId);
+    });
+
+  const prepareReviewedTurn: FactoryThreadEffects["Service"]["prepareReviewedTurn"] = (
+    threadId,
+    launchedBy,
+  ) =>
+    Effect.gen(function* () {
+      const delivery = Option.getOrUndefined(yield* deliveries.get(launchedBy));
+      const reviewed = delivery?.state.reviewedExecution;
+      if (delivery === undefined || reviewed === undefined) return;
+      const role = yield* judgeReviewedThread(delivery, reviewed, threadId);
+      if (role === undefined) return;
+      const { thread } = yield* projections.getThreadRecords(threadId, []);
+      const selection = yield* reviewedSelection(reviewed, role, threadId);
+      if (modelSelectionsEqual(thread.modelSelection, selection)) return;
+      yield* threads.dispatch({
+        type: "thread.model-selection.set",
+        // Per thread position, so a repeat replays and a later drift is set back again.
+        commandId: CommandId.make(
+          `factory-reviewed-selection:${threadId}:${yield* threads.getThreadEventSequence(threadId)}`,
+        ),
+        threadId,
+        modelSelection: selection,
+      });
+    });
+
+  /**
+   * What a review binds of the settings given, all but where publication goes. Each caller passes
+   * the one read of them it judges, so what it shows and what it binds can never differ.
+   */
+  const reviewedValues = (
+    project: { readonly workspaceRoot: string },
+    settings: FactorySettings.FactoryDeliverySettings,
+    defaults: {
+      readonly defaultModelSelection: ModelSelection | null | undefined;
+      readonly defaultRuntimeMode: RuntimeMode;
+    },
+    runtimeCeiling: RuntimeMode,
+  ) =>
+    Effect.gen(function* () {
+      const roles = {
+        planner: roleSelection(settings.roles, "planner", defaults.defaultModelSelection),
+        author: roleSelection(settings.roles, "author", defaults.defaultModelSelection),
+        reviewer: roleSelection(settings.roles, "reviewer", defaults.defaultModelSelection),
+      };
+      let ceiling =
+        runtimeModeRank[runtimeCeiling] < runtimeModeRank[defaults.defaultRuntimeMode]
+          ? runtimeCeiling
+          : defaults.defaultRuntimeMode;
+      for (const role of FactoryRole.literals) {
+        const { instanceId } = roles[role];
+        const mode = offeredWithin(ceiling, yield* offeredModes(instanceId));
+        if (mode === undefined) {
+          return yield* new FactoryRuntimeModeUnavailableError({
+            role,
+            instanceId,
+            runtimeMode: ceiling,
+          });
+        }
+        ceiling = mode;
+      }
+      // What a review would run is one it can never launch: said now, rather than after the start.
+      // Read as the modes above are, since this also runs inside a start's transaction.
+      for (const role of FactoryRole.literals) {
+        const { instanceId } = roles[role];
+        yield* refuseHostDisallowed(
+          yield* instanceSnapshot(instanceId),
+          role,
+          instanceId,
+          ceiling,
+          "before_review",
+        );
+      }
+      const override = (prompt: FactoryPromptName) =>
+        readOverride(project.workspaceRoot, prompt).pipe(
+          Effect.map((text) =>
+            text === undefined ? ("absent" as const) : reviewedContentHash(text),
+          ),
+        );
+      return {
+        roles,
+        verifyCommand: settings.verifyCommand,
+        setupCommand: settings.setupCommand,
+        limits: {
+          maxFixRounds: settings.limits.maxFixRounds,
+          maxReviewRounds: settings.limits.maxReviewRounds,
+          maxFixCommitTurns: FIX_COMMIT_TURNS,
+          verifyTimeoutMinutes: settings.limits.verifyTimeoutMinutes,
+        },
+        blockingSeverities: settings.blockingSeverities,
+        highRiskEffort: settings.highRiskEffort,
+        pipelineId: settings.pipelineId,
+        runtimeCeiling: ceiling,
+        promptOverrides: {
+          plan: yield* override("plan"),
+          author: yield* override("author"),
+          review: yield* override("review"),
+          "fix-verify": yield* override("fix-verify"),
+          "fix-review": yield* override("fix-review"),
+          "fix-commit": yield* override("fix-commit"),
+          integrate: yield* override("integrate"),
+        },
+      };
+    });
+
+  /** The whole of a review of the settings given, with where publication goes as asked now. */
+  const reviewedExecutionOf = (
+    project: { readonly projectId: ProjectId; readonly workspaceRoot: string },
+    settings: FactorySettings.FactoryDeliverySettings,
+    defaults: {
+      readonly defaultModelSelection: ModelSelection | null | undefined;
+      readonly defaultRuntimeMode: RuntimeMode;
+    },
+    input: {
+      readonly receiptId: FactoryReviewedExecution["receiptId"];
+      readonly reviewVersion: number;
+      readonly runtimeCeiling: RuntimeMode;
+    },
+  ) =>
+    Effect.gen(function* () {
+      // Named by no branch yet: only the delivery's start names it.
+      const { tracked: _tracked, ...publication } = yield* publicationOf(
+        project.workspaceRoot,
+        null,
+      );
+      if (publicationTargetUnbound(publication)) {
+        return yield* new FactoryReviewedExecutionRefusedError({
+          reason: "publication_target",
+          provider: publication.provider,
+        });
+      }
+      const values = yield* reviewedValues(project, settings, defaults, input.runtimeCeiling);
+      return {
+        receiptId: input.receiptId,
+        reviewVersion: input.reviewVersion,
+        ...values,
+        repository: {
+          projectId: project.projectId,
+          workspaceRoot: project.workspaceRoot,
+          publication,
+        },
+      } satisfies FactoryReviewedExecution;
+    });
+
+  const resolveReviewedExecution: FactoryThreadEffects["Service"]["resolveReviewedExecution"] = ({
+    projectId,
+    receiptId,
+    reviewVersion,
+    runtimeCeiling,
+  }) =>
+    Effect.gen(function* () {
+      const settings = yield* factorySettings.requireDeliverySettings(projectId);
+      const project = Option.getOrUndefined(yield* projects.get(projectId));
+      if (project === undefined) return yield* new FactoryProjectMissingError({ projectId });
+      return yield* reviewedExecutionOf(project, settings, yield* projectDefaults(project), {
+        receiptId,
+        reviewVersion,
+        runtimeCeiling,
+      });
+    });
+
+  const previewReviewedExecution: FactoryThreadEffects["Service"]["previewReviewedExecution"] = ({
+    projectId,
+    runtimeCeiling,
+  }) =>
+    Effect.gen(function* () {
+      const project = Option.getOrUndefined(yield* projects.get(projectId));
+      if (project === undefined) return yield* new FactoryProjectMissingError({ projectId });
+      const settings = yield* factorySettings.get(projectId);
+      const defaults = yield* projectDefaults(project);
+      const available = yield* providers.getProviders;
+      const describe = (role: FactoryRole) => {
+        const selection = roleSelection(settings.roles, role, defaults.defaultModelSelection);
+        const model = available
+          .find((provider) => provider.instanceId === selection.instanceId)
+          ?.models.find(({ slug }) => slug === selection.model);
+        return {
+          selection,
+          offered: model !== undefined,
+          options: (selection.options ?? []).map((option) => ({
+            id: option.id,
+            value: option.value,
+            supported: offersOptions(
+              { ...selection, options: [option] },
+              model?.capabilities?.optionDescriptors,
+            ),
+          })),
+        };
+      };
+      const { verifyCommand } = settings;
+      const resolved = yield* Effect.result(
+        Effect.gen(function* () {
+          if (verifyCommand === null) {
+            return yield* new FactorySettings.FactoryVerifyCommandMissingError({ projectId });
+          }
+          return yield* reviewedExecutionOf(project, { ...settings, verifyCommand }, defaults, {
+            // A start replaces both with its own.
+            receiptId: "preview",
+            reviewVersion: 1,
+            runtimeCeiling,
+          });
+        }),
+      );
+      return {
+        roles: {
+          planner: describe("planner"),
+          author: describe("author"),
+          reviewer: describe("reviewer"),
+        },
+        verifyCommand: settings.verifyCommand,
+        setupCommand: settings.setupCommand,
+        limits: settings.limits,
+        blockingSeverities: settings.blockingSeverities,
+        highRiskEffort: settings.highRiskEffort,
+        pipelineId: settings.pipelineId,
+        execution: Result.isSuccess(resolved) ? resolved.success : null,
+        refusal: Result.isSuccess(resolved) ? null : reviewRefusalText(resolved.failure),
+      };
+    });
+
+  const deliveryExecution: FactoryThreadEffects["Service"]["deliveryExecution"] = (delivery) =>
+    Effect.gen(function* () {
+      const { state, projectId } = delivery;
+      const reviewed = state.reviewedExecution;
+      const ended = state.status === "done" || state.status === "cancelled";
+      const used: ReadonlyArray<FactoryRole> =
+        state.kind === "parent" ? ["planner", "reviewer"] : ["author", "reviewer"];
+      const roles: Array<FactoryRoleExecution> = [];
+      for (const role of used) {
+        const threadId = state.threads[role];
+        const records =
+          threadId === undefined
+            ? undefined
+            : yield* projections.getThreadRecords(threadId, ["providerThreads", "runs"]).pipe(
+                Effect.catchTags({
+                  ProjectionStoreThreadNotFoundError: () => Effect.succeed(undefined),
+                }),
+              );
+        if (records === undefined && ended) continue;
+        const bound = {
+          role,
+          binding: reviewed === undefined ? ("read_now" as const) : ("reviewed" as const),
+          ...(reviewed === undefined ? {} : { reviewed: reviewed.roles[role] }),
+        };
+        if (records === undefined) {
+          const project = Option.getOrUndefined(yield* projects.get(projectId));
+          if (project === undefined) return yield* new FactoryProjectMissingError({ projectId });
+          const defaults = yield* projectDefaults(project);
+          roles.push({
+            ...bound,
+            selection: yield* launchSelection(delivery, role, defaults.defaultModelSelection),
+          });
+          continue;
+        }
+        // Only the active provider thread's report is about this thread as it runs now.
+        const acknowledged = records.providerThreads.find(
+          (candidate) =>
+            candidate.id === records.thread.activeProviderThreadId &&
+            candidate.providerInstanceId === records.thread.modelSelection.instanceId,
+        )?.nativeMetadata?.modelSelection;
+        const latest = records.runs.reduce<(typeof records.runs)[number] | undefined>(
+          (newest, run) => (newest === undefined || run.ordinal > newest.ordinal ? run : newest),
+          undefined,
+        );
+        roles.push({
+          ...bound,
+          selection: latest?.modelSelection ?? records.thread.modelSelection,
+          ...(acknowledged === undefined ? {} : { acknowledged }),
+        });
+      }
+      return { roles };
+    });
+
+  const reviewedExecutionHolds: FactoryThreadEffects["Service"]["reviewedExecutionHolds"] = ({
+    projectId,
+    runtimeCeiling,
+    execution,
+  }) =>
+    Effect.gen(function* () {
+      const project = Option.getOrUndefined(yield* projects.get(projectId));
+      if (project === undefined) return false;
+      const settings = yield* factorySettings.get(projectId);
+      const { verifyCommand } = settings;
+      if (verifyCommand === null) return false;
+      const values = yield* reviewedValues(
+        project,
+        { ...settings, verifyCommand },
+        yield* projectDefaults(project),
+        runtimeCeiling,
+      );
+      return sameReviewedExecution(execution, {
+        ...execution,
+        ...values,
+        repository: { ...execution.repository, workspaceRoot: project.workspaceRoot },
+      });
+    }).pipe(Effect.orElseSucceed(() => false));
+
+  const chargedTurnSent: FactoryThreadEffects["Service"]["chargedTurnSent"] = (
+    { deliveryId },
+    effect,
+  ) => {
+    if (effect.type !== "send_fix_commit_turn" && effect.type !== "send_repair_turn") {
+      return Effect.succeed(true);
+    }
+    const kind = effect.type === "send_repair_turn" ? effect.kind : "fix-commit";
+    const messageId = turnMessageId(kind, deliveryId, effect.id);
+    return projections.getThreadRecords(effect.threadId, ["runs"]).pipe(
+      Effect.map(({ runs }) => runs.some((run) => run.userMessageId === messageId)),
+      Effect.orElseSucceed(() => true),
+    );
+  };
+
   return FactoryThreadEffects.of({
     launchThread,
+    checkReviewed,
+    previewReviewedExecution,
+    deliveryExecution,
+    reviewedExecutionHolds,
+    chargedTurnSent,
+    checkThreadHostPolicy,
+    checkReviewedThread,
+    prepareReviewedTurn,
+    resolveReviewedExecution,
     sendFixCommitTurn: (delivery, effect) =>
       Effect.gen(function* () {
-        const rulesOverride = yield* projectOverride(delivery.projectId, "fix-commit");
-        const selection = yield* fixCommitSelection(delivery, effect);
+        const rulesOverride = yield* projectOverride(delivery, "fix-commit");
+        // One read of the thread, for its selection and the mode this turn would run in.
+        const threadRead = yield* Effect.cached(projections.getThreadRecords(effect.threadId, []));
+        const selection = yield* fixCommitSelection(delivery, effect, threadRead);
         return yield* sendTurn(
           delivery,
           effect,
@@ -1603,11 +2621,12 @@ const make = Effect.gen(function* () {
             rulesOverride,
           }),
           selection,
+          threadRead,
         );
       }),
     sendPlanRetryTurn: (delivery, effect) =>
       Effect.gen(function* () {
-        const rulesOverride = yield* projectOverride(delivery.projectId, "plan");
+        const rulesOverride = yield* projectOverride(delivery, "plan");
         return yield* sendTurn(
           delivery,
           effect,
@@ -1617,22 +2636,24 @@ const make = Effect.gen(function* () {
             checkpoint: effect.checkpoint ?? null,
             rulesOverride,
           }),
+          yield* retrySelection(delivery, "planner", effect.threadId, 1),
         );
       }),
     sendReplanTurn: (delivery, effect) =>
       Effect.gen(function* () {
-        const rulesOverride = yield* projectOverride(delivery.projectId, "plan");
+        const rulesOverride = yield* projectOverride(delivery, "plan");
         return yield* sendTurn(
           delivery,
           effect,
           "replan",
           renderReplanPrompt({ note: effect.note, rulesOverride }),
+          yield* retrySelection(delivery, "planner", effect.threadId, 1),
         );
       }),
     sendReviewRetryTurn: (delivery, effect) =>
       Effect.gen(function* () {
         const rulesOverride = yield* projectOverride(
-          delivery.projectId,
+          delivery,
           delivery.state.stage === "integrate" ? "integrate" : "review",
         );
         return yield* sendTurn(
@@ -1640,18 +2661,19 @@ const make = Effect.gen(function* () {
           effect,
           "review-retry",
           renderReviewRetryPrompt({ problems: effect.problems, rulesOverride }),
+          yield* retrySelection(delivery, "reviewer", effect.threadId, delivery.state.reviewRound),
         );
       }),
     sendRepairTurn: (delivery, effect) =>
       Effect.gen(function* () {
         const text = yield* repairText(delivery, effect);
-        const selection = yield* turnSelection(delivery, effect.threadId, effect.round);
+        const selection = yield* turnSelection(delivery, "author", effect.threadId, effect.round);
         return yield* sendTurn(delivery, effect, effect.kind, text, selection);
       }),
     sendReviewFollowUpTurn: (delivery, effect) =>
       Effect.gen(function* () {
         const text = yield* followUpText(delivery);
-        const selection = yield* turnSelection(delivery, effect.threadId, effect.round);
+        const selection = yield* turnSelection(delivery, "reviewer", effect.threadId, effect.round);
         return yield* sendTurn(delivery, effect, "review-follow-up", text, selection);
       }),
     launchState: ({ deliveryId }, effect) => {

@@ -7,6 +7,8 @@ import {
   factoryAssignmentRow,
   ideaAssignment,
   ideaCaptureRow,
+  ideaFacts,
+  portfolioRowTitle,
 } from "./workNavigation";
 
 const environmentId = EnvironmentId.make("local");
@@ -183,24 +185,115 @@ describe("a Factory assignment's row", () => {
     expect(factoryAssignmentRow(assignment({ executor: "looper" }), environmentId)).toBeNull();
   });
 
+  const factsOf = (item: Assignment) =>
+    Object.fromEntries(row(item).facts.map(({ label, value }) => [label, value]));
+
   it("shows Factory's status and stage, once a delivery row exists", () => {
+    const deliveryFact = (item: Assignment) => factsOf(item)["Factory delivery"];
     expect(
-      row(factoryAssignment("needs-input", delivery({ status: "blocked", stage: "verify" })))
-        .delivery,
-    ).toBe("Factory: Blocked · Verify");
-    expect(row(factoryAssignment("running", delivery())).delivery).toBe("Factory: Running");
-    expect(row(factoryAssignment("stopped", delivery({ status: null }))).delivery).toBeUndefined();
-    expect(row(factoryAssignment("queued")).delivery).toBeUndefined();
+      deliveryFact(
+        factoryAssignment("needs-input", delivery({ status: "blocked", stage: "verify" })),
+      ),
+    ).toBe("Blocked · Verify");
+    expect(deliveryFact(factoryAssignment("running", delivery()))).toBe("Running");
+    expect(deliveryFact(factoryAssignment("stopped", delivery({ status: null })))).toBe(
+      "Not started",
+    );
+    expect(deliveryFact(factoryAssignment("queued"))).toBe("Not started");
   });
 
-  it("opens its Work item in the Work page of its own project", () => {
+  it("keeps a To do item, its queue rank and its open pull request as separate facts", () => {
+    const item = factoryAssignment(
+      "needs-input",
+      delivery({
+        status: "pr_open",
+        stage: "pr",
+        pullRequestUrl: "https://github.com/acme/alpha/pull/7",
+        proceeding: false,
+      }),
+      {
+        priority: 1,
+        source: { title: "Format durations", status: "todo", statusName: null, assignee: null },
+      },
+    );
+    expect(factsOf(item)).toEqual({
+      "Work status": "To do",
+      "Queue priority": "P1",
+      "Human assignee": "Unassigned",
+      "Factory delivery": "PR open · Pull request",
+    });
+    expect(row(item).nextAction?.title).toBe("Ready for your review");
+  });
+
+  it("reads a source it could not read as unavailable, in the source's words otherwise", () => {
+    expect(factsOf(factoryAssignment("running", delivery()))).toMatchObject({
+      "Work status": "Not available",
+      "Human assignee": "Not available",
+    });
+    expect(
+      factsOf(
+        factoryAssignment("running", delivery(), {
+          source: {
+            title: "Format durations",
+            status: "in_progress",
+            statusName: "In review",
+            assignee: "Sam",
+          },
+        }),
+      ),
+    ).toMatchObject({ "Work status": "In review", "Human assignee": "Sam" });
+  });
+
+  it("reads the delivery's current state, whatever note its assignment last mirrored", () => {
+    // What the chat and the assignment's note said while the delivery ran stays as it was.
+    const item = factoryAssignment(
+      "running",
+      delivery({
+        status: "pr_open",
+        pullRequestUrl: "https://github.com/a/b/pull/1",
+        proceeding: false,
+      }),
+      { notice: "Factory delivery d1 is running." },
+    );
+    expect(row(item).nextAction?.title).toBe("Ready for your review");
+    expect(row(item).reasons).toEqual(["Factory delivery d1 is running."]);
+    expect(row(factoryAssignment("queued")).nextAction).toBeNull();
+  });
+
+  it("reads a merged pull request as closing out, and a following one as following", () => {
+    const url = "https://github.com/a/b/pull/1";
+    expect(
+      row(
+        factoryAssignment(
+          "running",
+          delivery({
+            status: "pr_open",
+            pullRequestUrl: url,
+            pullRequestOutcome: "merged",
+            proceeding: true,
+          }),
+        ),
+      ).nextAction?.title,
+    ).toBe("Merged, finishing up");
+    expect(
+      row(factoryAssignment("running", delivery({ status: "running", pullRequestUrl: url })))
+        .nextAction?.title,
+    ).toBe("Following up on the pull request");
+  });
+
+  it("opens its Work item in the All view of its own project and environment", () => {
     expect(row(factoryAssignment("running", delivery())).work).toEqual({
       to: "/work",
       search: {
         project: `local:project-a`,
         item: `${workItem.sourceId}:${workItem.itemId}`,
+        view: "all",
       },
     });
+    expect(
+      factoryAssignmentRow(factoryAssignment("running", delivery()), EnvironmentId.make("remote"))
+        ?.work?.search.project,
+    ).toBe("remote:project-a");
     const { workItem: _, ...withoutItem } = factoryAssignment("running");
     expect(row(withoutItem).work).toBeNull();
   });
@@ -280,6 +373,24 @@ describe("a Factory assignment's row", () => {
   });
 });
 
+describe("what a row is called", () => {
+  const goal = "Format durations exactly, in every place the app shows one, and ".repeat(8);
+
+  it("takes the short title, and never cuts the goal to make one", () => {
+    expect(portfolioRowTitle({ title: "Format durations", goal }, "idea")).toBe("Format durations");
+  });
+
+  it("keeps a legacy item's long title until its owner edits it", () => {
+    const stored = "x".repeat(400);
+    expect(portfolioRowTitle({ title: stored, goal }, "idea")).toBe(stored);
+  });
+
+  it("reads an older server's goal, and an empty one's id", () => {
+    expect(portfolioRowTitle({ goal }, "idea")).toBe(goal);
+    expect(portfolioRowTitle({ title: "  ", goal: "" }, "idea")).toBe("idea");
+  });
+});
+
 describe("an idea's capture", () => {
   const idea = (capture?: AssistantOverview["ideas"][number]["capture"]) => ({
     projectId: ProjectId.make("project-a"),
@@ -294,9 +405,33 @@ describe("an idea's capture", () => {
 
   it("says nothing of an idea with none, from an older server too", () => {
     expect(ideaCaptureRow(idea(), environmentId)).toBeNull();
+    expect(ideaFacts(idea(), undefined)).toBeNull();
   });
 
-  it("opens a captured item in Work", () => {
+  it("states a captured idea's facts apart, with no delivery until one exists", () => {
+    const captured = {
+      ...idea({ state: "captured", item: workItem }),
+      priority: 3,
+      source: { title: "Prepare", status: "todo" as const, statusName: null, assignee: "Sam" },
+    };
+    const facts = (assignment?: Assignment) =>
+      Object.fromEntries(
+        (ideaFacts(captured, assignment) ?? []).map(({ label, value }) => [label, value]),
+      );
+    expect(facts()).toEqual({
+      "Work status": "To do",
+      "Queue priority": "P3",
+      "Human assignee": "Sam",
+      "Factory delivery": "Not started",
+    });
+    expect(
+      facts(factoryAssignment("running", delivery({ status: "pr_open", stage: "pr" })))[
+        "Factory delivery"
+      ],
+    ).toBe("PR open · Pull request");
+  });
+
+  it("opens a captured item in the All view, where a saved filter cannot hide it", () => {
     expect(ideaCaptureRow(idea({ state: "captured", item: workItem }), environmentId)).toEqual({
       text: "Captured as fd-aaaaaa.",
       work: {
@@ -304,6 +439,7 @@ describe("an idea's capture", () => {
         search: {
           project: "local:project-a",
           item: `${workItem.sourceId}:${workItem.itemId}`,
+          view: "all",
         },
       },
     });
@@ -314,5 +450,41 @@ describe("an idea's capture", () => {
     expect(
       ideaCaptureRow(idea({ state: "uncertain", item: workItem }), environmentId)?.work,
     ).toBeNull();
+  });
+});
+
+describe("an attempt run under a review", () => {
+  const ended = (reviewed: boolean) =>
+    assignmentActions({
+      assignmentId: "a",
+      projectId: ProjectId.make("project"),
+      ideaId: "idea",
+      state: "cancelled",
+      attempt: 1,
+      goal: "Ship it",
+      brief: "",
+      threadId: null,
+      runId: null,
+      evidence: [],
+      notice: "",
+      executor: "factory",
+      reviewed,
+      factory: {
+        deliveryId: "d",
+        status: "cancelled",
+        stage: null,
+        needsYou: null,
+        capacityWait: false,
+        automaticWaits: { waiting: 0, blocked: 0 },
+        endedDispositions: 0,
+        notices: [],
+        pullRequestUrl: null,
+        threadId: null,
+      },
+    });
+
+  it("offers no retry, since only a fresh review can start another", () => {
+    expect(ended(false)).toContain("retry");
+    expect(ended(true)).not.toContain("retry");
   });
 });

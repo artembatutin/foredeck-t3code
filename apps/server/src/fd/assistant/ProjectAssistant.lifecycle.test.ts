@@ -7,6 +7,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
+import { pendingActionReason } from "@t3tools/shared/fd/approvals";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -170,6 +171,10 @@ const factoryPort = (fakes: Fakes): typeof HandoffBackend.HandoffFactory.Service
         : Effect.succeed(fakes.runState),
     ),
   requests: () => Effect.sync(() => fakes.requests),
+  pendingRequests: Effect.sync(() => ({
+    byRoot: new Map([...fakes.deliveries.keys()].map((id) => [id, fakes.requests] as const)),
+    complete: true,
+  })),
 });
 
 const layerOf = (fakes: Fakes) => {
@@ -1287,6 +1292,44 @@ describe("a Factory assignment's controls", () => {
           }),
         );
         assert.include(failure.message, refused);
+        assert.deepStrictEqual(fakes.dispatched, []);
+      }),
+    );
+  });
+
+  it.effect("words a permission's notice as the owner's list does, sending to its thread", () => {
+    const fakes = makeFakes();
+    return withFakes(
+      fakes,
+      Effect.gen(function* () {
+        yield* claimedAssignment(fakes);
+        const request = {
+          threadId: "author-thread",
+          requestId: "request-1",
+          kind: "file-change",
+          capability: "live",
+          run: live,
+          questions: null,
+          runtimeMode: "auto-accept-edits",
+        } as const;
+        fakes.requests = [request];
+        fakes.activity = { ...idle, phase: "proceeding" };
+        yield* tick;
+        const reason = pendingActionReason({
+          kind: request.kind,
+          runClass: "factory",
+          runtimeMode: request.runtimeMode,
+          capability: request.capability,
+        });
+        assert.isTrue(
+          (yield* notes).some(
+            (note) =>
+              note.includes("Provider or session permission on thread author-thread") &&
+              note.includes(reason) &&
+              note.includes("question tools cannot grant permission") &&
+              !note.includes("assistant_answer"),
+          ),
+        );
         assert.deepStrictEqual(fakes.dispatched, []);
       }),
     );

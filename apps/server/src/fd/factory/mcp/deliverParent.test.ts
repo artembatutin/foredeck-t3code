@@ -36,6 +36,7 @@ import * as FactoryWorkComments from "../FactoryWorkComments.ts";
 import * as FactoryWorker from "../FactoryWorker.ts";
 import * as Factory from "../index.ts";
 import { wsHandlers } from "../rpc/handlers.ts";
+import { unusedCommandSetup as commands } from "../testkit/commandSetup.ts";
 import * as FactoryVerifyRunner from "../verify/FactoryVerifyRunner.ts";
 import { toolLayer } from "./handlers.ts";
 import { FactoryToolkit } from "./tools.ts";
@@ -156,6 +157,7 @@ describe("a parent start of an item outside Markdown", () => {
       const handlers = wsHandlers({
         factory: yield* FactoryService.FactoryService,
         settings: yield* FactorySettings.FactorySettings,
+        commands,
         startup: ServerRuntimeStartup.ServerRuntimeStartup.of({
           awaitCommandReady: Effect.void,
           markHttpListening: Effect.void,

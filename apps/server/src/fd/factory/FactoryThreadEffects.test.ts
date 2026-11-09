@@ -11,7 +11,12 @@ import {
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
-import { FactoryDeliveryId, FactoryProjectSettings } from "@t3tools/contracts/fd/factory";
+import {
+  FactoryDeliveryId,
+  FactoryProjectSettings,
+  type FactoryReviewedExecution,
+  type FactoryRoleExecution,
+} from "@t3tools/contracts/fd/factory";
 import {
   type WorkItemDetail,
   WorkItemId,
@@ -41,6 +46,7 @@ import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegist
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import { getAutoBootstrapThreadModelSelection } from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as SourceControlProviderRegistry from "../../sourceControl/SourceControlProviderRegistry.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService } from "../work-management/index.ts";
@@ -60,7 +66,24 @@ import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import { advance } from "./pipeline/engine.ts";
 import { queuedDeliveryState } from "./pipeline/state.ts";
 import type { FactoryDeliveryState, FactoryEvent } from "./pipeline/state.ts";
-import { type FactoryAuthorItem, renderAuthorPrompt } from "./prompts/author.ts";
+import { authorThreadTitle, type FactoryAuthorItem, renderAuthorPrompt } from "./prompts/author.ts";
+import {
+  authorCommits,
+  drainFactory,
+  git as deliveryGit,
+  stateOf,
+  verifyCommands,
+  type World as DeliveryWorld,
+  withProject,
+} from "./testkit/deliveryHarness.ts";
+import { awaitedRun, passingReview } from "./testkit/followThrough.ts";
+import {
+  failsUntilFixed,
+  offeredModels,
+  reviewNow,
+  selection,
+  setSettings,
+} from "./testkit/reviewed.ts";
 import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 
@@ -114,6 +137,13 @@ interface World {
   readsUntilFailure: number | null;
   /** Runs inside each launch, standing in for its preparation. */
   onLaunch: Effect.Effect<void> | null;
+  /** The provider threads the author thread has, and which it is on now. */
+  providerThreads: ReadonlyArray<{
+    readonly id: string;
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly nativeMetadata: { readonly modelSelection?: ModelSelection } | null;
+  }>;
+  activeProviderThreadId: string | null;
   /** The author thread's events after the launch, as the test offers them. */
   readonly events: Queue.Queue<OrchestrationV2StoredEvent>;
   /** Completed once the launch subscribes to the thread's events. */
@@ -124,6 +154,9 @@ interface World {
 // result, so the fakes build no more than that.
 const fakes = (world: World) =>
   Layer.mergeAll(
+    Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+      resolveLink: () => undefined,
+    }),
     Layer.mock(ThreadLaunch.ThreadLaunchService)({
       launch: (input) =>
         Effect.suspend(() => {
@@ -185,8 +218,10 @@ const fakes = (world: World) =>
               worktreePath: world.worktreePath,
               deletedAt: null,
               modelSelection: authorModel,
+              activeProviderThreadId: world.activeProviderThreadId,
             },
             runs,
+            providerThreads: world.providerThreads,
           };
         })) as unknown as ProjectionStore.ProjectionStoreV2["Service"]["getThreadRecords"],
     }),
@@ -221,7 +256,7 @@ const makeLayer = (world: World) =>
   FactoryWorker.layer.pipe(
     // Transition comments are posted in FactoryWorkComments.test.ts; none is posted here.
     Layer.provide(Layer.mock(FactoryWorkComments.FactoryWorkComments)({ post: () => Effect.void })),
-    Layer.provide(
+    Layer.provideMerge(
       Layer.mergeAll(
         FactoryThreadEffects.layer,
         FactoryReview.layer.pipe(Layer.provide(FactoryEvidence.layer)),
@@ -268,6 +303,8 @@ const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) =>
       sendFailure: null,
       readsUntilFailure: null,
       onLaunch: null,
+      providerThreads: [],
+      activeProviderThreadId: null,
       events: yield* Queue.unbounded<OrchestrationV2StoredEvent>(),
       watching: yield* Deferred.make<void>(),
     };
@@ -408,6 +445,30 @@ const threadEvent = (type: "thread.metadata-updated" | "run.updated") =>
   }) as unknown as OrchestrationV2StoredEvent;
 
 const passingVerify = `console.log("all checks passed")`;
+
+describe("what a thread is called", () => {
+  const criteria = "1. The export writes a header row.\n2. A comma stays inside its field.";
+  const described = { ...item, body: `Users can export the current table.\n\n${criteria}` };
+
+  it("takes the item's short title, while its prompt keeps every criterion", () => {
+    assert.strictEqual(authorThreadTitle(described), "fd-aaaaaa: Add the export button");
+    const text = renderAuthorPrompt({ item: described, branch: "feature/fd-aaaaaa" });
+    assert.include(text, "1. The export writes a header row.");
+    assert.include(text, "2. A comma stays inside its field.");
+  });
+
+  it("cuts only the thread's label for a legacy long title, never the item or its body", () => {
+    const stored = "Format ".repeat(70).trim();
+    const legacy = { ...described, title: stored };
+    assert.strictEqual(authorThreadTitle(legacy).length, 100);
+    assert.isTrue(authorThreadTitle(legacy).startsWith("fd-aaaaaa: Format Format"));
+    // The label is cut on its own: the item and what its prompt says of it are as they were.
+    assert.strictEqual(legacy.title, stored);
+    const text = renderAuthorPrompt({ item: legacy, branch: "feature/fd-aaaaaa" });
+    assert.include(text, stored);
+    assert.include(text, "2. A comma stays inside its field.");
+  });
+});
 
 describe("FactoryThreadEffects launches", () => {
   it.effect("launches the first author thread on a new worktree and records it", () =>
@@ -1058,6 +1119,539 @@ describe("FactoryThreadEffects failures", () => {
           "Factory could not launch the author thread (FactoryBaselineError).",
         );
       }),
+    ),
+  );
+});
+
+describe("what each role of a delivery runs on", () => {
+  const execution = Effect.gen(function* () {
+    const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
+    const delivery = yield* Effect.flatMap(FactoryDeliveryStore.FactoryDeliveryStore, (store) =>
+      store.get(deliveryId),
+    );
+    return (yield* threads.deliveryExecution(Option.getOrThrow(delivery))).roles;
+  });
+  const roleOf = (roles: ReadonlyArray<FactoryRoleExecution>, role: FactoryRoleExecution["role"]) =>
+    roles.find((entry) => entry.role === role);
+  const codex = ProviderInstanceId.make("codex");
+  const reported: ModelSelection = {
+    instanceId: codex,
+    model: "author-model",
+    options: [{ id: "effort", value: "low" }],
+  };
+
+  it.effect("reads a role with a thread from it, and one without from the project's settings", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        world.existingAuthor = true;
+        world.projectModel = projectModel;
+        yield* useSettings({});
+        yield* insert({ ...queued, threads: { author } });
+        assert.deepStrictEqual(yield* execution, [
+          { role: "author", selection: authorModel, binding: "read_now" },
+          { role: "reviewer", selection: projectModel, binding: "read_now" },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("says a parent's planner, which launches no author of its own", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        world.projectModel = projectModel;
+        yield* useSettings({});
+        yield* insert({ ...queued, kind: "parent" });
+        assert.deepStrictEqual(
+          (yield* execution).map(({ role }) => role),
+          ["planner", "reviewer"],
+        );
+      }),
+    ),
+  );
+
+  it.effect(
+    "lists only the threads an ended delivery without a review ran, reading no default",
+    () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          world.existingAuthor = true;
+          yield* insert({ ...queued, status: "cancelled", threads: { author } });
+          assert.deepStrictEqual(yield* execution, [
+            { role: "author", selection: authorModel, binding: "read_now" },
+          ]);
+        }),
+      ),
+  );
+
+  it.effect("carries only what the thread's active provider thread itself reported", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        world.existingAuthor = true;
+        yield* useSettings({});
+        yield* insert({ ...queued, threads: { author } });
+        const authorRole = Effect.map(execution, (roles) => roleOf(roles, "author"));
+
+        // A provider thread that reported nothing: the request is not read back as its report.
+        world.activeProviderThreadId = "native-1";
+        world.providerThreads = [
+          { id: "native-1", providerInstanceId: codex, nativeMetadata: null },
+        ];
+        assert.notProperty(yield* authorRole, "acknowledged");
+
+        // A report from a thread the delivery has since handed off from says nothing of now.
+        world.providerThreads = [
+          {
+            id: "native-0",
+            providerInstanceId: codex,
+            nativeMetadata: { modelSelection: reported },
+          },
+          { id: "native-1", providerInstanceId: codex, nativeMetadata: null },
+        ];
+        assert.notProperty(yield* authorRole, "acknowledged");
+
+        // Nor does one from another provider instance than the thread runs on.
+        world.providerThreads = [
+          {
+            id: "native-1",
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            nativeMetadata: { modelSelection: reported },
+          },
+        ];
+        assert.notProperty(yield* authorRole, "acknowledged");
+
+        // A real report stands beside the request, even where they differ.
+        world.providerThreads = [
+          {
+            id: "native-1",
+            providerInstanceId: codex,
+            nativeMetadata: { modelSelection: reported },
+          },
+        ];
+        assert.deepStrictEqual(yield* authorRole, {
+          role: "author",
+          selection: authorModel,
+          binding: "read_now",
+          acknowledged: reported,
+        });
+      }),
+    ),
+  );
+});
+
+describe("a role's saved options, on the server's real stack", () => {
+  const factoryService = Factory.FactoryService.FactoryService;
+  const identity = ["-c", "user.name=Ada Lovelace", "-c", "user.email=ada@example.com"];
+  const tier = {
+    id: "serviceTier",
+    label: "Service tier",
+    type: "select",
+    options: [
+      { id: "standard", label: "Standard", isDefault: true },
+      { id: "priority", label: "Priority" },
+    ],
+  } as const;
+  const effortOf = (model: string, value: string) => ({
+    ...selection(model, value),
+    options: [
+      { id: "effort", value },
+      { id: "serviceTier", value: "priority" },
+    ],
+  });
+  const authorSaved = effortOf("author-model", "high");
+  const reviewerSaved = effortOf("reviewer-model", "medium");
+  const providersWithTier = () =>
+    offeredModels().map((provider) => ({
+      ...provider,
+      models: provider.models.map((model) => ({
+        ...model,
+        capabilities: {
+          optionDescriptors: [...(model.capabilities?.optionDescriptors ?? []), tier],
+        },
+      })),
+    }));
+  const turnsOn = (world: DeliveryWorld, threadId: ThreadId) =>
+    world.provider.started.filter((turn) => turn.threadId === threadId);
+  const blockingReview = {
+    ...passingReview(),
+    verdict: "changes-required",
+    findings: [
+      {
+        id: "empty-export",
+        severity: "high",
+        required: true,
+        file: "export.ts",
+        line: 1,
+        detail: "Empty input crashes the export.",
+      },
+    ],
+  };
+  const commitFixed = (worktreePath: string) =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      yield* fileSystem.writeFileString(path.join(worktreePath, "fixed.ts"), "export {};\n");
+      yield* deliveryGit(worktreePath, ["add", "-A"]);
+      yield* deliveryGit(worktreePath, [
+        ...identity,
+        "commit",
+        "--no-verify",
+        "-m",
+        "fix: add the export",
+      ]);
+    });
+  const executionOf = (id: FactoryDeliveryId) =>
+    Effect.gen(function* () {
+      const factory = yield* factoryService;
+      const found = yield* factory.getForClient(id);
+      return Option.getOrThrow(found).execution?.roles;
+    });
+
+  it.live(
+    "run with every launch and repair on the author's own thread, across a stop and a restart",
+    () =>
+      withProject(
+        failsUntilFixed,
+        (world) =>
+          Effect.gen(function* () {
+            yield* setSettings(world, {
+              verifyCommand: failsUntilFixed,
+              roles: { author: authorSaved, reviewer: reviewerSaved },
+              // No escalation to tell apart from an option that moved.
+              highRiskEffort: "medium",
+            });
+            const factory = yield* factoryService;
+            const author = yield* world.start;
+            const root = author.deliveryId;
+            assert.deepStrictEqual(world.provider.started[0]?.modelSelection, authorSaved);
+
+            // Verify fails, so its repair is a turn on the very thread the author launched on.
+            yield* authorCommits(author.worktreePath, "feat: add the export button");
+            yield* world.endRun(author.runId, "completed");
+            const repair = yield* awaitedRun(root);
+            assert.strictEqual(repair.threadId, author.threadId);
+            assert.deepStrictEqual(
+              turnsOn(world, author.threadId).map(({ modelSelection }) => modelSelection),
+              [authorSaved, authorSaved],
+            );
+
+            yield* factory.stop(root);
+            yield* commitFixed(author.worktreePath);
+            yield* world.endRun(repair.runId, "completed");
+            assert.strictEqual((yield* stateOf(root)).status, "stopped");
+
+            yield* world.rebuild(
+              Effect.gen(function* () {
+                const settings = yield* Factory.FactorySettings.FactorySettings;
+                const stored = yield* settings.get(world.projectId);
+                assert.deepStrictEqual(stored.roles.author, authorSaved);
+                assert.deepStrictEqual(stored.roles.reviewer, reviewerSaved);
+
+                const restarted = yield* factoryService;
+                yield* restarted.resume(root);
+                yield* drainFactory;
+                const review = yield* awaitedRun(root);
+                assert.deepStrictEqual(
+                  turnsOn(world, review.threadId).map(({ modelSelection }) => modelSelection),
+                  [reviewerSaved],
+                );
+
+                // A blocking review's repair goes back to the original author thread, options on.
+                yield* restarted.submitReview({
+                  threadId: review.threadId,
+                  review: blockingReview,
+                });
+                yield* world.endRun(review.runId, "completed");
+                const answer = yield* awaitedRun(root);
+                assert.strictEqual(answer.threadId, author.threadId);
+                const authorTurns = turnsOn(world, author.threadId);
+                assert.strictEqual(authorTurns.length, 3);
+                assert.deepStrictEqual(authorTurns.at(-1)?.modelSelection, authorSaved);
+              }),
+              { orchestration: true },
+            );
+          }).pipe(Effect.orDie),
+        { providers: providersWithTier() },
+      ),
+  );
+
+  it.live("leave a reviewed delivery alone when the defaults are edited, across a restart", () =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          yield* setSettings(world, {
+            verifyCommand: verifyCommands.passes,
+            roles: { author: authorSaved, reviewer: reviewerSaved },
+            highRiskEffort: "medium",
+          });
+          const reviewed = yield* reviewNow(world);
+          const factory = yield* factoryService;
+          const { deliveryId: root } = yield* factory.start({
+            itemRef: world.itemRef,
+            reviewedExecution: reviewed,
+          });
+          const author = yield* world.launched(root);
+
+          const edited = {
+            verifyCommand: verifyCommands.passes,
+            roles: {
+              author: effortOf("other-model", "low"),
+              reviewer: effortOf("other-model", "low"),
+            },
+            highRiskEffort: "medium",
+          };
+          yield* setSettings(world, edited);
+
+          const bound: ReadonlyArray<FactoryRoleExecution> = [
+            {
+              role: "author",
+              selection: reviewed.roles.author,
+              binding: "reviewed",
+              reviewed: reviewed.roles.author,
+            },
+            {
+              role: "reviewer",
+              selection: reviewed.roles.reviewer,
+              binding: "reviewed",
+              reviewed: reviewed.roles.reviewer,
+            },
+          ];
+          assert.deepStrictEqual(yield* executionOf(root), bound);
+          assert.deepStrictEqual(reviewed.roles.author, authorSaved);
+
+          yield* authorCommits(author.worktreePath, "feat: add the export button");
+          yield* factory.stop(root);
+          yield* world.endRun(author.runId, "completed");
+
+          yield* world.rebuild(
+            Effect.gen(function* () {
+              assert.deepStrictEqual(yield* executionOf(root), bound);
+              yield* (yield* factoryService).resume(root);
+              yield* drainFactory;
+              const review = yield* awaitedRun(root);
+              assert.deepStrictEqual(
+                turnsOn(world, review.threadId)[0]?.modelSelection,
+                reviewerSaved,
+              );
+              // The edit stands for the next delivery; it is this one that did not move.
+              const settings = yield* Factory.FactorySettings.FactorySettings;
+              assert.strictEqual(
+                (yield* settings.get(world.projectId)).roles.author?.model,
+                "other-model",
+              );
+            }),
+            { orchestration: true },
+          );
+        }).pipe(Effect.orDie),
+      { providers: providersWithTier() },
+    ),
+  );
+
+  describe("what a role is shown asking for is what it asked the provider", () => {
+    const authorLow = selection("author-model", "low");
+    const authorHigh = selection("author-model", "high");
+    const reviewerLow = selection("reviewer-model", "low");
+    const reviewerHigh = selection("reviewer-model", "high");
+    const escalating = {
+      roles: { author: authorLow, reviewer: reviewerLow },
+      highRiskEffort: "high",
+    };
+    const roleOf = (id: FactoryDeliveryId, role: FactoryRoleExecution["role"]) =>
+      Effect.map(executionOf(id), (roles) => roles?.find((entry) => entry.role === role));
+    /** A delivery of the item stored as a high-risk child's would be, which `start` never makes. */
+    const insertHighRisk = (
+      world: DeliveryWorld,
+      id: FactoryDeliveryId,
+      reviewedExecution?: FactoryReviewedExecution,
+    ) =>
+      Effect.flatMap(FactoryDeliveryStore.FactoryDeliveryStore, (store) =>
+        store.insert({
+          deliveryId: id,
+          projectId: world.projectId,
+          itemRef: world.itemRef,
+          state: queuedDeliveryState({
+            branch: "feature/high-risk",
+            baseRef: "main",
+            risk: "high",
+            ...(reviewedExecution === undefined ? {} : { reviewedExecution }),
+          }),
+        }),
+      );
+    const startInserted = (id: FactoryDeliveryId) =>
+      Effect.flatMap(Factory.FactoryWorker.FactoryWorker, (worker) =>
+        worker.step(id, { type: "start" }),
+      );
+
+    it.live("keeps a high-risk launch's escalated effort apart from the reviewed one", () =>
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            yield* setSettings(world, { verifyCommand: verifyCommands.passes, ...escalating });
+            const reviewed = yield* reviewNow(world);
+            const id = FactoryDeliveryId.make("high-risk-reviewed");
+            yield* insertHighRisk(world, id, reviewed);
+
+            // Before anything launched: what the launch will ask for, not what was reviewed.
+            assert.deepStrictEqual(yield* executionOf(id), [
+              { role: "author", binding: "reviewed", reviewed: authorLow, selection: authorHigh },
+              {
+                role: "reviewer",
+                binding: "reviewed",
+                reviewed: reviewerLow,
+                selection: reviewerHigh,
+              },
+            ]);
+
+            yield* startInserted(id);
+            yield* world.launched(id);
+            assert.deepStrictEqual(world.provider.started[0]?.modelSelection, authorHigh);
+            assert.deepStrictEqual(yield* roleOf(id, "author"), {
+              role: "author",
+              binding: "reviewed",
+              reviewed: authorLow,
+              selection: authorHigh,
+            });
+          }).pipe(Effect.orDie),
+        { providers: offeredModels() },
+      ),
+    );
+
+    it.live("follows a later round's escalated turn, the reviewed value staying as it was", () =>
+      withProject(
+        failsUntilFixed,
+        (world) =>
+          Effect.gen(function* () {
+            yield* setSettings(world, { verifyCommand: failsUntilFixed, ...escalating });
+            const reviewed = yield* reviewNow(world);
+            const factory = yield* factoryService;
+            const { deliveryId: root } = yield* factory.start({
+              itemRef: world.itemRef,
+              reviewedExecution: reviewed,
+            });
+            const author = yield* world.launched(root);
+            assert.deepStrictEqual((yield* roleOf(root, "author"))?.selection, authorLow);
+
+            yield* authorCommits(author.worktreePath, "feat: add the export button");
+            yield* world.endRun(author.runId, "completed");
+            const firstFix = yield* awaitedRun(root);
+            assert.deepStrictEqual((yield* roleOf(root, "author"))?.selection, authorLow);
+
+            yield* authorCommits(
+              author.worktreePath,
+              "fix: try the export again",
+              "export const x = 2;\n",
+            );
+            yield* world.endRun(firstFix.runId, "completed");
+            yield* awaitedRun(root);
+            const asked = turnsOn(world, author.threadId).at(-1)?.modelSelection;
+            assert.deepStrictEqual(asked, authorHigh);
+            assert.deepStrictEqual(yield* roleOf(root, "author"), {
+              role: "author",
+              binding: "reviewed",
+              reviewed: authorLow,
+              selection: authorHigh,
+            });
+          }).pipe(Effect.orDie),
+        { providers: offeredModels() },
+      ),
+    );
+
+    it.live("says a fix-commit turn asked for medium, the reviewed value staying as it was", () =>
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            yield* setSettings(world, { verifyCommand: verifyCommands.passes, ...escalating });
+            const reviewed = yield* reviewNow(world);
+            const factory = yield* factoryService;
+            const { deliveryId: root } = yield* factory.start({
+              itemRef: world.itemRef,
+              reviewedExecution: reviewed,
+            });
+            const author = yield* world.launched(root);
+            const fileSystem = yield* FileSystem.FileSystem;
+            const path = yield* Path.Path;
+            yield* fileSystem.writeFileString(
+              path.join(author.worktreePath, "uncommitted.ts"),
+              "export {};\n",
+            );
+            yield* world.endRun(author.runId, "completed");
+            yield* awaitedRun(root);
+
+            const medium = selection("author-model", "medium");
+            assert.deepStrictEqual(turnsOn(world, author.threadId).at(-1)?.modelSelection, medium);
+            assert.deepStrictEqual(yield* roleOf(root, "author"), {
+              role: "author",
+              binding: "reviewed",
+              reviewed: authorLow,
+              selection: medium,
+            });
+          }).pipe(Effect.orDie),
+        { providers: offeredModels() },
+      ),
+    );
+
+    it.live("escalates a launch without a review too, with no reviewed value to name", () =>
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            yield* setSettings(world, { verifyCommand: verifyCommands.passes, ...escalating });
+            const id = FactoryDeliveryId.make("high-risk-unreviewed");
+            yield* insertHighRisk(world, id);
+            assert.deepStrictEqual(yield* roleOf(id, "author"), {
+              role: "author",
+              binding: "read_now",
+              selection: authorHigh,
+            });
+            yield* startInserted(id);
+            yield* world.launched(id);
+            assert.deepStrictEqual(world.provider.started[0]?.modelSelection, authorHigh);
+            assert.deepStrictEqual(yield* roleOf(id, "author"), {
+              role: "author",
+              binding: "read_now",
+              selection: authorHigh,
+            });
+          }).pipe(Effect.orDie),
+        { providers: offeredModels() },
+      ),
+    );
+  });
+
+  it.live("show a delivery without a review what it reads now, and no listing pays for it", () =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          yield* setSettings(world, {
+            verifyCommand: verifyCommands.passes,
+            roles: { author: authorSaved, reviewer: reviewerSaved },
+          });
+          const factory = yield* factoryService;
+          const author = yield* world.start;
+          const root = author.deliveryId;
+          assert.deepStrictEqual(yield* executionOf(root), [
+            { role: "author", selection: authorSaved, binding: "read_now" },
+            { role: "reviewer", selection: reviewerSaved, binding: "read_now" },
+          ]);
+
+          // The reviewer has no thread yet, so the edit is what it would launch with. The author's
+          // next turn runs on its thread, whatever the default says now.
+          const next = effortOf("other-model", "low");
+          yield* setSettings(world, {
+            verifyCommand: verifyCommands.passes,
+            roles: { author: next, reviewer: next },
+          });
+          assert.deepStrictEqual(yield* executionOf(root), [
+            { role: "author", selection: authorSaved, binding: "read_now" },
+            { role: "reviewer", selection: next, binding: "read_now" },
+          ]);
+
+          const listed = yield* factory.listForClients({ projectId: world.projectId });
+          assert.isUndefined(listed[0]?.execution);
+        }).pipe(Effect.orDie),
+      { providers: providersWithTier() },
     ),
   );
 });

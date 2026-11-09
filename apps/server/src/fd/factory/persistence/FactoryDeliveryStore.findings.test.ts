@@ -140,7 +140,7 @@ describe("FactoryDeliveryStore with reviews accepted before details", () => {
   it.effect("shows the reviews' counts in its snapshot, with no details", () =>
     Effect.gen(function* () {
       yield* insertRow;
-      const snapshot = toFactoryDelivery({ ...(yield* load), stageRuns: [] });
+      const snapshot = toFactoryDelivery({ ...(yield* load), stageRuns: [], stageAttempts: {} });
       expect(snapshot.reviews).toEqual([
         { ...summary(1), number: 1 },
         { ...summary(2), number: 2 },
@@ -199,7 +199,7 @@ describe("FactoryDeliveryStore with reviews accepted before details", () => {
 
       const reloaded = yield* load;
       assert.deepStrictEqual(reloaded.state, state);
-      const snapshot = toFactoryDelivery({ ...reloaded, stageRuns: [] });
+      const snapshot = toFactoryDelivery({ ...reloaded, stageRuns: [], stageAttempts: {} });
       expect(snapshot.reviews.map((review) => review.details)).toEqual([
         undefined,
         withDetails.details,

@@ -2,15 +2,20 @@ import { AuthWorkReadScope, AuthWorkWriteScope } from "@t3tools/contracts";
 import type {
   WorkErrorReasonValue,
   WorkItemDetail,
+  WorkItemId,
   WorkItemSummary,
   WorkListQuery,
   WorkListResult,
+  WorkSourceId,
 } from "@t3tools/contracts/fd/work-management";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 
 import { HandoffBackend } from "../assistant/index.ts";
 import {
   actorFromCaller,
+  actorFromSession,
   type WorkActor,
   type WorkDomainError,
   workItemNotes,
@@ -27,6 +32,9 @@ const reader: WorkActor = {
 
 /** Each page a marker lookup reads holds this many items. */
 const LOOKUP_PAGE = 100;
+
+/** How long the overview waits on a Work source before showing its rows without its facts. */
+const SUMMARIES_TIMEOUT = "3 seconds";
 
 /** Work's own category for each of its failures, as its transports report it. */
 const REASONS: Readonly<Record<WorkDomainError["_tag"], WorkErrorReasonValue>> = {
@@ -95,6 +103,35 @@ export const make = Effect.gen(function* () {
         Effect.mapError(failed("read")),
       );
 
+  const summaries: Backend["summaries"] = (refs) =>
+    Effect.gen(function* () {
+      const bySource = new Map<WorkSourceId, Array<WorkItemId>>();
+      for (const { sourceId, itemId } of refs) {
+        bySource.set(sourceId, [...(bySource.get(sourceId) ?? []), itemId]);
+      }
+      const read = yield* Effect.forEach(
+        [...bySource],
+        ([sourceId, itemIds]) =>
+          work.currentSummaries(sourceId, itemIds).pipe(
+            Effect.timeoutOption(SUMMARIES_TIMEOUT),
+            Effect.map(Option.getOrElse(() => [])),
+            Effect.catchCause((cause) =>
+              Cause.hasInterruptsOnly(cause)
+                ? Effect.interrupt
+                : Effect.as(Effect.logWarning("assistant overview read no Work facts", cause), []),
+            ),
+          ),
+        { concurrency: "unbounded" },
+      );
+      return read.flat().map((summary) => ({
+        ref: summary.ref,
+        title: summary.title,
+        status: summary.status,
+        statusName: summary.nativeStatus?.name ?? null,
+        assignee: summary.assignee?.label ?? null,
+      }));
+    });
+
   const findByMarker: Backend["findByMarker"] = ({ sourceId, marker }) =>
     Effect.gen(function* () {
       yield* work.refresh(reader, {});
@@ -120,18 +157,28 @@ export const make = Effect.gen(function* () {
     sources: (projectId) =>
       work.listSources(reader, { projectId, includeDisconnected: false }).pipe(
         Effect.map(({ sources }) =>
-          sources.map(({ sourceId, kind, label }) => ({ sourceId, kind, label })),
+          sources.map(({ sourceId, kind, label, identity, version }) => ({
+            sourceId,
+            kind,
+            label,
+            identity,
+            version,
+          })),
         ),
         Effect.mapError(failed("sources")),
       ),
     read,
+    summaries,
     // What a capture writes is the whole body, as written: a read of it fingerprints the same.
     fingerprint: ({ kind, title, body }) =>
       workItemScopeFingerprint({ kind, title, body, bodyTruncated: false, bodyFidelity: "exact" }),
     findByMarker,
-    // Work's own grant for agents: a read-only client or a plan-mode thread only reads.
-    writer: (caller) => {
-      const actor = actorFromCaller(caller);
+    // An owner writes under their own session's grants, as their client reaches Work. An agent
+    // takes Work's own grant for agents: a read-only client or a plan-mode thread only reads.
+    writer: (input) => {
+      const actor = HandoffBackend.isHandoffOwner(input)
+        ? actorFromSession(input)
+        : actorFromCaller(input);
       return actor.grants.includes(AuthWorkWriteScope)
         ? Effect.succeed(actor)
         : Effect.fail(new HandoffBackend.HandoffWriteRefused());

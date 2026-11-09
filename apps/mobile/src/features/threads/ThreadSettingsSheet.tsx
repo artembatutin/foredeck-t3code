@@ -546,6 +546,7 @@ function ThreadSettingsSessionProvider(
   );
   const runtimeModeChoices = runtimeModeChoicesForSupportedModes(
     displayedModel?.supportedRuntimeModes,
+    displayedModel?.providerDriver,
   );
   const compatibleRuntimeMode = compatibleRuntimeModeForChoices(
     props.runtimeMode,

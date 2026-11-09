@@ -177,6 +177,14 @@ export function codexFileChangeApprovalPrompt(input: {
   return input.grantRoot?.trim() || undefined;
 }
 
+/** What Codex's approvals answer: once, for this session (see `sessionApprovals`), or not. */
+const CODEX_APPROVAL_OPTIONS: ReadonlyArray<ProviderApprovalOption> = [
+  { decision: "cancel", label: "Cancel" },
+  { decision: "decline", label: "Decline" },
+  { decision: "acceptForSession", label: "Always allow this session" },
+  { decision: "accept", label: "Approve" },
+];
+
 // Reasoning effort changes future generation, not the existing context's tokenizer
 // or model window. All other option changes remain untrusted until new telemetry.
 export function canReuseCodexContextUsage(previous: ModelSelection, next: ModelSelection): boolean {
@@ -4226,9 +4234,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           readonly prompt?: string | null;
           readonly appName?: string;
           readonly options?: ReadonlyArray<ProviderApprovalOption>;
+          readonly reason?: string | null | undefined;
         }) =>
           Effect.gen(function* () {
             const createdAt = yield* DateTime.now;
+            const reason = input.reason?.trim();
             // A subagent's approval is asked on the top-level thread and run,
             // under the subagent that asked, where the user can see and answer it.
             const { owner, subagent } = approvalOwnerCodexTurn(input.context);
@@ -4311,7 +4321,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ? {}
                 : { prompt: input.prompt }),
               ...(input.appName === undefined ? {} : { appName: input.appName }),
-              ...(input.options === undefined ? {} : { options: input.options }),
+              options: input.options ?? CODEX_APPROVAL_OPTIONS,
+              ...(reason ? { reason } : {}),
             };
             return { node, request, turnItem };
           });
@@ -5241,6 +5252,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ...((payload.reason ?? payload.command) === undefined
                 ? {}
                 : { prompt: payload.reason ?? payload.command }),
+              reason: payload.reason,
             });
             const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
             yield* Ref.update(pendingRuntimeRequests, (current) => {
@@ -5310,6 +5322,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               nativeRequestId: payload.itemId,
               requestKind: "file-change",
               prompt: codexFileChangeApprovalPrompt(payload) ?? null,
+              reason: payload.reason,
             });
             const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
             yield* Ref.update(pendingRuntimeRequests, (current) => {
@@ -5374,6 +5387,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               nativeRequestId: payload.itemId,
               requestKind,
               ...(payload.reason === undefined ? {} : { prompt: payload.reason }),
+              reason: payload.reason,
             });
             const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
             yield* Ref.update(pendingRuntimeRequests, (current) => {
@@ -5524,6 +5538,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               nativeRequestId,
               requestKind: "command",
               prompt: payload.reason ?? payload.command.join(" "),
+              reason: payload.reason,
             });
             const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
             yield* Ref.update(pendingRuntimeRequests, (current) => {
@@ -5593,6 +5608,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               nativeRequestId: payload.callId,
               requestKind: "file-change",
               prompt: codexFileChangeApprovalPrompt(payload) ?? null,
+              reason: payload.reason,
             });
             const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
             yield* Ref.update(pendingRuntimeRequests, (current) => {

@@ -7,14 +7,19 @@ import {
 } from "@t3tools/contracts";
 import {
   parseWorkItemRefString,
+  type WorkItemDetail,
   type WorkItemRef,
   type WorkItemSummary,
   type WorkManagementSupport,
+  type WorkSource,
   workItemRefString,
+  workItemScopeChanged,
   workManagementSupport,
   type WorkThreadLink,
 } from "@t3tools/contracts/fd/work-management";
 import * as Schema from "effect/Schema";
+
+import { scopedProjectKey, scopeProjectRef } from "../../environment/scoped.ts";
 
 /**
  * Pure Work presentation rules shared by web and mobile, so both surfaces agree on what Ready
@@ -137,13 +142,13 @@ export const workItemReferenceText = (
 };
 
 /**
- * Whether the item changed since the thread was started from it. The snapshot's revision is the
- * item as the thread first saw it.
+ * Whether the requirements changed since the thread was started from the item, as every surface
+ * and agent reads it: Factory's progress comments and a status change are not requirements.
  */
 export const changedSinceLink = (
   link: Pick<WorkThreadLink, "snapshot">,
-  item: Pick<WorkItemSummary, "revision">,
-): boolean => link.snapshot.revision !== item.revision;
+  item: Pick<WorkItemDetail, "scopeFingerprint">,
+): boolean => workItemScopeChanged(link, item);
 
 /**
  * The reverse prompts a linked item offers. "Back to todo?" undoes an automatic start whose run
@@ -166,23 +171,31 @@ export const linkPrompts = (
   };
 };
 
-/** Route params for one item on mobile and in links: the environment, project and reference. */
-export interface WorkItemRouteParams {
-  readonly environmentId: EnvironmentId;
-  readonly projectId: ProjectId;
-  readonly sourceId: string;
-  readonly itemId: string;
-}
+/**
+ * The project that owns a linked item: its source's, which a source keeps for life. A link's thread
+ * says nothing of this, since linking does not compare projects and the assistant's thread lives in
+ * the scratch project. Undefined until the sources are read, or for a source they do not hold.
+ */
+export const workItemOwningProject = (
+  sources: ReadonlyArray<Pick<WorkSource, "sourceId" | "projectId">>,
+  ref: Pick<WorkItemRef, "sourceId">,
+): ProjectId | undefined => sources.find((source) => source.sourceId === ref.sourceId)?.projectId;
 
-export const workItemRouteParams = (input: {
+/**
+ * Where a link to one Work item opens on the web: its exact project and the All view, the one view
+ * every item belongs to. The view travels in the URL, so the owner's saved filter stays as it was.
+ */
+export const workItemLinkTarget = (input: {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
   readonly ref: WorkItemRef;
-}): WorkItemRouteParams => ({
-  environmentId: input.environmentId,
-  projectId: input.projectId,
-  sourceId: input.ref.sourceId,
-  itemId: input.ref.itemId,
+}) => ({
+  to: "/work" as const,
+  search: {
+    project: scopedProjectKey(scopeProjectRef(input.environmentId, input.projectId)),
+    item: workItemRefString(input.ref),
+    view: "all" as const,
+  },
 });
 
 export const parseWorkItemRouteRef = (params: {

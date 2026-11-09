@@ -1,15 +1,17 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
-import { ProjectId, RunId, ThreadId } from "@t3tools/contracts";
+import { ProjectId, ProviderInstanceId, RunId, ThreadId } from "@t3tools/contracts";
 import {
   FactoryDeliveryId,
   type FactoryDeliveryStatus,
   FactoryProjectSettings,
+  type FactoryReviewedExecution,
 } from "@t3tools/contracts/fd/factory";
 import {
   type WorkItemDetail,
   WorkItemId,
   type WorkItemRef,
+  type WorkItemSummary,
   WorkSourceId,
 } from "@t3tools/contracts/fd/work-management";
 import * as Cause from "effect/Cause";
@@ -21,13 +23,18 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as Schema from "effect/Schema";
+import * as Queue from "effect/Queue";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import { type WorkDomainError, WorkService } from "../work-management/index.ts";
+import * as FactoryAdmission from "./FactoryAdmission.ts";
 import * as FactoryChildren from "./FactoryChildren.ts";
 import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryPullRequest from "./FactoryPullRequest.ts";
@@ -41,7 +48,8 @@ import * as FactoryWorker from "./FactoryWorker.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
-import type { FactoryEffect } from "./pipeline/state.ts";
+import { type FactoryEffect, queuedDeliveryState } from "./pipeline/state.ts";
+import { toFactoryDelivery } from "./snapshot.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 
 const projectId = ProjectId.make("project-alpha");
@@ -52,7 +60,7 @@ const otherSpelling: WorkItemRef = { sourceId, itemId: WorkItemId.make("FD-AAAAA
 /** Another item of the source. */
 const otherItem: WorkItemRef = { sourceId, itemId: WorkItemId.make("fd-bbbbbb") };
 /** `workBranchName` of the item below. */
-const branch = "work/fd-aaaaaa-add-the-export-button";
+const branch = "feature/fd-aaaaaa-add-the-export-button";
 const workspaceRoot = "/projects/alpha";
 
 // FactoryService reads only these fields of the item and the project.
@@ -90,11 +98,59 @@ interface World {
   committed: boolean;
   /** Runs inside each base check, before its answer. */
   onCheck: Effect.Effect<void> | null;
+  /** What each `currentSummaries` asked for, by source. */
+  readonly summaryReads: Array<ReadonlyArray<WorkItemId>>;
+  /** Answers each `currentSummaries`; absent answers with no items. */
+  summaries:
+    | ((
+        itemIds: ReadonlyArray<WorkItemId>,
+      ) => Effect.Effect<ReadonlyArray<WorkItemSummary>, WorkDomainError>)
+    | null;
+  /** The queue ranks the admission port answers with, by root. */
+  readonly priorities: Map<FactoryDeliveryId, number | null>;
+  /** Work's refresh epoch and the admission port's queue counter, once a test makes them. */
+  workEpoch: SubscriptionRef.SubscriptionRef<number> | null;
+  queueEpoch: SubscriptionRef.SubscriptionRef<number> | null;
 }
+
+const summaryOf = (itemId: WorkItemId, overrides: Partial<WorkItemSummary> = {}) =>
+  ({
+    ref: { sourceId, itemId },
+    key: itemId,
+    title: "Add the export button",
+    status: "todo",
+    nativeStatus: null,
+    assignee: null,
+    ...overrides,
+  }) as WorkItemSummary;
 
 const fakes = (world: World) =>
   Layer.mergeAll(
+    Layer.succeed(FactoryAdmission.FactoryAdmission, {
+      ...FactoryAdmission.FactoryAdmission.defaultValue(),
+      queueChanges: Stream.suspend(() =>
+        world.queueEpoch === null ? Stream.never : SubscriptionRef.changes(world.queueEpoch),
+      ),
+      queuePriorities: (roots) =>
+        Effect.sync(
+          () =>
+            new Map(
+              roots.flatMap((root) => {
+                const priority = world.priorities.get(root);
+                return priority === undefined ? [] : [[root, priority] as const];
+              }),
+            ),
+        ),
+    }),
     Layer.mock(WorkService.WorkService)({
+      subscribeRefreshes: Stream.suspend(() =>
+        world.workEpoch === null ? Stream.never : SubscriptionRef.changes(world.workEpoch),
+      ),
+      currentSummaries: (_sourceId, itemIds) =>
+        Effect.suspend(() => {
+          world.summaryReads.push(itemIds);
+          return world.summaries === null ? Effect.succeed([]) : world.summaries(itemIds);
+        }),
       // Work's markdown spelling is lowercase.
       canonicalRef: (ref) =>
         Effect.succeed({
@@ -224,6 +280,11 @@ const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
     baseRefused: false,
     committed: true,
     onCheck: null,
+    summaryReads: [],
+    summaries: null,
+    priorities: new Map(),
+    workEpoch: null,
+    queueEpoch: null,
   };
   return body(world).pipe(Effect.provide(makeLayer(world)), Effect.scoped);
 };
@@ -407,6 +468,143 @@ describe("FactoryService.start", () => {
       }),
     ),
   );
+
+  describe("with a reviewed execution", () => {
+    const reviewed = {
+      receiptId: "receipt-1",
+      reviewVersion: 1,
+      roles: {
+        planner: { instanceId: "codex", model: "plan-model" },
+        author: { instanceId: "codex", model: "author-model" },
+        reviewer: { instanceId: "codex", model: "review-model" },
+      },
+      verifyCommand: { executable: "vp", args: ["test"] },
+      setupCommand: null,
+      limits: {
+        maxFixRounds: 3,
+        maxReviewRounds: 4,
+        maxFixCommitTurns: 1,
+        verifyTimeoutMinutes: 9,
+      },
+      blockingSeverities: ["high"],
+      highRiskEffort: "xhigh",
+      pipelineId: "standard",
+      repository: {
+        projectId,
+        workspaceRoot,
+        publication: {
+          push: [],
+          head: [],
+          provider: "unknown",
+          repository: null,
+          remoteConfig: "reviewed-config",
+        },
+      },
+      runtimeCeiling: "auto-accept-edits",
+      promptOverrides: {
+        plan: "absent",
+        author: "absent",
+        review: "absent",
+        "fix-verify": "absent",
+        "fix-review": "absent",
+        "fix-commit": "absent",
+        integrate: "absent",
+      },
+    };
+    const startWith = (reviewedExecution: unknown, runtimeModeCeiling?: "approval-required") =>
+      Effect.flatMap(FactoryService.FactoryService, (factory) =>
+        factory.start({
+          itemRef: canonicalRef,
+          reviewedExecution,
+          ...(runtimeModeCeiling === undefined ? {} : { runtimeModeCeiling }),
+        }),
+      );
+
+    it.effect.each([
+      { name: "nothing", input: null, reason: "malformed" },
+      { name: "an empty value", input: {}, reason: "malformed" },
+      {
+        name: "a review with a field missing",
+        input: { ...reviewed, verifyCommand: undefined },
+        reason: "malformed",
+      },
+      {
+        name: "a review with a role unresolved",
+        input: { ...reviewed, roles: { ...reviewed.roles, reviewer: null } },
+        reason: "malformed",
+      },
+      {
+        name: "a review naming no receipt",
+        input: { ...reviewed, receiptId: "" },
+        reason: "malformed",
+      },
+      {
+        name: "a pipeline this server does not ship",
+        input: { ...reviewed, pipelineId: "another" },
+        reason: "pipeline",
+      },
+      {
+        name: "another project's review",
+        input: {
+          ...reviewed,
+          repository: { ...reviewed.repository, projectId: "project-beta" },
+        },
+        reason: "project",
+      },
+      {
+        name: "another repository's review",
+        input: {
+          ...reviewed,
+          repository: { ...reviewed.repository, workspaceRoot: "/projects/beta" },
+        },
+        reason: "repository",
+      },
+      {
+        name: "a provider bound with no target",
+        input: {
+          ...reviewed,
+          repository: {
+            ...reviewed.repository,
+            publication: { ...reviewed.repository.publication, provider: "gitlab" },
+          },
+        },
+        reason: "malformed",
+      },
+    ] as const)("refuses $name, writing nothing and starting nothing", ({ input, reason }) =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const error = yield* Effect.flip(startWith(input));
+          assert.strictEqual(error._tag, "FactoryReviewedExecutionInvalidError");
+          assert.include(error, { reason });
+          yield* assertNothingStarted(world);
+        }),
+      ),
+    );
+
+    it.effect("refuses a review broader than whoever starts it", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const error = yield* Effect.flip(startWith(reviewed, "approval-required"));
+          assert.include(error, {
+            _tag: "FactoryReviewedExecutionInvalidError",
+            reason: "runtime_ceiling",
+          });
+          yield* assertNothingStarted(world);
+        }),
+      ),
+    );
+
+    it.effect("runs on the review's limits and ceiling, with no settings to read", () =>
+      withWorld(() =>
+        Effect.gen(function* () {
+          const started = yield* startWith(reviewed);
+          assert.deepStrictEqual(started.state.limits, { maxFixRounds: 3, maxReviewRounds: 4 });
+          assert.strictEqual(started.state.runtimeModeCeiling, "auto-accept-edits");
+          assert.strictEqual(started.state.reviewedExecution?.receiptId, "receipt-1");
+        }),
+      ),
+    );
+  });
 
   it.effect("refuses a project without a verify command", () =>
     withWorld((world) =>
@@ -598,10 +796,393 @@ describe("FactoryService.get", () => {
           Option.map(yield* store.get(started.deliveryId), (delivery) => ({
             ...delivery,
             stageRuns,
+            stageAttempts: { author: 1 },
           })),
         );
         assert.isTrue(Option.isNone(yield* get(FactoryDeliveryId.make("delivery-unknown"))));
       }),
     ),
   );
+
+  describe("listForClients", () => {
+    const listed = Effect.flatMap(FactoryService.FactoryService, (service) =>
+      service.listForClients({}),
+    );
+    const setState = (deliveryId: FactoryDeliveryId, status: "cancelled" | "done" | "pr_open") =>
+      Effect.gen(function* () {
+        const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+        const current = Option.getOrThrow(yield* store.get(deliveryId));
+        yield* store.update(deliveryId, { ...current.state, status, awaiting: null });
+      });
+
+    it.effect("carries what the item's source says and its queue rank, apart from its status", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          yield* useVerify;
+          const started = yield* start(canonicalRef);
+          yield* drain;
+          yield* setState(started.deliveryId, "pr_open");
+          world.summaries = (itemIds) =>
+            Effect.succeed(
+              itemIds.map((itemId) =>
+                summaryOf(itemId, {
+                  title: "Format durations",
+                  nativeStatus: { id: "1", name: "Backlog" },
+                  assignee: { id: "sam", label: "Sam" },
+                }),
+              ),
+            );
+          world.priorities.set(started.deliveryId, 1);
+
+          const [delivery] = yield* listed;
+          assert.strictEqual(delivery?.state.status, "pr_open");
+          assert.deepStrictEqual(delivery?.source, {
+            key: "fd-aaaaaa",
+            title: "Format durations",
+            status: "todo",
+            statusName: "Backlog",
+            assignee: "Sam",
+          });
+          assert.strictEqual(delivery?.queuePriority, 1);
+        }),
+      ),
+    );
+
+    it.effect("asks each source once, and only about deliveries still under way", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          yield* useVerify;
+          const ended = yield* start(canonicalRef);
+          yield* drain;
+          yield* setState(ended.deliveryId, "done");
+          yield* start(otherItem);
+          yield* drain;
+
+          const deliveries = yield* listed;
+          assert.deepStrictEqual(world.summaryReads, [[otherItem.itemId]]);
+          const byId = new Map(deliveries.map((delivery) => [delivery.deliveryId, delivery]));
+          assert.notProperty(byId.get(ended.deliveryId), "source");
+        }),
+      ),
+    );
+
+    it.effect.each(["done", "cancelled"] as const)(
+      "keeps a %s delivery's rank, read with no tracker, as Work goes on showing it",
+      (status) =>
+        withWorld((world) =>
+          Effect.gen(function* () {
+            yield* useVerify;
+            const ended = yield* start(canonicalRef);
+            yield* drain;
+            yield* setState(ended.deliveryId, status);
+            world.priorities.set(ended.deliveryId, 1);
+
+            const [delivery] = yield* listed;
+            assert.strictEqual(delivery?.state.status, status);
+            assert.strictEqual(delivery?.queuePriority, 1);
+            assert.strictEqual(toFactoryDelivery(delivery!).queuePriority, 1);
+            // Nothing is under way, so no source was asked anything.
+            assert.deepStrictEqual(world.summaryReads, []);
+            assert.notProperty(delivery, "source");
+          }),
+        ),
+    );
+
+    it.effect("reads an ended delivery's rank apart from one it never had", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          yield* useVerify;
+          const unranked = yield* start(canonicalRef);
+          yield* drain;
+          yield* setState(unranked.deliveryId, "cancelled");
+          const unmanaged = yield* start(otherItem);
+          yield* drain;
+          yield* setState(unmanaged.deliveryId, "done");
+          world.priorities.set(unranked.deliveryId, null);
+
+          const deliveries = yield* listed;
+          const byId = new Map(deliveries.map((delivery) => [delivery.deliveryId, delivery]));
+          assert.isNull(byId.get(unranked.deliveryId)?.queuePriority);
+          assert.notProperty(byId.get(unmanaged.deliveryId), "queuePriority");
+        }),
+      ),
+    );
+
+    it.effect("reads an ended child's rank from its parent, the root its idea ranks", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          yield* useVerify;
+          const parent = yield* start(canonicalRef);
+          yield* drain;
+          const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+          const childId = FactoryDeliveryId.make("delivery-child");
+          yield* store.insert({
+            deliveryId: childId,
+            projectId,
+            itemRef: otherItem,
+            parentId: parent.deliveryId,
+            state: {
+              ...queuedDeliveryState({ kind: "child", branch: "child", baseRef: "HEAD" }),
+              status: "cancelled",
+            },
+          });
+          world.priorities.set(parent.deliveryId, 2);
+
+          const deliveries = yield* listed;
+          const child = deliveries.find(({ deliveryId }) => deliveryId === childId);
+          assert.strictEqual(child?.queuePriority, 2);
+        }),
+      ),
+    );
+
+    it.effect("leaves a source that fails out, and lists the delivery all the same", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          yield* useVerify;
+          const started = yield* start(canonicalRef);
+          yield* drain;
+          world.summaries = () =>
+            Effect.fail(new FakeItemNotFound({ itemId: "x" }) as unknown as WorkDomainError);
+
+          const [delivery] = yield* listed;
+          assert.strictEqual(delivery?.deliveryId, started.deliveryId);
+          assert.notProperty(delivery, "source");
+        }),
+      ),
+    );
+
+    it.effect("lists without a source that does not answer in time", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          yield* useVerify;
+          const started = yield* start(canonicalRef);
+          yield* drain;
+          const asked = yield* Deferred.make<void>();
+          world.summaries = () => Effect.andThen(Deferred.succeed(asked, undefined), Effect.never);
+
+          const listing = yield* Effect.forkChild(listed);
+          yield* Deferred.await(asked);
+          yield* TestClock.adjust("3 seconds");
+          const [delivery] = yield* Fiber.join(listing);
+          assert.strictEqual(delivery?.deliveryId, started.deliveryId);
+          assert.notProperty(delivery, "source");
+        }),
+      ),
+    );
+
+    it.effect("sets no queue rank for a root its manager does not hold", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          yield* useVerify;
+          yield* start(canonicalRef);
+          yield* drain;
+          world.summaries = (itemIds) => Effect.succeed(itemIds.map((itemId) => summaryOf(itemId)));
+          const [delivery] = yield* listed;
+          assert.notProperty(delivery, "queuePriority");
+          assert.strictEqual(delivery?.source?.assignee, null);
+        }),
+      ),
+    );
+  });
+
+  describe("listingChanges", () => {
+    /** Makes Work's and the queue's counters, then answers the epoch a new subscription gets. */
+    const following = (world: World) =>
+      Effect.gen(function* () {
+        const work = yield* SubscriptionRef.make(3);
+        const queue = yield* SubscriptionRef.make(5);
+        world.workEpoch = work;
+        world.queueEpoch = queue;
+        const service = yield* FactoryService.FactoryService;
+        const current = service.listingChanges.pipe(Stream.runHead, Effect.map(Option.getOrThrow));
+        return { work, queue, service, current };
+      });
+    const rise = (counter: SubscriptionRef.SubscriptionRef<number>) =>
+      SubscriptionRef.update(counter, (value) => value + 1);
+
+    it.effect("moves with a Work edit and a queue rank, with no Factory write", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const { work, queue, service, current } = yield* following(world);
+          const start = yield* current;
+          const seen = yield* Queue.unbounded<number>();
+          yield* Effect.forkChild(
+            service.listingChanges.pipe(Stream.runForEach((value) => Queue.offer(seen, value))),
+          );
+          assert.strictEqual(yield* Queue.take(seen), start);
+
+          yield* rise(work);
+          assert.strictEqual(yield* Queue.take(seen), start + 1);
+          yield* rise(queue);
+          assert.strictEqual(yield* Queue.take(seen), start + 2);
+        }),
+      ),
+    );
+
+    it.effect(
+      "moves with Factory's own writes, as a subscriber to Factory's epoch alone does",
+      () =>
+        withWorld((world) =>
+          Effect.gen(function* () {
+            const { service, current } = yield* following(world);
+            yield* useVerify;
+            const before = yield* current;
+            const factoryBefore = yield* service.subscribe.pipe(
+              Stream.runHead,
+              Effect.map(Option.getOrThrow),
+            );
+            yield* start(canonicalRef);
+            yield* drain;
+            const factoryAfter = yield* service.subscribe.pipe(
+              Stream.runHead,
+              Effect.map(Option.getOrThrow),
+            );
+            assert.isAbove(factoryAfter, factoryBefore);
+            assert.strictEqual(yield* current, before + (factoryAfter - factoryBefore));
+          }),
+        ),
+    );
+
+    it.effect("answers a new subscription the same value while nothing has moved", () =>
+      withWorld((world) =>
+        Effect.gen(function* () {
+          const { current } = yield* following(world);
+          assert.strictEqual(yield* current, yield* current);
+        }),
+      ),
+    );
+  });
+
+  describe("what a delivery has spent", () => {
+    const selection = { instanceId: ProviderInstanceId.make("codex"), model: "project-model" };
+
+    /** A delivery that repaired once after a blocking review, then passed its second review. */
+    const repairedOnce = (reviewed: boolean) =>
+      withWorld(() =>
+        Effect.gen(function* () {
+          yield* useVerify;
+          const started = yield* start(canonicalRef);
+          yield* drain;
+          const store = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+          const runs = yield* FactoryStageRunStore.FactoryStageRunStore;
+          const current = Option.getOrThrow(yield* store.get(started.deliveryId));
+          yield* store.update(started.deliveryId, {
+            ...current.state,
+            rounds: { fix: 0, review: 1 },
+            limits: { maxFixRounds: 2, maxReviewRounds: 2 },
+            ...(reviewed
+              ? {
+                  reviewedExecution: {
+                    receiptId: "receipt-1",
+                    reviewVersion: 1,
+                    roles: { planner: selection, author: selection, reviewer: selection },
+                    verifyCommand: { executable: "vp", args: ["test"] },
+                    setupCommand: null,
+                    limits: {
+                      maxFixRounds: 3,
+                      maxReviewRounds: 3,
+                      maxFixCommitTurns: 2,
+                      verifyTimeoutMinutes: 30,
+                    },
+                    blockingSeverities: ["high"],
+                    highRiskEffort: "xhigh",
+                    pipelineId: "standard",
+                    repository: {
+                      projectId,
+                      workspaceRoot,
+                      publication: {
+                        push: [],
+                        head: [],
+                        provider: "unknown",
+                        repository: null,
+                        remoteConfig: "reviewed-config",
+                      },
+                    },
+                    runtimeCeiling: "approval-required",
+                    promptOverrides: {
+                      plan: "absent",
+                      author: "absent",
+                      review: "absent",
+                      "fix-verify": "absent",
+                      "fix-review": "absent",
+                      "fix-commit": "absent",
+                      integrate: "absent",
+                    },
+                  } satisfies FactoryReviewedExecution,
+                }
+              : {}),
+          });
+          // The author's attempt is stored; these follow it as the worker's steps append them.
+          for (const stage of ["verify", "review", "repair", "verify", "review"] as const) {
+            yield* runs.append({ deliveryId: started.deliveryId, stage });
+          }
+          return toFactoryDelivery(Option.getOrThrow(yield* get(started.deliveryId))).allowance;
+        }),
+      );
+
+    it.effect("reports one repair and two review attempts for a delivery with no review", () =>
+      Effect.map(repairedOnce(false), (allowance) =>
+        assert.deepStrictEqual(allowance, {
+          counted: "since_resume",
+          verificationFixes: { used: 0, limit: 2, remaining: 2 },
+          reviewFollowUps: { used: 1, limit: 2, remaining: 1 },
+          fixCommitTurns: { used: 0, limit: 1, remaining: 1 },
+          attempts: { verify: 2, review: 2 },
+        }),
+      ),
+    );
+
+    /** One review, then more verify and repair attempts than the timeline's window holds. */
+    const longHistory = Effect.gen(function* () {
+      yield* useVerify;
+      const started = yield* start(canonicalRef);
+      yield* drain;
+      const runs = yield* FactoryStageRunStore.FactoryStageRunStore;
+      yield* runs.append({ deliveryId: started.deliveryId, stage: "review" });
+      for (let round = 0; round < 25; round += 1) {
+        yield* runs.append({ deliveryId: started.deliveryId, stage: "verify" });
+        yield* runs.append({ deliveryId: started.deliveryId, stage: "repair" });
+      }
+      return started.deliveryId;
+    });
+
+    it.effect("counts a review the timeline's window no longer holds, by every read", () =>
+      withWorld(() =>
+        Effect.gen(function* () {
+          const deliveryId = yield* longHistory;
+          const service = yield* FactoryService.FactoryService;
+          const expected = { verify: 25, review: 1 };
+
+          const read = Option.getOrThrow(yield* get(deliveryId));
+          assert.strictEqual(read.stageRuns.length, 50);
+          assert.isFalse(read.stageRuns.some(({ stage }) => stage === "review"));
+          const snapshot = toFactoryDelivery(read);
+          assert.strictEqual(snapshot.stageRuns.length, 50);
+          assert.deepStrictEqual(snapshot.allowance?.attempts, expected);
+
+          const [listed] = yield* service.list({});
+          assert.deepStrictEqual(toFactoryDelivery(listed!).allowance?.attempts, expected);
+          const [forClient] = yield* service.listForClients({});
+          assert.deepStrictEqual(toFactoryDelivery(forClient!).allowance?.attempts, expected);
+
+          // What a control answers with reads the same as a later list.
+          const stopped = yield* service.stop(deliveryId);
+          assert.strictEqual(stopped.stageRuns.length, 50);
+          assert.deepStrictEqual(toFactoryDelivery(stopped).allowance?.attempts, expected);
+        }),
+      ),
+    );
+
+    it.effect("reports what remains of a reviewed delivery's cumulative allowance", () =>
+      Effect.map(repairedOnce(true), (allowance) =>
+        assert.deepStrictEqual(allowance, {
+          counted: "whole_delivery",
+          verificationFixes: { used: 0, limit: 3, remaining: 3 },
+          reviewFollowUps: { used: 1, limit: 3, remaining: 2 },
+          fixCommitTurns: { used: 0, limit: 2, remaining: 2 },
+          attempts: { verify: 2, review: 2 },
+        }),
+      ),
+    );
+  });
 });

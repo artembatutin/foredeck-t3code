@@ -93,7 +93,7 @@ export const FactoryToolkit = Toolkit.make(
   }),
   Tool.make("factory_status", {
     description:
-      "Read where Factory deliveries stand: pass delivery for one delivery, or item for every delivery of that Work item, newest first. Each shows its status, stage, rounds, branch, threads by role, verify receipt and review summaries, and, when blocked, what needs the owner. Pass exactly one of delivery and item.",
+      "Read where Factory deliveries stand: pass delivery for one delivery, or item for every delivery of that Work item, newest first. Each shows its status, stage, rounds, what it has left of its allowance, its pull request, branch, threads by role, verify receipt and review summaries, and, when blocked, what needs the owner. Pass exactly one of delivery and item.",
     parameters: Schema.Struct({
       delivery: Schema.optionalKey(DeliveryReference),
       item: Schema.optionalKey(ItemReference),

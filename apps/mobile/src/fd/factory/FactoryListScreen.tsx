@@ -100,6 +100,7 @@ export function FactoryListScreen() {
             accessibilityLabel={[
               row.item,
               row.project,
+              row.nextAction,
               row.status,
               row.stage,
               row.needsYou,
@@ -143,6 +144,9 @@ export function FactoryListScreen() {
               >
                 {row.item}
               </Text>
+              <Text className="text-sm text-foreground-muted" numberOfLines={1}>
+                {row.nextAction}
+              </Text>
               {row.needsYou !== undefined ? (
                 <Text className="text-sm text-warning" numberOfLines={2}>
                   {row.needsYou}
@@ -164,6 +168,8 @@ export function FactoryListScreen() {
 const sameRow = (left: MobileFleetRow, right: MobileFleetRow) =>
   left.key === right.key &&
   left.project === right.project &&
+  left.item === right.item &&
+  left.nextAction === right.nextAction &&
   left.status === right.status &&
   left.stage === right.stage &&
   left.needsYou === right.needsYou &&

@@ -300,4 +300,60 @@ describe("WorkLinkStore", () => {
       ]);
     }).pipe(Effect.provide(persistence)),
   );
+
+  it.effect("keeps the scope baseline through a display refresh and a rebuilt store", () =>
+    Effect.gen(function* () {
+      yield* seedSources;
+      const links = yield* WorkLinkStore.WorkLinkStore;
+      const baselined = { ...snapshot("fd-aaaaaa"), scopeFingerprint: "scope-at-link" };
+      const { link } = yield* links.link({
+        sourceId: tasksId,
+        itemId: itemA,
+        threadId: thread1,
+        source: "started",
+        snapshot: baselined,
+      });
+      assert.deepStrictEqual(link.snapshot, baselined);
+
+      yield* links.updateSnapshotDisplay(tasksId, itemA, thread1, {
+        key: "fd-aaaaaa",
+        title: "Renamed",
+        status: "done",
+        url: "https://example.test/fd-aaaaaa",
+      });
+
+      // A store built anew over the same database reads what the old one wrote.
+      const rebuilt = yield* Effect.provide(WorkLinkStore.WorkLinkStore, WorkLinkStore.layer);
+      const [read] = yield* rebuilt.listByThread(thread1);
+      assert.deepStrictEqual(read?.snapshot, {
+        ...baselined,
+        title: "Renamed",
+        status: "done",
+        url: "https://example.test/fd-aaaaaa",
+      });
+    }).pipe(Effect.provide(persistence)),
+  );
+
+  it.effect("reads a row stored before baselines existed, and writes none into it", () =>
+    Effect.gen(function* () {
+      yield* seedSources;
+      const links = yield* WorkLinkStore.WorkLinkStore;
+      yield* links.link({
+        sourceId: tasksId,
+        itemId: itemA,
+        threadId: thread1,
+        source: "started",
+        snapshot: snapshot("fd-aaaaaa"),
+      });
+      yield* links.updateSnapshotDisplay(tasksId, itemA, thread1, {
+        key: "fd-aaaaaa",
+        title: "Renamed",
+        status: "todo",
+        url: null,
+      });
+      const [read] = yield* links.listByThread(thread1);
+      assert.notProperty(read?.snapshot, "scopeFingerprint");
+      assert.strictEqual(read?.snapshot.title, "Renamed");
+    }).pipe(Effect.provide(persistence)),
+  );
 });

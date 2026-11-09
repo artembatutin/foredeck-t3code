@@ -10,6 +10,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
 import * as Factory from "../index.ts";
 import { advance } from "../pipeline/engine.ts";
+import { toFactoryDelivery } from "../snapshot.ts";
 import { queuedDeliveryState } from "../pipeline/state.ts";
 import type { FactoryDeliveryState, FactoryEvent } from "../pipeline/state.ts";
 import * as FactoryDeliveryStore from "./FactoryDeliveryStore.ts";
@@ -168,6 +169,8 @@ describe("FactoryDeliveryStore with PR state", () => {
         (yield* store.listActive()).map((delivery) => delivery.deliveryId),
         [deliveryId],
       );
+      // Nothing opens its pull request, so a client must not read it as opening one.
+      assert.isFalse(toFactoryDelivery({ ...loaded, stageRuns: [], stageAttempts: {} }).proceeding);
       // It awaits nothing, so no PR result or failure moves it.
       for (const event of [
         { type: "pr.opened", effectId: 6, pullRequest: { number: 1, url: "u", headBranch: "b" } },

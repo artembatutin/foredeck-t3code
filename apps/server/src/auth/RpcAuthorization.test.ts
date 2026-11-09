@@ -89,6 +89,62 @@ describe("RPC authorization scopes", () => {
       expect(handled).toBe(false);
     }).pipe(Effect.scoped),
   );
+  it.effect.each([
+    { scopes: [AuthWorkWriteScope], missing: AuthOrchestrationOperateScope },
+    { scopes: [AuthOrchestrationOperateScope], missing: AuthWorkWriteScope },
+    { scopes: [], missing: AuthWorkWriteScope },
+  ])("rejects an owner's reviewed start without $missing before it runs", ({ scopes, missing }) =>
+    Effect.gen(function* () {
+      const group = WsRpcGroup.omit(
+        ...Array.from(WsRpcGroup.requests.keys()).filter(
+          (
+            tag,
+          ): tag is Exclude<
+            keyof typeof RPC_REQUIRED_SCOPES,
+            typeof WS_METHODS.assistantReviewStart
+          > => tag !== WS_METHODS.assistantReviewStart,
+        ),
+      );
+      let handled = false;
+      const client = yield* RpcTest.makeClient(group).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            group.toLayerHandler(WS_METHODS.assistantReviewStart, () =>
+              Effect.sync(() => {
+                handled = true;
+              }).pipe(Effect.andThen(Effect.never)),
+            ),
+            RpcAuthorization.layer(scopes),
+          ),
+        ),
+      );
+      expect(
+        yield* client[WS_METHODS.assistantReviewStart]({
+          projectId: ProjectId.make("project"),
+          ideaId: "idea",
+          managerThreadId: ThreadId.make("fd-assistant-owner"),
+          kind: "single",
+          reviewVersion: "version",
+          requestId: "request",
+        }).pipe(Effect.flip),
+      ).toMatchObject({ requiredPermission: missing });
+      expect(handled).toBe(false);
+    }).pipe(Effect.scoped),
+  );
+
+  it("guards an owner's edits and leaves their review readable", () => {
+    expect(clientRpcRequiredScopes(WS_METHODS.assistantReviewStart, undefined)).toEqual([
+      AuthWorkWriteScope,
+      AuthOrchestrationOperateScope,
+    ]);
+    expect(clientRpcRequiredScopes(WS_METHODS.assistantReviewRevise, undefined)).toEqual([
+      AuthOrchestrationOperateScope,
+    ]);
+    expect(requiredScopeForRpcMethod(WS_METHODS.assistantReviewGet)).toBe(
+      AuthOrchestrationReadScope,
+    );
+  });
+
   it("keeps Work reads behind work:read and Work writes behind their guarded scopes", () => {
     for (const method of Object.values(WORK_WS_METHODS)) {
       expect(Object.hasOwn(RPC_REQUIRED_SCOPES, method)).toBe(true);
@@ -103,7 +159,7 @@ describe("RPC authorization scopes", () => {
     );
   });
 
-  it("keeps Factory reads behind orchestration:read and guards exactly its nine controls", () => {
+  it("keeps Factory reads behind orchestration:read and guards its nine controls and two setup reads", () => {
     for (const method of Object.values(FACTORY_WS_METHODS)) {
       expect(Object.hasOwn(RPC_REQUIRED_SCOPES, method)).toBe(true);
     }
@@ -114,6 +170,8 @@ describe("RPC authorization scopes", () => {
     expect(Object.keys(FACTORY_CLIENT_GUARDED_RPC_SCOPES).sort()).toEqual(
       [
         FACTORY_WS_METHODS.factorySettingsSet,
+        FACTORY_WS_METHODS.factoryCommandsDiscover,
+        FACTORY_WS_METHODS.factoryCommandsValidate,
         FACTORY_WS_METHODS.factoryDeliveriesStart,
         FACTORY_WS_METHODS.factoryDeliveriesStop,
         FACTORY_WS_METHODS.factoryDeliveriesResume,
@@ -124,9 +182,13 @@ describe("RPC authorization scopes", () => {
         FACTORY_WS_METHODS.factoryPlanReplan,
       ].sort(),
     );
-    expect(requiredScopeForRpcMethod(FACTORY_WS_METHODS.factorySettingsSet)).toBe(
-      AuthSettingsWriteScope,
-    );
+    for (const method of [
+      FACTORY_WS_METHODS.factorySettingsSet,
+      FACTORY_WS_METHODS.factoryCommandsDiscover,
+      FACTORY_WS_METHODS.factoryCommandsValidate,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthSettingsWriteScope);
+    }
     for (const method of [
       FACTORY_WS_METHODS.factoryDeliveriesStart,
       FACTORY_WS_METHODS.factoryDeliveriesStop,
@@ -599,6 +661,8 @@ describe("Factory RPC authorization", () => {
               group.of({
                 [FACTORY_WS_METHODS.factorySettingsGet]: reached("settings.get"),
                 [FACTORY_WS_METHODS.factorySettingsSet]: reached("settings.set"),
+                [FACTORY_WS_METHODS.factoryCommandsDiscover]: reached("commands.discover"),
+                [FACTORY_WS_METHODS.factoryCommandsValidate]: reached("commands.validate"),
                 [FACTORY_WS_METHODS.factoryDeliveriesStart]: reached("start"),
                 [FACTORY_WS_METHODS.factoryDeliveriesStop]: reached("stop"),
                 [FACTORY_WS_METHODS.factoryDeliveriesResume]: reached("resume"),
@@ -631,6 +695,21 @@ describe("Factory RPC authorization", () => {
         client[FACTORY_WS_METHODS.factorySettingsSet]({
           projectId,
           settings: defaultFactorySettings,
+        }),
+    },
+    {
+      name: "commands.discover without settings:write",
+      missing: AuthSettingsWriteScope,
+      call: (client: FactoryClient) =>
+        client[FACTORY_WS_METHODS.factoryCommandsDiscover]({ projectId }),
+    },
+    {
+      name: "commands.validate without settings:write",
+      missing: AuthSettingsWriteScope,
+      call: (client: FactoryClient) =>
+        client[FACTORY_WS_METHODS.factoryCommandsValidate]({
+          projectId,
+          command: { executable: "vp", args: [] },
         }),
     },
     {

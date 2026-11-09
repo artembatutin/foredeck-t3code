@@ -110,7 +110,7 @@ export class WorkLinkStore extends Context.Service<
     ) => Effect.Effect<void, WorkStoreError>;
     /**
      * Refreshes only the displayed fields of a snapshot in place, so a concurrent write of its
-     * revision baseline, mode or auto-start mark is never overwritten by an older read.
+     * revision, scope fingerprint, mode or auto-start mark is never overwritten by an older read.
      */
     readonly updateSnapshotDisplay: (
       sourceId: WorkSourceId,

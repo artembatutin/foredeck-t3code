@@ -39,6 +39,7 @@ it.layer(NodeServices.layer)("Factory capability", (it) => {
       assert.deepStrictEqual(factorySupport(received.capabilities), {
         version: 1,
         planning: true,
+        commandSetup: true,
       });
     }),
   );

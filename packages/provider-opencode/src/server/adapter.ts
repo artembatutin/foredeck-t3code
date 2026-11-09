@@ -1831,6 +1831,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               permission.patterns.length === 0
                 ? permission.permission
                 : permission.patterns.join("\n"),
+            options: OpenCodeRuntime.openCodeApprovalOptions(permission.always),
           };
         };
 

@@ -25,9 +25,12 @@ use **Factory**:
   with the delivery's evidence under T3 home; setup does not produce a verify receipt.
 - **Role models** pick the model for the **Planner**, the **Author** and the **Reviewer** from that
   environment's providers. **Default** uses the project's model, and the planner and the reviewer
-  default to the author's. The planner plans an item delivered as a parent.
+  default to the author's. The planner plans an item delivered as a parent. Below each model are the
+  options that model describes, such as reasoning effort and service tier, and none where it
+  describes none. An option is a request: the provider decides what it runs and how it bills.
 - **Limits** set how many **Fix rounds** and **Review rounds** a delivery may spend, and the
-  **Verify timeout** in minutes.
+  **Verify timeout** in minutes. A delivery counts these as verification fixes and review
+  follow-ups: repair turns that answer a failed verify or a blocking review.
 - **Blocking severities** choose which review findings require a fix, even when the review's
   verdict passes. **High** is selected by default; select any combination of High, Medium and
   Low, including none. A changes-required verdict, an unverified acceptance criterion or missing
@@ -42,10 +45,26 @@ Each command is an executable plus its arguments, not a shell line. Enter `npm` 
 and `test` as an argument, each argument in its own field. Pipes, `&&`, variables and wildcards
 are not interpreted, so put several steps in a script and run that.
 
-A running delivery keeps the round limits it started with. The verify and setup commands, the
-timeout and the role models are read when each step runs, so a change applies to the delivery's
-next verify or thread. Blocking severities are read when a review is judged, so you can change
-them while the reviewer works. High-risk effort is read for each applicable turn.
+Above each command, **From this project** lists the scripts in the `package.json` of the project's
+checkout, run through the package manager its lockfile names, and tested presets such as a frozen
+install. Choosing one fills in the executable and arguments for you to save. Any other command still
+works: type it in, and **Custom command** brings back one a suggestion replaced. **Check command**
+looks for the command where this environment would run it and says what is missing, such as an
+executable not on its `PATH`, a runtime its script needs, or a Windows batch script, which has to be
+replaced by the program itself. Neither runs anything or changes what is saved. A check that finds
+the command does not say it passes; only a delivery runs it, in its own worktree.
+
+If you pick another model for a role with saved options, nothing changes until you choose what
+happens to them: keep them, remove them, or keep the old model. A saved value the model does not
+offer stays listed and flagged until you change it. A delivery you reviewed will not start or go on
+with one.
+
+These settings are defaults for future deliveries. A delivery you
+[reviewed and started](#review-and-start) keeps what you reviewed. Any other delivery keeps the round
+limits it started with, and reads the rest as it goes: the verify and setup commands, the timeout and
+the role models when each step runs, so a change applies to its next verify or thread, blocking
+severities when a review is judged, and high-risk effort for each applicable turn. A role's thread
+keeps the model and options it launched with.
 
 Factory settings are stored on each environment for its own checkout of the project. Changing
 them needs a live connection with the settings permission.
@@ -60,7 +79,9 @@ in the delivery worktree has no effect until it reaches the project's checkout.
 The seven names are `plan.md`, `author.md`, `review.md`, `fix-verify.md`, `fix-review.md`,
 `fix-commit.md` and `integrate.md`. `review.md` also supplies the rules for later review rounds;
 `integrate.md` controls the whole-branch review of a parent independently. Factory reads the
-applicable file again for each new launch or turn, including retries and replanning.
+applicable file again for each new launch or turn, including retries and replanning. A delivery you
+reviewed and started keeps the files you reviewed: a change blocks it before the next step that
+reads that file, until you restore the file or review the delivery again.
 
 Only the rules change. Item, branch, commit, receipt, findings and failure facts, the required
 plan and review fields, and submission and reply instructions stay fixed. The server's
@@ -173,10 +194,41 @@ it starts nothing listed after it and says the list was incomplete; check the so
 Like any delivery, it needs the project's verify command, and its threads never run with broader
 permissions than the task's agent.
 
+## Review and start
+
+On desktop and web, the project assistant's **Ideas** list offers **Review** on each idea. It shows
+what starting would capture and run: the short title, goal, acceptance criteria, restrictions and
+decisions, what changed since the last capture, where it goes, each role's model and options, the
+limits and the project's prompt overrides. Conversation notes are listed apart, since neither the Work
+item nor the agents receive them. You can edit the title, goal, criteria and restrictions there;
+saving starts nothing, and an edit made after someone else changed the idea is refused rather than
+overwriting theirs.
+
+**Review and start** captures the idea in Work and queues exactly one delivery, in one step, so there
+is no go-ahead to save first. It needs a connection allowed to write Work items and to run agents. If
+anything you reviewed changes while it runs, nothing is authorized or started and you review it
+again; whatever was already captured stays in Work.
+
+Until you start, everything here is the project's current settings. Once you do, the delivery keeps
+what you reviewed for good, across stops, resumes and restarts: the role models and options, the
+verify and setup commands, the limits, blocking severities, high-risk effort, pipeline, repository,
+runtime mode and prompt overrides. It keeps them as limits, not permissions: withdrawing your go-ahead,
+narrowing the project's default mode or a provider dropping a model still stops the next step, with
+nothing substituted. The fix, review and fix-commit rounds count for the whole delivery, so a resume
+never adds any. The timeout applies to each command; there is no limit on total time.
+
+To go past what a reviewed delivery was allowed, or past a blocked setting you have since changed on
+purpose, review the idea again while the delivery is **Stopped** or **Blocked**: **Review and resume**
+hands it the new values and it keeps counting what it used. It stays a single item or a parent, as it
+started. If the idea itself changed, cancel the delivery first. After a reviewed delivery failed or was cancelled, only a new review starts another
+attempt: **Retry** is not offered, and the assistant cannot queue the idea again. On mobile, you can
+follow these deliveries but not start them, and agents cannot authorize one.
+
 ## Hand work over from the project assistant
 
-On desktop and web, the [project assistant](./composer.md#project-assistant) can deliver an idea
-you agreed on through Factory. Discussing it starts nothing; each step waits for you to ask:
+On desktop and web, the [project assistant](./composer.md#project-assistant) can also deliver an idea
+you agreed on through Factory, without a review of its settings. Discussing it starts nothing; each
+step waits for you to ask:
 
 1. **Capture.** Ask the assistant to record the idea in Work. With `assistant_capture_work` it
    writes the goal, acceptance criteria, constraints, decisions and open questions into one item.
@@ -205,7 +257,7 @@ asks nothing of you, and it starts by itself once a slot frees up.
 
 Stopping a delivery before Factory has started it frees its slot and keeps the delivery. **Resume**
 waits for a slot and starts that same delivery; **Cancel** ends it. **Retry** is for an assignment
-that failed or was cancelled, and starts a new delivery.
+that failed or was cancelled without a review, and starts a new delivery.
 
 ### Follow-ups that wait
 
@@ -243,12 +295,47 @@ opens. A pull request closed without merging cancels it.
 
 ## Follow a delivery
 
-The item's Factory section shows its current delivery: its status, the stage it is in, its branch
-and how many fix and review rounds it has used. The timeline lists each step in order (author,
-verify, review, repair, record, pull request) with its round and outcome, the verify receipt or
-review it produced, and the findings a review raised. **Open thread** opens the thread a step ran
-on. On mobile, the item's screen in Work shows the same timeline and controls; start deliveries
-from web or desktop.
+The item's Factory section starts with what the delivery comes to now and what, if anything, it
+needs from you. Once its pull request is open and nothing else is running, it says **Ready for your
+review**, with **Open pull request**, **Review changes** and the verified commit, verify result and
+independent review it was judged on. That is not done: only a merge you make finishes it. A message
+in a thread from earlier in the delivery stays as it was written, so where it says Factory is still
+running, this section and the assistant's **Assignments** list say what is true now.
+
+**Pending actions** lists what the delivery waits on someone for, here and in the assistant's
+**Assignments**: each says what kind of decision it is, why it is asked, who asks and where it is
+decided, and listing it decides nothing. A question an agent asks never grants a permission, and a
+permission is only ever decided in its thread. A delivery whose mode the provider's host refuses,
+or whose thread's automatic turn that host refused, runs nothing and shows that here, with the modes
+that host allows; see
+[permission modes](./permission-modes.md#when-a-hosts-policy-refuses-a-mode). A parent also shows
+this for the child it waits on, with a link to that child's item, where you resume it.
+
+Four things are shown separately because they are separate: the item's **Work status** and **Human
+assignee** from its source, the project assistant's **Queue priority**, and the **Factory delivery**
+status. Factory never rewrites the item's fields to match; a To do item with an open pull request is
+normal until the merge. The Factory page and the assistant's lists show them the same way, and say
+**Not available** when a source could not be read in time. A change made in Work or to a queue
+priority shows at once; one made directly in a tracker shows when you return to the Factory page, or
+within a few minutes.
+
+The section counts **verification fixes** and **review follow-ups**, the repair turns a failed verify
+or a blocking review took, and **fix-commit turns**, with what each has left, beside how many verify
+and review attempts ran. One repair after a blocking review shows one review follow-up and two
+review attempts. A delivery you [reviewed and started](#review-and-start) counts what you approved
+for the whole delivery; any other delivery counts since its last resume. The timeline lists each
+step in order (author, verify, review, repair, record, pull request) with its attempt and outcome,
+the verify receipt or review it produced, and the findings a review raised. **Open thread** opens the
+thread a step ran on. On mobile, the item's screen in Work shows the same next action, timeline and
+controls; start deliveries from web or desktop.
+
+The section also says what each role runs on. **Reviewed** is the value your review holds it to, and
+**Requested** is what its latest turn actually asked for, or what its launch would ask for before it
+has one. They can differ: a high-risk task or a later round can raise the effort to the high-risk
+effort you reviewed, and a fix-commit turn asks for `medium` for that turn alone. **Read now** marks a
+delivery without a review, whose next step reads its values then. Beside each is what the provider
+reported for that role's thread, or **Not reported** where it reported nothing, which says nothing
+about whether your request was honored.
 
 Factory's threads are linked to the item but do not offer **Mark done?** or **Back to todo?**.
 Factory does not change the item's status until its pull request merges.
@@ -311,7 +398,7 @@ it once the pull request is merged.
 - **Resume** on a **Stopped** or **Blocked** single item or child checks its branch again and
   verifies it before going on, even if nothing changed, unless all that is left is opening the
   pull request for the commit it approved. It also gets a fresh set of repair rounds within the
-  limits it started with. If you deleted one of its threads, it blocks again; cancel it and
+  limits it started with, unless you reviewed it, which keeps counting. If you deleted one of its threads, it blocks again; cancel it and
   deliver the item anew.
 - **Resume** on a **Stopped** or **Blocked** parent goes on from where it is. Before you approve
   its plan, a parent stopped where the plan waits for you waits for you again on the same plan,
@@ -325,8 +412,12 @@ it once the pull request is merged.
   ends it. Cancelling a parent also ends its child deliveries not yet approved. Cancelling a child
   ends its parent and the parent's other children not yet approved. Approved children keep their
   approval. The branch, worktree and commits stay. Verification or a pull request the server has
-  already started finishes, but no longer changes the delivery. Delivering the item again starts
-  a new delivery on a branch of its own, named like the first with `-2`, `-3` and so on added.
+  already started finishes, but no longer changes the delivery. A pull request stays open on its
+  host. Delivering the item again starts a new delivery on a branch of its own, named like the
+  first with `-2`, `-3` and so on added.
+
+A delivery that is done or cancelled does not reopen: deliver the item again instead. Where a control
+is not offered, the section says why, such as a lost connection or a session without the permission.
 
 ## When a delivery needs you
 
@@ -348,6 +439,48 @@ waiting, so the GitHub issue, Jira issue or task file shows it too. It posts aga
 is approved, when the pull request opens or a feedback round updates it, and when it is closed
 without merging. Factory sends no notifications.
 
-Factory refuses to publish a pull request whose text would name an AI tool or credit one as an
-author, and blocks before pushing. The item's title and the verify command appear in the pull
-request as written; change them and resume.
+## What Factory will publish
+
+A new delivery works on a branch named `feature/<item key>-<title>`, with any AI tool's name left out.
+Its pull request gets a short Conventional title such as `feat(export): fd-7k3qa2 Add the export
+button`: the type and scope come from its commits, the summary from the item's title, shortened
+between words and never inside one. Its Work item stays as you wrote it.
+
+Before every push and pull request, feedback rounds included, Factory checks the branch's prefix
+(`feature/`, `bugfix/`, `chore/` or `docs/`), the name the push would give it on the remote, each
+commit's message and identities, and the title and body. Git can push a branch under a shorter name:
+with a remote called `feature`, or an upstream that renames it, `feature/x` lands as `x`. Factory
+checks the name it lands on, and pushes only there, to the push URLs it checked, which takes Git 2.46
+or later on the environment that runs the project: with an older Git it pushes nothing and the
+delivery blocks. The check covers every
+commit of the delivery, pushed or not, and any earlier commit the push would be the first to put on
+the remote; history the remote already holds is left alone. It refuses
+malformed subjects, AI tool names and generated attribution, including a trailer a commit hook added.
+Human co-authors, sign-offs and task references are fine. If something fails, nothing is pushed and
+the delivery blocks, saying what failed and what to do. Factory never rewrites a commit or renames a
+branch:
+
+- **A commit** that fails: correct it on the branch, or cancel and deliver the item again, then
+  **Resume**.
+- **A commit from before the delivery** that fails, which the branch it started from holds and the
+  remote does not: correct it on that branch, or put the project's checkout on a commit the remote
+  already holds, then cancel and deliver the item again.
+- **The remote** that cannot be read: Factory cannot tell what a push would add. Check the branch's
+  remote and your access to it, then **Resume**.
+- **The name on the remote** that fails: rename the remote whose name starts the branch's, or remove
+  the upstream that renames it, so a push keeps the branch's name, then **Resume**.
+- **Where the push goes** changed after the check, such as the remote's push URL or a URL rewrite in
+  your Git settings: Factory pushes nowhere it did not check, whatever your settings say by then, and
+  stops before the pull request. Keep or restore where the branch should publish, then **Resume**,
+  which checks that destination again before pushing.
+- **Git** on the environment that runs the project cannot hold the push to the URLs Factory checked:
+  update it there to 2.46 or later, then **Resume**.
+- **The title or body** that fails: change the item or the verify command, then **Resume**. A title
+  whose first word is too long to fit, such as a long address, needs a shorter opening.
+- **A delivery from before this check**, on a `work/...` branch: it can no longer publish. Its branch,
+  pull request and commits stay as they are; cancel it and deliver the item again.
+
+Once a pull request is open, Factory reads what the host saved. If the title, body or branch is not
+what it should be, or the host cannot be read, the delivery blocks with the pull request recorded.
+Factory edits nothing there: correct it on the host, then **Resume**, which checks it again before
+pushing anything else.

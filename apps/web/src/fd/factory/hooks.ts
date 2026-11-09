@@ -1,5 +1,6 @@
-import { useAtomSet, useAtomValue } from "@effect/atom-react";
+import { useAtomRefresh, useAtomSet, useAtomValue } from "@effect/atom-react";
 import { createFactoryFleetAtom, factoryFleet } from "@t3tools/client-runtime/fd/factory";
+import type { EnvironmentId } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import { Atom } from "effect/reactivity";
 import { useCallback, useEffect } from "react";
@@ -54,10 +55,20 @@ const fleetStateAtom = createFactoryFleetAtom({
   deliveries: (environmentId) => factoryEnvironment.deliveries({ environmentId, input: {} }),
 });
 
-const fleetAtom = Atom.make((get) => {
-  const fleet = get(fleetStateAtom);
-  return { ...fleet, rows: factoryFleet(fleet.environments) };
-}).pipe(Atom.withLabel("factory:fleet-rows"));
+// Refreshing it refreshes the deliveries it last read.
+let fleetEnvironments: ReadonlyArray<EnvironmentId> = [];
+const fleetAtom = Atom.readable(
+  (get) => {
+    const fleet = get(fleetStateAtom);
+    fleetEnvironments = fleet.environments.map(({ environmentId }) => environmentId);
+    return { ...fleet, rows: factoryFleet(fleet.environments) };
+  },
+  (refresh) => {
+    for (const environmentId of fleetEnvironments) {
+      refresh(factoryEnvironment.deliveries({ environmentId, input: {} }));
+    }
+  },
+).pipe(Atom.withLabel("factory:fleet-rows"));
 
 /** Whether any environment advertises Factory, for the sidebar's and the palette's entries. */
 export function useFactorySupported(): boolean {
@@ -67,6 +78,14 @@ export function useFactorySupported(): boolean {
 /** The Factory view's fleet: active deliveries across environments, needing you first. */
 export function useFactoryFleet() {
   return useAtomValue(fleetAtom);
+}
+
+/**
+ * Reads the fleet's deliveries again. Every change Foredeck hears of already moves their epoch;
+ * this is for what it cannot hear of, such as an assignee changed directly in a tracker.
+ */
+export function useRefreshFactoryFleet() {
+  return useAtomRefresh(fleetAtom);
 }
 
 /** What the shared Deliver rule reads of a target's destination; idle without a target. */

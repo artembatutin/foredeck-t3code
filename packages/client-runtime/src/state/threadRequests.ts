@@ -15,8 +15,10 @@ export interface ThreadPendingApproval {
   readonly detail?: string;
   /** App requesting access for mcp-elicitation approvals (#8058). */
   readonly appName?: string;
-  /** Approval choices advertised by the provider (#8058); defaults apply when absent. */
+  /** Approval choices advertised by the provider (#8058); see `approvalChoices` when absent. */
   readonly options?: ReadonlyArray<ProviderApprovalOption>;
+  /** Why the provider says it asks, when it says. */
+  readonly reason?: string;
   readonly responseCapability: "live" | "not_resumable";
 }
 
@@ -107,6 +109,7 @@ export function derivePendingThreadRequests(
       ...(item?.type === "approval_request" && item.options !== undefined
         ? { options: item.options }
         : {}),
+      ...(item?.type === "approval_request" && item.reason ? { reason: item.reason } : {}),
       responseCapability: responseCapability === "live" ? "live" : "not_resumable",
     });
   }

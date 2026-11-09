@@ -1,6 +1,7 @@
 import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import { scopedProjectKey, scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { derivePhysicalProjectKey } from "@t3tools/client-runtime/state/project-grouping";
+import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import {
   itemInView,
   linksByItem,
@@ -25,12 +26,20 @@ import {
 } from "@t3tools/contracts/fd/work-management";
 import { useNavigate } from "@tanstack/react-router";
 import { Atom } from "effect/reactivity";
-import { PlusIcon } from "lucide-react";
+import {
+  CircleAlertIcon,
+  ListTodoIcon,
+  PlusIcon,
+  SearchIcon,
+  TriangleAlertIcon,
+  XIcon,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { WorkspaceBreadcrumb, WorkspaceBreadcrumbItem } from "../../components/WorkspaceBreadcrumb";
 import { WorkspacePageContainer } from "../../components/WorkspacePageContainer";
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
+import { Alert, AlertAction, AlertDescription } from "../../components/ui/alert";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import {
@@ -38,9 +47,10 @@ import {
   EmptyContent,
   EmptyDescription,
   EmptyHeader,
+  EmptyMedia,
   EmptyTitle,
 } from "../../components/ui/empty";
-import { Input } from "../../components/ui/input";
+import { InputGroup, InputGroupAddon, InputGroupInput } from "../../components/ui/input-group";
 import { RefreshIcon } from "../../components/ui/refresh-icon";
 import {
   Select,
@@ -50,11 +60,12 @@ import {
   SelectValue,
 } from "../../components/ui/select";
 import { SidebarInset } from "../../components/ui/sidebar";
-import { Skeleton } from "../../components/ui/skeleton";
+import { Spinner } from "../../components/ui/spinner";
 import { Toggle, ToggleGroup } from "../../components/ui/toggle-group";
 import { isElectron } from "../../env";
 import { useLiveRefresh } from "../../hooks/useLiveRefresh";
 import { useEscapeToGoBack } from "../../hooks/useNavigateBack";
+import { cn } from "../../lib/utils";
 import {
   useAllEnvironmentShellsBootstrapped,
   useProjects,
@@ -62,8 +73,9 @@ import {
 } from "../../state/entities";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { FdListGhost, FdListRow } from "../list-rows";
 import { CreateWorkItemDialog } from "./CreateWorkItemDialog";
-import { SOURCE_KIND_LABELS, WorkRepairNotice, WorkSourceGlyph, WorkStatusBadge } from "./shared";
+import { WorkRepairNotice, WorkSourceGlyph, WorkStatusBadge } from "./shared";
 import {
   useReadableWorkEnvironments,
   useWorkSupport,
@@ -108,6 +120,22 @@ export function validateWorkSearch(raw: Record<string, unknown>): WorkSearch {
 }
 
 /**
+ * The project a Work page shows: the one its URL names, in that exact environment, or the first
+ * when it names none. A named project this client cannot read selects nothing, so a link never
+ * shows another project's list or an item under the wrong project.
+ */
+export function selectWorkProject<Project extends Pick<EnvironmentProject, "environmentId" | "id">>(
+  projects: ReadonlyArray<Project>,
+  key: string | undefined,
+): { readonly project: Project | undefined; readonly unavailable: boolean } {
+  if (key === undefined) return { project: projects[0], unavailable: false };
+  const project = projects.find(
+    (entry) => scopedProjectKey(scopeProjectRef(entry.environmentId, entry.id)) === key,
+  );
+  return { project, unavailable: project === undefined };
+}
+
+/**
  * The Work page: one project's items from all of its sources, with an inline detail. The route
  * may pass `itemSection` for the detail to render beside the item's linked threads, and
  * `startAction` for the item's start dialog to offer.
@@ -145,12 +173,10 @@ export function WorkRouteView({
         .toSorted((left, right) => left.title.localeCompare(right.title)),
     [allProjects, readableEnvironments],
   );
-  const selectedProject =
-    projects.find(
-      (project) =>
-        search.project !== undefined &&
-        scopedProjectKey(scopeProjectRef(project.environmentId, project.id)) === search.project,
-    ) ?? projects[0];
+  const { project: selectedProject, unavailable: projectUnavailable } = selectWorkProject(
+    projects,
+    search.project,
+  );
   const environmentId = selectedProject?.environmentId ?? null;
   const view = search.view ?? readStoredPreferences().view;
   const [query, setQuery] = useState(search.q ?? "");
@@ -248,7 +274,7 @@ export function WorkRouteView({
   );
   const pending = lists.some(({ pages }) => pages.waiting);
   const hasMore = lists.some(({ pages }) => pages.nextCursor !== null);
-  const items = useMemo(
+  const listedItems = useMemo(
     () =>
       lists
         .flatMap(({ sourceId, pages }) => {
@@ -263,9 +289,42 @@ export function WorkRouteView({
         ),
     [lists, runStates, sourceById, view],
   );
+  const selectedRef = search.item === undefined ? undefined : parseWorkItemRefString(search.item);
+  // All leaves nothing out, so an item open beside it that it does not list is further down than
+  // this view reads by itself, however far that is. Its own read, the one the detail makes, lists
+  // it first until the pages reach it. A search or another source can leave it out on purpose.
+  const selectedOffList =
+    view === "all" &&
+    term === undefined &&
+    selectedRef !== undefined &&
+    (search.source === undefined || search.source === selectedRef.sourceId) &&
+    !listedItems.some(({ item }) => workItemRefString(item.ref) === search.item);
+  const selectedItem = useEnvironmentQuery(
+    environmentId === null || !selectedOffList
+      ? null
+      : workEnvironment.detail({ environmentId, input: { ref: selectedRef } }),
+  ).data;
+  const selectedSource =
+    selectedItem === null ? undefined : sourceById.get(selectedItem.ref.sourceId);
+  const items =
+    selectedItem === null ||
+    selectedSource === undefined ||
+    (pending && listedItems.length === 0) ||
+    listedItems.some(
+      ({ item }) => workItemRefString(item.ref) === workItemRefString(selectedItem.ref),
+    )
+      ? listedItems
+      : [{ source: selectedSource, item: selectedItem }, ...listedItems];
   // A filtered view that came up short reads further pages by itself, within a small budget.
   // Adjusted during render: each step raises the page count, so it settles within the budget.
-  if (shouldAutoLoadWorkPage({ visible: items.length, hasMore, waiting: pending, pageCount })) {
+  if (
+    shouldAutoLoadWorkPage({
+      visible: listedItems.length,
+      hasMore,
+      waiting: pending,
+      pageCount,
+    })
+  ) {
     setPaging({ key: listKey, pageCount: pageCount + 1 });
   }
   const failures = lists.flatMap(({ sourceId, pages }) =>
@@ -299,12 +358,15 @@ export function WorkRouteView({
   });
   const canCreate = useWorkWritable(environmentId, workCommands.createItem, "items.write");
 
-  const selectedRef = search.item === undefined ? undefined : parseWorkItemRefString(search.item);
   const supported = support.size > 0;
   const readable = readableEnvironments.length > 0;
 
+  const viewLabel = WORK_VIEWS.find((entry) => entry.value === view)?.label ?? view;
   const body = !supported ? (
     <Empty>
+      <EmptyMedia variant="icon">
+        <ListTodoIcon />
+      </EmptyMedia>
       <EmptyHeader>
         <EmptyTitle>Work is not available</EmptyTitle>
         <EmptyDescription>Connect to a server that offers Work.</EmptyDescription>
@@ -314,8 +376,39 @@ export function WorkRouteView({
     <WorkRepairNotice />
   ) : !projectsKnown ? (
     <ListSkeleton />
+  ) : projectUnavailable ? (
+    <Empty>
+      <EmptyHeader>
+        <EmptyTitle>Project unavailable</EmptyTitle>
+        <EmptyDescription>
+          This link names a project this client cannot read. Connect to its environment, or open
+          Work for another project.
+        </EmptyDescription>
+      </EmptyHeader>
+      {projects.length > 0 ? (
+        <EmptyContent>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() =>
+              setSearch({
+                project: undefined,
+                source: undefined,
+                view: undefined,
+                item: undefined,
+              })
+            }
+          >
+            Open another project
+          </Button>
+        </EmptyContent>
+      ) : null}
+    </Empty>
   ) : selectedProject === undefined ? (
     <Empty>
+      <EmptyMedia variant="icon">
+        <ListTodoIcon />
+      </EmptyMedia>
       <EmptyHeader>
         <EmptyTitle>No projects</EmptyTitle>
         <EmptyDescription>Add a project to track its work.</EmptyDescription>
@@ -323,6 +416,9 @@ export function WorkRouteView({
     </Empty>
   ) : sourcesQuery.data !== null && sources.length === 0 ? (
     <Empty>
+      <EmptyMedia variant="icon">
+        <ListTodoIcon />
+      </EmptyMedia>
       <EmptyHeader>
         <EmptyTitle>No Work sources</EmptyTitle>
         <EmptyDescription>
@@ -340,6 +436,7 @@ export function WorkRouteView({
             })
           }
         >
+          <PlusIcon />
           Add a source
         </Button>
       </EmptyContent>
@@ -351,19 +448,78 @@ export function WorkRouteView({
       {sources
         .filter((source) => source.health.status !== "ok")
         .map((source) => (
-          <p key={source.sourceId} className="text-sm text-warning-foreground">
-            {source.label}: {source.health.message ?? source.health.status.replaceAll("_", " ")}
-          </p>
+          <Alert key={source.sourceId} variant="warning">
+            <TriangleAlertIcon />
+            <AlertDescription>
+              {source.label}: {source.health.message ?? source.health.status.replaceAll("_", " ")}
+            </AlertDescription>
+          </Alert>
         ))}
       {failures.length > 0 ? (
-        <p className="text-destructive text-sm">Could not read {failures.join(", ")}.</p>
+        <Alert variant="error">
+          <CircleAlertIcon />
+          <AlertDescription>Could not read {failures.join(", ")}.</AlertDescription>
+          <AlertAction>
+            <Button size="xs" variant="outline" disabled={pending} onClick={refresh}>
+              Retry
+            </Button>
+          </AlertAction>
+        </Alert>
       ) : null}
       {items.length === 0 ? (
-        <p className="py-8 text-center text-muted-foreground text-sm">
-          {pending ? "Loading..." : hasMore ? "Nothing here yet." : "Nothing here."}
-        </p>
+        pending ? (
+          <ListSkeleton />
+        ) : term !== undefined ? (
+          <Empty>
+            <EmptyMedia variant="icon">
+              <SearchIcon />
+            </EmptyMedia>
+            <EmptyHeader>
+              <EmptyTitle>
+                Nothing matches “{term.length > 48 ? `${term.slice(0, 48)}…` : term}”
+              </EmptyTitle>
+              <EmptyDescription>Try fewer words, or search by key or label.</EmptyDescription>
+            </EmptyHeader>
+            <EmptyContent>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setQuery("");
+                  setSearch({ q: undefined });
+                }}
+              >
+                <XIcon />
+                Clear search
+              </Button>
+            </EmptyContent>
+          </Empty>
+        ) : (
+          <Empty>
+            <EmptyMedia variant="icon">
+              <ListTodoIcon />
+            </EmptyMedia>
+            <EmptyHeader>
+              <EmptyTitle>
+                {view === "all" ? "No items" : `Nothing in ${viewLabel.toLowerCase()}`}
+              </EmptyTitle>
+              <EmptyDescription>
+                {view === "all"
+                  ? "Items from this project's Work sources appear here."
+                  : "Items move here as their status changes."}
+              </EmptyDescription>
+            </EmptyHeader>
+            {view !== "all" ? (
+              <EmptyContent>
+                <Button size="sm" variant="outline" onClick={() => setView("all")}>
+                  Show all items
+                </Button>
+              </EmptyContent>
+            ) : null}
+          </Empty>
+        )
       ) : (
-        <ul className="divide-y rounded-lg border" aria-label="Work items">
+        <div className="space-y-0.5" role="list" aria-label="Work items">
           {items.map(({ source, item }) => (
             <WorkItemRow
               key={workItemRefString(item.ref)}
@@ -378,13 +534,20 @@ export function WorkRouteView({
               onSelect={() => setSearch({ item: workItemRefString(item.ref) })}
             />
           ))}
-        </ul>
+        </div>
       )}
       {hasMore ? (
-        <div className="flex justify-center">
-          <Button size="sm" variant="outline" disabled={pending} onClick={loadMore}>
-            Load more
-          </Button>
+        <div className="flex justify-center py-3 text-xs text-muted-foreground">
+          {pending ? (
+            <span className="flex items-center gap-2">
+              <Spinner aria-hidden size="sm" />
+              Loading more
+            </span>
+          ) : (
+            <Button size="sm" variant="outline" onClick={loadMore}>
+              Load more items
+            </Button>
+          )}
         </div>
       ) : null}
     </>
@@ -393,7 +556,13 @@ export function WorkRouteView({
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
       <div className="flex min-h-0 flex-1">
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background">
+        {/* On a narrow screen an open item replaces the list; closing it brings the list back. */}
+        <div
+          className={cn(
+            "flex min-h-0 min-w-0 flex-1 flex-col bg-background",
+            selectedRef !== undefined && selectedProject !== undefined && "max-md:hidden",
+          )}
+        >
           <WorkspacePageHeader electron={isElectron} className="bg-background">
             <WorkspaceBreadcrumb ariaLabel="Work breadcrumb">
               <WorkspaceBreadcrumbItem current>
@@ -420,6 +589,19 @@ export function WorkRouteView({
             <WorkspacePageContainer width="expanded" className="gap-4">
               {readable && selectedProject !== undefined ? (
                 <div className="flex flex-wrap items-center gap-2">
+                  <InputGroup className="min-w-40 basis-full sm:basis-0 sm:flex-1">
+                    <InputGroupAddon>
+                      <SearchIcon aria-hidden />
+                    </InputGroupAddon>
+                    <InputGroupInput
+                      aria-label="Search work"
+                      placeholder="Search by title, key or label"
+                      type="search"
+                      size="sm"
+                      value={query}
+                      onChange={(event) => setQuery(event.target.value)}
+                    />
+                  </InputGroup>
                   <Select
                     value={scopedProjectKey(
                       scopeProjectRef(selectedProject.environmentId, selectedProject.id),
@@ -481,16 +663,6 @@ export function WorkRouteView({
                       </Toggle>
                     ))}
                   </ToggleGroup>
-                  <div className="min-w-40 flex-1">
-                    <Input
-                      aria-label="Search work"
-                      placeholder="Search"
-                      type="search"
-                      value={query}
-                      size="sm"
-                      onChange={(event) => setQuery(event.target.value)}
-                    />
-                  </div>
                   {canCreate && sources.some((source) => source.capabilities.create) ? (
                     <Button
                       size="sm"
@@ -514,7 +686,7 @@ export function WorkRouteView({
           </div>
         </div>
         {selectedRef !== undefined && selectedProject !== undefined ? (
-          <div className="w-[min(32rem,45%)] shrink-0 border-l">
+          <div className="w-[min(32rem,45%)] shrink-0 border-l max-md:w-full max-md:border-l-0">
             <WorkItemDetail
               key={search.item}
               environmentId={selectedProject.environmentId}
@@ -542,13 +714,7 @@ export function WorkRouteView({
 const EMPTY_LISTS_ATOM = Atom.make([] as ReadonlyArray<WorkPagedSource>);
 
 function ListSkeleton() {
-  return (
-    <div className="space-y-2" aria-busy>
-      {[0, 1, 2, 3].map((index) => (
-        <Skeleton key={index} className="h-12 w-full" />
-      ))}
-    </div>
-  );
+  return <FdListGhost label="Loading work items" />;
 }
 
 function WorkItemRow({
@@ -566,30 +732,49 @@ function WorkItemRow({
 }) {
   const running = states.find((state) => state === "working" || state === "needs-input");
   return (
-    <li>
-      <button
-        type="button"
-        aria-current={selected ? "true" : undefined}
-        className="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-accent/50 aria-[current=true]:bg-accent"
-        onClick={onSelect}
-      >
-        <WorkSourceGlyph kind={source.kind} className="size-4 shrink-0 text-muted-foreground" />
-        <span className="w-20 shrink-0 truncate text-muted-foreground text-xs">{item.key}</span>
-        <span className="min-w-0 flex-1 truncate text-sm">{item.title}</span>
-        {item.labels.slice(0, 3).map((label) => (
-          <Badge key={label} variant="secondary">
-            {label}
-          </Badge>
-        ))}
-        {item.priority === "high" ? <Badge variant="warning">High</Badge> : null}
-        {item.blocked ? <Badge variant="warning">Blocked</Badge> : null}
-        {running ? <Badge variant="info">{RUN_STATE_LABELS[running]}</Badge> : null}
-        <WorkStatusBadge
-          status={item.status}
-          {...(item.nativeStatus ? { label: item.nativeStatus.name } : {})}
-        />
-        <span className="sr-only">{SOURCE_KIND_LABELS[source.kind]}</span>
-      </button>
-    </li>
+    <div role="listitem">
+      <FdListRow
+        glyph={<WorkSourceGlyph kind={source.kind} className="size-4" />}
+        reference={item.key}
+        title={item.title}
+        signals={
+          <>
+            {item.priority === "high" ? (
+              <Badge size="sm" variant="warning">
+                High
+              </Badge>
+            ) : null}
+            {item.blocked ? (
+              <Badge size="sm" variant="warning">
+                Blocked
+              </Badge>
+            ) : null}
+            {running ? (
+              <Badge size="sm" variant="info">
+                {RUN_STATE_LABELS[running]}
+              </Badge>
+            ) : null}
+          </>
+        }
+        status={
+          <WorkStatusBadge
+            status={item.status}
+            {...(item.nativeStatus ? { label: item.nativeStatus.name } : {})}
+          />
+        }
+        meta={
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span className="shrink-0">{source.label}</span>
+            {item.labels.length > 0 ? (
+              <span className="truncate">· {item.labels.join(", ")}</span>
+            ) : null}
+            {item.assignee ? <span className="shrink-0">· {item.assignee.label}</span> : null}
+          </span>
+        }
+        updatedAt={item.updatedAt}
+        selected={selected}
+        onSelect={onSelect}
+      />
+    </div>
   );
 }

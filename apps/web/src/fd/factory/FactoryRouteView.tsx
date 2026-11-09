@@ -11,10 +11,11 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../../componen
 import { SidebarInset } from "../../components/ui/sidebar";
 import { Skeleton } from "../../components/ui/skeleton";
 import { isElectron } from "../../env";
+import { useLiveRefresh } from "../../hooks/useLiveRefresh";
 import { useProjects } from "../../state/entities";
 import { useEnvironments } from "../../state/environments";
 import { factoryFleetNotices, factoryFleetRowTarget } from "./fleetView";
-import { useFactoryFleet } from "./hooks";
+import { useFactoryFleet, useRefreshFactoryFleet } from "./hooks";
 
 /**
  * The Factory page: every active delivery across the connected environments that serve Factory,
@@ -24,6 +25,7 @@ import { useFactoryFleet } from "./hooks";
 export function FactoryRouteView() {
   const navigate = useNavigate();
   const fleet = useFactoryFleet();
+  useLiveRefresh(useRefreshFactoryFleet(), { key: "factory-fleet" });
   const projects = useProjects();
   const { environments } = useEnvironments();
   const projectTitles = useMemo(
@@ -133,15 +135,22 @@ function FactoryFleetRowItem({
           <span className="w-40 shrink-0 truncate text-muted-foreground text-xs">
             {environment === undefined ? project : `${project} · ${environment}`}
           </span>
-          <span className="min-w-0 flex-1 truncate text-sm">{row.itemRef.itemId}</span>
-          {row.stage !== undefined ? (
-            <span className="shrink-0 text-muted-foreground text-xs">{row.stage}</span>
-          ) : null}
-          <Badge variant={row.needsYou === undefined ? "outline" : "warning"}>{row.status}</Badge>
+          <span className="min-w-0 flex-1 truncate text-sm">{row.title}</span>
+          <Badge variant={row.nextAction.forYou ? "warning" : "outline"}>
+            {row.nextAction.title}
+          </Badge>
         </span>
         {row.needsYou !== undefined ? (
           <span className="text-sm text-warning-foreground">{row.needsYou}</span>
         ) : null}
+        <dl className="flex flex-wrap gap-x-3 text-xs" aria-label="Item facts">
+          {row.facts.map((fact) => (
+            <div key={fact.key} className="flex gap-1">
+              <dt className="text-muted-foreground">{fact.label}</dt>
+              <dd>{fact.value}</dd>
+            </div>
+          ))}
+        </dl>
         {row.capacityNote !== undefined ? (
           <span className="text-muted-foreground text-sm">{row.capacityNote}</span>
         ) : null}

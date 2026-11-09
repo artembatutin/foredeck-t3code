@@ -21,8 +21,10 @@ export interface MobileFleetRow {
   readonly key: string;
   /** The project's title, with its environment's label while more than one serves Factory. */
   readonly project: string;
-  /** The Work item the delivery is for. */
+  /** The Work item the delivery is for: its title, or its id when its source could not be read. */
   readonly item: string;
+  /** What it comes to now. */
+  readonly nextAction: string;
   readonly status: string;
   readonly stage: string | undefined;
   readonly needsYou: string | undefined;
@@ -81,7 +83,8 @@ export function mobileFleetRows(
       project: multipleEnvironments
         ? `${title} · ${environmentLabels.get(row.environmentId) ?? row.environmentId}`
         : title,
-      item: row.itemRef.itemId,
+      item: row.title,
+      nextAction: row.nextAction.title,
       status: row.status,
       stage: row.stage,
       needsYou: row.needsYou,

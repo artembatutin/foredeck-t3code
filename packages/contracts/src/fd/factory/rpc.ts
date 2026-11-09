@@ -9,6 +9,10 @@ import {
 } from "../../auth.ts";
 import { NonNegativeInt } from "../../baseSchemas.ts";
 import {
+  FactoryCommandDiscoverInput,
+  FactoryCommandDiscovery,
+  FactoryCommandValidateInput,
+  FactoryCommandValidation,
   FactoryDelivery,
   FactoryDeliveryList,
   FactoryDeliveryListInput,
@@ -30,6 +34,8 @@ import {
 export const FACTORY_WS_METHODS = {
   factorySettingsGet: "factory.settings.get",
   factorySettingsSet: "factory.settings.set",
+  factoryCommandsDiscover: "factory.commands.discover",
+  factoryCommandsValidate: "factory.commands.validate",
   factoryDeliveriesStart: "factory.deliveries.start",
   factoryDeliveriesStop: "factory.deliveries.stop",
   factoryDeliveriesResume: "factory.deliveries.resume",
@@ -54,6 +60,21 @@ const WsFactorySettingsGetRpc = Rpc.make(FACTORY_WS_METHODS.factorySettingsGet, 
 const WsFactorySettingsSetRpc = Rpc.make(FACTORY_WS_METHODS.factorySettingsSet, {
   payload: FactorySettingsSetInput,
   success: FactoryProjectSettings,
+  error: FactoryRpcError,
+});
+/**
+ * What the settings form offers and checks. Both read only: neither runs a command or saves one.
+ * Guarded like a settings write, the only thing they serve, since they answer with what the server's
+ * checkout and environment hold. Servers advertising `commandSetup` serve them.
+ */
+const WsFactoryCommandsDiscoverRpc = Rpc.make(FACTORY_WS_METHODS.factoryCommandsDiscover, {
+  payload: FactoryCommandDiscoverInput,
+  success: FactoryCommandDiscovery,
+  error: FactoryRpcError,
+});
+const WsFactoryCommandsValidateRpc = Rpc.make(FACTORY_WS_METHODS.factoryCommandsValidate, {
+  payload: FactoryCommandValidateInput,
+  success: FactoryCommandValidation,
   error: FactoryRpcError,
 });
 const WsFactoryDeliveriesStartRpc = Rpc.make(FACTORY_WS_METHODS.factoryDeliveriesStart, {
@@ -115,8 +136,9 @@ const WsFactoryPlanReplanRpc = Rpc.make(FACTORY_WS_METHODS.factoryPlanReplan, {
 });
 
 /**
- * An epoch that moves after every committed delivery or settings write, Work's refresh epoch for
- * Factory: clients refetch the deliveries and settings they show on each value. It carries no data.
+ * An epoch that moves after every committed delivery or settings write, and whenever what a listing
+ * shows beside a delivery may have changed (Work's refresh epoch, a queue priority): clients refetch
+ * the deliveries and settings they show on each value. It carries no data.
  */
 const WsFactoryDeliveriesSubscribeRpc = Rpc.make(FACTORY_WS_METHODS.factoryDeliveriesSubscribe, {
   payload: Schema.Struct({}),
@@ -128,6 +150,8 @@ const WsFactoryDeliveriesSubscribeRpc = Rpc.make(FACTORY_WS_METHODS.factoryDeliv
 export const FactoryRpcs = [
   WsFactorySettingsGetRpc,
   WsFactorySettingsSetRpc,
+  WsFactoryCommandsDiscoverRpc,
+  WsFactoryCommandsValidateRpc,
   WsFactoryDeliveriesStartRpc,
   WsFactoryDeliveriesStopRpc,
   WsFactoryDeliveriesResumeRpc,
@@ -150,11 +174,14 @@ export const FACTORY_RPC_READ_SCOPES = {
 } as const;
 
 /**
- * Writes, guarded on the client through `permissionAtom` and again on the server. Delivery
- * controls and the plan gate's actions run and interrupt agent threads, as starting a thread does.
+ * Writes, and the reads that serve one, guarded on the client through `permissionAtom` and again
+ * on the server. Delivery controls and the plan gate's actions run and interrupt agent threads, as
+ * starting a thread does.
  */
 export const FACTORY_CLIENT_GUARDED_RPC_SCOPES = {
   [FACTORY_WS_METHODS.factorySettingsSet]: AuthSettingsWriteScope,
+  [FACTORY_WS_METHODS.factoryCommandsDiscover]: AuthSettingsWriteScope,
+  [FACTORY_WS_METHODS.factoryCommandsValidate]: AuthSettingsWriteScope,
   [FACTORY_WS_METHODS.factoryDeliveriesStart]: AuthOrchestrationOperateScope,
   [FACTORY_WS_METHODS.factoryDeliveriesStop]: AuthOrchestrationOperateScope,
   [FACTORY_WS_METHODS.factoryDeliveriesResume]: AuthOrchestrationOperateScope,

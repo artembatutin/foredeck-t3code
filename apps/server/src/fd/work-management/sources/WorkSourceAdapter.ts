@@ -44,8 +44,15 @@ export interface WorkSourceRuntime {
   readonly interactive: boolean;
 }
 
-/** An item as the adapter reads it; the service adds thread links and source capabilities. */
-export type WorkSourceItemDetail = Omit<WorkItemDetail, "links" | "capabilities">;
+/**
+ * An item as the adapter reads it; the service adds thread links and source capabilities. Its
+ * `body` is cut for the wire, so its `scopeFingerprint` must come from the whole body first (see
+ * `workItemContentFingerprint`): only the adapter holds that.
+ */
+export type WorkSourceItemDetail = Omit<
+  WorkItemDetail,
+  "links" | "capabilities" | "scopeFingerprint"
+> & { readonly scopeFingerprint: string };
 
 export interface WorkSourceTestInput {
   readonly config: WorkSourceConfig;

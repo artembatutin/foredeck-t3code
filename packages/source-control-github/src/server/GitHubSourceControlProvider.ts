@@ -992,6 +992,11 @@ export const make = Effect.gen(function* () {
           providerError("getChangeRequest", input.cwd, { reference: input.reference }),
         ),
       ),
+    resolveChangeRequestRepository: (input) =>
+      resolveRepository(input).pipe(
+        Effect.map(({ host, owner, name }) => `${host}/${owner}/${name}`),
+        Effect.mapError(providerError("resolveChangeRequestRepository", input.cwd)),
+      ),
     createChangeRequest: (input) =>
       Effect.gen(function* () {
         const locator = yield* resolveRepository(input);

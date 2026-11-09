@@ -190,6 +190,7 @@ it("opens a Factory row's Work item from the row", async () => {
     search: {
       project: "env:p",
       item: "7e2aa85e-9347-44ce-b019-cb8dfd365b20:fd-aaaaaa",
+      view: "all",
     },
   });
   await act(async () => view.unmount());

@@ -3556,6 +3556,145 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
   );
 
   it.effect(
+    "leaves an archived thread archived when its create replays, until it is unarchived",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const threadId = ThreadId.make("runtime-layer-archived-create");
+        const projectId = ProjectId.make("runtime-layer-archived-create-project");
+        yield* seedProject({
+          projectId,
+          title: "Archived create",
+          workspaceRoot: process.cwd(),
+          defaultModelSelection: null,
+          createdAt: "2026-10-31T00:00:00.000Z",
+        });
+        const commandId = CommandId.make("create:runtime-layer-archived-create");
+        const create = orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId,
+          threadId,
+          projectId,
+          title: "Archived create",
+          modelSelection,
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        const where = Effect.gen(function* () {
+          const active = yield* orchestrator.getShellSnapshot({ location: "active" });
+          const archive = yield* orchestrator.getShellSnapshot({ location: "archive" });
+          return {
+            active: active.threads.some((thread) => thread.id === threadId),
+            archived: archive.archivedThreads.some((thread) => thread.id === threadId),
+          };
+        });
+
+        const created = yield* create;
+        yield* orchestrator.dispatch({
+          type: "thread.archive",
+          commandId: CommandId.make("runtime-layer-archived-create-archive"),
+          threadId,
+        });
+        assert.deepEqual(yield* where, { active: false, archived: true });
+
+        // Accepted, so a client sees success, yet nothing brings the thread back.
+        const replayed = yield* create;
+        assert.equal(replayed.sequence, created.sequence);
+        assert.deepEqual(yield* where, { active: false, archived: true });
+
+        yield* orchestrator.dispatch({
+          type: "thread.unarchive",
+          commandId: CommandId.make("runtime-layer-archived-create-unarchive"),
+          threadId,
+        });
+        assert.deepEqual(yield* where, { active: true, archived: false });
+      }).pipe(Effect.provide(Layer.fresh(layerTest))),
+  );
+
+  it.effect("recovers a rejected thread.create only under the next command id, creating once", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const projects = yield* ProjectStore.ProjectStoreV2;
+      const projectId = ProjectId.make("runtime-layer-rejected-create-project");
+      const threadId = ThreadId.make("runtime-layer-rejected-create");
+      const occurredAt = "2026-10-31T00:00:00.000Z";
+      // A project of several repositories refuses a create that names a worktree.
+      yield* projects.apply({
+        sequence: 1,
+        eventId: EventId.make("rejected-create-project"),
+        aggregateKind: "project",
+        aggregateId: projectId,
+        occurredAt,
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "project.created",
+        payload: {
+          projectId,
+          title: "Several repositories",
+          workspaceRoot: process.cwd(),
+          repositories: [
+            { id: "original", name: "Original", rootPath: process.cwd() },
+            { id: "additional", name: "Additional", rootPath: "/additional" },
+          ],
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: occurredAt,
+          updatedAt: occurredAt,
+        },
+      });
+      const create = (commandId: CommandId, worktreePath: string | null) =>
+        orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId,
+          threadId,
+          projectId,
+          title: "Created once",
+          modelSelection,
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          branch: null,
+          worktreePath,
+        });
+      const createdBy = (commandId: CommandId) =>
+        eventSink.readByCommandId({ commandId }).pipe(
+          Stream.runCollect,
+          Effect.map((stored) =>
+            Array.from(stored).filter(({ event }) => event.type === "thread.created"),
+          ),
+        );
+      const firstId = CommandId.make("create:runtime-layer-rejected-create");
+      const nextId = CommandId.make("create:runtime-layer-rejected-create:2");
+
+      const refused = yield* create(firstId, "/worktree").pipe(Effect.flip);
+      assert.equal(refused._tag, "OrchestratorDispatchError");
+
+      // The cause is gone, but the receipt refuses this id before anything is attempted.
+      const stillRefused = yield* create(firstId, null).pipe(Effect.flip);
+      assert.equal(stillRefused._tag, "OrchestratorCommandPreviouslyRejectedError");
+      assert.deepEqual(yield* createdBy(firstId), []);
+
+      const accepted = yield* create(nextId, null);
+      assert.lengthOf(yield* createdBy(nextId), 1);
+
+      // A client that missed the acknowledgement replays that id and creates nothing new.
+      const replayed = yield* create(nextId, null);
+      assert.equal(replayed.sequence, accepted.sequence);
+      assert.lengthOf(yield* createdBy(nextId), 1);
+      const firstStillRefused = yield* create(firstId, null).pipe(Effect.flip);
+      assert.equal(firstStillRefused._tag, "OrchestratorCommandPreviouslyRejectedError");
+    }).pipe(Effect.provide(Layer.fresh(layerTest))),
+  );
+
+  it.effect(
     "admits restart continuations once and rejects a stale continuation behind newer work",
     () =>
       Effect.gen(function* () {

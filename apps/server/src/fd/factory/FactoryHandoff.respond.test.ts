@@ -1,33 +1,48 @@
 import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
+  MessageId,
   type ProviderSessionId,
   type RunId,
+  type RuntimeMode,
   type RuntimeRequestId,
   type ThreadId,
 } from "@t3tools/contracts";
+import {
+  FACTORY_PENDING_REASON_MAX,
+  type FactoryPendingAction,
+} from "@t3tools/contracts/fd/factory";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 
+import * as AutomaticTurnGate from "../../orchestration-v2/AutomaticTurnGate.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import { ProjectAssistant } from "../assistant/index.ts";
+import * as Factory from "./index.ts";
 import * as AssistantHandoff from "../assistant-handoff/index.ts";
 import { type WorkDomainError, WorkService } from "../work-management/index.ts";
 import {
+  agreeAndCapture,
+  assignToFactory,
+  assistantThread,
   driver,
   endManagement,
   fill,
   governedMessages,
   type Managed,
   manage,
+  rootIdOf,
   runsOf,
+  startAssistantThread,
+  tick,
   writtenRows,
 } from "./testkit/handoff.ts";
 import { delegateFrom } from "./testkit/familyThreads.ts";
@@ -38,6 +53,7 @@ import {
   drainOrchestration,
   ended,
   runReached,
+  stateOf,
   threadProjection,
   verifyCommands,
   withProject,
@@ -84,6 +100,22 @@ const asked = (world: World, runId: RunId, mode: "live" | "message") =>
     );
     yield* drainOrchestration;
     return requestId;
+  }).pipe(Effect.orDie);
+
+/** The request is stored pending and core has acted on everything before it. */
+const requestSettled = (requestId: RuntimeRequestId) =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    yield* sink.stream().pipe(
+      Stream.filter(
+        ({ event }) =>
+          event.type === "runtime-request.updated" &&
+          event.payload.id === requestId &&
+          event.payload.status === "pending",
+      ),
+      Stream.runHead,
+    );
+    yield* drainOrchestration;
   }).pipe(Effect.orDie);
 
 const requestOf = (threadId: ThreadId, requestId: RuntimeRequestId) =>
@@ -192,6 +224,296 @@ const dropSlot = (managed: Managed) =>
     Effect.orDie,
     Effect.map((rows) => rows[0]?.entry_seq ?? assert.fail("The root held no slot.")),
   );
+
+describe("what a delivery's threads wait on", () => {
+  /** The epoch a client follows: its first value is where it stands now. */
+  const epoch = Effect.flatMap(Factory.FactoryService.FactoryService, (factory) =>
+    factory.listingChanges.pipe(Stream.runHead),
+  ).pipe(Effect.map(Option.getOrThrow));
+
+  it.live(
+    "lists them for the listing and the overview, writing nothing, and moves the epoch",
+    () =>
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const factory = yield* Factory.FactoryService.FactoryService;
+            const assistant = yield* ProjectAssistant.ProjectAssistant;
+            const author = yield* world.start;
+            const managed = yield* manage(world, author.deliveryId, { holding: true });
+            const child = yield* delegateFrom(author.threadId, author.runId);
+            const before = yield* epoch;
+
+            const question = yield* asked(world, author.runId, "live");
+            const said = `Needs network ${"x".repeat(FACTORY_PENDING_REASON_MAX)}`;
+            const approval = yield* world.provider
+              .askApproval(turnOf(world, child.runId), "command", "rm -rf build", said)
+              .pipe(Effect.orDie);
+            yield* requestSettled(approval);
+            yield* drainFactory;
+            assert.isAbove(yield* epoch, before);
+
+            const written = yield* writtenRows;
+            const listed = yield* factory.listForClients({ projectId: world.projectId });
+            const overview = yield* assistant.overview;
+            assert.deepStrictEqual(yield* writtenRows, written);
+            yield* drainOrchestration;
+            yield* drainFactory;
+            assert.deepStrictEqual(yield* writtenRows, written);
+
+            const pending = listed.find(
+              ({ deliveryId }) => deliveryId === author.deliveryId,
+            )?.pendingActions;
+            assert.deepStrictEqual(
+              pending?.items
+                .map(({ kind, runClass, threadId, projectId, requestId, capability }) => ({
+                  kind,
+                  runClass,
+                  threadId,
+                  projectId,
+                  requestId,
+                  capability,
+                }))
+                .toSorted((left, right) => left.kind.localeCompare(right.kind)),
+              [
+                {
+                  kind: "command",
+                  runClass: "factory",
+                  threadId: child.childThreadId,
+                  projectId: world.projectId,
+                  requestId: approval,
+                  capability: "live",
+                },
+                {
+                  kind: "user_input",
+                  runClass: "factory",
+                  threadId: author.threadId,
+                  projectId: world.projectId,
+                  requestId: question,
+                  capability: "live",
+                },
+              ],
+            );
+            assert.strictEqual(pending?.complete, true);
+            const asking = pending?.items.find(({ requestId }) => requestId === approval);
+            assert.strictEqual(asking?.reason, said.slice(0, FACTORY_PENDING_REASON_MAX));
+
+            const assignment = overview.assignments.find(
+              ({ assignmentId }) => assignmentId === managed.assignmentId,
+            );
+            assert.sameMembers(
+              assignment?.factory?.pendingActions?.items.map(({ requestId }) => requestId) ?? [],
+              [question, approval],
+            );
+            assert.strictEqual(
+              assignment?.factory?.pendingActions?.items.find(
+                ({ requestId }) => requestId === approval,
+              )?.reason,
+              said.slice(0, FACTORY_PENDING_REASON_MAX),
+            );
+          }),
+        { handoff: {}, automaticTurnGate: true },
+      ),
+    300_000,
+  );
+
+  it.live(
+    "keeps an answered question from granting anything, and refuses to answer a permission",
+    () =>
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const assistant = yield* ProjectAssistant.ProjectAssistant;
+            yield* startAssistantThread(world);
+            yield* agreeAndCapture(world, "export");
+            yield* assignToFactory(world, "export");
+            yield* tick;
+            yield* drainFactory;
+            yield* drainOrchestration;
+            const { awaiting } = yield* stateOf(yield* rootIdOf("export"));
+            if (awaiting?.type !== "run") return assert.fail("The author is not running.");
+            const author = { runId: awaiting.runId, threadId: awaiting.threadId };
+            const answer = (requestId: RuntimeRequestId) =>
+              assistant.answer({
+                assignmentId: "export",
+                managerThreadId: assistantThread,
+                requestId,
+                answers: { format: "CSV" },
+              });
+
+            const approval = yield* world.provider
+              .askApproval(turnOf(world, author.runId), "command", "rm -rf build")
+              .pipe(Effect.orDie);
+            yield* requestSettled(approval);
+            const refused = yield* Effect.flip(answer(approval));
+            assert.include(refused.message, "question tools cannot grant permission");
+            assert.strictEqual(respondedTo(world, approval), 0);
+            assert.strictEqual((yield* requestOf(author.threadId, approval)).status, "pending");
+
+            const question = yield* asked(world, author.runId, "live");
+            yield* answer(question);
+            yield* drainOrchestration;
+            const answered = world.provider.responded.find(
+              ({ requestId }) => requestId === question,
+            );
+            assert.deepStrictEqual(answered?.answers, { format: "CSV" });
+            assert.isUndefined(answered?.decision);
+            // The request it did not answer still waits on the owner's own decision.
+            assert.strictEqual((yield* requestOf(author.threadId, approval)).status, "pending");
+            assert.strictEqual(respondedTo(world, approval), 0);
+            const notices = (yield* assistant.overview).assignments.find(
+              ({ assignmentId }) => assignmentId === "export",
+            )?.factory?.pendingActions?.items;
+            assert.deepStrictEqual(
+              notices?.map(({ requestId }) => requestId),
+              [approval],
+            );
+          }),
+        { handoff: {}, automaticTurnGate: true },
+      ),
+    300_000,
+  );
+});
+
+describe("a managed delivery's work in a mode its host refuses", () => {
+  const options = (): Parameters<typeof withProject>[2] => ({
+    handoff: {},
+    automaticTurnGate: true,
+    hostPolicy: {
+      restrictions: [
+        { runtimeMode: "approval-required", status: "disallowed" },
+        { runtimeMode: "auto-accept-edits", status: "allowed" },
+        { runtimeMode: "full-access", status: "allowed" },
+      ],
+    },
+  });
+
+  const setThreadMode = (threadId: ThreadId, runtimeMode: RuntimeMode, label: string) =>
+    Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+      orchestrator.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make(label),
+        threadId,
+        runtimeMode,
+      }),
+    ).pipe(Effect.andThen(drainOrchestration));
+
+  const epoch = Effect.flatMap(Factory.FactoryService.FactoryService, (factory) =>
+    factory.listingChanges.pipe(Stream.runHead),
+  ).pipe(Effect.map(Option.getOrThrow));
+
+  it.live(
+    "lists a refused automatic turn for the listing and the overview, writing nothing",
+    () =>
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const factory = yield* Factory.FactoryService.FactoryService;
+            const assistant = yield* ProjectAssistant.ProjectAssistant;
+            const gate = yield* AutomaticTurnGate.AutomaticTurnGate;
+            const author = yield* world.start;
+            const managed = yield* manage(world, author.deliveryId, { holding: true });
+            yield* setThreadMode(author.threadId, "approval-required", "owner-supervises");
+            let ran = 0;
+            const turn = {
+              kind: "restart_continuation",
+              threadId: author.threadId,
+              messageId: MessageId.make(`message:restart-continuation:${author.runId}`),
+              key: author.runId,
+              sourceRunId: author.runId,
+              settled: false,
+            } as const;
+            const present = gate.admit(
+              turn,
+              Effect.sync(() => void (ran += 1)),
+            );
+            const before = yield* epoch;
+
+            const failure = yield* Effect.flip(present);
+            assert.strictEqual(failure.stage, "admission");
+            const refusing = yield* epoch;
+            assert.isAbove(refusing, before);
+            // Asking again says nothing new, so nothing a client follows moves.
+            yield* Effect.flip(present);
+            assert.strictEqual(yield* epoch, refusing);
+            assert.strictEqual(ran, 0);
+
+            const written = yield* writtenRows;
+            const listed = yield* factory.listForClients({ projectId: world.projectId });
+            const overview = yield* assistant.overview;
+            assert.deepStrictEqual(yield* writtenRows, written);
+            assert.strictEqual(yield* epoch, refusing);
+
+            const shown = (items: ReadonlyArray<FactoryPendingAction> | undefined) =>
+              (items ?? []).filter(({ kind }) => kind === "host_policy");
+            const inListing = shown(
+              listed.find(({ deliveryId }) => deliveryId === author.deliveryId)?.pendingActions
+                ?.items,
+            );
+            const inOverview = shown(
+              overview.assignments.find(({ assignmentId }) => assignmentId === managed.assignmentId)
+                ?.factory?.pendingActions?.items,
+            );
+            assert.deepStrictEqual(inOverview, inListing);
+            assert.lengthOf(inListing, 1);
+            assert.strictEqual(inListing[0]?.threadId, author.threadId);
+            assert.strictEqual(inListing[0]?.runtimeMode, "approval-required");
+            assert.deepStrictEqual(inListing[0]?.refused?.alternatives, [
+              "auto-accept-edits",
+              "full-access",
+            ]);
+            assert.strictEqual(inListing[0]?.refused?.choose, "automatic_turn");
+
+            // The owner chooses: nothing to show, before the turn is even asked for again.
+            yield* setThreadMode(author.threadId, "auto-accept-edits", "owner-chooses");
+            assert.deepStrictEqual(
+              shown(
+                (yield* factory.listForClients({ projectId: world.projectId })).find(
+                  ({ deliveryId }) => deliveryId === author.deliveryId,
+                )?.pendingActions?.items,
+              ),
+              [],
+            );
+            assert.isUndefined(
+              (yield* assistant.overview).assignments
+                .find(({ assignmentId }) => assignmentId === managed.assignmentId)
+                ?.factory?.pendingActions?.items.find(({ kind }) => kind === "host_policy"),
+            );
+          }),
+        options(),
+      ),
+    300_000,
+  );
+
+  it.live("refuses delegate_task from an unreviewed delivery's thread, writing nothing", () =>
+    withProject(
+      verifyCommands.passes,
+      (world) =>
+        withEndpoint(driver, (endpoint) =>
+          Effect.gen(function* () {
+            const author = yield* world.start;
+            yield* manage(world, author.deliveryId, { holding: true });
+            const agent = yield* endpoint.callerOn(author.threadId);
+            yield* setThreadMode(author.threadId, "approval-required", "owner-supervises");
+            const written = yield* writtenRows;
+
+            const refused = yield* agent.call("delegate_task", { task: "Check the export." });
+
+            assert.isTrue(refused.isError);
+            assert.include(refused.text, "This delivery cannot delegate now.");
+            assert.include(refused.text, "host policy refuses Supervised");
+            yield* drainFactory;
+            assert.deepStrictEqual(yield* writtenRows, written);
+            assert.deepStrictEqual((yield* threadProjection(author.threadId)).subagents, []);
+          }),
+        ).pipe(Effect.orDie),
+      options(),
+    ),
+  );
+});
 
 describe("answers by a managed delivery's agents", () => {
   it.live(

@@ -19,9 +19,12 @@ import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import { forkParked } from "../../serverActivation.ts";
+import * as FactoryChanges from "./FactoryChanges.ts";
+import * as FactoryOwnership from "./FactoryOwnership.ts";
 import { launchDeliveryId } from "./FactoryThreadEffects.ts";
 import * as FactoryWorker from "./FactoryWorker.ts";
 import { type RunCreated, runCreated, wakeOf } from "./followThrough.ts";
+import type { FactoryStoreError } from "./persistence/errors.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import {
   type FactoryEvent,
@@ -74,7 +77,13 @@ interface PullRequestEnded {
 }
 
 /** A run created by a command on a thread a Factory launch made, which may be a watch's wake. */
-type Job = "boot" | FactoryThreadEvent | LiveRun | PullRequestEnded | RunCreated;
+type Job = "boot" | FactoryThreadEvent | LiveRun | PullRequestEnded | RunCreated | RequestChanged;
+
+/** A runtime request opened or closed on a thread, which a delivery's listing may show. */
+interface RequestChanged {
+  readonly type: "request.changed";
+  readonly threadId: ThreadId;
+}
 
 /**
  * The event a link's stored snapshot makes: its pull request merged or closed, by number and URL.
@@ -103,6 +112,7 @@ const make = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
   const worker = yield* FactoryWorker.FactoryWorker;
+  const changes = yield* FactoryChanges.FactoryChanges;
   const ready = yield* Deferred.make<void>();
   // The sequence of the last event the tail has read; jobs for events up to it are queued.
   const handled = yield* TxRef.make(0);
@@ -294,8 +304,27 @@ const make = Effect.gen(function* () {
     Effect.andThen(worker.stopCancelledRuns),
   );
 
+  /** Tells a client following a delivery that a request on its family's thread moved. */
+  const announceRequest = ({ threadId }: RequestChanged) =>
+    FactoryOwnership.familyOf<FactoryStoreError | ProjectionStore.ProjectionStoreV2Error>(
+      {
+        delivery: (deliveryId) =>
+          deliveries.get(deliveryId).pipe(Effect.map(Option.getOrUndefined)),
+        lineage: (id) =>
+          projections.getThreadRecords(id, []).pipe(
+            Effect.map(({ thread }) => thread.lineage),
+            Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.undefined }),
+          ),
+      },
+      threadId,
+    ).pipe(
+      Effect.flatMap((family) => (family === null ? Effect.void : changes.announce)),
+      Effect.catchCause(logSkipped("factory request change skipped")),
+    );
+
   const jobs = yield* makeDrainableWorker((job: Job) => {
     if (job === "boot") return bootSweep;
+    if (job.type === "request.changed") return announceRequest(job);
     if (job.type === "run.live") return worker.stopCancelledRun(job);
     if (job.type === "pr.ended") {
       return stepPullRequest(job).pipe(
@@ -312,7 +341,8 @@ const make = Effect.gen(function* () {
 
   /**
    * A run's end, a thread's deletion, a run created or going live on a thread a Factory launch
-   * made, and a pull request link stored merged or closed; everything else passes by.
+   * made, a pull request link stored merged or closed, and a runtime request moving; everything
+   * else passes by.
    */
   const onDomainEvent = (stored: OrchestrationV2StoredEvent): Effect.Effect<void> => {
     const { event } = stored;
@@ -334,6 +364,8 @@ const make = Effect.gen(function* () {
       }
       case "thread.deleted":
         return jobs.enqueue({ type: "thread.deleted", threadId: event.payload.id });
+      case "runtime-request.updated":
+        return jobs.enqueue({ type: "request.changed", threadId: event.threadId });
       case "thread.pull-request-link-updated": {
         const ended = pullRequestEnded(event.payload);
         return ended === undefined

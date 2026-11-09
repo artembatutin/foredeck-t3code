@@ -1,9 +1,11 @@
+import * as NodePath from "@effect/platform-node/NodePath";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Result from "effect/Result";
 import * as TestClock from "effect/testing/TestClock";
@@ -32,6 +34,18 @@ import {
   withPathDirectoryListings,
   type WindowsShellEnvironmentReader,
 } from "./shell.ts";
+
+// The default spawn lookup stats through node:fs, and only runs for Windows, so these stand in for the
+// files on a Windows host. Everything else reaches the real file system.
+const windowsFiles = vi.hoisted(() => new Set<string>());
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    statSync: (file: string, ...rest: Array<never>) =>
+      windowsFiles.has(file) ? { isFile: () => true } : actual.statSync(file, ...rest),
+  };
+});
 
 const withWindowsEnvironmentMocks = <A, E, R>(
   effect: Effect.Effect<A, E, R>,
@@ -597,6 +611,364 @@ effectIt.layer(NodeServices.layer)("resolveCommandPath", (it) => {
       Effect.provideService(CommandResolutionCache, new Map()),
     ),
   );
+
+  describe("given the directory a command will start in", () => {
+    /** This process's directory for the effect's length, which `cwd` must outrank. */
+    const runningIn = <A, E, R>(directory: string, effect: Effect.Effect<A, E, R>) =>
+      Effect.acquireUseRelease(
+        Effect.sync(() => {
+          const previous = process.cwd();
+          process.chdir(directory);
+          return previous;
+        }),
+        () => effect,
+        (previous) => Effect.sync(() => process.chdir(previous)),
+      );
+
+    const installTool = (file: string) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        yield* fs.writeFileString(file, "#!/bin/sh\n");
+        yield* fs.chmod(file, 0o755);
+      });
+
+    /** A directory with a `bin`, holding each of the tools named. */
+    const rootWith = (...tools: ReadonlyArray<string>) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-command-root-" });
+        yield* fs.makeDirectory(path.join(root, "bin"));
+        for (const tool of tools) yield* installTool(path.join(root, "bin", tool));
+        return root;
+      });
+
+    const fromRelativePath = (cwd: string) => ({ cwd, env: { PATH: "./bin" } });
+
+    it.effect("reads a relative PATH directory from there, not from this process's", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const server = yield* rootWith("only-on-server", "on-both");
+        const target = yield* rootWith("only-in-target", "on-both");
+        yield* runningIn(
+          server,
+          Effect.gen(function* () {
+            const options = fromRelativePath(target);
+            expect(yield* resolveCommandPath("only-in-target", options)).toBe(
+              path.join(target, "bin", "only-in-target"),
+            );
+            expect(yield* resolveCommandPath("on-both", options)).toBe(
+              path.join(target, "bin", "on-both"),
+            );
+            expect(yield* resolveCommandPath("only-on-server", options)).toBeNull();
+            expect(yield* isCommandAvailable("only-on-server", options)).toBe(false);
+
+            // Every caller that names no directory keeps asking about this process's own.
+            const own = { env: { PATH: "./bin" } };
+            expect(yield* resolveCommandPath("only-on-server", own)).toBe(
+              path.join("bin", "only-on-server"),
+            );
+            expect(yield* resolveCommandPath("only-in-target", own)).toBeNull();
+          }),
+        );
+      }).pipe(Effect.provideService(CommandResolutionCache, new Map())),
+    );
+
+    it.effect("reads a relative command path from there too", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const server = yield* rootWith("only-on-server");
+        const target = yield* rootWith("only-in-target");
+        yield* runningIn(
+          server,
+          Effect.gen(function* () {
+            expect(
+              yield* resolveCommandPath("./bin/only-in-target", fromRelativePath(target)),
+            ).toBe(path.join(target, "bin", "only-in-target"));
+            expect(
+              yield* resolveCommandPath("./bin/only-on-server", fromRelativePath(target)),
+            ).toBeNull();
+          }),
+        );
+      }),
+    );
+
+    it.effect("keeps one relative PATH's cached answers apart for each directory", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const first = yield* rootWith("tool");
+        const second = yield* rootWith();
+        const firstTool = path.join(first, "bin", "tool");
+        const secondTool = path.join(second, "bin", "tool");
+        const lookUp = (cwd: string) => resolveCommandPath("tool", fromRelativePath(cwd));
+
+        expect(yield* lookUp(first)).toBe(firstTool);
+        expect(yield* lookUp(second)).toBeNull();
+
+        // Each directory still has its own answer cached, whatever has changed on disk since.
+        yield* fs.remove(firstTool);
+        yield* installTool(secondTool);
+        expect(yield* lookUp(first)).toBe(firstTool);
+        expect(yield* lookUp(second)).toBeNull();
+
+        yield* TestClock.adjust("30 seconds");
+        expect(yield* lookUp(first)).toBeNull();
+        expect(yield* lookUp(second)).toBe(secondTool);
+      }).pipe(Effect.provideService(CommandResolutionCache, new Map())),
+    );
+
+    it.effect("lists each directory's own relative PATH within one batch of lookups", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const first = yield* rootWith("in-first");
+        const second = yield* rootWith("in-second");
+        yield* Effect.gen(function* () {
+          expect(yield* resolveCommandPath("in-first", fromRelativePath(first))).toBe(
+            path.join(first, "bin", "in-first"),
+          );
+          expect(yield* resolveCommandPath("in-second", fromRelativePath(second))).toBe(
+            path.join(second, "bin", "in-second"),
+          );
+          expect(yield* resolveCommandPath("in-first", fromRelativePath(second))).toBeNull();
+        }).pipe(withPathDirectoryListings);
+      }).pipe(Effect.provideService(CommandResolutionCache, new Map())),
+    );
+
+    it.effect("leaves absolute PATH directories as they are, in their order", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const absolute = yield* rootWith("tool");
+        const target = yield* rootWith("tool");
+        const absoluteBin = path.join(absolute, "bin");
+        const lookUp = (PATH: string) =>
+          resolveCommandPath("tool", { cwd: target, env: { PATH } }).pipe(
+            Effect.provideService(CommandResolutionCache, new Map()),
+          );
+        expect(yield* lookUp(absoluteBin)).toBe(path.join(absoluteBin, "tool"));
+        expect(yield* lookUp(`${absoluteBin}:./bin`)).toBe(path.join(absoluteBin, "tool"));
+        expect(yield* lookUp(`./bin:${absoluteBin}`)).toBe(path.join(target, "bin", "tool"));
+      }).pipe(Effect.provideService(HostProcess.Platform, "linux")),
+    );
+
+    it.effect("searches there for an empty POSIX PATH entry, as a started process would", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const target = yield* rootWith();
+        const tool = path.join(target, "beside-the-checkout");
+        yield* installTool(tool);
+        const env = { PATH: "/fd-nowhere:" };
+        const lookUp = (options: { readonly env: typeof env; readonly cwd?: string }) =>
+          resolveCommandPath("beside-the-checkout", options).pipe(
+            Effect.provideService(CommandResolutionCache, new Map()),
+          );
+        expect(yield* lookUp({ cwd: target, env })).toBe(tool);
+        expect(yield* lookUp({ env })).toBeNull();
+      }).pipe(Effect.provideService(HostProcess.Platform, "linux")),
+    );
+
+    describe("with exactly an empty PATH", () => {
+      const fromEmptyPath = (cwd: string) => ({ cwd, env: { PATH: "" } });
+
+      /** A directory directly holding each of the tools named, as an empty entry searches it. */
+      const holding = (...tools: ReadonlyArray<string>) =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-empty-path-" });
+          for (const tool of tools) yield* installTool(path.join(root, tool));
+          return root;
+        });
+
+      it.effect("searches there on POSIX, never this process's directory", () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const server = yield* holding("only-on-server", "on-both");
+          const target = yield* holding("only-in-target", "on-both");
+          yield* runningIn(
+            server,
+            Effect.gen(function* () {
+              const options = fromEmptyPath(target);
+              expect(yield* resolveCommandPath("only-in-target", options)).toBe(
+                path.join(target, "only-in-target"),
+              );
+              expect(yield* resolveCommandPath("on-both", options)).toBe(
+                path.join(target, "on-both"),
+              );
+              expect(yield* resolveCommandPath("only-on-server", options)).toBeNull();
+              expect(yield* isCommandAvailable("only-in-target", options)).toBe(true);
+              expect(yield* isCommandAvailable("only-on-server", options)).toBe(false);
+            }),
+          );
+        }).pipe(
+          Effect.provideService(HostProcess.Platform, "linux"),
+          Effect.provideService(CommandResolutionCache, new Map()),
+        ),
+      );
+
+      it.effect("keeps each directory's answers apart in one cache", () =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const first = yield* holding("tool");
+          const second = yield* holding();
+          const firstTool = path.join(first, "tool");
+          const secondTool = path.join(second, "tool");
+          const lookUp = (cwd: string) => resolveCommandPath("tool", fromEmptyPath(cwd));
+
+          expect(yield* lookUp(first)).toBe(firstTool);
+          expect(yield* lookUp(second)).toBeNull();
+
+          // Each directory still has its own answer cached, whatever has changed on disk since.
+          yield* fs.remove(firstTool);
+          yield* installTool(secondTool);
+          expect(yield* lookUp(first)).toBe(firstTool);
+          expect(yield* lookUp(second)).toBeNull();
+
+          yield* TestClock.adjust("30 seconds");
+          expect(yield* lookUp(first)).toBeNull();
+          expect(yield* lookUp(second)).toBe(secondTool);
+        }).pipe(
+          Effect.provideService(HostProcess.Platform, "linux"),
+          Effect.provideService(CommandResolutionCache, new Map()),
+        ),
+      );
+
+      it.effect("lists each directory within one batch of lookups", () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const first = yield* holding("in-first");
+          const second = yield* holding("in-second");
+          yield* Effect.gen(function* () {
+            expect(yield* resolveCommandPath("in-first", fromEmptyPath(first))).toBe(
+              path.join(first, "in-first"),
+            );
+            expect(yield* resolveCommandPath("in-second", fromEmptyPath(second))).toBe(
+              path.join(second, "in-second"),
+            );
+            expect(yield* resolveCommandPath("in-first", fromEmptyPath(second))).toBeNull();
+          }).pipe(withPathDirectoryListings);
+        }).pipe(
+          Effect.provideService(HostProcess.Platform, "linux"),
+          Effect.provideService(CommandResolutionCache, new Map()),
+        ),
+      );
+
+      it.effect("finds nothing for a caller that names no directory, even in its own", () => {
+        const cache = new Map();
+        return Effect.gen(function* () {
+          const target = yield* holding("tool");
+          yield* runningIn(
+            target,
+            Effect.gen(function* () {
+              expect(yield* resolveCommandPath("tool", { env: { PATH: "" } })).toBeNull();
+              expect(yield* isCommandAvailable("tool", { env: { PATH: "" } })).toBe(false);
+            }),
+          );
+          expect(cache.size).toBe(0);
+        }).pipe(
+          Effect.provideService(HostProcess.Platform, "linux"),
+          Effect.provideService(CommandResolutionCache, cache),
+        );
+      });
+
+      // Only an exact `PATH=` is an entry to search. No PATH at all is the system's default, which
+      // this lookup does not model, and another spelling is not what a POSIX process reads.
+      it.effect.each([
+        { name: "no PATH", env: {} },
+        { name: "PATH left undefined", env: { PATH: undefined } },
+        { name: "an empty Path", env: { Path: "" } },
+        { name: "an empty path", env: { path: "" } },
+      ])("finds nothing there with $name", ({ env }) =>
+        Effect.gen(function* () {
+          const target = yield* holding("tool");
+          const cache = new Map();
+          const result = yield* resolveCommandPath("tool", { cwd: target, env }).pipe(
+            Effect.provideService(CommandResolutionCache, cache),
+          );
+          expect(result).toBeNull();
+          expect(cache.size).toBe(0);
+        }).pipe(Effect.provideService(HostProcess.Platform, "linux")),
+      );
+
+      it.effect("tells an empty PATH from no PATH under the same directory and cache", () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const target = yield* holding("tool");
+          const absent = { cwd: target, env: {} };
+          expect(yield* resolveCommandPath("tool", absent)).toBeNull();
+          expect(yield* resolveCommandPath("tool", fromEmptyPath(target))).toBe(
+            path.join(target, "tool"),
+          );
+          expect(yield* resolveCommandPath("tool", absent)).toBeNull();
+        }).pipe(
+          Effect.provideService(HostProcess.Platform, "linux"),
+          Effect.provideService(CommandResolutionCache, new Map()),
+        ),
+      );
+
+      it.effect("searches nothing on Windows, where an empty entry is skipped", () =>
+        Effect.gen(function* () {
+          const probed: Array<string> = [];
+          const cache = new Map();
+          const result = yield* resolveCommandPath("tool", {
+            cwd: "C:\\project",
+            env: { PATH: "", PATHEXT: ".EXE" },
+          }).pipe(
+            Effect.provideService(HostProcess.Platform, "win32"),
+            Effect.provideService(CommandResolutionCache, cache),
+            Effect.provide(
+              Layer.merge(
+                NodePath.layerWin32,
+                FileSystem.layerNoop({
+                  stat: (filePath) =>
+                    Effect.sync(() => {
+                      probed.push(filePath);
+                      return { type: "File" } as FileSystem.File.Info;
+                    }),
+                }),
+              ),
+            ),
+          );
+          expect(result).toBeNull();
+          expect(probed).toEqual([]);
+          expect(cache.size).toBe(0);
+        }),
+      );
+    });
+
+    it.effect("reads a relative Windows PATH from there, skipping an empty entry", () =>
+      Effect.gen(function* () {
+        const probed: Array<string> = [];
+        const result = yield* resolveCommandPath("tool", {
+          cwd: "C:\\project",
+          env: { PATH: ".\\bin;;C:\\tools", PATHEXT: ".EXE" },
+        }).pipe(
+          Effect.provideService(HostProcess.Platform, "win32"),
+          Effect.provideService(CommandResolutionCache, new Map()),
+          Effect.provide(
+            Layer.merge(
+              NodePath.layerWin32,
+              FileSystem.layerNoop({
+                stat: (filePath) =>
+                  Effect.sync(() => {
+                    probed.push(filePath);
+                    return { type: "Directory" } as FileSystem.File.Info;
+                  }),
+              }),
+            ),
+          ),
+        );
+        expect(result).toBeNull();
+        expect(probed).toEqual([
+          "C:\\project\\bin\\tool.EXE",
+          "C:\\project\\bin\\tool.exe",
+          "C:\\tools\\tool.EXE",
+          "C:\\tools\\tool.exe",
+        ]);
+      }),
+    );
+  });
 });
 
 describe("preferGitForWindowsBinary", () => {
@@ -792,6 +1164,103 @@ effectIt.layer(NodeServices.layer)("resolveSpawnCommand", (it) => {
       expect(scans).toHaveLength(7);
     }).pipe(Effect.provideService(CommandResolutionCache, new Map())),
   );
+
+  it.effect("scans a relative PATH once for each directory a command starts in", () =>
+    Effect.gen(function* () {
+      const scans: Array<string | undefined> = [];
+      const scan: SpawnExecutableResolver = (name, _platform, _env, cwd) => {
+        scans.push(cwd);
+        return `${cwd}\\bin\\${name}.exe`;
+      };
+      const resolve = (cwd: string) =>
+        resolveSpawnCommand("tool", [], { cwd, env: { PATH: ".\\bin", PATHEXT: ".EXE" } }).pipe(
+          Effect.provideService(HostProcess.Platform, "win32"),
+          Effect.provideService(SpawnExecutableResolution, scan),
+        );
+
+      expect((yield* resolve("C:\\one")).command).toBe("C:\\one\\bin\\tool.exe");
+      expect((yield* resolve("C:\\two")).command).toBe("C:\\two\\bin\\tool.exe");
+      expect((yield* resolve("C:\\one")).command).toBe("C:\\one\\bin\\tool.exe");
+      expect(scans).toEqual(["C:\\one", "C:\\two"]);
+    }).pipe(Effect.provideService(CommandResolutionCache, new Map())),
+  );
+
+  describe("through the default Windows lookup, given where the command starts", () => {
+    const resolveFrom = (command: string, cwd: string, PATH: string) =>
+      resolveSpawnCommand(command, ["--check"], {
+        cwd,
+        env: { PATH, PATHEXT: ".EXE;.CMD" },
+      }).pipe(
+        Effect.provideService(HostProcess.Platform, "win32"),
+        Effect.provideService(CommandResolutionCache, new Map()),
+      );
+    const withFiles = <A, E, R>(files: ReadonlyArray<string>, effect: Effect.Effect<A, E, R>) =>
+      Effect.acquireUseRelease(
+        Effect.sync(() => {
+          for (const file of files) windowsFiles.add(file);
+        }),
+        () => effect,
+        () => Effect.sync(() => windowsFiles.clear()),
+      );
+
+    it.effect("sees a batch script a relative PATH reaches there, and hands it to a shell", () =>
+      withFiles(
+        ["C:\\project\\bin\\verify.CMD"],
+        Effect.gen(function* () {
+          const resolved = yield* resolveFrom("verify", "C:\\project", ".\\bin");
+          expect(resolved.shell).toBe(true);
+          expect(resolved.command).toContain("C:\\project\\bin\\verify.CMD");
+        }),
+      ),
+    );
+
+    it.effect("runs a program a relative PATH reaches there, directly", () =>
+      withFiles(
+        ["C:\\project\\bin\\tool.EXE"],
+        Effect.gen(function* () {
+          expect(yield* resolveFrom("tool", "C:\\project", ".\\bin")).toEqual({
+            command: "C:\\project\\bin\\tool.EXE",
+            args: ["--check"],
+            shell: false,
+          });
+        }),
+      ),
+    );
+
+    it.effect("takes nothing from this process's own relative PATH directory", () =>
+      withFiles(
+        ["bin\\verify.CMD"],
+        Effect.gen(function* () {
+          expect(yield* resolveFrom("verify", "C:\\project", ".\\bin")).toEqual({
+            command: "verify",
+            args: ["--check"],
+            shell: false,
+          });
+        }),
+      ),
+    );
+
+    it.effect("reads a relative command path from there", () =>
+      withFiles(
+        ["C:\\project\\ci\\tool.EXE"],
+        Effect.gen(function* () {
+          const resolved = yield* resolveFrom(".\\ci\\tool", "C:\\project", "C:\\tools");
+          expect(resolved.command).toBe("C:\\project\\ci\\tool.EXE");
+        }),
+      ),
+    );
+
+    it.effect("still finds a batch script through an absolute PATH directory", () =>
+      withFiles(
+        ["C:\\tools\\verify.CMD"],
+        Effect.gen(function* () {
+          const resolved = yield* resolveFrom("verify", "C:\\project", "C:\\tools");
+          expect(resolved.shell).toBe(true);
+          expect(resolved.command).toContain("C:\\tools\\verify.CMD");
+        }),
+      ),
+    );
+  });
 
   it.effect("keeps launcher swaps apart for environments with and without MSYSTEM", () =>
     Effect.gen(function* () {

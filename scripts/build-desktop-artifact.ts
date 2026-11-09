@@ -4,6 +4,21 @@ import {
   ASSISTANT_PREVIEW_APP_ID,
   ASSISTANT_PREVIEW_PRODUCT_NAME,
 } from "./fd/assistantPreview.ts";
+import { convertPngToIcns, icnsProblems } from "./fd/icns.ts";
+import {
+  FROZEN_STAGE_INSTALL_ARGS,
+  readAcceptedLockfile,
+  verifyInstalledStage,
+  writeFrozenStage,
+} from "./fd/stageClosure.ts";
+import {
+  isUxPreviewVersion,
+  UX_PREVIEW_APP_ID,
+  UX_PREVIEW_HOME_ENV,
+  UX_PREVIEW_HOME_METADATA_KEY,
+  UX_PREVIEW_PRODUCT_NAME,
+  UX_PREVIEW_PROTOCOL,
+} from "./fd/uxPreview.ts";
 // @effect-diagnostics nodeBuiltinImport:off - Node's typed junction API avoids Windows symlink privileges while keeping the probe isolated.
 
 import * as NodeFSP from "node:fs/promises";
@@ -850,9 +865,13 @@ const spawnAndCollectOutput = Effect.fn("spawnAndCollectOutput")(function* (
   return { stdout, stderr, exitCode } as const;
 });
 
-const resolveGitCommitHash = Effect.fn("resolveGitCommitHash")(function* (repoRoot: string) {
+// A UX preview records the whole commit, which its About shows exactly.
+const resolveGitCommitHash = Effect.fn("resolveGitCommitHash")(function* (
+  repoRoot: string,
+  full = false,
+) {
   const result = yield* spawnAndCollectOutput(
-    ChildProcess.make("git", ["rev-parse", "--short=12", "HEAD"], {
+    ChildProcess.make("git", ["rev-parse", full ? "--verify" : "--short=12", "HEAD"], {
       cwd: repoRoot,
     }),
   ).pipe(
@@ -953,6 +972,8 @@ interface StagePackageJson {
   readonly version: string;
   readonly buildVersion: string;
   readonly t3codeCommitHash: string;
+  /** The exact home a UX preview runs on; see `readUxPreviewBuildHome` in the desktop app. */
+  readonly t3codeUxPreviewHome?: string;
   readonly t3codeWebAuthn?: MacWebAuthnEntitlements;
   readonly private: true;
   readonly packageManager: string;
@@ -1644,6 +1665,45 @@ export function createStageWorkspaceConfig(input: {
     packageExtensions: STAGE_PACKAGE_EXTENSIONS,
   };
 }
+
+/**
+ * A frozen stage's workspace config: what the install needs and nothing that steers a resolution.
+ * Overrides and package extensions are left out because the stage's lockfile already holds the
+ * accepted resolution they produced, and pnpm compares them with it before a frozen install.
+ */
+export function createFrozenStageWorkspaceConfig(input: {
+  readonly platform: typeof BuildPlatform.Type;
+  readonly arch: typeof BuildArch.Type;
+  readonly allowBuilds?: Record<string, boolean>;
+  readonly patchedDependencies: Record<string, string>;
+}): StageWorkspaceConfig {
+  const { packageExtensions: _resolutionOnly, ...frozen } = createStageWorkspaceConfig(input);
+  return frozen;
+}
+
+export class UxPreviewBuildInputError extends Schema.TaggedError<UxPreviewBuildInputError>()(
+  "UxPreviewBuildInputError",
+  { reason: Schema.Literals(["platform", "home"]) },
+) {
+  override get message(): string {
+    return this.reason === "platform"
+      ? "A UX preview is a macOS build; build it with --platform mac."
+      : `A UX preview build needs ${UX_PREVIEW_HOME_ENV} set to the absolute home it runs on; build it with scripts/fd/uxPreview.ts.`;
+  }
+}
+
+/** The home a UX preview build bakes in, required before anything is built. */
+export const resolveUxPreviewBuildHome = Effect.fn("resolveUxPreviewBuildHome")(function* (
+  platform: typeof BuildPlatform.Type,
+) {
+  if (platform !== "mac") return yield* new UxPreviewBuildInputError({ reason: "platform" });
+  const home = Option.getOrElse(
+    yield* Config.String(UX_PREVIEW_HOME_ENV).pipe(Config.option),
+    () => "",
+  ).trim();
+  if (!home.startsWith("/")) return yield* new UxPreviewBuildInputError({ reason: "home" });
+  return home;
+});
 
 export function createStagePatchedDependencies(
   patchedDependencies: Record<string, string>,
@@ -2442,12 +2502,37 @@ export const stageBrowserSecret = Effect.fn("stageBrowserSecret")(function* (inp
   );
 });
 
+export class MacIconConversionError extends Schema.TaggedError<MacIconConversionError>()(
+  "MacIconConversionError",
+  { problems: Schema.Array(Schema.String), cause: Schema.optional(Schema.Defect()) },
+) {
+  override get message(): string {
+    return `The pinned icon converter did not produce a valid icon: ${this.problems.join("; ")}.`;
+  }
+}
+
+/** Writes `targetIcns` from `sourcePng` with the pinned converter and checks what it wrote. */
+const convertMacIconWithPinnedConverter = Effect.fn("convertMacIconWithPinnedConverter")(function* (
+  sourcePng: string,
+  targetIcns: string,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const icns = yield* Effect.tryPromise({
+    try: () => convertPngToIcns(sourcePng),
+    catch: (cause) => new MacIconConversionError({ problems: ["it could not render"], cause }),
+  });
+  yield* fs.writeFile(targetIcns, icns);
+  const problems = icnsProblems(yield* fs.readFile(targetIcns));
+  if (problems.length > 0) return yield* new MacIconConversionError({ problems });
+});
+
 function generateMacIconSet(
   sourcePng: string,
   targetIcns: string,
   tmpRoot: string,
   path: Path.Path,
   verbose: boolean,
+  pinnedFallback = false,
 ) {
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -2472,14 +2557,30 @@ function generateMacIconSet(
       );
     }
 
-    yield* runCommand(ChildProcess.make({})`iconutil -c icns ${iconsetDir} -o ${targetIcns}`, {
-      label: "iconutil icns",
-      verbose,
-    });
+    const iconutil = runCommand(
+      ChildProcess.make({})`iconutil -c icns ${iconsetDir} -o ${targetIcns}`,
+      { label: "iconutil icns", verbose },
+    );
+    // Only a UX preview build falls back: every other build keeps failing on iconutil as before.
+    yield* pinnedFallback
+      ? iconutil.pipe(
+          Effect.catchTags({
+            BuildCommandFailedError: (failure) =>
+              Effect.logWarning(
+                `[desktop-artifact] iconutil exited with ${failure.exitCode}; writing the icon with the pinned converter.`,
+              ).pipe(Effect.andThen(convertMacIconWithPinnedConverter(sourcePng, targetIcns))),
+          }),
+        )
+      : iconutil;
   });
 }
 
-function stageMacIcons(stageResourcesDir: string, sourcePng: string, verbose: boolean) {
+export function stageMacIcons(
+  stageResourcesDir: string,
+  sourcePng: string,
+  verbose: boolean,
+  pinnedFallback = false,
+) {
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -2502,7 +2603,7 @@ function stageMacIcons(stageResourcesDir: string, sourcePng: string, verbose: bo
       verbose,
     });
 
-    yield* generateMacIconSet(sourcePng, iconIcnsPath, tmpRoot, path, verbose);
+    yield* generateMacIconSet(sourcePng, iconIcnsPath, tmpRoot, path, verbose, pinnedFallback);
   });
 }
 
@@ -2710,7 +2811,9 @@ export function resolveDesktopUpdateChannel(version: string): "latest" | "nightl
 // install can be pointed at one of these releases, and the build itself
 // reports that no update feed is configured instead of polling.
 export function isDesktopPreviewVersion(version: string): boolean {
-  return /-pr\./.test(version) || /-preview\.\d{8}\.\d+$/.test(version);
+  return (
+    /-pr\./.test(version) || /-preview\.\d{8}\.\d+$/.test(version) || isUxPreviewVersion(version)
+  );
 }
 
 export function resolveDesktopWebAssetBrand(version: string): WebAssetBrand {
@@ -2751,6 +2854,7 @@ export function resolvePackageManagerUserAgent(packageManager: string): string {
 }
 
 export function resolveDesktopProductName(version: string): string {
+  if (isUxPreviewVersion(version)) return UX_PREVIEW_PRODUCT_NAME;
   if (isAssistantPreviewVersion(version)) return ASSISTANT_PREVIEW_PRODUCT_NAME;
   return resolveDesktopUpdateChannel(version) === "nightly"
     ? "foredeck-t3 (Nightly)"
@@ -2777,7 +2881,11 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   arch?: typeof BuildArch.Type,
 ) {
   const buildConfig: Record<string, unknown> = {
-    appId: isAssistantPreviewVersion(version) ? ASSISTANT_PREVIEW_APP_ID : DESKTOP_APP_ID,
+    appId: isUxPreviewVersion(version)
+      ? UX_PREVIEW_APP_ID
+      : isAssistantPreviewVersion(version)
+        ? ASSISTANT_PREVIEW_APP_ID
+        : DESKTOP_APP_ID,
     productName: resolveDesktopProductName(version),
     artifactName: "foredeck-t3-${version}-${arch}.${ext}",
     electronLanguages: [...DESKTOP_ELECTRON_LANGUAGES],
@@ -2851,21 +2959,24 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
           },
         ],
       },
-      protocols: isAssistantPreviewVersion(version)
-        ? []
-        : [
-            {
-              name: "foredeck-t3",
-              schemes: ["t3code", "t3code-dev"],
-            },
-            // Lets people choose foredeck-t3 as their default web browser, which opens
-            // each link in a new thread's browser panel.
-            {
-              name: "Web site URL",
-              schemes: ["http", "https"],
-              role: "Viewer",
-            },
-          ],
+      // A UX preview answers only its own scheme, so no link meant for another install opens it.
+      protocols: isUxPreviewVersion(version)
+        ? [{ name: UX_PREVIEW_PRODUCT_NAME, schemes: [UX_PREVIEW_PROTOCOL] }]
+        : isAssistantPreviewVersion(version)
+          ? []
+          : [
+              {
+                name: "foredeck-t3",
+                schemes: ["t3code", "t3code-dev"],
+              },
+              // Lets people choose foredeck-t3 as their default web browser, which opens
+              // each link in a new thread's browser panel.
+              {
+                name: "Web site URL",
+                schemes: ["http", "https"],
+                role: "Viewer",
+              },
+            ],
       ...(signed ? { sign: path.join(repoRoot, "scripts/sign-macos.ts") } : {}),
       ...(macPasskeySigning
         ? {
@@ -2920,14 +3031,15 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       // electron-builder turns these into MimeType=x-scheme-handler/<scheme>;
       // in the .desktop entry (Exec already gets %U), so browsers can hand
       // t3code:// OAuth callbacks to the app.
-      protocols: isAssistantPreviewVersion(version)
-        ? []
-        : [
-            {
-              name: "foredeck-t3",
-              schemes: ["t3code", "t3code-dev"],
-            },
-          ],
+      protocols:
+        isAssistantPreviewVersion(version) || isUxPreviewVersion(version)
+          ? []
+          : [
+              {
+                name: "foredeck-t3",
+                schemes: ["t3code", "t3code-dev"],
+              },
+            ],
       desktop: {
         entry: {
           StartupWMClass: "t3code",
@@ -2991,9 +3103,10 @@ const assertPlatformBuildResources = Effect.fn("assertPlatformBuildResources")(f
   stageResourcesDir: string,
   iconAssets: DesktopBuildIconAssets,
   verbose: boolean,
+  pinnedIconFallback = false,
 ) {
   if (platform === "mac") {
-    yield* stageMacIcons(stageResourcesDir, iconAssets.macIconPng, verbose);
+    yield* stageMacIcons(stageResourcesDir, iconAssets.macIconPng, verbose, pinnedIconFallback);
     return;
   }
 
@@ -3627,8 +3740,12 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   });
 
   const appVersion = options.version ?? serverPackageJson.version;
+  // A UX preview installs the accepted lock's frozen closure and runs only on the home it bakes in.
+  const uxPreview = isUxPreviewVersion(appVersion);
+  const uxPreviewHome = uxPreview ? yield* resolveUxPreviewBuildHome(options.platform) : undefined;
+  const acceptedLock = uxPreview ? yield* readAcceptedLockfile(repoRoot) : undefined;
   const iconAssets = resolveDesktopBuildIconAssets(appVersion);
-  const commitHash = yield* resolveGitCommitHash(repoRoot);
+  const commitHash = yield* resolveGitCommitHash(repoRoot, uxPreview);
   const mkdir = options.keepStage ? fs.makeTempDirectory : fs.makeTempDirectoryScoped;
   const stageRoot = yield* mkdir({
     prefix: `t3code-desktop-${options.platform}-stage-`,
@@ -3809,6 +3926,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
       windowsIconIco: path.join(repoRoot, iconAssets.windowsIconIco),
     },
     options.verbose,
+    uxPreview,
   );
 
   // electron-builder is filtering out stageResourcesDir directory in the AppImage for production
@@ -3881,6 +3999,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     version: appVersion,
     buildVersion: appVersion,
     t3codeCommitHash: commitHash,
+    ...(uxPreviewHome === undefined ? {} : { [UX_PREVIEW_HOME_METADATA_KEY]: uxPreviewHome }),
     // Read by apps/desktop/src/preview/Passkeys.ts; must match the signed entitlements.
     ...(macWebAuthn ? { t3codeWebAuthn: macWebAuthn } : {}),
     private: true,
@@ -3916,32 +4035,66 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
 
   const stagePackageJsonString = yield* encodeJsonString(stagePackageJson);
   yield* fs.writeFileString(path.join(stageAppDir, "package.json"), `${stagePackageJsonString}\n`);
-  const stageWorkspaceConfig = createStageWorkspaceConfig({
-    platform: options.platform,
-    arch: options.arch,
-    allowBuilds: workspaceAllowBuilds,
-    patchedDependencies: stagePatchedDependencies,
-    overrides: resolvedOverrides,
-  });
+  // Writes the stage's lockfile and the registered patches it uses, transitive ones included.
+  const frozenStage = acceptedLock
+    ? yield* writeFrozenStage({
+        repoRoot,
+        stageAppDir,
+        lock: acceptedLock,
+        dependencies: stageDependencies,
+        devDependencies: stagePackageJson.devDependencies,
+        workspacePatches: workspacePatchedDependencies,
+      })
+    : undefined;
+  const stageWorkspaceConfig = frozenStage
+    ? createFrozenStageWorkspaceConfig({
+        platform: options.platform,
+        arch: options.arch,
+        allowBuilds: workspaceAllowBuilds,
+        patchedDependencies: frozenStage.patchFiles,
+      })
+    : createStageWorkspaceConfig({
+        platform: options.platform,
+        arch: options.arch,
+        allowBuilds: workspaceAllowBuilds,
+        patchedDependencies: stagePatchedDependencies,
+        overrides: resolvedOverrides,
+      });
   const stageWorkspaceConfigString = yield* encodeStageWorkspaceConfig(stageWorkspaceConfig);
   yield* fs.writeFileString(
     path.join(stageAppDir, "pnpm-workspace.yaml"),
     stageWorkspaceConfigString,
   );
 
-  if (Object.keys(stagePatchedDependencies).length > 0) {
+  if (!frozenStage && Object.keys(stagePatchedDependencies).length > 0) {
     yield* fs.copy(path.join(repoRoot, "patches"), path.join(stageAppDir, "patches"));
   }
 
   yield* Effect.log("[desktop-artifact] Installing staged production dependencies...");
-  const installCommand = yield* resolveSpawnCommand("vp", [...STAGE_INSTALL_ARGS]);
+  const installArgs = frozenStage ? FROZEN_STAGE_INSTALL_ARGS : STAGE_INSTALL_ARGS;
+  const installCommand = yield* resolveSpawnCommand("vp", [...installArgs]);
   yield* runCommand(
     ChildProcess.make(installCommand.command, installCommand.args, {
       cwd: stageAppDir,
       shell: installCommand.shell,
     }),
-    { label: "vp install --prod", verbose: options.verbose },
+    { label: `vp ${installArgs.join(" ")}`, verbose: options.verbose },
   );
+  if (frozenStage && acceptedLock) {
+    const closure = yield* verifyInstalledStage({
+      stageAppDir,
+      accepted: acceptedLock,
+      plan: frozenStage,
+    });
+    yield* fs.makeDirectory(options.outputDir, { recursive: true });
+    yield* fs.writeFileString(
+      path.join(options.outputDir, "stage-closure.json"),
+      `${yield* encodeJsonString(closure)}\n`,
+    );
+    yield* Effect.log(
+      `[desktop-artifact] Verified the frozen stage against the accepted lock: ${closure.installedSnapshots} packages, patches ${Object.keys(closure.patches).join(", ")}.`,
+    );
+  }
   yield* stageClerkPasskeyNativeBinaries(stageAppDir, options.platform, options.arch);
   yield* stageKeyringNativeBinaries(stageAppDir, options.platform, options.arch);
 

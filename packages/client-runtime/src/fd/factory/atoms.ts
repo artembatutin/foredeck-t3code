@@ -30,13 +30,14 @@ export interface EnvironmentTarget<Input> {
 }
 
 /**
- * What a request needs its destination to serve: Factory, or Factory's planning (the plan gate's
- * actions and parent starts), which a server from before planning does not serve.
+ * What a request needs its destination to serve: Factory, Factory's planning (the plan gate's
+ * actions and parent starts), which a server from before planning does not serve, or its command
+ * setup (discovering and validating commands), likewise.
  */
-type FactoryNeed = "factory" | "planning";
+type FactoryNeed = "factory" | "planning" | "commandSetup";
 
 const serves = (support: FactorySupport | undefined, need: FactoryNeed) =>
-  support !== undefined && (need === "factory" || support.planning);
+  support !== undefined && (need === "factory" || support[need]);
 
 /** Whether a session's server serves `need`, from the config the session connected with. */
 const sessionServes = (session: RpcSession, need: FactoryNeed) =>
@@ -74,7 +75,8 @@ export function createFactoryEnvironmentAtoms<R, E>(
     );
   const supported = viewServes("factory");
   const planning = viewServes("planning");
-  const viewed = { factory: supported, planning } as const;
+  const commandSetup = viewServes("commandSetup");
+  const viewed = { factory: supported, planning, commandSetup } as const;
 
   /** Whether a request needing `need` may leave now for the environment the effect targets. */
   const servedNow = (need: FactoryNeed) =>
@@ -103,12 +105,14 @@ export function createFactoryEnvironmentAtoms<R, E>(
     Effect.gen(function* () {
       if (yield* servedNow(need)) return yield* send;
       const { environmentId, label } = (yield* EnvironmentSupervisor.EnvironmentSupervisor).target;
+      const wanted = {
+        factory: "Factory. Update its server to use Factory.",
+        planning: "Factory planning. Update its server to plan deliveries.",
+        commandSetup: "Factory command setup. Update its server to find and check commands.",
+      } as const;
       return yield* new EnvironmentRpcUnavailableError({
         environmentId,
-        message:
-          need === "factory"
-            ? `${label} does not offer Factory. Update its server to use Factory.`
-            : `${label} does not offer Factory planning. Update its server to plan deliveries.`,
+        message: `${label} does not offer ${wanted[need]}`,
       });
     });
 
@@ -299,6 +303,34 @@ export function createFactoryEnvironmentAtoms<R, E>(
           key: ({ environmentId, input }) => lane(environmentId, "settings", input.projectId),
         },
       }),
+    ),
+    /** What the project's checkout offers as commands. It runs and saves nothing. */
+    discoverCommands: whereSupported(
+      createEnvironmentRpcCommand(runtime, {
+        label: "environment-data:factory:discover-commands",
+        tag: WS_METHODS.factoryCommandsDiscover,
+        execute: (input) =>
+          writeWhenServed(
+            "commandSetup",
+            requestGuarded(WS_METHODS.factoryCommandsDiscover, input),
+          ),
+        scheduler,
+      }),
+      "commandSetup",
+    ),
+    /** What resolving a command on the server finds. It runs and saves nothing. */
+    validateCommand: whereSupported(
+      createEnvironmentRpcCommand(runtime, {
+        label: "environment-data:factory:validate-command",
+        tag: WS_METHODS.factoryCommandsValidate,
+        execute: (input) =>
+          writeWhenServed(
+            "commandSetup",
+            requestGuarded(WS_METHODS.factoryCommandsValidate, input),
+          ),
+        scheduler,
+      }),
+      "commandSetup",
     ),
     /** Stores the owner's edit of the plan a delivery waits on at the plan gate. */
     updatePlan: whereSupported(

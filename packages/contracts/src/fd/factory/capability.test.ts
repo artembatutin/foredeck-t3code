@@ -69,17 +69,26 @@ describe("factorySupport", () => {
   );
 
   it("supports the version 1 capability, even with fields a newer server adds", () => {
-    expect(factorySupport(withFactory({ version: 1 }))).toEqual({ version: 1, planning: false });
+    expect(factorySupport(withFactory({ version: 1 }))).toEqual({
+      version: 1,
+      planning: false,
+      commandSetup: false,
+    });
     expect(factorySupport(withFactory({ version: 1, features: ["plans"] }))).toEqual({
       version: 1,
       planning: false,
+      commandSetup: false,
     });
   });
 
-  it("advertises version 1 with planning and encodes it unchanged", () => {
-    expect(FACTORY_CAPABILITY).toEqual({ version: 1, planning: true });
+  it("advertises version 1 with planning and command setup and encodes it unchanged", () => {
+    expect(FACTORY_CAPABILITY).toEqual({ version: 1, planning: true, commandSetup: true });
     const capabilities = withFactory(FACTORY_CAPABILITY);
-    expect(factorySupport(capabilities)).toEqual({ version: 1, planning: true });
+    expect(factorySupport(capabilities)).toEqual({
+      version: 1,
+      planning: true,
+      commandSetup: true,
+    });
     expect(encodeCapabilities(capabilities).factory).toEqual(FACTORY_CAPABILITY);
   });
 });
@@ -107,6 +116,20 @@ describe("factorySupport planning", () => {
     // That client's capability schema is the version alone; the field a newer server adds is
     // dropped, so its support is the same as against a server without planning.
     expect(decodeBeforePlanning(encodeCapability(FACTORY_CAPABILITY))).toEqual({ version: 1 });
+  });
+});
+
+describe("factorySupport command setup", () => {
+  it("reports it only for a server that advertises it", () => {
+    expect(factorySupport(withFactory({ version: 1, commandSetup: true }))?.commandSetup).toBe(
+      true,
+    );
+    // A server from before it omits the field, and still serves everything else it did.
+    expect(factorySupport(withFactory({ version: 1, planning: true }))).toEqual({
+      version: 1,
+      planning: true,
+      commandSetup: false,
+    });
   });
 });
 

@@ -1,6 +1,7 @@
 import { RequestActionButton } from "./RequestActionButton";
 import { QuestionAttachments } from "./QuestionAttachments";
-import type { RuntimeRequestId } from "@t3tools/contracts";
+import type { RuntimeMode, RuntimeRequestId } from "@t3tools/contracts";
+import type { RuntimeModeRefusal } from "@t3tools/shared/fd/approvals";
 import type { ThreadUserInputQuestion } from "@t3tools/client-runtime/state/thread-requests";
 import { useCallback, useRef } from "react";
 import { Platform, Pressable, ScrollView, View, type LayoutChangeEvent } from "react-native";
@@ -33,6 +34,10 @@ import {
 export interface PendingUserInputCardProps {
   readonly canOperateThread: boolean;
   readonly pendingUserInput: PendingUserInput;
+  /** Why the host would refuse the turn this answer starts: it waits, and can still be dismissed. */
+  readonly answerRefusal: RuntimeModeRefusal | null;
+  /** This card replaces the composer, so a refused answer's mode is chosen here. */
+  readonly onChooseRuntimeMode: (runtimeMode: RuntimeMode) => void;
   /**
    * Constant while a request is pending (it reserves keyboard space), so the
    * keyboard transition is pure translation; changes only on rare discrete
@@ -112,7 +117,7 @@ export function PendingUserInputCard(props: PendingUserInputCardProps) {
   // Message responses start a new run and remain available after the provider exits.
   const canRespond = props.pendingUserInput.responseCapability !== "not_resumable";
   const isResponding = props.respondingUserInputId === props.pendingUserInput.requestId;
-  const responseDisabled = !canRespond || isResponding;
+  const responseDisabled = !canRespond || isResponding || props.answerRefusal !== null;
 
   const cardCoverage = props.cardCoverage;
   const barHeightRef = useRef(0);
@@ -286,6 +291,24 @@ export function PendingUserInputCard(props: PendingUserInputCardProps) {
             run to continue.
           </Text>
         ) : null}
+        {props.answerRefusal === null ? null : (
+          <View className="gap-2 pb-1">
+            <Text className="font-sans text-sm leading-5 text-foreground-muted">
+              {props.answerRefusal.summary} Nothing was sent, and the mode is unchanged.
+            </Text>
+            {props.answerRefusal.alternatives.map(({ mode, label, meaning }) => (
+              <View key={mode} className="gap-1">
+                <RequestActionButton
+                  label={`Use ${label}`}
+                  tone="secondary"
+                  disabled={!props.canOperateThread}
+                  onPress={() => props.onChooseRuntimeMode(mode)}
+                />
+                <Text className="font-sans text-xs text-foreground-tertiary">{meaning}</Text>
+              </View>
+            ))}
+          </View>
+        )}
         {props.pendingUserInput.questions.map((question) => {
           const draft = props.drafts[question.id];
           return (

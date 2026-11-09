@@ -35,6 +35,11 @@ function canExecuteFile(filePath: string): boolean {
 export interface CommandAvailabilityOptions {
   readonly env?: NodeJS.ProcessEnv;
   readonly extendEnv?: boolean;
+  /**
+   * Where the command will start, when that is not this process's directory. A relative path and a
+   * relative PATH directory then mean what they will mean to the started process.
+   */
+  readonly cwd?: string;
 }
 
 export type CommandAvailabilityChecker = (
@@ -73,17 +78,20 @@ export type SpawnExecutableResolver = (
   command: string,
   platform: NodeJS.Platform,
   env: NodeJS.ProcessEnv,
+  cwd?: string,
 ) => string | undefined;
 
 function resolveSpawnExecutableWithNode(
   command: string,
   platform: NodeJS.Platform,
   env: NodeJS.ProcessEnv,
+  cwd?: string,
 ): string | undefined {
   const path = platform === "win32" ? NodePath.win32 : NodePath.posix;
   const windowsPathExtensions = platform === "win32" ? resolveWindowsPathExtensions(env) : [];
+  const explicitPath = command.includes("/") || command.includes("\\");
   const candidates = resolveCommandCandidates(
-    command,
+    explicitPath && cwd !== undefined ? path.resolve(cwd, command) : command,
     platform,
     windowsPathExtensions,
     path.extname,
@@ -100,15 +108,13 @@ function resolveSpawnExecutableWithNode(
     }
   };
 
-  if (command.includes("/") || command.includes("\\")) {
+  if (explicitPath) {
     return candidates.find(isExecutable);
   }
 
-  for (const pathEntry of (readEnvPath(env) ?? "").split(pathDelimiterForPlatform(platform))) {
-    const normalizedPathEntry = stripWrappingQuotes(pathEntry.trim());
-    if (normalizedPathEntry.length === 0) continue;
+  for (const directory of commandSearchDirectories(env, platform, cwd, path)) {
     for (const candidate of candidates) {
-      const candidatePath = path.join(normalizedPathEntry, candidate);
+      const candidatePath = path.join(directory, candidate);
       if (isExecutable(candidatePath)) return candidatePath;
     }
   }
@@ -429,6 +435,29 @@ function resolveWindowsPathExtensions(env: NodeJS.ProcessEnv): ReadonlyArray<str
   return parsed.length > 0 ? Array.from(new Set(parsed)) : fallback;
 }
 
+/**
+ * The directories a bare command name is searched in, in order and each once. Given `cwd`, they are
+ * the ones a process starting there searches: the system reads a relative PATH directory from the
+ * new process's directory, and on POSIX an empty one as that directory itself.
+ */
+function commandSearchDirectories(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  cwd: string | undefined,
+  path: { readonly resolve: (...segments: Array<string>) => string },
+): ReadonlyArray<string> {
+  // Keep case variants: Windows can make PATH directories case-sensitive.
+  const directories = new Set<string>();
+  for (const entry of resolvePathEnvironmentVariable(env).split(
+    pathDelimiterForPlatform(platform),
+  )) {
+    const directory = stripWrappingQuotes(entry.trim());
+    if (directory.length === 0 && (cwd === undefined || platform === "win32")) continue;
+    directories.add(cwd === undefined ? directory : path.resolve(cwd, directory));
+  }
+  return [...directories];
+}
+
 function resolveCommandCandidates(
   command: string,
   platform: NodeJS.Platform,
@@ -461,8 +490,8 @@ function resolveCommandCandidates(
 // Session bootstrap resolves the same commands over and over, each PATH scan
 // costing hundreds of 'shell.isExecutableFile' filesystem probes (tens of
 // thousands per connect). Memoize the scan outcome per
-// (platform, PATH, PATHEXT, command) for a short window: repeat scans hit the
-// cache while any change to the search environment invalidates immediately.
+// (platform, PATH, PATHEXT, command, cwd) for a short window: repeat scans hit
+// the cache while any change to the search environment invalidates immediately.
 // Explicit-path resolution is never cached - callers probe paths they have
 // just written (e.g. managed binary installs). A "not-found" outcome is also
 // cached for the TTL, so a just-installed binary can stay invisible for up to
@@ -592,14 +621,15 @@ const resolveCommandPathForPlatform = Effect.fn("shell.resolveCommandPathForPlat
   const platform = options.platform;
   const env = options.env ?? process.env;
   const windowsPathExtensions = platform === "win32" ? resolveWindowsPathExtensions(env) : [];
+  const explicitPath = command.includes("/") || command.includes("\\");
   const commandCandidates = resolveCommandCandidates(
-    command,
+    explicitPath && options.cwd !== undefined ? path.resolve(options.cwd, command) : command,
     platform,
     windowsPathExtensions,
     path.extname,
   );
 
-  if (command.includes("/") || command.includes("\\")) {
+  if (explicitPath) {
     for (const candidate of commandCandidates) {
       if (yield* isExecutableFile(candidate, platform, windowsPathExtensions)) {
         return candidate;
@@ -609,13 +639,20 @@ const resolveCommandPathForPlatform = Effect.fn("shell.resolveCommandPathForPlat
   }
 
   const pathValue = resolvePathEnvironmentVariable(env);
-  if (pathValue.length === 0) {
+  // Exactly `PATH=` is one empty entry, which a POSIX process starting in `cwd` searches as that
+  // directory. No PATH at all means a system default this lookup does not model.
+  const searchesEmptyEntry = platform !== "win32" && options.cwd !== undefined && env.PATH === "";
+  if (pathValue.length === 0 && !searchesEmptyEntry) {
     return null;
   }
 
-  const cacheKey = [platform, pathValue, windowsPathExtensions.join(";"), command].join(
-    COMMAND_RESOLUTION_CACHE_KEY_SEPARATOR,
-  );
+  const cacheKey = [
+    platform,
+    pathValue,
+    windowsPathExtensions.join(";"),
+    command,
+    options.cwd ?? "",
+  ].join(COMMAND_RESOLUTION_CACHE_KEY_SEPARATOR);
   const cache = yield* CommandResolutionCache;
   const nowNanos = yield* Clock.monotonicTimeNanos;
   const cached = cache.get(cacheKey);
@@ -623,19 +660,8 @@ const resolveCommandPathForPlatform = Effect.fn("shell.resolveCommandPathForPlat
     return cached.resolvedPath;
   }
 
-  // Keep case variants: Windows can make PATH directories case-sensitive.
-  const pathEntries: string[] = [];
-  const seenPathEntries = new Set<string>();
-  for (const entry of pathValue.split(pathDelimiterForPlatform(platform))) {
-    const pathEntry = stripWrappingQuotes(entry.trim());
-    if (pathEntry.length === 0 || seenPathEntries.has(pathEntry)) continue;
-
-    seenPathEntries.add(pathEntry);
-    pathEntries.push(pathEntry);
-  }
-
   const listings = yield* PathDirectoryListings;
-  for (const pathEntry of pathEntries) {
+  for (const pathEntry of commandSearchDirectories(env, platform, options.cwd, path)) {
     let listing = listings && (yield* Cache.get(listings, pathEntry));
     if (listings && listing?.names && listing.modified !== (yield* directoryMtime(pathEntry))) {
       yield* Cache.invalidate(listings, pathEntry);
@@ -660,6 +686,7 @@ export const resolveCommandPath = Effect.fn("shell.resolveCommandPath")(function
   options: CommandAvailabilityOptions = {},
 ) {
   return yield* resolveCommandPathForPlatform(command, {
+    ...options,
     env: options.env ?? (yield* HostProcess.Environment),
     platform: yield* HostProcess.Platform,
   });
@@ -739,6 +766,7 @@ export const resolveSpawnCommand = Effect.fnUntraced(function* (
     resolveWindowsPathExtensions(env).join(";"),
     env.MSYSTEM ? "msystem" : "",
     command,
+    options.cwd ?? "",
   ].join(COMMAND_RESOLUTION_CACHE_KEY_SEPARATOR);
   const nowNanos = yield* Clock.currentTimeNanos;
   const cached = explicitPath ? undefined : cache.get(cacheKey);
@@ -749,7 +777,7 @@ export const resolveSpawnCommand = Effect.fnUntraced(function* (
     // Cached with the scan: its file checks would otherwise run before every
     // git launch. A Git upgrade that moves the real binary can fail git for up
     // to the cache lifetime.
-    const found = resolveExecutable(command, platform, env);
+    const found = resolveExecutable(command, platform, env, options.cwd);
     resolvedExecutable = found === undefined ? null : preferGitForWindowsBinary(found, env);
     if (!explicitPath && resolvedExecutable !== null) {
       cacheCommandResolution(cache, cacheKey, resolvedExecutable, nowNanos);

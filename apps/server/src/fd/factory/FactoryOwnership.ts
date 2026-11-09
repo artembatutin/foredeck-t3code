@@ -124,7 +124,10 @@ const isSubagentChild = (lineage: OrchestrationV2AppThreadLineage | undefined) =
  * `MAX_FAMILY_DEPTH` levels. Any other thread, including one delegated from a non-family thread,
  * has none. A lineage deeper than that fails, as a read does.
  */
-export const familyOf = <E>(reads: OwnershipReads<E>, threadId: ThreadId) =>
+export const familyOf = <E>(
+  reads: Pick<OwnershipReads<E>, "delivery" | "lineage">,
+  threadId: ThreadId,
+) =>
   Effect.gen(function* () {
     let current = threadId;
     for (let levels = 0; ; levels += 1) {

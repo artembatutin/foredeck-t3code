@@ -17,6 +17,7 @@ import {
   type MobileFactoryDestination,
   mobileCancelTarget,
   mobileFactorySection,
+  mobilePendingActionRows,
 } from "./itemSection";
 
 const environmentId = EnvironmentId.make("env-1");
@@ -155,6 +156,58 @@ describe("mobileFactorySection", () => {
   });
 });
 
+describe("the next action on mobile", () => {
+  const opened = {
+    number: 7,
+    url: "https://github.com/acme/alpha/pull/7",
+    threadId: ThreadId.make("thread-author"),
+  };
+
+  it.each<[string, Partial<FactoryDelivery>, string]>([
+    ["queued", { status: "queued" }, "Waiting to start"],
+    ["running", { status: "running" }, "Factory is working"],
+    ["stopping", { status: "stopping" }, "Stopping after this step"],
+    ["stopped", { status: "stopped" }, "Stopped"],
+    ["blocked", { status: "blocked" }, "Blocked"],
+    ["waiting", { status: "waiting" }, "Waiting for your decision"],
+    ["approved", { status: "approved", proceeding: true }, "Opening the pull request"],
+    [
+      "pr_open idle",
+      { status: "pr_open", proceeding: false, pullRequest: opened },
+      "Ready for your review",
+    ],
+    [
+      "pr_open following up",
+      { status: "pr_open", proceeding: true, pullRequest: opened },
+      "Following up on the pull request",
+    ],
+    ["done", { status: "done" }, "Done"],
+    ["cancelled", { status: "cancelled" }, "Cancelled"],
+    ["a receipt-less legacy delivery", { status: "pr_open" }, "Ready for your review"],
+  ])("reads %s the same as every surface", (_name, overrides, title) => {
+    expect(section({ deliveries: [delivery("d1", overrides)] })?.nextAction.title).toBe(title);
+  });
+
+  it("offers the pull request and its changes on the delivery's own environment", () => {
+    const next = section({
+      environmentId: EnvironmentId.make("env-2"),
+      deliveries: [delivery("d1", { status: "pr_open", proceeding: false, pullRequest: opened })],
+    })?.nextAction;
+    expect(next?.pullRequestUrl).toBe(opened.url);
+    expect(next?.reviewThread).toEqual({
+      environmentId: EnvironmentId.make("env-2"),
+      threadId: opened.threadId,
+    });
+  });
+
+  it("explains a control a reconnecting device cannot offer", () => {
+    expect(
+      section({ deliveries: [delivery("d1", { status: "blocked" })], connectionState: "offline" })
+        ?.controlsNote,
+    ).toBe("Reconnect to resume or cancel this delivery.");
+  });
+});
+
 describe("the cancel confirmation's family", () => {
   const PARENT = FactoryDeliveryId.make("parent-1");
   const familyOf = (deliveries: ReadonlyArray<FactoryDelivery>) => section({ deliveries })?.family;
@@ -282,5 +335,139 @@ describe("factoryCommandError", () => {
     expect(factoryCommandError(AsyncResult.failure(Cause.fail("lost")))).toBe(
       "Factory could not complete the request. Try again.",
     );
+  });
+});
+
+describe("what the section lists as pending", () => {
+  it("words a delivery's pending actions with the logic every client shares", () => {
+    const threadId = ThreadId.make("thread-author");
+    const view = section({
+      deliveries: [
+        delivery("d1", {
+          pendingActions: {
+            items: [
+              {
+                kind: "command",
+                runClass: "factory",
+                runtimeMode: "auto-accept-edits",
+                threadId,
+                projectId: ProjectId.make("p1"),
+                requestId: "request-1",
+                capability: "live",
+              },
+            ],
+            omitted: 1,
+            complete: true,
+          },
+        }),
+      ],
+    });
+    expect(view?.pendingActions.rows[0]).toMatchObject({
+      label: "Provider or session permission",
+      provenance: "Factory's own agent",
+      threadId,
+    });
+    expect(view?.pendingActions.note).toContain("1 more is not listed here.");
+  });
+
+  const projectOne = ProjectId.make("p1");
+  const approval = (id: string) =>
+    ({
+      kind: "command",
+      runClass: "factory",
+      runtimeMode: "auto-accept-edits",
+      threadId: ThreadId.make(id),
+      projectId: projectOne,
+      requestId: `request-${id}`,
+      capability: "live",
+    }) as const;
+
+  it("tells a family's approvals apart by their target before any is opened", () => {
+    const view = section({
+      deliveries: [
+        delivery("d1", {
+          pendingActions: {
+            items: [approval("author"), approval("delegated")],
+            omitted: 0,
+            complete: true,
+          },
+        }),
+      ],
+    });
+    if (view === null) return expect.unreachable("The section shows the delivery.");
+    const rows = mobilePendingActionRows({
+      environmentId,
+      view,
+      shownItem: itemRef,
+      projects: [{ id: "p1", environmentId, title: "Alpha" }],
+      threads: [
+        { id: "author", environmentId, title: "Author of the export" },
+        { id: "delegated", environmentId, title: "Delegated check" },
+      ],
+    });
+    expect(rows.map(({ target }) => target)).toEqual([
+      "Project: Alpha · Thread: Author of the export",
+      "Project: Alpha · Thread: Delegated check",
+    ]);
+    expect(rows.map(({ destination }) => destination)).toEqual([
+      { type: "thread", threadId: ThreadId.make("author") },
+      { type: "thread", threadId: ThreadId.make("delegated") },
+    ]);
+  });
+
+  it("shows an id rather than a name from another environment", () => {
+    const view = section({
+      deliveries: [
+        delivery("d1", {
+          pendingActions: { items: [approval("author")], omitted: 0, complete: true },
+        }),
+      ],
+    });
+    if (view === null) return expect.unreachable("The section shows the delivery.");
+    const elsewhere = EnvironmentId.make("env-2");
+    const [row] = mobilePendingActionRows({
+      environmentId,
+      view,
+      shownItem: itemRef,
+      projects: [{ id: "p1", environmentId: elsewhere, title: "Other" }],
+      threads: [{ id: "author", environmentId: elsewhere, title: "Other thread" }],
+    });
+    expect(row?.target).toBe("Project: p1 · Thread: author");
+  });
+
+  it("sends a child's refused launch on a parent to the child's item", () => {
+    const childItem = { sourceId: itemRef.sourceId, itemId: WorkItemId.make("fd-child1") };
+    const view = section({
+      deliveries: [
+        delivery("d1", {
+          pendingActions: {
+            items: [
+              {
+                kind: "host_policy",
+                runClass: null,
+                runtimeMode: "approval-required",
+                threadId: null,
+                projectId: projectOne,
+                requestId: null,
+                capability: "live",
+                item: childItem,
+              },
+            ],
+            omitted: 0,
+            complete: true,
+          },
+        }),
+      ],
+    });
+    if (view === null) return expect.unreachable("The section shows the delivery.");
+    const [row] = mobilePendingActionRows({
+      environmentId,
+      view,
+      shownItem: itemRef,
+      projects: [],
+      threads: [],
+    });
+    expect(row?.destination).toEqual({ type: "item", item: childItem });
+    expect(row?.target).toBe("Project: p1");
   });
 });

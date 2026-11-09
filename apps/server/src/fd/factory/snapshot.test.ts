@@ -3,6 +3,7 @@ import { ProjectId, RunId, ThreadId } from "@t3tools/contracts";
 import {
   FactoryDelivery,
   FactoryDeliveryId,
+  type FactoryReviewedExecution,
   type FactoryReviewSummary,
   type FactoryVerifyReceipt,
 } from "@t3tools/contracts/fd/factory";
@@ -55,6 +56,9 @@ const reviewSummary: FactoryReviewSummary = {
 
 const base = queuedDeliveryState({ branch: "work/fd-aaaaaa-add-export", baseRef: "HEAD" });
 
+/** Only its limits matter here: the snapshot reads no other part of a review. */
+const reviewedExecutionFixture = {} as FactoryReviewedExecution;
+
 const running: FactoryDeliveryState = {
   ...base,
   status: "running",
@@ -73,6 +77,7 @@ const stored = (state: FactoryDeliveryState): FactoryDeliveryWithRuns => ({
   parentId: null,
   state,
   stageRuns: [],
+  stageAttempts: {},
   createdAt: "2026-10-24T09:00:00.000Z",
   updatedAt: "2026-10-24T10:06:00.000Z",
 });
@@ -98,10 +103,216 @@ describe("toFactoryDelivery", () => {
       receipts: [],
       reviews: [],
       stageRuns: [],
+      allowance: {
+        counted: "since_resume",
+        verificationFixes: { used: 0, limit: 2, remaining: 2 },
+        reviewFollowUps: { used: 0, limit: 2, remaining: 2 },
+        fixCommitTurns: { used: 0, limit: 1, remaining: 1 },
+        attempts: { verify: 0, review: 0 },
+      },
+      proceeding: true,
       createdAt: "2026-10-24T09:00:00.000Z",
       updatedAt: "2026-10-24T10:06:00.000Z",
     });
     expect(roundTrip(snapshot)).toStrictEqual(snapshot);
+  });
+
+  describe("its allowance", () => {
+    const oneRepairTwoReviews = { author: 1, verify: 2, review: 2, repair: 1 };
+    const spent = { ...running, rounds: { fix: 0, review: 1 } };
+
+    it("counts one repair and two review attempts apart, for a delivery with no review", () => {
+      const { allowance } = toFactoryDelivery({
+        ...stored(spent),
+        stageAttempts: oneRepairTwoReviews,
+      });
+      expect(allowance).toEqual({
+        counted: "since_resume",
+        verificationFixes: { used: 0, limit: 2, remaining: 2 },
+        reviewFollowUps: { used: 1, limit: 2, remaining: 1 },
+        fixCommitTurns: { used: 0, limit: 1, remaining: 1 },
+        attempts: { verify: 2, review: 2 },
+      });
+    });
+
+    it("counts what a review approved for the whole delivery, whatever its limits say", () => {
+      const reviewed = {
+        ...spent,
+        fixCommitTurns: 1,
+        limits: { maxFixRounds: 9, maxReviewRounds: 9 },
+        reviewedExecution: {
+          ...reviewedExecutionFixture,
+          limits: {
+            maxFixRounds: 3,
+            maxReviewRounds: 1,
+            maxFixCommitTurns: 2,
+            verifyTimeoutMinutes: 30,
+          },
+        },
+      };
+      const { allowance } = toFactoryDelivery({
+        ...stored(reviewed),
+        stageAttempts: oneRepairTwoReviews,
+      });
+      expect(allowance).toEqual({
+        counted: "whole_delivery",
+        verificationFixes: { used: 0, limit: 3, remaining: 3 },
+        reviewFollowUps: { used: 1, limit: 1, remaining: 0 },
+        fixCommitTurns: { used: 1, limit: 2, remaining: 1 },
+        attempts: { verify: 2, review: 2 },
+      });
+    });
+
+    it("never reads a limit lowered below what was spent as a negative", () => {
+      const { allowance } = toFactoryDelivery(
+        stored({
+          ...running,
+          rounds: { fix: 3, review: 0 },
+          limits: { maxFixRounds: 1, maxReviewRounds: 1 },
+        }),
+      );
+      expect(allowance?.verificationFixes).toEqual({ used: 3, limit: 1, remaining: 0 });
+    });
+
+    it("reads the totals of the whole history, not of the attempts the timeline's window holds", () => {
+      const snapshot = toFactoryDelivery({
+        ...stored(running),
+        stageRuns: [],
+        stageAttempts: { verify: 25, review: 1, repair: 25 },
+      });
+      expect(snapshot.stageRuns).toEqual([]);
+      expect(snapshot.allowance?.attempts).toEqual({ verify: 25, review: 1 });
+    });
+
+    it("counts a parent's integrate attempts as its reviews, submitted or not", () => {
+      const { allowance } = toFactoryDelivery({
+        // No review accepted: the reviewer's run failed, or is still going.
+        ...stored({ ...running, kind: "parent", receipts: [receipt], reviews: [] }),
+        stageAttempts: { plan: 1, verify: 1, integrate: 1 },
+      });
+      expect(allowance).toMatchObject({
+        verificationFixes: null,
+        reviewFollowUps: null,
+        attempts: { verify: 1, review: 1 },
+      });
+    });
+  });
+
+  describe("whether anything of it is under way", () => {
+    const opening = {
+      type: "effect",
+      effect: { id: 6, type: "open_pr" },
+    } as FactoryDeliveryState["awaiting"];
+    const closing = {
+      type: "effect",
+      effect: { id: 9, type: "close_out" },
+    } as FactoryDeliveryState["awaiting"];
+
+    it.each<[string, Partial<FactoryDeliveryState>, boolean]>([
+      ["running, awaiting a run", {}, true],
+      ["stopping, awaiting a run", { status: "stopping" }, true],
+      ["approved, opening its pull request", { status: "approved", awaiting: opening }, true],
+      // As `FactoryDeliveryStore.pr.test.ts` stores one: nothing will open its pull request.
+      [
+        "approved before the PR stage existed",
+        { status: "approved", stage: "record", awaiting: null },
+        false,
+      ],
+      ["an approved child", { status: "approved", kind: "child", awaiting: null }, false],
+      ["resting on its open pull request", { status: "pr_open", awaiting: null }, false],
+      ["closing out its merge", { status: "pr_open", awaiting: closing }, true],
+      ["blocked", { status: "blocked", awaiting: null }, false],
+      ["stopped", { status: "stopped", awaiting: null }, false],
+      ["waiting at the plan gate", { status: "waiting", awaiting: null }, false],
+      ["queued", { status: "queued", awaiting: null }, false],
+      ["done", { status: "done", awaiting: null }, false],
+    ])("reads a delivery %s", (_name, state, proceeding) => {
+      expect(toFactoryDelivery(stored({ ...running, ...state })).proceeding).toBe(proceeding);
+    });
+  });
+
+  describe("its pull request", () => {
+    const pullRequest = {
+      number: 7,
+      url: "https://github.com/acme/alpha/pull/7",
+      headBranch: "feature/fd-aaaaaa",
+    };
+
+    it("is absent until one opens", () => {
+      expect(toFactoryDelivery(stored(running))).not.toHaveProperty("pullRequest");
+    });
+
+    it("names the author's thread for a single item, and rests with nothing awaited", () => {
+      const snapshot = toFactoryDelivery(
+        stored({ ...running, status: "pr_open", awaiting: null, pullRequest }),
+      );
+      expect(snapshot.pullRequest).toEqual({
+        number: 7,
+        url: pullRequest.url,
+        threadId: author,
+      });
+      expect(snapshot.proceeding).toBe(false);
+      expect(roundTrip(snapshot)).toStrictEqual(snapshot);
+    });
+
+    it("names the thread a parent's pull request is linked to", () => {
+      const linked = ThreadId.make("thread-last-child-author");
+      expect(
+        toFactoryDelivery(
+          stored({
+            ...base,
+            kind: "parent",
+            status: "pr_open",
+            pullRequest,
+            pullRequestThread: linked,
+          }),
+        ).pullRequest?.threadId,
+      ).toBe(linked);
+    });
+
+    it("says a merge is closing out rather than resting on its owner", () => {
+      const snapshot = toFactoryDelivery(
+        stored({
+          ...running,
+          status: "pr_open",
+          pullRequest: { ...pullRequest, outcome: "merged" },
+          awaiting: {
+            type: "effect",
+            effect: { id: 9, type: "close_out" },
+          },
+        }),
+      );
+      expect(snapshot.pullRequest?.outcome).toBe("merged");
+      expect(snapshot.proceeding).toBe(true);
+    });
+
+    it("is still followed up while a round runs on it", () => {
+      const snapshot = toFactoryDelivery(
+        stored({ ...running, stage: "follow_through", pullRequest }),
+      );
+      expect(snapshot.status).toBe("running");
+      expect(snapshot.pullRequest?.url).toBe(pullRequest.url);
+      expect(snapshot.proceeding).toBe(true);
+    });
+  });
+
+  describe("what a listing reads beside it", () => {
+    it("is carried when present, and absent otherwise", () => {
+      const source = {
+        key: "fd-aaaaaa",
+        title: "Add export",
+        status: "todo" as const,
+        statusName: null,
+        assignee: null,
+      };
+      const snapshot = toFactoryDelivery({ ...stored(running), source, queuePriority: null });
+      expect(snapshot.source).toEqual(source);
+      expect(snapshot.queuePriority).toBeNull();
+      expect(roundTrip(snapshot)).toStrictEqual(snapshot);
+      const plain = toFactoryDelivery(stored(running));
+      expect(plain).not.toHaveProperty("source");
+      expect(plain).not.toHaveProperty("queuePriority");
+    });
   });
 
   describe("capacityWait", () => {

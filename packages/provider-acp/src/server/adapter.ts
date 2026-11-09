@@ -108,6 +108,7 @@ import {
   makeProviderRetryTurnItem,
 } from "@t3tools/provider-core/server/failure";
 import { acpSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
+import { ProviderImageInputError } from "@t3tools/provider-core/fd/image-attachments";
 import {
   isProviderNativeImageAttachment,
   providerMessageTextWithAttachmentPaths,
@@ -1107,12 +1108,62 @@ function selectPermissionOptionId(
   decision: Exclude<ProviderApprovalDecision, "cancel">,
 ): string | undefined {
   const kind =
-    decision === "acceptForSession"
+    decision === "acceptForSession" || decision === "acceptAlways"
       ? "allow_always"
       : decision === "accept"
         ? "allow_once"
         : "reject_once";
   return request.options.find((option) => option.kind === kind)?.optionId.trim() || undefined;
+}
+
+/**
+ * The choices a permission request itself offers, for an agent whose flavor words none of its own.
+ * An agent decides how long its allow-always lasts, which can outlive the session, so it is offered
+ * as that agent's choice under its own name and never as a session one. A choice with no option to
+ * answer would come back cancelled, so none is offered. Cancelling is ACP's own, always there.
+ */
+export function acpNativeApprovalOptions(
+  request: EffectAcpSchema.RequestPermissionRequest,
+): ReadonlyArray<ProviderApprovalOption> {
+  const always = request.options.find(
+    (option) => option.kind === "allow_always" && option.optionId.trim(),
+  );
+  return [
+    { decision: "cancel", label: "Cancel" },
+    ...(selectPermissionOptionId(request, "decline")
+      ? [{ decision: "decline", label: "Decline" } as const]
+      : []),
+    ...(always === undefined
+      ? []
+      : [{ decision: "acceptAlways", label: always.name.trim() || "Always allow" } as const]),
+    ...(selectPermissionOptionId(request, "accept")
+      ? [{ decision: "accept", label: "Approve" } as const]
+      : []),
+  ];
+}
+
+/**
+ * How a decision answers a permission request, and whether that approved anything: a decision with
+ * no native option to answer it comes back cancelled, so it must grant nothing.
+ */
+export function acpPermissionAnswer(
+  request: EffectAcpSchema.RequestPermissionRequest,
+  decision: ProviderApprovalDecision,
+) {
+  const optionId = decision === "cancel" ? undefined : selectPermissionOptionId(request, decision);
+  return {
+    response:
+      optionId === undefined
+        ? ({ outcome: { outcome: "cancelled" } } as const)
+        : ({ outcome: { outcome: "selected", optionId } } as const),
+    grant:
+      optionId === undefined ||
+      (decision !== "accept" && decision !== "acceptForSession" && decision !== "acceptAlways")
+        ? null
+        : decision === "accept"
+          ? ("turn" as const)
+          : ("session" as const),
+  };
 }
 
 /**
@@ -4793,7 +4844,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         ) {
           yield* closeTextStreams(context);
           const parsed = parsePermissionRequest(params);
-          const approvalOptions = flavor.approvalOptions?.(params);
+          const approvalOptions =
+            flavor.approvalOptions?.(params) ?? acpNativeApprovalOptions(params);
           const nativeRequestId = params.toolCall.toolCallId;
           const requestId = yield* idAllocator.allocate.runtimeRequest({
             driver,
@@ -5797,25 +5849,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   ).pipe(Effect.asVoid),
                 ),
               );
-              if (
-                parsedPermission.kind !== "unknown" &&
-                (decision === "accept" || decision === "acceptForSession")
-              ) {
+              const { response, grant } = acpPermissionAnswer(params, decision);
+              if (parsedPermission.kind !== "unknown" && grant !== null) {
                 clientPolicyGrants.recordApproval({
                   kind: providerRequestKind(parsedPermission.kind),
-                  scope: decision === "acceptForSession" ? "session" : "turn",
+                  scope: grant,
                   turnKey: String(context.providerTurnId),
                 });
               }
-              const response = (() => {
-                if (decision === "cancel") {
-                  return { outcome: { outcome: "cancelled" } } as const;
-                }
-                const optionId = selectPermissionOptionId(params, decision);
-                return optionId === undefined
-                  ? ({ outcome: { outcome: "cancelled" } } as const)
-                  : ({ outcome: { outcome: "selected", optionId } } as const);
-              })();
               const checked = yield* runRuntimeCallbackAtGeneration(
                 handlerGeneration,
                 Effect.succeed(response),
@@ -6942,37 +6983,31 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           const imageAttachments = turnInput.message.attachments.filter(
             isProviderNativeImageAttachment,
           );
-          if (
-            imageAttachments.length > 0 &&
-            (!supportsImagePrompts ||
+          if (imageAttachments.length > 0) {
+            if (!supportsImagePrompts) {
+              return yield* new ProviderImageInputError({ reason: "unsupported_session" });
+            }
+            if (
               flavor.modelSupportsImages?.(
                 yield* runtime.getConfigOptions,
                 turnInput.modelSelection.model,
-              ) === false)
-          ) {
-            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
-              driver,
-              detail: "ACP driver did not negotiate image prompt support",
-            });
+              ) === false
+            ) {
+              return yield* new ProviderImageInputError({ reason: "unsupported_model" });
+            }
           }
           for (const attachment of imageAttachments) {
             const path = host.resolveAttachmentPath(attachment as ChatAttachment);
             if (path === null) {
-              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
-                driver,
-                detail: `Invalid attachment id '${attachment.id}'`,
-              });
+              return yield* new ProviderImageInputError({ reason: "unreadable" });
             }
-            const bytes = yield* fileSystem.readFile(path).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapter.ProviderAdapterProtocolError({
-                    driver,
-                    detail: `Failed to read attachment '${attachment.id}'`,
-                    payload: cause,
-                  }),
-              ),
-            );
+            const bytes = yield* fileSystem
+              .readFile(path)
+              .pipe(
+                Effect.mapError(
+                  (cause) => new ProviderImageInputError({ reason: "unreadable", cause }),
+                ),
+              );
             prompt.push({
               type: "image",
               data: Buffer.from(bytes).toString("base64"),

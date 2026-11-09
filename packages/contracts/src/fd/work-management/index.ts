@@ -36,6 +36,7 @@ export {
   WorkThreadLinkSource,
   WorkThreadLinkOrigin,
   WorkThreadLink,
+  workItemScopeChanged,
   WorkItemChild,
   WorkItemDetail,
   WorkItemGetInput,

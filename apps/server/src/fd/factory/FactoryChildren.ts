@@ -62,8 +62,8 @@ export class FactoryChildren extends Context.Service<
      * Each task, in plan order, gets its child item under the parent item, blocked by the previous
      * task's child, and the item is recorded on the task before the next task's is created. Once
      * every task has its child, the children's deliveries are stored queued, on the parent's
-     * branch and worktree with its limits and runtime-mode ceiling and the task's risk; none
-     * starts.
+     * branch and worktree with its limits, runtime-mode ceiling and review, and the task's risk;
+     * none starts.
      *
      * A task that records its child is done. Each task is claimed before its child is created,
      * so only a claimed one may have a child from a run that stopped before recording it: the item
@@ -242,6 +242,9 @@ const make = Effect.gen(function* () {
                 ...(state.runtimeModeCeiling === undefined
                   ? {}
                   : { runtimeModeCeiling: state.runtimeModeCeiling }),
+                ...(state.reviewedExecution === undefined
+                  ? {}
+                  : { reviewedExecution: state.reviewedExecution }),
               }),
             });
             return deliveryId;

@@ -32,7 +32,8 @@ projects currently need another isolation strategy and are refused before dispat
 Ask the assistant to inspect, stop, resume, retry or cancel an assignment. A stop is
 pending until the worker confirms it. Resuming uses a fresh conversation with the
 retained worktree and the idea's authorized brief. Worker questions come back to the assistant;
-permission approvals still need the worker's approval UI. A completed worker turn waits
+permission approvals still need the worker's approval UI, and **Assignments** lists what each
+delivery waits on with a link to where it is decided. A completed worker turn waits
 for verification of the acceptance criteria. The assistant reports implementation,
 tests, integration and deployment separately.
 

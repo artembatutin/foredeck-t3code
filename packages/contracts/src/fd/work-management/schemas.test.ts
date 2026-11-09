@@ -24,6 +24,8 @@ import {
   WorkSourceList,
   WorkStartThreadInput,
   WorkStatus,
+  WorkItemDetail,
+  workItemScopeChanged,
   WorkThreadLink,
 } from "./index.ts";
 
@@ -376,6 +378,72 @@ describe("WorkThreadLink", () => {
     const decoded = decode({ ...link, origin: "someday" });
     expect(decoded.origin).toBeUndefined();
     expect(decoded).toEqual(link);
+  });
+
+  it("reads a stored link with or without a scope baseline", () => {
+    expect("scopeFingerprint" in decode(link).snapshot).toBe(false);
+    const baselined = { ...link, snapshot: { ...link.snapshot, scopeFingerprint: "a" } };
+    expect(decode(baselined).snapshot.scopeFingerprint).toBe("a");
+  });
+});
+
+describe("workItemScopeChanged", () => {
+  const linked = (scopeFingerprint?: string) => ({
+    snapshot: scopeFingerprint === undefined ? {} : { scopeFingerprint },
+  });
+
+  it("compares fingerprints, whatever the revisions say", () => {
+    expect(workItemScopeChanged(linked("a"), { scopeFingerprint: "a" })).toBe(false);
+    expect(workItemScopeChanged(linked("a"), { scopeFingerprint: "b" })).toBe(true);
+  });
+
+  it("claims no change without both fingerprints", () => {
+    expect(workItemScopeChanged(linked(), { scopeFingerprint: "b" })).toBe(false);
+    expect(workItemScopeChanged(linked("a"), {})).toBe(false);
+    expect(workItemScopeChanged(linked(), {})).toBe(false);
+  });
+});
+
+describe("WorkItemDetail", () => {
+  it("keeps the scope fingerprint optional, so an older server's item still reads", () => {
+    const decode = Schema.decodeUnknownSync(WorkItemDetail);
+    const older = {
+      ref: { sourceId: uuid, itemId: "fd-abc123" },
+      kind: "markdown",
+      key: "fd-abc123",
+      title: "Ship",
+      status: "todo",
+      nativeStatus: null,
+      blocked: false,
+      priority: null,
+      labels: [],
+      assignee: null,
+      parent: null,
+      blockedBy: [],
+      url: null,
+      updatedAt: null,
+      revision: "r",
+      invalid: null,
+      body: "",
+      bodyTruncated: false,
+      bodyFidelity: "exact",
+      comments: [],
+      commentsTruncated: false,
+      children: [],
+      blocking: [],
+      links: [],
+      transitions: [],
+      capabilities: {
+        create: true,
+        statuses: [],
+        fields: [],
+        comments: "full",
+        transitions: false,
+        people: false,
+      },
+    };
+    expect(decode(older).scopeFingerprint).toBeUndefined();
+    expect(decode({ ...older, scopeFingerprint: "a" }).scopeFingerprint).toBe("a");
   });
 });
 

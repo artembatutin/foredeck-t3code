@@ -91,6 +91,7 @@ import { useWorkspaceContentWidth } from "../layout/workspace-content-width";
 import { useNativeWorkspaceColumnsSupported } from "../../native/NativeWorkspaceColumns";
 import { useNativeColumnLayoutMetrics } from "../../native/native-layout-metrics";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
+import { pendingAnswerRefusal } from "@t3tools/shared/fd/approvals";
 import { collectProviderUsageLimits } from "@t3tools/shared/usageLimits";
 import type { ComposerEditorHandle } from "../../components/ComposerEditor";
 import type { StatusTone } from "../../components/StatusPill";
@@ -1360,6 +1361,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                           canOperateThread={props.canOperateThread}
                           approval={props.activePendingApproval}
                           respondingApprovalId={props.respondingApprovalId}
+                          runtimeMode={props.selectedThread.runtimeMode}
                           onRespond={props.onRespondToApproval}
                         />
                       ) : null}
@@ -1367,6 +1369,15 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                         <PendingUserInputCard
                           canOperateThread={props.canOperateThread}
                           pendingUserInput={props.activePendingUserInput}
+                          answerRefusal={pendingAnswerRefusal({
+                            responseCapability: props.activePendingUserInput.responseCapability,
+                            provider: props.serverConfig?.providers.find(
+                              ({ instanceId }) =>
+                                instanceId === props.selectedThread.modelSelection.instanceId,
+                            ),
+                            threadMode: props.selectedThread.runtimeMode,
+                          })}
+                          onChooseRuntimeMode={props.onUpdateThreadRuntimeMode}
                           maxHeight={pendingUserInputMaxHeight}
                           collapsed={userInputCollapsed}
                           onToggleCollapsed={handleToggleUserInputCollapsed}

@@ -10,6 +10,7 @@ import type * as FactorySettings from "./FactorySettings.ts";
 import type * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 import type { FactoryBranchUnavailableError } from "./git/freshBranch.ts";
 import type { FactoryStoreError } from "./persistence/errors.ts";
+import type { FactoryReviewedExecutionInvalidError } from "./reviewedExecution.ts";
 import type * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 
 /** What the Factory services fail with, as the RPC and MCP handlers meet them. */
@@ -21,6 +22,7 @@ export type FactoryServiceError =
   | FactoryService.FactoryParentSourceUnsupportedError
   | FactoryService.FactoryDeliveryIdError
   | FactoryService.FactoryDeliveryIdConflictError
+  | FactoryReviewedExecutionInvalidError
   | FactoryService.FactoryDeliveryNotFoundError
   | FactoryService.FactoryStopRefusedError
   | FactoryService.FactoryResumeRefusedError
@@ -65,6 +67,9 @@ export const toFactoryError = (error: FactoryServiceError): FactoryError => {
         message: "This Factory delivery id already names a delivery of something else.",
         deliveryId: error.deliveryId,
       });
+    // No transport starts a reviewed delivery; this keeps the mapping exhaustive.
+    case "FactoryReviewedExecutionInvalidError":
+      return new FactoryError({ reason: "invalid_request", message: error.message });
     case "FactoryDeliveryNotFoundError":
       return new FactoryError({
         reason: "not_found",

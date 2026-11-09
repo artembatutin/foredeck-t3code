@@ -9,6 +9,7 @@ describe("ComposerPendingApprovalPanel", () => {
     const detail = `bun run release -- ${"x".repeat(500)}\nsecond line`;
     const markup = renderToStaticMarkup(
       <ComposerPendingApprovalPanel
+        runtimeMode="approval-required"
         approval={{
           requestId: RuntimeRequestId.make("approval-1"),
           requestKind: "command",
@@ -27,6 +28,7 @@ describe("ComposerPendingApprovalPanel", () => {
   it("falls back to the approval kind when the provider sends an empty detail", () => {
     const markup = renderToStaticMarkup(
       <ComposerPendingApprovalPanel
+        runtimeMode="approval-required"
         approval={{
           requestId: RuntimeRequestId.make("approval-2"),
           requestKind: "file-read",
@@ -44,6 +46,7 @@ describe("ComposerPendingApprovalPanel", () => {
   it("shows the app name and message for an MCP access request", () => {
     const markup = renderToStaticMarkup(
       <ComposerPendingApprovalPanel
+        runtimeMode="approval-required"
         approval={{
           requestId: RuntimeRequestId.make("approval-safari"),
           requestKind: "mcp-elicitation",
@@ -65,6 +68,7 @@ describe("ComposerPendingApprovalPanel", () => {
     const detail = "Allow ChatGPT to access the selected application?";
     const markup = renderToStaticMarkup(
       <ComposerPendingApprovalPanel
+        runtimeMode="approval-required"
         approval={{
           requestId: RuntimeRequestId.make("approval-long-app-name"),
           requestKind: "mcp-elicitation",

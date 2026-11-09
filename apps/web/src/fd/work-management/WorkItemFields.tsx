@@ -207,14 +207,16 @@ export function WorkRelationshipEditor({
   };
   if (draft === null) {
     return (
-      <div className="flex items-center gap-2">
-        <span>
-          {label}:{" "}
-          {current.length === 0 ? <span className="text-muted-foreground">none</span> : current}
-        </span>
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="w-20 shrink-0 text-muted-foreground text-xs">{label}</span>
+        {current.length === 0 ? (
+          <span className="text-muted-foreground text-xs">None</span>
+        ) : (
+          <span className="min-w-0 break-words font-mono text-xs">{current}</span>
+        )}
         <Button
           size="xs"
-          variant="ghost"
+          variant="ghost-muted"
           onClick={() => setDraft(beginWorkRelationshipDraft(item, field))}
         >
           Edit

@@ -9,6 +9,7 @@ import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, type HttpClientRequest, HttpClientResponse } from "effect/http";
 
+import { workItemContentFingerprint } from "../../model/scope.ts";
 import { owner } from "../../testkit/fakes.ts";
 import type { WorkSourceRuntime } from "../WorkSourceAdapter.ts";
 import { SCOPED_TOKEN_MESSAGE } from "./JiraApi.ts";
@@ -304,6 +305,66 @@ describe("JiraSource", () => {
       assert.strictEqual(refused._tag, "WorkUnsupported");
     }),
   );
+
+  describe("the scope fingerprint", () => {
+    const paragraph = (text: string) => ({
+      type: "paragraph",
+      content: [{ type: "text", text }],
+    });
+    const read = (description: unknown) =>
+      Effect.gen(function* () {
+        const fake = fakeJira((seen) =>
+          seen.path.endsWith("/comment")
+            ? { body: { comments: [] } }
+            : { body: issueJson("PROJ-4", { description }) },
+        );
+        const adapter = yield* adapterWith(fake);
+        return yield* adapter.get(runtime(), WorkItemId.make("PROJ-4"));
+      });
+    const doc = (...content: ReadonlyArray<unknown>) => ({ type: "doc", content });
+
+    it.effect("sees an edit past the wire cap, which the served body cannot show", () =>
+      Effect.gen(function* () {
+        const long = "a".repeat(70_000);
+        const before = yield* read(doc(paragraph(`${long} Writes CSV.`)));
+        const after = yield* read(doc(paragraph(`${long} Writes CSV and PDF.`)));
+        assert.isTrue(before.bodyTruncated);
+        assert.strictEqual(after.body, before.body);
+        assert.notStrictEqual(after.scopeFingerprint, before.scopeFingerprint);
+      }),
+    );
+
+    it.effect("sees an edit inside what a lossy body shows only as a placeholder", () =>
+      Effect.gen(function* () {
+        const table = (cell: string) => ({
+          type: "table",
+          content: [{ type: "tableRow", content: [paragraph(cell)] }],
+        });
+        const before = yield* read(doc(paragraph("Steps"), table("Writes CSV.")));
+        const after = yield* read(doc(paragraph("Steps"), table("Writes PDF.")));
+        assert.strictEqual(before.bodyFidelity, "lossy");
+        assert.strictEqual(after.body, before.body);
+        assert.notStrictEqual(after.scopeFingerprint, before.scopeFingerprint);
+      }),
+    );
+
+    it.effect("reads an exact body as what the same text written whole fingerprints", () =>
+      Effect.gen(function* () {
+        const detail = yield* read(doc(paragraph("Steps")));
+        assert.strictEqual(detail.bodyFidelity, "exact");
+        assert.strictEqual(
+          detail.scopeFingerprint,
+          workItemContentFingerprint({
+            kind: "jira",
+            title: detail.title,
+            body: detail.body,
+            bodyTruncated: false,
+            bodyFidelity: "exact",
+          }),
+        );
+      }),
+    );
+  });
 
   it.effect("refuses to overwrite a description it could not show", () =>
     Effect.gen(function* () {

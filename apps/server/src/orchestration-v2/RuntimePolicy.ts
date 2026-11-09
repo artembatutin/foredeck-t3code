@@ -77,7 +77,7 @@ export const layer: Layer.Layer<RuntimePolicyV2> = Layer.succeed(RuntimePolicyV2
  * Supervised when available, otherwise its first advertised mode. Remote
  * providers may offer only Full access in their hosted workspace.
  */
-function providerRuntimeMode(
+export function providerRuntimeMode(
   runtimeMode: RuntimeMode,
   supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined,
 ): RuntimeMode {

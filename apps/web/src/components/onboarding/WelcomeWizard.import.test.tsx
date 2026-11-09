@@ -218,7 +218,8 @@ async function click(label: string) {
   await act(async () => target.props.onClick());
 }
 
-async function mountImport(remote = false) {
+/** The import step's choice, offered before anything has looked for previous projects. */
+async function mountChoice(remote = false) {
   state.selectedEnvironment = remote ? "remote" : "primary";
   await act(async () => {
     renderer = create(
@@ -229,6 +230,13 @@ async function mountImport(remote = false) {
   });
   await click("Continue");
   await click("Continue");
+  expect(text(renderer!.root)).toContain("Start fresh");
+  expect(state.scan).not.toHaveBeenCalled();
+}
+
+async function mountImport(remote = false) {
+  await mountChoice(remote);
+  await click("Find previous projects");
   expect(text(renderer!.root)).toContain("Import your projects");
 }
 
@@ -268,6 +276,36 @@ afterEach(async () => {
   state.registry?.dispose();
   state.sessions.clear();
   vi.unstubAllGlobals();
+});
+
+it("starts fresh having looked for no previous projects", async () => {
+  await mountChoice();
+  await click("Start fresh");
+  expect(state.scan).not.toHaveBeenCalled();
+  expect(state.createProject).not.toHaveBeenCalled();
+  expect(state.importThreads).not.toHaveBeenCalled();
+  expect(state.completeOnboarding).toHaveBeenCalledOnce();
+  expect(state.onDone).toHaveBeenCalledExactlyOnceWith(undefined);
+});
+
+it("looks for previous projects only once the owner asks, on the computers set up", async () => {
+  await mountChoice(true);
+  await click("Find previous projects");
+  expect(state.scan).toHaveBeenCalled();
+  expect(state.scan.mock.calls.every(([query]) => query.environmentId === remoteId)).toBe(true);
+  expect(state.completeOnboarding).not.toHaveBeenCalled();
+});
+
+it("keeps the choice when setup cannot be saved, so starting fresh can be retried", async () => {
+  state.completeOnboarding.mockRejectedValueOnce(new Error("settings unavailable"));
+  await mountChoice();
+  await click("Start fresh");
+  expect(state.onDone).not.toHaveBeenCalled();
+  expect(text(renderer!.root)).toContain("Start fresh");
+  await click("Start fresh");
+  expect(state.completeOnboarding).toHaveBeenCalledTimes(2);
+  expect(state.onDone).toHaveBeenCalledExactlyOnceWith(undefined);
+  expect(state.scan).not.toHaveBeenCalled();
 });
 
 it("keeps scanning, choosing and skipping available to a paired read-only environment", async () => {

@@ -134,9 +134,10 @@ thread's run fails or is stopped, the item offers **Back to todo?**; when a run
 completes, it offers to mark the item done. Both can be undone, and nothing
 changes on its own. Undo applies only while nobody else has changed the item
 since; otherwise Work tells you and leaves the newer change in place. **Send
-update to thread** appears when the item changed after its thread started, and
-opens the thread with a note added to its draft; anything you had already typed
-there stays.
+update to thread** appears when the item's title or description changed after its
+thread started, and opens the thread with a note added to its draft; anything you
+had already typed there stays. Comments, status and assignee changes do not show
+it, since they do not change what the thread was asked to do.
 
 ## Agents
 

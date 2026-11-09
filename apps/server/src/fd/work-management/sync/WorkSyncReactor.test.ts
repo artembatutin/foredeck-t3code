@@ -268,7 +268,8 @@ describe("WorkSyncReactor", () => {
           harness.threads.set(threadId, threadShell(threadId, alpha));
           yield* work.setLink(owner, { ref: item.ref, threadId, action: "link" });
         }
-        const baseline = (yield* links.listByThread(running!))[0]!.snapshot.revision;
+        const started = (yield* links.listByThread(running!))[0]!.snapshot;
+        const baseline = started.revision;
         yield* reactor.start;
         yield* Deferred.await(tailSubscribed);
 
@@ -295,9 +296,11 @@ describe("WorkSyncReactor", () => {
         );
         assert.deepStrictEqual(remaining[0]!.run, { status: "failed", at });
         assert.strictEqual(remaining[0]!.snapshot.status, "done");
-        // The displayed fields follow the item; the revision stays the one the thread started
-        // from, so "Changed since the thread started" still shows.
+        // The displayed fields follow the item; the revision and the scope stay the ones the
+        // thread started from, so an edit since then still shows as one.
         assert.strictEqual(remaining[0]!.snapshot.revision, baseline);
+        assert.isDefined(started.scopeFingerprint);
+        assert.strictEqual(remaining[0]!.snapshot.scopeFingerprint, started.scopeFingerprint);
         assert.isAtLeast(markdown.count("snapshots"), 1);
 
         // Repeating the deletion and settlement changes nothing.

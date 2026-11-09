@@ -1,9 +1,13 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import { CommandResolutionCache, resolveCommandPath } from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
+import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
@@ -74,20 +78,26 @@ function withProcessEnv<A, E, R>(
   );
 }
 
-function runShellEnvironment(input: {
+function runShellEnvironment<R = never>(input: {
   readonly env: NodeJS.ProcessEnv;
   readonly platform: NodeJS.Platform;
+  readonly homeDirectory?: string;
+  readonly baseDir?: string;
   readonly userShell?: string;
   readonly handler: (
     command: ChildProcess.Command,
   ) => string | { output: string; exitCode: number | null };
   readonly failure?: PlatformError.PlatformError;
   readonly repeat?: boolean;
+  /** Runs after installation while the test env is still `process.env`. */
+  readonly afterInstall?: Effect.Effect<void, never, R>;
 }) {
   const layerEnvironment = Layer.succeed(
     DesktopEnvironment.DesktopEnvironment,
     DesktopEnvironment.DesktopEnvironment.of({
       platform: input.platform,
+      ...(input.homeDirectory === undefined ? {} : { homeDirectory: input.homeDirectory }),
+      ...(input.baseDir === undefined ? {} : { baseDir: input.baseDir }),
     } as DesktopEnvironment.DesktopEnvironment["Service"]),
   );
   const layerSpawner = Layer.succeed(
@@ -107,6 +117,7 @@ function runShellEnvironment(input: {
     const shellEnvironment = yield* DesktopShellEnvironment.DesktopShellEnvironment;
     const prepared = yield* shellEnvironment.installIntoProcess;
     if (input.repeat) assert.equal(yield* shellEnvironment.installIntoProcess, prepared);
+    if (input.afterInstall) yield* input.afterInstall;
     return prepared;
   }).pipe(
     Effect.provide(
@@ -657,6 +668,310 @@ describe("DesktopShellEnvironment", () => {
         }),
       ),
       Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+    );
+  });
+});
+
+const windowsHost = HostProcess.Platform.defaultValue() === "win32";
+
+const writeCommand = Effect.fn(function* (directory: string, name: string) {
+  const fs = yield* FileSystem.FileSystem;
+  const file = `${directory}/${name}`;
+  yield* fs.writeFileString(file, "#!/bin/sh\nexit 0\n");
+  yield* fs.chmod(file, 0o755);
+});
+
+// A temporary HOME whose .local/bin holds both provider commands, plus directories standing in
+// for the GUI-inherited PATH and a recovered shell or launchctl PATH.
+const makeCommandFixtures = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-desktop-user-commands-" });
+  const home = `${root}/home`;
+  const localBin = `${home}/.local/bin`;
+  const guiBin = `${root}/gui-bin`;
+  const systemBin = `${root}/system-bin`;
+  for (const directory of [localBin, guiBin, systemBin]) {
+    yield* fs.makeDirectory(directory, { recursive: true });
+  }
+  yield* writeCommand(localBin, "codex");
+  yield* writeCommand(localBin, "claude");
+  return { root, home, localBin, guiBin, systemBin };
+});
+
+// Resolves both commands through the shared lookup against the repaired `process.env`, the
+// object the backend inherits, while the service's environment is still installed.
+const expectRepairedProcessEnv = (
+  platform: NodeJS.Platform,
+  expected: {
+    readonly path: string;
+    readonly codex: string | null;
+    readonly claude: string | null;
+  },
+) =>
+  Effect.suspend(() => {
+    const env = process.env;
+    assert.equal(env.PATH, expected.path);
+    return Effect.all({
+      codex: resolveCommandPath("codex", { env }),
+      claude: resolveCommandPath("claude", { env }),
+    });
+  }).pipe(
+    Effect.map((resolved) =>
+      assert.deepEqual(resolved, { codex: expected.codex, claude: expected.claude }),
+    ),
+    Effect.provideService(HostProcess.Platform, platform),
+    Effect.provideService(CommandResolutionCache, new Map()),
+  );
+
+const standardCommand = (command: ChildProcess.Command) =>
+  command._tag === "StandardCommand" ? command.command : "";
+
+describe.skipIf(windowsHost)("DesktopShellEnvironment user command directories", () => {
+  it.layer(NodeServices.layer)((it) => {
+    it.effect("finds user-installed commands after the macOS login shell times out", () =>
+      Effect.gen(function* () {
+        const fixtures = yield* makeCommandFixtures;
+        const commands: string[] = [];
+        const env: NodeJS.ProcessEnv = { SHELL: "/bin/zsh", PATH: fixtures.guiBin };
+        const path = [fixtures.systemBin, fixtures.guiBin, fixtures.localBin].join(":");
+        const pending = yield* runShellEnvironment({
+          env,
+          platform: "darwin",
+          homeDirectory: fixtures.home,
+          handler: (command) => {
+            commands.push(standardCommand(command));
+            return standardCommand(command) === "/bin/launchctl"
+              ? fixtures.systemBin
+              : { output: "", exitCode: null };
+          },
+          afterInstall: expectRepairedProcessEnv("darwin", {
+            path,
+            codex: `${fixtures.localBin}/codex`,
+            claude: `${fixtures.localBin}/claude`,
+          }),
+        }).pipe(Effect.forkChild);
+        yield* TestClock.adjust("5 seconds");
+        assert.isFalse(yield* Fiber.join(pending));
+        assert.deepEqual(commands, ["/bin/zsh", "/bin/launchctl"]);
+        assert.equal(env.PATH, path);
+      }).pipe(Effect.provide(Logger.layer([]))),
+    );
+
+    it.effect("finds user-installed commands after a failed linux login shell", () =>
+      Effect.gen(function* () {
+        const fixtures = yield* makeCommandFixtures;
+        const commands: string[] = [];
+        const env: NodeJS.ProcessEnv = { SHELL: "/bin/bash", PATH: fixtures.guiBin };
+        const path = [fixtures.guiBin, fixtures.localBin].join(":");
+        const prepared = yield* runShellEnvironment({
+          env,
+          platform: "linux",
+          homeDirectory: fixtures.home,
+          handler: (command) => {
+            commands.push(standardCommand(command));
+            return { output: envOutput({ PATH: fixtures.systemBin }), exitCode: 1 };
+          },
+          afterInstall: expectRepairedProcessEnv("linux", {
+            path,
+            codex: `${fixtures.localBin}/codex`,
+            claude: `${fixtures.localBin}/claude`,
+          }),
+        });
+        assert.isFalse(prepared);
+        assert.deepEqual(commands, ["/bin/bash"]);
+        assert.equal(env.PATH, path);
+      }).pipe(Effect.provide(Logger.layer([]))),
+    );
+
+    it.effect.each(["darwin", "linux"] as const)(
+      "appends user command directories to a partial login-shell PATH on %s",
+      (platform) =>
+        Effect.gen(function* () {
+          const fixtures = yield* makeCommandFixtures;
+          const commands: string[] = [];
+          const env: NodeJS.ProcessEnv = { SHELL: "/bin/zsh", PATH: fixtures.guiBin };
+          const path = [fixtures.systemBin, fixtures.guiBin, fixtures.localBin].join(":");
+          const prepared = yield* runShellEnvironment({
+            env,
+            platform,
+            homeDirectory: fixtures.home,
+            handler: (command) => {
+              commands.push(standardCommand(command));
+              return envOutput({ PATH: fixtures.systemBin });
+            },
+            afterInstall: expectRepairedProcessEnv(platform, {
+              path,
+              codex: `${fixtures.localBin}/codex`,
+              claude: `${fixtures.localBin}/claude`,
+            }),
+          });
+          assert.isTrue(prepared);
+          assert.deepEqual(commands, ["/bin/zsh"]);
+          assert.equal(env.PATH, path);
+        }),
+    );
+
+    it.effect.each(["inherited", "recovered"] as const)(
+      "keeps an earlier %s command ahead of the user command directory",
+      (source) =>
+        Effect.gen(function* () {
+          const fixtures = yield* makeCommandFixtures;
+          const earlier = source === "inherited" ? fixtures.guiBin : fixtures.systemBin;
+          yield* writeCommand(earlier, "codex");
+          const env: NodeJS.ProcessEnv = { SHELL: "/bin/bash", PATH: fixtures.guiBin };
+          const path =
+            source === "inherited"
+              ? [fixtures.guiBin, fixtures.localBin].join(":")
+              : [fixtures.systemBin, fixtures.guiBin, fixtures.localBin].join(":");
+          const prepared = yield* runShellEnvironment({
+            env,
+            platform: "linux",
+            homeDirectory: fixtures.home,
+            handler: () =>
+              source === "inherited"
+                ? { output: "", exitCode: 1 }
+                : envOutput({ PATH: fixtures.systemBin }),
+            afterInstall: expectRepairedProcessEnv("linux", {
+              path,
+              codex: `${earlier}/codex`,
+              claude: `${fixtures.localBin}/claude`,
+            }),
+          });
+          assert.equal(prepared, source === "recovered");
+        }).pipe(Effect.provide(Logger.layer([]))),
+    );
+
+    it.effect("keeps a listed user command directory once in place", () =>
+      Effect.gen(function* () {
+        const fixtures = yield* makeCommandFixtures;
+        const env: NodeJS.ProcessEnv = {
+          SHELL: "/bin/bash",
+          PATH: [fixtures.guiBin, fixtures.localBin].join(":"),
+        };
+        yield* runShellEnvironment({
+          env,
+          platform: "linux",
+          homeDirectory: fixtures.home,
+          handler: () => envOutput({ PATH: [fixtures.localBin, fixtures.systemBin].join(":") }),
+        });
+        assert.equal(env.PATH, [fixtures.localBin, fixtures.systemBin, fixtures.guiBin].join(":"));
+      }),
+    );
+
+    it.effect("appends an existing ~/bin after ~/.local/bin", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const fixtures = yield* makeCommandFixtures;
+        const homeBin = `${fixtures.home}/bin`;
+        yield* fs.makeDirectory(homeBin);
+        const env: NodeJS.ProcessEnv = { SHELL: "/bin/bash", PATH: fixtures.guiBin };
+        yield* runShellEnvironment({
+          env,
+          platform: "linux",
+          homeDirectory: fixtures.home,
+          handler: () => ({ output: "", exitCode: 1 }),
+        });
+        assert.equal(env.PATH, [fixtures.guiBin, fixtures.localBin, homeBin].join(":"));
+      }).pipe(Effect.provide(Logger.layer([]))),
+    );
+
+    it.effect("skips a user command path that is a regular file", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const fixtures = yield* makeCommandFixtures;
+        const home = `${fixtures.root}/file-home`;
+        yield* fs.makeDirectory(`${home}/.local`, { recursive: true });
+        yield* fs.writeFileString(`${home}/.local/bin`, "");
+        const env: NodeJS.ProcessEnv = { SHELL: "/bin/bash", PATH: fixtures.guiBin };
+        yield* runShellEnvironment({
+          env,
+          platform: "linux",
+          homeDirectory: home,
+          handler: () => ({ output: "", exitCode: 1 }),
+          afterInstall: expectRepairedProcessEnv("linux", {
+            path: fixtures.guiBin,
+            codex: null,
+            claude: null,
+          }),
+        });
+      }).pipe(Effect.provide(Logger.layer([]))),
+    );
+
+    it.effect.each(["unset", "empty", "relative"] as const)(
+      "adds no user command directory when the home directory is %s",
+      (kind) =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const fixtures = yield* makeCommandFixtures;
+          // The relative form names the real fixture from the working directory, so only the
+          // absolute-path guard keeps it out.
+          const homeDirectory = {
+            unset: undefined,
+            empty: "  ",
+            relative: path.relative(process.cwd(), fixtures.home),
+          }[kind];
+          const env: NodeJS.ProcessEnv = { SHELL: "/bin/bash", PATH: fixtures.guiBin };
+          yield* runShellEnvironment({
+            env,
+            platform: "linux",
+            ...(homeDirectory === undefined ? {} : { homeDirectory }),
+            handler: () => ({ output: "", exitCode: 1 }),
+            afterInstall: expectRepairedProcessEnv("linux", {
+              path: fixtures.guiBin,
+              codex: null,
+              claude: null,
+            }),
+          });
+        }).pipe(Effect.provide(Logger.layer([]))),
+    );
+
+    it.effect("never adds the isolated desktop home's command directory", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const fixtures = yield* makeCommandFixtures;
+        const home = `${fixtures.root}/plain-home`;
+        yield* fs.makeDirectory(home);
+        const env: NodeJS.ProcessEnv = { SHELL: "/bin/bash", PATH: fixtures.guiBin };
+        yield* runShellEnvironment({
+          env,
+          platform: "linux",
+          homeDirectory: home,
+          baseDir: fixtures.home,
+          handler: () => ({ output: "", exitCode: 1 }),
+          afterInstall: expectRepairedProcessEnv("linux", {
+            path: fixtures.guiBin,
+            codex: null,
+            claude: null,
+          }),
+        });
+      }).pipe(Effect.provide(Logger.layer([]))),
+    );
+
+    it.effect.each(["darwin", "linux"] as const)(
+      "leaves PATH unset on %s when no source provides one",
+      (platform) =>
+        Effect.gen(function* () {
+          const fixtures = yield* makeCommandFixtures;
+          const commands: string[] = [];
+          const env: NodeJS.ProcessEnv = {
+            SHELL: platform === "darwin" ? "/bin/zsh" : "/bin/bash",
+          };
+          const prepared = yield* runShellEnvironment({
+            env,
+            platform,
+            homeDirectory: fixtures.home,
+            handler: (command) => {
+              commands.push(standardCommand(command));
+              return { output: "", exitCode: 1 };
+            },
+          });
+          assert.isFalse(prepared);
+          assert.deepEqual(
+            commands,
+            platform === "darwin" ? ["/bin/zsh", "/bin/launchctl"] : ["/bin/bash"],
+          );
+          assert.notProperty(env, "PATH");
+        }).pipe(Effect.provide(Logger.layer([]))),
     );
   });
 });

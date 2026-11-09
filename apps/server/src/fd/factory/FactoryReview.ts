@@ -242,7 +242,8 @@ const make = Effect.gen(function* () {
     if (candidate.type === "invalid") return candidate satisfies FactoryReviewJudgment;
 
     const { review } = candidate;
-    const { blockingSeverities } = yield* settings.get(delivery.projectId);
+    const { blockingSeverities } =
+      delivery.state.reviewedExecution ?? (yield* settings.get(delivery.projectId));
     const criteria = basis.tasks === null ? null : integrateCriteria(basis.tasks);
     // A single item has no planned criteria; a planned child's count arrives with planning.
     const validation = yield* validateReviewInWorktree(basis.worktreePath, review, {

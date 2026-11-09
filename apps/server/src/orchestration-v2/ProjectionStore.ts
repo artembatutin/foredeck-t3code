@@ -466,6 +466,11 @@ export interface ProjectionStoreV2Shape {
    * same threads as the shell snapshot's `threads`. Reads only the thread rows,
    * so callers can check who uses a path without a shell snapshot.
    */
+  /** The threads holding a pending runtime request, with no read of any thread's history. */
+  readonly getThreadsWithPendingRequests: () => Effect.Effect<
+    ReadonlyArray<ThreadId>,
+    ProjectionStoreV2Error
+  >;
   readonly getThreadWorktreePaths: () => Effect.Effect<
     ReadonlyArray<{ readonly threadId: ThreadId; readonly worktreePath: string }>,
     ProjectionStoreV2Error
@@ -5817,6 +5822,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         );
       }).pipe(Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })));
 
+    const getThreadsWithPendingRequests: ProjectionStoreV2Shape["getThreadsWithPendingRequests"] =
+      () =>
+        sql<{ readonly thread_id: string }>`
+          SELECT DISTINCT thread_id FROM orchestration_v2_projection_runtime_requests
+          WHERE status = 'pending'
+        `.pipe(
+          Effect.map((rows) => rows.map((row) => ThreadId.make(row.thread_id))),
+          Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+        );
+
     const getThreadWorktreePaths: ProjectionStoreV2Shape["getThreadWorktreePaths"] = () =>
       sql<{ readonly thread_id: string; readonly worktree_path: string }>`
         SELECT thread_id, json_extract(payload_json, '$.worktreePath') AS worktree_path
@@ -6170,6 +6185,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getThread,
       getSettlementCandidates,
       getThreadsWithPullRequests,
+      getThreadsWithPendingRequests,
       getThreadWorktreePaths,
       getThreadProjection,
       getTurnStartContext,
@@ -6321,6 +6337,14 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                 left.id.localeCompare(right.id),
             );
         }),
+      getThreadsWithPendingRequests: () =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            [...state.projections.values()].flatMap(({ thread, runtimeRequests }) =>
+              runtimeRequests.some((request) => request.status === "pending") ? [thread.id] : [],
+            ),
+          ),
+        ),
       getThreadWorktreePaths: () =>
         Ref.get(replayState).pipe(
           Effect.map((state) =>

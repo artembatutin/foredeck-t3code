@@ -164,6 +164,13 @@ export const make = Effect.gen(function* () {
       const governed = yield* governing(thread.threadId).pipe(Effect.mapError(unconfirmed));
       if (governed === undefined) return yield* handler;
       if (governed.management !== "active") return yield* denied(callerPolicyText.retired);
+      // A delegation starts a run, so a review that no longer holds stops it as it does a turn.
+      const reviewRefused = yield* factory
+        .reviewedRefusal(thread.threadId)
+        .pipe(Effect.mapError(unconfirmed));
+      if (reviewRefused !== undefined) {
+        return yield* denied(`This delivery cannot delegate now. ${reviewRefused}`);
+      }
       const messageId = `mcp-delegation:${yield* randomUuidV4}`;
       const admit = (work?: HandoffAdmission.WorkRead) =>
         admission

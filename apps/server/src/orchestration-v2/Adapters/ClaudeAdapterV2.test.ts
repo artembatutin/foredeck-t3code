@@ -1098,12 +1098,21 @@ describe("ClaudeAdapterV2 Auto-accept edits", () => {
           Stream.runHead,
           Effect.forkScoped,
         );
+        const approvalItem = yield* runtime.events.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "turn_item.updated" && event.turnItem.type === "approval_request",
+          ),
+          Stream.runHead,
+          Effect.forkScoped,
+        );
         const command = { command: "node -e 'console.log(42)'" };
         const decision = yield* Effect.promise(() =>
           canUseTool!("Bash", command, {
             signal: new AbortController().signal,
             toolUseID: "tool-bash-accept-edits",
             requestId: "request-bash-accept-edits",
+            decisionReason: "Not on the allow list.",
           }),
         ).pipe(Effect.forkScoped);
         // Without a callback that asks, the command is allowed before any
@@ -1121,6 +1130,21 @@ describe("ClaudeAdapterV2 Auto-accept edits", () => {
         const event = first.event;
         if (Option.isNone(event) || event.value.type !== "runtime_request.updated") return;
         assert.equal(event.value.runtimeRequest.kind, "command");
+
+        // The request says what it can answer and why it asks, so no client has to guess either.
+        const item = yield* Fiber.join(approvalItem);
+        if (
+          Option.isNone(item) ||
+          item.value.type !== "turn_item.updated" ||
+          item.value.turnItem.type !== "approval_request"
+        ) {
+          return assert.fail("No approval item was emitted.");
+        }
+        assert.deepEqual(
+          item.value.turnItem.options?.map((option) => option.decision),
+          ["cancel", "decline", "acceptForSession", "accept"],
+        );
+        assert.equal(item.value.turnItem.reason, "Not on the allow list.");
 
         yield* runtime.respondToRuntimeRequest({
           requestId: event.value.runtimeRequest.id,

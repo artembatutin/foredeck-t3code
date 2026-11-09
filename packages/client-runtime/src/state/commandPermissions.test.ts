@@ -17,6 +17,7 @@ import {
   ProjectId,
   ScheduledTaskId,
   WS_METHODS,
+  type AuthEnvironmentScope,
   type AuthSessionState,
   type ServerConfig,
 } from "@t3tools/contracts";
@@ -389,6 +390,35 @@ it.effect("assistant controls recheck the destination grant after it is revoked"
       registry.set(sessions(env), AsyncResult.success(grant(false)));
       expect(registry.get(assistant.permissionAtom(env))).toBe(false);
       expect((yield* assistant.authorize(registry, env).pipe(Effect.flip))._tag).toBe(
+        "EnvironmentAuthorizationError",
+      );
+    }),
+  ),
+);
+
+it.effect("an owner's reviewed start needs both Work write and run grants at its destination", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const registry = yield* setup;
+      const start = createCommandPermissions(runtime, WS_METHODS.assistantReviewStart);
+      const session = (scopes: ReadonlyArray<AuthEnvironmentScope>) =>
+        AsyncResult.success({ ...grant(false), scopes, permissions: scopes });
+
+      for (const scopes of [[AuthWorkWriteScope], [AuthOrchestrationOperateScope], []]) {
+        registry.set(sessions(env), session(scopes));
+        expect(registry.get(start.permissionAtom(env))).toBe(false);
+        const denied = yield* start.authorize(registry, env).pipe(Effect.flip);
+        expect(denied._tag).toBe("EnvironmentAuthorizationError");
+      }
+
+      registry.set(sessions(env), session([AuthWorkWriteScope, AuthOrchestrationOperateScope]));
+      expect(registry.get(start.permissionAtom(env))).toBe(true);
+      yield* start.authorize(registry, env);
+
+      // Revoked at the destination, it is checked again when it runs.
+      registry.set(sessions(env), session([AuthWorkWriteScope]));
+      expect(registry.get(start.permissionAtom(env))).toBe(false);
+      expect((yield* start.authorize(registry, env).pipe(Effect.flip))._tag).toBe(
         "EnvironmentAuthorizationError",
       );
     }),

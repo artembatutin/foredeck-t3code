@@ -8,13 +8,21 @@ import {
 import {
   FACTORY_REPLAN_NOTE_MAX_LENGTH,
   FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
+  boundedPendingActions,
+  type FactoryDeliveryExecution,
   FactoryDeliveryId,
+  type FactoryDeliverySource,
   FactoryDeliveryStatus,
+  type FactoryPendingAction,
+  type FactoryPendingActions,
   FactoryPlanField,
   FactoryReplanNote,
+  type FactoryReviewedExecution,
   FactoryTaskId,
 } from "@t3tools/contracts/fd/factory";
+import { isOwnerDecidedRequest } from "@t3tools/shared/fd/approvals";
 import {
+  type WorkItemId,
   type WorkItemRef,
   workItemRefString,
   type WorkListResult,
@@ -23,6 +31,7 @@ import {
 } from "@t3tools/contracts/fd/work-management";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -31,8 +40,9 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
-import type * as Stream from "effect/Stream";
+import * as Stream from "effect/Stream";
 
+import { exceededDispatchModeLimit } from "../../orchestration-v2/DispatchModeLimit.ts";
 import type * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
@@ -44,6 +54,13 @@ import {
   workBranchName,
 } from "../work-management/index.ts";
 import * as FactoryActivity from "./FactoryActivity.ts";
+import {
+  ownerPendingActions,
+  refusedTurnPendingAction,
+  requestPendingAction,
+  withRefusedTurns,
+} from "./pendingActions.ts";
+import * as FactoryAdmission from "./FactoryAdmission.ts";
 import * as FactoryChanges from "./FactoryChanges.ts";
 import * as FactoryPlanning from "./FactoryPlanning.ts";
 import * as FactoryReview from "./FactoryReview.ts";
@@ -67,6 +84,7 @@ import {
   type FactoryEvent,
   type FactoryLaunchEffect,
   type FactoryResumeCheck,
+  type FactoryReviewedAllowances,
   isTerminal,
   planAtGate,
   queuedDeliveryState,
@@ -76,6 +94,15 @@ import {
 } from "./pipeline/state.ts";
 import { uncreatableTasks } from "./plan/childItem.ts";
 import { validatePlanEdit } from "./plan/edit.ts";
+import {
+  FactoryReviewedAmendmentRefusedError,
+  FactoryReviewedExecutionInvalidError,
+  isFactoryReviewedExecutionInvalid,
+  isFactoryReviewedExecutionRefusedError,
+  FactoryReviewedRebindRefusedError,
+  parseReviewedExecution,
+  sameReviewedExecution,
+} from "./reviewedExecution.ts";
 
 const FactoryReceiptRefusal = Schema.Literals(["head_changed", "tree_dirty"]);
 
@@ -219,15 +246,15 @@ export class FactoryDeliveryIdError extends Schema.TaggedError<FactoryDeliveryId
 }
 
 /**
- * A caller's intended delivery id already names a delivery of another item, kind or ceiling; nothing
- * was written.
+ * A caller's intended delivery id already names a delivery of another item, kind, ceiling or
+ * review; nothing was written.
  */
 export class FactoryDeliveryIdConflictError extends Schema.TaggedError<FactoryDeliveryIdConflictError>()(
   "FactoryDeliveryIdConflictError",
   { deliveryId: FactoryDeliveryId },
 ) {
   override get message(): string {
-    return `Factory delivery ${this.deliveryId} already exists for another item, kind or runtime ceiling.`;
+    return `Factory delivery ${this.deliveryId} already exists for another item, kind, runtime ceiling or review.`;
   }
 }
 
@@ -252,6 +279,16 @@ export class FactoryStopRefusedError extends Schema.TaggedError<FactoryStopRefus
 }
 
 /** Only a stopping, stopped or blocked delivery can resume; nothing changed. */
+/** A review's resume that was taken already, or whose delivery ended. Nothing changed. */
+class FactoryResumeNotOwedError extends Schema.TaggedError<FactoryResumeNotOwedError>()(
+  "FactoryResumeNotOwedError",
+  { deliveryId: FactoryDeliveryId },
+) {
+  override get message(): string {
+    return `Factory delivery ${this.deliveryId} is not owed this review's resume.`;
+  }
+}
+
 export class FactoryResumeRefusedError extends Schema.TaggedError<FactoryResumeRefusedError>()(
   "FactoryResumeRefusedError",
   { deliveryId: FactoryDeliveryId, status: FactoryDeliveryStatus },
@@ -353,6 +390,7 @@ export type FactoryStartError =
   | FactoryBranchUnavailableError
   | FactoryDeliveryIdError
   | FactoryDeliveryIdConflictError
+  | FactoryReviewedExecutionInvalidError
   | FactoryDeliveryStore.FactoryDeliveryActive
   | FactoryStoreError;
 
@@ -360,8 +398,24 @@ export type FactoryStartError =
  * A stored delivery with its newest stage attempts, as many as a snapshot carries, in the order
  * they started.
  */
+/** A listing reads what its items say for at most this many deliveries, the newest. */
+const LISTING_FACTS_MAX = 100;
+/** How long a listing waits on a Work source before showing its deliveries without its facts. */
+const LISTING_FACTS_TIMEOUT = "3 seconds";
+
 export type FactoryDeliveryWithRuns = FactoryDeliveryStore.StoredFactoryDelivery & {
+  /** The newest attempts, at most `FACTORY_SNAPSHOT_STAGE_RUNS_MAX`, for its timeline. */
   readonly stageRuns: ReadonlyArray<FactoryStageRunStore.StoredFactoryStageRun>;
+  /** Its attempts per stage over its whole history, which that window cannot count. */
+  readonly stageAttempts: FactoryStageRunStore.FactoryStageAttempts;
+  /** What `listForClients` read of its Work item; absent elsewhere, or when it could not. */
+  readonly source?: FactoryDeliverySource;
+  /** What `listForClients` read of its queue rank; absent when nothing manages it. */
+  readonly queuePriority?: number | null;
+  /** What `listForClients` found it waiting on someone for; absent while nothing is. */
+  readonly pendingActions?: FactoryPendingActions;
+  /** What `getForClient` found its roles running on; absent elsewhere, or when it could not. */
+  readonly execution?: FactoryDeliveryExecution;
 };
 
 /**
@@ -403,6 +457,13 @@ export class FactoryService extends Context.Service<
      * ceiling takes the start step only if it is still queued, and is otherwise returned as it is,
      * even done or cancelled, whatever Work or the settings say now; one naming any other fails
      * with `FactoryDeliveryIdConflictError`, writing nothing.
+     *
+     * With `reviewedExecution`, which only a review receipt's claim passes, the delivery runs on
+     * what its owner reviewed from then on and reads no Factory setting, so a setting removed or
+     * changed while it queued neither refuses nor alters the start. A value that is no complete
+     * review (see `FactoryReviewedExecution`), of another project or repository, or broader than
+     * `runtimeModeCeiling`, is refused with `FactoryReviewedExecutionInvalidError`, writing nothing, and a replay under the
+     * same id with another review is a conflict.
      */
     readonly start: (input: {
       readonly itemRef: WorkItemRef;
@@ -411,7 +472,56 @@ export class FactoryService extends Context.Service<
       readonly runtimeModeCeiling?: RuntimeMode;
       /** The delivery's id, minted by the caller; a random one when absent. */
       readonly deliveryId?: FactoryDeliveryId;
+      /** The review receipt's execution, as any value it was stored as; judged here. */
+      readonly reviewedExecution?: unknown;
     }) => Effect.Effect<FactoryDeliveryWithRuns, FactoryStartError>;
+    /**
+     * What an owner would review for a delivery of the project, for a review receipt; see
+     * `FactoryThreadEffects.resolveReviewedExecution`.
+     */
+    readonly resolveReviewedExecution: FactoryThreadEffects.FactoryThreadEffects["Service"]["resolveReviewedExecution"];
+    /** What an owner reviewing the project sees; see `FactoryThreadEffects`. */
+    readonly previewReviewedExecution: FactoryThreadEffects.FactoryThreadEffects["Service"]["previewReviewedExecution"];
+    /** Whether a review still says what would be bound now; see `FactoryThreadEffects`. */
+    readonly reviewedExecutionHolds: FactoryThreadEffects.FactoryThreadEffects["Service"]["reviewedExecutionHolds"];
+    /**
+     * A fresh owner review of the whole of a reviewed delivery, under its lock: it runs on this from
+     * then on, as a delivery blocked on a setting that drifted needs, and what it used so far stays
+     * counted, whatever the new limits say. Only for one with nothing under way: stopped, blocked,
+     * still queued, or waiting on a child. Only a new receipt of a later version takes effect, and
+     * the same receipt again changes nothing, whatever became of the delivery since, so a repeated
+     * confirmation is harmless. A receipt an earlier review stood under never authorizes anything
+     * again. With `resume`, this review owes the delivery one resume, in the same step: the next
+     * resume of it takes that up, so a repeat of the confirmation can tell it happened. It names the
+     * effects the delivery had issued when the owner confirmed, and any more mean it ran on since,
+     * so the review no longer describes it. Refused with `FactoryReviewedRebindRefusedError`,
+     * changing nothing, otherwise.
+     */
+    readonly rebindReviewed: (input: {
+      readonly deliveryId: FactoryDeliveryId;
+      readonly execution: FactoryReviewedExecution;
+      readonly resume?: { readonly effectsIssued: number };
+    }) => Effect.Effect<
+      FactoryDeliveryWithRuns,
+      FactoryReviewedRebindRefusedError | FactoryDeliveryNotFoundError | FactoryStoreError
+    >;
+    /**
+     * A fresh owner review's new allowances for a reviewed delivery, under the delivery's lock:
+     * they stand under its new receipt, and what it used so far stays counted, so a resume after
+     * it spends only the difference. Only a new receipt of a later version can raise an allowance,
+     * and none can lower one; a receipt an earlier review stood under never authorizes anything
+     * again. The same receipt with the same allowances changes nothing, so a repeated confirmation
+     * is harmless. Refused with `FactoryReviewedAmendmentRefusedError`, changing nothing, otherwise.
+     */
+    readonly amendReviewedAllowance: (input: {
+      readonly deliveryId: FactoryDeliveryId;
+      readonly receiptId: FactoryReviewedExecution["receiptId"];
+      readonly reviewVersion: number;
+      readonly allowances: FactoryReviewedAllowances;
+    }) => Effect.Effect<
+      FactoryDeliveryWithRuns,
+      FactoryReviewedAmendmentRefusedError | FactoryDeliveryNotFoundError | FactoryStoreError
+    >;
     /**
      * Starts the project's next Ready item as a single delivery, through `start`, for MCP and
      * scheduled tasks. Ready is Work's Ready: a todo item that is not blocked and has no open
@@ -443,6 +553,22 @@ export class FactoryService extends Context.Service<
      * one bounded read, however many deliveries there are.
      */
     readonly list: (input: {
+      readonly projectId?: ProjectId;
+    }) => Effect.Effect<ReadonlyArray<FactoryDeliveryWithRuns>, FactoryStoreError>;
+    /**
+     * `get` for a client showing this one delivery, with what each role it uses runs on. A failed read
+     * of that leaves it out rather than fail the delivery; it costs a read per thread, so no listing
+     * asks.
+     */
+    readonly getForClient: (
+      deliveryId: FactoryDeliveryId,
+    ) => Effect.Effect<Option.Option<FactoryDeliveryWithRuns>, FactoryStoreError>;
+    /**
+     * `list` as a client shows it: every delivery with its queue rank, and each not done or
+     * cancelled with what its Work item says now. Those reads never fail or hold up the list: one
+     * that cannot answer in time leaves its part out. It writes nothing, here or at any source.
+     */
+    readonly listForClients: (input: {
       readonly projectId?: ProjectId;
     }) => Effect.Effect<ReadonlyArray<FactoryDeliveryWithRuns>, FactoryStoreError>;
     /**
@@ -484,8 +610,10 @@ export class FactoryService extends Context.Service<
      * branch it left is settled and verified at once. A parent that stopped or blocked while
      * planning resumes into planning, its unrecorded planner launch replayed alike, and a
      * recorded planner asked for its plan again. A resume grants a fresh retry allowance
-     * (owner decision): repair rounds and failure fingerprints start over, its limits do not.
-     * Refused, with nothing changed, in any other status. A delivery blocked on a PR stage whose
+     * (owner decision): repair rounds and failure fingerprints start over, its limits do not. A
+     * reviewed delivery's counts stay, and only its fingerprints start over: repeating a resume
+     * adds no work (see `amendReviewedAllowance`). Refused, with nothing changed, in any other
+     * status. A delivery blocked on a PR stage whose
      * result a restart lost first recovers what that stage published (see
      * `FactoryWorker.recoverPullRequest`), since the resume clears the only sign it did; a
      * recovery that cannot read the records fails the resume, and one that proves a pull request
@@ -495,6 +623,22 @@ export class FactoryService extends Context.Service<
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<
       FactoryDeliveryWithRuns,
+      | FactoryResumeRefusedError
+      | FactoryPullRequestUnknownError
+      | FactoryDeliveryNotFoundError
+      | FactoryStoreError
+      | ProjectionStore.ProjectionStoreV2Error
+    >;
+    /**
+     * `resume`, as the one resume a fresh review's receipt owes the delivery (see `rebindReviewed`):
+     * whether it still does is judged in the very step that resumes it and clears it, so a resume
+     * that anyone else took first leaves none to take. None when it is not owed, changing nothing.
+     */
+    readonly resumeOwedByReview: (
+      deliveryId: FactoryDeliveryId,
+      receiptId: FactoryReviewedExecution["receiptId"],
+    ) => Effect.Effect<
+      FactoryDeliveryWithRuns | null,
       | FactoryResumeRefusedError
       | FactoryPullRequestUnknownError
       | FactoryDeliveryNotFoundError
@@ -547,6 +691,15 @@ export class FactoryService extends Context.Service<
       threadId: ThreadId,
     ) => Effect.Effect<FactoryDeliveryId | null, FactoryActivity.FactoryOwnershipReadError>;
     /**
+     * Why the review of the delivery whose family the thread belongs to no longer allows new work
+     * from it, or the host's policy refuses the mode that work would run in, as text fit to show the
+     * thread's agent, for a caller policy judging a delegation. None when neither holds, or for a
+     * thread of no delivery. Fails, deciding nothing, when what it judges cannot be read.
+     */
+    readonly reviewedRefusal: (
+      threadId: ThreadId,
+    ) => Effect.Effect<string | undefined, { readonly _tag: string }>;
+    /**
      * Whose the runtime request on the thread is, read-only, for a caller policy judging an
      * answer to it: the root of the thread's family (null for none, as `familyRoot` says), the
      * request's status, kind, response capability and run, and that run's status and class on the
@@ -572,6 +725,13 @@ export class FactoryService extends Context.Service<
     readonly turnRunState: FactoryActivity.FactoryActivity["Service"]["turnRunState"];
     /** Every request still pending on the root's family's threads, read-only. */
     readonly familyRequests: FactoryActivity.FactoryActivity["Service"]["familyRequests"];
+    /** The automatic turns the host refused on the delivery's threads, judged again now. */
+    readonly refusedTurnActions: (delivery: {
+      readonly deliveryId: FactoryDeliveryId;
+      readonly projectId: ProjectId;
+    }) => Effect.Effect<ReadonlyArray<FactoryPendingAction>>;
+    /** Every request pending on a delivery's thread, starting from the threads holding one. */
+    readonly pendingRequests: FactoryActivity.FactoryActivity["Service"]["pendingRequests"];
     /**
      * The owner's edit of the plan a parent waits on at the plan gate: `plan`, any value as it
      * arrived, replaces it, and the delivery waits on. The edit is judged under the delivery's
@@ -685,6 +845,14 @@ export class FactoryService extends Context.Service<
      * on each value.
      */
     readonly subscribe: Stream.Stream<number>;
+    /**
+     * What a client's reads follow: an epoch that moves with `subscribe`, and whenever what
+     * `listForClients` shows beside a delivery may have changed, so a delivery resting on its pull
+     * request still shows its item's status, assignee and queue rank as they are now. It is the
+     * sum of three counters that only rise: every move changes it, and a new subscription with
+     * nothing moved answers the same value, which a client does not refetch on.
+     */
+    readonly listingChanges: Stream.Stream<number>;
   }
 >()("t3/fd/factory/FactoryService") {}
 
@@ -711,6 +879,7 @@ const make = Effect.gen(function* () {
   const threads = yield* FactoryThreadEffects.FactoryThreadEffects;
   const changes = yield* FactoryChanges.FactoryChanges;
   const activity = yield* FactoryActivity.FactoryActivity;
+  const admission = yield* FactoryAdmission.FactoryAdmission;
   const sql = yield* SqlClient.SqlClient;
   const crypto = yield* Crypto.Crypto;
   const gitContext = yield* Effect.context<FileSystem.FileSystem | GitVcsDriver.GitVcsDriver>();
@@ -718,21 +887,176 @@ const make = Effect.gen(function* () {
   // lock is enough, as for Work's thread starts.
   const itemLocks = yield* KeyedLock.make<string>();
 
-  /** The deliveries with their newest attempts, in one read however many there are. */
-  const withRuns = (stored: ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>) =>
-    stageRuns
-      .listNewestByDeliveries({
-        deliveryIds: stored.map(({ deliveryId }) => deliveryId),
-        limit: FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
-      })
-      .pipe(
-        Effect.map((runs) =>
-          stored.map((delivery) => ({
-            ...delivery,
-            stageRuns: runs.get(delivery.deliveryId) ?? [],
-          })),
-        ),
+  /** What one source says of the items a listing shows, or nothing if it cannot say in time. */
+  const listedSummaries = (sourceId: WorkSourceId, itemIds: ReadonlyArray<WorkItemId>) =>
+    work.currentSummaries(sourceId, itemIds).pipe(
+      Effect.timeoutOption(LISTING_FACTS_TIMEOUT),
+      Effect.map(Option.getOrElse(() => [])),
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.as(Effect.logWarning("factory listing read no Work facts", cause), []),
+      ),
+    );
+
+  /**
+   * The automatic turns the host refused on these deliveries' threads, judged again now: a thread
+   * whose owner has since changed its mode shows nothing, even before its turn is asked for again.
+   * One it cannot read shows nothing and says so in the log. Costs nothing while no turn was
+   * refused, then a local read per refused thread of these deliveries, and writes nothing.
+   */
+  const refusedTurnActions = (
+    deliveries: ReadonlyArray<{
+      readonly deliveryId: FactoryDeliveryId;
+      readonly projectId: ProjectId;
+    }>,
+  ) =>
+    Effect.gen(function* () {
+      const byDelivery = new Map<FactoryDeliveryId, ReadonlyArray<FactoryPendingAction>>();
+      const recorded = yield* changes.refusedTurns;
+      if (recorded.size === 0) return byDelivery;
+      const projectOf = new Map(
+        deliveries.map((delivery) => [delivery.deliveryId, delivery.projectId]),
       );
+      for (const [threadId, { root, launchedBy }] of recorded) {
+        const projectId = projectOf.get(root) ?? projectOf.get(launchedBy);
+        if (projectId === undefined) continue;
+        const refusal = yield* threads.checkThreadHostPolicy(threadId, launchedBy).pipe(
+          Effect.as(undefined),
+          Effect.catch((cause) =>
+            FactoryThreadEffects.isFactoryRuntimeModeRefusedError(cause)
+              ? Effect.succeed(cause)
+              : Effect.as(
+                  Effect.logWarning("factory listing read no refused turn", cause),
+                  undefined,
+                ),
+          ),
+        );
+        if (refusal === undefined) continue;
+        const action = refusedTurnPendingAction(projectId, refusal);
+        for (const deliveryId of new Set([root, launchedBy])) {
+          byDelivery.set(deliveryId, [...(byDelivery.get(deliveryId) ?? []), action]);
+        }
+      }
+      return byDelivery;
+    });
+
+  /**
+   * What a listing shows beside its deliveries. A queue rank is a local read, and every delivery
+   * takes one: Work's section goes on showing an item's newest delivery after it ends, beside the
+   * rank its idea still has. What an item says now costs a tracker, so only a delivery not done or
+   * cancelled asks, and one request a source, whatever it holds: a list a client refetches on every
+   * step must not cost a read per delivery. The Factory page lists only those, and Work's section
+   * has its item on hand.
+   */
+  const withListingFacts = (listed: ReadonlyArray<FactoryDeliveryWithRuns>) =>
+    Effect.gen(function* () {
+      const active = listed.filter(({ state }) => !isTerminal(state)).slice(0, LISTING_FACTS_MAX);
+      const bySource = new Map<WorkSourceId, Array<WorkItemId>>();
+      for (const { itemRef } of active) {
+        bySource.set(itemRef.sourceId, [...(bySource.get(itemRef.sourceId) ?? []), itemRef.itemId]);
+      }
+      const summaries = yield* Effect.forEach(
+        [...bySource],
+        ([sourceId, itemIds]) => listedSummaries(sourceId, itemIds),
+        { concurrency: "unbounded" },
+      );
+      const sources = new Map(
+        summaries.flat().map((summary) => [workItemRefString(summary.ref), summary] as const),
+      );
+      const refusedTurns = yield* refusedTurnActions(active);
+      const noRequests = (complete: boolean): FactoryActivity.FactoryPendingRequests => ({
+        byDelivery: new Map(),
+        complete,
+      });
+      const pending =
+        active.length === 0
+          ? noRequests(true)
+          : yield* activity.pendingRequests.pipe(
+              Effect.catchCause((cause) =>
+                Cause.hasInterruptsOnly(cause)
+                  ? Effect.interrupt
+                  : Effect.as(
+                      Effect.logWarning("factory listing read no pending requests", cause),
+                      noRequests(false),
+                    ),
+              ),
+            );
+      const rootOf = ({ deliveryId, parentId }: FactoryDeliveryWithRuns) => parentId ?? deliveryId;
+      const priorities = yield* admission
+        .queuePriorities([...new Set(listed.map(rootOf))])
+        .pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.as(
+                  Effect.logWarning("factory listing read no queue priority", cause),
+                  new Map<FactoryDeliveryId, number | null>(),
+                ),
+          ),
+        );
+      return listed.map((delivery) => {
+        const summary = isTerminal(delivery.state)
+          ? undefined
+          : sources.get(workItemRefString(delivery.itemRef));
+        const priority = priorities.get(rootOf(delivery));
+        // A parent waiting on its child shows what that child waits on, or nothing would say why.
+        const { awaiting } = delivery.state;
+        const child =
+          awaiting?.type === "child"
+            ? listed.find(({ deliveryId }) => deliveryId === awaiting.deliveryId)
+            : undefined;
+        const actions = isTerminal(delivery.state)
+          ? []
+          : [
+              ...withRefusedTurns(
+                [
+                  ...ownerPendingActions(delivery),
+                  ...(child === undefined ? [] : ownerPendingActions(child)),
+                ],
+                refusedTurns.get(delivery.deliveryId) ?? [],
+              ),
+              ...(pending.byDelivery.get(delivery.deliveryId) ?? [])
+                .filter(({ kind }) => isOwnerDecidedRequest(kind))
+                .map(requestPendingAction),
+            ];
+        return {
+          ...delivery,
+          ...(isTerminal(delivery.state) || (actions.length === 0 && pending.complete)
+            ? {}
+            : { pendingActions: boundedPendingActions(actions, pending.complete) }),
+          ...(summary === undefined
+            ? {}
+            : {
+                source: {
+                  key: summary.key,
+                  title: summary.title,
+                  status: summary.status,
+                  statusName: summary.nativeStatus?.name ?? null,
+                  assignee: summary.assignee?.label ?? null,
+                },
+              }),
+          ...(priority === undefined ? {} : { queuePriority: priority }),
+        };
+      });
+    });
+
+  /** The deliveries with their newest attempts, in one read however many there are. */
+  const withRuns = (stored: ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>) => {
+    const deliveryIds = stored.map(({ deliveryId }) => deliveryId);
+    return Effect.all([
+      stageRuns.listNewestByDeliveries({ deliveryIds, limit: FACTORY_SNAPSHOT_STAGE_RUNS_MAX }),
+      stageRuns.attemptTotals(deliveryIds),
+    ]).pipe(
+      Effect.map(([runs, totals]) =>
+        stored.map((delivery) => ({
+          ...delivery,
+          stageRuns: runs.get(delivery.deliveryId) ?? [],
+          stageAttempts: totals.get(delivery.deliveryId) ?? {},
+        })),
+      ),
+    );
+  };
 
   /**
    * Reads deliveries and their attempts in one read-only transaction, a single snapshot of the
@@ -757,7 +1081,12 @@ const make = Effect.gen(function* () {
   const steppedWithRuns = (stepped: {
     readonly delivery: FactoryDeliveryStore.StoredFactoryDelivery;
     readonly stageRuns: ReadonlyArray<FactoryStageRunStore.StoredFactoryStageRun>;
-  }) => ({ ...stepped.delivery, stageRuns: stepped.stageRuns });
+    readonly stageAttempts: FactoryStageRunStore.FactoryStageAttempts;
+  }) => ({
+    ...stepped.delivery,
+    stageRuns: stepped.stageRuns,
+    stageAttempts: stepped.stageAttempts,
+  });
 
   const start: FactoryService["Service"]["start"] = Effect.fn("FactoryService.start")(
     function* (input) {
@@ -766,6 +1095,25 @@ const make = Effect.gen(function* () {
       const itemRef = yield* work.canonicalRef(input.itemRef);
       const kind = input.kind ?? "single";
       const { deliveryId: intended } = input;
+      const parsed =
+        input.reviewedExecution === undefined
+          ? undefined
+          : parseReviewedExecution(input.reviewedExecution);
+      if (isFactoryReviewedExecutionInvalid(parsed)) return yield* parsed;
+      const reviewed = parsed;
+      // A review is a ceiling and never a grant: it cannot run broader than whoever starts it.
+      if (
+        reviewed !== undefined &&
+        input.runtimeModeCeiling !== undefined &&
+        exceededDispatchModeLimit(
+          { runtimeMode: input.runtimeModeCeiling, interactionMode: "default" },
+          { runtimeMode: reviewed.runtimeCeiling, interactionMode: "default" },
+        ) !== undefined
+      ) {
+        return yield* new FactoryReviewedExecutionInvalidError({ reason: "runtime_ceiling" });
+      }
+      // A review's ceiling is the delivery's, so a replay is judged against the same one.
+      const ceiling = reviewed?.runtimeCeiling ?? input.runtimeModeCeiling;
       /** The delivery the caller's id already names, if any; another item's is a conflict. */
       const named = Effect.gen(function* () {
         if (intended === undefined) return Option.none();
@@ -774,7 +1122,8 @@ const make = Effect.gen(function* () {
         const { itemRef: storedItem, state } = stored.value;
         return workItemRefString(storedItem) === workItemRefString(itemRef) &&
           state.kind === kind &&
-          state.runtimeModeCeiling === input.runtimeModeCeiling
+          state.runtimeModeCeiling === ceiling &&
+          sameReviewedExecution(state.reviewedExecution, reviewed)
           ? stored
           : yield* new FactoryDeliveryIdConflictError({ deliveryId: intended });
       });
@@ -785,7 +1134,7 @@ const make = Effect.gen(function* () {
       const started = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
         delivery.state.status !== "queued"
           ? withRuns([delivery]).pipe(
-              Effect.map(([found]) => found ?? { ...delivery, stageRuns: [] }),
+              Effect.map(([found]) => found ?? { ...delivery, stageRuns: [], stageAttempts: {} }),
             )
           : // A storage failure here leaves the delivery queued with nothing launched.
             worker
@@ -795,7 +1144,7 @@ const make = Effect.gen(function* () {
               .pipe(
                 Effect.map(
                   Option.match({
-                    onNone: () => ({ ...delivery, stageRuns: [] }),
+                    onNone: () => ({ ...delivery, stageRuns: [], stageAttempts: {} }),
                     onSome: steppedWithRuns,
                   }),
                 ),
@@ -815,10 +1164,19 @@ const make = Effect.gen(function* () {
         });
       }
       const { projectId } = source;
-      const { limits } = yield* settings.requireDeliverySettings(projectId);
+      // A review carries its limits, whatever the settings say by now.
+      const { limits } = reviewed ?? (yield* settings.requireDeliverySettings(projectId));
       const project = Option.getOrUndefined(yield* projects.get(projectId));
       if (project === undefined) {
         return yield* new FactoryThreadEffects.FactoryProjectMissingError({ projectId });
+      }
+      if (reviewed !== undefined) {
+        if (reviewed.repository.projectId !== projectId) {
+          return yield* new FactoryReviewedExecutionInvalidError({ reason: "project" });
+        }
+        if (reviewed.repository.workspaceRoot !== project.workspaceRoot) {
+          return yield* new FactoryReviewedExecutionInvalidError({ reason: "repository" });
+        }
       }
       const item = yield* work.getItem(itemReader, { ref: itemRef });
 
@@ -883,9 +1241,8 @@ const make = Effect.gen(function* () {
                         maxFixRounds: limits.maxFixRounds,
                         maxReviewRounds: limits.maxReviewRounds,
                       },
-                      ...(input.runtimeModeCeiling === undefined
-                        ? {}
-                        : { runtimeModeCeiling: input.runtimeModeCeiling }),
+                      ...(ceiling === undefined ? {} : { runtimeModeCeiling: ceiling }),
+                      ...(reviewed === undefined ? {} : { reviewedExecution: reviewed }),
                     }),
                   })
                   .pipe(
@@ -1191,32 +1548,133 @@ const make = Effect.gen(function* () {
 
   // Decided under the delivery's lock, like stop and cancel: the worktree is read and judged with
   // no run end or effect result landing in between.
-  const resume: FactoryService["Service"]["resume"] = Effect.fn("FactoryService.resume")(
-    function* (deliveryId) {
-      // First, under the delivery's lock, what a PR stage a restart cut short published: the
-      // resume clears its block, which is then all that says the stage ran, and a cancel after
-      // it would leave that stage's watch on. Its records do not change, so what this found
-      // still holds when the resume is decided.
-      if ((yield* worker.recoverPullRequest(deliveryId)) === "unknown") {
-        return yield* new FactoryPullRequestUnknownError({ deliveryId });
-      }
-      const stepped = yield* worker.stepWith(deliveryId, (current) =>
-        Effect.gen(function* () {
-          const { status } = current.state;
-          if (status === "stopping") {
-            return { event: { type: "resume", check: null } as const, value: undefined };
+  const resumeStep = Effect.fn("FactoryService.resumeStep")(function* (
+    deliveryId: FactoryDeliveryId,
+    owedBy?: FactoryReviewedExecution["receiptId"],
+  ) {
+    // First, under the delivery's lock, what a PR stage a restart cut short published: the
+    // resume clears its block, which is then all that says the stage ran, and a cancel after
+    // it would leave that stage's watch on. Its records do not change, so what this found
+    // still holds when the resume is decided.
+    if ((yield* worker.recoverPullRequest(deliveryId)) === "unknown") {
+      return yield* new FactoryPullRequestUnknownError({ deliveryId });
+    }
+    const stepped = yield* worker.stepWith(deliveryId, (current) =>
+      Effect.gen(function* () {
+        const { status } = current.state;
+        if (
+          owedBy !== undefined &&
+          (current.state.reviewResumeOwed !== owedBy || isTerminal(current.state))
+        ) {
+          return yield* new FactoryResumeNotOwedError({ deliveryId });
+        }
+        if (status === "stopping") {
+          return { event: { type: "resume", check: null } as const, value: undefined };
+        }
+        if (status !== "stopped" && status !== "blocked") {
+          return yield* new FactoryResumeRefusedError({ deliveryId, status });
+        }
+        const check = yield* resumeCheck(current);
+        return { event: { type: "resume", check } as const, value: undefined };
+      }),
+    );
+    if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
+    return steppedWithRuns(stepped.value);
+  });
+
+  const resume: FactoryService["Service"]["resume"] = (deliveryId) =>
+    resumeStep(deliveryId).pipe(
+      Effect.catchTags({ FactoryResumeNotOwedError: (cause) => Effect.die(cause) }),
+    );
+
+  const resumeOwedByReview: FactoryService["Service"]["resumeOwedByReview"] = (
+    deliveryId,
+    receiptId,
+  ) =>
+    resumeStep(deliveryId, receiptId).pipe(
+      Effect.catchTags({ FactoryResumeNotOwedError: () => Effect.succeed(null) }),
+    );
+
+  const amendReviewedAllowance: FactoryService["Service"]["amendReviewedAllowance"] = Effect.fn(
+    "FactoryService.amendReviewedAllowance",
+  )(function* ({ deliveryId, receiptId, reviewVersion, allowances }) {
+    const refuse = (reason: FactoryReviewedAmendmentRefusedError["reason"]) =>
+      new FactoryReviewedAmendmentRefusedError({ deliveryId, reason });
+    const stepped = yield* worker.stepWith(deliveryId, ({ state }) =>
+      Effect.gen(function* () {
+        const { reviewedExecution: reviewed } = state;
+        if (reviewed === undefined) return yield* refuse("not_reviewed");
+        if (isTerminal(state)) return yield* refuse("ended");
+        const { limits } = reviewed;
+        if (state.supersededReceipts?.includes(receiptId) === true) {
+          return yield* refuse("reused_receipt");
+        }
+        if (reviewed.receiptId === receiptId) {
+          const same =
+            limits.maxFixRounds === allowances.maxFixRounds &&
+            limits.maxReviewRounds === allowances.maxReviewRounds &&
+            limits.maxFixCommitTurns === allowances.maxFixCommitTurns;
+          if (!same) return yield* refuse("same_receipt");
+        } else {
+          if (reviewVersion <= reviewed.reviewVersion) return yield* refuse("stale_version");
+          if (
+            allowances.maxFixRounds < limits.maxFixRounds ||
+            allowances.maxReviewRounds < limits.maxReviewRounds ||
+            allowances.maxFixCommitTurns < limits.maxFixCommitTurns
+          ) {
+            return yield* refuse("lower_allowance");
           }
-          if (status !== "stopped" && status !== "blocked") {
-            return yield* new FactoryResumeRefusedError({ deliveryId, status });
-          }
-          const check = yield* resumeCheck(current);
-          return { event: { type: "resume", check } as const, value: undefined };
-        }),
-      );
-      if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
-      return steppedWithRuns(stepped.value);
-    },
-  );
+        }
+        const event: FactoryEvent = {
+          type: "reviewed.amended",
+          receiptId,
+          reviewVersion,
+          allowances,
+        };
+        return { event, value: undefined };
+      }),
+    );
+    if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
+    return steppedWithRuns(stepped.value);
+  });
+
+  const rebindReviewed: FactoryService["Service"]["rebindReviewed"] = Effect.fn(
+    "FactoryService.rebindReviewed",
+  )(function* ({ deliveryId, execution, resume }) {
+    const refuse = (reason: FactoryReviewedRebindRefusedError["reason"]) =>
+      new FactoryReviewedRebindRefusedError({ deliveryId, reason });
+    const stepped = yield* worker.stepWith(deliveryId, ({ projectId, state }) =>
+      Effect.gen(function* () {
+        const { reviewedExecution: reviewed } = state;
+        if (reviewed === undefined) return yield* refuse("not_reviewed");
+        const event: FactoryEvent = {
+          type: "reviewed.rebound",
+          execution,
+          owesResume: resume !== undefined,
+        };
+        if (reviewed.receiptId === execution.receiptId) return { event, value: undefined };
+        if (state.supersededReceipts?.includes(execution.receiptId) === true) {
+          return yield* refuse("reused_receipt");
+        }
+        if (isTerminal(state)) return yield* refuse("ended");
+        if (execution.repository.projectId !== projectId) return yield* refuse("project");
+        if (execution.reviewVersion <= reviewed.reviewVersion) {
+          return yield* refuse("stale_version");
+        }
+        const atRest =
+          state.status === "stopped" ||
+          state.status === "blocked" ||
+          state.status === "queued" ||
+          state.awaiting?.type === "child";
+        if (!atRest || (resume !== undefined && resume.effectsIssued !== state.effectsIssued)) {
+          return yield* refuse("not_at_rest");
+        }
+        return { event, value: undefined };
+      }),
+    );
+    if (Option.isNone(stepped)) return yield* new FactoryDeliveryNotFoundError({ deliveryId });
+    return steppedWithRuns(stepped.value);
+  });
 
   const cancel: FactoryService["Service"]["cancel"] = Effect.fn("FactoryService.cancel")(
     function* (deliveryId) {
@@ -1321,12 +1779,38 @@ const make = Effect.gen(function* () {
 
   return FactoryService.of({
     start,
+    resolveReviewedExecution: threads.resolveReviewedExecution,
+    amendReviewedAllowance,
+    rebindReviewed,
+    resumeOwedByReview,
+    previewReviewedExecution: threads.previewReviewedExecution,
+    reviewedExecutionHolds: threads.reviewedExecutionHolds,
     startNext,
     get: (deliveryId) =>
       readWithRuns("service.get", deliveries.get(deliveryId).pipe(Effect.map(Option.toArray))).pipe(
         Effect.map(([delivery]) => Option.fromUndefinedOr(delivery)),
       ),
+    getForClient: (deliveryId) =>
+      readWithRuns("service.get", deliveries.get(deliveryId).pipe(Effect.map(Option.toArray))).pipe(
+        Effect.flatMap(([delivery]) =>
+          delivery === undefined
+            ? Effect.succeed(Option.none())
+            : threads.deliveryExecution(delivery).pipe(
+                Effect.map((execution) => Option.some({ ...delivery, execution })),
+                Effect.catchCause((cause) =>
+                  Cause.hasInterruptsOnly(cause)
+                    ? Effect.interrupt
+                    : Effect.as(
+                        Effect.logWarning("factory read no role execution", cause),
+                        Option.some(delivery),
+                      ),
+                ),
+              ),
+        ),
+      ),
     list: (input) => readWithRuns("service.list", deliveries.list(input)),
+    listForClients: (input) =>
+      readWithRuns("service.list", deliveries.list(input)).pipe(Effect.flatMap(withListingFacts)),
     listByItem: (input) =>
       Effect.gen(function* () {
         const itemRef = yield* work.canonicalRef(input);
@@ -1340,10 +1824,30 @@ const make = Effect.gen(function* () {
     ensureDeferred: worker.ensureDeferred,
     familyRoot: (threadId) =>
       activity.family(threadId).pipe(Effect.map((family) => family?.root ?? null)),
+    reviewedRefusal: (threadId) =>
+      Effect.gen(function* () {
+        const family = yield* activity.family(threadId);
+        if (family === null) return undefined;
+        yield* threads.checkReviewedThread(threadId, family.launchedBy);
+        yield* threads.checkThreadHostPolicy(threadId, family.launchedBy);
+        return undefined;
+      }).pipe(
+        Effect.catch((cause) =>
+          isFactoryReviewedExecutionRefusedError(cause) ||
+          FactoryThreadEffects.isFactoryRuntimeModeRefusedError(cause)
+            ? Effect.succeed(cause.message)
+            : Effect.fail(cause),
+        ),
+      ),
     requestOwnership: activity.requestOwnership,
     activity: activity.activity,
     turnRunState: activity.turnRunState,
     familyRequests: activity.familyRequests,
+    pendingRequests: activity.pendingRequests,
+    refusedTurnActions: (delivery) =>
+      refusedTurnActions([delivery]).pipe(
+        Effect.map((byDelivery) => byDelivery.get(delivery.deliveryId) ?? []),
+      ),
     updatePlan,
     approvePlan,
     rejectPlan,
@@ -1351,6 +1855,11 @@ const make = Effect.gen(function* () {
     submitPlan,
     submitReview,
     subscribe: changes.changes,
+    listingChanges: Stream.suspend(() =>
+      Stream.zipLatestAll(changes.changes, work.subscribeRefreshes, admission.queueChanges),
+    ).pipe(
+      Stream.map(([factoryEpoch, workEpoch, queueEpoch]) => factoryEpoch + workEpoch + queueEpoch),
+    ),
   });
 });
 

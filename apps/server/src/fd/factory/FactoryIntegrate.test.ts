@@ -31,6 +31,7 @@ import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistryMock from "../../provider/testUtils/providerRegistryMock.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as SourceControlProviderRegistry from "../../sourceControl/SourceControlProviderRegistry.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { WorkService } from "../work-management/index.ts";
@@ -53,7 +54,7 @@ import {
   type FactoryEvent,
   queuedDeliveryState,
 } from "./pipeline/state.ts";
-import { needsYou } from "./snapshot.ts";
+import { needsYou, toFactoryDelivery } from "./snapshot.ts";
 import {
   authorCommits,
   drainFactory,
@@ -389,6 +390,35 @@ describe("a parent's integrate stage", () => {
       ),
   );
 
+  it.live("counts a reviewer that ran and never submitted, and one still running", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const factory = yield* service;
+        const parent = yield* deliverChildren(world, oneTaskPlan);
+        const attempts = factory.get(parent.parentId).pipe(
+          Effect.map((found) => toFactoryDelivery(Option.getOrThrow(found)).allowance?.attempts),
+          Effect.orDie,
+        );
+
+        const reviewer = yield* awaitedRun(parent.parentId);
+        assert.deepStrictEqual(yield* attempts, { verify: 1, review: 1 });
+
+        // Its run fails with no review accepted, so only its stage attempt records that it ran.
+        yield* world.endRun(reviewer.runId, "failed");
+        const blocked = yield* stateOf(parent.parentId);
+        assert.strictEqual(blocked.status, "blocked");
+        assert.lengthOf(blocked.reviews, 0);
+        assert.deepStrictEqual(yield* attempts, { verify: 1, review: 1 });
+
+        // A resume verifies and reviews again, with a new reviewer.
+        yield* factory.resume(parent.parentId);
+        yield* drainFactory;
+        yield* awaitedRun(parent.parentId);
+        assert.deepStrictEqual(yield* attempts, { verify: 2, review: 2 });
+      }),
+    ),
+  );
+
   it.live("blocks on a blocking review with its summary, then reviews afresh on resume", () =>
     withProject(verifyCommands.passes, (world) =>
       Effect.gen(function* () {
@@ -566,6 +596,11 @@ const layer = FactoryService.layer.pipe(
   Layer.provideMerge(FactorySettings.layer),
   Layer.provideMerge(Factory.layerPersistence),
   Layer.provideMerge(SqlitePersistence.layerMemory),
+  Layer.provideMerge(
+    Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+      resolveLink: () => undefined,
+    }),
+  ),
   Layer.provideMerge(GitVcsDriver.layer),
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-integrate-" })),
   Layer.provideMerge(VcsProcess.layer),

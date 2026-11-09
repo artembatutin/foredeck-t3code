@@ -31,8 +31,12 @@ capabilities, never the driver kind.
   mode by answering approvals in T3: T3's check is weaker than the agent's own enforcement. The
   server runs an unoffered stored mode as Supervised
   ([`RuntimePolicy.ts`](../../apps/server/src/orchestration-v2/RuntimePolicy.ts)).
+  A mode a host's own policy refuses belongs in `runtimeModeRestrictions` instead, which only
+  explains it; an adapter with no such policy to read leaves that out, which reads as unknown.
 - **Approval and question options.** Pass the provider's own option IDs through unchanged. Every
-  request needs a way to decline that the provider honors.
+  request needs a way to decline that the provider honors. List what an approval can answer on its
+  `options`: a client offers no session or lasting choice a request does not list. Put why the
+  provider asks in `reason` when it says; nothing else may work that out from the kind.
 - **Interaction modes.** Hide the plan toggle (`showInteractionModeToggle: false`) unless the
   provider's plan output becomes T3's proposed-plan card.
 

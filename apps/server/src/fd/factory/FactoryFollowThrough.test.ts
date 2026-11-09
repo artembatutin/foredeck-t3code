@@ -6,7 +6,9 @@ import * as Option from "effect/Option";
 
 import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
 import * as Factory from "./index.ts";
+import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import * as FactoryStageRunStore from "./persistence/FactoryStageRunStore.ts";
 import * as FactoryTaskStore from "./persistence/FactoryTaskStore.ts";
 import {
@@ -22,6 +24,7 @@ import {
   withProject,
   type World,
 } from "./testkit/deliveryHarness.ts";
+import { appendingRemoteUrls } from "./testkit/gitProcesses.ts";
 import {
   awaitedRun,
   closedComment,
@@ -77,6 +80,14 @@ const attemptsOf = (deliveryId: FactoryDeliveryId) =>
     Effect.orDie,
     Effect.map((runs) => runs.map(({ stage, outcome }) => [stage, outcome])),
   );
+
+/** The block a push left once where it goes changed after the gate judged it. */
+const CHANGED =
+  "Factory could not open the pull request. Factory published nothing it had not judged: where a push of its branch goes, its remote, upstream or push URLs, changed after Factory judged what the push would add there. Factory pushes only where it judged, and goes no further once that changes: keep or restore the remote, upstream and push URLs its branch should publish to, then Resume, which judges that destination again before pushing.";
+
+/** The block a push left where the Git that runs it cannot be held to the URLs the gate judged. */
+const UNPINNABLE =
+  "Factory could not open the pull request. Factory published nothing: the Git that runs this project cannot hold a push to only the push URLs Factory judged. Factory pushes only where it can hold Git to what it judged: update Git on the environment that runs this project to 2.46 or later, then Resume, which judges the destination again before pushing.";
 
 const commentsSince = (world: World, from: number) =>
   world.commentCalls.slice(from).map(({ input }) => input.body);
@@ -320,6 +331,263 @@ describe("Factory follow-through: a round after its run", () => {
 });
 
 describe("Factory follow-through: what a round refuses", () => {
+  it.live("pushes nothing once the saved title loses the item's key, until it has it back", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const { deliveryId, threadId: author, worktreePath } = yield* openSingle(world);
+        const published = yield* git(worktreePath, ["rev-parse", "@{upstream}"]);
+        const title = world.pullRequestCalls[0]?.input.prTitle ?? assert.fail("No title.");
+
+        // Reworded on its host to a Conventional title about nothing in particular.
+        world.rewordPullRequest(fakePullRequest.number, "feat: unrelated change");
+        const wakeRun = yield* wakeStarted(author, fakePullRequest.number);
+        yield* authorCommits(worktreePath, "fix: write the header row", "export const x = 2;\n");
+        const fixed = yield* git(worktreePath, ["rev-parse", "HEAD"]);
+        yield* world.endRun(wakeRun, "completed");
+        yield* reviewPasses(world, deliveryId);
+
+        const refusal = (effectId: number) => ({
+          reason: "effect_failed",
+          effect: { id: effectId, type: "open_pr" },
+          detail:
+            "Factory could not open the pull request. Factory published nothing: its saved title is not one short Conventional line keeping the item's key. Factory edits nothing on the host: correct the pull request there, then Resume.",
+        });
+        const blocked = yield* stateOf(deliveryId);
+        assert.strictEqual(blocked.status, "blocked");
+        assert.deepStrictEqual(blocked.block as unknown, refusal(blocked.effectsIssued));
+        assert.deepStrictEqual(
+          world.pullRequestCalls.map(({ input }) => input.action),
+          ["create_pr"],
+        );
+        assert.strictEqual(yield* git(worktreePath, ["rev-parse", "@{upstream}"]), published);
+
+        // A resume changes nothing about what the host holds, so it pushes nothing either.
+        const factory = yield* service;
+        yield* factory.resume(deliveryId).pipe(Effect.orDie);
+        yield* drainFactory;
+        const again = yield* stateOf(deliveryId);
+        assert.strictEqual(again.status, "blocked");
+        assert.deepStrictEqual(again.block as unknown, refusal(again.effectsIssued));
+        assert.strictEqual(world.pullRequestCalls.length, 1);
+
+        // Reworded back, the same approved commit goes out to the same pull request.
+        world.rewordPullRequest(fakePullRequest.number, title);
+        yield* factory.resume(deliveryId).pipe(Effect.orDie);
+        yield* drainFactory;
+        const open = yield* stateOf(deliveryId);
+        assert.strictEqual(open.status, "pr_open");
+        assert.deepStrictEqual(
+          world.pullRequestCalls.map(({ input }) => input.action),
+          ["create_pr", "push"],
+        );
+        assert.strictEqual(yield* git(worktreePath, ["rev-parse", "@{upstream}"]), fixed);
+      }),
+    ),
+  );
+
+  it.live("pushes nothing to a recorded legacy pull request on a disallowed branch", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const { deliveryId, threadId: author, worktreePath, state } = yield* openSingle(world);
+        const published = yield* git(worktreePath, ["rev-parse", "@{upstream}"]);
+        const remote = yield* git(worktreePath, ["ls-remote", "origin"]);
+
+        // As a server from before the gate stored it: the delivery and its pull request on the
+        // branch that server named, the pull request already open on its host.
+        const legacy = `work/${state.branch.slice("feature/".length)}`;
+        yield* git(worktreePath, ["branch", "-m", state.branch, legacy]);
+        yield* git(worktreePath, ["branch", "--set-upstream-to", `origin/${state.branch}`]);
+        const recorded = state.pullRequest ?? assert.fail("No pull request.");
+        yield* Effect.flatMap(FactoryDeliveryStore.FactoryDeliveryStore, (deliveries) =>
+          deliveries.update(deliveryId, {
+            ...state,
+            branch: legacy,
+            pullRequest: { ...recorded, headBranch: legacy },
+          }),
+        ).pipe(Effect.orDie);
+        const linked = yield* linkOf(author, fakePullRequest.number);
+
+        // A real round: its feedback, a fix, verify and review all still run.
+        const wakeRun = yield* wakeStarted(author, fakePullRequest.number);
+        yield* authorCommits(worktreePath, "fix: write the header row", "export const x = 2;\n");
+        const fixed = yield* git(worktreePath, ["rev-parse", "HEAD"]);
+        yield* world.endRun(wakeRun, "completed");
+        yield* reviewPasses(world, deliveryId);
+
+        const blocked = yield* stateOf(deliveryId);
+        assert.strictEqual(blocked.status, "blocked");
+        assert.strictEqual(blocked.stage, "pr");
+        assert.deepStrictEqual(blocked.block, {
+          reason: "effect_failed",
+          effect: { id: blocked.effectsIssued, type: "open_pr" },
+          detail: `Factory could not open the pull request. Factory published nothing: its branch "${legacy}" has no feature/, bugfix/, chore/ or docs/ prefix. Factory renames nothing, and any branch, pull request and commits it published stay as they are: cancel this delivery and deliver the item again, which publishes from a compliant branch.`,
+        });
+
+        // No push and no new pull request, and only the one from before the rename exists.
+        assert.deepStrictEqual(
+          world.pullRequestCalls.map(({ input }) => input.action),
+          ["create_pr"],
+        );
+        assert.strictEqual(yield* git(worktreePath, ["rev-parse", "@{upstream}"]), published);
+        assert.strictEqual(yield* git(worktreePath, ["ls-remote", "origin"]), remote);
+        // Its branch, pull request, link and commits stay as they were: nothing renamed or rewritten.
+        assert.strictEqual(blocked.branch, legacy);
+        assert.deepStrictEqual(blocked.pullRequest, { ...recorded, headBranch: legacy });
+        assert.strictEqual(yield* git(worktreePath, ["branch", "--show-current"]), legacy);
+        assert.strictEqual(yield* git(worktreePath, ["rev-parse", "HEAD"]), fixed);
+        const link = yield* linkOf(author, fakePullRequest.number);
+        assert.strictEqual(link.url, linked.url);
+        assert.strictEqual(link.source, linked.source);
+        assert.deepStrictEqual((yield* attemptsOf(deliveryId)).at(-1), ["pr", "blocked"]);
+      }),
+    ),
+  );
+
+  it.live("pushes nothing once where its push goes changes after the gate, until restored", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const { deliveryId, threadId: author, worktreePath, state } = yield* openSingle(world);
+        const published = yield* git(worktreePath, ["rev-parse", "@{upstream}"]);
+        const origin = yield* git(worktreePath, ["remote", "get-url", "origin"]);
+        const elsewhere = `${origin.slice(0, -"origin.git".length)}elsewhere.git`;
+        yield* git(worktreePath, ["init", "--bare", elsewhere]);
+        const remote = yield* git(worktreePath, ["ls-remote", "origin"]);
+        const linked = yield* linkOf(author, fakePullRequest.number);
+
+        // The round's push goes through Git's own push, bound to what the gate judged. Inside its
+        // action, after the gate read origin, the push URL moves: the remote and branch stay.
+        world.publishing.throughDriver = true;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        world.publishHooks.push(
+          git(worktreePath, ["remote", "set-url", "--push", "origin", elsewhere]).pipe(
+            Effect.provideService(GitVcsDriver.GitVcsDriver, driver),
+            Effect.orDie,
+            Effect.asVoid,
+          ),
+        );
+        const wakeRun = yield* wakeStarted(author, fakePullRequest.number);
+        yield* authorCommits(worktreePath, "fix: write the header row", "export const x = 2;\n");
+        const fixed = yield* git(worktreePath, ["rev-parse", "HEAD"]);
+        yield* world.endRun(wakeRun, "completed");
+        yield* reviewPasses(world, deliveryId);
+
+        const blocked = yield* stateOf(deliveryId);
+        assert.strictEqual(blocked.status, "blocked");
+        assert.strictEqual(blocked.stage, "pr");
+        assert.deepStrictEqual(blocked.block, {
+          reason: "effect_failed",
+          effect: { id: blocked.effectsIssued, type: "open_pr" },
+          detail: CHANGED,
+        });
+        assert.notInclude(JSON.stringify(blocked.block), elsewhere);
+        // Nothing went out, there or to origin, and no new pull request was asked for.
+        assert.deepStrictEqual(
+          world.pullRequestCalls.map(({ input }) => input.action),
+          ["create_pr", "push"],
+        );
+        assert.strictEqual(yield* git(worktreePath, ["ls-remote", elsewhere]), "");
+        assert.strictEqual(yield* git(worktreePath, ["ls-remote", "origin"]), remote);
+        assert.strictEqual(yield* git(worktreePath, ["rev-parse", "@{upstream}"]), published);
+        // Its pull request, link, branch and commits stay as they were.
+        assert.deepStrictEqual(blocked.pullRequest, state.pullRequest);
+        assert.strictEqual(blocked.branch, state.branch);
+        assert.strictEqual((yield* linkOf(author, fakePullRequest.number)).url, linked.url);
+        assert.strictEqual(yield* git(worktreePath, ["rev-parse", "HEAD"]), fixed);
+        assert.deepStrictEqual((yield* attemptsOf(deliveryId)).at(-1), ["pr", "blocked"]);
+
+        // Restored, a resume judges origin again and pushes the approved commit to the same pull
+        // request.
+        yield* git(worktreePath, ["config", "--unset", "remote.origin.pushurl"]);
+        const factory = yield* service;
+        yield* factory.resume(deliveryId).pipe(Effect.orDie);
+        yield* drainFactory;
+        const open = yield* stateOf(deliveryId);
+        assert.strictEqual(open.status, "pr_open");
+        assert.deepStrictEqual(open.pullRequest, state.pullRequest);
+        assert.deepStrictEqual(
+          world.pullRequestCalls.map(({ input }) => input.action),
+          ["create_pr", "push", "push"],
+        );
+        assert.strictEqual(yield* git(worktreePath, ["rev-parse", "@{upstream}"]), fixed);
+        assert.strictEqual(yield* git(worktreePath, ["ls-remote", elsewhere]), "");
+      }),
+    ),
+  );
+
+  it.live("pushes nothing where Git cannot hold its push to the URLs judged, until it can", () =>
+    withProject(verifyCommands.passes, (world) =>
+      Effect.gen(function* () {
+        const { deliveryId, threadId: author, worktreePath, state } = yield* openSingle(world);
+        const published = yield* git(worktreePath, ["rev-parse", "@{upstream}"]);
+        const origin = yield* git(worktreePath, ["remote", "get-url", "origin"]);
+        const before = yield* Effect.all([
+          git(worktreePath, ["ls-remote", "origin"]),
+          git(worktreePath, ["config", "--get-regexp", "^branch\\."]),
+        ]);
+        const linked = yield* linkOf(author, fakePullRequest.number);
+
+        // The round's push goes through Git's own push, bound to what the gate judged, on a Git
+        // that takes per-command settings, so the gate reads origin as ever, but cannot clear a
+        // remote's URLs, so the push cannot be held to the ones the gate judged.
+        world.publishing.throughDriver = true;
+        world.gitProcesses.before = appendingRemoteUrls;
+        const wakeRun = yield* wakeStarted(author, fakePullRequest.number);
+        yield* authorCommits(worktreePath, "fix: write the header row", "export const x = 2;\n");
+        const fixed = yield* git(worktreePath, ["rev-parse", "HEAD"]);
+        yield* world.endRun(wakeRun, "completed");
+        yield* reviewPasses(world, deliveryId);
+
+        const blocked = yield* stateOf(deliveryId);
+        assert.strictEqual(blocked.status, "blocked");
+        assert.strictEqual(blocked.stage, "pr");
+        assert.deepStrictEqual(blocked.block, {
+          reason: "effect_failed",
+          effect: { id: blocked.effectsIssued, type: "open_pr" },
+          detail: UNPINNABLE,
+        });
+        // Only that fixed text: no Git output, URL or spelling the push was pinned with.
+        const shown = JSON.stringify(blocked.block);
+        for (const hidden of [origin, "fd-pinned-url", "fd-test-empty-remote-url", "GitCommand"]) {
+          assert.notInclude(shown, hidden);
+        }
+        // Nothing went out, no new pull request was asked for, and no ref or upstream moved.
+        assert.deepStrictEqual(
+          world.pullRequestCalls.map(({ input }) => input.action),
+          ["create_pr", "push"],
+        );
+        assert.deepStrictEqual(
+          yield* Effect.all([
+            git(worktreePath, ["ls-remote", "origin"]),
+            git(worktreePath, ["config", "--get-regexp", "^branch\\."]),
+          ]),
+          before,
+        );
+        assert.strictEqual(yield* git(worktreePath, ["rev-parse", "@{upstream}"]), published);
+        // Its pull request, link, branch and commits stay as they were.
+        assert.deepStrictEqual(blocked.pullRequest, state.pullRequest);
+        assert.strictEqual(blocked.branch, state.branch);
+        assert.strictEqual((yield* linkOf(author, fakePullRequest.number)).url, linked.url);
+        assert.strictEqual(yield* git(worktreePath, ["rev-parse", "HEAD"]), fixed);
+        assert.deepStrictEqual((yield* attemptsOf(deliveryId)).at(-1), ["pr", "blocked"]);
+
+        // On a Git that can, a resume judges origin again and pushes the approved commit to the
+        // same pull request.
+        world.gitProcesses.before = undefined;
+        const factory = yield* service;
+        yield* factory.resume(deliveryId).pipe(Effect.orDie);
+        yield* drainFactory;
+        const open = yield* stateOf(deliveryId);
+        assert.strictEqual(open.status, "pr_open");
+        assert.deepStrictEqual(open.pullRequest, state.pullRequest);
+        assert.deepStrictEqual(
+          world.pullRequestCalls.map(({ input }) => input.action),
+          ["create_pr", "push", "push"],
+        );
+        assert.strictEqual(yield* git(worktreePath, ["rev-parse", "@{upstream}"]), fixed);
+      }),
+    ),
+  );
+
   it.live("blocks on a commit made during the round's review", () =>
     withProject(verifyCommands.passes, (world) =>
       Effect.gen(function* () {

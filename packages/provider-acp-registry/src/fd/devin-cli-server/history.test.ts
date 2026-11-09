@@ -52,11 +52,11 @@ const setup = Effect.gen(function* () {
   yield* sql.unsafe(
     "CREATE TABLE message_nodes (row_id INTEGER PRIMARY KEY, session_id TEXT, created_at INTEGER, chat_message TEXT)",
   );
-  const insert = (row: number, message: unknown, session = "root") =>
+  const insert = (row: number, message: unknown, session = "root", storedAtMs = sinceMs) =>
     sql.unsafe("INSERT INTO message_nodes VALUES (?, ?, ?, ?)", [
       row,
       session,
-      sinceMs / 1000,
+      storedAtMs / 1000,
       typeof message === "string" ? message : JSON.stringify(message),
     ]);
   return { root, dir, filename, sql, insert };
@@ -128,6 +128,21 @@ describe("local CLI usage history", () => {
           ))[0]?.total,
         ).toBe(10);
       }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("skips nodes stored well before the window", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      // Its own timestamp is in the window; only the store time places it before.
+      yield* fixture.insert(1, message("stale"), "root", sinceMs - 2 * 86_400_000);
+      yield* fixture.insert(2, message("edge"), "root", sinceMs - 3_600_000);
+      yield* fixture.insert(3, message("current"));
+      const records = (yield* scan(fixture.root))[0]?.files?.[0]?.records ?? [];
+      expect(records.map((record) => record.dedupeKey)).toEqual([
+        "devin:request-edge",
+        "devin:request-current",
+      ]);
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   it.effect("keeps native model/time fallbacks and rejects invalid or empty token counts", () =>

@@ -287,6 +287,51 @@ describe("DesktopAppIdentity", () => {
     );
   });
 
+  it.effect.each([
+    { kind: "a development build", appVersion: "0.0.45-dev.20261103.1" },
+    { kind: "an earlier UX preview", appVersion: "0.0.45-uxpreview.20261102.1" },
+  ])(
+    "names $kind Foredeck, with its exact version and the full commit its build embedded",
+    ({ appVersion }) => {
+      const calls: ElectronAppCalls = {
+        setAboutPanelOptions: [],
+        setDockIcon: [],
+        setName: [],
+      };
+      const commit = "5c73e2b8d6003767fced1fe2ae265757aabfdadd";
+
+      return withIdentity(
+        Effect.gen(function* () {
+          const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+          yield* identity.configure;
+          // The bare product name, with no stage label added.
+          assert.deepEqual(calls.setName, ["Foredeck"]);
+          // RFC 9110's token grammar, after Electron removes ASCII spaces.
+          assert.match(calls.setName[0]!.replaceAll(" ", ""), /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/);
+          assert.deepEqual(calls.setAboutPanelOptions[0], {
+            applicationName: "Foredeck",
+            applicationVersion: appVersion,
+            // Not the launch's override: the build's own commit, whole.
+            version: commit,
+          });
+          assert.equal(
+            yield* identity.resolveUserDataPath,
+            "/evidence/desktop-home/userdata/desktop-profile",
+          );
+        }),
+        {
+          calls,
+          environment: {
+            appVersion,
+            uxPreviewHome: "/evidence/desktop-home",
+            env: { T3CODE_COMMIT_HASH: "0123456789abcdef" },
+          },
+          packageJson: JSON.stringify({ t3codeCommitHash: commit.toUpperCase() }),
+        },
+      );
+    },
+  );
+
   it.effect("sets the dock icon only when running unpackaged", () => {
     const calls: ElectronAppCalls = {
       setAboutPanelOptions: [],

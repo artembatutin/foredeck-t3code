@@ -1,5 +1,8 @@
 import { describe, expect, it } from "@effect/vitest";
-import { normalizeDevinUsage, reportedCreditCost } from "./usage.ts";
+import type { AcpAdapterV2ExtensionContext } from "@t3tools/provider-acp/server/adapter";
+import * as Effect from "effect/Effect";
+import type * as Schema from "effect/Schema";
+import { makeDevinUsage, normalizeDevinUsage, reportedCreditCost } from "./usage.ts";
 
 describe("native usage units", () => {
   it("uses the labelled credit metric without converting differently scaled integers", () => {
@@ -51,9 +54,63 @@ describe("native usage units", () => {
     ).toEqual({
       usedTokens: 14076,
       maxTokens: 200000,
+      compactsAutomatically: true,
       lastInputTokens: 14074,
       lastOutputTokens: 2,
       lastCachedInputTokens: 704,
     });
   });
+  it.effect(
+    "keeps the last turn's stats through later context updates until a session cost arrives",
+    () =>
+      Effect.gen(function* () {
+        const usage = makeDevinUsage();
+        const update = (_meta: { readonly [key: string]: Schema.Json }) =>
+          usage.normalizeUsage(
+            {
+              sessionId: "s",
+              update: { sessionUpdate: "usage_update", used: 900, size: 1000, _meta },
+            },
+            { usedTokens: 900, maxTokens: 1000 },
+          );
+        const reported: Array<unknown> = [];
+        let stopped:
+          | ((notice: { sessionId: string; stats: unknown }) => Effect.Effect<void>)
+          | undefined;
+        yield* usage.registerExtensions({
+          runtime: {
+            handleExtNotification: (_method: string, _schema: unknown, handler: typeof stopped) =>
+              Effect.sync(() => {
+                stopped = handler;
+              }),
+          },
+          reportUsage: (notice: unknown) => Effect.sync(() => void reported.push(notice)),
+        } as unknown as AcpAdapterV2ExtensionContext);
+        yield* stopped!({
+          sessionId: "s",
+          stats: {
+            toolCalls: 3,
+            totalTimeMs: 1200,
+            responseDimensions: [
+              { uid: "credits", kind: { type: "cumulativeMetric", value: 2, tail: " credits" } },
+            ],
+          },
+        });
+        expect(reported).toHaveLength(1);
+        expect(update({ "cognition.ai/inputTokens": 10 })).toMatchObject({
+          usedTokens: 900,
+          lastInputTokens: 10,
+          toolUses: 3,
+          durationMs: 1200,
+          cost: { amount: 2, currency: "credits", scope: "turn" },
+        });
+        expect(
+          update({
+            "cognition.ai/responseDimensions": [
+              { uid: "credits", kind: { type: "cumulativeMetric", value: 7, tail: " credits" } },
+            ],
+          }).cost,
+        ).toEqual({ amount: 7, currency: "credits", scope: "session" });
+      }),
+  );
 });

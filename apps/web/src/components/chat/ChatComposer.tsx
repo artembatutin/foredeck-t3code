@@ -285,6 +285,11 @@ import {
   ComposerCommandMenu,
   composerSuggestionOptionId,
 } from "./ComposerCommandMenu";
+import {
+  composerRuntimeModeRefusal,
+  pendingAnswerRefusal,
+  runtimeModeChoiceDescriptions,
+} from "../../fd/approvals";
 import { ComposerPendingApprovalActions } from "./ComposerPendingApprovalActions";
 import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
 import { ComposerImageThumbnail } from "./ComposerImageThumbnail";
@@ -2233,10 +2238,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const selectedProvider: ProviderDriverKind =
     selectedProviderEntry?.driverKind ?? requestedDriverKind;
   const supportedRuntimeModes = selectedProviderEntry?.snapshot.supportedRuntimeModes;
-  const compatibleRuntimeModeOptions =
-    supportedRuntimeModes && supportedRuntimeModes.length > 0
-      ? runtimeModeOptions.filter((option) => supportedRuntimeModes.includes(option.mode))
-      : runtimeModeOptions;
+  const compatibleRuntimeModeOptions = useMemo(
+    () =>
+      runtimeModeChoiceDescriptions(
+        supportedRuntimeModes && supportedRuntimeModes.length > 0
+          ? runtimeModeOptions.filter((option) => supportedRuntimeModes.includes(option.mode))
+          : runtimeModeOptions,
+        selectedProvider,
+      ),
+    [selectedProvider, supportedRuntimeModes],
+  );
   // Older threads can contain a mode their current provider no longer offers.
   // Display the provider's first supported mode, which is also its safe legacy
   // fallback, without mutating persisted state until the user makes a choice.
@@ -2255,18 +2266,35 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     projectModelSelection: activeProjectDefaultModelSelection,
     settings,
   });
+  // Several models send per provider, checked as ChatView sends each one.
+  const runtimeModeHostRefusal =
+    multipleModelSelections === null
+      ? composerRuntimeModeRefusal({
+          provider: selectedProviderEntry?.snapshot,
+          runtimeMode: compatibleRuntimeMode,
+        })
+      : null;
+  // Answering a message-capable question starts a turn, on the thread's own provider and mode.
+  const pendingAnswerHostRefusal = pendingAnswerRefusal({
+    responseCapability: pendingUserInputs[0]?.responseCapability,
+    provider: selectedProviderEntry?.snapshot,
+    threadMode: runtimeMode,
+  });
   const providerSendBlockReason =
     repositoryExecutionBlockReason({
       isMultiRepository: multiRepository === true,
       serverProtocolVersion: repositoryProtocol,
       provider: selectedProviderEntry?.snapshot,
       runtimeMode,
-    }) ?? getAntigravitySendBlockReason(selectedProviderEntry?.snapshot, selectedModel);
+    }) ??
+    getAntigravitySendBlockReason(selectedProviderEntry?.snapshot, selectedModel) ??
+    runtimeModeHostRefusal?.summary ??
+    null;
   const sendDisabledReason =
     externalSendDisabledReason ??
     (multipleModelSelections?.length === 0 ? "Select at least one model." : null) ??
     (activePendingProgress
-      ? attachmentBlockReason
+      ? (attachmentBlockReason ?? pendingAnswerHostRefusal?.summary ?? null)
       : (attachmentBlockReason ??
         (multipleModelSelections === null ? providerSendBlockReason : null)));
   const isSendDisabled = sendDisabledReason !== null;
@@ -5825,9 +5853,40 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         content: activityStackContent,
       }
     : null;
-  const bannerStackItems = activityStackItem
-    ? [activityStackItem, ...props.bannerItems]
-    : props.bannerItems;
+  const shownHostRefusal = runtimeModeHostRefusal ?? pendingAnswerHostRefusal;
+  const hostRefusalStackItem: ComposerBannerStackItem | null = shownHostRefusal
+    ? {
+        id: "composer-runtime-mode-refusal",
+        variant: "warning",
+        priority: "urgent",
+        icon: <ShieldIcon />,
+        title: shownHostRefusal.reason,
+        description:
+          shownHostRefusal.alternatives.length === 0
+            ? "It leaves no other mode this provider offers. Nothing was sent, and the mode is unchanged."
+            : `Nothing was sent, and the mode is unchanged. ${shownHostRefusal.alternatives
+                .map(({ label, meaning }) => `${label}: ${meaning}`)
+                .join(" ")}`,
+        actions: shownHostRefusal.alternatives.map(({ mode, label }) => (
+          <Button
+            key={mode}
+            size="xs"
+            variant="outline"
+            onClick={() => handleRuntimeModeChange(mode)}
+          >
+            Use {label}
+          </Button>
+        )),
+      }
+    : null;
+  const bannerStackItems =
+    activityStackItem || hostRefusalStackItem
+      ? [
+          ...(activityStackItem ? [activityStackItem] : []),
+          ...(hostRefusalStackItem ? [hostRefusalStackItem] : []),
+          ...props.bannerItems,
+        ]
+      : props.bannerItems;
   useEffect(() => {
     if (activeTasksProgress === null || activeTaskSteps === null) {
       setIsTasksDrawerOpen(false);
@@ -6988,6 +7047,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       <ComposerPendingApprovalPanel
                         approval={activePendingApproval}
                         pendingCount={pendingApprovals.length}
+                        runtimeMode={compatibleRuntimeMode}
                       />
                     </ComposerBanner.Content>
                     <ComposerBanner.Actions>
@@ -7009,6 +7069,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     cwd={gitCwd ?? undefined}
                     threadRef={routeThreadRef}
                     disabled={!canOperateThread}
+                    turn={{ provider: selectedProviderEntry?.snapshot, threadMode: runtimeMode }}
                     respondingRequestIds={
                       activePendingIsResponding && activePendingUserInput
                         ? [...respondingRequestIds, activePendingUserInput.requestId]
@@ -7032,6 +7093,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       cwd={gitCwd ?? undefined}
                       threadRef={routeThreadRef}
                       disabled={!canOperateThread}
+                      turn={{ provider: selectedProviderEntry?.snapshot, threadMode: runtimeMode }}
                       respondingRequestIds={
                         activePendingIsResponding && activePendingUserInput
                           ? [...respondingRequestIds, activePendingUserInput.requestId]

@@ -34,6 +34,9 @@ export const StoredFactoryStageRun = Schema.Struct({
 });
 export type StoredFactoryStageRun = typeof StoredFactoryStageRun.Type;
 
+/** How many attempts of each stage a delivery made over its whole history; none are absent. */
+export type FactoryStageAttempts = Readonly<Partial<Record<FactoryStageName, number>>>;
+
 /**
  * Stage attempts per delivery. Rows are only appended and then finished once; a thread has at
  * most one active attempt, so a terminal run on it names the delivery it belongs to.
@@ -87,6 +90,10 @@ export class FactoryStageRunStore extends Context.Service<
       ReadonlyMap<FactoryDeliveryId, ReadonlyArray<StoredFactoryStageRun>>,
       FactoryStoreError
     >;
+    /** Each delivery's attempts per stage, over every attempt the snapshot's window leaves out. */
+    readonly attemptTotals: (
+      deliveryIds: ReadonlyArray<FactoryDeliveryId>,
+    ) => Effect.Effect<ReadonlyMap<FactoryDeliveryId, FactoryStageAttempts>, FactoryStoreError>;
   }
 >()("t3/fd/factory/persistence/FactoryStageRunStore") {}
 
@@ -185,6 +192,23 @@ const make = Effect.gen(function* () {
   });
 
   // Both write the attempt read in the same transaction.
+  // An attempt's number counts its stage's attempts, and the primary key answers this from its
+  // index however long the history.
+  const selectAttemptTotals = SqlSchema.findAll({
+    Request: Schema.Array(FactoryDeliveryId),
+    Result: Schema.Struct({
+      deliveryId: FactoryDeliveryId,
+      stage: FactoryStageName,
+      attempts: PositiveInt,
+    }),
+    execute: (deliveryIds) => sql`
+      SELECT delivery_id AS "deliveryId", stage, MAX(attempt) AS attempts
+      FROM fd_factory_stage_runs
+      WHERE delivery_id IN (SELECT value FROM json_each(${JSON.stringify(deliveryIds)}))
+      GROUP BY delivery_id, stage
+    `,
+  });
+
   const writeRun = SqlSchema.void({
     Request: StoredFactoryStageRun,
     execute: (row) => sql`
@@ -303,6 +327,17 @@ const make = Effect.gen(function* () {
           return byDelivery;
         }),
         Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.listNewestByDeliveries")),
+      ),
+    attemptTotals: (deliveryIds) =>
+      (deliveryIds.length === 0 ? Effect.succeed([]) : selectAttemptTotals(deliveryIds)).pipe(
+        Effect.map((rows) => {
+          const totals = new Map<FactoryDeliveryId, Partial<Record<FactoryStageName, number>>>();
+          for (const { deliveryId, stage, attempts } of rows) {
+            totals.set(deliveryId, { ...totals.get(deliveryId), [stage]: attempts });
+          }
+          return totals;
+        }),
+        Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.attemptTotals")),
       ),
   });
 });

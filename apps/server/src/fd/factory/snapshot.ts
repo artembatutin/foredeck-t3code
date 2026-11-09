@@ -2,6 +2,7 @@ import type { ThreadId } from "@t3tools/contracts";
 import {
   FACTORY_SNAPSHOT_STAGE_RUNS_MAX,
   type FactoryDelivery,
+  type FactoryDeliveryAllowance,
   type FactoryPlan,
   type FactoryReviewSummary,
   type FactoryStageKind,
@@ -14,7 +15,7 @@ import {
 import type { FactoryDeliveryWithRuns } from "./FactoryService.ts";
 import type { StoredFactoryStageRun } from "./persistence/FactoryStageRunStore.ts";
 import { standardStages } from "./pipeline/definitions.ts";
-import { acceptedPlan } from "./pipeline/state.ts";
+import { acceptedPlan, FIX_COMMIT_TURNS, isAdvancing } from "./pipeline/state.ts";
 import type {
   FactoryAcceptedPlan,
   FactoryAcceptedReview,
@@ -109,6 +110,12 @@ const stageRunSummary = (
 };
 
 const NEEDS_YOU_MAX_LENGTH = 280;
+
+const ALLOWANCES = {
+  fix: "fix round",
+  review: "review round",
+  fix_commit: "fix-commit turn",
+} as const;
 
 const RUN_ENDINGS = {
   failed: "failed",
@@ -205,6 +212,10 @@ const blockReason = (state: FactoryDeliveryState, block: FactoryBlock): string =
       return `The worktree no longer holds the verified, reviewed commit: ${listed(block.differences.map((difference) => RECORD_DIFFERENCES[difference]))}.`;
     case "watch_ended":
       return "The pull request's watch ended, so Factory no longer follows its feedback.";
+    case "allowance_exhausted":
+      return `This delivery used ${block.used} of the ${block.approved} ${ALLOWANCES[block.allowance]}${block.approved === 1 ? "" : "s"} its owner approved. Resuming adds none; more takes a fresh review.`;
+    case "reviewed_refused":
+      return block.detail;
   }
 };
 
@@ -237,6 +248,47 @@ export const needsYou = (state: FactoryDeliveryState): string | undefined => {
 const awaitsCapacity = ({ awaiting, admissionWait }: FactoryDeliveryState) =>
   awaiting?.type === "effect" && admissionWait?.effectId === awaiting.effect.id;
 
+const count = (used: number, limit: number) => ({
+  used,
+  limit,
+  remaining: Math.max(0, limit - used),
+});
+
+/** What the delivery spent of what it may, from the counts its engine charges and blocks on. */
+const allowanceOf = ({
+  state,
+  stageAttempts,
+}: FactoryDeliveryWithRuns): FactoryDeliveryAllowance => {
+  const reviewed = state.reviewedExecution?.limits;
+  const { maxFixRounds, maxReviewRounds } = reviewed ?? state.limits;
+  // A parent has no repair round.
+  const parent = state.kind === "parent";
+  return {
+    counted: reviewed === undefined ? "since_resume" : "whole_delivery",
+    verificationFixes: parent ? null : count(state.rounds.fix, maxFixRounds),
+    reviewFollowUps: parent ? null : count(state.rounds.review, maxReviewRounds),
+    fixCommitTurns: count(state.fixCommitTurns, reviewed?.maxFixCommitTurns ?? FIX_COMMIT_TURNS),
+    // From the whole history, however little of it the timeline's window holds. A parent's reviews
+    // are its integrate stage's attempts, and a reviewer that never submitted one still counts.
+    attempts: {
+      verify: stageAttempts.verify ?? 0,
+      review: (stageAttempts.review ?? 0) + (stageAttempts.integrate ?? 0),
+    },
+  };
+};
+
+/** The pull request as clients read it, on the thread whose checkout holds its changes. */
+const pullRequestOf = ({ pullRequest, pullRequestThread, threads }: FactoryDeliveryState) => {
+  if (pullRequest === null) return undefined;
+  const threadId = pullRequestThread ?? threads.author;
+  return {
+    number: pullRequest.number,
+    url: pullRequest.url,
+    ...(threadId === undefined ? {} : { threadId }),
+    ...(pullRequest.outcome === undefined ? {} : { outcome: pullRequest.outcome }),
+  };
+};
+
 /**
  * A delivery as clients see it: its progress, threads and the summaries of its receipts, reviews
  * and newest stage attempts, never their logs or evidence paths. Receipts and reviews carry their
@@ -244,11 +296,14 @@ const awaitsCapacity = ({ awaiting, admissionWait }: FactoryDeliveryState) =>
  * kept when they were accepted. The current plan round's plan is carried while one is recorded,
  * so a parent waiting at the plan gate shows the plan it waits on. `needsYou` is set only while it
  * waits at the plan gate or is blocked, and `capacityWait` only while an awaited effect is marked.
+ * What a listing read beside it, its item's source, queue priority and pending actions, and what a
+ * read of this one delivery found its roles running on, are carried when present.
  */
 export const toFactoryDelivery = (delivery: FactoryDeliveryWithRuns): FactoryDelivery => {
   const { state } = delivery;
   const reason = needsYou(state);
   const plan = acceptedPlan(state);
+  const pullRequest = pullRequestOf(state);
   const receipts = state.receipts.map(receiptSummary);
   const reviews = state.reviews.map(reviewSummary);
   const evidence = { receipts: numbersOf(receipts), reviews: numbersOf(reviews) };
@@ -274,6 +329,13 @@ export const toFactoryDelivery = (delivery: FactoryDeliveryWithRuns): FactoryDel
     ...(plan === undefined ? {} : { plan: planSnapshot(plan) }),
     ...(reason === undefined ? {} : { needsYou: reason }),
     ...(awaitsCapacity(state) ? { capacityWait: true } : {}),
+    allowance: allowanceOf(delivery),
+    ...(pullRequest === undefined ? {} : { pullRequest }),
+    proceeding: isAdvancing(state),
+    ...(delivery.source === undefined ? {} : { source: delivery.source }),
+    ...(delivery.queuePriority === undefined ? {} : { queuePriority: delivery.queuePriority }),
+    ...(delivery.pendingActions === undefined ? {} : { pendingActions: delivery.pendingActions }),
+    ...(delivery.execution === undefined ? {} : { execution: delivery.execution }),
     createdAt: delivery.createdAt,
     updatedAt: delivery.updatedAt,
   };

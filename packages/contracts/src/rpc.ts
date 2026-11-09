@@ -1,4 +1,13 @@
-import { AssistantOverview, AssistantOperationError, SpokenReply } from "./fd/assistant/index.ts";
+import {
+  AssistantOverview,
+  AssistantOperationError,
+  AssistantReviewGetInput,
+  AssistantReviewReviseInput,
+  AssistantReviewSnapshot,
+  AssistantReviewStarted,
+  AssistantReviewStartInput,
+  SpokenReply,
+} from "./fd/assistant/index.ts";
 import { WORK_WS_METHODS, WorkRpcs } from "./fd/work-management/index.ts";
 import { FACTORY_WS_METHODS, FactoryRpcs } from "./fd/factory/index.ts";
 import { RepositoryTargetError } from "./project.ts";
@@ -485,6 +494,9 @@ export const WS_METHODS = {
   assistantOverview: "assistant.overview",
   assistantControl: "assistant.control",
   assistantSpeech: "assistant.speech",
+  assistantReviewGet: "assistant.review.get",
+  assistantReviewRevise: "assistant.review.revise",
+  assistantReviewStart: "assistant.review.start",
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
   serverRefreshProviders: "server.refreshProviders",
@@ -638,6 +650,29 @@ const WsAssistantSpeechRpc = Rpc.make(WS_METHODS.assistantSpeech, {
   success: SpokenReply,
   error: Schema.Union([AssistantOperationError, EnvironmentAuthorizationError]),
 });
+
+const WsAssistantReviewGetRpc = Rpc.make(WS_METHODS.assistantReviewGet, {
+  payload: AssistantReviewGetInput,
+  success: AssistantReviewSnapshot,
+  error: Schema.Union([AssistantOperationError, EnvironmentAuthorizationError]),
+});
+const WsAssistantReviewReviseRpc = Rpc.make(WS_METHODS.assistantReviewRevise, {
+  payload: AssistantReviewReviseInput,
+  success: Schema.Void,
+  error: Schema.Union([AssistantOperationError, EnvironmentAuthorizationError]),
+});
+const WsAssistantReviewStartRpc = Rpc.make(WS_METHODS.assistantReviewStart, {
+  payload: AssistantReviewStartInput,
+  success: AssistantReviewStarted,
+  error: Schema.Union([AssistantOperationError, EnvironmentAuthorizationError]),
+});
+
+/** The owner's review, which the server handles apart from the rest of `WsRpcGroup`. */
+export const AssistantReviewRpcs = [
+  WsAssistantReviewGetRpc,
+  WsAssistantReviewReviseRpc,
+  WsAssistantReviewStartRpc,
+] as const;
 
 const WsServerGetConfigRpc = Rpc.make(WS_METHODS.serverGetConfig, {
   payload: Schema.Struct({}),
@@ -1970,6 +2005,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsAssistantOverviewRpc,
   WsAssistantControlRpc,
   WsAssistantSpeechRpc,
+  ...AssistantReviewRpcs,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsProviderConsumeResetCreditRpc,

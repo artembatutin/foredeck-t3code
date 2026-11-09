@@ -1,9 +1,11 @@
 import { RequestActionButton } from "./RequestActionButton";
-import type {
-  ProviderApprovalDecision,
-  ProviderApprovalOption,
-  RuntimeRequestId,
-} from "@t3tools/contracts";
+import type { ProviderApprovalDecision, RuntimeMode, RuntimeRequestId } from "@t3tools/contracts";
+import {
+  approvalChoiceNote,
+  approvalChoices,
+  approvalOptionLabel,
+  pendingApprovalReason,
+} from "@t3tools/shared/fd/approvals";
 import { View } from "react-native";
 
 import { AppText as Text } from "../../components/AppText";
@@ -13,21 +15,16 @@ export interface PendingApprovalCardProps {
   readonly canOperateThread: boolean;
   readonly approval: PendingApproval;
   readonly respondingApprovalId: RuntimeRequestId | null;
+  /** The thread's mode, which says what this approval was not already covered by. */
+  readonly runtimeMode: RuntimeMode | undefined;
   readonly onRespond: (
     requestId: RuntimeRequestId,
     decision: ProviderApprovalDecision,
   ) => Promise<unknown>;
 }
 
-const DEFAULT_APPROVAL_OPTIONS: ReadonlyArray<ProviderApprovalOption> = [
-  { decision: "accept", label: "Allow once" },
-  { decision: "acceptForSession", label: "Allow session" },
-  { decision: "decline", label: "Decline" },
-];
-
 export function PendingApprovalCard(props: PendingApprovalCardProps) {
-  const options: ReadonlyArray<ProviderApprovalOption> =
-    props.approval.options ?? DEFAULT_APPROVAL_OPTIONS;
+  const options = approvalChoices(props.approval.options);
   const warning = options.find((option) => option.warning)?.warning;
   // Opaque for the same reason as PendingUserInputCard: nothing blurs the feed
   // behind this card, so a translucent surface bleeds messages through it.
@@ -46,6 +43,15 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
           {props.approval.detail}
         </Text>
       ) : null}
+      <Text className="font-sans text-xs leading-normal text-foreground-secondary">
+        {pendingApprovalReason({
+          kind: props.approval.requestKind,
+          runtimeMode: props.runtimeMode,
+          reason: props.approval.reason,
+          detail: props.approval.detail,
+        })}{" "}
+        {approvalChoiceNote(options)}
+      </Text>
       {!canRespond ? (
         <Text className="font-sans text-sm leading-5 text-foreground-muted">
           The provider process for this request is no longer available. Interrupt or restart the run
@@ -59,7 +65,7 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
         {options.map((option) => (
           <RequestActionButton
             key={option.decision}
-            label={option.label}
+            label={approvalOptionLabel(option)}
             tone={
               option.decision === "accept"
                 ? "primary"

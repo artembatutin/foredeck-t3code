@@ -1,6 +1,8 @@
 import { assert, it } from "@effect/vitest";
 import {
+  CommandId,
   ORCHESTRATION_PROTOCOL_VERSION,
+  OrchestrationV2DispatchCommandError,
   ProjectId,
   ThreadId,
   type OrchestrationV2StoredEvent,
@@ -19,11 +21,13 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/process";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
 import * as OrchestrationEventStore from "./persistence/OrchestrationEventStore.ts";
@@ -32,6 +36,7 @@ import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ProjectEnrichment from "./project/ProjectEnrichmentService.ts";
 import * as ProjectService from "./project/ProjectService.ts";
 import {
+  dispatchRejectionField,
   hasCompatibleOrchestrationProtocol,
   resolveAvailableEditorsForConfig,
   shouldUseBoundedThreadSnapshot,
@@ -39,6 +44,9 @@ import {
   subscribeOrchestrationV2Thread,
   withLateEditorConfig,
 } from "./ws.ts";
+
+const decodeDispatchError = Schema.decodeUnknownSync(OrchestrationV2DispatchCommandError);
+const encodeDispatchError = Schema.encodeUnknownSync(OrchestrationV2DispatchCommandError);
 
 it("accepts only the current orchestration protocol before websocket RPC setup", () => {
   assert.isTrue(
@@ -51,6 +59,47 @@ it("accepts only the current orchestration protocol before websocket RPC setup",
     hasCompatibleOrchestrationProtocol(
       new URL(`https://host.test/ws?orchestrationProtocol=${ORCHESTRATION_PROTOCOL_VERSION - 1}`),
     ),
+  );
+});
+
+it("tells a client over the wire when its command id holds a rejected receipt", () => {
+  const commandId = CommandId.make("create:thread");
+  const overTheWire = (cause: { readonly _tag: string }) =>
+    decodeDispatchError(
+      encodeDispatchError(
+        new OrchestrationV2DispatchCommandError({
+          commandId,
+          commandType: "thread.create",
+          message: "Failed to dispatch orchestration V2 command",
+          ...dispatchRejectionField(cause),
+        }),
+      ),
+    );
+
+  assert.strictEqual(
+    overTheWire(
+      new Orchestrator.OrchestratorCommandPreviouslyRejectedError({
+        commandId,
+        commandType: "thread.create",
+        detail: "Project unavailable.",
+      }),
+    ).previouslyRejected,
+    true,
+  );
+  // A first rejection or any other failure says nothing of the id, so a retry keeps it.
+  assert.isUndefined(
+    overTheWire(
+      new Orchestrator.OrchestratorDispatchError({ commandId, commandType: "thread.create" }),
+    ).previouslyRejected,
+  );
+  // What an older server sends still decodes.
+  assert.isUndefined(
+    decodeDispatchError({
+      _tag: "OrchestrationV2DispatchCommandError",
+      commandId,
+      commandType: "thread.create",
+      message: "Failed to dispatch orchestration V2 command",
+    }).previouslyRejected,
   );
 });
 

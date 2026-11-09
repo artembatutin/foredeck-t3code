@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useAtomValue } from "@effect/atom-react";
+import type { FactoryItemFact } from "@t3tools/client-runtime/fd/factory";
+import { workItemLinkTarget } from "@t3tools/client-runtime/fd/work-management";
 import type { AssistantOverview, ScopedThreadRef, ThreadId } from "@t3tools/contracts";
 import {
   BriefcaseBusinessIcon,
@@ -23,9 +25,13 @@ import {
   factoryAssignmentRow,
   ideaAssignment,
   ideaCaptureRow,
+  ideaFacts,
+  portfolioRowTitle,
   type WorkItemTarget,
 } from "./workNavigation";
 import { readOverview, controlAssignment } from "./commands";
+import { ReviewStartCard, type ReviewTarget } from "./ReviewStartCard";
+import { PendingActionsList } from "../approvals";
 
 const statusLabels: Record<string, string> = {
   draft: "Draft",
@@ -41,6 +47,20 @@ const statusLabels: Record<string, string> = {
   completed: "Completed",
   cancelled: "Cancelled",
 };
+
+/** A row's facts, each labelled as itself. */
+function ItemFacts({ facts }: { facts: ReadonlyArray<FactoryItemFact> }) {
+  return (
+    <dl className="grid grid-cols-[max-content_1fr] gap-x-2 text-xs" aria-label="Item facts">
+      {facts.map((fact) => (
+        <div key={fact.key} className="contents">
+          <dt className="text-muted-foreground">{fact.label}</dt>
+          <dd>{fact.value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
 
 function PortfolioPopover({
   title,
@@ -87,6 +107,7 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
   const snapshot = loaded?.environmentId === threadRef.environmentId ? loaded.snapshot : null;
   const [error, setError] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const [reviewing, setReviewing] = useState<ReviewTarget | null>(null);
   const refresh = useCallback(async () => {
     const environmentId = threadRef.environmentId;
     const result = await read({ environmentId, input: {} });
@@ -130,32 +151,49 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
             ideas.map((idea) => {
               const threadId = workerThread(ideaAssignment(idea, work));
               const capture = ideaCaptureRow(idea, threadRef.environmentId);
+              const facts = ideaFacts(idea, ideaAssignment(idea, work));
+              const review = (
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="outline"
+                  aria-label={`Review and start: ${portfolioRowTitle(idea, idea.ideaId)}`}
+                  onClick={() => {
+                    setReviewing({ projectId: idea.projectId, ideaId: idea.ideaId });
+                    close();
+                  }}
+                >
+                  Review
+                </Button>
+              );
               const label = (
                 <>
                   <div className="min-w-0 flex-1">
-                    <p className="truncate font-medium">{idea.goal || idea.ideaId}</p>
+                    <p className="truncate font-medium">{portfolioRowTitle(idea, idea.ideaId)}</p>
                     <p className="truncate text-xs text-muted-foreground">
                       {projectName(idea.projectId)}
                     </p>
                   </div>
                   {idea.priority !== null ? (
                     <Badge variant="secondary" size="sm">
-                      P{idea.priority}
+                      Queue P{idea.priority}
                     </Badge>
                   ) : null}
                 </>
               );
               return threadId ? (
-                <button
-                  key={`${idea.projectId}:${idea.ideaId}`}
-                  type="button"
-                  className="flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-3 text-left text-sm hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                  aria-label={`Open work for ${idea.goal || idea.ideaId}`}
-                  onClick={() => openWorker(threadId, close)}
-                >
-                  {label}
-                  <ArrowUpRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
-                </button>
+                <div key={`${idea.projectId}:${idea.ideaId}`} className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md px-2 py-3 text-left text-sm hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                    aria-label={`Open work for ${portfolioRowTitle(idea, idea.ideaId)}`}
+                    onClick={() => openWorker(threadId, close)}
+                  >
+                    {label}
+                    <ArrowUpRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                  </button>
+                  {review}
+                </div>
               ) : (
                 <details key={`${idea.projectId}:${idea.ideaId}`} className="group/idea py-2">
                   <summary className="flex cursor-pointer list-none items-center gap-2 rounded-md px-2 py-1 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
@@ -172,16 +210,20 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                     {capture ? (
                       <p className="text-xs text-muted-foreground">{capture.text}</p>
                     ) : null}
-                    {capture?.work ? (
-                      <Button
-                        type="button"
-                        size="xs"
-                        variant="outline"
-                        onClick={() => openWork(capture.work!, close)}
-                      >
-                        Open in Work
-                      </Button>
-                    ) : null}
+                    {facts ? <ItemFacts facts={facts} /> : null}
+                    <div className="flex flex-wrap gap-1">
+                      {review}
+                      {capture?.work ? (
+                        <Button
+                          type="button"
+                          size="xs"
+                          variant="outline"
+                          onClick={() => openWork(capture.work!, close)}
+                        >
+                          Open in Work
+                        </Button>
+                      ) : null}
+                    </div>
                     <p className="text-xs text-muted-foreground">
                       No worker conversation yet. Continue this idea with the assistant.
                     </p>
@@ -197,42 +239,81 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
           {(close) =>
             work.map((item) => {
               const threadId = workerThread(item);
+              const title = portfolioRowTitle(item, item.assignmentId);
+              const actions = assignmentActions(item);
+              const row = factoryAssignmentRow(item, threadRef.environmentId);
+              // A delivery's own state, which reads true whatever the chat said while it ran.
+              const next = row?.nextAction ?? null;
               const label = (
                 <>
                   <div className="min-w-0 flex-1">
-                    <p className="truncate font-medium">{item.goal}</p>
+                    <p className="truncate font-medium">{title}</p>
                     <p className="truncate text-xs text-muted-foreground">
                       {projectName(item.projectId)}
                     </p>
                   </div>
                   <Badge
                     variant={
-                      item.state === "completed"
-                        ? "success"
-                        : item.state === "failed"
-                          ? "error"
-                          : ["needs-input", "launch-uncertain", "awaiting-verification"].includes(
-                                item.state,
-                              )
-                            ? "warning"
-                            : "secondary"
+                      next !== null
+                        ? next.forYou
+                          ? "warning"
+                          : "secondary"
+                        : item.state === "completed"
+                          ? "success"
+                          : item.state === "failed"
+                            ? "error"
+                            : ["needs-input", "launch-uncertain", "awaiting-verification"].includes(
+                                  item.state,
+                                )
+                              ? "warning"
+                              : "secondary"
                     }
                     size="sm"
                   >
-                    {statusLabels[item.state] ?? item.state}
+                    {next?.title ?? statusLabels[item.state] ?? item.state}
                   </Badge>
                 </>
               );
-              const actions = assignmentActions(item);
-              const row = factoryAssignmentRow(item, threadRef.environmentId);
               return (
                 <div key={item.assignmentId} className="flex items-start gap-1 py-1">
                   {row ? (
                     <div className="min-w-0 flex-1 space-y-1 px-2 py-2 text-sm">
                       <div className="flex items-center gap-2">{label}</div>
-                      {row.delivery ? (
-                        <p className="text-xs text-muted-foreground">{row.delivery}</p>
+                      {next !== null && (next.readyForReview || !next.forYou) ? (
+                        <p className="text-xs text-muted-foreground">{next.detail}</p>
                       ) : null}
+                      <ItemFacts facts={row.facts} />
+                      {row.reviewed ? (
+                        <p className="text-xs text-muted-foreground">Runs on what you reviewed.</p>
+                      ) : null}
+                      <PendingActionsList
+                        pending={row.pendingActions}
+                        shownItem={null}
+                        projectName={(id) =>
+                          projects.find(
+                            (project) =>
+                              project.id === id &&
+                              project.environmentId === threadRef.environmentId,
+                          )?.title
+                        }
+                        threadName={(id) =>
+                          threads.find(
+                            (thread) =>
+                              thread.id === id && thread.environmentId === threadRef.environmentId,
+                          )?.title
+                        }
+                        onOpenThread={(id) => openWorker(id, close)}
+                        onOpenItem={(ref, projectId) =>
+                          openWork(
+                            workItemLinkTarget({
+                              environmentId: threadRef.environmentId,
+                              projectId,
+                              ref,
+                            }),
+                            close,
+                          )
+                        }
+                      />
                       {row.reasons.map((reason) => (
                         <p key={reason} className="break-words">
                           {reason}
@@ -287,7 +368,7 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                     <button
                       type="button"
                       className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-                      aria-label={`Open work: ${item.goal}`}
+                      aria-label={`Open work: ${title}`}
                       onClick={() => openWorker(threadId, close)}
                     >
                       {label}
@@ -321,7 +402,7 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                               type="button"
                               size="icon-xs"
                               variant="ghost"
-                              aria-label={`Manage work: ${item.goal}`}
+                              aria-label={`Manage work: ${title}`}
                             />
                           }
                         >
@@ -369,6 +450,15 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
             })
           }
         </PortfolioPopover>
+      ) : null}
+      {reviewing !== null ? (
+        <ReviewStartCard
+          environmentId={threadRef.environmentId}
+          managerThreadId={threadRef.threadId}
+          target={reviewing}
+          onClose={() => setReviewing(null)}
+          onStarted={() => void refresh()}
+        />
       ) : null}
       {error ? (
         <Popover>

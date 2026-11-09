@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 import { AuthWorkReadScope, type RunId } from "@t3tools/contracts";
-import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
+import type { FactoryDeliveryId, FactoryPromptName } from "@t3tools/contracts/fd/factory";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -9,7 +9,7 @@ import { WorkService } from "../work-management/index.ts";
 import * as Factory from "./index.ts";
 import { renderAuthorPrompt } from "./prompts/author.ts";
 import { renderReviewPrompt } from "./prompts/review.ts";
-import { type FactoryPromptName, MAX_PROMPT_OVERRIDE_BYTES } from "./prompts/overrides.ts";
+import { MAX_PROMPT_OVERRIDE_BYTES } from "./prompts/overrides.ts";
 import {
   authorCommits,
   drainFactory,

@@ -3,6 +3,7 @@ import {
   type WorkThreadMode,
   workItemRefString,
 } from "@t3tools/contracts/fd/work-management";
+import { slugWithoutAiNames } from "@t3tools/shared/fd/publishedNames";
 
 import { truncateText } from "./bounds.ts";
 
@@ -25,19 +26,15 @@ export const workBranchKey = (item: Pick<WorkPromptItem, "kind" | "ref">): strin
   item.kind === "github" ? `gh-${item.ref.itemId}` : item.ref.itemId;
 
 /**
- * `work/<key>-<slug>`. The Jira key keeps its case so tracker automations recognize it; the slug
- * keeps only lowercase letters, digits and single dashes.
+ * `feature/<key>-<slug>`, the fork's neutral prefix. The Jira key keeps its case so tracker
+ * automations recognize it; the slug keeps only lowercase letters, digits and single dashes, with
+ * no AI agent, model or provider name. Only new branches read this: a delivery keeps the branch it
+ * stored.
  */
 export const workBranchName = (item: Pick<WorkPromptItem, "kind" | "ref" | "title">): string => {
-  const slug = item.title
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, BRANCH_SLUG_MAX_CHARS)
-    .replace(/-+$/, "");
+  const slug = slugWithoutAiNames(item.title, BRANCH_SLUG_MAX_CHARS);
   const key = workBranchKey(item);
-  return slug.length === 0 ? `work/${key}` : `work/${key}-${slug}`;
+  return slug.length === 0 ? `feature/${key}` : `feature/${key}-${slug}`;
 };
 
 /** `<key>: <title>`, cut to the thread title limit. */
@@ -49,7 +46,7 @@ const MODE_INSTRUCTIONS: Record<WorkThreadMode, string> = {
     "Mode: scope. Investigate the item and reply with a plan, its risks and your confidence. Change no files. Post the plan once with work_comment.",
   plan: "Mode: plan. Write the implementation plan, then stop and ask before changing anything.",
   implement:
-    "Mode: implement. Implement the item, verify it, and open exactly one pull request titled `<key>: ...` whose body references the item. Never open a second pull request for it.",
+    "Mode: implement. Implement the item, verify it, and open exactly one pull request with a short Conventional title, `<type>(<scope>): <key> <summary>`, whose body references the item. Never open a second pull request for it.",
 };
 
 const field = (label: string, value: string | null | undefined): string | null =>

@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
+  ForwardCompatibleArray,
   ForwardCompatibleOptional,
   IsoDateTime,
   NonNegativeInt,
@@ -13,7 +14,8 @@ import {
   TrimmedNonEmptyString,
 } from "../../baseSchemas.ts";
 import { ModelSelection } from "../../modelSelection.ts";
-import { WorkItemRef, WorkItemTitle } from "../work-management/index.ts";
+import { RuntimeMode } from "../../providerPolicy.ts";
+import { WorkItemRef, WorkItemTitle, WorkStatus } from "../work-management/index.ts";
 
 /**
  * Factory contracts. Like Work's, nothing here imports `environment.ts`, `project.ts` or
@@ -265,6 +267,86 @@ export const FactoryProjectSettings = Schema.Struct({
 });
 export type FactoryProjectSettings = typeof FactoryProjectSettings.Type;
 
+/** The rule files a project can override under `.foredeck/factory/prompts`. */
+export const FactoryPromptName = Schema.Literals([
+  "plan",
+  "author",
+  "review",
+  "fix-verify",
+  "fix-review",
+  "fix-commit",
+  "integrate",
+]);
+export type FactoryPromptName = typeof FactoryPromptName.Type;
+
+/** A prompt override as an owner reviewed it: the SHA-256 of its text, or that none existed. */
+const FactoryReviewedPromptOverride = Schema.Union([
+  Schema.Literal("absent"),
+  Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/)),
+]);
+
+/**
+ * What an owner reviewed for one delivery, stored on its review receipt while it queues and on the
+ * delivery from its start: the delivery runs on these, never on the project's settings, which it
+ * cannot widen. Every field is required, so a partial review cannot start anything. A role that
+ * defaulted holds what it resolved to. `verifyTimeoutMinutes` is the per-command timeout, and the
+ * count limits are all a review approves: no aggregate time budget exists.
+ */
+export const FactoryReviewedExecution = Schema.Struct({
+  receiptId: FactorySlug,
+  reviewVersion: PositiveInt,
+  roles: Schema.Struct({
+    planner: ModelSelection,
+    author: ModelSelection,
+    reviewer: ModelSelection,
+  }),
+  verifyCommand: FactoryCommand,
+  setupCommand: Schema.NullOr(FactoryCommand),
+  limits: Schema.Struct({
+    maxFixRounds: RoundLimit,
+    maxReviewRounds: RoundLimit,
+    maxFixCommitTurns: RoundLimit,
+    verifyTimeoutMinutes: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 1440 })),
+  }),
+  blockingSeverities: Schema.Array(FactoryFindingSeverity),
+  highRiskEffort: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+  pipelineId: FactorySlug,
+  repository: Schema.Struct({
+    projectId: ProjectId,
+    workspaceRoot: Schema.String,
+    /**
+     * Where publication goes, as what publishes resolves it: each destination by its role, since
+     * two remotes exchanging URLs leave any one set of them the same. Each list is sorted.
+     */
+    publication: Schema.Struct({
+      /** Where a push goes: the push URLs of the remote it picks, which can be its fetch URLs. */
+      push: Schema.Array(Schema.String),
+      /** That remote's fetch URLs, which name the pull request's head repository. */
+      head: Schema.Array(Schema.String),
+      /** The source control provider that would open the pull request. */
+      provider: TrimmedNonEmptyString,
+      /**
+       * The repository that provider says it would open the pull request against. Null only when
+       * no provider hosts the repository, so no pull request can be opened from it.
+       */
+      repository: Schema.NullOr(Schema.String),
+      /** A hash of every `remote.*` and `url.*` Git setting, in Git's order. */
+      remoteConfig: Schema.String,
+    }),
+  }),
+  runtimeCeiling: RuntimeMode,
+  promptOverrides: Schema.Struct({
+    plan: FactoryReviewedPromptOverride,
+    author: FactoryReviewedPromptOverride,
+    review: FactoryReviewedPromptOverride,
+    "fix-verify": FactoryReviewedPromptOverride,
+    "fix-review": FactoryReviewedPromptOverride,
+    "fix-commit": FactoryReviewedPromptOverride,
+    integrate: FactoryReviewedPromptOverride,
+  }),
+});
+export type FactoryReviewedExecution = typeof FactoryReviewedExecution.Type;
+
 /** A full Git object id (SHA-1 or SHA-256). */
 const FactoryGitObjectId = Schema.String.check(Schema.isPattern(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/));
 
@@ -444,6 +526,83 @@ export const FactoryStageRunSummary = Schema.Struct({
 });
 export type FactoryStageRunSummary = typeof FactoryStageRunSummary.Type;
 
+/** One count a delivery may spend, as it stands now. */
+const FactoryAllowanceCount = Schema.Struct({
+  used: NonNegativeInt,
+  limit: NonNegativeInt,
+  remaining: NonNegativeInt,
+});
+
+/**
+ * What a delivery has spent of what it may. A repair turn answers one failed verify or blocking
+ * review, so these count turns while `attempts` counts every verify and review it ran: one repair
+ * and two review attempts is the ordinary shape of a review that asked for one fix.
+ */
+export const FactoryDeliveryAllowance = Schema.Struct({
+  /**
+   * `whole_delivery`: what its owner's review approved, kept across stops, resumes and restarts.
+   * `since_resume`: a delivery started without a review, whose counts a resume starts over.
+   */
+  counted: literalsOr(["whole_delivery", "since_resume", "unknown"], "unknown"),
+  /** Repair turns answering a failed verify. Null for a parent, which has no repair round. */
+  verificationFixes: Schema.NullOr(FactoryAllowanceCount),
+  /** Repair turns answering a blocking review. Null for a parent, which has no repair round. */
+  reviewFollowUps: Schema.NullOr(FactoryAllowanceCount),
+  /** Mechanical turns that settle the branch. */
+  fixCommitTurns: FactoryAllowanceCount,
+  attempts: Schema.Struct({ verify: NonNegativeInt, review: NonNegativeInt }),
+});
+export type FactoryDeliveryAllowance = typeof FactoryDeliveryAllowance.Type;
+
+/** The pull request a delivery opened. */
+const FactoryDeliveryPullRequest = Schema.Struct({
+  number: PositiveInt,
+  url: Schema.String,
+  /** The thread it is linked to, whose checkout holds its changes. */
+  threadId: Schema.optionalKey(ThreadId),
+  /** How it left `open`, once the delivery took that; absent while it is open. */
+  outcome: Schema.optionalKey(literalsOr(["merged", "closed", "unknown"], "unknown")),
+});
+
+/**
+ * What the delivery's Work item says now, on a listing. Factory only reads these: what a source
+ * says of an item and how its delivery stands are separate facts, and neither moves the other.
+ */
+export const FactoryDeliverySource = Schema.Struct({
+  key: Schema.String,
+  title: Schema.String,
+  status: WorkStatus,
+  /** The source's own name for the status, where it has one. */
+  statusName: Schema.NullOr(Schema.String),
+  /** The human the source assigns it to, never the agents that work on it. */
+  assignee: Schema.NullOr(Schema.String),
+});
+export type FactoryDeliverySource = typeof FactoryDeliverySource.Type;
+
+/**
+ * What one role of a delivery runs on. `selection` is what it actually asks for: what its latest
+ * turn asked, escalation and a fix-commit turn's medium included, or with no turn yet what its launch
+ * would ask. `binding` says where that starts from: `reviewed` when its owner's review binds it, with
+ * the bound value in `reviewed`, which `selection` can differ from, or `read_now` for a delivery
+ * without a review, which reads its thread's selection or the project's settings as each step runs.
+ * `acknowledged` is only what a provider itself reported for the role's thread, so it is absent,
+ * never a copy of the request, when none did.
+ */
+export const FactoryRoleExecution = Schema.Struct({
+  role: literalsOr(["planner", "author", "reviewer", "unknown"], "unknown"),
+  selection: ModelSelection,
+  binding: literalsOr(["reviewed", "read_now", "unknown"], "unknown"),
+  reviewed: Schema.optionalKey(ModelSelection),
+  acknowledged: Schema.optionalKey(ModelSelection),
+});
+export type FactoryRoleExecution = typeof FactoryRoleExecution.Type;
+
+/** What each role a delivery uses runs on, in plan, author, review order. */
+export const FactoryDeliveryExecution = Schema.Struct({
+  roles: ForwardCompatibleList(FactoryRoleExecution),
+});
+export type FactoryDeliveryExecution = typeof FactoryDeliveryExecution.Type;
+
 /**
  * A delivery as clients see it; receipts, reviews and stage attempts are summaries, never logs.
  * From a newer server, a status, stage name, stage kind or attempt outcome this build does not
@@ -451,6 +610,70 @@ export type FactoryStageRunSummary = typeof FactoryStageRunSummary.Type;
  * and a receipt, review summary or attempt this build cannot read is left out instead of failing
  * the snapshot.
  */
+/** At most this many pending actions cross the wire for one delivery; the rest are counted. */
+export const FACTORY_PENDING_ACTIONS_MAX = 10;
+/** The most of a provider's own reason that crosses the wire with one. */
+export const FACTORY_PENDING_REASON_MAX = 500;
+
+/**
+ * One thing a delivery is waiting on someone for, as the server read it: a request on one of its
+ * threads, its plan gate, or a mode the provider's host policy refused. Clients word it through
+ * `@t3tools/shared/fd/approvals`, so an unfamiliar `kind` reads as unknown rather than failing.
+ */
+export const FactoryPendingAction = Schema.Struct({
+  kind: Schema.String,
+  /** Whose work the run that asked is; null without a run. */
+  runClass: Schema.NullOr(Schema.Literals(["factory", "explicit", "unknown"])),
+  /** The mode the asking thread runs in; null when none does. */
+  runtimeMode: Schema.NullOr(RuntimeMode),
+  /** Where it is decided; null when no thread exists yet, so it is decided on the delivery. */
+  threadId: Schema.NullOr(ThreadId),
+  projectId: ProjectId,
+  requestId: Schema.NullOr(Schema.String),
+  capability: Schema.Literals(["live", "message", "not_resumable"]),
+  /** Why the provider says it asks, when it says. */
+  reason: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(FACTORY_PENDING_REASON_MAX))),
+  /**
+   * The Work item whose delivery decides it, for what no thread asks: a parent lists its awaited
+   * child's this way, and that is decided on the child.
+   */
+  item: Schema.optionalKey(WorkItemRef),
+  /** For a mode the host refused: the provider, and the modes it could run instead. */
+  refused: Schema.optionalKey(
+    Schema.Struct({
+      provider: Schema.String,
+      driver: Schema.String,
+      /** What the policy allows, as the provider read it. */
+      detail: Schema.optionalKey(Schema.String),
+      /** How the owner chooses another mode. */
+      choose: Schema.Literals(["resume", "thread", "automatic_turn", "review", "before_review"]),
+      alternatives: Schema.Array(RuntimeMode),
+    }),
+  ),
+});
+export type FactoryPendingAction = typeof FactoryPendingAction.Type;
+
+/**
+ * A bounded list of pending actions. `complete` is false when its requests could not be read, so
+ * an empty list never reads as nothing waiting.
+ */
+export const FactoryPendingActions = Schema.Struct({
+  items: ForwardCompatibleArray(FactoryPendingAction),
+  omitted: NonNegativeInt,
+  complete: Schema.Boolean,
+});
+export type FactoryPendingActions = typeof FactoryPendingActions.Type;
+
+/** Cuts a delivery's pending actions to what crosses the wire, counting what it leaves out. */
+export const boundedPendingActions = (
+  actions: ReadonlyArray<FactoryPendingAction>,
+  complete: boolean,
+): FactoryPendingActions => ({
+  items: actions.slice(0, FACTORY_PENDING_ACTIONS_MAX),
+  omitted: Math.max(0, actions.length - FACTORY_PENDING_ACTIONS_MAX),
+  complete,
+});
+
 export const FactoryDelivery = Schema.Struct({
   deliveryId: FactoryDeliveryId,
   projectId: ProjectId,
@@ -495,6 +718,35 @@ export const FactoryDelivery = Schema.Struct({
    * It never means the owner has anything to do. Absent otherwise and from older servers.
    */
   capacityWait: Schema.optionalKey(Schema.Boolean),
+  /** Absent from older servers, which report `rounds` alone. */
+  allowance: ForwardCompatibleOptional(FactoryDeliveryAllowance),
+  /** Absent until it opens one, and from older servers. */
+  pullRequest: ForwardCompatibleOptional(FactoryDeliveryPullRequest),
+  /**
+   * Whether anything of it is under way now, rather than it resting on its owner or its pull
+   * request. Absent from older servers, which cannot say.
+   */
+  proceeding: Schema.optionalKey(Schema.Boolean),
+  /**
+   * What its Work item says now: only on a listing, only for a delivery not done or cancelled, and
+   * absent when its source could not be read in time.
+   */
+  source: ForwardCompatibleOptional(FactoryDeliverySource),
+  /**
+   * The project assistant's rank for its idea, on a listing, ended or not; null when the idea has
+   * no rank, and absent when the assistant never managed it. Not the Work item's own priority.
+   */
+  queuePriority: Schema.optionalKey(Schema.NullOr(Schema.Int)),
+  /**
+   * What it waits on someone for: only on a listing, only for a delivery not done or cancelled, and
+   * absent while nothing does.
+   */
+  pendingActions: ForwardCompatibleOptional(FactoryPendingActions),
+  /**
+   * What each of its roles runs on: only when one delivery is read, since it takes a read per thread
+   * that a listing refetched on every step must not cost. Absent from older servers.
+   */
+  execution: ForwardCompatibleOptional(FactoryDeliveryExecution),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -509,6 +761,66 @@ export const FactorySettingsSetInput = Schema.Struct({
   settings: FactoryProjectSettings,
 });
 export type FactorySettingsSetInput = typeof FactorySettingsSetInput.Type;
+
+/** Asks what the project's canonical checkout offers as verify and setup commands. */
+export const FactoryCommandDiscoverInput = Schema.Struct({ projectId: ProjectId });
+export type FactoryCommandDiscoverInput = typeof FactoryCommandDiscoverInput.Type;
+
+/**
+ * A command to offer the owner, never run or saved by being proposed. `script` is a script of the
+ * checkout's `package.json`, `preset` one Factory ships. `purpose` says which field it suits;
+ * `any` suits either.
+ */
+export const FactoryCommandProposal = Schema.Struct({
+  /** Stable within one answer: `script:<name>` or `preset:<name>`. */
+  id: Schema.String,
+  label: Schema.String,
+  source: literalsOr(["script", "preset", "unknown"], "unknown"),
+  purpose: literalsOr(["verify", "setup", "any"], "any"),
+  command: FactoryCommand,
+});
+export type FactoryCommandProposal = typeof FactoryCommandProposal.Type;
+
+/**
+ * What discovery read of the checkout and what it proposes from that. `scripts` says how the read of
+ * `package.json` went, so a checkout with nothing to offer reads differently from one Factory could
+ * not read. `packageManager` is the one the checkout's lockfile names; null without a lockfile.
+ */
+export const FactoryCommandDiscovery = Schema.Struct({
+  scripts: literalsOr(["found", "none", "no_package_json", "unreadable", "unknown"], "unknown"),
+  packageManager: Schema.NullOr(Schema.String),
+  /** Every package manager lockfile the checkout holds; more than one makes the choice a guess. */
+  lockfiles: Schema.Array(Schema.String),
+  proposals: ForwardCompatibleList(FactoryCommandProposal),
+  /** The scripts left out past the bound, or for names no command can carry. */
+  omittedScripts: NonNegativeInt,
+});
+export type FactoryCommandDiscovery = typeof FactoryCommandDiscovery.Type;
+
+/** A command to check as the verify runner would resolve it; nothing saves or runs it. */
+export const FactoryCommandValidateInput = Schema.Struct({
+  projectId: ProjectId,
+  command: FactoryCommand,
+});
+export type FactoryCommandValidateInput = typeof FactoryCommandValidateInput.Type;
+
+/**
+ * What resolving a command in the server's real environment found, without running it. `found` means
+ * only that the executable and any runtime its script names exist, not that the command passes. A
+ * problem is an answer rather than a failure: a command may be right for a worktree the checkout
+ * does not resemble yet, so the owner decides.
+ */
+export const FactoryCommandValidation = Schema.Struct({
+  status: literalsOr(
+    ["found", "missing_executable", "missing_runtime", "not_executable", "batch_script", "unknown"],
+    "unknown",
+  ),
+  /** Where the executable resolved; null when it did not. */
+  resolvedPath: Schema.NullOr(Schema.String),
+  /** The server's own words for the owner, with what to do about a problem. */
+  message: Schema.String,
+});
+export type FactoryCommandValidation = typeof FactoryCommandValidation.Type;
 
 export const FactoryDeliveryStartInput = Schema.Struct({
   itemRef: WorkItemRef,

@@ -38,6 +38,7 @@ import {
   WorkUnauthenticated,
   type WorkDomainError,
 } from "../errors.ts";
+import { workItemContentFingerprint } from "../model/scope.ts";
 import * as WorkLinkStore from "../persistence/WorkLinkStore.ts";
 import * as WorkMigrations from "../persistence/WorkMigrations.ts";
 import * as WorkSourceStore from "../persistence/WorkSourceStore.ts";
@@ -146,32 +147,35 @@ export const fakeDetail = (
   ref: WorkItemRef,
   kind: WorkSourceKind,
   title: string,
-): WorkSourceItemDetail => ({
-  ref,
-  kind,
-  key: ref.itemId,
-  title,
-  status: "todo",
-  nativeStatus: null,
-  blocked: false,
-  priority: null,
-  labels: [],
-  assignee: null,
-  parent: null,
-  blockedBy: [],
-  url: null,
-  updatedAt: at,
-  revision: "r1",
-  invalid: null,
-  body: "",
-  bodyTruncated: false,
-  bodyFidelity: "exact",
-  comments: [],
-  commentsTruncated: false,
-  children: [],
-  blocking: [],
-  transitions: [],
-});
+): WorkSourceItemDetail => {
+  const detail = {
+    ref,
+    kind,
+    key: ref.itemId,
+    title,
+    status: "todo",
+    nativeStatus: null,
+    blocked: false,
+    priority: null,
+    labels: [],
+    assignee: null,
+    parent: null,
+    blockedBy: [],
+    url: null,
+    updatedAt: at,
+    revision: "r1",
+    invalid: null,
+    body: "",
+    bodyTruncated: false,
+    bodyFidelity: "exact",
+    comments: [],
+    commentsTruncated: false,
+    children: [],
+    blocking: [],
+    transitions: [],
+  } satisfies Omit<WorkSourceItemDetail, "scopeFingerprint">;
+  return { ...detail, scopeFingerprint: workItemContentFingerprint(detail) };
+};
 
 export const summaryOf = (detail: WorkSourceItemDetail): WorkItemSummary => ({
   ref: detail.ref,
@@ -302,8 +306,9 @@ export const fakeAdapter = (
       ? Effect.succeed(detail)
       : Effect.fail(new WorkStale({ itemId: detail.ref.itemId, current: summaryOf(detail) }));
   const put = (runtime: WorkSourceRuntime, detail: WorkSourceItemDetail) => {
-    items.set(keyOf(runtime, detail.ref.itemId), detail);
-    return summaryOf(detail);
+    const stored = { ...detail, scopeFingerprint: workItemContentFingerprint(detail) };
+    items.set(keyOf(runtime, detail.ref.itemId), stored);
+    return summaryOf(stored);
   };
   const ownItems = (runtime: WorkSourceRuntime) =>
     [...items.entries()]
