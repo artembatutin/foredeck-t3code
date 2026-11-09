@@ -31,7 +31,7 @@ export const listJql = (projectKey: string, query: WorkListQuery): string => {
   }
   if (query.assignee === "me") clauses.push("assignee = currentUser()");
   if (query.labels !== undefined && query.labels.length > 0) {
-    clauses.push(`labels in (${query.labels.map(jqlString).join(", ")})`);
+    clauses.push(...query.labels.map((label) => `labels = ${jqlString(label)}`));
   }
   const search = query.search?.trim();
   if (search !== undefined && search.length > 0) clauses.push(`text ~ ${jqlString(search)}`);

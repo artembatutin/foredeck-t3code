@@ -7,7 +7,6 @@ import { HandoffAdmission, HandoffBackend, ProjectAssistant } from "../assistant
 import * as Factory from "./index.ts";
 import {
   drainFactory,
-  fakePullRequest,
   stateOf,
   verifyCommands,
   withProject,
@@ -72,7 +71,9 @@ const delivered = (world: World, idea: string) =>
     yield* tick;
     assert.strictEqual((yield* assignmentOf(idea)).state, "needs-input");
     assert.isUndefined(yield* slotOf(root));
-    return { idea, root, thread: opened.threadId, runId: opened.runId };
+    const pullRequest =
+      opened.state.pullRequest ?? assert.fail("The delivery opened no pull request.");
+    return { idea, root, thread: opened.threadId, runId: opened.runId, pullRequest };
   });
 
 /** A first start ending with no row, then a stop: parked with its delivery absent. */
@@ -136,10 +137,10 @@ const wakeRound = (
 ) =>
   Effect.forEach(
     roots,
-    ({ root, thread, runId }) =>
+    ({ root, thread, runId, pullRequest }) =>
       Effect.gen(function* () {
         const providerThread = yield* providerThreadOf(thread, runId);
-        const link = yield* linkOf(thread, fakePullRequest.number);
+        const link = yield* linkOf(thread, pullRequest.number);
         yield* presentChecking(root, pullRequestWakeTurn(thread, link), record);
         yield* presentChecking(root, turns.backgroundWake(thread, providerThread), record);
       }),

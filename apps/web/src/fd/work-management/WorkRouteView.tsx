@@ -5,6 +5,8 @@ import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import {
   itemInView,
   linksByItem,
+  normalizeWorkLabels,
+  workFilterSources,
   readWorkListPreferences,
   refreshWork,
   RUN_STATE_LABELS,
@@ -34,7 +36,7 @@ import {
   TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 
 import { WorkspaceBreadcrumb, WorkspaceBreadcrumbItem } from "../../components/WorkspaceBreadcrumb";
 import { WorkspacePageContainer } from "../../components/WorkspacePageContainer";
@@ -83,6 +85,8 @@ import {
   workCommands,
   workEnvironment,
 } from "./state";
+import { WorkLabelFilter } from "./WorkLabelFilter";
+import { useWorkSearchInput } from "./useWorkSearchInput";
 import type { StartWorkThreadAction } from "./StartWorkThreadDialog";
 import { WorkItemDetail, type WorkItemSection } from "./WorkItemDetail";
 
@@ -94,6 +98,8 @@ export interface WorkSearch {
   readonly source?: string;
   readonly view?: WorkView;
   readonly q?: string;
+  readonly labels?: ReadonlyArray<string>;
+  readonly assignedToMe?: boolean;
   /** `<sourceId>:<itemId>` of the item open in the detail column. */
   readonly item?: string;
 }
@@ -115,6 +121,10 @@ export function validateWorkSearch(raw: Record<string, unknown>): WorkSearch {
     ...(text(raw.source) === undefined ? {} : { source: text(raw.source)! }),
     ...(view === undefined ? {} : { view }),
     ...(text(raw.q) === undefined ? {} : { q: text(raw.q)! }),
+    ...(Array.isArray(raw.labels) && raw.labels.every((label) => typeof label === "string")
+      ? { labels: normalizeWorkLabels(raw.labels) }
+      : {}),
+    ...(typeof raw.assignedToMe === "boolean" ? { assignedToMe: raw.assignedToMe } : {}),
     ...(text(raw.item, 300) === undefined ? {} : { item: text(raw.item, 300)! }),
   };
 }
@@ -179,15 +189,9 @@ export function WorkRouteView({
   );
   const environmentId = selectedProject?.environmentId ?? null;
   const view = search.view ?? readStoredPreferences().view;
-  const [query, setQuery] = useState(search.q ?? "");
+  const commitQuery = useCallback((q: string | undefined) => setSearch({ q }), [setSearch]);
+  const [query, setQuery] = useWorkSearchInput(search, commitQuery);
   const [creating, setCreating] = useState<WorkSource | null>(null);
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      if ((search.q ?? "") !== query.trim()) setSearch({ q: query.trim() || undefined });
-    }, 250);
-    return () => window.clearTimeout(timer);
-  }, [query, search.q, setSearch]);
 
   const setView = (next: WorkView) => {
     try {
@@ -210,15 +214,36 @@ export function WorkRouteView({
         }),
   );
   const sources = useMemo(() => sourcesQuery.data?.sources ?? [], [sourcesQuery.data]);
-  const shownSources = useMemo(
+  const selectedSources = useMemo(
     () =>
       sources.filter((source) => search.source === undefined || source.sourceId === search.source),
     [search.source, sources],
   );
+  const canFilterAssignee = selectedSources.some((source) => source.capabilities.people);
+  const assignedToMe =
+    canFilterAssignee &&
+    (search.assignedToMe ?? (search.item === undefined && readStoredPreferences().assignedToMe)) ===
+      true;
+  const shownSources = useMemo(
+    () => workFilterSources(selectedSources, assignedToMe),
+    [assignedToMe, selectedSources],
+  );
+  const labels = useMemo(() => [...(search.labels ?? [])], [search.labels]);
+  const setAssignedToMe = (next: boolean) => {
+    try {
+      window.localStorage.setItem(
+        PREFERENCES_KEY,
+        writeWorkListPreferences({ ...readStoredPreferences(), assignedToMe: next }),
+      );
+    } catch {
+      // The URL still carries the choice when storage is unavailable.
+    }
+    setSearch({ assignedToMe: next });
+  };
 
   const term = search.q?.trim() || undefined;
   // Pages loaded so far; any change to what the list shows starts again from the first page.
-  const listKey = `${environmentId}|${shownSources.map((source) => source.sourceId).join(",")}|${view}|${term ?? ""}`;
+  const listKey = `${environmentId}|${shownSources.map((source) => source.sourceId).join(",")}|${view}|${term ?? ""}|${JSON.stringify(labels)}|${assignedToMe}`;
   const [paging, setPaging] = useState({ key: listKey, pageCount: 1 });
   const pageCount = paging.key === listKey ? paging.pageCount : 1;
   const loadMore = useCallback(
@@ -236,10 +261,12 @@ export function WorkRouteView({
               kind: source.kind,
             })),
             search: term,
+            labels,
+            assignee: assignedToMe ? "me" : undefined,
             statuses: workViewStatuses(view),
             pageCount,
           }),
-    [environmentId, pageCount, shownSources, term, view],
+    [assignedToMe, environmentId, labels, pageCount, shownSources, term, view],
   );
   const lists = useAtomValue(listAtom ?? EMPTY_LISTS_ATOM);
   const refreshList = useAtomRefresh(listAtom ?? EMPTY_LISTS_ATOM);
@@ -296,6 +323,8 @@ export function WorkRouteView({
   const selectedOffList =
     view === "all" &&
     term === undefined &&
+    labels.length === 0 &&
+    !assignedToMe &&
     selectedRef !== undefined &&
     (search.source === undefined || search.source === selectedRef.sourceId) &&
     !listedItems.some(({ item }) => workItemRefString(item.ref) === search.item);
@@ -531,7 +560,7 @@ export function WorkRouteView({
                 selectedRef.sourceId === item.ref.sourceId &&
                 selectedRef.itemId === item.ref.itemId
               }
-              onSelect={() => setSearch({ item: workItemRefString(item.ref) })}
+              onSelect={() => setSearch({ item: workItemRefString(item.ref), assignedToMe })}
             />
           ))}
         </div>
@@ -663,6 +692,33 @@ export function WorkRouteView({
                       </Toggle>
                     ))}
                   </ToggleGroup>
+                  <WorkLabelFilter
+                    key={JSON.stringify([search.project, search.source, labels])}
+                    labels={labels}
+                    onApply={(next) => setSearch({ labels: next.length === 0 ? undefined : next })}
+                  />
+                  {canFilterAssignee ? (
+                    <Button
+                      size="sm"
+                      variant={assignedToMe ? "secondary" : "outline"}
+                      aria-pressed={assignedToMe}
+                      onClick={() => setAssignedToMe(!assignedToMe)}
+                    >
+                      Assigned to me
+                    </Button>
+                  ) : null}
+                  {labels.length > 0 || assignedToMe || term !== undefined ? (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => {
+                        setQuery("");
+                        setSearch({ q: undefined, labels: undefined, assignedToMe: false });
+                      }}
+                    >
+                      Clear filters
+                    </Button>
+                  ) : null}
                   {canCreate && sources.some((source) => source.capabilities.create) ? (
                     <Button
                       size="sm"

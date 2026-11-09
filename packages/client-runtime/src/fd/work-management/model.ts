@@ -203,6 +203,20 @@ export const parseWorkItemRouteRef = (params: {
   readonly itemId: string;
 }): WorkItemRef | undefined => parseWorkItemRefString(`${params.sourceId}:${params.itemId}`);
 
+/** Canonical label filters keep equivalent queries and every page on the same cache key. */
+export const normalizeWorkLabels = (labels: ReadonlyArray<string>): ReadonlyArray<string> =>
+  [...new Set(labels.map((label) => label.trim()).filter(Boolean))].sort();
+
+export const parseWorkLabelFilter = (text: string): ReadonlyArray<string> =>
+  normalizeWorkLabels(text.split(","));
+
+/** Free-text Markdown assignees have no authenticated "me" identity. */
+export const workFilterSources = <Source extends Pick<WorkSource, "capabilities">>(
+  sources: ReadonlyArray<Source>,
+  assignedToMe: boolean,
+): ReadonlyArray<Source> =>
+  assignedToMe ? sources.filter((source) => source.capabilities.people) : sources;
+
 /** List controls a client remembers between visits. */
 export const WorkListPreferences = Schema.Struct({
   view: Schema.Literals(["ready", "active", "all", "done"]),

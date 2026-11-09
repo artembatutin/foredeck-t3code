@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useAtomValue } from "@effect/atom-react";
 import type { FactoryItemFact } from "@t3tools/client-runtime/fd/factory";
@@ -12,7 +12,8 @@ import {
   LightbulbIcon,
   WifiOffIcon,
 } from "lucide-react";
-import { useProjects, useThreadShells } from "~/state/entities";
+import { useProjects, useThreadShell, useThreadShells } from "~/state/entities";
+import { useEnvironment } from "~/state/environments";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { useLiveRefresh } from "~/hooks/useLiveRefresh";
 import { Button } from "~/components/ui/button";
@@ -99,6 +100,9 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
   const allowed = useAtomValue(controlAssignment.permissionAtom(threadRef.environmentId));
   const projects = useProjects();
   const threads = useThreadShells();
+  const manager = useThreadShell(threadRef);
+  const connected = useEnvironment(threadRef.environmentId)?.connection.phase === "connected";
+  const completedRunId = manager?.latestRun?.completedAt == null ? null : manager.latestRun.runId;
   const navigate = useNavigate();
   const [loaded, setLoaded] = useState<{
     environmentId: ScopedThreadRef["environmentId"];
@@ -108,18 +112,52 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
   const [error, setError] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [reviewing, setReviewing] = useState<ReviewTarget | null>(null);
+  const readVersion = useRef(0);
   const refresh = useCallback(async () => {
+    const version = ++readVersion.current;
     const environmentId = threadRef.environmentId;
     const result = await read({ environmentId, input: {} });
+    if (version !== readVersion.current) return;
     setError(result._tag === "Failure");
     if (result._tag === "Success") setLoaded({ environmentId, snapshot: result.value });
   }, [read, threadRef.environmentId]);
-  // The first read happens on mount; later ones follow focus, arrival and the shared live
-  // interval instead of a fixed short loop.
+  const observed = useRef<{
+    environmentId: ScopedThreadRef["environmentId"];
+    threadId: ThreadId;
+    connected: boolean;
+    completedRunId: typeof completedRunId;
+  } | null>(null);
+  // Cached shells can mount before their connection. A completed assistant turn is the
+  // milestone after its idea/capture tools have finished; streaming text does not trigger reads.
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
-  useLiveRefresh(() => void refresh(), { key: threadRef.environmentId });
+    const previous = observed.current;
+    observed.current = {
+      environmentId: threadRef.environmentId,
+      threadId: threadRef.threadId,
+      connected,
+      completedRunId,
+    };
+    if (!connected) {
+      readVersion.current += 1;
+      return;
+    }
+    if (
+      previous === null ||
+      !previous.connected ||
+      previous.environmentId !== threadRef.environmentId ||
+      previous.threadId !== threadRef.threadId ||
+      (completedRunId !== null && completedRunId !== previous.completedRunId)
+    )
+      void refresh();
+  }, [connected, completedRunId, refresh, threadRef.environmentId, threadRef.threadId]);
+  useEffect(
+    () => () => {
+      observed.current = null;
+      readVersion.current += 1;
+    },
+    [],
+  );
+  useLiveRefresh(connected ? () => void refresh() : null, { key: threadRef.environmentId });
   const projectName = (id: string) =>
     projects.find((p) => p.id === id && p.environmentId === threadRef.environmentId)?.title ?? id;
   const work = snapshot?.assignments ?? [];

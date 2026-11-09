@@ -21,6 +21,10 @@ you can reapply your edit or discard it. **Deliver** hands the item to
 review to one pull request. **Deliver as parent** has Factory plan a Markdown
 task into child tasks first; see [Deliver a parent](./factory.md#deliver-a-parent).
 
+Filter by labels to show items carrying every selected label. **Assigned to me**
+uses the signed-in GitHub or Jira account; Markdown sources have free-text
+assignees and do not support that filter. These filters are also available on mobile.
+
 To add a source, open the project's settings and use **Work sources**. In a
 thread, the details panel lists the thread's linked items; use **Link work item**
 there or in the command palette.

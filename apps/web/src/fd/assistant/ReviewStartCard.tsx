@@ -133,11 +133,23 @@ export function ReviewStartCard({
   const [editing, setEditing] = useState<ReviewEditing | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const reviewRead = useRef(0);
+  const selectionKey = JSON.stringify([
+    environmentId,
+    managerThreadId,
+    target.projectId,
+    target.ideaId,
+    kind,
+    sourceId,
+  ]);
+  const [reviewedSelectionKey, setReviewedSelectionKey] = useState<string | null>(null);
+  const reviewing = reviewedSelectionKey !== selectionKey;
   // One per version: repeating a confirmation after a lost reply converges on what it started.
   const request = useRef<{ readonly version: string; readonly id: string } | null>(null);
 
   const refresh = useCallback(
     async (saved = false) => {
+      const sequence = ++reviewRead.current;
       const result = await read({
         environmentId,
         input: {
@@ -148,10 +160,13 @@ export function ReviewStartCard({
           ...(sourceId === undefined ? {} : { sourceId }),
         },
       });
+      // Selection changes and closing the card invalidate every older response, including errors.
+      if (sequence !== reviewRead.current) return;
       if (result._tag === "Failure") {
         setError(reviewFailureText(result.cause));
         return;
       }
+      setReviewedSelectionKey(selectionKey);
       setSnapshot(result.value);
       setEditing((current) =>
         saved || current === null
@@ -159,12 +174,24 @@ export function ReviewStartCard({
           : reviewEditingAfter(current, result.value),
       );
     },
-    [environmentId, kind, managerThreadId, read, sourceId, target.ideaId, target.projectId],
+    [
+      environmentId,
+      kind,
+      managerThreadId,
+      read,
+      selectionKey,
+      sourceId,
+      target.ideaId,
+      target.projectId,
+    ],
   );
 
   // Choosing how to deliver it keeps what the owner has typed.
   useEffect(() => {
     void refresh();
+    return () => {
+      reviewRead.current += 1;
+    };
   }, [refresh]);
 
   if (snapshot === null || editing === null) {
@@ -198,6 +225,7 @@ export function ReviewStartCard({
   };
 
   const confirm = async () => {
+    if (pending || reviewing || !availability.canStart) return;
     setPending(true);
     setError(null);
     const requestId =
@@ -216,14 +244,15 @@ export function ReviewStartCard({
         requestId,
       },
     });
-    setPending(false);
     if (result._tag === "Success") {
+      setPending(false);
       onStarted();
       onClose();
       return;
     }
     setError(reviewFailureText(result.cause));
     await refresh();
+    setPending(false);
   };
 
   const text = (name: "title" | "goal") => ({
@@ -315,9 +344,15 @@ export function ReviewStartCard({
                   <Button
                     key={option}
                     size="xs"
-                    variant={where.kind === option ? "secondary" : "outline"}
+                    variant={
+                      (where.kindFixed ? where.kind : kind) === option ? "secondary" : "outline"
+                    }
                     disabled={pending || where.kindFixed}
-                    onClick={() => setKind(option)}
+                    onClick={() => {
+                      if (option === kind) return;
+                      setReviewedSelectionKey(null);
+                      setKind(option);
+                    }}
                   >
                     {option === "single" ? "Single item" : "Plan into tasks"}
                   </Button>
@@ -328,10 +363,16 @@ export function ReviewStartCard({
                         key={source.sourceId}
                         size="xs"
                         variant={
-                          where.source?.sourceId === source.sourceId ? "secondary" : "outline"
+                          (sourceId ?? where.source?.sourceId) === source.sourceId
+                            ? "secondary"
+                            : "outline"
                         }
                         disabled={pending}
-                        onClick={() => setSourceId(source.sourceId)}
+                        onClick={() => {
+                          if (source.sourceId === sourceId) return;
+                          setReviewedSelectionKey(null);
+                          setSourceId(source.sourceId);
+                        }}
                       >
                         {source.label}
                       </Button>
@@ -339,6 +380,7 @@ export function ReviewStartCard({
                   : null}
               </div>
             </Section>
+            {reviewing ? <p className="text-xs">Updating review for your selection…</p> : null}
             <Section title="What it runs with">
               <Lines
                 items={[
@@ -384,7 +426,7 @@ export function ReviewStartCard({
               <Button
                 size="sm"
                 variant="outline"
-                disabled={pending || !canEdit}
+                disabled={pending || reviewing || !canEdit}
                 onClick={() => void save()}
               >
                 Save edits
@@ -393,7 +435,7 @@ export function ReviewStartCard({
           ) : null}
           <Button
             size="sm"
-            disabled={pending || !availability.canStart}
+            disabled={pending || reviewing || !availability.canStart}
             onClick={() => void confirm()}
           >
             {availability.label}

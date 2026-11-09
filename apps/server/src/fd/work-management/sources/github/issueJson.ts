@@ -47,7 +47,7 @@ export const IssueSummaryJson = Schema.Struct({
   assignees: Schema.optional(Schema.NullOr(Connection(Actor))),
   parent: Schema.optional(Schema.NullOr(Schema.Struct({ number: Schema.Int }))),
   issueDependenciesSummary: Schema.optional(
-    Schema.NullOr(Schema.Struct({ totalBlockedBy: Schema.Int })),
+    Schema.NullOr(Schema.Struct({ blockedBy: Schema.Int })),
   ),
   blockedBy: Schema.optional(
     Schema.NullOr(Connection(Schema.Struct({ number: Schema.Int, state: Schema.String }))),
@@ -207,7 +207,7 @@ const nodes = <A>(connection: { readonly nodes: ReadonlyArray<A | null> } | null
 const isOpenState = (state: string) => state.toUpperCase() === "OPEN";
 
 export const toSummary = (sourceId: WorkSourceId, issue: IssueSummaryJson): WorkItemSummary => {
-  const blockers = nodes(issue.blockedBy);
+  const blockers = nodes(issue.blockedBy).filter((blocker) => isOpenState(blocker.state));
   const assignee = nodes(issue.assignees)[0];
   return {
     ref: { sourceId, itemId: WorkItemId.make(String(issue.number)) },
@@ -219,9 +219,8 @@ export const toSummary = (sourceId: WorkSourceId, issue: IssueSummaryJson): Work
         : issue.title.replace(/[\r\n]+/g, " ").slice(0, 512),
     status: issueStatus(issue.state, issue.stateReason),
     nativeStatus: null,
-    blocked:
-      (issue.issueDependenciesSummary?.totalBlockedBy ?? 0) > 0 ||
-      blockers.some((blocker) => isOpenState(blocker.state)),
+    // The summary counts open blockers beyond the bounded connection, unlike totalBlockedBy.
+    blocked: (issue.issueDependenciesSummary?.blockedBy ?? 0) > 0 || blockers.length > 0,
     priority: null,
     labels: nodes(issue.labels)
       .map((label) => label.name)

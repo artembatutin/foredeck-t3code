@@ -1,12 +1,14 @@
-import { cloneElement, type ReactElement, type ReactNode } from "react";
+import { cloneElement, StrictMode, type ReactElement, type ReactNode } from "react";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
-import { afterEach, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 
 const mocks = vi.hoisted(() => ({
   read: vi.fn(),
   control: vi.fn(),
   navigate: vi.fn(),
+  connection: "connected",
+  run: null as { runId: string; status: string; completedAt: string | null } | null,
   passthrough: ({ children }: { children?: unknown }) => children ?? null,
 }));
 vi.mock("~/components/ui/button", () => ({ Button: (props: object) => <button {...props} /> }));
@@ -27,7 +29,14 @@ vi.mock("~/components/ui/menu", () => ({
     cloneElement(render, {}, children),
   MenuItem: (props: object) => <button data-menu-item {...props} />,
 }));
-vi.mock("~/state/entities", () => ({ useProjects: () => [], useThreadShells: () => [] }));
+vi.mock("~/state/entities", () => ({
+  useProjects: () => [],
+  useThreadShells: () => [],
+  useThreadShell: () => ({ latestRun: mocks.run }),
+}));
+vi.mock("~/state/environments", () => ({
+  useEnvironment: () => ({ connection: { phase: mocks.connection } }),
+}));
 vi.mock("~/hooks/useLiveRefresh", () => ({ useLiveRefresh: () => undefined }));
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => mocks.navigate }));
 vi.mock("@effect/atom-react", () => ({ useAtomValue: () => true }));
@@ -39,6 +48,11 @@ vi.mock("~/state/use-atom-command", () => ({
   useAtomCommand: (command: unknown) => (command === "read-overview" ? mocks.read : mocks.control),
 }));
 import { AssignmentsPanel } from "./AssignmentsPanel";
+
+beforeEach(() => {
+  mocks.connection = "connected";
+  mocks.run = null;
+});
 
 afterEach(() => {
   vi.clearAllMocks();
@@ -193,5 +207,111 @@ it("opens a Factory row's Work item from the row", async () => {
       view: "all",
     },
   });
+  await act(async () => view.unmount());
+});
+
+const ideaOverview = {
+  _tag: "Success" as const,
+  value: {
+    assignments: [],
+    ideas: [
+      {
+        projectId: ProjectId.make("p"),
+        ideaId: "saved",
+        title: "Export visible rows",
+        goal: "Export visible rows",
+        brief: "Export visible rows",
+        authorized: false,
+        priority: null,
+        priorityReason: "",
+      },
+    ],
+  },
+};
+const rerender = async (view: ReactTestRenderer) => {
+  await act(async () => view.update(<AssignmentsPanel threadRef={threadRef} />));
+};
+
+it("loads saved ideas as soon as the mounted environment connects and reconnects", async () => {
+  mocks.connection = "connecting";
+  mocks.read.mockResolvedValue(ideaOverview);
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  expect(mocks.read).not.toHaveBeenCalled();
+  mocks.connection = "connected";
+  await rerender(view);
+  expect(mocks.read).toHaveBeenCalledTimes(1);
+  expect(JSON.stringify(view.toJSON())).toContain("Export visible rows");
+  mocks.connection = "reconnecting";
+  await rerender(view);
+  mocks.connection = "connected";
+  await rerender(view);
+  expect(mocks.read).toHaveBeenCalledTimes(2);
+  expect(JSON.stringify(view.toJSON())).not.toContain("Status unavailable");
+  await act(async () => view.unmount());
+});
+
+it("refreshes newly saved ideas after the assistant completes a turn, without reads while streaming", async () => {
+  mocks.read.mockResolvedValue({ _tag: "Success", value: { ideas: [], assignments: [] } });
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  expect(mocks.read).toHaveBeenCalledTimes(1);
+  mocks.run = { runId: "discussion", status: "running", completedAt: null };
+  await rerender(view);
+  await rerender(view);
+  expect(mocks.read).toHaveBeenCalledTimes(1);
+  mocks.read.mockResolvedValue(ideaOverview);
+  mocks.run = { ...mocks.run, status: "completed", completedAt: "2026-11-09T20:00:00Z" };
+  await rerender(view);
+  expect(mocks.read).toHaveBeenCalledTimes(2);
+  expect(JSON.stringify(view.toJSON())).toContain("Export visible rows");
+  await rerender(view);
+  expect(mocks.read).toHaveBeenCalledTimes(2);
+  mocks.run = { runId: "capture", status: "running", completedAt: null };
+  await rerender(view);
+  expect(mocks.read).toHaveBeenCalledTimes(2);
+  await act(async () => view.unmount());
+});
+
+it("ignores an old disconnected read that fails after the reconnect loaded fresh ideas", async () => {
+  let failOld!: (value: { _tag: "Failure"; cause: string }) => void;
+  mocks.read.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        failOld = resolve;
+      }),
+  );
+  mocks.read.mockResolvedValue(ideaOverview);
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  mocks.connection = "reconnecting";
+  await rerender(view);
+  mocks.connection = "connected";
+  await rerender(view);
+  expect(JSON.stringify(view.toJSON())).toContain("Export visible rows");
+  await act(async () => failOld({ _tag: "Failure", cause: "not connected" }));
+  expect(JSON.stringify(view.toJSON())).not.toContain("Status unavailable");
+  expect(JSON.stringify(view.toJSON())).toContain("Export visible rows");
+  await act(async () => view.unmount());
+});
+
+it("loads ideas when development effect replay invalidates the first read", async () => {
+  mocks.read.mockResolvedValue(ideaOverview);
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(
+      <StrictMode>
+        <AssignmentsPanel threadRef={threadRef} />
+      </StrictMode>,
+    );
+  });
+  expect(JSON.stringify(view.toJSON())).toContain("Export visible rows");
+  expect(JSON.stringify(view.toJSON())).not.toContain("Status unavailable");
   await act(async () => view.unmount());
 });

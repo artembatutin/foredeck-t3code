@@ -157,7 +157,11 @@ describe("JiraSource", () => {
         },
       }));
       const adapter = yield* adapterWith(fake);
-      const result = yield* adapter.list(runtime(), { sourceId, limit: 20, statuses: ["todo"] });
+      const result = yield* adapter.list(runtime(), {
+        sourceId,
+        limit: 20,
+        statuses: ["cancelled"],
+      });
       const [item] = result.items;
       assert.strictEqual(item?.key, "PROJ-7");
       assert.strictEqual(item?.ref.itemId, "PROJ-7");
@@ -171,7 +175,7 @@ describe("JiraSource", () => {
       const [request] = fake.seen;
       assert.strictEqual(request?.path, "/rest/api/3/search/jql");
       assert.deepInclude(request?.body as object, { maxResults: 20 });
-      assert.include((request!.body as { jql: string }).jql, "statusCategory in (2)");
+      assert.include((request!.body as { jql: string }).jql, "statusCategory in (3)");
       assert.isTrue(request?.authorization?.startsWith("Basic "));
     }),
   );
@@ -182,6 +186,114 @@ describe("JiraSource", () => {
       const adapter = yield* adapterWith(fake);
       const result = yield* adapter.list(runtime(), { sourceId, limit: 50, cursor: "SAME" });
       assert.isNull(result.nextCursor);
+    }),
+  );
+
+  it.effect.each(["done", "cancelled"] as const)(
+    "returns only normalized %s issues across mixed and empty filtered pages",
+    (status) =>
+      Effect.gen(function* () {
+        const closed = (key: string, cancelled: boolean) =>
+          issueJson(key, {
+            status: { name: "Closed", statusCategory: { key: "done" } },
+            resolution: cancelled ? { name: "dUpLiCaTe" } : null,
+          });
+        const requested = status === "cancelled";
+        const fake = fakeJira(({ body }) => {
+          const { nextPageToken } = body as { nextPageToken?: string };
+          switch (nextPageToken) {
+            case undefined:
+              return {
+                body: {
+                  issues: [closed("PROJ-6", !requested), closed("PROJ-5", requested)],
+                  nextPageToken: "T2",
+                },
+              };
+            case "T2":
+              return {
+                body: {
+                  issues: [closed("PROJ-4", !requested), closed("PROJ-3", !requested)],
+                  nextPageToken: "T3",
+                },
+              };
+            case "T3":
+              return {
+                body: {
+                  issues: [closed("PROJ-2", requested), closed("PROJ-1", requested)],
+                  isLast: true,
+                },
+              };
+            default:
+              throw new Error("Unexpected page token");
+          }
+        });
+        const adapter = yield* adapterWith(fake);
+        const query = {
+          sourceId,
+          limit: 2,
+          statuses: [status],
+          assignee: "me" as const,
+          labels: ["auth"],
+        };
+        const first = yield* adapter.list(runtime(), query);
+        assert.strictEqual(first.nextCursor, "T2");
+        const second = yield* adapter.list(runtime(), { ...query, cursor: first.nextCursor! });
+        assert.deepStrictEqual(second.items, []);
+        assert.strictEqual(second.nextCursor, "T3");
+        const third = yield* adapter.list(runtime(), { ...query, cursor: second.nextCursor! });
+        assert.isNull(third.nextCursor);
+        assert.deepStrictEqual(
+          [...first.items, ...second.items, ...third.items].map((item) => [item.key, item.status]),
+          [
+            ["PROJ-5", status],
+            ["PROJ-2", status],
+            ["PROJ-1", status],
+          ],
+        );
+        assert.strictEqual(fake.seen.length, 3);
+        for (const request of fake.seen) {
+          assert.deepInclude(request.body as object, { maxResults: 2 });
+          const jql = (request.body as { jql: string }).jql;
+          assert.include(jql, "statusCategory in (3)");
+          assert.include(jql, "assignee = currentUser()");
+          assert.include(jql, 'labels = "auth"');
+        }
+      }),
+  );
+
+  it.effect("combines requested statuses and excludes unrelated normalized statuses", () =>
+    Effect.gen(function* () {
+      const fake = fakeJira(() => ({
+        body: {
+          issues: [
+            issueJson("PROJ-5", { status: { statusCategory: { key: "new" } } }),
+            issueJson("PROJ-4"),
+            issueJson("PROJ-3", { status: { statusCategory: { key: "done" } } }),
+            issueJson("PROJ-2", {
+              status: { statusCategory: { key: "done" } },
+              resolution: { name: "Cancelled" },
+            }),
+            issueJson("PROJ-1", { status: { statusCategory: { key: "future" } } }),
+          ],
+          isLast: true,
+          nextPageToken: "IGNORED",
+        },
+      }));
+      const adapter = yield* adapterWith(fake);
+      const result = yield* adapter.list(runtime(), {
+        sourceId,
+        limit: 50,
+        statuses: ["todo", "done", "cancelled"],
+      });
+      assert.deepStrictEqual(
+        result.items.map((item) => item.status),
+        ["todo", "done", "cancelled"],
+      );
+      assert.isNull(result.nextCursor);
+      const all = yield* adapter.list(runtime(), { sourceId, limit: 50 });
+      assert.strictEqual(all.items.length, 5);
+      const empty = yield* adapter.list(runtime(), { sourceId, limit: 50, statuses: [] });
+      assert.strictEqual(empty.items.length, 5);
     }),
   );
 

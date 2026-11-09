@@ -157,8 +157,20 @@ export const verifyCommands = {
  * interrupt is recorded, and the test ends one by sending its terminal events, as a provider
  * process would.
  */
-const makeFakeProvider = Effect.gen(function* () {
-  const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+export const makeFakeProvider = Effect.sync(() => {
+  // A provider session owns its stream. Sharing one queue lets another live session consume
+  // this turn's terminal event, leaving its actual run waiting forever.
+  const turnEvents = new Map<RunId, Queue.Queue<ProviderAdapter.ProviderAdapterV2Event>>();
+  const emit = (
+    turn: ProviderAdapter.ProviderAdapterV2TurnInput,
+    event: ProviderAdapter.ProviderAdapterV2Event,
+  ) =>
+    Effect.suspend(() => {
+      const events = turnEvents.get(turn.runId);
+      return events === undefined
+        ? Effect.die(`No provider session started run ${turn.runId}.`)
+        : Queue.offer(events, event);
+    });
   const started: Array<ProviderAdapter.ProviderAdapterV2TurnInput> = [];
   const interrupted: Array<ProviderAdapter.ProviderAdapterV2InterruptInput> = [];
   const responded: Array<ProviderAdapter.ProviderAdapterV2RuntimeRequestResponseInput> = [];
@@ -193,6 +205,7 @@ const makeFakeProvider = Effect.gen(function* () {
     planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
     openSession: (input) =>
       Effect.gen(function* () {
+        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
         const now = yield* DateTime.now;
         const { cwd } = input.runtimePolicy;
         if (cwd === null) return yield* Effect.die("A Factory thread runs in its worktree.");
@@ -255,6 +268,7 @@ const makeFakeProvider = Effect.gen(function* () {
           startTurn: (turn) =>
             Effect.gen(function* () {
               started.push(turn);
+              turnEvents.set(turn.runId, events);
               yield* Queue.offer(events, {
                 type: "provider_turn.updated",
                 driver,
@@ -280,7 +294,7 @@ const makeFakeProvider = Effect.gen(function* () {
   ) =>
     Effect.gen(function* () {
       const now = yield* DateTime.now;
-      yield* Queue.offer(events, {
+      yield* emit(turn, {
         type: "provider_turn.updated",
         driver,
         providerTurn: providerTurn(turn, status, now),
@@ -293,8 +307,8 @@ const makeFakeProvider = Effect.gen(function* () {
         runOrdinal: turn.runOrdinal,
         threadDisposition: "reusable",
       } as const;
-      yield* Queue.offer(
-        events,
+      yield* emit(
+        turn,
         status === "failed"
           ? {
               ...terminal,
@@ -315,7 +329,7 @@ const makeFakeProvider = Effect.gen(function* () {
   const say = (turn: ProviderAdapter.ProviderAdapterV2TurnInput, text: string) =>
     Effect.gen(function* () {
       const now = yield* DateTime.now;
-      yield* Queue.offer(events, {
+      yield* emit(turn, {
         type: "message.updated",
         driver,
         message: {
@@ -343,7 +357,7 @@ const makeFakeProvider = Effect.gen(function* () {
     Effect.gen(function* () {
       const now = yield* DateTime.now;
       const id = `command:${turn.attemptId}`;
-      yield* Queue.offer(events, {
+      yield* emit(turn, {
         type: "turn_item.updated",
         driver,
         turnItem: {
@@ -378,7 +392,7 @@ const makeFakeProvider = Effect.gen(function* () {
     Effect.gen(function* () {
       const now = yield* DateTime.now;
       const id = `subagent:${turn.attemptId}`;
-      yield* Queue.offer(events, {
+      yield* emit(turn, {
         type: "turn_item.updated",
         driver,
         turnItem: {
@@ -424,7 +438,7 @@ const makeFakeProvider = Effect.gen(function* () {
       const providerSessionId = turn.providerThread.providerSessionId;
       if (providerSessionId === null) return yield* Effect.die("The turn has no provider session.");
       const nativeItemRef = { driver, nativeId: native, strength: "strong" as const };
-      yield* Queue.offer(events, {
+      yield* emit(turn, {
         type: "node.updated",
         driver,
         node: {
@@ -445,7 +459,7 @@ const makeFakeProvider = Effect.gen(function* () {
           completedAt: null,
         },
       });
-      yield* Queue.offer(events, {
+      yield* emit(turn, {
         type: "turn_item.updated",
         driver,
         turnItem: {
@@ -469,7 +483,7 @@ const makeFakeProvider = Effect.gen(function* () {
           ...(mode === "message" ? { responseMode: "message" as const } : {}),
         },
       });
-      yield* Queue.offer(events, {
+      yield* emit(turn, {
         type: "runtime_request.updated",
         driver,
         runtimeRequest: {
@@ -504,7 +518,7 @@ const makeFakeProvider = Effect.gen(function* () {
       const providerSessionId = turn.providerThread.providerSessionId;
       if (providerSessionId === null) return yield* Effect.die("The turn has no provider session.");
       const nativeItemRef = { driver, nativeId: native, strength: "strong" as const };
-      yield* Queue.offer(events, {
+      yield* emit(turn, {
         type: "node.updated",
         driver,
         node: {
@@ -525,7 +539,7 @@ const makeFakeProvider = Effect.gen(function* () {
           completedAt: null,
         },
       });
-      yield* Queue.offer(events, {
+      yield* emit(turn, {
         type: "turn_item.updated",
         driver,
         turnItem: {
@@ -550,7 +564,7 @@ const makeFakeProvider = Effect.gen(function* () {
           ...(reason === undefined ? {} : { reason }),
         },
       });
-      yield* Queue.offer(events, {
+      yield* emit(turn, {
         type: "runtime_request.updated",
         driver,
         runtimeRequest: {
@@ -897,16 +911,17 @@ const threadLaunch = (setupScripts: World["setupScripts"]) =>
     ),
   );
 
-/** Work as the server builds it, with its real Markdown source. */
-const work = WorkManagement.WorkService.layer.pipe(
-  Layer.provide(WorkManagement.layerAdapters),
-  Layer.provideMerge(WorkManagement.layerPersistence),
-  Layer.provide(Layer.mock(GitHubApi.GitHubApi)({})),
-  Layer.provide(SourceControlRateLimit.layer),
-  Layer.provide(FetchHttpClient.layer),
-  // Markdown sources hold no credential.
-  Layer.provide(Layer.mock(ServerSecretStore.ServerSecretStore)({})),
-);
+/** Work as the server builds it, with real source adapters and an optional fake GitHub host. */
+const work = (githubApi: Partial<GitHubApi.GitHubApi["Service"]> = {}) =>
+  WorkManagement.WorkService.layer.pipe(
+    Layer.provide(WorkManagement.layerAdapters),
+    Layer.provideMerge(WorkManagement.layerPersistence),
+    Layer.provide(Layer.mock(GitHubApi.GitHubApi)(githubApi)),
+    Layer.provide(SourceControlRateLimit.layer),
+    Layer.provide(FetchHttpClient.layer),
+    // Markdown sources hold no credential.
+    Layer.provide(Layer.mock(ServerSecretStore.ServerSecretStore)({})),
+  );
 
 type WorkServiceShape = WorkManagement.WorkService.WorkService["Service"];
 
@@ -914,6 +929,7 @@ type WorkServiceShape = WorkManagement.WorkService.WorkService["Service"];
 const recordingWork = (
   calls: Array<CommentCall>,
   wrap: (service: WorkServiceShape) => WorkServiceShape,
+  githubApi: Partial<GitHubApi.GitHubApi["Service"]> | undefined,
 ) =>
   Layer.effect(
     WorkManagement.WorkService.WorkService,
@@ -928,7 +944,7 @@ const recordingWork = (
         }),
       ),
     ),
-  ).pipe(Layer.provideMerge(work));
+  ).pipe(Layer.provideMerge(work(githubApi)));
 
 /**
  * Factory's reactor over the event sink the orchestrator commits through. `Factory.workerLayer`
@@ -1017,6 +1033,7 @@ interface ServerInput {
   readonly setupScripts: World["setupScripts"];
   readonly commentCalls: Array<CommentCall>;
   readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
+  readonly githubApi: Partial<GitHubApi.GitHubApi["Service"]> | undefined;
   readonly wrapProviders: ProviderRegistryWrapper | undefined;
   readonly manualReactor: boolean;
   readonly admission: typeof Factory.FactoryAdmission.FactoryAdmission.Service | undefined;
@@ -1112,7 +1129,7 @@ const coreLayer = (input: ServerInput) => {
       runContinuationWorker: input.automaticTurnGate,
     },
   );
-  return recordingWork(input.commentCalls, input.wrapWork).pipe(
+  return recordingWork(input.commentCalls, input.wrapWork, input.githubApi).pipe(
     Layer.provideMerge(threadLaunch(input.setupScripts)),
     Layer.provideMerge(projectService),
     Layer.provideMerge(ThreadManagement.layer),
@@ -1561,6 +1578,8 @@ export const withProject = <A, E>(
     readonly itemTitle?: string;
     /** Wraps the Work service the server runs with, to fail some of its calls. */
     readonly work?: (service: WorkServiceShape) => WorkServiceShape;
+    /** Fake GitHub transport for tests of the real Work GitHub adapter. */
+    readonly githubApi?: Partial<GitHubApi.GitHubApi["Service"]>;
     /** Wraps the provider registry Factory reads, to act while one of its reads runs. */
     readonly wrapProviders?: ProviderRegistryWrapper;
     /** Factory's reactor runs only inside `world.boot`; see there. */
@@ -1624,6 +1643,7 @@ export const withProject = <A, E>(
         setupScripts,
         commentCalls,
         wrapWork: options.work ?? ((service) => service),
+        githubApi: options.githubApi,
         wrapProviders: options.wrapProviders,
         manualReactor: options.manualReactor === true,
         admission: options.admission,

@@ -36,7 +36,7 @@ const issue = (number: number, overrides: Record<string, unknown> = {}) => ({
   labels: { nodes: [{ name: "bug" }] },
   assignees: { nodes: [] },
   parent: null,
-  issueDependenciesSummary: { totalBlockedBy: 0 },
+  issueDependenciesSummary: { blockedBy: 0 },
   blockedBy: { nodes: [] },
   ...overrides,
 });
@@ -393,7 +393,7 @@ describe("GitHubIssuesSource", () => {
       const api = stubApi(() =>
         Effect.succeed(
           detailBody(6, {
-            issueDependenciesSummary: { totalBlockedBy: 1 },
+            issueDependenciesSummary: { blockedBy: 1 },
             blockedBy: { nodes: [{ number: 2, state: "OPEN" }] },
             assignees: { nodes: [{ login: "octo", name: "Octo Cat" }] },
           }),
@@ -407,6 +407,96 @@ describe("GitHubIssuesSource", () => {
       assert.strictEqual(detail.revision, "2026-10-20T10:00:00Z|I_6");
     }),
   );
+
+  it.effect("releases closed dependencies consistently in lists, details and snapshots", () =>
+    Effect.gen(function* () {
+      const dependencies = {
+        // GitHub retains closed dependency links in both the total and the connection.
+        issueDependenciesSummary: { blockedBy: 0, totalBlockedBy: 2 },
+        blockedBy: {
+          nodes: [
+            { number: 2, state: "CLOSED" },
+            { number: 3, state: "CLOSED" },
+          ],
+        },
+      };
+      const api = stubApi((call) => {
+        assert.include(call.query ?? "", "issueDependenciesSummary { blockedBy }");
+        if (call.operation === "work.issue") return Effect.succeed(detailBody(6, dependencies));
+        return Effect.succeed(
+          JSON.stringify({
+            data: {
+              repository:
+                call.operation === "work.issues.list"
+                  ? {
+                      issues: {
+                        pageInfo: { hasNextPage: false, endCursor: null },
+                        nodes: [issue(6, dependencies)],
+                      },
+                    }
+                  : { i6: issue(6, dependencies) },
+            },
+          }),
+        );
+      });
+      const adapter = yield* adapterWith(api);
+      const listed = yield* adapter.list(runtime, { sourceId, limit: 50, statuses: ["todo"] });
+      const detail = yield* adapter.get(runtime, WorkItemId.make("6"));
+      const snapshots = yield* adapter.snapshots(runtime, [WorkItemId.make("6")]);
+      assert.strictEqual(listed.items.length, 1);
+      assert.strictEqual(snapshots.length, 1);
+      for (const item of [...listed.items, detail, ...snapshots]) {
+        assert.strictEqual(item.status, "todo");
+        assert.isFalse(item.blocked);
+        assert.deepStrictEqual(item.blockedBy, []);
+      }
+    }),
+  );
+
+  it.effect("keeps unresolved blockers beyond the first fifty dependencies blocking", () =>
+    Effect.gen(function* () {
+      const api = stubApi(() =>
+        Effect.succeed(
+          detailBody(6, {
+            issueDependenciesSummary: { blockedBy: 1, totalBlockedBy: 51 },
+            blockedBy: {
+              nodes: Array.from({ length: 50 }, (_, index) => ({
+                number: index + 10,
+                state: "CLOSED",
+              })),
+            },
+          }),
+        ),
+      );
+      const adapter = yield* adapterWith(api);
+      const detail = yield* adapter.get(runtime, WorkItemId.make("6"));
+      assert.isTrue(detail.blocked);
+      assert.deepStrictEqual(detail.blockedBy, []);
+    }),
+  );
+
+  it.effect("shows only open blockers in the dependency list", () =>
+    Effect.gen(function* () {
+      const api = stubApi(() =>
+        Effect.succeed(
+          detailBody(6, {
+            issueDependenciesSummary: { blockedBy: 1, totalBlockedBy: 2 },
+            blockedBy: {
+              nodes: [
+                { number: 2, state: "CLOSED" },
+                { number: 3, state: "OPEN" },
+              ],
+            },
+          }),
+        ),
+      );
+      const adapter = yield* adapterWith(api);
+      const detail = yield* adapter.get(runtime, WorkItemId.make("6"));
+      assert.isTrue(detail.blocked);
+      assert.deepStrictEqual(detail.blockedBy, [WorkItemId.make("3")]);
+    }),
+  );
+
   it.effect("spaces every request of a multi-request update and of a queued write", () =>
     Effect.gen(function* () {
       const api = stubApi((call) =>

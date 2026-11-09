@@ -44,7 +44,11 @@ let server: {
   kind?: "single" | "parent";
 };
 
-const snapshotOf = (input: { readonly kind: "single" | "parent" }) => {
+const sources = [
+  { sourceId: "source", kind: "markdown", label: "Tasks", identity: ".foredeck/work" },
+  { sourceId: "other", kind: "markdown", label: "Other tasks", identity: "other/tasks" },
+];
+const snapshotOf = (input: { readonly kind: "single" | "parent"; readonly sourceId?: string }) => {
   const role = {
     instanceId: "codex",
     model: "m",
@@ -70,13 +74,8 @@ const snapshotOf = (input: { readonly kind: "single" | "parent" }) => {
       repository: null,
       kind: server.kind ?? input.kind,
       kindFixed: server.kind !== undefined,
-      source: {
-        sourceId: "source",
-        kind: "markdown",
-        label: "Tasks",
-        identity: ".foredeck/work",
-      },
-      sources: [],
+      source: sources.find((source) => source.sourceId === input.sourceId) ?? sources[0],
+      sources,
       sourcesOmitted: 0,
       item: null,
     },
@@ -148,6 +147,14 @@ const click = async (view: ReactTestRenderer, label: string) => {
   const found = button(view, label);
   if (found === undefined) throw new Error(`No ${label} button.`);
   await act(async () => found.props.onClick());
+};
+
+const deferred = () => {
+  let resolve!: (value: unknown) => void;
+  const promise = new Promise<unknown>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
 };
 
 const field = (view: ReactTestRenderer, label: string): ReactTestInstance =>
@@ -262,5 +269,71 @@ it("hides the planner of a single item, and asks for it once planned into tasks"
   expect(textOf(view)).toContain("planner-model");
   await click(view, "Review and start");
   expect(mocks.start.mock.calls[0]?.[0].input.kind).toBe("parent");
+  await act(async () => view.unmount());
+});
+
+it.each(["success", "failure"])(
+  "ignores a superseded %s while reviewing rapid kind and source changes",
+  async (superseded) => {
+    const view = await open();
+    const first = deferred();
+    const latest = deferred();
+    mocks.read.mockImplementationOnce(() => first.promise);
+    mocks.read.mockImplementationOnce(() => latest.promise);
+
+    await click(view, "Plan into tasks");
+    expect(button(view, "Review and start")?.props.disabled).toBe(true);
+    await click(view, "Review and start");
+    expect(mocks.start).not.toHaveBeenCalled();
+    await click(view, "Other tasks");
+    expect(mocks.read.mock.calls.at(-1)?.[0].input).toMatchObject({
+      kind: "parent",
+      sourceId: "other",
+    });
+
+    await act(async () =>
+      latest.resolve({
+        _tag: "Success",
+        value: snapshotOf({ kind: "parent", sourceId: "other" }),
+      }),
+    );
+    expect(button(view, "Review and start")?.props.disabled).toBe(false);
+    await act(async () =>
+      first.resolve(
+        superseded === "success"
+          ? { _tag: "Success", value: snapshotOf({ kind: "parent" }) }
+          : { _tag: "Failure", cause: Cause.fail(new Error("Old request failed")) },
+      ),
+    );
+    expect(textOf(view)).toContain("Work source: Other tasks (other/tasks)");
+    expect(textOf(view)).not.toContain("Old request failed");
+    await click(view, "Review and start");
+    expect(mocks.start.mock.calls[0]?.[0].input).toMatchObject({
+      kind: "parent",
+      sourceId: "other",
+      reviewVersion: "version-1-parent",
+    });
+    await act(async () => view.unmount());
+  },
+);
+
+it("keeps confirmation disabled when an old response arrives before the latest selection", async () => {
+  const view = await open();
+  const first = deferred();
+  const latest = deferred();
+  mocks.read.mockImplementationOnce(() => first.promise);
+  mocks.read.mockImplementationOnce(() => latest.promise);
+  await click(view, "Plan into tasks");
+  await click(view, "Single item");
+  await act(async () => first.resolve({ _tag: "Success", value: snapshotOf({ kind: "parent" }) }));
+  expect(button(view, "Review and start")?.props.disabled).toBe(true);
+  await click(view, "Review and start");
+  expect(mocks.start).not.toHaveBeenCalled();
+  await act(async () => latest.resolve({ _tag: "Success", value: snapshotOf({ kind: "single" }) }));
+  await click(view, "Review and start");
+  expect(mocks.start.mock.calls[0]?.[0].input).toMatchObject({
+    kind: "single",
+    reviewVersion: "version-1-single",
+  });
   await act(async () => view.unmount());
 });
