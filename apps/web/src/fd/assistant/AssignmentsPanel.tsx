@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useAtomValue } from "@effect/atom-react";
-import type { FactoryItemFact } from "@t3tools/client-runtime/fd/factory";
+import { FACTORY_CANCEL_TEXT, type FactoryItemFact } from "@t3tools/client-runtime/fd/factory";
 import { workItemLinkTarget } from "@t3tools/client-runtime/fd/work-management";
 import type { AssistantOverview, ScopedThreadRef, ThreadId } from "@t3tools/contracts";
 import {
@@ -20,6 +20,15 @@ import { Badge } from "~/components/ui/badge";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "~/components/ui/popover";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "~/components/ui/menu";
 import {
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "~/components/ui/alert-dialog";
+import {
   assignmentActions,
   availableWorkerThread,
   factoryAssignmentRow,
@@ -27,11 +36,23 @@ import {
   ideaCaptureRow,
   ideaFacts,
   portfolioRowTitle,
+  type AssignmentAction,
   type WorkItemTarget,
 } from "./workNavigation";
+import { useFactoryCancelFamily, useOverviewEpochs } from "./assignmentReads";
+import { epochsMoved } from "./overviewEpochs";
 import { readOverview, controlAssignment } from "./commands";
 import { ReviewStartCard, type ReviewTarget } from "./ReviewStartCard";
 import { PendingActionsList } from "../approvals";
+
+type Assignment = AssistantOverview["assignments"][number];
+
+/** What cancelling an assignment that runs outside Factory ends. */
+const ASSIGNMENT_CANCEL_TEXT =
+  "Its worker stops and the assignment ends. It cannot be resumed or retried afterwards; its conversation stays.";
+
+/** How long a burst of Factory and Work changes settles before the overview is read again. */
+export const OVERVIEW_CHANGE_SETTLE_MS = 400;
 
 const statusLabels: Record<string, string> = {
   draft: "Draft",
@@ -108,18 +129,86 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
   const [error, setError] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [reviewing, setReviewing] = useState<ReviewTarget | null>(null);
+  // Held with its environment, so switching away never confirms one environment's cancel in another.
+  const [cancelTarget, setCancelTarget] = useState<{
+    environmentId: ScopedThreadRef["environmentId"];
+    item: Assignment;
+  } | null>(null);
+  const confirmingCancel =
+    cancelTarget?.environmentId === threadRef.environmentId ? cancelTarget.item : null;
+  // Only the latest read started may land: an older one, or one for the environment shown before,
+  // finishing last would otherwise put back what the newer read replaced.
+  const latestRead = useRef(0);
   const refresh = useCallback(async () => {
     const environmentId = threadRef.environmentId;
+    const request = ++latestRead.current;
     const result = await read({ environmentId, input: {} });
+    if (request !== latestRead.current) return;
     setError(result._tag === "Failure");
     if (result._tag === "Success") setLoaded({ environmentId, snapshot: result.value });
   }, [read, threadRef.environmentId]);
-  // The first read happens on mount; later ones follow focus, arrival and the shared live
-  // interval instead of a fixed short loop.
+  // The first read happens on mount; later ones follow Factory's and Work's change epochs, then
+  // focus, arrival and the shared live interval for what neither epoch hears of.
   useEffect(() => {
     void refresh();
+    return () => {
+      // Unmounted or switched away: whatever is in flight is no longer this panel's to show.
+      latestRead.current++;
+    };
   }, [refresh]);
   useLiveRefresh(() => void refresh(), { key: threadRef.environmentId });
+  const refreshRef = useRef(refresh);
+  useEffect(() => {
+    refreshRef.current = refresh;
+  }, [refresh]);
+  const { factory: factoryEpoch, work: workEpoch } = useOverviewEpochs(threadRef.environmentId);
+  const seenEpochs = useRef({
+    environmentId: threadRef.environmentId,
+    epochs: { factory: factoryEpoch, work: workEpoch },
+  });
+  const settleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Epochs are compared by value, so a re-render with the same numbers reads nothing.
+  useEffect(() => {
+    const previous = seenEpochs.current;
+    const epochs = { factory: factoryEpoch, work: workEpoch };
+    seenEpochs.current = { environmentId: threadRef.environmentId, epochs };
+    if (previous.environmentId !== threadRef.environmentId) return;
+    if (!epochsMoved(previous.epochs, epochs)) return;
+    // A burst of moves, such as a delivery blocking and its Work item updating, reads once.
+    if (settleTimer.current !== null) clearTimeout(settleTimer.current);
+    settleTimer.current = setTimeout(() => {
+      settleTimer.current = null;
+      void refreshRef.current();
+    }, OVERVIEW_CHANGE_SETTLE_MS);
+  }, [threadRef.environmentId, factoryEpoch, workEpoch]);
+  useEffect(
+    () => () => {
+      if (settleTimer.current !== null) clearTimeout(settleTimer.current);
+    },
+    [],
+  );
+  const cancelDeliveryId =
+    confirmingCancel?.executor === "factory"
+      ? (confirmingCancel.factory?.deliveryId ?? null)
+      : null;
+  const cancelFamily = useFactoryCancelFamily(threadRef.environmentId, cancelDeliveryId);
+  const runAction = async (item: Assignment, action: AssignmentAction) => {
+    setBusy(item.assignmentId);
+    try {
+      const result = await control({
+        environmentId: threadRef.environmentId,
+        input: {
+          assignmentId: item.assignmentId,
+          managerThreadId: threadRef.threadId,
+          action,
+        },
+      });
+      // Show the new state now rather than at the next slow refresh.
+      if (result._tag === "Success") await refresh();
+    } finally {
+      setBusy(null);
+    }
+  };
   const projectName = (id: string) =>
     projects.find((p) => p.id === id && p.environmentId === threadRef.environmentId)?.title ?? id;
   const work = snapshot?.assignments ?? [];
@@ -137,7 +226,7 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
     void navigate(target);
     close();
   };
-  const workerThread = (item: AssistantOverview["assignments"][number] | undefined) =>
+  const workerThread = (item: Assignment | undefined) =>
     availableWorkerThread(item, threadRef.environmentId, threads);
 
   return (
@@ -413,22 +502,15 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                             <MenuItem
                               key={action}
                               disabled={!allowed || busy !== null}
-                              onClick={async () => {
-                                setBusy(item.assignmentId);
-                                try {
-                                  const result = await control({
-                                    environmentId: threadRef.environmentId,
-                                    input: {
-                                      assignmentId: item.assignmentId,
-                                      managerThreadId: threadRef.threadId,
-                                      action,
-                                    },
-                                  });
-                                  // Show the new state now rather than at the next slow refresh.
-                                  if (result._tag === "Success") await refresh();
-                                } finally {
-                                  setBusy(null);
+                              onClick={() => {
+                                // Cancelling ends the assignment, and a delivery's family with it,
+                                // so it asks first as Factory's own section does.
+                                if (action === "cancel") {
+                                  setCancelTarget({ environmentId: threadRef.environmentId, item });
+                                  close();
+                                  return;
                                 }
+                                return runAction(item, action);
                               }}
                             >
                               {
@@ -451,6 +533,48 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
           }
         </PortfolioPopover>
       ) : null}
+      <AlertDialog
+        open={confirmingCancel !== null}
+        onOpenChange={(open) => {
+          if (!open) setCancelTarget(null);
+        }}
+      >
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {cancelDeliveryId !== null ? "Cancel the delivery of " : "Cancel "}
+              {confirmingCancel
+                ? portfolioRowTitle(confirmingCancel, confirmingCancel.assignmentId)
+                : ""}
+              ?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {cancelDeliveryId !== null
+                ? cancelFamily === null
+                  ? "Checking what cancelling it ends…"
+                  : FACTORY_CANCEL_TEXT[cancelFamily]
+                : ASSIGNMENT_CANCEL_TEXT}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" />}>Keep it</AlertDialogClose>
+            <Button
+              variant="destructive"
+              disabled={
+                !allowed || busy !== null || (cancelDeliveryId !== null && cancelFamily === null)
+              }
+              onClick={() => {
+                if (confirmingCancel === null) return;
+                const item = confirmingCancel;
+                setCancelTarget(null);
+                void runAction(item, "cancel");
+              }}
+            >
+              {cancelDeliveryId !== null ? "Cancel delivery" : "Cancel assignment"}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
       {reviewing !== null ? (
         <ReviewStartCard
           environmentId={threadRef.environmentId}

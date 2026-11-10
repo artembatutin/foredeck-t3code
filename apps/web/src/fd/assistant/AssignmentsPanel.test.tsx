@@ -7,6 +7,8 @@ const mocks = vi.hoisted(() => ({
   read: vi.fn(),
   control: vi.fn(),
   navigate: vi.fn(),
+  epochs: { factory: null as number | null, work: null as number | null },
+  cancelFamily: "single" as string | null,
   passthrough: ({ children }: { children?: unknown }) => children ?? null,
 }));
 vi.mock("~/components/ui/button", () => ({ Button: (props: object) => <button {...props} /> }));
@@ -27,6 +29,23 @@ vi.mock("~/components/ui/menu", () => ({
     cloneElement(render, {}, children),
   MenuItem: (props: object) => <button data-menu-item {...props} />,
 }));
+vi.mock("~/components/ui/alert-dialog", () => ({
+  AlertDialog: ({ open, children }: { open: boolean; children: ReactNode }) =>
+    open ? <div data-dialog>{children}</div> : null,
+  AlertDialogPopup: mocks.passthrough,
+  AlertDialogHeader: mocks.passthrough,
+  AlertDialogFooter: mocks.passthrough,
+  AlertDialogTitle: mocks.passthrough,
+  AlertDialogDescription: ({ children }: { children: ReactNode }) => (
+    <p data-dialog-description>{children}</p>
+  ),
+  AlertDialogClose: mocks.passthrough,
+}));
+vi.mock("./assignmentReads", () => ({
+  useOverviewEpochs: () => mocks.epochs,
+  useFactoryCancelFamily: (_environmentId: unknown, deliveryId: string | null) =>
+    deliveryId === null ? null : mocks.cancelFamily,
+}));
 vi.mock("~/state/entities", () => ({ useProjects: () => [], useThreadShells: () => [] }));
 vi.mock("~/hooks/useLiveRefresh", () => ({ useLiveRefresh: () => undefined }));
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => mocks.navigate }));
@@ -38,10 +57,14 @@ vi.mock("./commands", () => ({
 vi.mock("~/state/use-atom-command", () => ({
   useAtomCommand: (command: unknown) => (command === "read-overview" ? mocks.read : mocks.control),
 }));
-import { AssignmentsPanel } from "./AssignmentsPanel";
+import { FACTORY_CANCEL_TEXT } from "@t3tools/client-runtime/fd/factory";
+import { AssignmentsPanel, OVERVIEW_CHANGE_SETTLE_MS } from "./AssignmentsPanel";
 
 afterEach(() => {
   vi.clearAllMocks();
+  vi.useRealTimers();
+  mocks.epochs = { factory: null, work: null };
+  mocks.cancelFamily = "single";
 });
 
 const overview = (state: string) => ({
@@ -146,6 +169,13 @@ const factoryOverview = (state: string, status: string) => {
   };
 };
 
+const dialog = (view: ReactTestRenderer) =>
+  view.root.findAll((node) => node.props["data-dialog"] === true)[0];
+const dialogText = (view: ReactTestRenderer) =>
+  view.root.findAll((node) => node.props["data-dialog-description"] === true)[0]?.props.children;
+const button = (view: ReactTestRenderer, label: string) =>
+  view.root.findAll((node) => node.type === "button" && node.props.children === label)[0]!;
+
 const menuLabels = (view: ReactTestRenderer) =>
   view.root
     .findAll((node) => node.props["data-menu-item"] === true)
@@ -163,12 +193,18 @@ it("offers a Factory row only what the server accepts, and refreshes after it", 
   mocks.read.mockResolvedValue(factoryOverview("needs-input", "blocked"));
   mocks.control.mockResolvedValue({ _tag: "Failure", cause: "refused" });
   await act(async () => {
-    await menuItem(view, "Cancel").props.onClick();
+    menuItem(view, "Cancel").props.onClick();
+  });
+  await act(async () => {
+    button(view, "Cancel delivery").props.onClick();
   });
   expect(mocks.read).toHaveBeenCalledTimes(1);
   mocks.control.mockResolvedValue({ _tag: "Success", value: undefined });
   await act(async () => {
-    await menuItem(view, "Cancel").props.onClick();
+    menuItem(view, "Cancel").props.onClick();
+  });
+  await act(async () => {
+    button(view, "Cancel delivery").props.onClick();
   });
   expect(mocks.read).toHaveBeenCalledTimes(2);
   expect(menuLabels(view)).toEqual(["Resume", "Cancel"]);
@@ -194,4 +230,130 @@ it("opens a Factory row's Work item from the row", async () => {
     },
   });
   await act(async () => view.unmount());
+});
+
+it("asks before cancelling a Factory delivery, saying what its family loses", async () => {
+  mocks.read.mockResolvedValue(factoryOverview("running", "running"));
+  mocks.cancelFamily = "child";
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  await act(async () => {
+    menuItem(view, "Cancel").props.onClick();
+  });
+  expect(mocks.control).not.toHaveBeenCalled();
+  expect(dialogText(view)).toBe(FACTORY_CANCEL_TEXT.child);
+
+  // Keeping it closes the confirmation and changes nothing.
+  await act(async () => {
+    dialog(view)!.parent!.props.onOpenChange(false);
+  });
+  expect(dialog(view)).toBeUndefined();
+  expect(mocks.control).not.toHaveBeenCalled();
+});
+
+it("cannot confirm a delivery's cancel until its family is known", async () => {
+  mocks.read.mockResolvedValue(factoryOverview("running", "running"));
+  mocks.cancelFamily = null;
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  await act(async () => {
+    menuItem(view, "Cancel").props.onClick();
+  });
+  expect(button(view, "Cancel delivery").props.disabled).toBe(true);
+});
+
+it("asks before cancelling an ordinary assignment, then cancels it", async () => {
+  mocks.read.mockResolvedValue(overview("running"));
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  await act(async () => {
+    menuItem(view, "Cancel").props.onClick();
+  });
+  expect(mocks.control).not.toHaveBeenCalled();
+  mocks.control.mockResolvedValue({ _tag: "Success", value: undefined });
+  mocks.read.mockResolvedValue(overview("cancelled"));
+  await act(async () => {
+    button(view, "Cancel assignment").props.onClick();
+  });
+  expect(mocks.control).toHaveBeenCalledWith({
+    environmentId: threadRef.environmentId,
+    input: { assignmentId: "a-1", managerThreadId: threadRef.threadId, action: "cancel" },
+  });
+  expect(dialog(view)).toBeUndefined();
+  expect(badge(view)).toBe("Cancelled");
+});
+
+it("keeps the latest overview read started, whichever finishes last", async () => {
+  let finishFirst!: (value: unknown) => void;
+  mocks.read.mockReturnValueOnce(new Promise((resolve) => (finishFirst = resolve)));
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  // A second environment's read starts and lands before the first one.
+  const other = { ...threadRef, environmentId: EnvironmentId.make("env-2") };
+  mocks.read.mockResolvedValueOnce(overview("stopped"));
+  await act(async () => {
+    view.update(<AssignmentsPanel threadRef={other} />);
+  });
+  expect(badge(view)).toBe("Stopped");
+  await act(async () => {
+    finishFirst(overview("running"));
+  });
+  expect(badge(view)).toBe("Stopped");
+});
+
+it("reads the overview again once Factory's or Work's epoch moves and settles", async () => {
+  vi.useFakeTimers();
+  mocks.read.mockResolvedValue(overview("running"));
+  mocks.epochs = { factory: 3, work: 7 };
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  expect(mocks.read).toHaveBeenCalledTimes(1);
+
+  // The same epochs again read nothing.
+  mocks.epochs = { factory: 3, work: 7 };
+  await act(async () => {
+    view.update(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  await act(async () => {
+    vi.advanceTimersByTime(OVERVIEW_CHANGE_SETTLE_MS);
+  });
+  expect(mocks.read).toHaveBeenCalledTimes(1);
+
+  // A burst of moves reads once, after it settles.
+  mocks.read.mockResolvedValue(overview("needs-input"));
+  mocks.epochs = { factory: 4, work: 7 };
+  await act(async () => {
+    view.update(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  mocks.epochs = { factory: 4, work: 8 };
+  await act(async () => {
+    view.update(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  expect(mocks.read).toHaveBeenCalledTimes(1);
+  await act(async () => {
+    vi.advanceTimersByTime(OVERVIEW_CHANGE_SETTLE_MS);
+  });
+  expect(mocks.read).toHaveBeenCalledTimes(2);
+  expect(badge(view)).toBe("Needs input");
+
+  // A move that was still settling when the panel closed reads nothing.
+  mocks.epochs = { factory: 5, work: 8 };
+  await act(async () => {
+    view.update(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  await act(async () => view.unmount());
+  await act(async () => {
+    vi.advanceTimersByTime(OVERVIEW_CHANGE_SETTLE_MS);
+  });
+  expect(mocks.read).toHaveBeenCalledTimes(2);
 });
