@@ -524,9 +524,11 @@ result, so the child can run, even to its approval, before its parent waits for 
 takes an approval stored by then as it takes the start, and the boot sweep takes a start a
 restart kept from the parent, with that approval, rather than block on the lost effect.
 
-A parent's cancel cancels its children that are not approved, and by owner decision a child's own
-cancel cancels its parent, so its unfinished siblings too; each stops what its threads run, and
-approved children keep their approvals. Each delivery's cancel is its own commit, so the boot
+A parent's cancel cancels its children, and by owner decision a child's own cancel cancels its
+parent, so its siblings too; each stops what its threads run. Approved children are cancelled as
+well, keeping their approval evidence: an approved child counts as active for the
+one-delivery-per-item index, and with no pull request left to carry its work it would otherwise
+hold its item forever. Each delivery's cancel is its own commit, so the boot
 sweep completes a cancellation a restart cut short between a parent and its children before
 anything else moves them.
 
@@ -580,9 +582,12 @@ raising them makes older clients leave out the reviews that use the room.
 A failed verify or a blocking review becomes a repair turn on the author thread, then the branch is
 settled and verified again. Each kind counts against its own limit, and every delivery keeps the
 limits it started with, so changing the settings never moves a loop already running. A failure's
-fingerprint hashes the stage, the log tail or the findings to fix, and the tree. Seeing the same
-failure on the same tree again in the current retry allowance stops the loop even with rounds
-left; a changed tree has a different fingerprint (see
+fingerprint hashes only the stage and the tree it failed on. The same stage failing again on the
+same tree in the current retry allowance stops the loop even with rounds left, since the last
+round changed nothing that stage judges; a changed tree has a different fingerprint. The failure's
+text is deliberately left out: log timings and reworded findings differ every run, so a hash of
+them never repeated and loops ran to the round limit. Fingerprints persisted before this hashed
+that text and never equal current ones, costing at most one extra round (see
 [`fingerprint.ts`](../../apps/server/src/fd/factory/pipeline/fingerprint.ts)).
 
 Only the first review round runs on a fresh thread that never sees the author's account. After a
@@ -664,8 +669,12 @@ last any time and the command, settings or machine may have changed since; revie
 usual round rules, and the author gets no new turn. Only a delivery resuming the PR stage on
 exactly its approved commit (the task's `lastReviewedSha`, with the last receipt's tree, on a
 settled branch) opens its pull request without that. Any other unsettled branch gets one
-fix-commit turn naming the checkpoint, an unrepairable one blocks, and a deleted thread of the
-delivery blocks it again: a resume never launches a replacement for a thread the delivery recorded.
+fix-commit turn naming the checkpoint, an unrepairable one blocks, and a deleted thread the resume
+would send a turn to blocks it again: a resume never launches a replacement for a thread the
+delivery recorded. Only those threads count, the author's (or the one its unrecorded launch made)
+and the reviewer's while a fix-review reply awaits its follow-up turn; a finished reviewer, or a
+planner whose plan waits at the gate, is never sent anything again, and blocking on its deletion
+would leave only cancel.
 A resume that blocks keeps the checkpoint, so the next one still knows it stopped before `pr`.
 
 A delivery with no author recorded is not proof that no author ran. A launch can go through and its
@@ -684,7 +693,8 @@ its failure after the resume blocks. A thread that launch made and the owner del
 every resume, like any deleted thread of the delivery.
 
 A parent that stopped or blocked while planning resumes into planning, never into authoring.
-Stopped before the plan gate, it waits there again on the same plan. Its planner launch is recorded
+Stopped before the plan gate, it waits there again on the same plan, whether or not the planner's
+thread still exists; planning again blocks on its deletion. Its planner launch is recorded
 and replayed like an author's (`plannerLaunch`). A recorded planner gets one retry turn in a new
 plan round, because a plan accepted before the block, from a run that failed after submitting,
 must not stand in for what the resumed planner submits.
@@ -901,7 +911,8 @@ delivery's worktree.
 The delivery records how its pull request left `open` (`pullRequest.outcome`), so a report of
 either arriving later is inert, and a close's cancel is told apart from the owner's: only the close
 announces itself on the item. A closed parent cancels as an owner's cancel does, so its approved
-children keep their approvals; a merged parent's approved children are done once it is.
+children are cancelled with their approvals kept; a merged parent's approved children are done
+once it is.
 
 ## Follow-through rounds are core's watch wakes
 
@@ -928,8 +939,8 @@ an earlier child's thread changes nothing. The round's run end needs no such rou
 parent's stage attempt names that thread and run and the child's attempts have all finished; the
 worker sends a deletion of that thread to the parent too, since only the child records it.
 Recovery and cancels follow the same rule. The boot sweep sends the wakes it finds on that thread
-to the parent. The approved child is never cancelled to stop what runs there: a cancelled parent
-interrupts its rounds' runs on that thread itself, and a run that goes live there later is judged
+to the parent. The approved child's cancel is never what stops a parent's round there: a
+cancelled parent interrupts its rounds' runs on that thread itself, and a run that goes live there later is judged
 for the parent that follows the thread before the child whose launch made it.
 
 A wake is identified by its command, not its text: the run's command receipt is a
@@ -1086,7 +1097,9 @@ not gated, since its message comes from the owner or from an agent outside the f
 
 A family is a structure, not a guess: the threads a delivery's launch made, and every thread whose
 lineage leads to one, at most eight levels deep. A deeper walk fails like a failed read. Threads
-delegated from elsewhere are not in it.
+delegated from elsewhere are not in it. An automatic turn whose family cannot be read fails its
+consult only while some root is or was managed (`FactoryAdmission.managesAny`): with none, no managed
+family can hold its thread, and an ordinary continuation must not be dropped over a read it does not need.
 
 Each turn or run on a family thread has one class, decided from its exact cause
 ([`FactoryOwnership.ts`](../../apps/server/src/fd/factory/FactoryOwnership.ts)) and recorded on first
@@ -1128,7 +1141,7 @@ escape the slot. So a caller is governed by the thread's family root, whichever 
 that root has any management; other threads, outside clients and never-managed deliveries are
 unchanged.
 
-[`callerTools.ts`](../../apps/server/src/fd/assistant-handoff/callerTools.ts) gives every published
+[`callerTools.ts`](../../apps/server/src/fd/assistant/callerTools.ts) gives every published
 tool a class, by exact name, and a name it does not list is refused. A new tool must join it:
 [`registration.test.ts`](../../apps/server/src/mcp/toolkits/worktree/registration.test.ts) fails on a
 published tool with no class.

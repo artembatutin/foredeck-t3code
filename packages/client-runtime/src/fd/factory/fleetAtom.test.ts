@@ -75,8 +75,10 @@ const harness = (
     ),
   );
   const held = new Set<EnvironmentId>();
+  const reads: Array<EnvironmentId> = [];
   const deliveries = Atom.family((environmentId: EnvironmentId) =>
     Atom.make((get) => {
+      reads.push(environmentId);
       held.add(environmentId);
       get.addFinalizer(() => held.delete(environmentId));
       return get(results(environmentId));
@@ -108,10 +110,34 @@ const harness = (
     load: (environmentId: EnvironmentId, read: Read) => registry.set(results(environmentId), read),
     support: (environmentId: EnvironmentId, value: boolean) =>
       registry.set(supported(environmentId), value),
+    refresh: () => registry.refresh(fleet),
+    reads: () => {
+      settle();
+      return [...reads].sort();
+    },
   };
 };
 
 describe("createFactoryFleetAtom", () => {
+  it("reads again the deliveries of the connected environments it read when refreshed", () => {
+    const fleet = harness([
+      [envA, "connected"],
+      [envB, "reconnecting"],
+    ]);
+    fleet.load(envA, loaded(delivery("a1")));
+    expect(fleet.fleet().rows).toEqual(["env-a:a1"]);
+    const before = fleet.reads();
+    expect(new Set(before)).toEqual(new Set([envA]));
+
+    fleet.refresh();
+    expect(fleet.reads()).toEqual([...before, envA]);
+    // Rows already read stay while they are read again.
+    fleet.load(envA, AsyncResult.waiting(loaded(delivery("a1"))));
+    expect(fleet.fleet()).toMatchObject({ rows: ["env-a:a1"], loading: false, refreshing: true });
+    fleet.load(envA, loaded(delivery("a1")));
+    expect(fleet.fleet()).toMatchObject({ refreshing: false });
+  });
+
   it("reads only connected Factory environments and names the rest as not connected", () => {
     const fleet = harness([
       [envA, "connected"],
@@ -133,6 +159,7 @@ describe("createFactoryFleetAtom", () => {
       ],
       rows: ["env-a:a1"],
       loading: false,
+      refreshing: false,
       failed: [],
       disconnected: [envB],
     });
@@ -154,6 +181,7 @@ describe("createFactoryFleetAtom", () => {
       expect(fleet.fleet()).toMatchObject({
         rows: ["env-a:a1"],
         loading: false,
+        refreshing: false,
         failed: [],
         disconnected: [envB],
       });
@@ -199,6 +227,7 @@ describe("createFactoryFleetAtom", () => {
       environments: [],
       rows: [],
       loading: false,
+      refreshing: false,
       failed: [],
       disconnected: [],
     });
@@ -218,6 +247,7 @@ describe("createFactoryFleetAtom", () => {
     expect(fleet.fleet()).toMatchObject({
       rows: ["env-c:c1"],
       loading: false,
+      refreshing: false,
       failed: [],
       disconnected: [],
     });

@@ -284,8 +284,9 @@ const holdsApprovedCommit = (
 
 /**
  * Picks a stopped or blocked delivery up from its checkpoint, the stage it stopped before or the
- * one it blocked in, like Looper's `--finish`. A deleted thread of the delivery blocks it again,
- * and so does a branch that cannot be repaired. A settled branch is verified again, never trusting
+ * one it blocked in, like Looper's `--finish`. A deleted thread the resume would send a turn to
+ * blocks it again (the author, or the reviewer awaiting a fix-review reply's follow-up), and so
+ * does a branch that cannot be repaired. A settled branch is verified again, never trusting
  * an earlier receipt, then reviewed; only a delivery resuming the PR stage on the very commit its
  * task was approved for opens its pull request at once. A branch with repairable problems gets one
  * fix-commit turn naming the checkpoint, and is settled after it as after any author turn.
@@ -300,16 +301,14 @@ const resume = (delivery: FactoryDeliveryState, check: FactoryResumeCheck): Fact
   const lost = unrecordedAuthorLaunch(delivery);
   // Kept as the author launch whatever happens next, so every later resume finds it again.
   const known = lost === undefined ? delivery : { ...delivery, authorLaunch: lost };
-  const { author } = known.threads;
-  const deleted =
-    author !== undefined && check.deletedThreads.includes(author)
-      ? author
-      : check.deletedThreads[0];
-  if (deleted !== undefined) {
-    return blocked(known, { reason: "thread_deleted", threadId: deleted });
-  }
+  const { author, reviewer } = known.threads;
   const checkpoint = known.checkpoint ?? known.stage;
   if (author === undefined) {
+    // Without an author, what is gone is the thread an unrecorded launch made, which a replay
+    // would send to.
+    const [deleted] = check.deletedThreads;
+    if (deleted !== undefined)
+      return blocked(known, { reason: "thread_deleted", threadId: deleted });
     if (lost === undefined) return begin(resumed(known), standardStages.author);
     const launch = check.unrecordedAuthorRunEnded
       ? { ...lost, resumeCheckpoint: checkpoint ?? "author" }
@@ -323,11 +322,29 @@ const resume = (delivery: FactoryDeliveryState, check: FactoryResumeCheck): Fact
       effects: [launch],
     };
   }
+  // Only a thread the resume goes on to send a turn to holds it: the author, and the reviewer
+  // while the author's fix-review reply awaits its follow-up turn. A finished reviewer whose
+  // round is over is not needed again, since the next review round launches a fresh one.
+  if (check.deletedThreads.includes(author)) {
+    return blocked(known, { reason: "thread_deleted", threadId: author });
+  }
   const { worktree } = check;
   // The worktree is read whenever the author has launched; without it there is nothing to judge.
   if (worktree === null) return unchanged(delivery);
+  const opensPr =
+    worktree.settle.status === "settled" &&
+    checkpoint === "pr" &&
+    holdsApprovedCommit(delivery, worktree);
+  if (
+    !opensPr &&
+    reviewer !== undefined &&
+    delivery.reviewResponse !== null &&
+    check.deletedThreads.includes(reviewer)
+  ) {
+    return blocked(known, { reason: "thread_deleted", threadId: reviewer });
+  }
   return resumeBranch(delivery, worktree.settle, author, () =>
-    checkpoint === "pr" && holdsApprovedCommit(delivery, worktree)
+    opensPr
       ? begin({ ...resumed(delivery), status: "approved" }, standardStages.pr)
       : begin(resumed(delivery), standardStages.verify),
   );
@@ -335,8 +352,9 @@ const resume = (delivery: FactoryDeliveryState, check: FactoryResumeCheck): Fact
 
 /**
  * Picks a parent that stopped or blocked while planning up again; it never begins the author
- * stage. A deleted thread of the delivery blocks it again. Stopped where it would have entered
- * the plan gate, it waits there again on the same plan, issuing nothing. A planner launch the
+ * stage. Stopped where it would have entered the plan gate, it waits there again on the same plan,
+ * issuing nothing, whether or not its planner's thread still exists. Otherwise a deleted planner
+ * thread blocks it again. A planner launch the
  * delivery issued but never recorded is issued again under its own id, as an author's is (see
  * `resume`); when that run had already ended, the planner gets its retry turn once the launch is
  * recorded. A recorded planner gets one plan retry turn in a new plan round, naming the problems
@@ -348,16 +366,20 @@ const resumePlanning = (
   check: FactoryResumeCheck,
 ): FactoryAdvance => {
   const { planner } = delivery.threads;
-  const deleted =
-    planner !== undefined && check.deletedThreads.includes(planner)
-      ? planner
-      : check.deletedThreads[0];
-  if (deleted !== undefined) {
-    return blocked(delivery, { reason: "thread_deleted", threadId: deleted });
-  }
+  // Waiting at the gate sends the planner nothing, so its deletion does not hold the plan there.
   const plan = acceptedPlan(delivery);
   if (delivery.checkpoint === "approve_plan" && plan !== undefined && plan.tasks.length > 0) {
     return begin(resumed(delivery), standardStages.approve_plan);
+  }
+  // Planning again sends a turn to the planner, or replays the launch that made its thread.
+  const deleted =
+    planner === undefined
+      ? check.deletedThreads[0]
+      : check.deletedThreads.includes(planner)
+        ? planner
+        : undefined;
+  if (deleted !== undefined) {
+    return blocked(delivery, { reason: "thread_deleted", threadId: deleted });
   }
   if (planner === undefined) {
     const lost = unrecordedPlannerLaunch(delivery);

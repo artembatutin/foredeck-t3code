@@ -44,8 +44,8 @@ const bootSweeps = (times: number) =>
   );
 
 /**
- * The world's item with 55 notes, so every ordinary read shows the oldest 50 and says it left
- * some out, and a delivery of it. Returns what a crashed process's comments look like on it.
+ * The world's item with 55 notes, so every ordinary read shows only the newest 50 and says it
+ * left some out, and a delivery of it. Returns what a crashed process's comments look like on it.
  */
 const crashedOnLongItem = (world: World) =>
   Effect.gen(function* () {
@@ -90,6 +90,12 @@ const crashedOnLongItem = (world: World) =>
       ),
       /** A comment claimed, and the process died before sending it. */
       unsent: claimed,
+      /** Notes the team adds after Factory's, pushing them out of every ordinary read. */
+      bury: Effect.forEach(
+        Array.from({ length: 50 }, (_, index) => index + 56),
+        (note) => work.addComment(member, { ref, body: `Team note ${note}.` }),
+        { discard: true },
+      ),
       occurrences: (text: string) =>
         fileSystem
           .readFileString(taskFile)
@@ -105,6 +111,8 @@ describe("Factory comments a crash left unfinished, on a Markdown item past its 
         const item = yield* crashedOnLongItem(world);
 
         yield* item.accepted;
+        // Past the newest 50, so only a lookup of the whole history can find it was taken.
+        yield* item.bury;
         yield* bootSweeps(3);
         assert.strictEqual(yield* item.occurrences(reference(1)), 1);
         assert.strictEqual(item.attempts(), 1);
@@ -117,10 +125,12 @@ describe("Factory comments a crash left unfinished, on a Markdown item past its 
         assert.strictEqual(item.attempts(), 2);
         assert.deepStrictEqual(yield* item.store.listUnfinished(), []);
 
-        // Still past the bound: neither reference shows in an ordinary read.
+        // The buried one is past the bound; the one posted last is the newest note.
         const after = yield* item.work.getItem(member, { ref: item.ref });
         assert.isTrue(after.commentsTruncated);
-        assert.isFalse(after.comments.some(({ body }) => body.includes("Factory delivery")));
+        const shows = (text: string) => after.comments.some(({ body }) => body.includes(text));
+        assert.isFalse(shows(reference(1)));
+        assert.isTrue(shows(reference(2)));
       }).pipe(Effect.orDie),
     ),
   );

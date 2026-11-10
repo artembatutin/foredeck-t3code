@@ -870,8 +870,15 @@ export const FactoryPlanReplanInput = Schema.Struct({
 });
 export type FactoryPlanReplanInput = typeof FactoryPlanReplanInput.Type;
 
-/** Every delivery on the environment, or one project's. */
-export const FactoryDeliveryListInput = Schema.Struct({ projectId: Schema.optionalKey(ProjectId) });
+/**
+ * Every delivery on the environment, or one project's; with `activeOnly`, only those not done or
+ * cancelled. A server older than `activeOnly` ignores it and lists every delivery, so a client
+ * asking for active ones still filters what comes back.
+ */
+export const FactoryDeliveryListInput = Schema.Struct({
+  projectId: Schema.optionalKey(ProjectId),
+  activeOnly: Schema.optionalKey(Schema.Boolean),
+});
 export type FactoryDeliveryListInput = typeof FactoryDeliveryListInput.Type;
 
 /** Newest first. A delivery this build cannot read is left out instead of failing the list. */

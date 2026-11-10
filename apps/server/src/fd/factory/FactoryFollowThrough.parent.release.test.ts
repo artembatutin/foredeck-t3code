@@ -61,6 +61,41 @@ const rowsOf = (deliveryId: FactoryDeliveryId) =>
     };
   }).pipe(Effect.orDie);
 
+/** A delivery's rows as the tests read them: its delivery row among others. */
+type ReadRows = { readonly delivery: ReadonlyArray<object> } & Readonly<Record<string, unknown>>;
+
+/** A delivery's rows without the time its row was last written, its state decoded. */
+const comparable = (rows: ReadRows | undefined): Record<string, unknown> => {
+  if (rows === undefined) return assert.fail("The delivery's rows were read.");
+  return {
+    ...rows,
+    delivery: rows.delivery.map((row) => {
+      const { updated_at: _, ...kept } = row as Record<string, unknown>;
+      return { ...kept, state_json: JSON.parse(String(kept.state_json)) as unknown };
+    }),
+  };
+};
+
+/**
+ * An approved child's rows as its parent's cancel leaves them: cancelled, keeping everything else
+ * it recorded, its approval included, so its item is free to deliver again.
+ */
+const endedWithParent = (rows: ReadRows | undefined): Record<string, unknown> => {
+  if (rows === undefined) return assert.fail("The delivery's rows were read.");
+  return comparable({
+    ...rows,
+    delivery: rows.delivery.map((row) => {
+      const kept = row as Record<string, unknown>;
+      const state = JSON.parse(String(kept.state_json)) as Record<string, unknown>;
+      return {
+        ...kept,
+        status: "cancelled",
+        state_json: JSON.stringify({ ...state, status: "cancelled" }),
+      };
+    }),
+  });
+};
+
 /** Cancels the delivery as its owner does. */
 const cancel = (deliveryId: FactoryDeliveryId) =>
   Effect.flatMap(service, (factory) => factory.cancel(deliveryId)).pipe(Effect.orDie);
@@ -111,7 +146,7 @@ const targetOf = (
 
 /**
  * The parent's work stays after a cancel: its worktree at the same HEAD, its branch, its tasks'
- * approvals, and its approved children as they were. A child its owner cancelled ends cancelled
+ * approvals, and its approved children's records, the children ended with it. A child its owner cancelled ends cancelled
  * with everything else it recorded, its receipts and reviews included.
  */
 const assertWorkKept = (
@@ -129,14 +164,20 @@ const assertWorkKept = (
     );
     assert.deepStrictEqual((yield* rowsOf(parent.deliveryId)).tasks, parent.parentRows.tasks);
     const [first, last] = parent.childRows;
-    assert.deepStrictEqual(yield* rowsOf(parent.first.deliveryId), first);
+    assert.deepStrictEqual(
+      comparable(yield* rowsOf(parent.first.deliveryId)),
+      endedWithParent(first),
+    );
     if (child) {
       assert.deepStrictEqual(yield* stateOf(parent.last.deliveryId), {
         ...parent.lastState,
         status: "cancelled",
       });
     } else {
-      assert.deepStrictEqual(yield* rowsOf(parent.last.deliveryId), last);
+      assert.deepStrictEqual(
+        comparable(yield* rowsOf(parent.last.deliveryId)),
+        endedWithParent(last),
+      );
     }
   });
 

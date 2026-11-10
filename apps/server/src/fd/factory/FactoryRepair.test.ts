@@ -309,6 +309,8 @@ const failureOutput = "1 test failed: the export has no header row";
 const verifyCommands = {
   fails: `console.error(${JSON.stringify(failureOutput)}); process.exitCode = 1;`,
   passes: `console.log("all checks passed")`,
+  // A log that differs every run, as timings and durations do.
+  failsWithTimings: `console.error("failed after " + process.hrtime.bigint() + "ns"); process.exitCode = 1;`,
 };
 const useSettings = (script: string) =>
   Effect.flatMap(FactorySettings.FactorySettings, (settings) =>
@@ -459,7 +461,6 @@ describe("fix-verify rounds", () => {
           assert.deepStrictEqual(repairing.rounds, { fix: 1, review: 0 });
           const fingerprint = failureFingerprint({
             stage: "verify",
-            tail: failureOutput,
             tree: yield* treeOf(cwd),
           });
           assert.deepStrictEqual(repairing.fingerprints, [fingerprint]);
@@ -546,12 +547,10 @@ describe("fix-verify rounds", () => {
 
           const first = failureFingerprint({
             stage: "verify",
-            tail: failureOutput,
             tree: firstTree,
           });
           const repeated = failureFingerprint({
             stage: "verify",
-            tail: failureOutput,
             tree: secondTree,
           });
           assert.notStrictEqual(first, repeated);
@@ -583,6 +582,24 @@ describe("fix-verify rounds", () => {
           );
         }),
       ),
+  );
+
+  it.effect("stops when verify fails again on an unchanged tree, though its log differs", () =>
+    withWorld((world) =>
+      Effect.gen(function* () {
+        yield* useSettings(verifyCommands.failsWithTimings);
+        yield* authorFinishes(world, { limits: limits(3, 2) });
+        assert.strictEqual(world.sends.length, 1);
+
+        // The repair round commits nothing; the second verify prints another duration.
+        yield* runEnds(author, runOf(world.sends[0]));
+
+        const blocked = yield* state;
+        assert.deepStrictEqual(blocked.block, { reason: "repeated_failure", stage: "verify" });
+        assert.deepStrictEqual(blocked.rounds, { fix: 1, review: 0 });
+        assert.strictEqual(world.sends.length, 1);
+      }),
+    ),
   );
 
   it.effect("blocks verify_failed once the fix rounds are spent", () =>
@@ -667,7 +684,6 @@ describe("fix-review rounds", () => {
           assert.deepStrictEqual(fixing.rounds, { fix: 0, review: 1 });
           const fingerprint = failureFingerprint({
             stage: "review",
-            findings: [emptyTable],
             tree: reviewedTree,
           });
           assert.deepStrictEqual(fixing.fingerprints, [fingerprint]);

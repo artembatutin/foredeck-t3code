@@ -1,6 +1,7 @@
 import {
   createFactoryEnvironmentAtoms,
   createFactoryFleetAtom,
+  FACTORY_FLEET_INPUT,
 } from "@t3tools/client-runtime/fd/factory";
 import { Atom } from "effect/reactivity";
 
@@ -25,5 +26,6 @@ export const factoryAnySupportedAtom = Atom.make((get) =>
 export const factoryFleetAtom = createFactoryFleetAtom({
   environmentsAtom: workspaceConnections.environmentsAtom,
   supported: factoryEnvironment.supported,
-  deliveries: (environmentId) => factoryEnvironment.deliveries({ environmentId, input: {} }),
+  deliveries: (environmentId) =>
+    factoryEnvironment.deliveries({ environmentId, input: FACTORY_FLEET_INPUT }),
 });

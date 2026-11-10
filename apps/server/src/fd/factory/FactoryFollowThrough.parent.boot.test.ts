@@ -81,6 +81,41 @@ const childRows = (parent: {
   readonly children: ReadonlyArray<{ readonly deliveryId: FactoryDeliveryId }>;
 }) => Effect.forEach(parent.children, ({ deliveryId }) => rowsOf(deliveryId));
 
+/** A delivery's rows as the tests read them: its delivery row among others. */
+type ReadRows = { readonly delivery: ReadonlyArray<object> } & Readonly<Record<string, unknown>>;
+
+/** A delivery's rows without the time its row was last written, its state decoded. */
+const comparable = (rows: ReadRows | undefined): Record<string, unknown> => {
+  if (rows === undefined) return assert.fail("The delivery's rows were read.");
+  return {
+    ...rows,
+    delivery: rows.delivery.map((row) => {
+      const { updated_at: _, ...kept } = row as Record<string, unknown>;
+      return { ...kept, state_json: JSON.parse(String(kept.state_json)) as unknown };
+    }),
+  };
+};
+
+/**
+ * An approved child's rows as its parent's cancel leaves them: cancelled, keeping everything else
+ * it recorded, its approval included, so its item is free to deliver again.
+ */
+const endedWithParent = (rows: ReadRows | undefined): Record<string, unknown> => {
+  if (rows === undefined) return assert.fail("The delivery's rows were read.");
+  return comparable({
+    ...rows,
+    delivery: rows.delivery.map((row) => {
+      const kept = row as Record<string, unknown>;
+      const state = JSON.parse(String(kept.state_json)) as Record<string, unknown>;
+      return {
+        ...kept,
+        status: "cancelled",
+        state_json: JSON.stringify({ ...state, status: "cancelled" }),
+      };
+    }),
+  });
+};
+
 const attemptsOf = (deliveryId: FactoryDeliveryId) =>
   Effect.flatMap(FactoryStageRunStore.FactoryStageRunStore, (runs) =>
     runs.listByDelivery(deliveryId),
@@ -459,18 +494,24 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
               ),
               [["thread.pull-request-watch.sync", last.author, watch.startedAt]],
             );
-            // The integrate reviewer stops; the approved children keep their approvals.
+            // The integrate reviewer stops; the approved children end with their approvals kept.
             assert.deepStrictEqual(yield* cancelledRuns(reviewer.threadId, deliveryId), [
               reviewer.runId,
             ]);
-            assert.deepStrictEqual(yield* rowsOf(first.deliveryId), firstRows);
+            assert.deepStrictEqual(
+              comparable(yield* rowsOf(first.deliveryId)),
+              endedWithParent(firstRows),
+            );
             if (child) {
               assert.deepStrictEqual(yield* stateOf(last.deliveryId), {
                 ...lastState,
                 status: "cancelled",
               });
             } else {
-              assert.deepStrictEqual(yield* rowsOf(last.deliveryId), lastRows);
+              assert.deepStrictEqual(
+                comparable(yield* rowsOf(last.deliveryId)),
+                endedWithParent(lastRows),
+              );
             }
           }),
         { manualReactor: true },
@@ -527,7 +568,10 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
             );
             assert.deepStrictEqual(yield* cancelledRuns(last.author, deliveryId), [wake]);
             assert.strictEqual(yield* runStatus(last.author, ownerRun), "running");
-            assert.deepStrictEqual(yield* childRows(parent), children);
+            assert.deepStrictEqual(
+              (yield* childRows(parent)).map(comparable),
+              children.map(endedWithParent),
+            );
           }),
         { manualReactor: true },
       ),
@@ -667,7 +711,7 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
             );
             if (outcome === "closed") {
               // Closed without merging: cancelled, with the one comment that says so, keeping
-              // its work and its children's approvals.
+              // its work and its children's approvals, the children ending with it.
               assert.strictEqual(after.status, "cancelled");
               assert.deepStrictEqual(
                 world.commentCalls
@@ -676,7 +720,10 @@ describe("Factory follow-through of a parent whose PR stage result was lost", ()
                 [world.itemRef],
               );
               assert.isTrue(yield* world.exists(parent.worktreePath));
-              assert.deepStrictEqual(yield* childRows(parent), children);
+              assert.deepStrictEqual(
+                (yield* childRows(parent)).map(comparable),
+                children.map(endedWithParent),
+              );
             } else {
               // Merged: closed out, every item done and the clean worktree removed.
               assert.strictEqual(after.status, "done");
@@ -876,7 +923,7 @@ describe("Factory follow-through of a parent whose lost PR stage result cannot b
 
 describe("Factory follow-through of a parent cancelled while a restart carried its wake on", () => {
   it.live.each([{ continuation: "still pending" }, { continuation: "already running" }] as const)(
-    "stops the wake's continuation, $continuation as Factory boots, as the parent's, leaving its children approved and the owner's turn",
+    "stops the wake's continuation, $continuation as Factory boots, as the parent's, ending its approved children and leaving the owner's turn",
     ({ continuation }) =>
       withProject(
         verifyCommands.passes,
@@ -951,12 +998,15 @@ describe("Factory follow-through of a parent cancelled while a restart carried i
             if (turns.length > 0) yield* world.boot(world.endRun(continued.id, "cancelled"));
             const settled = (yield* threadProjection(last.author)).runs;
             assert.isTrue(settled.every(({ status }) => isTerminalRunStatus(status)));
-            // The boot released the parent's watch; its children stay approved, untouched.
+            // The boot released the parent's watch; its approved children ended with it.
             const cancelled = yield* stateOf(deliveryId);
             assert.strictEqual(cancelled.status, "cancelled");
             assert.isUndefined(cancelled.releaseWatch);
             assert.isUndefined((yield* linkOf(last.author, fakePullRequest.number)).watch);
-            assert.deepStrictEqual(yield* childRows(parent), children);
+            assert.deepStrictEqual(
+              (yield* childRows(parent)).map(comparable),
+              children.map(endedWithParent),
+            );
 
             // Server 3: a repeated recovery finds nothing to carry on, and Factory nothing to do.
             const before = yield* rowsOf(deliveryId);
@@ -970,7 +1020,10 @@ describe("Factory follow-through of a parent cancelled while a restart carried i
             assert.deepStrictEqual((yield* threadProjection(last.author)).runs, settled);
             assert.strictEqual(world.provider.interrupted.length, turns.length);
             assert.deepStrictEqual(yield* rowsOf(deliveryId), before);
-            assert.deepStrictEqual(yield* childRows(parent), children);
+            assert.deepStrictEqual(
+              (yield* childRows(parent)).map(comparable),
+              children.map(endedWithParent),
+            );
 
             // The owner's own turn on that thread is theirs, and runs on.
             const own = yield* world.boot(
@@ -984,7 +1037,10 @@ describe("Factory follow-through of a parent cancelled while a restart carried i
             const owned = (yield* threadProjection(last.author)).runs.find(({ id }) => id === own);
             assert.isFalse(owned === undefined || isTerminalRunStatus(owned.status));
             assert.strictEqual(world.provider.interrupted.length, turns.length);
-            assert.deepStrictEqual(yield* childRows(parent), children);
+            assert.deepStrictEqual(
+              (yield* childRows(parent)).map(comparable),
+              children.map(endedWithParent),
+            );
           }),
         { manualReactor: true },
       ).pipe(Effect.orDie),

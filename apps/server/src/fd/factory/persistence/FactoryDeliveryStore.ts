@@ -423,10 +423,14 @@ export class FactoryDeliveryStore extends Context.Service<
     readonly listByItem: (
       itemRef: WorkItemRef,
     ) => Effect.Effect<ReadonlyArray<StoredFactoryDelivery>, FactoryStoreError>;
-    /** Every delivery, or one project's or item's, whatever its status, newest first. */
+    /**
+     * Every delivery, or one project's or item's, newest first: whatever its status, or with
+     * `activeOnly` only those not done or cancelled.
+     */
     readonly list: (input: {
       readonly projectId?: ProjectId;
       readonly itemRef?: WorkItemRef;
+      readonly activeOnly?: boolean;
     }) => Effect.Effect<ReadonlyArray<StoredFactoryDelivery>, FactoryStoreError>;
     /**
      * Deliveries, cancelled ones included, that must still end the pull request watch a Factory
@@ -572,10 +576,11 @@ const make = Effect.gen(function* () {
         Effect.map((rows) => rows.map(fromRow)),
         Effect.catchTags(FactoryStoreError.catchStorage("deliveries.listByItem")),
       ),
-    list: ({ projectId, itemRef }) =>
+    list: ({ projectId, itemRef, activeOnly }) =>
       selectDeliveries({
         ...(projectId === undefined ? {} : { projectId }),
         ...(itemRef === undefined ? {} : { itemRef }),
+        ...(activeOnly === true ? { activeOnly } : {}),
         newestFirst: true,
       }).pipe(
         Effect.map((rows) => rows.map(fromRow)),
