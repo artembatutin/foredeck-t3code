@@ -394,6 +394,8 @@ export class HandoffAdmission extends Context.Service<
     readonly instanceId: string;
     /** The root's management, read now; a failed read is never taken as `never`. */
     readonly management: (root: string) => Effect.Effect<Management, HandoffAdmissionError>;
+    /** Whether any root was ever claimed: none means every root is `never`, and stays so for now. */
+    readonly managesAny: Effect.Effect<boolean, HandoffAdmissionError>;
     /**
      * The queue rank of each root's idea, null for one with no rank, whether the root is running,
      * has ended or a retry left it behind. A root the assistant never claimed is left out. For a
@@ -1828,6 +1830,13 @@ const make = Effect.gen(function* () {
       Effect.map((row): Management => row?.state ?? "never"),
       failed("management", root),
     );
+
+  const managesAny: HandoffAdmission["Service"]["managesAny"] = sql<{
+    readonly managed: number;
+  }>`SELECT 1 AS managed FROM fd_assistant_managed_roots LIMIT 1`.pipe(
+    Effect.map((rows) => rows.length > 0),
+    failed("management"),
+  );
 
   const slot: HandoffAdmission["Service"]["slot"] = (root) =>
     readSlot(root).pipe(
@@ -3559,6 +3568,7 @@ const make = Effect.gen(function* () {
   return HandoffAdmission.of({
     instanceId,
     management,
+    managesAny,
     slot,
     enter,
     deferredDemand,

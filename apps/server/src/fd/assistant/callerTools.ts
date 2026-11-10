@@ -2,6 +2,8 @@
  * How the caller policy (see `CallerPolicy`) treats each published MCP tool when a thread of a
  * Factory delivery the project assistant manages calls it, by exact name. A name this module does
  * not list is refused, so a tool published later stays refused there until it is classified.
+ * The project assistant's own threads reach only the `allow` class and their own toolkit (see
+ * `toolPolicy`).
  */
 export type CallerToolClass = "refuse" | "respond_live" | "delegate" | "allow";
 

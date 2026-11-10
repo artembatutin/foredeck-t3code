@@ -375,12 +375,26 @@ const AssistantReviewResumeTarget = Effect.gen(function* () {
   yield* sql`ALTER TABLE fd_assistant_review_starts ADD COLUMN resume_json TEXT`;
 });
 
+const AssistantAuthorizationHolds = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  // The assistant run whose Work capture last withdrew an idea's execution authorization. That run
+  // cannot authorize the idea again: the owner reviews the item first, and their reply is a new run.
+  yield* sql`CREATE TABLE fd_assistant_authorization_holds (
+    project_id TEXT NOT NULL,
+    idea_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    held_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, idea_id)
+  ) WITHOUT ROWID`;
+});
+
 export const assistantMigrationEntries = [
   [1, "AssistantWorkCaptures", AssistantWorkCaptures],
   [2, "AssistantFactoryHandoff", AssistantFactoryHandoff],
   [3, "AssistantReviewReceipts", AssistantReviewReceipts],
   [4, "AssistantOwnerReview", AssistantOwnerReview],
   [5, "AssistantReviewResumeTarget", AssistantReviewResumeTarget],
+  [6, "AssistantAuthorizationHolds", AssistantAuthorizationHolds],
 ] as const;
 
 const run = Migrator.make({});

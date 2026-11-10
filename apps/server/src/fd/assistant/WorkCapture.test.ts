@@ -54,10 +54,17 @@ const tickets: HandoffBackend.HandoffSource = {
   version: 1,
 };
 
-/** A thread's MCP caller, as `readCaller` builds it: only its scope and limits are read here. */
+/**
+ * A thread's MCP caller, as `readCaller` builds it: only its scope, its limits and the run its
+ * thread is in (`run`, none by default) are read here.
+ */
 const callerFor = (
   threadId: string,
-  options: { readonly plan?: boolean; readonly readOnlyClient?: boolean } = {},
+  options: {
+    readonly plan?: boolean;
+    readonly readOnlyClient?: boolean;
+    readonly run?: string;
+  } = {},
 ): Caller => ({
   scope: {
     environmentId: EnvironmentId.make("environment"),
@@ -73,7 +80,12 @@ const callerFor = (
       ? { sessionId: "client", label: "Outside client", access: "read-only" }
       : undefined,
   },
-  threads: {} as Caller["threads"],
+  threads: {
+    getThreadRecords: () =>
+      Effect.succeed({
+        runs: options.run === undefined ? [] : [{ id: options.run, ordinal: 1, status: "running" }],
+      }),
+  } as unknown as Caller["threads"],
   caller: undefined,
   limits: { runtimeMode: "full-access", interactionMode: options.plan ? "plan" : "default" },
 });
@@ -394,6 +406,40 @@ describe("capturing an idea as a Work item", () => {
         assert.strictEqual(result.outcome, "created");
         assert.isFalse(result.executionAuthorized);
         assert.strictEqual((yield* revisionsOf()).length, before);
+      }),
+    ),
+  );
+});
+
+describe("the run that captured an idea", () => {
+  const holdsOf = (ideaId = "export") =>
+    Effect.flatMap(
+      SqlClient.SqlClient,
+      (sql) => sql<{ readonly run_id: string }>`
+        SELECT run_id FROM fd_assistant_authorization_holds
+        WHERE project_id = ${alpha} AND idea_id = ${ideaId}
+      `,
+    ).pipe(Effect.map((rows) => rows.map((row) => row.run_id)));
+
+  it.effect("is held from authorizing only by a capture that withdrew the authorization", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const work = makeWork([tasks]);
+        const { service } = yield* instance(fakeBackend(work));
+        yield* revise(agreed);
+        const inRun = (run: string) => input({ caller: callerFor("fd-assistant-owner", { run }) });
+
+        assert.strictEqual((yield* service.capture(inRun("run-1"))).outcome, "created");
+        assert.deepStrictEqual(yield* holdsOf(), ["run-1"]);
+
+        // Writing nothing withdraws nothing, so the hold stays with the run that withdrew it.
+        yield* revise({ executionAuthorized: true });
+        assert.strictEqual((yield* service.capture(inRun("run-2"))).outcome, "unchanged");
+        assert.deepStrictEqual(yield* holdsOf(), ["run-1"]);
+
+        yield* revise({ goal: "Add the export menu" });
+        assert.strictEqual((yield* service.capture(inRun("run-3"))).outcome, "updated");
+        assert.deepStrictEqual(yield* holdsOf(), ["run-3"]);
       }),
     ),
   );

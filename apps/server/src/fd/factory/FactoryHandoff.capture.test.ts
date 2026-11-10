@@ -53,7 +53,10 @@ const assistant: Caller = {
     },
     client: undefined,
   },
-  threads: {} as Caller["threads"],
+  // No assistant run is in progress, so a capture holds no run's authorization.
+  threads: {
+    getThreadRecords: () => Effect.succeed({ runs: [] }),
+  } as unknown as Caller["threads"],
   caller: undefined,
   limits: { runtimeMode: "full-access", interactionMode: "default" },
 };

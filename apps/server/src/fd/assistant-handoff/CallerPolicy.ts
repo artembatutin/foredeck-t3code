@@ -8,9 +8,8 @@ import * as Schema from "effect/Schema";
 import * as McpCallerPolicy from "../../mcp/McpCallerPolicy.ts";
 import type * as McpInvocationContext from "../../mcp/McpInvocationContext.ts";
 import { isTerminalRunStatus } from "../../orchestration-v2/ThreadManagementService.ts";
-import { HandoffAdmission, HandoffBackend } from "../assistant/index.ts";
+import { CallerTools, HandoffAdmission, HandoffBackend } from "../assistant/index.ts";
 import { FactoryAdmission, FactoryService } from "../factory/index.ts";
-import { callerToolClass } from "./callerTools.ts";
 import { readWorkWith } from "./FactoryAdmissionBridge.ts";
 
 /** What a governed caller is told when the policy refuses a call (note 6.10). */
@@ -124,7 +123,10 @@ export const make = Effect.gen(function* () {
     });
 
   const screen: Policy["screen"] = ({ caller, calls }) => {
-    const classed = calls.map((call) => ({ call, toolClass: callerToolClass(call.tool) }));
+    const classed = calls.map((call) => ({
+      call,
+      toolClass: CallerTools.callerToolClass(call.tool),
+    }));
     // Reads only for calls the policy may refuse.
     if (classed.every(({ toolClass }) => toolClass === "allow")) return Effect.succeed(allow);
     return Effect.gen(function* () {

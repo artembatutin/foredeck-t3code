@@ -15,10 +15,9 @@ import * as Result from "effect/Result";
 
 import type * as McpCallerPolicy from "../../mcp/McpCallerPolicy.ts";
 import type * as McpInvocationContext from "../../mcp/McpInvocationContext.ts";
-import { HandoffAdmission, HandoffBackend } from "../assistant/index.ts";
+import { CallerTools, HandoffAdmission, HandoffBackend } from "../assistant/index.ts";
 import { FactoryActivity, FactoryService } from "../factory/index.ts";
 import * as CallerPolicy from "./CallerPolicy.ts";
-import { callerToolClass } from "./callerTools.ts";
 
 /**
  * The caller policy's decisions over the reads it takes, each stubbed: who a thread belongs to,
@@ -259,7 +258,7 @@ describe("the caller policy's screen", () => {
     "a_tool_nobody_listed",
   ])("refuses %s by the root's management", (tool) =>
     Effect.gen(function* () {
-      assert.strictEqual(callerToolClass(tool), "refuse");
+      assert.strictEqual(CallerTools.callerToolClass(tool), "refuse");
       assert.deepStrictEqual(yield* screen(active, author, [call(tool)]), refused(text.active));
       for (const management of ["ending", "retired"] as const) {
         assert.deepStrictEqual(

@@ -65,6 +65,24 @@ const make = Effect.gen(function* () {
       new AutomaticTurnDecisionError({ kind: turn.kind, thread: turn.threadId, stage, cause });
 
   /**
+   * The turn's thread's family. One that cannot be read fails the turn only while some root is or
+   * was managed, since the thread may then be in a managed family that must not run uncounted;
+   * otherwise no managed family can hold it, and the turn runs as a thread of no family would.
+   */
+  const familyOf = (turn: AutomaticTurn) =>
+    activity
+      .family(turn.threadId)
+      .pipe(
+        Effect.catch((cause) =>
+          (admission.managesAny ?? Effect.succeed(true)).pipe(
+            Effect.flatMap((managesAny) =>
+              managesAny ? Effect.fail(failed(turn, "read")(cause)) : Effect.succeed(null),
+            ),
+          ),
+        ),
+      );
+
+  /**
    * Where the turn goes. A thread of no Factory family, or of a root nothing manages, runs it
    * inline and records nothing. On a managed root's family thread, the turn's class is decided once
    * from its exact source and recorded, and a turn presented again keeps the recorded one: an
@@ -73,9 +91,7 @@ const make = Effect.gen(function* () {
    */
   const route = (turn: AutomaticTurn) =>
     Effect.gen(function* () {
-      const family = yield* activity
-        .family(turn.threadId)
-        .pipe(Effect.mapError(failed(turn, "read")));
+      const family = yield* familyOf(turn);
       if (family === null) return { type: "inline", family } satisfies Route;
       const management = yield* admission
         .management(family.root)
@@ -217,7 +233,8 @@ const make = Effect.gen(function* () {
  * it; every other turn runs inline. Any turn but one a retired manager declines must also be in a
  * mode the host's policy allows. A refusal, or a read or record that fails, decides nothing: the
  * consult fails with `AutomaticTurnDecisionError`, nothing is dispatched, and the turn's producer
- * asks again by its own means.
+ * asks again by its own means. A failed family read is the exception while no root is or ever was
+ * managed: no managed family can hold the thread, so the turn runs.
  */
 export const layer = Layer.effectDiscard(make).pipe(Layer.provide(FactoryActivity.layer));
 

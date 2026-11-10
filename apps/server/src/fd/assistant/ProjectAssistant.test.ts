@@ -18,6 +18,7 @@ import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as Threads from "../../orchestration-v2/ThreadManagementService.ts";
 import * as Launches from "../../orchestration-v2/ThreadLaunchService.ts";
@@ -81,6 +82,7 @@ function harness(looperMode = false) {
   const notices: Threads.ThreadManagementSendInput[] = [];
   const interrupts: ThreadId[] = [];
   let uncertain: "none" | "accepted" | "absent" = "none";
+  const deleted = new Set<ThreadId>();
   const owner = {
     ...shell(managerId, ProjectId.make("manager-workspace")),
     runtimeMode: looperMode ? ("full-access" as const) : ("approval-required" as const),
@@ -98,6 +100,7 @@ function harness(looperMode = false) {
                 ...shell(id, projections.get(id)!.thread.projectId),
                 worktreePath: `/isolated/${id}`,
                 branch: `feature/${id}`,
+                deletedAt: deleted.has(id) ? DateTime.makeUnsafe(at) : null,
               }
             : null,
       ),
@@ -252,6 +255,9 @@ function harness(looperMode = false) {
     loseReply: (mode: typeof uncertain) => {
       uncertain = mode;
     },
+    deleteThread: (id: ThreadId) => {
+      deleted.add(id);
+    },
   };
 }
 const queue = Effect.fn(function* (projectId: ProjectId, rank = 1) {
@@ -354,25 +360,104 @@ it.effect("recovers an accepted launch after service restart without duplicate w
   }).pipe(inMemory);
 });
 
-it.effect("unknown launches occupy capacity and cannot be blindly retried or cancelled", () => {
+it.effect(
+  "unknown launches occupy capacity until their thread is confirmed absent, and are never relaunched",
+  () => {
+    const h = harness();
+    h.loseReply("absent");
+    return Effect.gen(function* () {
+      const service = yield* Assistant.ProjectAssistant;
+      yield* queue(alpha);
+      yield* queue(beta);
+      yield* queue(gamma);
+      yield* service.tick;
+      assert.equal(h.launches.length, 2);
+      assert.equal((yield* service.inspect(alpha)).assignments[0]!.state, "launch-uncertain");
+      yield* Effect.flip(
+        service.control({
+          assignmentId: "work-alpha",
+          managerThreadId: managerId,
+          action: "retry",
+        }),
+      );
+      assert.equal(h.launches.length, 2);
+
+      // The next reconciliation finds neither thread, so both fail and free their slots for the
+      // queue; neither is launched again.
+      yield* service.tick;
+      assert.equal((yield* service.inspect(alpha)).assignments[0]!.state, "failed");
+      assert.equal((yield* service.inspect(beta)).assignments[0]!.state, "failed");
+      assert.deepEqual(
+        h.launches.map((launch) => launch.projectId),
+        [alpha, beta, gamma],
+      );
+
+      // A retry is the owner's own new attempt, with a fresh thread.
+      h.loseReply("none");
+      yield* service.control({
+        assignmentId: "work-alpha",
+        managerThreadId: managerId,
+        action: "retry",
+      });
+      yield* service.tick;
+      assert.equal(h.launches.length, 4);
+      assert.equal(h.launches[3]!.projectId, alpha);
+      assert.notEqual(h.launches[3]!.threadId, h.launches[0]!.threadId);
+    }).pipe(Effect.provide(h.layer()), inMemory);
+  },
+);
+
+it.effect("the owner can cancel an uncertain launch to release its slot", () => {
+  const h = harness(true);
+  return Effect.gen(function* () {
+    const service = yield* Assistant.ProjectAssistant;
+    yield* service.revise({
+      projectId: alpha,
+      patch: {
+        goal: "Build alpha",
+        acceptanceCriteria: ["Verify alpha"],
+        executionAuthorized: true,
+      },
+    });
+    yield* service.enqueue({
+      assignmentId: "loop-work",
+      projectId: alpha,
+      managerThreadId: managerId,
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      looperConfig: "/config/loop.json",
+    });
+    yield* service.tick;
+    assert.equal((yield* service.inspect(alpha)).assignments[0]!.state, "launch-uncertain");
+    yield* service.control({
+      assignmentId: "loop-work",
+      managerThreadId: managerId,
+      action: "cancel",
+    });
+    assert.equal((yield* service.inspect(alpha)).assignments[0]!.state, "cancelled");
+    yield* service.tick;
+    assert.equal(h.looperStarts.length, 1);
+  }).pipe(Effect.provide(h.layer()), inMemory);
+});
+
+it.effect("a deleted worker thread releases its running assignment's slot", () => {
   const h = harness();
-  h.loseReply("absent");
   return Effect.gen(function* () {
     const service = yield* Assistant.ProjectAssistant;
     yield* queue(alpha);
     yield* queue(beta);
     yield* queue(gamma);
     yield* service.tick;
+    assert.equal((yield* service.inspect(alpha)).assignments[0]!.state, "running");
+    assert.equal(h.launches.length, 2);
+    h.deleteThread(h.launches[0]!.threadId!);
     yield* service.tick;
-    assert.equal(h.launches.length, 2);
-    assert.equal((yield* service.inspect(alpha)).assignments[0]!.state, "launch-uncertain");
-    yield* Effect.flip(
-      service.control({ assignmentId: "work-alpha", managerThreadId: managerId, action: "retry" }),
+    assert.equal((yield* service.inspect(alpha)).assignments[0]!.state, "failed");
+    assert.deepEqual(
+      h.launches.map((launch) => launch.projectId),
+      [alpha, beta, gamma],
     );
-    yield* Effect.flip(
-      service.control({ assignmentId: "work-alpha", managerThreadId: managerId, action: "cancel" }),
-    );
-    assert.equal(h.launches.length, 2);
   }).pipe(Effect.provide(h.layer()), inMemory);
 });
 
@@ -494,6 +579,94 @@ it.effect(
         }),
       );
       assert.equal(h.commands.length, 1);
+    }).pipe(Effect.provide(h.layer()), inMemory);
+  },
+);
+
+it.effect("a queued head with no saved dispatch fails and the next assignment launches", () => {
+  const h = harness();
+  return Effect.gen(function* () {
+    const service = yield* Assistant.ProjectAssistant;
+    const sql = yield* SqlClient.SqlClient;
+    yield* queue(alpha, 1);
+    yield* queue(beta, 2);
+    yield* sql`DELETE FROM fd_assistant_dispatches WHERE assignment_id = 'work-alpha'`;
+    yield* service.tick;
+    const [stuck] = (yield* service.inspect(alpha)).assignments;
+    assert.equal(stuck!.state, "failed");
+    assert.include(stuck!.progress.at(-1)!.text, "saved launch details are missing");
+    assert.deepEqual(
+      h.launches.map((launch) => launch.projectId),
+      [beta],
+    );
+  }).pipe(Effect.provide(h.layer()), inMemory);
+});
+
+/** The assistant's own thread in its run `runId`, as the owner's message starts one. */
+const managerInRun = (h: ReturnType<typeof harness>, runId: string) =>
+  h.projections.set(managerId, {
+    ...emptyProjection({
+      id: EventId.make(managerId),
+      threadId: managerId,
+      type: "thread.created",
+      occurredAt: DateTime.makeUnsafe(at),
+      payload: { ...shell(managerId, ProjectId.make("manager-workspace")), lastVisitedAt: null },
+    }),
+    runs: [
+      {
+        id: RunId.make(runId),
+        threadId: managerId,
+        ordinal: Number(runId.replace(/\D/g, "")),
+        providerInstanceId: modelSelection.instanceId,
+        modelSelection,
+        providerThreadId: null,
+        userMessageId: MessageId.make(`message:${runId}`),
+        rootNodeId: null,
+        activeAttemptId: null,
+        status: "running",
+        requestedAt: DateTime.makeUnsafe(at),
+        startedAt: DateTime.makeUnsafe(at),
+        completedAt: null,
+        checkpointId: null,
+        contextHandoffId: null,
+      },
+    ],
+  });
+
+it.effect(
+  "the run whose capture withdrew an idea's authorization cannot authorize it again",
+  () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      const service = yield* Assistant.ProjectAssistant;
+      const sql = yield* SqlClient.SqlClient;
+      yield* service.revise({
+        projectId: alpha,
+        patch: { goal: "Build alpha", acceptanceCriteria: ["Verify alpha"] },
+      });
+      // What a capture in run 1 that changed the idea's Work item records.
+      yield* sql`INSERT INTO fd_assistant_authorization_holds (project_id, idea_id, run_id, held_at)
+      VALUES (${alpha}, 'legacy', 'run-1', ${at})`;
+      const authorize = service.revise({
+        projectId: alpha,
+        patch: { executionAuthorized: true },
+        managerThreadId: managerId,
+      });
+
+      managerInRun(h, "run-1");
+      const refused = yield* Effect.flip(authorize);
+      assert.include(refused.message, "Ask the owner to review the item in Work");
+      assert.isFalse((yield* service.inspect(alpha)).briefs[0]!.executionAuthorized);
+      // Withdrawing it, or saving anything else, is still the assistant's to do.
+      yield* service.revise({
+        projectId: alpha,
+        patch: { decisions: ["Use the toolbar"] },
+        managerThreadId: managerId,
+      });
+
+      // The owner's reply after reviewing the item is a new run.
+      managerInRun(h, "run-2");
+      assert.isTrue((yield* authorize).executionAuthorized);
     }).pipe(Effect.provide(h.layer()), inMemory);
   },
 );

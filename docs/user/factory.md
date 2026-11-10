@@ -235,7 +235,8 @@ step waits for you to ask:
    If the project has several Work sources, say which to use. An idea Factory should plan into
    tasks needs a Markdown source.
 2. **Review.** Read the item in Work. If you edit it or the idea changes, ask for a new capture:
-   a capture that changes the item withdraws your go-ahead, and an item edited since its capture
+   a capture that changes the item withdraws your go-ahead, which the assistant cannot save again
+   until your next message, and an item edited since its capture
    is not queued until you have decided which version stands.
 3. **Authorize.** Tell the assistant to go ahead. It saves your go-ahead with
    `assistant_revise_brief` and queues the delivery with `assistant_assign`. The project needs a
@@ -398,20 +399,22 @@ it once the pull request is merged.
 - **Resume** on a **Stopped** or **Blocked** single item or child checks its branch again and
   verifies it before going on, even if nothing changed, unless all that is left is opening the
   pull request for the commit it approved. It also gets a fresh set of repair rounds within the
-  limits it started with, unless you reviewed it, which keeps counting. If you deleted one of its threads, it blocks again; cancel it and
-  deliver the item anew.
+  limits it started with, unless you reviewed it, which keeps counting. If you deleted its author's
+  thread, or its reviewer's thread while the reviewer still has to check the author's reply, it
+  blocks again; cancel it and deliver the item anew.
 - **Resume** on a **Stopped** or **Blocked** parent goes on from where it is. Before you approve
   its plan, a parent stopped where the plan waits for you waits for you again on the same plan,
-  without verifying; otherwise its planner gets a new turn to plan again. If you deleted the
-  planner's thread, it blocks again; cancel it and deliver the item anew. Once its plan is
+  without verifying, even if you deleted the planner's thread; otherwise its planner gets a new
+  turn to plan again, and if you deleted the planner's thread it blocks again; cancel it and
+  deliver the item anew. Once its plan is
   approved, deleted planner or reviewer threads do not hold it back. It creates the child items
   still missing, keeping those already created, or goes on with the first child not yet approved,
   and never creates a child twice. After its last child is approved, it integrates again with a
   fresh verify and a new reviewer on a separate thread, with no repair round.
 - **Cancel delivery** asks first, then interrupts what the delivery's agents are working on and
-  ends it. Cancelling a parent also ends its child deliveries not yet approved. Cancelling a child
-  ends its parent and the parent's other children not yet approved. Approved children keep their
-  approval. The branch, worktree and commits stay. Verification or a pull request the server has
+  ends it. Cancelling a parent also ends its child deliveries. Cancelling a child ends its parent
+  and the parent's other children. Approved children keep their recorded approval, and their
+  items can be delivered again. The branch, worktree and commits stay. Verification or a pull request the server has
   already started finishes, but no longer changes the delivery. A pull request stays open on its
   host. Delivering the item again starts a new delivery on a branch of its own, named like the
   first with `-2`, `-3` and so on added.

@@ -213,12 +213,12 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
     }
     if (invocation.thread !== undefined && request.method === "POST") {
       const body = yield* request.json.pipe(Effect.orElseSucceed(() => undefined));
-      if (invocation.thread.threadId.startsWith("fd-assistant-")) {
-        const refusal = assistantToolRefusal(invocation.thread.threadId, body);
-        if (refusal) return HttpServerResponse.jsonUnsafe(refusal);
-      }
       // Before any handler runs, so a refused call resolves and dispatches nothing.
       const calls = toolCallsOf(body);
+      const assistantRefusal = assistantToolRefusal(invocation.thread.threadId, calls);
+      if (assistantRefusal) {
+        return HttpServerResponse.jsonUnsafe(callerRefusal(body, assistantRefusal));
+      }
       if (calls.length > 0) {
         const screened = yield* policy.screen({ caller: invocation.thread, calls });
         if (screened.type === "refuse") {

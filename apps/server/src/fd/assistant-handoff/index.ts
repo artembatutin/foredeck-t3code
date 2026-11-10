@@ -14,7 +14,7 @@ import * as WorkBackend from "./WorkBackend.ts";
  * The assistant imports neither; the server composes these beneath it.
  */
 
-export * as CallerTools from "./callerTools.ts";
+export { CallerTools } from "../assistant/index.ts";
 export { callerPolicyText } from "./CallerPolicy.ts";
 
 /** The assistant's Work port over Work's service, which it needs. */

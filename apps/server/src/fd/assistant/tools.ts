@@ -176,8 +176,10 @@ export const toolLayer = McpToolAccess.toLayer(AssistantToolkit, {
   ),
   assistant_revise_brief: McpToolAccess.actsAsCaller((input) =>
     Effect.gen(function* () {
-      yield* manager;
-      return yield* result((yield* Assistant.ProjectAssistant).revise(input));
+      const caller = yield* manager;
+      return yield* result(
+        (yield* Assistant.ProjectAssistant).revise({ ...input, managerThreadId: caller.id }),
+      );
     }),
   ),
   assistant_assign: McpToolAccess.startsThreads(

@@ -118,6 +118,7 @@ const recordingPort = (management: FactoryAdmission.FactoryManagement) => {
   const port: typeof FactoryAdmission.FactoryAdmission.Service = {
     ...FactoryAdmission.FactoryAdmission.defaultValue(),
     management: () => Effect.succeed(management),
+    managesAny: Effect.succeed(management !== "never"),
     automaticTurn: (turn) =>
       Effect.sync(() => {
         reached.push({
@@ -1782,6 +1783,42 @@ describe("Factory's gate when it cannot decide", () => {
       assert.deepStrictEqual(dispatched, []);
     }).pipe(Effect.provide(focusedStack(faults, port)), Effect.scoped);
   });
+
+  it.effect.each([
+    { managed: false, outcome: "runs it" },
+    { managed: true, outcome: "fails the consult" },
+  ] as const)(
+    "on a thread whose family cannot be read, $outcome when a root managed is $managed",
+    ({ managed }) => {
+      const faults = makeFaults();
+      const port = {
+        ...FactoryAdmission.FactoryAdmission.defaultValue(),
+        managesAny: Effect.succeed(managed),
+      };
+      return Effect.gen(function* () {
+        const gate = yield* AutomaticTurnGate.AutomaticTurnGate;
+        const dispatched: Array<string> = [];
+        // An ordinary thread's continuation: no Factory launch made it, so its lineage is read.
+        const turn = turns.restartContinuation(ThreadId.make("ordinary-thread"), focusedRun);
+        faults.reads = 1;
+        const admitted = yield* Effect.exit(
+          gate.admit(
+            turn,
+            Effect.sync(() => void dispatched.push(turn.messageId)),
+          ),
+        );
+        assert.strictEqual(faults.reads, 0);
+        if (managed) {
+          assert.isTrue(Exit.isFailure(admitted));
+          assert.deepStrictEqual(dispatched, []);
+        } else {
+          assert.deepStrictEqual(admitted, Exit.succeed(AutomaticTurnGate.ran(undefined)));
+          assert.deepStrictEqual(dispatched, [turn.messageId]);
+        }
+        assert.deepStrictEqual(yield* recordedTurns, []);
+      }).pipe(Effect.provide(focusedStack(faults, port)), Effect.scoped);
+    },
+  );
 
   it.effect.each([
     { shape: "with no callback", clearable: false },
