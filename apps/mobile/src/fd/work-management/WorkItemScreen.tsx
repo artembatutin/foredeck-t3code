@@ -111,7 +111,8 @@ export function WorkItemScreen({
   const requestRefresh = useAtomCommand(workCommands.refresh);
   const refreshQuery = query.refresh;
   const sourceId = ref?.sourceId;
-  // Pull to refresh drops the server's cached copy of this source, then reads again.
+  // Pull to refresh drops the server's cached copy of this source; the refresh subscription
+  // then reads again.
   const refresh = useCallback(
     () =>
       void refreshWork({

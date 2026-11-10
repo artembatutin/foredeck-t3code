@@ -58,7 +58,7 @@ export const searchIssuesQuery = (fields: IssueFieldSet) => `
   query WorkIssueSearch($query: String!, $first: Int!, $after: String) {
     search(type: ISSUE, query: $query, first: $first, after: $after) {
       pageInfo { hasNextPage endCursor }
-      nodes { ... on Issue { ${summaryFields(fields)} } }
+      nodes { ... on Issue { ${summaryFields(fields)} repository { nameWithOwner } } }
     }
   }
 `;

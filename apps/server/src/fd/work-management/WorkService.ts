@@ -95,7 +95,7 @@ const OPEN_LINK_READ_CONCURRENCY = 8;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-/** Cache keys carry the epoch, so a bump makes every older entry unreachable. */
+/** Cache keys carry their source's cache generation, so a bump makes its older entries unreachable. */
 const ListCacheKey = Schema.fromJsonString(
   Schema.Tuple([WorkSourceId, WorkListQuery, Schema.Number]),
 );
@@ -223,6 +223,10 @@ export class WorkService extends Context.Service<
     readonly retireProject: (projectId: ProjectId) => Effect.Effect<void, WorkDomainError>;
     /** Marks every Work read stale and wakes subscribers. */
     readonly bumpEpoch: Effect.Effect<void>;
+    /** Marks one source's reads stale (its items changed) and wakes subscribers. */
+    readonly sourceChanged: (sourceId: WorkSourceId) => Effect.Effect<void>;
+    /** Wakes subscribers for a change no cached read holds, such as a link or a run outcome. */
+    readonly notifyChanged: Effect.Effect<void>;
     /** The spelling locks, caches and link rows key on; an unknown source keeps the input. */
     readonly canonicalRef: (ref: WorkItemRef) => Effect.Effect<WorkItemRef, WorkDomainError>;
     /**
@@ -291,8 +295,28 @@ const make = Effect.gen(function* () {
   const secrets = yield* ServerSecretStore.ServerSecretStore;
   const crypto = yield* Crypto.Crypto;
 
+  // One epoch tells clients to refetch, whatever changed; the wire carries nothing more. Cached
+  // reads go stale per source instead, so one source's change leaves the others' caches warm.
   const epoch = yield* SubscriptionRef.make(0);
-  const bumpEpoch = SubscriptionRef.update(epoch, (value) => value + 1);
+  const notifyChanged = SubscriptionRef.update(epoch, (value) => value + 1);
+  // A source's cache generation is the sum of these two counters. Both only grow, so every bump
+  // gives the source a generation its older cache keys never had.
+  let everySourceGeneration = 0;
+  const sourceGenerations = new Map<WorkSourceId, number>();
+  const cacheGeneration = (sourceId: WorkSourceId) =>
+    Effect.sync(() => everySourceGeneration + (sourceGenerations.get(sourceId) ?? 0));
+  const staleSource = (sourceId: WorkSourceId) => {
+    sourceGenerations.set(sourceId, (sourceGenerations.get(sourceId) ?? 0) + 1);
+  };
+  const sourceChanged = (sourceId: WorkSourceId) =>
+    Effect.suspend(() => {
+      staleSource(sourceId);
+      return notifyChanged;
+    });
+  const bumpEpoch = Effect.suspend(() => {
+    everySourceGeneration += 1;
+    return notifyChanged;
+  });
   const health = new Map<WorkSourceId, WorkSourceHealth>();
   const replays = new Map<string, ReplayEntry>();
   const launching = new Map<ThreadId, number>();
@@ -420,7 +444,7 @@ const make = Effect.gen(function* () {
       health.set(sourceId, next);
       // Only a status change is worth a refetch: a retryAt that moves on every attempt would have
       // clients hammer a host that just asked them to back off.
-      return previous.status === next.status ? Effect.void : bumpEpoch;
+      return previous.status === next.status ? Effect.void : notifyChanged;
     });
 
   /** Records what a source call said about the source's reachability. */
@@ -446,7 +470,7 @@ const make = Effect.gen(function* () {
           // agent's own tool): drop the cached reads, so the reload a conflict asks for shows
           // the current version instead of the one the stale write was based on.
           case "WorkStale":
-            return bumpEpoch;
+            return sourceChanged(sourceId);
           default:
             return Effect.void;
         }
@@ -699,7 +723,7 @@ const make = Effect.gen(function* () {
       // The row exists whether or not prepare succeeds, so subscribers hear about it either way.
       yield* adapter
         .prepare(toRuntime(stored, rootPath, secret, true))
-        .pipe(Effect.ensuring(bumpEpoch));
+        .pipe(Effect.ensuring(sourceChanged(stored.sourceId)));
       // A rotated account leaves its old token behind unless another source still uses it.
       if (
         previous !== undefined &&
@@ -719,7 +743,7 @@ const make = Effect.gen(function* () {
         .pipe(Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }));
       yield* releaseSecret(stored.secretName);
       health.delete(stored.sourceId);
-      yield* bumpEpoch;
+      yield* sourceChanged(stored.sourceId);
       return toWorkSource(stored, registry.get(stored.kind));
     });
 
@@ -744,7 +768,7 @@ const make = Effect.gen(function* () {
               )
           : restored;
       health.delete(stored.sourceId);
-      yield* bumpEpoch;
+      yield* sourceChanged(stored.sourceId);
       return toWorkSource(stored, registry.get(stored.kind));
     });
 
@@ -798,12 +822,10 @@ const make = Effect.gen(function* () {
     { capacity: CACHE_CAPACITY, timeToLive: liveFor(ITEM_TTL) },
   );
 
-  const currentEpoch = SubscriptionRef.get(epoch);
-
   const listItems: WorkService["Service"]["listItems"] = (actor, query) =>
     Effect.gen(function* () {
       yield* requireGrants(actor, [AuthWorkReadScope]);
-      const at = yield* currentEpoch;
+      const at = yield* cacheGeneration(query.sourceId);
       return yield* Cache.get(listCache, encodeListKey([query.sourceId, query, at]));
     });
 
@@ -822,7 +844,7 @@ const make = Effect.gen(function* () {
       yield* requireGrants(actor, [AuthWorkReadScope]);
       const { adapter } = yield* resolveSource(input.ref.sourceId, { interactive: true });
       const ref = yield* canonicalRef(input.ref);
-      const at = yield* currentEpoch;
+      const at = yield* cacheGeneration(ref.sourceId);
       const detail = yield* Cache.get(itemCache, encodeItemKey([ref.sourceId, ref.itemId, at]));
       const itemLinks = yield* links
         .listByItem(ref.sourceId, ref.itemId)
@@ -909,7 +931,7 @@ const make = Effect.gen(function* () {
         input.clientRequestId,
         observed(input.sourceId, adapter.create(runtime, input, actor)),
       );
-      yield* bumpEpoch;
+      yield* sourceChanged(input.sourceId);
       return created;
     });
 
@@ -926,8 +948,17 @@ const make = Effect.gen(function* () {
       }
       const { adapter, runtime } = yield* resolveSource(input.ref.sourceId, { interactive: true });
       const patch = { ...input, ref: yield* canonicalRef(input.ref) };
+      // Every reader is served a body cut at the wire cap; saving one back would drop the rest.
+      if (patch.body !== undefined) {
+        const current = yield* observed(patch.ref.sourceId, adapter.get(runtime, patch.ref.itemId));
+        if (current.bodyTruncated) {
+          return yield* new WorkUnsupported({
+            detail: "The body is longer than Work can edit; change it in its source.",
+          });
+        }
+      }
       const updated = yield* observed(patch.ref.sourceId, adapter.update(runtime, patch, actor));
-      yield* bumpEpoch;
+      yield* sourceChanged(patch.ref.sourceId);
       return updated;
     });
 
@@ -940,7 +971,7 @@ const make = Effect.gen(function* () {
         input.ref.sourceId,
         adapter.setStatus(runtime, request, actor),
       );
-      yield* bumpEpoch;
+      yield* sourceChanged(input.ref.sourceId);
       return updated;
     });
 
@@ -965,7 +996,7 @@ const make = Effect.gen(function* () {
         input.clientRequestId,
         observed(ref.sourceId, adapter.comment(runtime, ref.itemId, body, actor)),
       );
-      yield* bumpEpoch;
+      yield* sourceChanged(ref.sourceId);
       return result;
     });
 
@@ -1031,7 +1062,7 @@ const make = Effect.gen(function* () {
         const removed = yield* links
           .unlink(input.ref.sourceId, input.ref.itemId, input.threadId)
           .pipe(Effect.mapError(storeFailure));
-        if (removed) yield* bumpEpoch;
+        if (removed) yield* notifyChanged;
         return { linked: false };
       }
       const { adapter, runtime } = yield* resolveSource(input.ref.sourceId, { interactive: true });
@@ -1059,7 +1090,7 @@ const make = Effect.gen(function* () {
           },
         })
         .pipe(Effect.mapError(storeFailure));
-      yield* bumpEpoch;
+      yield* notifyChanged;
       return { linked: true };
     });
 
@@ -1077,7 +1108,7 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const ref = yield* canonicalRef(input.ref);
       // Usually served by the read the caller made before preparing its launch.
-      const at = yield* currentEpoch;
+      const at = yield* cacheGeneration(ref.sourceId);
       const detail = yield* Cache.get(itemCache, encodeItemKey([ref.sourceId, ref.itemId, at]));
       const reserve = links
         .link({
@@ -1112,12 +1143,22 @@ const make = Effect.gen(function* () {
           Effect.scoped,
         ),
       );
-      if (inserted) yield* bumpEpoch;
+      if (inserted) yield* notifyChanged;
       return launched;
     });
 
-  const refresh: WorkService["Service"]["refresh"] = (actor, _input) =>
-    requireGrants(actor, [AuthWorkReadScope]).pipe(Effect.andThen(bumpEpoch));
+  /** Drops the cached reads of the sources named (one, a project's, or every one). */
+  const refresh: WorkService["Service"]["refresh"] = (actor, input) =>
+    Effect.gen(function* () {
+      yield* requireGrants(actor, [AuthWorkReadScope]);
+      if (input.sourceId !== undefined) return yield* sourceChanged(input.sourceId);
+      if (input.projectId === undefined) return yield* bumpEpoch;
+      const rows = yield* sources
+        .list({ projectId: input.projectId })
+        .pipe(Effect.mapError(storeFailure));
+      for (const row of rows) staleSource(row.sourceId);
+      yield* notifyChanged;
+    });
 
   const watchableSources: WorkService["Service"]["watchableSources"] = sources.list().pipe(
     Effect.mapError(storeFailure),
@@ -1151,7 +1192,7 @@ const make = Effect.gen(function* () {
   );
 
   const currentSummaries: WorkService["Service"]["currentSummaries"] = (sourceId, itemIds) =>
-    currentEpoch.pipe(
+    cacheGeneration(sourceId).pipe(
       Effect.flatMap((at) =>
         Cache.get(
           summariesCache,
@@ -1201,6 +1242,8 @@ const make = Effect.gen(function* () {
     currentSummaries,
     retireProject,
     bumpEpoch,
+    sourceChanged,
+    notifyChanged,
     canonicalRef,
     reserveLaunch,
     isLaunching,

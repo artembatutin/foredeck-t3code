@@ -149,7 +149,7 @@ describe("collectWorkPages", () => {
 });
 
 describe("refreshWork", () => {
-  it("asks the server to refresh, then refreshes the queries", async () => {
+  it("leaves the refetch to the refresh subscription once the server refreshed", async () => {
     const calls: Array<string> = [];
     const refreshed = await refreshWork({
       requestServerRefresh: async () => {
@@ -159,7 +159,7 @@ describe("refreshWork", () => {
       refreshQueries: () => calls.push("queries"),
     });
     expect(refreshed).toBe(true);
-    expect(calls).toEqual(["server", "queries"]);
+    expect(calls).toEqual(["server"]);
   });
 
   it("still refreshes the queries when the server refresh fails", async () => {

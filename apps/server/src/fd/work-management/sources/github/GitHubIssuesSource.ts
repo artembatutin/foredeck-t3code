@@ -135,8 +135,29 @@ const mentionsOptionalField = (error: unknown) =>
     OPTIONAL_FIELD_NAMES.some((field) => message.includes(field)),
   );
 
-/** GraphQL search syntax quotes phrases; a quote in the text is dropped rather than escaped. */
-const searchTerm = (text: string) => text.replaceAll('"', " ").trim();
+/**
+ * Free text for a search, never qualifiers: a word with a colon is quoted, so `repo:other/app`
+ * is searched for rather than added to the repositories GitHub searches. Search syntax cannot
+ * escape a quote, so a quote in the text is dropped.
+ */
+const searchTerm = (text: string) =>
+  text
+    .replaceAll('"', " ")
+    .split(/\s+/)
+    .filter((word) => word.length > 0)
+    .map((word) => (word.includes(":") ? `"${word}"` : word))
+    .join(" ");
+
+/** The repository a search node belongs to, as the search query asks for it. */
+const nodeRepository = (node: unknown): string | undefined => {
+  const repository =
+    typeof node === "object" && node !== null
+      ? (node as { repository?: { nameWithOwner?: unknown } }).repository
+      : undefined;
+  return typeof repository?.nameWithOwner === "string"
+    ? repository.nameWithOwner.toLowerCase()
+    : undefined;
+};
 
 /**
  * An issue number written in decimal digits, or undefined. `Number` alone would also read `1e0`
@@ -354,7 +375,10 @@ export const make = (options: GitHubIssuesOptions = {}) =>
             { query: qualifiers.join(" "), first, after: query.cursor ?? null },
             IssueSearchResponse,
           );
+          const repository = `${config.owner}/${config.name}`.toLowerCase();
           const items = response.data.search.nodes.flatMap((node) => {
+            // Issues of another repository would collide with this one's numbers.
+            if (nodeRepository(node) !== repository) return [];
             const decoded = decodeIssueSummary(node);
             return Option.isSome(decoded) ? [toSummary(runtime.sourceId, decoded.value)] : [];
           });

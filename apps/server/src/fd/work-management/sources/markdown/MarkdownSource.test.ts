@@ -587,6 +587,39 @@ describe("MarkdownSource", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("keeps the file's notes when a body is replaced", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* setup;
+      const created = yield* adapter.create(
+        runtime,
+        { sourceId, title: "Alpha", body: "Intro\n" },
+        actor,
+      );
+      yield* adapter.comment(runtime, created.ref.itemId, "First note", actor);
+      const notes = `## Notes\n- ${EPOCH} (Artem) First note\n`;
+
+      // A body without notes keeps them after the new text.
+      yield* adapter.update(runtime, { ref: created.ref, body: "Rewritten\n" }, actor);
+      assert.strictEqual(
+        (yield* adapter.get(runtime, created.ref.itemId)).body,
+        `Rewritten\n\n${notes}`,
+      );
+
+      // A body whose notes were edited or dropped gets the file's back in their place.
+      yield* adapter.update(
+        runtime,
+        { ref: created.ref, body: "Again\n\n## Notes\n- forged\n\n## After\nTail\n" },
+        actor,
+      );
+      const detail = yield* adapter.get(runtime, created.ref.itemId);
+      assert.strictEqual(detail.body, `Again\n\n${notes}## After\nTail\n`);
+      assert.deepStrictEqual(
+        detail.comments.map((comment) => comment.body),
+        ["First note"],
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("lists symbolic links read-only and never reads or writes through them", () =>
     Effect.gen(function* () {
       const { fs, path, directory, adapter, runtime, reads, writeTask } = yield* setup;

@@ -258,6 +258,47 @@ describe("WorkThreads.start", () => {
     }),
   );
 
+  it.effect("launches its own thread beside threads linked by hand or by Factory", () =>
+    Effect.gen(function* () {
+      const { control, harness, layer } = yield* setup();
+      const manual = ThreadId.make("thread-manual");
+      const factory = ThreadId.make("thread-factory");
+      harness.threads.set(manual, threadShell(manual, projectId));
+      harness.threads.set(factory, threadShell(factory, projectId));
+      yield* Effect.gen(function* () {
+        const work = yield* WorkService.WorkService;
+        const store = yield* WorkLinkStore.WorkLinkStore;
+        const threads = yield* WorkThreads.WorkThreads;
+        const item = yield* createItem;
+        yield* work.setLink(owner, { ref: item.ref, threadId: manual, action: "link" });
+        yield* store.link({
+          ...item.ref,
+          threadId: factory,
+          source: "started",
+          origin: "factory",
+          snapshot: {
+            key: item.key,
+            title: item.title,
+            status: item.status,
+            url: item.url,
+            revision: item.revision,
+            autoStarted: false,
+          },
+        });
+
+        const first = yield* threads.start(starter, startInput(item.ref));
+        assert.isFalse(first.resumed);
+        assert.notInclude([manual, factory], first.threadId);
+        assert.strictEqual(control.launched.length, 1);
+        // A later start finds the thread the first one launched.
+        assert.deepStrictEqual(yield* threads.start(starter, startInput(item.ref)), {
+          threadId: first.threadId,
+          resumed: true,
+        });
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
   it.effect("removes the link when the launch fails", () =>
     Effect.gen(function* () {
       const { control, layer } = yield* setup();

@@ -16,6 +16,7 @@ import {
   splitNotes,
   TASK_ID_PATTERN,
   taskFilename,
+  withNotesOf,
 } from "./taskFiles.ts";
 
 const ISO = "2026-10-21T12:00:00.000Z";
@@ -370,6 +371,17 @@ describe("notes", () => {
     assert.strictEqual(appendNote("", line, "\r\n"), `## Notes\r\n${line}\r\n`);
     assert.strictEqual(appendNote("Intro", line, "\r\n"), `Intro\r\n\r\n## Notes\r\n${line}\r\n`);
     assert.strictEqual(appendNote("Intro\r\n", line), `Intro\r\n\r\n## Notes\r\n${line}\r\n`);
+  });
+
+  it("keeps the current notes when a body is replaced, wherever the new text puts them", () => {
+    const notes = `## Notes\n- ${ISO} (Artem) First\n`;
+    const current = `Intro\n\n${notes}`;
+    assert.strictEqual(withNotesOf(current, "New\n"), `New\n\n${notes}`);
+    assert.strictEqual(withNotesOf(current, current), current);
+    // A fence the new text leaves open would swallow notes after it.
+    assert.strictEqual(withNotesOf(current, "New\n```\ncode\n"), `New\n\n${notes}\`\`\`\ncode\n`);
+    // Notes are never written through a body: a section of its own is dropped when none exists.
+    assert.strictEqual(withNotesOf("Intro\n", "New\n## Notes\n- forged\n"), "New\n");
   });
 
   it("reads comments back from the Notes section only", () => {

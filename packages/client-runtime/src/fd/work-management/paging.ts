@@ -110,9 +110,12 @@ export const shouldAutoLoadWorkPage = (input: {
   input.pageCount < WORK_AUTO_PAGE_LIMIT;
 
 /**
- * An explicit refresh: ask the server to drop its caches (every client then refetches through
- * the refresh subscription), and refresh this client's queries too so a missed or late
- * subscription event cannot leave the view stale. Resolves whether the server refresh worked.
+ * An explicit refresh (the refresh button, pull to refresh): ask the server to drop its cached
+ * reads, after which every client refetches through the refresh subscription. This client
+ * refreshes its own queries only when the server could not be asked, so nothing reads twice.
+ * Automatic refreshes (focus, an interval) refresh the queries alone: the server's caches expire
+ * within a minute, and dropping them would refetch every list on every client. Resolves whether
+ * the server refresh worked.
  */
 export async function refreshWork(input: {
   readonly requestServerRefresh: () => Promise<{ readonly _tag: "Success" | "Failure" }>;
@@ -122,7 +125,7 @@ export async function refreshWork(input: {
   try {
     refreshed = (await input.requestServerRefresh())._tag === "Success";
   } finally {
-    input.refreshQueries();
+    if (!refreshed) input.refreshQueries();
   }
   return refreshed;
 }

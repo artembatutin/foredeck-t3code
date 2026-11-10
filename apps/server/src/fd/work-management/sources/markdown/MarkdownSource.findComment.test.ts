@@ -49,13 +49,16 @@ describe("MarkdownSource findComment", () => {
     Effect.gen(function* () {
       const { adapter, runtime } = yield* withNotes(55);
       const detail = yield* adapter.get(runtime, itemId);
+      // A read keeps the newest notes, as GitHub and Jira keep their newest comments.
       assert.strictEqual(detail.comments.length, 50);
       assert.isTrue(detail.commentsTruncated);
+      assert.strictEqual(detail.comments[0]?.body, "note-006 reviewed.");
+      assert.strictEqual(detail.comments.at(-1)?.body, "note-055 reviewed.");
 
-      const found = yield* adapter.findComment(runtime, itemId, "note-053 ");
+      const found = yield* adapter.findComment(runtime, itemId, "note-003 ");
       assert.deepStrictEqual(
         Option.map(found, ({ id, body }) => ({ id, body })),
-        Option.some({ id: "53", body: "note-053 reviewed." }),
+        Option.some({ id: "3", body: "note-003 reviewed." }),
       );
       assert.isTrue(Option.isNone(yield* adapter.findComment(runtime, itemId, "note-056 ")));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

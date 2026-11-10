@@ -680,6 +680,55 @@ describe("WorkService items", () => {
     }).pipe(Effect.scoped, Effect.provide(harness.layer));
   });
 
+  it.effect(
+    "drops only the changed source's cached reads, while every change wakes clients",
+    () => {
+      const markdown = fakeAdapter("markdown");
+      const github = fakeAdapter("github");
+      const harness = seeded(markdown.adapter, github.adapter);
+      return Effect.gen(function* () {
+        const work = yield* WorkService.WorkService;
+        const tasks = yield* work.saveSource(owner, {
+          projectId: alpha,
+          label: "Tasks",
+          config: markdownConfig("tasks"),
+        });
+        const issues = yield* work.saveSource(owner, {
+          projectId: alpha,
+          label: "Issues",
+          config: { kind: "github", host: "github.com", owner: "acme", name: "app" },
+        });
+        const task = yield* work.createItem(owner, { sourceId: tasks.sourceId, title: "Task" });
+        yield* work.createItem(owner, { sourceId: issues.sourceId, title: "Issue" });
+        const read = Effect.all([
+          work.listItems(owner, { sourceId: tasks.sourceId, limit: 50 }),
+          work.listItems(owner, { sourceId: issues.sourceId, limit: 50 }),
+        ]);
+        yield* read;
+        assert.deepStrictEqual([markdown.count("list"), github.count("list")], [1, 1]);
+
+        const pull = yield* Stream.toPull(work.subscribeRefreshes);
+        const [initial] = yield* pull;
+        yield* work.setStatus(owner, { ref: task.ref, status: "in_progress" });
+        const bumped = yield* pull;
+        assert.isAbove(bumped.at(-1)!, initial!);
+        yield* read;
+        assert.deepStrictEqual([markdown.count("list"), github.count("list")], [2, 1]);
+
+        // A refresh names what it drops: one source, or a project's sources.
+        yield* work.refresh(owner, { sourceId: issues.sourceId });
+        yield* read;
+        assert.deepStrictEqual([markdown.count("list"), github.count("list")], [2, 2]);
+        yield* work.refresh(owner, { projectId: alpha });
+        yield* read;
+        assert.deepStrictEqual([markdown.count("list"), github.count("list")], [3, 3]);
+        yield* work.refresh(owner, {});
+        yield* read;
+        assert.deepStrictEqual([markdown.count("list"), github.count("list")], [4, 4]);
+      }).pipe(Effect.scoped, Effect.provide(harness.layer));
+    },
+  );
+
   it.effect("replays retried creates and comments and attributes what agents post", () => {
     const markdown = fakeAdapter("markdown");
     const harness = seeded(markdown.adapter);
@@ -866,6 +915,44 @@ describe("WorkService stale writes", () => {
       const reloaded = yield* work.getItem(owner, { ref: item.ref });
       assert.strictEqual(reloaded.revision, outside.revision);
       assert.strictEqual(reloaded.title, "Changed elsewhere");
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("refuses to save back a body its source served cut at the wire cap", () => {
+    const github = fakeAdapter("github");
+    const harness = seeded(github.adapter);
+    return Effect.gen(function* () {
+      const work = yield* WorkService.WorkService;
+      const source = yield* work.saveSource(owner, {
+        projectId: alpha,
+        label: "Issues",
+        config: { kind: "github", host: "github.com", owner: "acme", name: "app" },
+      });
+      const item = yield* work.createItem(owner, {
+        sourceId: source.sourceId,
+        title: "Long",
+        body: "x".repeat(70_000),
+      });
+      const served = yield* work.getItem(owner, { ref: item.ref });
+      assert.isTrue(served.bodyTruncated);
+      assert.strictEqual(
+        yield* failureOf(
+          work.updateItem(owner, {
+            ref: item.ref,
+            body: served.body,
+            expectedRevision: served.revision,
+          }),
+        ),
+        "WorkUnsupported",
+      );
+      assert.strictEqual(github.count("update"), 0);
+      // A title edit leaves the body alone, so it still saves.
+      yield* work.updateItem(owner, {
+        ref: item.ref,
+        title: "Long, renamed",
+        expectedRevision: served.revision,
+      });
+      assert.strictEqual(github.count("update"), 1);
     }).pipe(Effect.provide(harness.layer));
   });
 });

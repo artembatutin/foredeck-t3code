@@ -138,7 +138,7 @@ const make = Effect.gen(function* () {
           Stream.runForEach(watch(source.runtime), () =>
             Effect.suspend(() => {
               reported = true;
-              return work.bumpEpoch;
+              return work.sourceChanged(sourceId);
             }),
           ),
         ),
@@ -256,7 +256,7 @@ const make = Effect.gen(function* () {
 
   const unlinkThreadOnce = (threadId: ThreadId, linkedUpTo: string | undefined) =>
     links.unlinkThread(threadId, linkedUpTo === undefined ? undefined : { linkedUpTo }).pipe(
-      Effect.flatMap((removed) => (removed > 0 ? work.bumpEpoch : Effect.void)),
+      Effect.flatMap((removed) => (removed > 0 ? work.notifyChanged : Effect.void)),
       Effect.catchCause(logSkipped("work thread unlink failed")),
     );
 
@@ -270,7 +270,7 @@ const make = Effect.gen(function* () {
         yield* links.updateRun(link.sourceId, link.itemId, link.threadId, { status, at });
       }
       yield* refreshSnapshots(rows);
-      yield* work.bumpEpoch;
+      yield* work.notifyChanged;
     }).pipe(Effect.catchCause(logSkipped("work run outcome update failed")));
 
   /** The latest run's outcome when it ended after the link was made and the link lacks it. */
@@ -321,7 +321,7 @@ const make = Effect.gen(function* () {
       if (shell.archivedAt === null) kept.push(link);
     }
     changed += yield* refreshSnapshots(kept);
-    if (changed > 0) yield* work.bumpEpoch;
+    if (changed > 0) yield* work.notifyChanged;
   }).pipe(Effect.catchCause(logSkipped("work link sweep failed")));
 
   const worker = yield* makeDrainableWorker((job: Job) => {

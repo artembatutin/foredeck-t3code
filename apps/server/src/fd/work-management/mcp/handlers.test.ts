@@ -31,10 +31,13 @@ const refOf = (item: { readonly ref: { readonly sourceId: string; readonly itemI
   `${item.ref.sourceId}:${item.ref.itemId}`;
 const callerId = ThreadId.make("caller-thread");
 
-const setup = (modes: {
-  readonly runtimeMode: RuntimeMode;
-  readonly interactionMode?: ProviderInteractionMode;
-}) =>
+const setup = (
+  modes: {
+    readonly runtimeMode: RuntimeMode;
+    readonly interactionMode?: ProviderInteractionMode;
+  },
+  body?: string,
+) =>
   Effect.gen(function* () {
     const markdown = fakeAdapter("markdown");
     const harness = makeHarness([markdown.adapter]);
@@ -101,7 +104,11 @@ const setup = (modes: {
         label: "Tasks",
         config: markdownConfig("tasks"),
       });
-      return yield* work.createItem(owner, { sourceId: source.sourceId, title: "Ship it" });
+      return yield* work.createItem(owner, {
+        sourceId: source.sourceId,
+        title: "Ship it",
+        ...(body === undefined ? {} : { body }),
+      });
     }).pipe(Effect.provide(context));
     return { call, item, launched, markdown };
   });
@@ -195,6 +202,33 @@ describe("work MCP tools", () => {
       assert.include(comment!.body, "`@copilot`");
       assert.include(comment!.body, `— posted by codex via Foredeck (thread ${callerId})`);
       assert.strictEqual(comment!.actorId, `thread:${callerId}`);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("refuses to replace a body longer than work_read showed the agent", () =>
+    Effect.gen(function* () {
+      const { call, item, markdown } = yield* setup(
+        { runtimeMode: "full-access" },
+        "x".repeat(16_001),
+      );
+      const read = yield* call("work_read", { item: refOf(item) });
+      const shown = read.result as { readonly body: string; readonly bodyTruncated: boolean };
+      assert.isTrue(shown.bodyTruncated);
+      const update = yield* call("work_update", {
+        item: refOf(item),
+        body: shown.body.slice(0, 100),
+        expectedRevision: item.revision,
+      });
+      assert.isTrue(update.isFailure);
+      assert.deepInclude(update.result as object, { code: "unsupported" });
+      assert.strictEqual(markdown.count("update"), 0);
+      // Other fields still change.
+      const retitled = yield* call("work_update", {
+        item: refOf(item),
+        title: "Ship it soon",
+        expectedRevision: item.revision,
+      });
+      assert.isFalse(retitled.isFailure, JSON.stringify(retitled.result));
     }).pipe(Effect.scoped),
   );
 

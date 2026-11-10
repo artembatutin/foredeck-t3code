@@ -67,7 +67,8 @@ Free Markdown. Checkboxes are just Markdown.
 - A task is **blocked** while any task in `blocked_by` is not done or cancelled.
   Blocked is shown, never stored.
 - Comments are lines under `## Notes`. Work appends them; it never edits or
-  removes old notes.
+  removes old notes, and saving a body keeps the file's notes. Change a note in
+  your editor.
 - A file that cannot be read cleanly (broken frontmatter, a duplicate id, an
   unknown status) is shown as read-only and never rewritten. Fix it in your
   editor.
@@ -163,7 +164,9 @@ An agent names an item by the reference in its prompt
 
 Agents in plan mode, and outside clients you approved as read-only, can only
 read. Other agents can update items and start threads, but never with broader
-permissions than their own, and never change source settings.
+permissions than their own, and never change source settings. An agent sees at
+most 16,000 characters of a body, so it cannot replace a longer one; edit that
+item in its source.
 
 To keep agents from editing task frontmatter by hand, you can add this to your
 project's `AGENTS.md` or `CLAUDE.md`:

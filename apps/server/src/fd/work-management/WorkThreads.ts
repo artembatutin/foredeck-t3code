@@ -59,7 +59,7 @@ export interface WorkThreadStart {
 /**
  * Starts an agent thread from a Work item. Starts of one item (in its canonical spelling) are
  * serialized, the link row is written before the launch so a concurrent start sees it, and an
- * open linked thread is returned instead of a second launch unless the caller forces one. The
+ * open thread an earlier start launched is returned instead of a second launch unless the caller forces one. The
  * link is a reservation for as long as the launch runs; a launch that ends without a thread
  * removes it, however it ended.
  */
@@ -103,16 +103,24 @@ const make = Effect.gen(function* () {
   const threadReadFailure = (cause: unknown) =>
     new WorkUnavailable({ detail: "Thread state could not be read.", cause });
 
-  /** An open linked thread, after dropping links whose launch died before creating it. */
+  /**
+   * An open thread a Work start launched for the item, after dropping links whose launch died
+   * before creating it. A thread linked by hand, by an agent, or launched by another feature
+   * (a Factory stage) is not a start of this item: starting launches its own thread.
+   */
   const openLinkedThread = (ref: WorkItemRef) =>
     Effect.gen(function* () {
       const rows = yield* links
         .listByItem(ref.sourceId, ref.itemId)
         .pipe(Effect.mapError(storeFailure));
       for (const link of rows) {
+        const started = link.source === "started" && link.origin === null;
         // A reservation is released only once its thread exists or its link is gone, so it is
         // checked before the thread.
-        if (yield* work.isLaunching(link.threadId)) return link.threadId;
+        if (yield* work.isLaunching(link.threadId)) {
+          if (started) return link.threadId;
+          continue;
+        }
         const shell = yield* projections
           .getThreadShell(link.threadId)
           .pipe(Effect.mapError(threadReadFailure));
@@ -123,7 +131,12 @@ const make = Effect.gen(function* () {
             .pipe(Effect.mapError(storeFailure));
           continue;
         }
-        if (shell.deletedAt === null && shell.settledAt === null && shell.archivedAt === null) {
+        if (
+          started &&
+          shell.deletedAt === null &&
+          shell.settledAt === null &&
+          shell.archivedAt === null
+        ) {
           return link.threadId;
         }
       }
@@ -331,7 +344,8 @@ const make = Effect.gen(function* () {
           );
       }
 
-      yield* work.bumpEpoch;
+      // The link changed, and a Markdown item may have moved to in progress.
+      yield* work.sourceChanged(input.ref.sourceId);
       return { threadId: launched.threadId, resumed: launched.resumed };
     });
 

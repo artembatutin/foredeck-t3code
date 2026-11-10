@@ -188,7 +188,8 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
   const requestRefresh = useAtomCommand(workCommands.refresh);
   const refreshSources = sourcesQuery.refresh;
   const refreshLinks = linksQuery.refresh;
-  // Pull to refresh drops the server's caches, then refreshes this list's own queries.
+  // Pull to refresh drops the server's caches; every client then refetches through the refresh
+  // subscription.
   const refresh = useCallback(() => {
     if (project === undefined) return;
     void refreshWork({

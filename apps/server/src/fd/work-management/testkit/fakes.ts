@@ -38,6 +38,7 @@ import {
   WorkUnauthenticated,
   type WorkDomainError,
 } from "../errors.ts";
+import { BODY_MAX_CHARS, truncateText } from "../model/bounds.ts";
 import { workItemContentFingerprint } from "../model/scope.ts";
 import * as WorkLinkStore from "../persistence/WorkLinkStore.ts";
 import * as WorkMigrations from "../persistence/WorkMigrations.ts";
@@ -363,9 +364,12 @@ export const fakeAdapter = (
           }
           minted += 1;
           const itemId = WorkItemId.make(options.mintId?.(minted) ?? `item-${minted}`);
+          // Served cut at the wire cap, as every source serves a body.
+          const body = truncateText(input.body ?? "", BODY_MAX_CHARS);
           return put(runtime, {
             ...fakeDetail({ sourceId: runtime.sourceId, itemId }, kind, input.title),
-            body: input.body ?? "",
+            body: body.text,
+            bodyTruncated: body.truncated,
             labels: input.labels ?? [],
           });
         }),

@@ -226,6 +226,17 @@ export const toolLayer = McpToolAccess.toLayer(WorkToolkit, {
         params.blockedBy === undefined
           ? undefined
           : yield* Effect.forEach(params.blockedBy, itemId);
+      // work_read shows an agent at most AGENT_BODY_MAX_CHARS, so a longer body saved back would
+      // lose what it never saw.
+      if (params.body !== undefined) {
+        const current = yield* work(service.getItem(actor, { ref }));
+        if (current.bodyTruncated || current.body.length > AGENT_BODY_MAX_CHARS) {
+          return yield* new WorkMcpFailure({
+            code: "unsupported",
+            message: `This item's body is longer than the ${AGENT_BODY_MAX_CHARS} characters work_read shows, so it cannot be replaced here. Ask the owner to edit it in its source, or record your change with work_comment.`,
+          });
+        }
+      }
       return yield* work(
         service.updateItem(actor, {
           ref,

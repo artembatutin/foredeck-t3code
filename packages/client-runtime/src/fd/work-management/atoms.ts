@@ -9,7 +9,8 @@ import {
   WorkListResult,
   WorkSourceList,
 } from "@t3tools/contracts/fd/work-management";
-import { Atom } from "effect/reactivity";
+import * as Option from "effect/Option";
+import { AsyncResult, Atom } from "effect/reactivity";
 
 import type { EnvironmentRegistry } from "../../connection/registry.ts";
 import { persistQuery } from "../../state/queryPersistence.ts";
@@ -51,8 +52,17 @@ export function createWorkEnvironmentAtoms<R, E>(
     label: "environment-data:work:refreshes",
     tag: WS_METHODS.workSubscribeRefreshes,
   });
+  // The epoch alone, holding its last value while the stream reconnects: a resubscribe answers the
+  // current epoch again, and only a move should refetch (a reconnect already re-runs every read).
+  const refreshEpoch = Atom.family((environmentId: EnvironmentId) =>
+    Atom.readable((get): number | null =>
+      Option.getOrElse(AsyncResult.value(get(refreshes({ environmentId, input: {} }))), () =>
+        Option.getOrNull(get.self<number | null>()),
+      ),
+    ).pipe(Atom.withLabel(`environment-data:work:refresh-epoch:${environmentId}`)),
+  );
   const refreshTrigger = ({ environmentId }: { readonly environmentId: EnvironmentId }) =>
-    refreshes({ environmentId, input: {} });
+    refreshEpoch(environmentId);
   const list = createEnvironmentRpcQueryAtomFamily(runtime, {
     label: "environment-data:work:list",
     persistence: persistQuery(WorkListResult),

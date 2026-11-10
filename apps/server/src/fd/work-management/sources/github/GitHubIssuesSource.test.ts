@@ -171,7 +171,7 @@ describe("GitHubIssuesSource", () => {
       }),
   );
 
-  it.effect("searches with repository and filter qualifiers", () =>
+  it.effect("searches only the source's repository, whatever the text says", () =>
     Effect.gen(function* () {
       const api = stubApi((call) =>
         call.kind === "rest"
@@ -181,7 +181,13 @@ describe("GitHubIssuesSource", () => {
                 data: {
                   search: {
                     pageInfo: { hasNextPage: false, endCursor: null },
-                    nodes: [issue(3), {}],
+                    nodes: [
+                      issue(3, { repository: { nameWithOwner: "Acme/App" } }),
+                      {},
+                      // Another repository's issue with a colliding number.
+                      issue(4, { repository: { nameWithOwner: "other/app" } }),
+                      issue(5),
+                    ],
                   },
                 },
               }),
@@ -191,7 +197,7 @@ describe("GitHubIssuesSource", () => {
       const result = yield* adapter.list(runtime, {
         sourceId,
         limit: 20,
-        search: 'crash "now"',
+        search: 'crash "now" repo:other/app -repo:acme/app',
         statuses: ["todo"],
         labels: ["bug"],
         assignee: "me",
@@ -203,7 +209,7 @@ describe("GitHubIssuesSource", () => {
       const search = api.calls.find((call) => call.operation === "work.issues.search");
       assert.strictEqual(
         search?.variables?.query,
-        'repo:acme/app is:issue sort:updated-desc is:open label:"bug" assignee:octo crash  now',
+        'repo:acme/app is:issue sort:updated-desc is:open label:"bug" assignee:octo crash now "repo:other/app" "-repo:acme/app"',
       );
     }),
   );
