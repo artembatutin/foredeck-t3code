@@ -71,8 +71,8 @@ describe("boundList", () => {
     expect(bounded.truncated).toBe(false);
   });
 
-  it("keeps the first items and reports the cut", () => {
-    expect(boundList(["a", "b", "c"], 2)).toEqual({ items: ["a", "b"], truncated: true });
+  it("keeps the last items and reports the cut", () => {
+    expect(boundList(["a", "b", "c"], 2)).toEqual({ items: ["b", "c"], truncated: true });
     expect(boundList(["a"], 0)).toEqual({ items: [], truncated: true });
     expect(boundList([], 0)).toEqual({ items: [], truncated: false });
   });

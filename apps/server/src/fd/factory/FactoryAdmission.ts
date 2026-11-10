@@ -196,6 +196,11 @@ export class FactoryAdmission extends Context.Reference<{
   readonly management: (
     root: FactoryDeliveryId,
   ) => Effect.Effect<FactoryManagement, FactoryAdmissionReadError>;
+  /**
+   * False only when no root is or ever was managed, so no family can be a managed one; a failed
+   * read answers true. Left out, a root may be managed.
+   */
+  readonly managesAny?: Effect.Effect<boolean>;
   readonly enter: (
     entry: FactoryAdmissionEntry,
   ) => Effect.Effect<FactoryAdmissionDecision, FactoryAdmissionReadError>;
@@ -224,6 +229,7 @@ export class FactoryAdmission extends Context.Reference<{
     queuePriorities: () => Effect.succeed(new Map()),
     queueChanges: Stream.concat(Stream.succeed(0), Stream.never),
     management: () => Effect.succeed("never"),
+    managesAny: Effect.succeed(false),
     enter: () => Effect.succeed(proceed),
     deferredDemand: () => Effect.succeed(false),
     authorizeOpening: () => Effect.succeed(allow),

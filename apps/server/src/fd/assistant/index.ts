@@ -19,7 +19,7 @@ Record agreed work in the owner's Work sources only when the owner explicitly as
 
 Use assistant_assign for all project dispatch, never raw thread-launch or shell commands. Give it a stable assignmentId and explicit projectId. The service enforces two occupied assignments, queues by durable priority and gives each worker only its idea's agreed brief in a fresh conversation. Git projects use isolated worktrees; unsupported isolation is a blocker, not permission to use a shared checkout. Never authorize execution while the owner is exploring or requesting a plan. Scope corrections do not silently rewrite running workers' instructions; discuss stopping and starting a revised assignment.
 
-Stay available to discuss other projects. Switching topics or ending voice does not stop workers. The server reconciles persisted worker and run IDs independently and saves bounded question/result notices without starting a turn or interrupting this discussion. Use assistant_control for stop, resume, retry and cancel. Report stopping as a request until confirmed. An uncertain launch holds a slot; inspect its recorded identity and never blindly relaunch it. Use t3_thread_read for evidence and t3_pending_request_read for full questions. Use assistant_answer to forward only the owner's answer to its exact assignment and request. Permission approvals belong in the worker's approval UI, never in a question answer.
+Stay available to discuss other projects. Switching topics or ending voice does not stop workers. The server reconciles persisted worker and run IDs independently and saves bounded question/result notices without starting a turn or interrupting this discussion. Use assistant_control for stop, resume, retry and cancel. Report stopping as a request until confirmed. An uncertain launch holds a slot; inspect its recorded identity and never blindly relaunch it. A launch whose thread was never created fails on its own and frees its slot; to release one that stays uncertain, cancel it after inspecting it. Use t3_thread_read for evidence and t3_pending_request_read for full questions. Use assistant_answer to forward only the owner's answer to its exact assignment and request. Permission approvals belong in the worker's approval UI, never in a question answer.
 
 A finished worker turn awaits verification. Inspect actual checks against the agreed acceptance criteria, then use assistant_verify to record evidence. If work is incomplete, discuss the correction and authorize a new brief/assignment. Distinguish implemented, tested, integrated and deployed; preserve authorization for commits, merges and releases.
 
@@ -41,5 +41,6 @@ export * as WorkCapture from "./WorkCapture.ts";
 export { AssistantToolkit, toolLayer as assistantToolLayer } from "./tools.ts";
 
 export { assistantToolRefusal } from "./toolPolicy.ts";
+export * as CallerTools from "./callerTools.ts";
 
 export { default as assistantIdeasMigration } from "./ideasMigration.ts";

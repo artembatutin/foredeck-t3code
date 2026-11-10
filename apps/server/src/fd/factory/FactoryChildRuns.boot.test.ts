@@ -821,7 +821,8 @@ describe("a cancellation a restart cut short", () => {
         yield* sweep;
 
         assert.strictEqual((yield* stateOf(parentId)).status, "cancelled");
-        assert.deepStrictEqual(yield* stateOf(first), approved);
+        // The approved child ends too, freeing its item, with its approval kept.
+        assert.deepStrictEqual(yield* stateOf(first), { ...approved, status: "cancelled" });
         for (const childId of [second, third]) {
           const child = yield* stateOf(childId);
           assert.strictEqual(child.status, "cancelled");
@@ -866,7 +867,7 @@ describe("a cancellation a restart cut short", () => {
         assert.isNull(parent.awaiting);
         assert.strictEqual((yield* stateOf(third)).status, "cancelled");
         assert.strictEqual((yield* stateOf(second)).status, "cancelled");
-        assert.deepStrictEqual(yield* stateOf(first), approved);
+        assert.deepStrictEqual(yield* stateOf(first), { ...approved, status: "cancelled" });
         // The first task's approval stays.
         const tasks = yield* Effect.flatMap(FactoryTaskStore.FactoryTaskStore, (store) =>
           store.listByDelivery(parentId),
@@ -912,7 +913,8 @@ describe("a cancellation a restart cut short", () => {
           const author = launched(second, 1);
           const continued = RunId.make("run-continued-after-restart");
           world.liveRuns.push({ threadId: author.threadId, runId: continued, factoryTurn: true });
-          // A run live on the approved child's thread belongs to no cancelled delivery.
+          // A Factory turn live on the approved child's thread stops too: the child ends with its
+          // parent.
           const approved = launched(first, 1);
           world.liveRuns.push({
             threadId: approved.threadId,
@@ -926,11 +928,13 @@ describe("a cancellation a restart cut short", () => {
             world.interrupts.filter(({ deliveryId }) => deliveryId === second),
             [{ deliveryId: second, threadId: author.threadId, runId: continued }],
           );
-          assert.isFalse(world.interrupts.some(({ deliveryId }) => deliveryId === first));
-          for (const deliveryId of [parentId, second, third]) {
+          assert.deepStrictEqual(
+            world.interrupts.filter(({ deliveryId }) => deliveryId === first),
+            [{ deliveryId: first, ...approved }],
+          );
+          for (const deliveryId of [parentId, first, second, third]) {
             assert.strictEqual((yield* stateOf(deliveryId)).status, "cancelled");
           }
-          assert.strictEqual((yield* stateOf(first)).status, "approved");
           assert.deepStrictEqual(world.launches, []);
 
           // Once its run stops, the next server finds nothing more to stop.

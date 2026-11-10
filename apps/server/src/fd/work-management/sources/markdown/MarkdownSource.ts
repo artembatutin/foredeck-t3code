@@ -44,6 +44,7 @@ import {
   parseOptionalFields,
   parseTaskId,
   type TaskOptionalFields,
+  withNotesOf,
 } from "../../documents/taskFiles.ts";
 import {
   WorkConflict,
@@ -867,9 +868,19 @@ export const make: Effect.Effect<
           }
           fields.blocked_by = blockers.length === 0 ? null : formatCommaList(blockers);
         }
+        // Notes grow only through comments: the file's own section replaces any the body carries.
+        const body =
+          patch.body === undefined
+            ? undefined
+            : withNotesOf(current.body, patch.body, current.newline);
+        if (body !== undefined && parseNotes(body).length < parseNotes(current.body).length) {
+          return yield* new WorkInvalid({
+            detail: "The body would hide this item's Notes; keep them outside code blocks.",
+          });
+        }
         return {
           ...(patch.title === undefined ? {} : { title: patch.title }),
-          ...(patch.body === undefined ? {} : { body: patch.body }),
+          ...(body === undefined ? {} : { body }),
           fields,
         };
       }),

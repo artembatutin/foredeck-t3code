@@ -711,11 +711,25 @@ describe("resume a parent that blocked or stopped while planning", () => {
     ["the planner", [planner], planner],
     ["another thread and the planner, naming the planner", [author, planner], planner],
   ] as const)("blocks again when %s was deleted, issuing nothing", (_, deletedThreads, named) => {
-    for (const delivery of [blockedOnRun, stoppedAtGate]) {
-      expect(advance(delivery, resumeWith({ ...nothingFound, deletedThreads }))).toEqual(
-        blockedState(delivery, { reason: "thread_deleted", threadId: named }),
-      );
-    }
+    expect(advance(blockedOnRun, resumeWith({ ...nothingFound, deletedThreads }))).toEqual(
+      blockedState(blockedOnRun, { reason: "thread_deleted", threadId: named }),
+    );
+  });
+
+  it("is not held by deleted threads it sends nothing to", () => {
+    // Waiting at the gate again needs no planner, and planning again needs no other thread.
+    const atGate = advance(
+      stoppedAtGate,
+      resumeWith({ ...nothingFound, deletedThreads: [planner] }),
+    );
+    expect(atGate).toEqual(advance(stoppedAtGate, resumeWith(nothingFound)));
+    expect(atGate.delivery.status).toBe("waiting");
+    const replanning = advance(
+      blockedOnRun,
+      resumeWith({ ...nothingFound, deletedThreads: [author] }),
+    );
+    expect(replanning).toEqual(advance(blockedOnRun, resumeWith(nothingFound)));
+    expect(replanning.delivery.status).toBe("running");
   });
 
   it("never begins the author stage", () => {

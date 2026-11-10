@@ -283,6 +283,9 @@ describe("cancelling a parent after a resume replaced its blocked integrate revi
         });
         assert.deepStrictEqual(interruptedTurns(world), interrupted.toSorted());
         assert.deepStrictEqual(yield* sent, commands);
+        // The approved child ends with its parent, keeping its approval.
+        const cancelledChild = yield* stateOf(childId);
+        assert.deepStrictEqual(cancelledChild, { ...approvedChild, status: "cancelled" });
 
         // A second cancel is refused, and the boot sweep's pass over the live runs of Factory's
         // threads, both reviewers' still among them, sends no second interrupt either.
@@ -303,7 +306,7 @@ describe("cancelling a parent after a resume replaced its blocked integrate revi
         }
         yield* drainFactory;
         assert.deepStrictEqual(yield* stateOf(parentId), cancelled.state);
-        assert.deepStrictEqual(yield* stateOf(childId), approvedChild);
+        assert.deepStrictEqual(yield* stateOf(childId), cancelledChild);
         assert.strictEqual(approvedChild.status, "approved");
         assert.deepStrictEqual(yield* taskRows(parentId), tasks);
 

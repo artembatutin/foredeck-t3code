@@ -392,7 +392,15 @@ const MOVES: {
   "confirm-stopped": { from: ["stopping"], to: "stopped" },
   resume: { from: ["stopped"], to: "queued", requiresAuthorization: true },
   fail: {
-    from: ["queued", "launching", "running", "needs-input", "stopping", "awaiting-verification"],
+    from: [
+      "queued",
+      "launching",
+      "launch-uncertain",
+      "running",
+      "needs-input",
+      "stopping",
+      "awaiting-verification",
+    ],
     to: "failed",
   },
   retry: { from: ["failed"], to: "queued", requiresAuthorization: true },
@@ -400,8 +408,9 @@ const MOVES: {
   // cancelled assignment stays cancelled.
   "retry-delivery": { from: ["failed", "cancelled"], to: "queued", requiresAuthorization: true },
   complete: { from: ["running", "stopping", "awaiting-verification"], to: "completed" },
+  // An uncertain launch is cancelled by the owner once its recorded identity is inspected.
   cancel: {
-    from: ["draft", "queued", "stopped", "failed", "awaiting-verification"],
+    from: ["draft", "queued", "launch-uncertain", "stopped", "failed", "awaiting-verification"],
     to: "cancelled",
   },
   // `to` is the event's own, for a Factory delivery's assignment that has not ended.

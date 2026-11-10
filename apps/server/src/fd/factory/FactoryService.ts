@@ -564,12 +564,14 @@ export class FactoryService extends Context.Service<
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<Option.Option<FactoryDeliveryWithRuns>, FactoryStoreError>;
     /**
-     * `list` as a client shows it: every delivery with its queue rank, and each not done or
-     * cancelled with what its Work item says now. Those reads never fail or hold up the list: one
-     * that cannot answer in time leaves its part out. It writes nothing, here or at any source.
+     * `list` as a client shows it: every delivery (only those not done or cancelled with
+     * `activeOnly`) with its queue rank, and each not done or cancelled with what its Work item
+     * says now. Those reads never fail or hold up the list: one that cannot answer in time leaves
+     * its part out. It writes nothing, here or at any source.
      */
     readonly listForClients: (input: {
       readonly projectId?: ProjectId;
+      readonly activeOnly?: boolean;
     }) => Effect.Effect<ReadonlyArray<FactoryDeliveryWithRuns>, FactoryStoreError>;
     /**
      * The item in Work's canonical spelling, which deliveries are stored under, and every

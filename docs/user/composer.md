@@ -51,7 +51,9 @@ Ask the assistant to review pending results when you are ready.
 The host server keeps coordinating work while it runs, including when a remote client
 disconnects. Closing a desktop app that hosts the server can stop it; a stopped host
 cannot execute. Restarting reconciles saved worker identities. An uncertain launch
-keeps its slot until reconciled and is never automatically duplicated.
+keeps its slot until reconciled and is never automatically duplicated: one whose thread was
+never created fails and frees its slot, and you can ask the assistant to cancel one that stays
+uncertain.
 
 ## Local voice
 

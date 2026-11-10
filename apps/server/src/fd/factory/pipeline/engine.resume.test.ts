@@ -433,6 +433,50 @@ describe("resume with an unsettled branch", () => {
   });
 });
 
+describe("resume with a deleted thread", () => {
+  // Round 1 blocked, the author answered, and the delivery stopped once the branch settled.
+  const answered = fold(
+    reviewing,
+    submitted(accepted(true)),
+    finished(reviewer, reviewRun),
+    turnStarted(5, repairRun),
+    stop,
+    finished(author, repairRun),
+    settled(6),
+  );
+
+  it("blocks again on a deleted author, whatever else it finds", () => {
+    for (const delivery of [stoppedAtVerify, stoppedAtPr, answered]) {
+      const step = advance(delivery, resumeWith(check({}, [reviewer, author])));
+      expect(step.delivery.block).toEqual({ reason: "thread_deleted", threadId: author });
+      expect(step.effects).toEqual([]);
+    }
+  });
+
+  it("goes on past a finished reviewer's deletion, launching a fresh reviewer", () => {
+    for (const delivery of [stoppedAtReview, stoppedAtRecord, blockedInVerify]) {
+      expect(advance(delivery, resumeWith(check({}, [reviewer])))).toEqual(
+        advance(delivery, resumeWith(check())),
+      );
+    }
+    const step = run(stoppedAtRecord, resumeWith(check({}, [reviewer])), verified(5));
+    expect(step.effects).toMatchObject([{ id: 6, type: "launch_thread", role: "reviewer" }]);
+  });
+
+  it("opens its pull request on the approved commit without its deleted reviewer", () => {
+    const step = advance(stoppedAtPr, resumeWith(check({ approvedSha: head }, [reviewer])));
+    expect(step).toEqual(advance(stoppedAtPr, resumeWith(check({ approvedSha: head }))));
+    expect(step.delivery.status).toBe("approved");
+  });
+
+  it("blocks on a deleted reviewer that a fix-review reply still awaits", () => {
+    const step = advance(answered, resumeWith(check({}, [reviewer])));
+    expect(step.delivery.status).toBe("blocked");
+    expect(step.delivery.block).toEqual({ reason: "thread_deleted", threadId: reviewer });
+    expect(step.effects).toEqual([]);
+  });
+});
+
 describe("resume without an author or with a deleted thread", () => {
   const firstLaunch = {
     id: 1,
@@ -580,7 +624,6 @@ describe("resume without an author or with a deleted thread", () => {
 
   it.each([
     ["the author", [author], author],
-    ["the reviewer", [reviewer], reviewer],
     ["both, naming the author", [reviewer, author], author],
   ] as const)("blocks again when %s was deleted, launching nothing", (_, deleted, named) => {
     expect(advance(stoppedAtRecord, resumeWith(check({}, deleted)))).toEqual({

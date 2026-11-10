@@ -1,5 +1,9 @@
 import { useAtomRefresh, useAtomSet, useAtomValue } from "@effect/atom-react";
-import { createFactoryFleetAtom, factoryFleet } from "@t3tools/client-runtime/fd/factory";
+import {
+  createFactoryFleetAtom,
+  FACTORY_FLEET_INPUT,
+  factoryFleet,
+} from "@t3tools/client-runtime/fd/factory";
 import type { EnvironmentId } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import { Atom } from "effect/reactivity";
@@ -52,7 +56,8 @@ const anySupportedAtom = Atom.make((get) =>
 const fleetStateAtom = createFactoryFleetAtom({
   environmentsAtom: environmentSummaries.environmentsAtom,
   supported: factoryEnvironment.supported,
-  deliveries: (environmentId) => factoryEnvironment.deliveries({ environmentId, input: {} }),
+  deliveries: (environmentId) =>
+    factoryEnvironment.deliveries({ environmentId, input: FACTORY_FLEET_INPUT }),
 });
 
 // Refreshing it refreshes the deliveries it last read.
@@ -65,7 +70,7 @@ const fleetAtom = Atom.readable(
   },
   (refresh) => {
     for (const environmentId of fleetEnvironments) {
-      refresh(factoryEnvironment.deliveries({ environmentId, input: {} }));
+      refresh(factoryEnvironment.deliveries({ environmentId, input: FACTORY_FLEET_INPUT }));
     }
   },
 ).pipe(Atom.withLabel("factory:fleet-rows"));

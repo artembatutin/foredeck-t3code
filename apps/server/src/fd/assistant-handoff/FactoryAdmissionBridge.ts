@@ -203,6 +203,8 @@ export const make = Effect.gen(function* () {
 
   return FactoryAdmission.FactoryAdmission.of({
     management,
+    // A failed read may hide a managed root, so it answers as if one were managed.
+    managesAny: admission.managesAny.pipe(Effect.orElseSucceed(() => true)),
     enter,
     deferredDemand,
     authorizeOpening,

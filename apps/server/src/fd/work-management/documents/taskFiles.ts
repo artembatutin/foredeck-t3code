@@ -355,6 +355,33 @@ export const appendNote = (
   return `${body.slice(0, insertAt)}${newline}${line}${body.slice(insertAt)}`;
 };
 
+/**
+ * `next` with the `## Notes` section of `current` in place of its own, for a write that replaces
+ * a task's text: notes only grow through `appendNote`, so an edit never changes or drops one. A
+ * `next` without a section gets `current`'s at its end, or just before an unterminated fence.
+ */
+export const withNotesOf = (
+  current: string,
+  next: string,
+  newline: "\n" | "\r\n" = current.includes("\r\n") ? "\r\n" : "\n",
+): string => {
+  const { notes } = splitNotes(current);
+  const ended = (rest: string) =>
+    rest !== "" && notes !== "" && !notes.endsWith("\n") ? `${notes}${newline}` : notes;
+  const own = findNotes(next);
+  if (own !== undefined) {
+    const rest = next.slice(own.end);
+    return `${next.slice(0, own.start)}${ended(rest)}${rest}`;
+  }
+  if (notes === "") return next;
+  const openAt = unterminatedFence(next);
+  let prefix = openAt === undefined ? next : next.slice(0, openAt);
+  const rest = openAt === undefined ? "" : next.slice(openAt);
+  if (prefix !== "" && !prefix.endsWith("\n")) prefix += newline;
+  if (prefix !== "" && !/\n\r?\n$/.test(prefix)) prefix += newline;
+  return `${prefix}${ended(rest)}${rest}`;
+};
+
 const singleLine = (value: string) => value.replace(/\s*(?:\r\n|\r|\n)\s*/g, " ").trim();
 
 /** Who wrote a note when the actor has no usable label. */

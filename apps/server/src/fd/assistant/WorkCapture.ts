@@ -1,4 +1,4 @@
-import type { ProjectId } from "@t3tools/contracts";
+import type { ProjectId, ThreadId } from "@t3tools/contracts";
 import {
   WorkErrorReason,
   type WorkErrorReasonValue,
@@ -19,6 +19,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import type { Caller } from "../../mcp/threadAccess.ts";
+import type * as ThreadManagement from "../../orchestration-v2/ThreadManagementService.ts";
 import * as HandoffBackend from "./handoffBackend.ts";
 import * as Portfolio from "./portfolio.ts";
 import * as PortfolioStore from "./PortfolioStore.ts";
@@ -406,10 +407,32 @@ export const captureSource = (
     : picked;
 };
 
+/**
+ * The assistant run a capture writes for, null for the owner's. A capture that withdraws an
+ * idea's execution authorization holds it for the rest of that run (`fd_assistant_authorization_holds`),
+ * so the assistant cannot authorize again before the owner has had a turn to review the item.
+ */
+class CapturingRun extends Context.Reference<string | null>(
+  "t3/fd/assistant/WorkCapture/CapturingRun",
+  { defaultValue: () => null },
+) {}
+
+/** The id of the run `threadId` is in now, or null when none is running. */
+export const activeRunOf = (
+  threads: Pick<ThreadManagement.ThreadManagementService["Service"], "getThreadRecords">,
+  threadId: ThreadId,
+) =>
+  threads.getThreadRecords(threadId, ["runs"]).pipe(
+    Effect.map(({ runs }) => {
+      const run = runs.toSorted((a, b) => b.ordinal - a.ordinal)[0];
+      return run !== undefined && run.status === "running" ? run.id : null;
+    }),
+  );
+
 const assistantOnly = (caller: Caller) => {
   const threadId = caller.scope.thread?.threadId;
   return threadId !== undefined && isAssistantThread(threadId)
-    ? Effect.void
+    ? Effect.succeed(threadId)
     : Effect.fail(refused("not_assistant"));
 };
 
@@ -490,6 +513,12 @@ const make = Effect.gen(function* () {
           const authorized = options.clear
             ? (yield* clearAuthorization(next, next.itemKey)).executionAuthorized
             : options.authorized;
+          const run = yield* CapturingRun;
+          if (options.clear && run !== null)
+            yield* sql`INSERT INTO fd_assistant_authorization_holds (project_id, idea_id, run_id, held_at)
+              VALUES (${next.projectId}, ${next.ideaId}, ${run}, ${saved.value.updatedAt})
+              ON CONFLICT (project_id, idea_id) DO UPDATE
+              SET run_id = excluded.run_id, held_at = excluded.held_at`;
           return Option.some({ saved: saved.value, authorized });
         }),
       )
@@ -1004,11 +1033,18 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const joined = (input: CaptureRequest, writer: HandoffBackend.HandoffWriter) =>
+  const joined = (
+    input: CaptureRequest,
+    writer: HandoffBackend.HandoffWriter,
+    capturingRun: string | null,
+  ) =>
     Effect.gen(function* () {
       const key = keyOf(input.projectId, input.ideaId);
       for (;;) {
-        const slot = yield* slotFor(key, run(input, writer));
+        const slot = yield* slotFor(
+          key,
+          run(input, writer).pipe(Effect.provideService(CapturingRun, capturingRun)),
+        );
         if (slot.type === "capture") return yield* Deferred.await(slot.done);
         // An abandon runs: once it ends, this capture starts afresh.
         yield* Deferred.await(slot.done);
@@ -1017,12 +1053,16 @@ const make = Effect.gen(function* () {
 
   const capture: WorkCapture["Service"]["capture"] = (input) =>
     Effect.gen(function* () {
-      yield* assistantOnly(input.caller);
-      return yield* joined(input, yield* writerOf(input.caller));
+      const threadId = yield* assistantOnly(input.caller);
+      const writer = yield* writerOf(input.caller);
+      const capturingRun = yield* activeRunOf(input.caller.threads, threadId).pipe(
+        Effect.mapError(storageFailed),
+      );
+      return yield* joined(input, writer, capturingRun);
     });
 
   const captureAsOwner: WorkCapture["Service"]["captureAsOwner"] = ({ owner, ...input }) =>
-    Effect.flatMap(writerOf(owner), (writer) => joined(input, writer));
+    Effect.flatMap(writerOf(owner), (writer) => joined(input, writer, null));
 
   const abandon: WorkCapture["Service"]["abandon"] = (input) =>
     Effect.gen(function* () {

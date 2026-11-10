@@ -9,6 +9,7 @@ import {
   type WorkDomainError,
   WorkConflict,
   WorkInvalid,
+  WorkItemNotFound,
   WorkStale,
   WorkUnauthenticated,
   WorkUnavailable,
@@ -38,7 +39,7 @@ import {
   TransitionsResponse,
   UsersResponse,
 } from "./jiraJson.ts";
-import { JIRA_PROJECT_KEY, keysJql, listJql, normalizeIssueKey } from "./jql.ts";
+import { JIRA_ISSUE_KEY, JIRA_PROJECT_KEY, keysJql, listJql, normalizeIssueKey } from "./jql.ts";
 
 type JiraConfig = Extract<WorkSourceConfig, { readonly kind: "jira" }>;
 
@@ -77,6 +78,30 @@ const originOf = (config: JiraConfig) => {
 
 export const jiraIdentity = (config: JiraConfig) =>
   `${new URL(originOf(config)).host.toLowerCase()}/${config.projectKey.trim().toUpperCase()}`;
+
+/** Whether an upper-cased issue key belongs to the source's project. */
+const inProject = (config: JiraConfig, key: string) =>
+  JIRA_ISSUE_KEY.test(key) && key.startsWith(`${config.projectKey.trim().toUpperCase()}-`);
+
+/**
+ * The upper-cased key of an issue of the source's project. A source reads and writes only its
+ * own project, however the item was named: the token behind it may reach every project.
+ */
+const projectIssueKey = (
+  runtime: Pick<WorkSourceRuntime, "config">,
+  itemId: string,
+): Effect.Effect<string, WorkItemNotFound> => {
+  const config = configOf(runtime);
+  const key = normalizeIssueKey(itemId);
+  return inProject(config, key)
+    ? Effect.succeed(key)
+    : Effect.fail(
+        new WorkItemNotFound({
+          itemId: key,
+          detail: `It is not an issue of the ${config.projectKey.trim().toUpperCase()} project.`,
+        }),
+      );
+};
 
 export type JiraSourceOptions = JiraApi.JiraApiOptions;
 
@@ -147,11 +172,22 @@ export const make = (options: JiraSourceOptions = {}) =>
         itemId: key,
       }).pipe(
         Effect.flatMap((response) => decodeIssue(response.body).pipe(Effect.mapError(unexpected))),
+        // Jira answers an old key with the issue it now names, which may have moved project.
+        Effect.flatMap((issue) =>
+          inProject(configOf(runtime), normalizeIssueKey(issue.key))
+            ? Effect.succeed(issue)
+            : Effect.fail(
+                new WorkItemNotFound({
+                  itemId: key,
+                  detail: `It moved to ${normalizeIssueKey(issue.key)}, outside this project.`,
+                }),
+              ),
+        ),
       );
 
     const detail = (runtime: WorkSourceRuntime, itemId: string) =>
       Effect.gen(function* () {
-        const key = normalizeIssueKey(itemId);
+        const key = yield* projectIssueKey(runtime, itemId);
         const issue = yield* readIssue(runtime, key, "transitions");
         const comments = yield* call(runtime, {
           operation: "jira.comments",
@@ -220,23 +256,26 @@ export const make = (options: JiraSourceOptions = {}) =>
       });
 
     const people = (runtime: WorkSourceRuntime, query: string, itemId?: string) =>
-      call(runtime, {
-        operation: "jira.assignable",
-        kind: "read",
-        path: "/rest/api/3/user/assignable/search",
-        query: {
-          query,
-          maxResults: "20",
-          ...(itemId === undefined
-            ? { project: configOf(runtime).projectKey.toUpperCase() }
-            : { issueKey: normalizeIssueKey(itemId) }),
-        },
-      }).pipe(
-        Effect.flatMap((response) => decodeUsers(response.body).pipe(Effect.mapError(unexpected))),
-        Effect.map((users) =>
-          users.map((user) => ({ id: user.accountId, label: user.displayName ?? user.accountId })),
-        ),
-      );
+      Effect.gen(function* () {
+        const issueKey = itemId === undefined ? undefined : yield* projectIssueKey(runtime, itemId);
+        const response = yield* call(runtime, {
+          operation: "jira.assignable",
+          kind: "read",
+          path: "/rest/api/3/user/assignable/search",
+          query: {
+            query,
+            maxResults: "20",
+            ...(issueKey === undefined
+              ? { project: configOf(runtime).projectKey.toUpperCase() }
+              : { issueKey }),
+          },
+        });
+        const users = yield* decodeUsers(response.body).pipe(Effect.mapError(unexpected));
+        return users.map((user) => ({
+          id: user.accountId,
+          label: user.displayName ?? user.accountId,
+        }));
+      });
 
     const issueTypeFor = (runtime: WorkSourceRuntime) =>
       call(runtime, {
@@ -474,6 +513,7 @@ export const make = (options: JiraSourceOptions = {}) =>
           runtime,
           key,
           Effect.gen(function* () {
+            yield* projectIssueKey(runtime, key);
             if (patch.blockedBy !== undefined) {
               return yield* new WorkUnsupported({ detail: "Change Jira issue links in Jira." });
             }
@@ -550,6 +590,7 @@ export const make = (options: JiraSourceOptions = {}) =>
           runtime,
           key,
           Effect.gen(function* () {
+            yield* projectIssueKey(runtime, key);
             yield* checkRevision(runtime, key, input.expectedRevision);
             yield* transitionTo(runtime, key, {
               ...(input.status === undefined ? {} : { status: input.status }),
@@ -564,24 +605,28 @@ export const make = (options: JiraSourceOptions = {}) =>
         return issueWrite(
           runtime,
           key,
-          call(runtime, {
-            operation: "jira.comment",
-            kind: "write",
-            method: "POST",
-            path: `/rest/api/3/issue/${encodeURIComponent(key)}/comment`,
-            body: { body: markdownToAdf(body) },
-            itemId: key,
-          }).pipe(
-            Effect.flatMap((response) =>
-              decodeCommentCreated(response.body).pipe(Effect.mapError(unexpected)),
+          projectIssueKey(runtime, key).pipe(
+            Effect.andThen(
+              call(runtime, {
+                operation: "jira.comment",
+                kind: "write",
+                method: "POST",
+                path: `/rest/api/3/issue/${encodeURIComponent(key)}/comment`,
+                body: { body: markdownToAdf(body) },
+                itemId: key,
+              }).pipe(
+                Effect.flatMap((response) =>
+                  decodeCommentCreated(response.body).pipe(Effect.mapError(unexpected)),
+                ),
+                Effect.map((created) => ({ commentId: created.id })),
+              ),
             ),
-            Effect.map((created) => ({ commentId: created.id })),
           ),
         );
       },
       findComment: (runtime, itemId, text) =>
         Effect.gen(function* () {
-          const key = normalizeIssueKey(itemId);
+          const key = yield* projectIssueKey(runtime, itemId);
           const page = (startAt: number) =>
             call(runtime, {
               operation: "jira.comments",
@@ -646,12 +691,14 @@ export const make = (options: JiraSourceOptions = {}) =>
         Effect.gen(function* () {
           const config = configOf(runtime);
           const summaries: Array<WorkItemSummary> = [];
-          const keys = itemIds.map(normalizeIssueKey);
+          const keys = itemIds.map(normalizeIssueKey).filter((key) => inProject(config, key));
           for (let index = 0; index < keys.length; index += SNAPSHOT_BATCH) {
             const batch = keys.slice(index, index + SNAPSHOT_BATCH);
             const result = yield* search(runtime, keysJql(batch), batch.length, undefined);
             summaries.push(
-              ...result.issues.map((issue) => toSummary(runtime.sourceId, originOf(config), issue)),
+              ...result.issues
+                .filter((issue) => inProject(config, normalizeIssueKey(issue.key)))
+                .map((issue) => toSummary(runtime.sourceId, originOf(config), issue)),
             );
           }
           return summaries;

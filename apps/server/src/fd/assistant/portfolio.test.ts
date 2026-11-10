@@ -73,6 +73,10 @@ const EXPECTED_MOVES: ReadonlyArray<
   ["launching", "record-progress", "launching"],
   ["launch-uncertain", "start", "running"],
   ["launch-uncertain", "record-progress", "launch-uncertain"],
+  // An uncertain launch can always be released: it fails once its thread is confirmed absent,
+  // and the owner can cancel it.
+  ["launch-uncertain", "fail", "failed"],
+  ["launch-uncertain", "cancel", "cancelled"],
   ["running", "finish", "awaiting-verification"],
   ["awaiting-verification", "complete", "completed"],
   ["awaiting-verification", "cancel", "cancelled"],

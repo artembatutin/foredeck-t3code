@@ -1004,7 +1004,8 @@ it.effect("admits provider and OAuth client credentials and points only clients 
       };
       const seen: Array<McpInvocationContext.McpInvocationScope> = [];
       const ProbeToolkit = Toolkit.make(
-        Tool.make("probe", {
+        // An assistant thread reaches only allowed tools, so the probe takes an allowed read's name.
+        Tool.make("work_list", {
           description: "Reports the caller.",
           success: Schema.Struct({ ok: Schema.Boolean }),
           failure: OrchestratorMcpFailure,
@@ -1015,7 +1016,7 @@ it.effect("admits provider and OAuth client credentials and points only clients 
       const serverLayer = McpHttpServer.toolkitRegistration(
         ProbeToolkit,
         McpToolAccess.toLayer(ProbeToolkit, {
-          probe: McpToolAccess.reads(() =>
+          work_list: McpToolAccess.reads(() =>
             McpInvocationContext.McpInvocationContext.pipe(
               Effect.tap((scope) => Effect.sync(() => seen.push(scope))),
               Effect.as({ ok: true }),
@@ -1047,7 +1048,7 @@ it.effect("admits provider and OAuth client credentials and points only clients 
         Layer.build,
       );
       const httpClient = yield* HttpClient.HttpClient;
-      const call = (token: string | undefined, name = "probe") =>
+      const call = (token: string | undefined, name = "work_list") =>
         Effect.gen(function* () {
           const headers = {
             accept: "application/json, text/event-stream",
@@ -1283,6 +1284,16 @@ it.effect(
           id: 7,
           result: { isError: true },
         });
+        expect(screened).toHaveLength(screens);
+        // An assistant batch is refused whole, whatever its other calls are.
+        const assistantBatch = yield* post(assistantToken, [
+          toolCall(9, "t3_thread_read"),
+          toolCall(10, "t3_thread_launch"),
+        ]);
+        expect(assistantBatch).toMatchObject([
+          { id: 9, result: { isError: true } },
+          { id: 10, result: { isError: true } },
+        ]);
         expect(screened).toHaveLength(screens);
 
         // A client outside every thread is not screened.

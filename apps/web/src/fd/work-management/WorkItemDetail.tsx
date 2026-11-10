@@ -102,7 +102,8 @@ export function WorkItemDetail({
   );
   const requestRefresh = useAtomCommand(workCommands.refresh);
   const refreshQuery = query.refresh;
-  // Explicit refresh drops the server's cached copy of this source, then reads again.
+  // Explicit refresh drops the server's cached copy of this source; the refresh subscription
+  // then reads again.
   const fullRefresh = useCallback(
     () =>
       void refreshWork({

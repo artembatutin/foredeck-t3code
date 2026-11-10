@@ -336,8 +336,13 @@ export function WorkRouteView({
   const refreshSources = sourcesQuery.refresh;
   const refreshLinks = linksQuery.refresh;
   const projectId = selectedProject?.id;
-  // Drops the server's caches (every client refetches through the refresh subscription) and
-  // refreshes this view's own queries, for the button and the live interval alike.
+  const refreshQueries = useCallback(() => {
+    refreshSources();
+    refreshLinks();
+    refreshList();
+  }, [refreshLinks, refreshList, refreshSources]);
+  // The button drops the server's caches, and every client refetches through the refresh
+  // subscription. Focus and the live interval refresh this view's queries alone.
   const refresh = useCallback(() => {
     if (environmentId === null) return;
     void refreshWork({
@@ -346,14 +351,10 @@ export function WorkRouteView({
           environmentId,
           input: projectId === undefined ? {} : { projectId },
         }),
-      refreshQueries: () => {
-        refreshSources();
-        refreshLinks();
-        refreshList();
-      },
+      refreshQueries,
     });
-  }, [environmentId, projectId, refreshLinks, refreshList, refreshSources, requestRefresh]);
-  useLiveRefresh(environmentId === null ? null : refresh, {
+  }, [environmentId, projectId, refreshQueries, requestRefresh]);
+  useLiveRefresh(environmentId === null ? null : refreshQueries, {
     key: selectedProject?.id ?? "none",
   });
   const canCreate = useWorkWritable(environmentId, workCommands.createItem, "items.write");

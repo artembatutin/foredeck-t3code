@@ -1,5 +1,10 @@
 export { createFactoryEnvironmentAtoms, type EnvironmentTarget } from "./atoms.ts";
-export { factoryFleet, type FactoryFleetEnvironment, type FactoryFleetRow } from "./fleet.ts";
+export {
+  FACTORY_FLEET_INPUT,
+  factoryFleet,
+  type FactoryFleetEnvironment,
+  type FactoryFleetRow,
+} from "./fleet.ts";
 export { createFactoryFleetAtom, type FactoryFleetState } from "./fleetAtom.ts";
 export {
   currentDelivery,

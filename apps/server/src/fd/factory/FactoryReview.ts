@@ -34,7 +34,6 @@ import { integrateCriteria } from "./prompts/integrate.ts";
 import { reviewDetails } from "./review/details.ts";
 import { type FactoryEvidencePathError, validateReviewInWorktree } from "./review/evidencePaths.ts";
 import { parseFencedReview } from "./review/fencedJson.ts";
-import { findingsToFix } from "./review/validate.ts";
 import * as FactoryEvidence from "./verify/FactoryEvidence.ts";
 
 /**
@@ -164,7 +163,7 @@ type FactoryReviewCandidate =
  * is not clean, refuses any review. Otherwise the review must decode and pass the validation
  * port, evidence paths included; a valid one, blocking or not, is written to the delivery's
  * evidence as `review-<n>.json` and accepted with the bounded details clients see, a blocking one
- * with its failure fingerprint (its findings to fix and the reviewed tree). An integrate review
+ * with its failure fingerprint (the reviewed tree). An integrate review
  * of a parent's whole branch has an acceptance entry for each criterion of every approved task,
  * numbered across them in plan order (see `renderIntegratePrompt`): one out of that range is
  * invalid, and one missing blocks. Judging records nothing on the delivery; the engine does, from
@@ -283,11 +282,7 @@ const make = Effect.gen(function* () {
         review: { source, summary, evidencePath, details },
       } satisfies FactoryReviewJudgment;
     }
-    const fingerprint = failureFingerprint({
-      stage: "review",
-      findings: findingsToFix(review, blockingSeverities),
-      tree: basis.receipt.tree,
-    });
+    const fingerprint = failureFingerprint({ stage: "review", tree: basis.receipt.tree });
     return {
       type: "accepted",
       review: { source, summary, evidencePath, fingerprint, details },

@@ -521,6 +521,29 @@ describe("Factory RPC handlers over real stores", () => {
     }).pipe(Effect.provide(layer)),
   );
 
+  it.effect("lists only deliveries not done or cancelled when asked for active ones", () =>
+    Effect.gen(function* () {
+      yield* store("delivery-old", alpha, "fd-aaaaaa");
+      yield* store("delivery-new", beta, "fd-bbbbbb");
+      const deliveries = yield* FactoryDeliveryStore.FactoryDeliveryStore;
+      const cancelled = {
+        ...queuedDeliveryState({ branch: "work/fd-aaaaaa", baseRef: "HEAD" }),
+        status: "cancelled" as const,
+      };
+      yield* deliveries.update(FactoryDeliveryId.make("delivery-old"), cancelled);
+      const rpc = yield* handlers;
+      const ids = (query: { readonly projectId?: ProjectId; readonly activeOnly?: boolean }) =>
+        rpc[FACTORY_WS_METHODS.factoryDeliveriesList](query).pipe(
+          Effect.map(({ deliveries }) => deliveries.map(({ deliveryId }) => deliveryId)),
+        );
+
+      expect(yield* ids({ activeOnly: true })).toEqual(["delivery-new"]);
+      expect(yield* ids({ activeOnly: true, projectId: alpha })).toEqual([]);
+      expect(yield* ids({ activeOnly: false })).toEqual(["delivery-new", "delivery-old"]);
+      expect(yield* ids({})).toEqual(["delivery-new", "delivery-old"]);
+    }).pipe(Effect.provide(layer)),
+  );
+
   it.effect("gets a stored delivery's snapshot and refuses an unknown id as not found", () =>
     Effect.gen(function* () {
       yield* store("delivery-old", alpha, "fd-aaaaaa");

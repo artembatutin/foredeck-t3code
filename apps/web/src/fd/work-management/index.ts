@@ -5,3 +5,6 @@ export { ThreadWorkBadge } from "./ThreadWorkBadge";
 export { LinkWorkItemDialogHost, openLinkWorkItemDialog } from "./LinkWorkItemDialog";
 export { WorkSidebarItem } from "./WorkSidebarItem";
 export { workPaletteActions } from "./commands";
+
+/** Change streams and read access other features follow to refresh what they show of Work. */
+export { useWorkReadable, workEnvironment } from "./state";

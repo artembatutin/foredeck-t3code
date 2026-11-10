@@ -1,5 +1,9 @@
 import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
-import type { FactoryDelivery, FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
+import type {
+  FactoryDelivery,
+  FactoryDeliveryId,
+  FactoryDeliveryListInput,
+} from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 
 import {
@@ -12,6 +16,13 @@ import {
   factoryNextAction,
   type FactoryNextAction,
 } from "./model.ts";
+
+/**
+ * What the fleet reads of each environment: only deliveries not done or cancelled, so ended ones
+ * with their receipts, reviews and attempts never cross the wire. A server older than the filter
+ * lists every delivery, and `factoryFleet` drops the ended ones itself.
+ */
+export const FACTORY_FLEET_INPUT: FactoryDeliveryListInput = { activeOnly: true };
 
 /** One environment's part of the fleet: whether it serves Factory, and its deliveries once read. */
 export interface FactoryFleetEnvironment {
@@ -113,6 +124,7 @@ export function factoryFleet(
   for (const { environmentId, supported, deliveries } of environments) {
     if (!supported || deliveries === null) continue;
     for (const delivery of deliveries) {
+      // Older servers ignore `FACTORY_FLEET_INPUT`'s filter.
       if (delivery.status === "done" || delivery.status === "cancelled") continue;
       listed.push({ environmentId, delivery });
     }

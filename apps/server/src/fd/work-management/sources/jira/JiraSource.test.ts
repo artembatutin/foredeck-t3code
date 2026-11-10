@@ -9,6 +9,7 @@ import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, type HttpClientRequest, HttpClientResponse } from "effect/http";
 
+import type { WorkDomainError } from "../../errors.ts";
 import { workItemContentFingerprint } from "../../model/scope.ts";
 import { owner } from "../../testkit/fakes.ts";
 import type { WorkSourceRuntime } from "../WorkSourceAdapter.ts";
@@ -651,6 +652,49 @@ describe("JiraSource", () => {
       assert.deepStrictEqual(
         fake.seen.filter((seen) => seen.method === "POST").map((seen) => seen.at),
         [0, 2_000],
+      );
+    }),
+  );
+
+  it.effect("reads and writes only issues of the configured project", () =>
+    Effect.gen(function* () {
+      const fake = fakeJira((seen) =>
+        seen.path.endsWith("/comment")
+          ? { body: { comments: [] } }
+          : seen.path === "/rest/api/3/search/jql"
+            ? { body: { issues: [issueJson("PROJ-2"), issueJson("OTHER-3")], isLast: true } }
+            : // Jira answers an old key with the issue it moved to.
+              { body: issueJson("OTHER-9") },
+      );
+      const adapter = yield* adapterWith(fake);
+      const elsewhere = WorkItemId.make("other-1");
+      const attempts: ReadonlyArray<Effect.Effect<object, WorkDomainError>> = [
+        adapter.get(runtime(), elsewhere),
+        adapter.comment(runtime(), elsewhere, "hi", owner),
+        adapter.setStatus(
+          runtime(),
+          { ref: { sourceId, itemId: elsewhere }, status: "done" },
+          owner,
+        ),
+        adapter.update(runtime(), { ref: { sourceId, itemId: elsewhere }, title: "x" }, owner),
+        // A project whose key only starts like this one's.
+        adapter.get(runtime(), WorkItemId.make("PROJECT-1")),
+      ];
+      for (const attempt of attempts) {
+        assert.strictEqual((yield* Effect.flip(attempt))._tag, "WorkItemNotFound");
+      }
+      assert.deepStrictEqual(fake.seen, []);
+
+      const moved = yield* Effect.flip(adapter.get(runtime(), WorkItemId.make("proj-1")));
+      assert.strictEqual(moved._tag, "WorkItemNotFound");
+
+      const snapshots = yield* adapter.snapshots(runtime(), [
+        WorkItemId.make("PROJ-2"),
+        WorkItemId.make("OTHER-3"),
+      ]);
+      assert.deepStrictEqual(
+        snapshots.map((item) => item.ref.itemId),
+        ["PROJ-2"],
       );
     }),
   );

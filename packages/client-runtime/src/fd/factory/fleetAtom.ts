@@ -30,6 +30,8 @@ export interface FactoryFleetState {
   readonly environments: ReadonlyArray<FactoryFleetEnvironment>;
   /** Whether a connected environment's deliveries are still loading. */
   readonly loading: boolean;
+  /** Whether deliveries already read are being read again, as a refresh does. */
+  readonly refreshing: boolean;
   readonly failed: ReadonlyArray<EnvironmentId>;
   /** Environments whose server advertises Factory but that are not connected now. */
   readonly disconnected: ReadonlyArray<EnvironmentId>;
@@ -40,32 +42,42 @@ export interface FactoryFleetState {
  * environment is connected: a server's config outlives its connection, and a read made while it
  * reconnects waits forever holding what it read before, so it would show stale rows or never
  * finish loading. A Factory environment that is not connected is listed as such instead, and
- * read again once it reconnects.
+ * read again once it reconnects. Refreshing the fleet refetches the deliveries it last read.
  */
-export const createFactoryFleetAtom = (sources: FactoryFleetSources) =>
-  Atom.make((get): FactoryFleetState => {
-    const environments: Array<FactoryFleetEnvironment> = [];
-    const failed: Array<EnvironmentId> = [];
-    const disconnected: Array<EnvironmentId> = [];
-    let loading = false;
-    const known = [...get(sources.environmentsAtom)].sort((left, right) =>
-      left.environmentId < right.environmentId
-        ? -1
-        : left.environmentId > right.environmentId
-          ? 1
-          : 0,
-    );
-    for (const { environmentId, connectionState } of known) {
-      if (!get(sources.supported(environmentId))) continue;
-      if (connectionState !== "connected") {
-        disconnected.push(environmentId);
-        continue;
+export const createFactoryFleetAtom = (sources: FactoryFleetSources) => {
+  let read: ReadonlyArray<EnvironmentId> = [];
+  return Atom.readable(
+    (get): FactoryFleetState => {
+      const environments: Array<FactoryFleetEnvironment> = [];
+      const failed: Array<EnvironmentId> = [];
+      const disconnected: Array<EnvironmentId> = [];
+      let loading = false;
+      let refreshing = false;
+      const known = [...get(sources.environmentsAtom)].sort((left, right) =>
+        left.environmentId < right.environmentId
+          ? -1
+          : left.environmentId > right.environmentId
+            ? 1
+            : 0,
+      );
+      for (const { environmentId, connectionState } of known) {
+        if (!get(sources.supported(environmentId))) continue;
+        if (connectionState !== "connected") {
+          disconnected.push(environmentId);
+          continue;
+        }
+        const result = get(sources.deliveries(environmentId));
+        const deliveries = Option.getOrNull(AsyncResult.value(result))?.deliveries ?? null;
+        if (result._tag === "Failure") failed.push(environmentId);
+        else if (deliveries === null) loading = true;
+        if (result.waiting && deliveries !== null) refreshing = true;
+        environments.push({ environmentId, supported: true, deliveries });
       }
-      const result = get(sources.deliveries(environmentId));
-      const deliveries = Option.getOrNull(AsyncResult.value(result))?.deliveries ?? null;
-      if (result._tag === "Failure") failed.push(environmentId);
-      else if (deliveries === null) loading = true;
-      environments.push({ environmentId, supported: true, deliveries });
-    }
-    return { environments, loading, failed, disconnected };
-  }).pipe(Atom.withLabel("factory:fleet"));
+      read = environments.map(({ environmentId }) => environmentId);
+      return { environments, loading, refreshing, failed, disconnected };
+    },
+    (refresh) => {
+      for (const environmentId of read) refresh(sources.deliveries(environmentId));
+    },
+  ).pipe(Atom.withLabel("factory:fleet"));
+};

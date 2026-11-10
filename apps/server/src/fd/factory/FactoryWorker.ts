@@ -60,7 +60,6 @@ import type {
   FactoryThreadEvent,
 } from "./pipeline/state.ts";
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
-import { readLogTail } from "./verify/logTail.ts";
 
 /** The delivery has nothing to run for the stage: only verify has a command, run in the worktree. */
 class FactoryStageCommandError extends Schema.TaggedError<FactoryStageCommandError>()(
@@ -248,7 +247,7 @@ export class FactoryWorker extends Context.Service<
     /**
      * Completes what a restart cut short between a parent and its children. A parent's cancel is
      * stored before its children's, and a child's before its parent's, so a child whose parent is
-     * cancelled is cancelled, unless approved, and a parent with a cancelled child is cancelled
+     * cancelled is cancelled, approved or not, and a parent with a cancelled child is cancelled
      * with its unfinished children; each stops what its threads run. A merged parent is done
      * before its children, so an approved child whose parent is done is done. Any other delivery
      * is left as it is. The boot sweep calls this for every delivery that is not done or cancelled.
@@ -597,21 +596,14 @@ const make = Effect.gen(function* () {
           );
     });
 
-  /** A failed run's outcome with its failure fingerprint: the end of its log, and its tree. */
-  const withFingerprint = (outcome: FactoryCommandOutcome) =>
+  /** A failed run's outcome with its failure fingerprint: verify failed on its tree. */
+  const withFingerprint = (outcome: FactoryCommandOutcome): FactoryCommandOutcome =>
     outcome.type === "receipt" && receiptFailed(outcome.receipt)
-      ? readLogTail(outcome.receipt.logPath).pipe(
-          Effect.map((tail): FactoryCommandOutcome => ({
-            ...outcome,
-            fingerprint: failureFingerprint({
-              stage: "verify",
-              tail,
-              tree: outcome.receipt.tree,
-            }),
-          })),
-          Effect.provideContext(gitContext),
-        )
-      : Effect.succeed(outcome);
+      ? {
+          ...outcome,
+          fingerprint: failureFingerprint({ stage: "verify", tree: outcome.receipt.tree }),
+        }
+      : outcome;
 
   /** Carries out one effect and returns the event that answers it. Every failure is tagged. */
   const execute = ({
@@ -645,7 +637,7 @@ const make = Effect.gen(function* () {
         );
       case "run_command":
         return runCommand(delivery, effect.stage).pipe(
-          Effect.flatMap(withFingerprint),
+          Effect.map(withFingerprint),
           Effect.map((outcome): FactoryEvent => ({
             type: "command.finished",
             effectId: effect.id,
@@ -894,8 +886,9 @@ const make = Effect.gen(function* () {
         );
       }
       yield* stopRetiredRuns(deliveryId, recorded);
-      // A parent's children go with it, the one it waits for and those it never started, and
-      // stop what their threads run; an approved child keeps its approval.
+      // A parent's children go with it, the one it waits for, those it never started and those
+      // approved, and stop what their threads run. An approved child keeps its approval evidence,
+      // but no longer holds its item: no pull request will carry its work.
       for (const childId of before.children) yield* cancelChild(childId);
     }
     // Done once its merged pull request is closed out: the parent's approved children with it.
@@ -1053,14 +1046,14 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  /** Cancels a cancelled parent's child, under the child's lock, unless it was approved. */
+  /** Cancels a cancelled parent's child, under the child's lock, approved or not. */
   // Annotated: it closes the cycle `stepLocked` → `cancelChild`.
   const cancelChild = (childId: FactoryDeliveryId): Effect.Effect<void, FactoryStoreError> =>
     locks.withLock(
       childId,
       Effect.gen(function* () {
         const child = yield* deliveries.get(childId);
-        if (Option.isNone(child) || child.value.state.status === "approved") return;
+        if (Option.isNone(child) || isTerminal(child.value.state)) return;
         yield* stepLocked(childId, { type: "cancel" });
       }),
     );

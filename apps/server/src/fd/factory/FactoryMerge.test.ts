@@ -360,7 +360,7 @@ describe("Factory follow-through of a parent's pull request", () => {
     );
   });
 
-  it.live("cancels a closed parent alone, leaving its approved children approved", () =>
+  it.live("cancels a closed parent with its approved children, keeping their approvals", () =>
     withProject(verifyCommands.passes, (world) =>
       Effect.gen(function* () {
         const parent = yield* openParent(world);
@@ -377,7 +377,10 @@ describe("Factory follow-through of a parent's pull request", () => {
         );
         assert.strictEqual((yield* stateOf(parent.deliveryId)).status, "cancelled");
         for (const [index, { deliveryId }] of parent.children.entries()) {
-          assert.deepStrictEqual(yield* stateOf(deliveryId), approvedChildren[index]);
+          assert.deepStrictEqual(yield* stateOf(deliveryId), {
+            ...approvedChildren[index],
+            status: "cancelled",
+          });
         }
         for (const { itemRef } of parent.children) {
           assert.strictEqual(yield* itemStatus(itemRef), "todo");

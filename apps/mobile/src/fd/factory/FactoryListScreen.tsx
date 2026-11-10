@@ -1,9 +1,9 @@
-import { useAtomValue } from "@effect/atom-react";
+import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import type { EnvironmentId } from "@t3tools/contracts";
 import { LegendList } from "@legendapp/list/react-native";
-import { useNavigation } from "@react-navigation/native";
-import { useMemo } from "react";
-import { ActivityIndicator, Pressable, View } from "react-native";
+import { useFocusEffect, useNavigation } from "@react-navigation/native";
+import { useCallback, useMemo } from "react";
+import { ActivityIndicator, Pressable, RefreshControl, View } from "react-native";
 
 import { SymbolView } from "../../components/AppSymbol";
 import { AppText as Text } from "../../components/AppText";
@@ -17,12 +17,18 @@ import { factoryFleetAtom } from "./state";
 /**
  * Every active delivery across the connected environments that serve Factory, those that need
  * you first; a Factory environment that is not connected is named instead. Each row opens its
- * item's Work item screen, whose Factory section shows the timeline and controls. Registered by
- * the app's Stack.
+ * item's Work item screen, whose Factory section shows the timeline and controls. It reads the
+ * deliveries again when it comes into focus and on pull to refresh. Registered by the app's Stack.
  */
 export function FactoryListScreen() {
   const navigation = useNavigation();
   const fleet = useAtomValue(factoryFleetAtom);
+  const refresh = useAtomRefresh(factoryFleetAtom);
+  useFocusEffect(
+    useCallback(() => {
+      refresh();
+    }, [refresh]),
+  );
   const projects = useProjects();
   const environments = useWorkspaceEnvironments();
   const rows = useMemo(
@@ -64,6 +70,9 @@ export function FactoryListScreen() {
         keyExtractor={(row) => row.key}
         recycleItems
         itemsAreEqual={sameRow}
+        refreshControl={
+          <RefreshControl refreshing={fleet.refreshing && rows.length > 0} onRefresh={refresh} />
+        }
         ListHeaderComponent={
           failed.length > 0 || disconnected.length > 0 ? (
             <View className="gap-2 px-4 pt-2 pb-3">

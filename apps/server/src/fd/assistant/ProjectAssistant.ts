@@ -67,6 +67,11 @@ export class ProjectAssistant extends Context.Service<
       reason?: string;
       /** The revision an owner edited; another one is refused, overwriting nothing. */
       expectedRevision?: number;
+      /**
+       * The assistant thread saving it. It cannot authorize an idea in the run whose capture
+       * withdrew the authorization: the owner reviews the item first.
+       */
+      managerThreadId?: ThreadId;
     }) => Effect.Effect<Portfolio.ProjectBrief, AssistantError>;
     /** What a start of the idea would capture and run, as it stands now, for its owner to review. */
     readonly review: (
@@ -240,6 +245,21 @@ const make = Effect.gen(function* () {
     );
   });
 
+  /** Releases the slot of an assignment whose worker thread is gone, since it can no longer run. */
+  const releaseLostWorker = Effect.fn(function* (work: Portfolio.Assignment, record: Dispatch) {
+    if (work.state === "stopping") {
+      const stopped = yield* move(work.assignmentId, {
+        type: "confirm-stopped",
+        note: "The worker thread was deleted.",
+      });
+      if (record.cancelRequested) yield* move(stopped.assignmentId, { type: "cancel" });
+    } else if (["launching", "launch-uncertain", "running", "needs-input"].includes(work.state))
+      yield* move(work.assignmentId, {
+        type: "fail",
+        note: "The worker thread was deleted; inspect retained changes before retrying.",
+      });
+  });
+
   const reconcile = Effect.fn(function* (initial: Dispatch) {
     let record = initial;
     let work = yield* assignment(record.assignmentId);
@@ -344,16 +364,23 @@ const make = Effect.gen(function* () {
     const shell = yield* threads.getThreadShell(record.threadId);
     if (shell === null) {
       if (work.state === "launching")
-        work = yield* move(work.assignmentId, {
+        yield* move(work.assignmentId, {
           type: "uncertain",
           note: "Launch outcome is unknown. No automatic relaunch.",
         });
-      if (work.state === "launch-uncertain")
-        yield* notice(
-          record,
-          `uncertain:${work.attempt}`,
-          "Launch outcome is uncertain. Inspect the recorded thread and receipt before taking action.",
-        );
+      // A launch creates its thread inline and always under this lock, so a thread still absent
+      // on a later reconciliation was never created: nothing ran, and the slot is released
+      // without relaunching.
+      else if (work.state === "launch-uncertain")
+        yield* move(work.assignmentId, {
+          type: "fail",
+          note: "The launch never created its worker thread, so nothing ran. Retry starts a fresh attempt.",
+        });
+      else yield* releaseLostWorker(work, record);
+      return;
+    }
+    if (shell.deletedAt !== null) {
+      yield* releaseLostWorker(work, record);
       return;
     }
     const projection = yield* threads.getThreadRecords(
@@ -578,7 +605,19 @@ const make = Effect.gen(function* () {
           const record = (yield* dispatches()).find(
             (item) => item.assignmentId === head.assignmentId,
           );
-          if (!record) break;
+          // Nothing launches without its saved dispatch, so the head leaves the queue instead of
+          // holding every grant behind it.
+          if (!record) {
+            yield* move(head.assignmentId, {
+              type: "fail",
+              note: "Its saved launch details are missing, so it cannot start. Authorize a new assignment.",
+            });
+            continue;
+          }
+          // Below, a head exists only while capacity is free, and every claim and grant commits
+          // only at the fair head. False means that head cannot go yet: a contended claim or a
+          // deferred grant. Granting past it would be refused, so the tick stops and the next asks
+          // again.
           if (head.factory) {
             const claimed = yield* factoryExecutor.launch(
               record.brief.projectId,
@@ -801,7 +840,22 @@ const make = Effect.gen(function* () {
           const project = yield* projects.getById(input.projectId);
           if (Option.isNone(project) || project.value.deletedAt !== null)
             return yield* failure("Choose a registered project before saving an idea.");
-          return yield* store.reviseBrief(input);
+          const { managerThreadId, ...revision } = input;
+          if (managerThreadId !== undefined && input.patch.executionAuthorized === true) {
+            const run = yield* WorkCapture.activeRunOf(threads, managerThreadId);
+            const held =
+              run === null
+                ? []
+                : yield* sql<{ readonly held: number }>`SELECT 1 AS held
+                    FROM fd_assistant_authorization_holds
+                    WHERE project_id = ${input.projectId} AND idea_id = ${input.ideaId ?? "legacy"}
+                      AND run_id = ${run}`;
+            if (held.length > 0)
+              return yield* failure(
+                "This turn's Work capture changed the idea's Work item and withdrew its execution authorization. Ask the owner to review the item in Work, and save their authorization only after they reply.",
+              );
+          }
+          return yield* store.reviseBrief(revision);
         }),
       ),
     enqueue: ({ executor = "foredeck", ...input }) =>
@@ -942,9 +996,14 @@ const make = Effect.gen(function* () {
             if (input.action === "stop" || input.action === "cancel") {
               if (
                 input.action === "cancel" &&
-                ["draft", "queued", "stopped", "failed", "awaiting-verification"].includes(
-                  work.state,
-                )
+                [
+                  "draft",
+                  "queued",
+                  "launch-uncertain",
+                  "stopped",
+                  "failed",
+                  "awaiting-verification",
+                ].includes(work.state)
               )
                 return yield* move(input.assignmentId, { type: "cancel" });
               if (work.state !== "stopping")

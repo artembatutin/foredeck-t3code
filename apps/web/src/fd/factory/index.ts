@@ -4,3 +4,6 @@ export { FactorySettings } from "./FactorySettings";
 export { FactorySidebarItem } from "./FactorySidebarItem";
 export { FactoryStartDialogAction } from "./FactoryStartDialogAction";
 export { useFactoryPaletteActions } from "./hooks";
+
+/** Change streams other features follow to refresh what they show of Factory. */
+export { factoryEnvironment } from "./state";

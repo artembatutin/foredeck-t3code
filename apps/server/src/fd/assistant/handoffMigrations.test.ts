@@ -253,6 +253,7 @@ describe("runAssistantMigrations", () => {
         [3, "AssistantReviewReceipts"],
         [4, "AssistantOwnerReview"],
         [5, "AssistantReviewResumeTarget"],
+        [6, "AssistantAuthorizationHolds"],
       ]);
       assert.deepStrictEqual(yield* assistantLedger, assistantManifest);
       assert.deepStrictEqual(yield* coreLedger, core);
@@ -273,6 +274,7 @@ describe("runAssistantMigrations", () => {
           ["index", "fd_assistant_managed_roots_live"],
           ["table", "fd_assistant_admission_demands"],
           ["table", "fd_assistant_admissions"],
+          ["table", "fd_assistant_authorization_holds"],
           ["table", "fd_assistant_brief_details"],
           ["table", "fd_assistant_capture_events"],
           ["table", "fd_assistant_dispositions"],
@@ -359,6 +361,7 @@ describe("the review receipts migration", () => {
         [3, "AssistantReviewReceipts"],
         [4, "AssistantOwnerReview"],
         [5, "AssistantReviewResumeTarget"],
+        [6, "AssistantAuthorizationHolds"],
       ]);
       const [link] = yield* sql<{
         readonly delivery_id: string;

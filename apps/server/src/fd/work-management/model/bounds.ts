@@ -37,10 +37,13 @@ export const truncateText = (text: string, maxChars: number): BoundedText => {
   return { text: text.slice(0, end), truncated: true };
 };
 
-/** Keeps the first `max` items. The input is returned as is when it already fits. */
+/**
+ * Keeps the last `max` items: the newest of a list in written order, as trackers keep their
+ * recent comments. The input is returned as is when it already fits.
+ */
 export const boundList = <T>(items: ReadonlyArray<T>, max: number): BoundedList<T> => {
   const limit = Math.max(0, Math.floor(max));
   return items.length <= limit
     ? { items, truncated: false }
-    : { items: items.slice(0, limit), truncated: true };
+    : { items: items.slice(items.length - limit), truncated: true };
 };
