@@ -204,8 +204,9 @@ item nor the agents receive them. You can edit the title, goal, criteria and res
 saving starts nothing, and an edit made after someone else changed the idea is refused rather than
 overwriting theirs.
 
-**Review and start** captures the idea in Work and queues exactly one delivery, in one step, so there
-is no go-ahead to save first. It needs a connection allowed to write Work items and to run agents. If
+**Start delivery** captures the idea in Work and queues exactly one delivery, in one step, so there
+is no go-ahead to save first. Anything that stops a start is listed at the top of the review. Edits
+are saved or discarded before you start or close it. It needs a connection allowed to write Work items and to run agents. If
 anything you reviewed changes while it runs, nothing is authorized or started and you review it
 again; whatever was already captured stays in Work.
 
@@ -256,7 +257,7 @@ When it has more to do and no slot is free, it shows **Waiting for a project ass
 asks nothing of you, and it starts by itself once a slot frees up.
 
 Stopping a delivery before Factory has started it frees its slot and keeps the delivery. **Resume**
-waits for a slot and starts that same delivery; **Cancel** ends it. **Retry** is for an assignment
+waits for a slot and starts that same delivery; **Cancel** asks first, then ends it. **Retry** is for an assignment
 that failed or was cancelled without a review, and starts a new delivery.
 
 ### Follow-ups that wait

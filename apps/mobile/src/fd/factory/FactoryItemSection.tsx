@@ -2,6 +2,7 @@ import { useAtomValue } from "@effect/atom-react";
 import {
   FACTORY_CANCEL_TEXT,
   factoryExecutionView,
+  type FactoryOutcomeTone,
   type FactoryReviewLine,
   type FactoryThreadTarget,
 } from "@t3tools/client-runtime/fd/factory";
@@ -43,8 +44,8 @@ interface FactoryItemSectionProps {
 
 /**
  * The Work item screen's Factory section: what the item's current delivery comes to now, read
- * from its current state, then its counts, stop, resume and cancel, its timeline, and its plan
- * while it waits at the plan gate. Renders nothing on a server
+ * from its current state with stop, resume and cancel beside it, then its plan while it waits at
+ * the plan gate, its allowances, its timeline and what each role runs on. Renders nothing on a server
  * without Factory or for an item without a delivery. Registered with the Work item screen by the
  * app's Stack.
  */
@@ -60,6 +61,14 @@ export function FactoryItemSection(props: FactoryItemSectionProps) {
 }
 
 type Action = "stop" | "resume" | "cancel";
+
+const OUTCOME_CLASSES: Record<FactoryOutcomeTone, string> = {
+  success: "text-sm font-t3-medium text-success",
+  error: "text-sm font-t3-medium text-danger",
+  warning: "text-sm font-t3-medium text-warning",
+  active: "text-sm font-t3-medium text-primary-text",
+  neutral: "text-sm text-foreground-muted",
+};
 
 function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps) {
   const navigation = useNavigation();
@@ -157,6 +166,9 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
   };
 
   const { controls } = view;
+  const noteClassName = view.nextAction.forYou
+    ? "text-xs text-warning-foreground"
+    : "text-xs text-foreground-muted";
   return (
     <View className="gap-2" accessibilityLabel="Factory">
       <SectionTitle
@@ -165,11 +177,10 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
             <StatusPill
               label={view.label}
               size="compact"
-              pillClassName={view.needsYou === undefined ? "bg-subtle" : "bg-warning"}
+              // The same rule as the card below it, so the two never disagree.
+              pillClassName={view.nextAction.forYou ? "bg-warning" : "bg-subtle"}
               textClassName={
-                view.needsYou === undefined
-                  ? "text-foreground-secondary"
-                  : "text-warning-foreground"
+                view.nextAction.forYou ? "text-warning-foreground" : "text-foreground-secondary"
               }
             />
             {view.stage !== undefined ? (
@@ -219,11 +230,17 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
             </Text>
           </>
         ) : null}
-        {view.nextAction.pullRequestUrl !== null || view.nextAction.reviewThread !== null ? (
+        {view.nextAction.pullRequestUrl !== null ||
+        view.nextAction.reviewThread !== null ||
+        controls.stop ||
+        controls.resume ||
+        controls.cancel ? (
+          // Everything the line above asks for is within reach of it.
           <View className="flex-row flex-wrap gap-2 pt-1">
             {view.nextAction.pullRequestUrl !== null ? (
               <Control
                 label="Open pull request"
+                primary
                 onPress={() => {
                   const url = view.nextAction.pullRequestUrl;
                   if (url !== null) void tryOpenExternalUrl(url, "pull-request");
@@ -239,9 +256,38 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
                 }}
               />
             ) : null}
+            {controls.resume ? (
+              <Control
+                label={pending === "resume" ? "Resuming…" : "Resume"}
+                primary={view.nextAction.forYou}
+                disabled={pending !== null}
+                onPress={() => void run("resume", () => resume(control(view.deliveryId)))}
+              />
+            ) : null}
+            {controls.stop ? (
+              <Control
+                label={pending === "stop" ? "Stopping…" : "Stop after step"}
+                disabled={pending !== null}
+                onPress={() => void run("stop", () => stop(control(view.deliveryId)))}
+              />
+            ) : null}
+            {controls.cancel ? (
+              <Control
+                label={pending === "cancel" ? "Cancelling…" : "Cancel delivery"}
+                disabled={pending !== null}
+                onPress={() => confirmCancel({ deliveryId: view.deliveryId, family: view.family })}
+              />
+            ) : null}
           </View>
         ) : null}
+        {view.controlsNote !== undefined ? (
+          <Text className={noteClassName}>{view.controlsNote}</Text>
+        ) : null}
+        {view.capacityNote !== undefined ? (
+          <Text className={noteClassName}>{view.capacityNote}</Text>
+        ) : null}
       </View>
+      {error !== null ? <ErrorBanner message={error} /> : null}
       {view.pendingActions.rows.length > 0 || view.pendingActions.note !== undefined ? (
         <View className="gap-1" accessibilityLabel="Pending actions">
           <Text className="text-xs font-t3-bold text-foreground">Pending actions</Text>
@@ -282,54 +328,6 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
           )}
         </View>
       ) : null}
-      <DeliveryRoles environmentId={environmentId} deliveryId={view.deliveryId} />
-      {view.capacityNote !== undefined ? (
-        <Text className="text-sm text-foreground-muted">{view.capacityNote}</Text>
-      ) : null}
-      <Text className="text-xs text-foreground-muted">
-        {view.branch === undefined ? null : (
-          <Text selectable className="font-mono text-foreground">
-            {view.branch}
-            {" · "}
-          </Text>
-        )}
-        {view.counters.lines.map((line) => `${line.label}: ${line.text}`).join(" · ")}
-      </Text>
-      {view.counters.attempts !== undefined ? (
-        <Text className="text-xs text-foreground-muted">{view.counters.attempts}</Text>
-      ) : null}
-      {view.counters.scope !== undefined ? (
-        <Text className="text-xs text-foreground-muted">{view.counters.scope}</Text>
-      ) : null}
-      {controls.stop || controls.resume || controls.cancel ? (
-        <View className="flex-row flex-wrap gap-2">
-          {controls.stop ? (
-            <Control
-              label="Stop after step"
-              disabled={pending !== null}
-              onPress={() => void run("stop", () => stop(control(view.deliveryId)))}
-            />
-          ) : null}
-          {controls.resume ? (
-            <Control
-              label="Resume"
-              disabled={pending !== null}
-              onPress={() => void run("resume", () => resume(control(view.deliveryId)))}
-            />
-          ) : null}
-          {controls.cancel ? (
-            <Control
-              label="Cancel delivery"
-              disabled={pending !== null}
-              onPress={() => confirmCancel({ deliveryId: view.deliveryId, family: view.family })}
-            />
-          ) : null}
-        </View>
-      ) : null}
-      {view.controlsNote !== undefined ? (
-        <Text className="text-xs text-foreground-muted">{view.controlsNote}</Text>
-      ) : null}
-      {error !== null ? <ErrorBanner message={error} /> : null}
       {gate !== null ? (
         // A draft and a note belong to one delivery; another delivery's plan starts afresh.
         <FactoryPlanGate
@@ -339,6 +337,31 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
         />
       ) : null}
       {deliveriesQuery.error !== null ? <ErrorBanner message={deliveriesQuery.error} /> : null}
+      <View
+        className="gap-1 rounded-2xl bg-grouped-card px-3.5 py-3"
+        accessibilityLabel="Allowances"
+      >
+        <Text className="text-sm font-t3-medium text-foreground-muted">Allowances</Text>
+        {view.counters.lines.map((line) => (
+          <View key={line.key} className="flex-row justify-between gap-3">
+            <Text className="text-xs text-foreground-muted">{line.label}</Text>
+            <Text className="min-w-0 shrink text-right text-xs tabular-nums text-foreground">
+              {line.text}
+            </Text>
+          </View>
+        ))}
+        {view.counters.attempts !== undefined ? (
+          <View className="flex-row justify-between gap-3">
+            <Text className="text-xs text-foreground-muted">Attempts run</Text>
+            <Text className="min-w-0 shrink text-right text-xs tabular-nums text-foreground">
+              {view.counters.attempts}
+            </Text>
+          </View>
+        ) : null}
+        {view.counters.scope !== undefined ? (
+          <Text className="pt-1 text-xs text-foreground-muted">{view.counters.scope}</Text>
+        ) : null}
+      </View>
       {view.timeline.length > 0 ? (
         <View className="overflow-hidden rounded-[24px] border-continuous bg-grouped-card android:rounded-[28px]">
           {view.timeline.map(({ thread, ...row }, index) => (
@@ -359,7 +382,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
                       </Text>
                     ) : null}
                   </Text>
-                  <Text className="text-sm text-foreground-muted">
+                  <Text className={OUTCOME_CLASSES[row.outcomeTone]}>
                     {row.outcome}
                     {row.startedAt !== undefined ? (
                       <Text className="text-foreground-tertiary">
@@ -398,6 +421,15 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
           ))}
         </View>
       ) : null}
+      {view.branch === undefined ? null : (
+        <Text className="text-xs text-foreground-muted">
+          Branch{" "}
+          <Text selectable className="font-mono text-foreground">
+            {view.branch}
+          </Text>
+        </Text>
+      )}
+      <DeliveryRoles environmentId={environmentId} deliveryId={view.deliveryId} />
     </View>
   );
 }

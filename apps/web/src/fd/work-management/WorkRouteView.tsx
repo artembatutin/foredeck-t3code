@@ -13,6 +13,7 @@ import {
   runStateOf,
   shouldAutoLoadWorkPage,
   WORK_VIEWS,
+  workEmptyState,
   type WorkPagedSource,
   type WorkRunState,
   type WorkView,
@@ -390,7 +391,11 @@ export function WorkRouteView({
   const supported = support.size > 0;
   const readable = readableEnvironments.length > 0;
 
-  const viewLabel = WORK_VIEWS.find((entry) => entry.value === view)?.label ?? view;
+  const empty = workEmptyState({ view, term, labels, assignedToMe });
+  const clearFilters = () => {
+    setQuery("");
+    setSearch({ q: undefined, labels: undefined, assignedToMe: false });
+  };
   const body = !supported ? (
     <Empty>
       <EmptyMedia variant="icon">
@@ -498,53 +503,29 @@ export function WorkRouteView({
       {items.length === 0 ? (
         pending ? (
           <ListSkeleton />
-        ) : term !== undefined ? (
-          <Empty>
-            <EmptyMedia variant="icon">
-              <SearchIcon />
-            </EmptyMedia>
-            <EmptyHeader>
-              <EmptyTitle>
-                Nothing matches “{term.length > 48 ? `${term.slice(0, 48)}…` : term}”
-              </EmptyTitle>
-              <EmptyDescription>Try fewer words, or search by key or label.</EmptyDescription>
-            </EmptyHeader>
-            <EmptyContent>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  setQuery("");
-                  setSearch({ q: undefined });
-                }}
-              >
-                <XIcon />
-                Clear search
-              </Button>
-            </EmptyContent>
-          </Empty>
         ) : (
           <Empty>
             <EmptyMedia variant="icon">
-              <ListTodoIcon />
+              {empty.action === "clear-search" ? <SearchIcon /> : <ListTodoIcon />}
             </EmptyMedia>
             <EmptyHeader>
-              <EmptyTitle>
-                {view === "all" ? "No items" : `Nothing in ${viewLabel.toLowerCase()}`}
-              </EmptyTitle>
-              <EmptyDescription>
-                {view === "all"
-                  ? "Items from this project's Work sources appear here."
-                  : "Items move here as their status changes."}
-              </EmptyDescription>
+              <EmptyTitle>{empty.title}</EmptyTitle>
+              <EmptyDescription>{empty.detail}</EmptyDescription>
             </EmptyHeader>
-            {view !== "all" ? (
+            {empty.action === null ? null : (
               <EmptyContent>
-                <Button size="sm" variant="outline" onClick={() => setView("all")}>
-                  Show all items
-                </Button>
+                {empty.action === "show-all" ? (
+                  <Button size="sm" variant="outline" onClick={() => setView("all")}>
+                    Show all items
+                  </Button>
+                ) : (
+                  <Button size="sm" variant="outline" onClick={clearFilters}>
+                    <XIcon />
+                    {empty.action === "clear-search" ? "Clear search" : "Clear filters"}
+                  </Button>
+                )}
               </EmptyContent>
-            ) : null}
+            )}
           </Empty>
         )
       ) : (
@@ -599,6 +580,26 @@ export function WorkRouteView({
               </WorkspaceBreadcrumbItem>
             </WorkspaceBreadcrumb>
             <div className="min-w-0 flex-1" />
+            {/* In the header so it holds its place whatever the filters below it show. */}
+            {readable &&
+            selectedProject !== undefined &&
+            canCreate &&
+            sources.some((source) => source.capabilities.create) ? (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() =>
+                  setCreating(
+                    shownSources.find((source) => source.capabilities.create) ??
+                      sources.find((source) => source.capabilities.create) ??
+                      null,
+                  )
+                }
+              >
+                <PlusIcon />
+                New item
+              </Button>
+            ) : null}
             <Button
               size="icon-sm"
               variant="ghost"
@@ -708,31 +709,8 @@ export function WorkRouteView({
                     </Button>
                   ) : null}
                   {labels.length > 0 || assignedToMe || term !== undefined ? (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => {
-                        setQuery("");
-                        setSearch({ q: undefined, labels: undefined, assignedToMe: false });
-                      }}
-                    >
+                    <Button size="sm" variant="ghost" onClick={clearFilters}>
                       Clear filters
-                    </Button>
-                  ) : null}
-                  {canCreate && sources.some((source) => source.capabilities.create) ? (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() =>
-                        setCreating(
-                          shownSources.find((source) => source.capabilities.create) ??
-                            sources.find((source) => source.capabilities.create) ??
-                            null,
-                        )
-                      }
-                    >
-                      <PlusIcon />
-                      New item
                     </Button>
                   ) : null}
                 </div>

@@ -8,6 +8,7 @@ import {
   ideaAssignment,
   ideaCaptureRow,
   ideaFacts,
+  ideaStage,
   portfolioRowTitle,
 } from "./workNavigation";
 
@@ -401,6 +402,23 @@ describe("an idea's capture", () => {
     priority: null,
     priorityReason: "",
     ...(capture === undefined ? {} : { capture }),
+  });
+
+  it("tells discussion, captured work and active delivery apart", () => {
+    const captured = idea({ state: "captured", item: null });
+    expect(ideaStage(idea(), undefined).label).toBe("Discussion");
+    expect(ideaStage(idea({ state: "pending", item: null }), undefined).label).toBe("Capturing");
+    expect(ideaStage(captured, undefined)).toMatchObject({
+      label: "Captured",
+      detail: expect.stringContaining("started no worker"),
+    });
+    expect(ideaStage(idea({ state: "lost", item: null }), undefined).stage).toBe("unconfirmed");
+    expect(ideaStage(captured, assignment({ state: "queued" })).label).toBe("In delivery");
+    expect(ideaStage(captured, assignment({ state: "stopped" })).label).toBe("In delivery");
+    // An attempt that ended, or was never started, leaves the idea where its capture has it.
+    for (const state of ["draft", "completed", "failed", "cancelled"]) {
+      expect(ideaStage(captured, assignment({ state })).label).toBe("Captured");
+    }
   });
 
   it("says nothing of an idea with none, from an older server too", () => {

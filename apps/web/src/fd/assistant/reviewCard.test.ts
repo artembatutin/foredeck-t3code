@@ -9,10 +9,11 @@ import {
   reviewEditingOf,
   reviewEditOvertaken,
   reviewFreezeNote,
-  reviewLimitLines,
-  reviewOverrideLine,
+  reviewLimitFacts,
+  reviewOverrideFact,
   reviewPatchOf,
-  reviewRoleLine,
+  REVIEW_PROVIDER_NOTE,
+  reviewRoleFact,
   reviewSaveInput,
   reviewStartAvailability,
 } from "./reviewCard";
@@ -177,7 +178,13 @@ describe("whether a start is available", () => {
   it("is, once nothing stands in the way", () => {
     expect(
       reviewStartAvailability(start("new_attempt"), { permitted: true, edited: false }),
-    ).toEqual({ canStart: true, reasons: [], label: "Review and start" });
+    ).toEqual({
+      canStart: true,
+      reasons: [],
+      blockers: [],
+      label: "Review and start",
+      action: "Start delivery",
+    });
     expect(reviewStartAvailability(start("amend"), { permitted: true, edited: false }).label).toBe(
       "Review and resume",
     );
@@ -225,46 +232,62 @@ describe("what the review shows of its settings", () => {
   };
 
   it("flags what a model does not support and never claims a provider confirmed it", () => {
-    const line = reviewRoleLine("Author", role);
-    expect(line).toContain("effort: high");
-    expect(line).toContain("tier: priority (not supported)");
-    expect(line).toContain("Provider confirmation: not reported");
-    expect(reviewRoleLine("Author", { ...role, offered: false })).toContain("(not offered)");
-    expect(reviewRoleLine("Author", { ...role, optionsOmitted: 3 })).toContain("… and 3 more");
+    const { label, value } = reviewRoleFact("Author", role);
+    expect(label).toBe("Author");
+    expect(value).toContain("model-a");
+    expect(value).toContain("effort: high");
+    expect(value).toContain("tier: priority (not supported)");
+    expect(REVIEW_PROVIDER_NOTE).toContain("Provider confirmation: not reported");
+    expect(reviewRoleFact("Author", { ...role, offered: false }).value).toContain("(not offered)");
+    expect(reviewRoleFact("Author", { ...role, optionsOmitted: 3 }).value).toContain(
+      "… and 3 more",
+    );
   });
 
-  it("labels the timeout per command and total time as unsupported", () => {
-    const lines = reviewLimitLines({
-      verifyCommand: { executable: "npm", args: ["test"] },
-      setupCommand: null,
-      blockingSeverities: [],
-      highRiskEffort: "xhigh",
-      limits: {
-        maxFixRounds: 3,
-        maxReviewRounds: 2,
-        maxFixCommitTurns: null,
-        verifyTimeoutMinutes: 30,
-        verifyTimeoutScope: "per_command",
-        totalTime: "unsupported",
-      },
-    });
-    expect(lines).toContain("Verify: npm test");
-    expect(lines).toContain("Setup: None");
-    expect(lines).toContain("Timeout: 30 minutes per command");
-    expect(lines).toContain("Total time limit: not supported");
-    expect(lines.some((line) => line.includes("Fix-commit"))).toBe(false);
+  it("labels the timeout per command and says total time is not limited", () => {
+    const facts = new Map(
+      reviewLimitFacts({
+        verifyCommand: { executable: "npm", args: ["test"] },
+        setupCommand: null,
+        blockingSeverities: [],
+        highRiskEffort: "xhigh",
+        limits: {
+          maxFixRounds: 3,
+          maxReviewRounds: 2,
+          maxFixCommitTurns: null,
+          verifyTimeoutMinutes: 30,
+          verifyTimeoutScope: "per_command",
+          totalTime: "unsupported",
+        },
+      }).map((fact) => [fact.label, fact.value]),
+    );
+    expect(facts.get("Verify command")).toBe("npm test");
+    expect(facts.get("Setup command")).toBe("None");
+    expect(facts.get("Fix rounds")).toBe("Up to 3");
+    expect(facts.get("Verify timeout")).toBe("30 minutes per command");
+    expect(facts.get("Total time")).toBe("Not limited");
+    expect(facts.get("Blocking severities")).toBe("None");
+    expect(facts.has("Fix-commit turns")).toBe(false);
   });
 
   it("names the overrides that exist, and says so when they could not be read", () => {
     expect(
-      reviewOverrideLine([
+      reviewOverrideFact([
         { prompt: "plan", state: "absent" },
         { prompt: "author", state: "present" },
-      ]),
-    ).toBe("Prompt overrides: author");
-    expect(reviewOverrideLine([{ prompt: "plan", state: "absent" }])).toBe(
-      "Prompt overrides: none",
+      ]).value,
+    ).toBe("author");
+    expect(reviewOverrideFact([{ prompt: "plan", state: "absent" }]).value).toBe("None");
+    expect(reviewOverrideFact([{ prompt: "plan", state: "unknown" }]).value).toContain("Could not");
+  });
+
+  it("keeps the owner's own unsaved draft out of what blocks a start for everyone", () => {
+    const availability = reviewStartAvailability(
+      { start: { mode: "amend", blockers: [{ code: "any", message: "No verify command." }] } },
+      { permitted: true, edited: true },
     );
-    expect(reviewOverrideLine([{ prompt: "plan", state: "unknown" }])).toContain("could not");
+    expect(availability.blockers).toEqual(["No verify command."]);
+    expect(availability.reasons).toHaveLength(2);
+    expect(availability.action).toBe("Resume delivery");
   });
 });

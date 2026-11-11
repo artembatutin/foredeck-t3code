@@ -64,12 +64,24 @@ export interface FactoryThreadTarget {
   readonly threadId: ThreadId;
 }
 
+/** How an attempt's outcome reads at a glance; `active` is one still under way. */
+export type FactoryOutcomeTone = "success" | "error" | "warning" | "active" | "neutral";
+
+const OUTCOME_TONES: Record<NonNullable<FactoryTimelineEntry["outcome"]>, FactoryOutcomeTone> = {
+  passed: "success",
+  failed: "error",
+  blocked: "warning",
+  cancelled: "neutral",
+  unknown: "neutral",
+};
+
 export interface FactoryTimelineRow {
   readonly key: string;
   readonly stage: string;
   /** The attempt's number within its stage; null for a server that sends no attempts. */
   readonly round: number | null;
   readonly outcome: string;
+  readonly outcomeTone: FactoryOutcomeTone;
   readonly startedAt: string | undefined;
   readonly receipts: ReadonlyArray<FactoryEvidenceLine>;
   readonly reviews: ReadonlyArray<FactoryReviewLine>;
@@ -398,6 +410,7 @@ export function factoryDeliveryView(input: {
             ? "Current stage"
             : "In progress"
           : OUTCOME_LABELS[entry.outcome],
+      outcomeTone: entry.outcome === null ? "active" : OUTCOME_TONES[entry.outcome],
       startedAt: entry.startedAt,
       receipts: entry.receipts.map(receiptLine),
       reviews: entry.reviews.map(reviewLine),

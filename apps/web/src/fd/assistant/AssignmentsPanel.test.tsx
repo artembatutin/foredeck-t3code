@@ -22,6 +22,15 @@ vi.mock("~/components/ui/popover", () => ({
   PopoverTrigger: ({ render, children }: { render: ReactElement; children: ReactNode }) =>
     cloneElement(render, {}, children),
 }));
+vi.mock("~/components/ui/alert-dialog", () => ({
+  AlertDialog: mocks.passthrough,
+  AlertDialogClose: mocks.passthrough,
+  AlertDialogDescription: mocks.passthrough,
+  AlertDialogFooter: mocks.passthrough,
+  AlertDialogHeader: mocks.passthrough,
+  AlertDialogPopup: mocks.passthrough,
+  AlertDialogTitle: mocks.passthrough,
+}));
 vi.mock("~/components/ui/menu", () => ({
   Menu: mocks.passthrough,
   MenuPopup: mocks.passthrough,
@@ -160,6 +169,19 @@ const factoryOverview = (state: string, status: string) => {
   };
 };
 
+const confirmButton = (view: ReactTestRenderer) =>
+  view.root.findAll((node) => node.type === "button" && node.props.children === "Cancel work")[0]!;
+
+/** Chooses Cancel in a row's menu, then confirms it as the owner must. */
+const cancelAndConfirm = async (view: ReactTestRenderer) => {
+  await act(async () => {
+    await menuItem(view, "Cancel").props.onClick();
+  });
+  await act(async () => {
+    await confirmButton(view).props.onClick();
+  });
+};
+
 const menuLabels = (view: ReactTestRenderer) =>
   view.root
     .findAll((node) => node.props["data-menu-item"] === true)
@@ -176,16 +198,37 @@ it("offers a Factory row only what the server accepts, and refreshes after it", 
 
   mocks.read.mockResolvedValue(factoryOverview("needs-input", "blocked"));
   mocks.control.mockResolvedValue({ _tag: "Failure", cause: "refused" });
-  await act(async () => {
-    await menuItem(view, "Cancel").props.onClick();
-  });
+  await cancelAndConfirm(view);
   expect(mocks.read).toHaveBeenCalledTimes(1);
   mocks.control.mockResolvedValue({ _tag: "Success", value: undefined });
+  await cancelAndConfirm(view);
+  expect(mocks.read).toHaveBeenCalledTimes(2);
+  expect(menuLabels(view)).toEqual(["Resume", "Cancel"]);
+  await act(async () => view.unmount());
+});
+
+it("sends no cancel until the owner confirms it", async () => {
+  mocks.read.mockResolvedValue(factoryOverview("running", "running"));
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(<AssignmentsPanel threadRef={threadRef} />);
+  });
+  // Nothing to confirm yet, so the confirmation's own button cannot cancel anything.
+  expect(confirmButton(view).props.disabled).toBe(true);
   await act(async () => {
     await menuItem(view, "Cancel").props.onClick();
   });
-  expect(mocks.read).toHaveBeenCalledTimes(2);
-  expect(menuLabels(view)).toEqual(["Resume", "Cancel"]);
+  expect(mocks.control).not.toHaveBeenCalled();
+  expect(confirmButton(view).props.disabled).toBe(false);
+
+  mocks.control.mockResolvedValue({ _tag: "Success", value: undefined });
+  await act(async () => {
+    await confirmButton(view).props.onClick();
+  });
+  expect(mocks.control).toHaveBeenCalledWith({
+    environmentId: threadRef.environmentId,
+    input: { assignmentId: "a-1", managerThreadId: threadRef.threadId, action: "cancel" },
+  });
   await act(async () => view.unmount());
 });
 

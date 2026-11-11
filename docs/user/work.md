@@ -21,7 +21,8 @@ you can reapply your edit or discard it. **Deliver** hands the item to
 review to one pull request. **Deliver as parent** has Factory plan a Markdown
 task into child tasks first; see [Deliver a parent](./factory.md#deliver-a-parent).
 
-Filter by labels to show items carrying every selected label. **Assigned to me**
+Filter by labels to show items carrying every selected label; each applied label can be removed
+on its own. **Assigned to me**
 uses the signed-in GitHub or Jira account; Markdown sources have free-text
 assignees and do not support that filter. These filters are also available on mobile.
 

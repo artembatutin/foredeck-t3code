@@ -3,6 +3,7 @@ import { LegendList } from "@legendapp/list/react-native";
 import {
   itemInView,
   linksByItem,
+  normalizeWorkLabels,
   parseWorkLabelFilter,
   workFilterSources,
   refreshWork,
@@ -10,6 +11,7 @@ import {
   runStateOf,
   shouldAutoLoadWorkPage,
   WORK_VIEWS,
+  workEmptyState,
   type WorkPagedSource,
   type WorkRunState,
   type WorkView,
@@ -269,6 +271,22 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
   }
 
   const viewLabel = WORK_VIEWS.find((entry) => entry.value === view)?.label ?? "Ready";
+  const filtered = labels.length > 0 || filterAssignedToMe || query.length > 0;
+  const empty = workEmptyState({ view, term, labels, assignedToMe: filterAssignedToMe });
+  // The box only adds; what it held is applied, so it empties.
+  const addLabels = () => {
+    const added = parseWorkLabelFilter(labelText);
+    if (added.length === 0) return;
+    setLabelText("");
+    setLabels(normalizeWorkLabels([...labels, ...added]));
+  };
+  const clearFilters = () => {
+    setQuery("");
+    setTerm("");
+    setLabelText("");
+    setLabels([]);
+    setAssignedToMe(false);
+  };
   return (
     <View className="flex-1 bg-screen">
       <View className="flex-row flex-wrap items-center gap-2 px-4 pt-2 pb-3">
@@ -354,38 +372,51 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
         <AppTextInput
           accessibilityLabel="Filter by labels"
           className="h-12 min-h-12 flex-1 rounded-[24px] px-4 py-0 text-base leading-snug"
-          placeholder="Labels, comma-separated"
+          placeholder={labels.length > 0 ? "Add another label" : "Filter by label"}
           value={labelText}
           autoCapitalize="none"
           autoCorrect={false}
           clearButtonMode="while-editing"
-          returnKeyType="search"
+          returnKeyType="done"
           onChangeText={setLabelText}
-          onSubmitEditing={() => setLabels(parseWorkLabelFilter(labelText))}
+          onSubmitEditing={addLabels}
         />
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Apply labels"
-          onPress={() => setLabels(parseWorkLabelFilter(labelText))}
+          hitSlop={8}
+          onPress={addLabels}
         >
-          <Text className="text-sm font-t3-medium text-link">Apply labels</Text>
+          <Text className="text-sm font-t3-medium text-link">Add label</Text>
         </Pressable>
       </View>
-      {labels.length > 0 || filterAssignedToMe || query.length > 0 ? (
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Clear filters"
-          className="px-4 pb-2"
-          onPress={() => {
-            setQuery("");
-            setTerm("");
-            setLabelText("");
-            setLabels([]);
-            setAssignedToMe(false);
-          }}
-        >
-          <Text className="text-sm font-t3-medium text-link">Clear filters</Text>
-        </Pressable>
+      {filtered ? (
+        // What is applied, apart from what is typed: each label removes itself.
+        <View className="flex-row flex-wrap items-center gap-2 px-4 pb-2">
+          {labels.map((label) => (
+            <Pressable
+              key={label}
+              accessibilityRole="button"
+              accessibilityLabel={`Remove label filter ${label}`}
+              hitSlop={6}
+              className="h-8 flex-row items-center gap-1.5 rounded-full bg-subtle px-3 active:opacity-70"
+              onPress={() => setLabels(labels.filter((other) => other !== label))}
+            >
+              <Text className="text-sm font-t3-medium text-foreground-muted" numberOfLines={1}>
+                {label}
+              </Text>
+              <SymbolView name="xmark" size={11} tintColorClassName="accent-icon-muted" />
+            </Pressable>
+          ))}
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Clear filters"
+            hitSlop={8}
+            onPress={clearFilters}
+          >
+            <Text className="text-sm font-t3-medium text-link">Clear filters</Text>
+          </Pressable>
+        </View>
       ) : null}
       {creating ? (
         <CreateWorkItemForm
@@ -449,14 +480,21 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
             ) : (
               <EmptyState
                 variant="plain"
-                title={term.length > 0 ? "No results" : `Nothing ${viewLabel.toLowerCase()}`}
+                title={empty.title}
                 detail={
                   hasMore
                     ? "Nothing matched in the items loaded so far. Scroll to load more."
-                    : term.length > 0
-                      ? "No items match your search in this view."
-                      : "Choose another view to see more items."
+                    : empty.detail
                 }
+                {...(empty.action === null
+                  ? {}
+                  : empty.action === "show-all"
+                    ? { actionLabel: "Show all items", onAction: () => setView("all") }
+                    : {
+                        actionLabel:
+                          empty.action === "clear-search" ? "Clear search" : "Clear filters",
+                        onAction: clearFilters,
+                      })}
               />
             )
           }

@@ -19,14 +19,27 @@ import { useLiveRefresh } from "~/hooks/useLiveRefresh";
 import { Button } from "~/components/ui/button";
 import { Badge } from "~/components/ui/badge";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "~/components/ui/popover";
+import {
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "~/components/ui/alert-dialog";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "~/components/ui/menu";
 import {
+  type AssignmentAction,
   assignmentActions,
+  assignmentCancelText,
   availableWorkerThread,
   factoryAssignmentRow,
   ideaAssignment,
   ideaCaptureRow,
   ideaFacts,
+  type IdeaStage,
+  ideaStage,
   portfolioRowTitle,
   type WorkItemTarget,
 } from "./workNavigation";
@@ -47,6 +60,21 @@ const statusLabels: Record<string, string> = {
   failed: "Failed",
   completed: "Completed",
   cancelled: "Cancelled",
+};
+
+const STAGE_VARIANTS = {
+  discussion: "outline",
+  capturing: "secondary",
+  captured: "secondary",
+  unconfirmed: "warning",
+  delivery: "info",
+} as const satisfies Record<IdeaStage["stage"], string>;
+
+const ACTION_LABELS: Record<AssignmentAction, string> = {
+  stop: "Stop",
+  resume: "Resume",
+  retry: "Retry",
+  cancel: "Cancel",
 };
 
 /** A row's facts, each labelled as itself. */
@@ -112,6 +140,8 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
   const [error, setError] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [reviewing, setReviewing] = useState<ReviewTarget | null>(null);
+  // The assignment whose cancel waits for the owner to confirm it.
+  const [confirmingCancel, setConfirmingCancel] = useState<string | null>(null);
   const readVersion = useRef(0);
   const refresh = useCallback(async () => {
     const version = ++readVersion.current;
@@ -175,6 +205,27 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
     void navigate(target);
     close();
   };
+  const runControl = async (assignmentId: string, action: AssignmentAction) => {
+    setBusy(assignmentId);
+    try {
+      const result = await control({
+        environmentId: threadRef.environmentId,
+        input: { assignmentId, managerThreadId: threadRef.threadId, action },
+      });
+      // Show the new state now rather than at the next slow refresh.
+      if (result._tag === "Success") await refresh();
+    } finally {
+      setBusy(null);
+    }
+  };
+  // What an open confirmation cancels: its assignment, while that still offers cancel. Anything
+  // else closes it, so confirming never cancels what replaced the row it was opened from.
+  const cancelling =
+    work.find(
+      (item) =>
+        item.assignmentId === confirmingCancel && assignmentActions(item).includes("cancel"),
+    ) ?? null;
+  if (confirmingCancel !== null && cancelling === null) setConfirmingCancel(null);
   const workerThread = (item: AssistantOverview["assignments"][number] | undefined) =>
     availableWorkerThread(item, threadRef.environmentId, threads);
 
@@ -190,6 +241,7 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
               const threadId = workerThread(ideaAssignment(idea, work));
               const capture = ideaCaptureRow(idea, threadRef.environmentId);
               const facts = ideaFacts(idea, ideaAssignment(idea, work));
+              const stage = ideaStage(idea, ideaAssignment(idea, work));
               const review = (
                 <Button
                   type="button"
@@ -213,10 +265,13 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                     </p>
                   </div>
                   {idea.priority !== null ? (
-                    <Badge variant="secondary" size="sm">
+                    <Badge variant="outline" size="sm">
                       Queue P{idea.priority}
                     </Badge>
                   ) : null}
+                  <Badge variant={STAGE_VARIANTS[stage.stage]} size="sm">
+                    {stage.label}
+                  </Badge>
                 </>
               );
               return threadId ? (
@@ -239,14 +294,15 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                     {label}
                   </summary>
                   <div className="space-y-2 px-2 pb-1 text-sm">
-                    <Badge variant={idea.authorized ? "success" : "secondary"} size="sm">
-                      {idea.authorized ? "Approved" : "Draft"}
-                    </Badge>
+                    {capture ? <p className="text-xs">{capture.text}</p> : null}
+                    <p className="text-xs text-muted-foreground">{stage.detail}</p>
+                    {idea.authorized ? (
+                      <Badge variant="success" size="sm">
+                        Approved to start
+                      </Badge>
+                    ) : null}
                     {idea.priorityReason ? (
                       <p className="text-xs text-muted-foreground">{idea.priorityReason}</p>
-                    ) : null}
-                    {capture ? (
-                      <p className="text-xs text-muted-foreground">{capture.text}</p>
                     ) : null}
                     {facts ? <ItemFacts facts={facts} /> : null}
                     <div className="flex flex-wrap gap-1">
@@ -262,9 +318,6 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                         </Button>
                       ) : null}
                     </div>
-                    <p className="text-xs text-muted-foreground">
-                      No worker conversation yet. Continue this idea with the assistant.
-                    </p>
                   </div>
                 </details>
               );
@@ -451,32 +504,13 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                             <MenuItem
                               key={action}
                               disabled={!allowed || busy !== null}
-                              onClick={async () => {
-                                setBusy(item.assignmentId);
-                                try {
-                                  const result = await control({
-                                    environmentId: threadRef.environmentId,
-                                    input: {
-                                      assignmentId: item.assignmentId,
-                                      managerThreadId: threadRef.threadId,
-                                      action,
-                                    },
-                                  });
-                                  // Show the new state now rather than at the next slow refresh.
-                                  if (result._tag === "Success") await refresh();
-                                } finally {
-                                  setBusy(null);
-                                }
-                              }}
-                            >
-                              {
-                                {
-                                  stop: "Stop",
-                                  resume: "Resume",
-                                  retry: "Retry",
-                                  cancel: "Cancel",
-                                }[action]
+                              onClick={() =>
+                                action === "cancel"
+                                  ? setConfirmingCancel(item.assignmentId)
+                                  : runControl(item.assignmentId, action)
                               }
+                            >
+                              {ACTION_LABELS[action]}
                             </MenuItem>
                           ))}
                         </MenuPopup>
@@ -498,6 +532,41 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
           onStarted={() => void refresh()}
         />
       ) : null}
+      <AlertDialog
+        open={cancelling !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmingCancel(null);
+        }}
+      >
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Cancel{" "}
+              {cancelling === null
+                ? "this work"
+                : portfolioRowTitle(cancelling, cancelling.assignmentId)}
+              ?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {cancelling === null ? null : assignmentCancelText(cancelling)}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" />}>Keep it</AlertDialogClose>
+            <Button
+              variant="destructive"
+              disabled={cancelling === null || busy !== null}
+              onClick={() => {
+                if (cancelling === null) return;
+                setConfirmingCancel(null);
+                void runControl(cancelling.assignmentId, "cancel");
+              }}
+            >
+              Cancel work
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
       {error ? (
         <Popover>
           <PopoverTrigger render={<Button type="button" size="xs" variant="ghost" />}>

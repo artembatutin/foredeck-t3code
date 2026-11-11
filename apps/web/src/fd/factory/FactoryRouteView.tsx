@@ -1,13 +1,22 @@
 import { scopedProjectKey, scopeProjectRef } from "@t3tools/client-runtime/environment";
 import type { FactoryFleetRow } from "@t3tools/client-runtime/fd/factory";
 import { useNavigate } from "@tanstack/react-router";
+import { FactoryIcon } from "lucide-react";
 import { useMemo } from "react";
 
 import { WorkspaceBreadcrumb, WorkspaceBreadcrumbItem } from "../../components/WorkspaceBreadcrumb";
 import { WorkspacePageContainer } from "../../components/WorkspacePageContainer";
 import { WorkspacePageHeader } from "../../components/WorkspacePageHeader";
 import { Badge } from "../../components/ui/badge";
-import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../../components/ui/empty";
+import { Button } from "../../components/ui/button";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "../../components/ui/empty";
 import { SidebarInset } from "../../components/ui/sidebar";
 import { Skeleton } from "../../components/ui/skeleton";
 import { isElectron } from "../../env";
@@ -88,7 +97,23 @@ export function FactoryRouteView() {
           ))}
         </div>
       ) : notices.empty !== null ? (
-        <p className="py-8 text-center text-muted-foreground text-sm">{notices.empty}</p>
+        <Empty>
+          <EmptyMedia variant="icon">
+            <FactoryIcon />
+          </EmptyMedia>
+          <EmptyHeader>
+            <EmptyTitle>{notices.empty}</EmptyTitle>
+            <EmptyDescription>
+              Deliver an item from Work, or review and start an idea with the assistant, and its
+              progress shows here.
+            </EmptyDescription>
+          </EmptyHeader>
+          <EmptyContent>
+            <Button size="sm" variant="outline" onClick={() => void navigate({ to: "/work" })}>
+              Open Work
+            </Button>
+          </EmptyContent>
+        </Empty>
       ) : null}
     </>
   );
