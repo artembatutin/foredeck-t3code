@@ -16,7 +16,7 @@ const SUMMARY_BASIC = `
 
 const SUMMARY_FULL = `${SUMMARY_BASIC}
   parent { number }
-  issueDependenciesSummary { totalBlockedBy }
+  issueDependenciesSummary { blockedBy }
   blockedBy(first: 50) { nodes { number state } }
 `;
 

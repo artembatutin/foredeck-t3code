@@ -16,6 +16,7 @@ import {
   runStateOf,
   type WorkThreadShell,
   workBranchPreview,
+  workEmptyState,
   workItemLinkTarget,
   workItemOwningProject,
   workItemReferenceText,
@@ -278,5 +279,40 @@ describe("helpers", () => {
     });
     expect(readWorkListPreferences("{bad")).toEqual({ view: "ready", assignedToMe: false });
     expect(readWorkListPreferences(null).view).toBe("ready");
+  });
+});
+
+describe("workEmptyState", () => {
+  const none = { labels: [], assignedToMe: false };
+
+  it("names a label or assignee filter before the view, and offers to clear it", () => {
+    expect(
+      workEmptyState({ view: "ready", labels: ["auth", "urgent"], assignedToMe: true, term: "x" }),
+    ).toEqual({
+      title: "No items match these filters",
+      detail: "Nothing matching “x”, labelled auth and urgent, assigned to you is in Ready.",
+      action: "clear-filters",
+    });
+    expect(workEmptyState({ view: "all", labels: [], assignedToMe: true }).action).toBe(
+      "clear-filters",
+    );
+  });
+
+  it("offers to clear a search that is the only thing narrowing the list", () => {
+    const state = workEmptyState({ ...none, view: "ready", term: `  ${"long ".repeat(20)}` });
+    expect(state.action).toBe("clear-search");
+    expect(state.title.length).toBeLessThan(80);
+  });
+
+  it("says what a view holds, and leads out of every view but All", () => {
+    expect(workEmptyState({ ...none, view: "ready" })).toEqual({
+      title: "Nothing in Ready",
+      detail: "Ready shows unblocked to-do items that nobody is working on.",
+      action: "show-all",
+    });
+    expect(workEmptyState({ ...none, view: "all", term: " " })).toMatchObject({
+      title: "No items",
+      action: null,
+    });
   });
 });

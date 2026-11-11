@@ -20,6 +20,11 @@ vi.mock("~/components/ui/input", () => ({ Input: (props: object) => <input {...p
 vi.mock("~/components/ui/textarea", () => ({
   Textarea: (props: object) => <textarea {...props} />,
 }));
+vi.mock("~/components/ui/alert", () => ({
+  Alert: mocks.passthrough,
+  AlertDescription: mocks.passthrough,
+  AlertTitle: mocks.passthrough,
+}));
 vi.mock("~/components/ui/dialog", () => ({
   Dialog: mocks.passthrough,
   DialogDescription: mocks.passthrough,
@@ -44,7 +49,11 @@ let server: {
   kind?: "single" | "parent";
 };
 
-const snapshotOf = (input: { readonly kind: "single" | "parent" }) => {
+const sources = [
+  { sourceId: "source", kind: "markdown", label: "Tasks", identity: ".foredeck/work" },
+  { sourceId: "other", kind: "markdown", label: "Other tasks", identity: "other/tasks" },
+];
+const snapshotOf = (input: { readonly kind: "single" | "parent"; readonly sourceId?: string }) => {
   const role = {
     instanceId: "codex",
     model: "m",
@@ -70,13 +79,8 @@ const snapshotOf = (input: { readonly kind: "single" | "parent" }) => {
       repository: null,
       kind: server.kind ?? input.kind,
       kindFixed: server.kind !== undefined,
-      source: {
-        sourceId: "source",
-        kind: "markdown",
-        label: "Tasks",
-        identity: ".foredeck/work",
-      },
-      sources: [],
+      source: sources.find((source) => source.sourceId === input.sourceId) ?? sources[0],
+      sources,
       sourcesOmitted: 0,
       item: null,
     },
@@ -150,6 +154,14 @@ const click = async (view: ReactTestRenderer, label: string) => {
   await act(async () => found.props.onClick());
 };
 
+const deferred = () => {
+  let resolve!: (value: unknown) => void;
+  const promise = new Promise<unknown>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+};
+
 const field = (view: ReactTestRenderer, label: string): ReactTestInstance =>
   view.root.findByProps({ "aria-label": label });
 
@@ -167,7 +179,7 @@ const textOf = (view: ReactTestRenderer) => {
           ? node.map(text).join(" ")
           : "";
   return view.root
-    .findAll((node) => node.type === "p")
+    .findAll((node) => node.type === "p" || node.type === "dd")
     .map((node) => text(node.props.children))
     .join("\n");
 };
@@ -195,14 +207,14 @@ it("never saves a draft over a correction that landed during a kind change", asy
   expect(server.constraints).toEqual(["No new dependencies"]);
   expect(textOf(view)).toContain("Your edit was not saved.");
   expect(field(view, "Restriction 1").props.value).toBe("Keep it small");
-  expect(button(view, "Review and start")?.props.disabled).toBe(true);
+  expect(button(view, "Start delivery")?.props.disabled).toBe(true);
 
   // Discarding shows what it says now, which can then be started.
   await click(view, "Discard edits");
   expect(field(view, "Goal").props.value).toBe("Add the export, corrected");
   expect(field(view, "Restriction 1").props.value).toBe("No new dependencies");
   expect(button(view, "Save edits")).toBeUndefined();
-  expect(button(view, "Review and start")?.props.disabled).toBe(false);
+  expect(button(view, "Start delivery")?.props.disabled).toBe(false);
   await act(async () => view.unmount());
 });
 
@@ -219,13 +231,13 @@ it("follows a correction while its owner has typed nothing", async () => {
 it("saves an edit of the current revision, and starts from what that left", async () => {
   const view = await open();
   await type(view, "Goal", "Add it");
-  expect(button(view, "Review and start")?.props.disabled).toBe(true);
+  expect(button(view, "Start delivery")?.props.disabled).toBe(true);
   await click(view, "Save edits");
   expect(mocks.revise.mock.calls[0]?.[0].input.expectedRevision).toBe(1);
   expect(server.goal).toBe("Add it");
   expect(field(view, "Goal").props.value).toBe("Add it");
   expect(button(view, "Save edits")).toBeUndefined();
-  await click(view, "Review and start");
+  await click(view, "Start delivery");
   expect(mocks.start.mock.calls[0]?.[0].input.reviewVersion).toBe("version-2-single");
   await act(async () => view.unmount());
 });
@@ -239,7 +251,7 @@ it("reviews a delivery at rest as what it is, whatever was asked for", async () 
   expect(button(view, "Plan into tasks")?.props.disabled).toBe(true);
   expect(button(view, "Single item")?.props.disabled).toBe(true);
 
-  await click(view, "Review and resume");
+  await click(view, "Resume delivery");
   expect(mocks.start.mock.calls[0]?.[0].input).toMatchObject({
     kind: "parent",
     reviewVersion: "version-1-parent",
@@ -249,8 +261,8 @@ it("reviews a delivery at rest as what it is, whatever was asked for", async () 
 
 it("says where a capture would go, and confirms the source it showed", async () => {
   const view = await open();
-  expect(textOf(view)).toContain("Work source: Tasks (.foredeck/work)");
-  await click(view, "Review and start");
+  expect(textOf(view)).toContain("Tasks (.foredeck/work)");
+  await click(view, "Start delivery");
   expect(mocks.start.mock.calls[0]?.[0].input.sourceId).toBe("source");
   await act(async () => view.unmount());
 });
@@ -260,7 +272,112 @@ it("hides the planner of a single item, and asks for it once planned into tasks"
   expect(textOf(view)).not.toContain("planner-model");
   await click(view, "Plan into tasks");
   expect(textOf(view)).toContain("planner-model");
-  await click(view, "Review and start");
+  await click(view, "Start delivery");
   expect(mocks.start.mock.calls[0]?.[0].input.kind).toBe("parent");
+  await act(async () => view.unmount());
+});
+
+it.each(["success", "failure"])(
+  "ignores a superseded %s while reviewing rapid kind and source changes",
+  async (superseded) => {
+    const view = await open();
+    const first = deferred();
+    const latest = deferred();
+    mocks.read.mockImplementationOnce(() => first.promise);
+    mocks.read.mockImplementationOnce(() => latest.promise);
+
+    await click(view, "Plan into tasks");
+    expect(button(view, "Start delivery")?.props.disabled).toBe(true);
+    await click(view, "Start delivery");
+    expect(mocks.start).not.toHaveBeenCalled();
+    await click(view, "Other tasks");
+    expect(mocks.read.mock.calls.at(-1)?.[0].input).toMatchObject({
+      kind: "parent",
+      sourceId: "other",
+    });
+
+    await act(async () =>
+      latest.resolve({
+        _tag: "Success",
+        value: snapshotOf({ kind: "parent", sourceId: "other" }),
+      }),
+    );
+    expect(button(view, "Start delivery")?.props.disabled).toBe(false);
+    await act(async () =>
+      first.resolve(
+        superseded === "success"
+          ? { _tag: "Success", value: snapshotOf({ kind: "parent" }) }
+          : { _tag: "Failure", cause: Cause.fail(new Error("Old request failed")) },
+      ),
+    );
+    expect(textOf(view)).toContain("Other tasks (other/tasks)");
+    expect(textOf(view)).not.toContain("Old request failed");
+    await click(view, "Start delivery");
+    expect(mocks.start.mock.calls[0]?.[0].input).toMatchObject({
+      kind: "parent",
+      sourceId: "other",
+      reviewVersion: "version-1-parent",
+    });
+    await act(async () => view.unmount());
+  },
+);
+
+it("keeps confirmation disabled when an old response arrives before the latest selection", async () => {
+  const view = await open();
+  const first = deferred();
+  const latest = deferred();
+  mocks.read.mockImplementationOnce(() => first.promise);
+  mocks.read.mockImplementationOnce(() => latest.promise);
+  await click(view, "Plan into tasks");
+  await click(view, "Single item");
+  await act(async () => first.resolve({ _tag: "Success", value: snapshotOf({ kind: "parent" }) }));
+  expect(button(view, "Start delivery")?.props.disabled).toBe(true);
+  await click(view, "Start delivery");
+  expect(mocks.start).not.toHaveBeenCalled();
+  await act(async () => latest.resolve({ _tag: "Success", value: snapshotOf({ kind: "single" }) }));
+  await click(view, "Start delivery");
+  expect(mocks.start.mock.calls[0]?.[0].input).toMatchObject({
+    kind: "single",
+    reviewVersion: "version-1-single",
+  });
+  await act(async () => view.unmount());
+});
+
+it("keeps typed edits when asked to close, and closes once they are discarded", async () => {
+  const onClose = vi.fn();
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(
+      <ReviewStartCard
+        environmentId={EnvironmentId.make("environment")}
+        managerThreadId={ThreadId.make("fd-assistant-owner")}
+        target={{ projectId: ProjectId.make("project"), ideaId: "idea" }}
+        onClose={onClose}
+        onStarted={() => undefined}
+      />,
+    );
+  });
+  await type(view, "Goal", "Add it");
+  // With edits there is no plain Close, and dismissing the dialog is refused, saying why.
+  expect(button(view, "Close")).toBeUndefined();
+  const dialog = view.root.findAll((node) => typeof node.props.onOpenChange === "function")[0]!;
+  await act(async () => dialog.props.onOpenChange(false));
+  expect(onClose).not.toHaveBeenCalled();
+  expect(textOf(view)).toContain("Save or discard your edits before closing.");
+  expect(field(view, "Goal").props.value).toBe("Add it");
+
+  await click(view, "Discard edits");
+  await click(view, "Close");
+  expect(onClose).toHaveBeenCalledTimes(1);
+  await act(async () => view.unmount());
+});
+
+it("offers a way out and another try when the review cannot be read", async () => {
+  mocks.read.mockResolvedValueOnce({ _tag: "Failure", cause: Cause.fail(new Error("Offline.")) });
+  const view = await open();
+  expect(button(view, "Close")).toBeDefined();
+  await click(view, "Try again");
+  expect(mocks.read).toHaveBeenCalledTimes(2);
+  expect(field(view, "Goal").props.value).toBe("Add the export");
   await act(async () => view.unmount());
 });

@@ -464,9 +464,17 @@ export const make = (options: JiraSourceOptions = {}) =>
             Math.min(query.limit, 50),
             query.cursor,
           );
-          const items = result.issues.map((issue) =>
-            toSummary(runtime.sourceId, originOf(config), issue),
-          );
+          // Done and Cancelled share Jira's done category. Filter after normalization, keeping
+          // the remote page's cursor even when all its issues were excluded.
+          const statuses = query.statuses;
+          const items = result.issues
+            .map((issue) => toSummary(runtime.sourceId, originOf(config), issue))
+            .filter(
+              (item) =>
+                statuses === undefined ||
+                statuses.length === 0 ||
+                statuses.some((status) => status === item.status),
+            );
           const token = result.nextPageToken ?? null;
           // A token that does not move would page forever; stop instead.
           const nextCursor =

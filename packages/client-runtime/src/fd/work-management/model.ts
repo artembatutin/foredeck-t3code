@@ -203,6 +203,76 @@ export const parseWorkItemRouteRef = (params: {
   readonly itemId: string;
 }): WorkItemRef | undefined => parseWorkItemRefString(`${params.sourceId}:${params.itemId}`);
 
+/** Canonical label filters keep equivalent queries and every page on the same cache key. */
+export const normalizeWorkLabels = (labels: ReadonlyArray<string>): ReadonlyArray<string> =>
+  [...new Set(labels.map((label) => label.trim()).filter(Boolean))].sort();
+
+export const parseWorkLabelFilter = (text: string): ReadonlyArray<string> =>
+  normalizeWorkLabels(text.split(","));
+
+/** What an empty Work list says, and the one way out of it that it offers. */
+export interface WorkEmptyState {
+  readonly title: string;
+  readonly detail: string;
+  readonly action: "clear-search" | "clear-filters" | "show-all" | null;
+}
+
+const VIEW_MEANINGS: Record<WorkView, string> = {
+  ready: "Ready shows unblocked to-do items that nobody is working on.",
+  active: "Active shows items with an open linked thread.",
+  done: "Done shows finished and cancelled items.",
+  all: "Items from this project's Work sources appear here.",
+};
+
+const shortened = (text: string) => (text.length > 48 ? `${text.slice(0, 48)}…` : text);
+
+/**
+ * Why a list is empty, by what narrowed it: a label or assignee filter is named before the view, so
+ * an owner is never sent to another view for items their own filter is hiding.
+ */
+export const workEmptyState = (input: {
+  readonly view: WorkView;
+  readonly term?: string | undefined;
+  readonly labels: ReadonlyArray<string>;
+  readonly assignedToMe: boolean;
+}): WorkEmptyState => {
+  const term = input.term?.trim() ?? "";
+  const viewLabel = WORK_VIEWS.find((entry) => entry.value === input.view)?.label ?? input.view;
+  if (input.labels.length > 0 || input.assignedToMe) {
+    const narrowed = [
+      ...(term === "" ? [] : [`matching “${shortened(term)}”`]),
+      ...(input.labels.length === 0 ? [] : [`labelled ${input.labels.join(" and ")}`]),
+      ...(input.assignedToMe ? ["assigned to you"] : []),
+    ].join(", ");
+    return {
+      title: "No items match these filters",
+      detail: `Nothing ${narrowed} is in ${viewLabel}.`,
+      action: "clear-filters",
+    };
+  }
+  if (term !== "") {
+    return {
+      title: `Nothing matches “${shortened(term)}”`,
+      detail: "Try fewer words, or search by key or label.",
+      action: "clear-search",
+    };
+  }
+  return input.view === "all"
+    ? { title: "No items", detail: VIEW_MEANINGS.all, action: null }
+    : {
+        title: `Nothing in ${viewLabel}`,
+        detail: VIEW_MEANINGS[input.view],
+        action: "show-all",
+      };
+};
+
+/** Free-text Markdown assignees have no authenticated "me" identity. */
+export const workFilterSources = <Source extends Pick<WorkSource, "capabilities">>(
+  sources: ReadonlyArray<Source>,
+  assignedToMe: boolean,
+): ReadonlyArray<Source> =>
+  assignedToMe ? sources.filter((source) => source.capabilities.people) : sources;
+
 /** List controls a client remembers between visits. */
 export const WorkListPreferences = Schema.Struct({
   view: Schema.Literals(["ready", "active", "all", "done"]),

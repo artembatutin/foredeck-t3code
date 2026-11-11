@@ -9,6 +9,9 @@ import type { WorkSourceId } from "@t3tools/contracts/fd/work-management";
 import { useAtomValue } from "@effect/atom-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
+import { TriangleAlertIcon } from "lucide-react";
+
+import { Alert, AlertDescription, AlertTitle } from "~/components/ui/alert";
 import { Button } from "~/components/ui/button";
 import {
   Dialog,
@@ -25,18 +28,23 @@ import { randomUUID } from "~/lib/utils";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { readReview, reviseReview, startReview } from "./commands";
 import {
+  REVIEW_KIND_NOTES,
+  REVIEW_PROVIDER_NOTE,
+  reviewDestinationFacts,
   reviewEditable,
   reviewEdited,
   type ReviewEditing,
   reviewEditingAfter,
   reviewEditingOf,
   reviewEditOvertaken,
+  type ReviewFact,
   reviewFailureText,
   reviewFreezeNote,
-  reviewLimitLines,
-  reviewOverrideLine,
-  reviewRoleLine,
+  reviewLimitFacts,
+  reviewOverrideFact,
+  reviewRoleFact,
   reviewSaveInput,
+  reviewScopeFieldLabel,
   reviewStartAvailability,
 } from "./reviewCard";
 
@@ -45,10 +53,20 @@ export interface ReviewTarget {
   readonly ideaId: string;
 }
 
+/** One of the review's three parts: what is delivered, where, and with what. */
+function Group({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="space-y-3">
+      <h3 className="border-b pb-1 font-medium text-sm">{title}</h3>
+      {children}
+    </section>
+  );
+}
+
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="space-y-1">
-      <h3 className="text-xs font-medium text-muted-foreground">{title}</h3>
+      <h4 className="text-xs font-medium text-muted-foreground">{title}</h4>
       {children}
     </section>
   );
@@ -68,6 +86,7 @@ function Entries({
 }) {
   return (
     <div className="space-y-1">
+      {entries.length === 0 ? <p className="text-muted-foreground text-xs">None yet.</p> : null}
       {entries.map((entry, index) => (
         <Textarea
           // The list only grows at its end, and an emptied box stays until it is saved away.
@@ -87,7 +106,7 @@ function Entries({
         disabled={disabled}
         onClick={() => onChange([...entries, ""])}
       >
-        Add
+        {`Add ${label.toLowerCase()}`}
       </Button>
     </div>
   );
@@ -102,6 +121,54 @@ function Lines({ items }: { items: ReadonlyArray<string> }) {
         </p>
       ))}
     </>
+  );
+}
+
+/** Settings as label and value, so one can be found without reading the rest. */
+function Facts({ facts }: { facts: ReadonlyArray<ReviewFact> }) {
+  return (
+    <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs">
+      {facts.map((fact) => (
+        <div key={fact.key} className="contents">
+          <dt className="text-muted-foreground">{fact.label}</dt>
+          <dd className="min-w-0 break-words">{fact.value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+/** One choice among a few, with the current one marked as pressed. */
+function Choice<Value extends string>({
+  label,
+  options,
+  value,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  options: ReadonlyArray<{ readonly value: Value; readonly label: string }>;
+  value: Value | undefined;
+  disabled: boolean;
+  onChange: (value: Value) => void;
+}) {
+  return (
+    <div role="group" aria-label={label} className="flex flex-wrap items-center gap-1">
+      <span className="pe-1 text-muted-foreground text-xs">{label}</span>
+      {options.map((option) => (
+        <Button
+          key={option.value}
+          type="button"
+          size="xs"
+          variant={option.value === value ? "secondary" : "outline"}
+          aria-pressed={option.value === value}
+          disabled={disabled}
+          onClick={() => onChange(option.value)}
+        >
+          {option.label}
+        </Button>
+      ))}
+    </div>
   );
 }
 
@@ -133,11 +200,25 @@ export function ReviewStartCard({
   const [editing, setEditing] = useState<ReviewEditing | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The owner asked to close with edits unsaved, which is said until they are saved or discarded.
+  const [closeRefused, setCloseRefused] = useState(false);
+  const reviewRead = useRef(0);
+  const selectionKey = JSON.stringify([
+    environmentId,
+    managerThreadId,
+    target.projectId,
+    target.ideaId,
+    kind,
+    sourceId,
+  ]);
+  const [reviewedSelectionKey, setReviewedSelectionKey] = useState<string | null>(null);
+  const reviewing = reviewedSelectionKey !== selectionKey;
   // One per version: repeating a confirmation after a lost reply converges on what it started.
   const request = useRef<{ readonly version: string; readonly id: string } | null>(null);
 
   const refresh = useCallback(
     async (saved = false) => {
+      const sequence = ++reviewRead.current;
       const result = await read({
         environmentId,
         input: {
@@ -148,10 +229,13 @@ export function ReviewStartCard({
           ...(sourceId === undefined ? {} : { sourceId }),
         },
       });
+      // Selection changes and closing the card invalidate every older response, including errors.
+      if (sequence !== reviewRead.current) return;
       if (result._tag === "Failure") {
         setError(reviewFailureText(result.cause));
         return;
       }
+      setReviewedSelectionKey(selectionKey);
       setSnapshot(result.value);
       setEditing((current) =>
         saved || current === null
@@ -159,12 +243,24 @@ export function ReviewStartCard({
           : reviewEditingAfter(current, result.value),
       );
     },
-    [environmentId, kind, managerThreadId, read, sourceId, target.ideaId, target.projectId],
+    [
+      environmentId,
+      kind,
+      managerThreadId,
+      read,
+      selectionKey,
+      sourceId,
+      target.ideaId,
+      target.projectId,
+    ],
   );
 
   // Choosing how to deliver it keeps what the owner has typed.
   useEffect(() => {
     void refresh();
+    return () => {
+      reviewRead.current += 1;
+    };
   }, [refresh]);
 
   if (snapshot === null || editing === null) {
@@ -173,10 +269,26 @@ export function ReviewStartCard({
         <DialogPopup className="max-w-xl">
           <DialogHeader>
             <DialogTitle>Review and start</DialogTitle>
-            <DialogDescription>
-              {error ?? "Reading what a start would capture and run."}
+            <DialogDescription role={error === null ? "status" : "alert"}>
+              {error ?? "Reading what a start would capture and run…"}
             </DialogDescription>
           </DialogHeader>
+          <DialogFooter>
+            <Button size="sm" variant="outline" onClick={onClose}>
+              Close
+            </Button>
+            {error === null ? null : (
+              <Button
+                size="sm"
+                onClick={() => {
+                  setError(null);
+                  void refresh();
+                }}
+              >
+                Try again
+              </Button>
+            )}
+          </DialogFooter>
         </DialogPopup>
       </Dialog>
     );
@@ -193,11 +305,13 @@ export function ReviewStartCard({
     setError(null);
     const result = await revise({ environmentId, input: reviewSaveInput(editing) });
     if (result._tag === "Failure") setError(reviewFailureText(result.cause));
+    else setCloseRefused(false);
     await refresh(result._tag === "Success");
     setPending(false);
   };
 
   const confirm = async () => {
+    if (pending || reviewing || !availability.canStart) return;
     setPending(true);
     setError(null);
     const requestId =
@@ -216,14 +330,15 @@ export function ReviewStartCard({
         requestId,
       },
     });
-    setPending(false);
     if (result._tag === "Success") {
+      setPending(false);
       onStarted();
       onClose();
       return;
     }
     setError(reviewFailureText(result.cause));
     await refresh();
+    setPending(false);
   };
 
   const text = (name: "title" | "goal") => ({
@@ -239,15 +354,44 @@ export function ReviewStartCard({
       setEditing({ ...editing, draft: { ...draft, [name]: entries } }),
   });
 
+  const overtaken = reviewEditOvertaken(editing, snapshot);
+  // Closing would drop what the owner typed, so it waits for them to save or discard it.
+  const close = () => {
+    if (pending) return;
+    if (edited) setCloseRefused(true);
+    else onClose();
+  };
+  const discard = () => {
+    setCloseRefused(false);
+    setEditing(reviewEditingOf(snapshot));
+  };
+
   return (
-    <Dialog open onOpenChange={(open) => (open || pending ? undefined : onClose())}>
+    <Dialog open onOpenChange={(open) => (open ? undefined : close())}>
       <DialogPopup className="max-w-xl">
         <DialogHeader>
           <DialogTitle>{availability.label}</DialogTitle>
           <DialogDescription>{reviewFreezeNote(snapshot.start.mode)}</DialogDescription>
         </DialogHeader>
         <DialogPanel>
-          <div className="space-y-3">
+          {availability.blockers.length > 0 ? (
+            <Alert variant="warning" controlAlignment="first-line">
+              <TriangleAlertIcon />
+              <AlertTitle>
+                {snapshot.start.mode === "amend" ? "It cannot resume yet" : "It cannot start yet"}
+              </AlertTitle>
+              <AlertDescription>
+                <ul className="list-disc space-y-1 ps-4">
+                  {availability.blockers.map((reason) => (
+                    <li key={reason} className="break-words">
+                      {reason}
+                    </li>
+                  ))}
+                </ul>
+              </AlertDescription>
+            </Alert>
+          ) : null}
+          <Group title="What is delivered">
             <Section title="Title">
               <Input
                 aria-label="Short title"
@@ -268,6 +412,11 @@ export function ReviewStartCard({
             <Section title="Decisions">
               <Entries label="Decision" {...list("decisions")} />
             </Section>
+            {snapshot.briefTruncated ? (
+              <p className="text-muted-foreground text-xs">
+                This text is too long to show whole, so it is edited with the assistant.
+              </p>
+            ) : null}
             {snapshot.openQuestions.length > 0 ? (
               <Section title="Open questions">
                 <Lines items={snapshot.openQuestions} />
@@ -278,125 +427,141 @@ export function ReviewStartCard({
                 <Lines items={snapshot.conversationNotes.items} />
               </Section>
             ) : null}
-            <Section title="Changed since the last capture">
-              {snapshot.scopeChanges === null ? (
-                <p className="text-xs">Not captured yet.</p>
-              ) : snapshot.scopeChanges.length === 0 ? (
-                <p className="text-xs">Nothing.</p>
-              ) : (
-                snapshot.scopeChanges.map(({ field: changed, previous, next }) => (
-                  <div key={changed} className="text-xs">
-                    <p className="font-medium">{changed}</p>
-                    <Lines items={previous.map((line) => `- ${line}`)} />
-                    <Lines items={next.map((line) => `+ ${line}`)} />
+            {snapshot.scopeChanges !== null && snapshot.scopeChanges.length > 0 ? (
+              <Section title="Changed since the last capture">
+                {snapshot.scopeChanges.map(({ field: changed, previous, next }) => (
+                  <div key={changed} className="space-y-0.5 text-xs">
+                    <p className="font-medium">{reviewScopeFieldLabel(changed)}</p>
+                    {previous.map((line) => (
+                      <p key={`-${line}`} className="break-words text-muted-foreground">
+                        <span className="pe-1">Was:</span>
+                        <del>{line}</del>
+                      </p>
+                    ))}
+                    {next.map((line) => (
+                      <p key={`+${line}`} className="break-words">
+                        <span className="pe-1 text-muted-foreground">Now:</span>
+                        {line}
+                      </p>
+                    ))}
                   </div>
-                ))
-              )}
-            </Section>
-            <Section title="Where it goes">
-              <Lines
-                items={[
-                  where.repository === null
-                    ? "Repository: could not be resolved"
-                    : `Repository: ${where.repository.repository ?? where.repository.workspaceRoot} (${where.repository.provider})`,
-                  ...(where.source === null
-                    ? []
-                    : [`Work source: ${where.source.label} (${where.source.identity})`]),
-                  ...(where.sourcesOmitted > 0
-                    ? [`${where.sourcesOmitted} more Work sources are not listed here.`]
-                    : []),
-                  where.item === null
-                    ? "Work item: created when you start"
-                    : `Work item: ${where.item.key ?? where.item.itemId}`,
-                ]}
-              />
-              <div className="flex flex-wrap gap-1 pt-1">
-                {(["single", "parent"] as const).map((option) => (
-                  <Button
-                    key={option}
-                    size="xs"
-                    variant={where.kind === option ? "secondary" : "outline"}
-                    disabled={pending || where.kindFixed}
-                    onClick={() => setKind(option)}
-                  >
-                    {option === "single" ? "Single item" : "Plan into tasks"}
-                  </Button>
                 ))}
-                {where.sources.length > 1
-                  ? where.sources.map((source) => (
-                      <Button
-                        key={source.sourceId}
-                        size="xs"
-                        variant={
-                          where.source?.sourceId === source.sourceId ? "secondary" : "outline"
-                        }
-                        disabled={pending}
-                        onClick={() => setSourceId(source.sourceId)}
-                      >
-                        {source.label}
-                      </Button>
-                    ))
-                  : null}
-              </div>
-            </Section>
-            <Section title="What it runs with">
-              <Lines
-                items={[
-                  reviewRoleLine("Author", snapshot.roles.author),
-                  reviewRoleLine("Reviewer", snapshot.roles.reviewer),
-                  ...(where.kind === "parent"
-                    ? [reviewRoleLine("Planner", snapshot.roles.planner)]
-                    : []),
-                  `Runtime: ${snapshot.runtime.ceiling ?? "could not be resolved"}`,
-                  ...reviewLimitLines(snapshot),
-                  reviewOverrideLine(snapshot.overrides),
-                ]}
-              />
-            </Section>
-            {availability.reasons.length > 0 ? (
-              <Section title="Why it cannot start yet">
-                <Lines items={availability.reasons} />
               </Section>
             ) : null}
-            {reviewEditOvertaken(editing, snapshot) ? (
-              <p className="text-destructive text-xs">
-                This idea changed after you began editing, so your edits cannot be saved over it.
-                Discard them to see what it says now.
+          </Group>
+          <Group title="Where it goes">
+            <Facts facts={reviewDestinationFacts(where)} />
+            <Choice
+              label="Deliver as"
+              options={[
+                { value: "single", label: "Single item" },
+                { value: "parent", label: "Plan into tasks" },
+              ]}
+              value={where.kindFixed ? where.kind : kind}
+              disabled={pending || where.kindFixed}
+              onChange={(option) => {
+                if (option === kind) return;
+                setReviewedSelectionKey(null);
+                setKind(option);
+              }}
+            />
+            <p className="text-muted-foreground text-xs">
+              {REVIEW_KIND_NOTES[where.kindFixed ? where.kind : kind]}
+              {where.kindFixed ? " An attempt under way keeps how it was started." : ""}
+            </p>
+            {where.sources.length > 1 ? (
+              <Choice
+                label="Work source"
+                options={where.sources.map((source) => ({
+                  value: source.sourceId,
+                  label: source.label,
+                }))}
+                value={sourceId ?? where.source?.sourceId}
+                disabled={pending}
+                onChange={(option) => {
+                  if (option === sourceId) return;
+                  setReviewedSelectionKey(null);
+                  setSourceId(option);
+                }}
+              />
+            ) : null}
+            {reviewing ? (
+              <p className="text-muted-foreground text-xs" role="status">
+                Updating the review for your selection…
               </p>
             ) : null}
-            {error ? <p className="text-destructive text-xs">{error}</p> : null}
-          </div>
+          </Group>
+          <Group title="What it runs with">
+            <Section title="Roles">
+              <Facts
+                facts={[
+                  reviewRoleFact("Author", snapshot.roles.author),
+                  reviewRoleFact("Reviewer", snapshot.roles.reviewer),
+                  ...(where.kind === "parent"
+                    ? [reviewRoleFact("Planner", snapshot.roles.planner)]
+                    : []),
+                  {
+                    key: "runtime",
+                    label: "Runtime mode",
+                    value: snapshot.runtime.ceiling ?? "Could not be resolved",
+                  },
+                  reviewOverrideFact(snapshot.overrides),
+                ]}
+              />
+              <p className="text-muted-foreground text-xs">{REVIEW_PROVIDER_NOTE}</p>
+            </Section>
+            <Section title="Allowances and checks">
+              <Facts facts={reviewLimitFacts(snapshot)} />
+            </Section>
+          </Group>
+          {overtaken ? (
+            <p className="text-destructive text-xs" role="alert">
+              This idea changed after you began editing, so your edits cannot be saved over it.
+              Discard them to see what it says now.
+            </p>
+          ) : null}
+          {error ? (
+            <p className="text-destructive text-xs" role="alert">
+              {error}
+            </p>
+          ) : null}
         </DialogPanel>
         <DialogFooter>
-          <Button size="sm" variant="outline" disabled={pending} onClick={onClose}>
-            Close
-          </Button>
+          {edited ? (
+            <p
+              className="text-muted-foreground text-xs sm:me-auto sm:self-center"
+              role={closeRefused ? "alert" : undefined}
+            >
+              {closeRefused
+                ? "Save or discard your edits before closing."
+                : "Unsaved edits. A start uses what is saved."}
+            </p>
+          ) : null}
           {edited ? (
             <>
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={pending}
-                onClick={() => setEditing(reviewEditingOf(snapshot))}
-              >
+              <Button size="sm" variant="outline" disabled={pending} onClick={discard}>
                 Discard edits
               </Button>
               <Button
                 size="sm"
                 variant="outline"
-                disabled={pending || !canEdit}
+                disabled={pending || reviewing || !canEdit}
                 onClick={() => void save()}
               >
                 Save edits
               </Button>
             </>
-          ) : null}
+          ) : (
+            <Button size="sm" variant="outline" disabled={pending} onClick={onClose}>
+              Close
+            </Button>
+          )}
           <Button
             size="sm"
-            disabled={pending || !availability.canStart}
+            disabled={pending || reviewing || !availability.canStart}
             onClick={() => void confirm()}
           >
-            {availability.label}
+            {availability.action}
           </Button>
         </DialogFooter>
       </DialogPopup>

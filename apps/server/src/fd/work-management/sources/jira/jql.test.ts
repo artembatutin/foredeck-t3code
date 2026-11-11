@@ -17,11 +17,11 @@ describe("JQL", () => {
         limit: 50,
         statuses: ["todo", "in_progress", "cancelled", "done"],
         assignee: "me",
-        labels: ["a b"],
+        labels: ["a b", "urgent"],
         search: 'crash "x"',
       }),
     ).toBe(
-      'project = "PROJ" AND statusCategory in (2, 4, 3) AND assignee = currentUser() AND labels in ("a b") AND text ~ "crash \\"x\\"" ORDER BY updated DESC, key DESC',
+      'project = "PROJ" AND statusCategory in (2, 4, 3) AND assignee = currentUser() AND labels = "a b" AND labels = "urgent" AND text ~ "crash \\"x\\"" ORDER BY updated DESC, key DESC',
     );
     expect(listJql("PROJ", { sourceId, limit: 50 })).toBe(
       'project = "PROJ" ORDER BY updated DESC, key DESC',

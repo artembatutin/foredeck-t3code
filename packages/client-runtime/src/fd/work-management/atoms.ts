@@ -20,7 +20,7 @@ import {
   createEnvironmentRpcQueryAtomFamily,
   createEnvironmentRpcSubscriptionAtomFamily,
 } from "../../state/runtime.ts";
-import { workSupport } from "./model.ts";
+import { normalizeWorkLabels, workSupport } from "./model.ts";
 import { collectWorkPages, workPageLimit, type WorkSourcePages } from "./paging.ts";
 
 /** One list view: the sources it reads, its server-side filters and how many pages it wants. */
@@ -31,6 +31,8 @@ export interface WorkPagedListInput {
     readonly kind: WorkSourceKind;
   }>;
   readonly search?: string | undefined;
+  readonly labels?: ReadonlyArray<string> | undefined;
+  readonly assignee?: "me" | undefined;
   readonly statuses?: ReadonlyArray<WorkNativeStatus> | undefined;
   readonly pageCount: number;
 }
@@ -88,6 +90,8 @@ export function createWorkEnvironmentAtoms<R, E>(
                 limit: workPageLimit(source.kind),
                 ...(input.search === undefined ? {} : { search: input.search }),
                 ...(input.statuses === undefined ? {} : { statuses: [...input.statuses] }),
+                ...(input.labels === undefined ? {} : { labels: [...input.labels] }),
+                ...(input.assignee === undefined ? {} : { assignee: input.assignee }),
                 ...(cursor === undefined ? {} : { cursor }),
               },
             });
@@ -112,6 +116,10 @@ export function createWorkEnvironmentAtoms<R, E>(
           ? {}
           : { search: input.search }),
         ...(input.statuses === undefined ? {} : { statuses: [...input.statuses] }),
+        ...(input.labels === undefined || input.labels.length === 0
+          ? {}
+          : { labels: normalizeWorkLabels(input.labels) }),
+        ...(input.assignee === undefined ? {} : { assignee: input.assignee }),
         pageCount: Math.max(1, input.pageCount),
       }),
     );

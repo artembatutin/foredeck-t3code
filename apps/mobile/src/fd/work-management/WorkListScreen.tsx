@@ -3,11 +3,15 @@ import { LegendList } from "@legendapp/list/react-native";
 import {
   itemInView,
   linksByItem,
+  normalizeWorkLabels,
+  parseWorkLabelFilter,
+  workFilterSources,
   refreshWork,
   RUN_STATE_LABELS,
   runStateOf,
   shouldAutoLoadWorkPage,
   WORK_VIEWS,
+  workEmptyState,
   type WorkPagedSource,
   type WorkRunState,
   type WorkView,
@@ -88,6 +92,9 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
   const [view, setView] = useState<WorkView>("ready");
   const [query, setQuery] = useState("");
   const [term, setTerm] = useState("");
+  const [labelText, setLabelText] = useState("");
+  const [labels, setLabels] = useState<ReadonlyArray<string>>([]);
+  const [assignedToMe, setAssignedToMe] = useState(false);
   const [creating, setCreating] = useState(false);
   useEffect(() => {
     const timer = setTimeout(() => setTerm(query.trim()), 250);
@@ -107,8 +114,22 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
         }),
   );
   const sources = useMemo(() => sourcesQuery.data?.sources ?? [], [sourcesQuery.data]);
+  const canFilterAssignee = sources.some((source) => source.capabilities.people);
+  const filterAssignedToMe = canFilterAssignee && assignedToMe;
+  const shownSources = useMemo(
+    () => workFilterSources(sources, filterAssignedToMe),
+    [filterAssignedToMe, sources],
+  );
   // Pages loaded so far; any change to what the list shows starts again from the first page.
-  const listKey = `${project?.environmentId}|${project?.id}|${sources.map((source) => source.sourceId).join(",")}|${view}|${term}`;
+  const listKey = JSON.stringify([
+    project?.environmentId,
+    project?.id,
+    shownSources.map((source) => source.sourceId),
+    view,
+    term,
+    labels,
+    filterAssignedToMe,
+  ]);
   const [paging, setPaging] = useState({ key: listKey, pageCount: 1 });
   const pageCount = paging.key === listKey ? paging.pageCount : 1;
   const loadMore = useCallback(
@@ -117,16 +138,21 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
   );
   const listsAtom = useMemo(
     () =>
-      project === undefined || sources.length === 0
+      project === undefined || shownSources.length === 0
         ? null
         : workEnvironment.pagedList({
             environmentId: project.environmentId,
-            sources: sources.map((source) => ({ sourceId: source.sourceId, kind: source.kind })),
+            sources: shownSources.map((source) => ({
+              sourceId: source.sourceId,
+              kind: source.kind,
+            })),
             search: term.length === 0 ? undefined : term,
             statuses: workViewStatuses(view),
+            labels,
+            assignee: filterAssignedToMe ? "me" : undefined,
             pageCount,
           }),
-    [pageCount, project, sources, term, view],
+    [filterAssignedToMe, labels, pageCount, project, shownSources, term, view],
   );
   const lists = useAtomValue(listsAtom ?? EMPTY_LISTS);
   const refreshLists = useAtomRefresh(listsAtom ?? EMPTY_LISTS);
@@ -246,6 +272,22 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
   }
 
   const viewLabel = WORK_VIEWS.find((entry) => entry.value === view)?.label ?? "Ready";
+  const filtered = labels.length > 0 || filterAssignedToMe || query.length > 0;
+  const empty = workEmptyState({ view, term, labels, assignedToMe: filterAssignedToMe });
+  // The box only adds; what it held is applied, so it empties.
+  const addLabels = () => {
+    const added = parseWorkLabelFilter(labelText);
+    if (added.length === 0) return;
+    setLabelText("");
+    setLabels(normalizeWorkLabels([...labels, ...added]));
+  };
+  const clearFilters = () => {
+    setQuery("");
+    setTerm("");
+    setLabelText("");
+    setLabels([]);
+    setAssignedToMe(false);
+  };
   return (
     <View className="flex-1 bg-screen">
       <View className="flex-row flex-wrap items-center gap-2 px-4 pt-2 pb-3">
@@ -283,6 +325,18 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
             if (next) setView(next.value);
           }}
         />
+        {canFilterAssignee ? (
+          <ListFilterMenu
+            label={filterAssignedToMe ? "Assigned to me" : "Anyone"}
+            accessibilityLabel="Filter by assignee"
+            active={filterAssignedToMe}
+            actions={[
+              { id: "all", title: "Anyone", state: filterAssignedToMe ? "off" : "on" },
+              { id: "me", title: "Assigned to me", state: filterAssignedToMe ? "on" : "off" },
+            ]}
+            onSelect={(id) => setAssignedToMe(id === "me")}
+          />
+        ) : null}
         {canCreate && creatable.length > 0 ? (
           <Pressable
             accessibilityRole="button"
@@ -315,6 +369,56 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
           onChangeText={setQuery}
         />
       </View>
+      <View className="flex-row items-center gap-2 px-4 pb-2">
+        <AppTextInput
+          accessibilityLabel="Filter by labels"
+          className="h-12 min-h-12 flex-1 rounded-[24px] px-4 py-0 text-base leading-snug"
+          placeholder={labels.length > 0 ? "Add another label" : "Filter by label"}
+          value={labelText}
+          autoCapitalize="none"
+          autoCorrect={false}
+          clearButtonMode="while-editing"
+          returnKeyType="done"
+          onChangeText={setLabelText}
+          onSubmitEditing={addLabels}
+        />
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Apply labels"
+          hitSlop={8}
+          onPress={addLabels}
+        >
+          <Text className="text-sm font-t3-medium text-link">Add label</Text>
+        </Pressable>
+      </View>
+      {filtered ? (
+        // What is applied, apart from what is typed: each label removes itself.
+        <View className="flex-row flex-wrap items-center gap-2 px-4 pb-2">
+          {labels.map((label) => (
+            <Pressable
+              key={label}
+              accessibilityRole="button"
+              accessibilityLabel={`Remove label filter ${label}`}
+              hitSlop={6}
+              className="h-8 flex-row items-center gap-1.5 rounded-full bg-subtle px-3 active:opacity-70"
+              onPress={() => setLabels(labels.filter((other) => other !== label))}
+            >
+              <Text className="text-sm font-t3-medium text-foreground-muted" numberOfLines={1}>
+                {label}
+              </Text>
+              <SymbolView name="xmark" size={11} tintColorClassName="accent-icon-muted" />
+            </Pressable>
+          ))}
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Clear filters"
+            hitSlop={8}
+            onPress={clearFilters}
+          >
+            <Text className="text-sm font-t3-medium text-link">Clear filters</Text>
+          </Pressable>
+        </View>
+      ) : null}
       {creating ? (
         <CreateWorkItemForm
           environmentId={project.environmentId}
@@ -377,14 +481,21 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
             ) : (
               <EmptyState
                 variant="plain"
-                title={term.length > 0 ? "No results" : `Nothing ${viewLabel.toLowerCase()}`}
+                title={empty.title}
                 detail={
                   hasMore
                     ? "Nothing matched in the items loaded so far. Scroll to load more."
-                    : term.length > 0
-                      ? "No items match your search in this view."
-                      : "Choose another view to see more items."
+                    : empty.detail
                 }
+                {...(empty.action === null
+                  ? {}
+                  : empty.action === "show-all"
+                    ? { actionLabel: "Show all items", onAction: () => setView("all") }
+                    : {
+                        actionLabel:
+                          empty.action === "clear-search" ? "Clear search" : "Clear filters",
+                        onAction: clearFilters,
+                      })}
               />
             )
           }

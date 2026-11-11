@@ -108,6 +108,7 @@ export {
   type FactoryReviewLine,
   type FactoryRoleExecutionLine,
   type FactoryThreadTarget,
+  type FactoryOutcomeTone,
   type FactoryTimelineRow,
 } from "./section.ts";
 export {

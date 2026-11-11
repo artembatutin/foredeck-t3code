@@ -19,6 +19,8 @@ const database = FactoryTaskStore.layer.pipe(
   Layer.provideMerge(SqlitePersistence.layerMemory),
 );
 
+const manifest = FactoryMigrations.factoryMigrationEntries.map(([id, name]) => [id, name] as const);
+
 const deliveryId = FactoryDeliveryId.make("delivery-parent");
 const plan = Schema.decodeSync(FactoryPlanTask)({
   id: "export-csv",
@@ -54,10 +56,7 @@ const migrateThrough = (count: number) =>
 describe("the task store's child items", () => {
   it.effect("are added by an appended migration that a rerun leaves as it is", () =>
     Effect.gen(function* () {
-      const manifest = FactoryMigrations.factoryMigrationEntries.map(
-        ([id, name]) => [id, name] as const,
-      );
-      assert.deepStrictEqual(manifest.slice(-2), [
+      assert.deepStrictEqual(manifest.slice(6, 8), [
         [7, "FactoryTaskChildItems"],
         [8, "FactoryTaskChildClaims"],
       ]);
@@ -97,10 +96,7 @@ describe("the task store's child items", () => {
         `;
       }
 
-      assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), [
-        [7, "FactoryTaskChildItems"],
-        [8, "FactoryTaskChildClaims"],
-      ]);
+      assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), manifest.slice(6));
       const tasks = yield* FactoryTaskStore.FactoryTaskStore;
       const stored = yield* tasks.listByDelivery(deliveryId);
       // The planned task may have had its child begun by that build, so it counts as claimed.
@@ -167,9 +163,7 @@ describe("the task store's child items", () => {
         `;
       }
 
-      assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), [
-        [8, "FactoryTaskChildClaims"],
-      ]);
+      assert.deepStrictEqual(yield* FactoryMigrations.runFactoryMigrations(), manifest.slice(7));
       const tasks = yield* FactoryTaskStore.FactoryTaskStore;
       assert.deepStrictEqual(
         (yield* tasks.listByDelivery(deliveryId)).map(({ childClaimedAt }) => childClaimedAt),

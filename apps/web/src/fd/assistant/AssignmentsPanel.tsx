@@ -12,13 +12,13 @@ import {
   LightbulbIcon,
   WifiOffIcon,
 } from "lucide-react";
-import { useProjects, useThreadShells } from "~/state/entities";
+import { useProjects, useThreadShell, useThreadShells } from "~/state/entities";
+import { useEnvironment } from "~/state/environments";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { useLiveRefresh } from "~/hooks/useLiveRefresh";
 import { Button } from "~/components/ui/button";
 import { Badge } from "~/components/ui/badge";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "~/components/ui/popover";
-import { Menu, MenuItem, MenuPopup, MenuTrigger } from "~/components/ui/menu";
 import {
   AlertDialog,
   AlertDialogClose,
@@ -28,6 +28,7 @@ import {
   AlertDialogPopup,
   AlertDialogTitle,
 } from "~/components/ui/alert-dialog";
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from "~/components/ui/menu";
 import {
   assignmentActions,
   availableWorkerThread,
@@ -35,6 +36,8 @@ import {
   ideaAssignment,
   ideaCaptureRow,
   ideaFacts,
+  type IdeaStage,
+  ideaStage,
   portfolioRowTitle,
   type AssignmentAction,
   type WorkItemTarget,
@@ -67,6 +70,21 @@ const statusLabels: Record<string, string> = {
   failed: "Failed",
   completed: "Completed",
   cancelled: "Cancelled",
+};
+
+const STAGE_VARIANTS = {
+  discussion: "outline",
+  capturing: "secondary",
+  captured: "secondary",
+  unconfirmed: "warning",
+  delivery: "info",
+} as const satisfies Record<IdeaStage["stage"], string>;
+
+const ACTION_LABELS: Record<AssignmentAction, string> = {
+  stop: "Stop",
+  resume: "Resume",
+  retry: "Retry",
+  cancel: "Cancel",
 };
 
 /** A row's facts, each labelled as itself. */
@@ -120,6 +138,9 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
   const allowed = useAtomValue(controlAssignment.permissionAtom(threadRef.environmentId));
   const projects = useProjects();
   const threads = useThreadShells();
+  const manager = useThreadShell(threadRef);
+  const connected = useEnvironment(threadRef.environmentId)?.connection.phase === "connected";
+  const completedRunId = manager?.latestRun?.completedAt == null ? null : manager.latestRun.runId;
   const navigate = useNavigate();
   const [loaded, setLoaded] = useState<{
     environmentId: ScopedThreadRef["environmentId"];
@@ -132,10 +153,19 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
   // Held with its environment, so switching away never confirms one environment's cancel in another.
   const [cancelTarget, setCancelTarget] = useState<{
     environmentId: ScopedThreadRef["environmentId"];
-    item: Assignment;
+    assignmentId: string;
   } | null>(null);
+  // The current row, while it still offers cancel. Anything else closes the confirmation, so it never
+  // cancels what replaced the row it was opened from.
   const confirmingCancel =
-    cancelTarget?.environmentId === threadRef.environmentId ? cancelTarget.item : null;
+    cancelTarget?.environmentId === threadRef.environmentId
+      ? (snapshot?.assignments.find(
+          (item) =>
+            item.assignmentId === cancelTarget.assignmentId &&
+            assignmentActions(item).includes("cancel"),
+        ) ?? null)
+      : null;
+  if (cancelTarget !== null && confirmingCancel === null) setCancelTarget(null);
   // Only the latest read started may land: an older one, or one for the environment shown before,
   // finishing last would otherwise put back what the newer read replaced.
   const latestRead = useRef(0);
@@ -147,16 +177,43 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
     setError(result._tag === "Failure");
     if (result._tag === "Success") setLoaded({ environmentId, snapshot: result.value });
   }, [read, threadRef.environmentId]);
-  // The first read happens on mount; later ones follow Factory's and Work's change epochs, then
-  // focus, arrival and the shared live interval for what neither epoch hears of.
+  const observed = useRef<{
+    environmentId: ScopedThreadRef["environmentId"];
+    threadId: ThreadId;
+    connected: boolean;
+    completedRunId: typeof completedRunId;
+  } | null>(null);
+  // Cached shells can mount before their connection. A completed assistant turn is the
+  // milestone after its idea/capture tools have finished; streaming text does not trigger reads.
   useEffect(() => {
-    void refresh();
-    return () => {
-      // Unmounted or switched away: whatever is in flight is no longer this panel's to show.
-      latestRead.current++;
+    const previous = observed.current;
+    observed.current = {
+      environmentId: threadRef.environmentId,
+      threadId: threadRef.threadId,
+      connected,
+      completedRunId,
     };
-  }, [refresh]);
-  useLiveRefresh(() => void refresh(), { key: threadRef.environmentId });
+    if (!connected) {
+      latestRead.current++;
+      return;
+    }
+    if (
+      previous === null ||
+      !previous.connected ||
+      previous.environmentId !== threadRef.environmentId ||
+      previous.threadId !== threadRef.threadId ||
+      (completedRunId !== null && completedRunId !== previous.completedRunId)
+    )
+      void refresh();
+  }, [connected, completedRunId, refresh, threadRef.environmentId, threadRef.threadId]);
+  useEffect(
+    () => () => {
+      observed.current = null;
+      latestRead.current++;
+    },
+    [],
+  );
+  useLiveRefresh(connected ? () => void refresh() : null, { key: threadRef.environmentId });
   const refreshRef = useRef(refresh);
   useEffect(() => {
     refreshRef.current = refresh;
@@ -241,6 +298,7 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
               const threadId = workerThread(ideaAssignment(idea, work));
               const capture = ideaCaptureRow(idea, threadRef.environmentId);
               const facts = ideaFacts(idea, ideaAssignment(idea, work));
+              const stage = ideaStage(idea, ideaAssignment(idea, work));
               const review = (
                 <Button
                   type="button"
@@ -264,10 +322,13 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                     </p>
                   </div>
                   {idea.priority !== null ? (
-                    <Badge variant="secondary" size="sm">
+                    <Badge variant="outline" size="sm">
                       Queue P{idea.priority}
                     </Badge>
                   ) : null}
+                  <Badge variant={STAGE_VARIANTS[stage.stage]} size="sm">
+                    {stage.label}
+                  </Badge>
                 </>
               );
               return threadId ? (
@@ -290,14 +351,15 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                     {label}
                   </summary>
                   <div className="space-y-2 px-2 pb-1 text-sm">
-                    <Badge variant={idea.authorized ? "success" : "secondary"} size="sm">
-                      {idea.authorized ? "Approved" : "Draft"}
-                    </Badge>
+                    {capture ? <p className="text-xs">{capture.text}</p> : null}
+                    <p className="text-xs text-muted-foreground">{stage.detail}</p>
+                    {idea.authorized ? (
+                      <Badge variant="success" size="sm">
+                        Approved to start
+                      </Badge>
+                    ) : null}
                     {idea.priorityReason ? (
                       <p className="text-xs text-muted-foreground">{idea.priorityReason}</p>
-                    ) : null}
-                    {capture ? (
-                      <p className="text-xs text-muted-foreground">{capture.text}</p>
                     ) : null}
                     {facts ? <ItemFacts facts={facts} /> : null}
                     <div className="flex flex-wrap gap-1">
@@ -313,9 +375,6 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                         </Button>
                       ) : null}
                     </div>
-                    <p className="text-xs text-muted-foreground">
-                      No worker conversation yet. Continue this idea with the assistant.
-                    </p>
                   </div>
                 </details>
               );
@@ -506,21 +565,17 @@ export function AssignmentsPanel({ threadRef }: { threadRef: ScopedThreadRef }) 
                                 // Cancelling ends the assignment, and a delivery's family with it,
                                 // so it asks first as Factory's own section does.
                                 if (action === "cancel") {
-                                  setCancelTarget({ environmentId: threadRef.environmentId, item });
+                                  setCancelTarget({
+                                    environmentId: threadRef.environmentId,
+                                    assignmentId: item.assignmentId,
+                                  });
                                   close();
                                   return;
                                 }
                                 return runAction(item, action);
                               }}
                             >
-                              {
-                                {
-                                  stop: "Stop",
-                                  resume: "Resume",
-                                  retry: "Retry",
-                                  cancel: "Cancel",
-                                }[action]
-                              }
+                              {ACTION_LABELS[action]}
                             </MenuItem>
                           ))}
                         </MenuPopup>

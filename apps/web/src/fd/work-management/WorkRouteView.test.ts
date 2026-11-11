@@ -15,6 +15,7 @@ type TestItem = {
   status: string;
   blocked: boolean;
   labels: ReadonlyArray<string>;
+  assignee?: "me" | "someone";
   priority: string;
   updatedAt: string;
 };
@@ -22,6 +23,9 @@ type PagedListInput = {
   environmentId: string;
   statuses: ReadonlyArray<string> | undefined;
   pageCount: number;
+  search?: string;
+  labels?: ReadonlyArray<string>;
+  assignee?: "me";
 };
 
 const world = vi.hoisted(() => ({
@@ -63,7 +67,11 @@ vi.mock("../../components/ui/empty", () => ({
   EmptyMedia: world.passthrough,
   EmptyTitle: world.passthrough,
 }));
-vi.mock("../../components/ui/input", () => ({ Input: () => null }));
+vi.mock("../../components/ui/input-group", () => ({
+  InputGroup: world.passthrough,
+  InputGroupAddon: world.passthrough,
+  InputGroupInput: (props: object) => createElement("input", props),
+}));
 vi.mock("../../components/ui/refresh-icon", () => ({ RefreshIcon: () => null }));
 vi.mock("../../components/ui/select", () => ({
   Select: world.passthrough,
@@ -170,6 +178,7 @@ const details = (view: ReactTestRenderer) =>
 const lastListRead = () => world.pagedList.mock.lastCall?.[0] as PagedListInput | undefined;
 
 beforeEach(() => {
+  vi.useFakeTimers();
   stored = new Map([[PREFERENCES_KEY, JSON.stringify({ view: "ready", assignedToMe: true })]]);
   setItem.mockImplementation((key: string, value: string) => void stored.set(key, value));
   vi.stubGlobal("window", {
@@ -190,7 +199,7 @@ beforeEach(() => {
         kind: "markdown",
         label: "Tasks",
         health: { status: "ok" },
-        capabilities: { create: false },
+        capabilities: { create: false, people: false },
       },
     ],
   }));
@@ -201,7 +210,12 @@ beforeEach(() => {
   // As the server serves it: the statuses a view asks for, a page at a time.
   world.pagedList.mockImplementation((input: PagedListInput) => {
     const matching = world.items.filter(
-      (entry) => input.statuses === undefined || input.statuses.includes(entry.status),
+      (entry) =>
+        (input.statuses === undefined || input.statuses.includes(entry.status)) &&
+        (input.search === undefined || entry.title.includes(input.search)) &&
+        (input.labels === undefined ||
+          input.labels.every((label) => entry.labels.includes(label))) &&
+        (input.assignee === undefined || entry.assignee === input.assignee),
     );
     const shown = input.pageCount * world.pageSize;
     return [
@@ -225,6 +239,7 @@ afterEach(async () => {
     for (const view of views) view.unmount();
   });
   views = [];
+  vi.useRealTimers();
   vi.resetAllMocks();
   vi.unstubAllGlobals();
 });
@@ -558,5 +573,164 @@ describe("a Work item link's project", () => {
         .findAllByType("button")
         .filter((node) => node.props.children === "Open another project"),
     ).toEqual([]);
+  });
+});
+
+describe("Work search navigation", () => {
+  const searchInput = (view: ReactTestRenderer) =>
+    view.root.findByProps({ "aria-label": "Search work" });
+  const visit = async (view: ReactTestRenderer, search: Record<string, unknown>) => {
+    await act(async () =>
+      view.update(createElement(WorkRouteView, { search: validateWorkSearch(search) })),
+    );
+  };
+  const type = async (view: ReactTestRenderer, value: string) => {
+    await act(async () => searchInput(view).props.onChange({ target: { value } }));
+  };
+  const tick = async () =>
+    act(async () => {
+      vi.advanceTimersByTime(250);
+    });
+
+  it("clears an obsolete search and cancels pending typing when an item link opens", async () => {
+    world.items = [item("fd-captured")];
+    const view = await open({ project: "env-a:project-a", q: "obsolete" });
+    await type(view, "pending obsolete");
+    await visit(view, linkTo("fd-captured"));
+    await tick();
+    expect(searchInput(view).props.value).toBe("");
+    expect(world.navigate).not.toHaveBeenCalled();
+    expect(rows(view)).toEqual([{ current: true, text: expect.stringContaining("fd-captured") }]);
+  });
+
+  it("debounces ordinary typing and retains typing ahead of the route acknowledgement", async () => {
+    const view = await open({ project: "env-a:project-a" });
+    await type(view, "first");
+    await tick();
+    expect(world.navigate).toHaveBeenCalledTimes(1);
+    await type(view, "first second");
+    await visit(view, { project: "env-a:project-a", q: "first" });
+    expect(searchInput(view).props.value).toBe("first second");
+    await tick();
+    expect(world.navigate).toHaveBeenLastCalledWith({
+      to: "/work",
+      search: { project: "env-a:project-a", q: "first second" },
+      replace: true,
+    });
+    await visit(view, { project: "env-a:project-a", q: "first second" });
+    await tick();
+    expect(world.navigate).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the typing deadline when the same route renders again", async () => {
+    const search = { project: "env-a:project-a" };
+    const view = await open(search);
+    await type(view, "current query");
+    await act(async () => {
+      vi.advanceTimersByTime(125);
+    });
+    await visit(view, search);
+    await act(async () => {
+      vi.advanceTimersByTime(125);
+    });
+    expect(world.navigate).toHaveBeenCalledExactlyOnceWith({
+      to: "/work",
+      search: { ...search, q: "current query" },
+      replace: true,
+    });
+  });
+
+  it("back and forward restore each URL search without writing it back", async () => {
+    const view = await open({ project: "env-a:project-a", q: "second" });
+    await type(view, "discard this draft");
+    await visit(view, { project: "env-a:project-a", q: "first" });
+    expect(searchInput(view).props.value).toBe("first");
+    await tick();
+    await visit(view, { project: "env-a:project-a", q: "second" });
+    expect(searchInput(view).props.value).toBe("second");
+    await tick();
+    expect(world.navigate).not.toHaveBeenCalled();
+  });
+});
+
+describe("Work label and assignee filters", () => {
+  beforeEach(() => {
+    world.sources.mockImplementation(() => ({
+      sources: [
+        {
+          sourceId,
+          kind: "github",
+          label: "Issues",
+          health: { status: "ok" },
+          capabilities: { create: false, people: true },
+        },
+      ],
+    }));
+    world.items = [
+      item("mine-auth", { labels: ["auth", "urgent"], assignee: "me" }),
+      item("their-auth", { labels: ["auth", "urgent"], assignee: "someone" }),
+      item("mine-ui", { labels: ["ui"], assignee: "me" }),
+    ];
+  });
+
+  it("combines saved assignment with all selected labels and clears both", async () => {
+    const view = await open({ project: "env-a:project-a", labels: ["urgent", "auth"] });
+    expect(rows(view).map((row) => row.text)).toEqual([expect.stringContaining("mine-auth")]);
+    expect(lastListRead()).toMatchObject({ assignee: "me", labels: ["auth", "urgent"] });
+    const clear = view.root
+      .findAllByType("button")
+      .find((node) => node.props.children === "Clear filters")!;
+    await act(async () => clear.props.onClick());
+    const next = world.navigate.mock.lastCall?.[0].search;
+    await act(async () => view.update(createElement(WorkRouteView, { search: next })));
+    expect(rows(view)).toHaveLength(3);
+    expect(lastListRead()?.assignee).toBeUndefined();
+    expect(lastListRead()?.labels).toEqual([]);
+  });
+
+  it("applies labels absent from the first page and resets pagination", async () => {
+    world.pageSize = 30;
+    world.items = [
+      ...Array.from({ length: 35 }, (_, index) => item(`other-${index}`, { assignee: "me" })),
+      item("matching", { labels: ["later"], assignee: "me" }),
+    ];
+    const view = await open({ project: "env-a:project-a", view: "all" });
+    const more = view.root
+      .findAllByType("button")
+      .find((node) => node.props.children === "Load more items")!;
+    await act(async () => more.props.onClick());
+    expect(lastListRead()?.pageCount).toBe(2);
+    const input = view.root.findByProps({ "aria-label": "Filter by labels" });
+    await act(async () => input.props.onChange({ target: { value: " later, later " } }));
+    await act(async () => view.root.findByType("form").props.onSubmit({ preventDefault() {} }));
+    const next = world.navigate.mock.lastCall?.[0].search;
+    await act(async () => view.update(createElement(WorkRouteView, { search: next })));
+    expect(lastListRead()?.pageCount).toBe(1);
+    expect(rows(view).map((row) => row.text)).toEqual([expect.stringContaining("matching")]);
+  });
+
+  it("opens a linked item outside the saved assigned-to-me filter without changing that preference", async () => {
+    const view = await open(linkTo("their-auth"));
+    expect(lastListRead()?.assignee).toBeUndefined();
+    expect(rows(view).filter((row) => row.current)).toEqual([
+      { current: true, text: expect.stringContaining("their-auth") },
+    ]);
+    expect(JSON.parse(stored.get(PREFERENCES_KEY)!).assignedToMe).toBe(true);
+    expect(setItem).not.toHaveBeenCalled();
+  });
+
+  it("saves an explicit assignment choice and retains the view preference", async () => {
+    const view = await open({ project: "env-a:project-a" });
+    const toggle = view.root
+      .findAllByType("button")
+      .find((node) => node.props.children === "Assigned to me")!;
+    await act(async () => toggle.props.onClick());
+    const next = world.navigate.mock.lastCall?.[0].search;
+    await act(async () => view.update(createElement(WorkRouteView, { search: next })));
+    expect(rows(view)).toHaveLength(3);
+    expect(JSON.parse(stored.get(PREFERENCES_KEY)!)).toEqual({
+      view: "ready",
+      assignedToMe: false,
+    });
   });
 });

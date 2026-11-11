@@ -215,6 +215,77 @@ const deliveredItems = (world: World) =>
 const key = workItemRefString;
 
 describe("FactoryService.startNext picks", () => {
+  it.live("starts a GitHub item once its retained dependency has closed", () => {
+    let blockerOpen = true;
+    const issue = () => ({
+      id: "I_6",
+      number: 6,
+      title: "Add the export button",
+      state: "OPEN",
+      stateReason: null,
+      url: "https://github.com/acme/alpha/issues/6",
+      updatedAt: "2026-10-20T10:00:00Z",
+      issueDependenciesSummary: { blockedBy: blockerOpen ? 1 : 0, totalBlockedBy: 1 },
+      blockedBy: { nodes: [{ number: 2, state: blockerOpen ? "OPEN" : "CLOSED" }] },
+      body: "Add the export button.",
+      comments: { totalCount: 0, nodes: [] },
+    });
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        Effect.gen(function* () {
+          const work = yield* WorkService.WorkService;
+          // Keep this pick on the GitHub source, rather than the harness's Markdown item.
+          yield* work.disconnectSource(owner, { sourceId: world.itemRef.sourceId });
+          const source = yield* work.saveSource(owner, {
+            projectId: world.projectId,
+            label: "GitHub",
+            config: { kind: "github", host: "github.com", owner: "acme", name: "alpha" },
+          });
+          assert.deepStrictEqual(yield* startNext({ projectId: world.projectId }), {
+            type: "nothing_ready",
+            incomplete: false,
+          });
+          assert.deepStrictEqual(world.provider.started, []);
+
+          blockerOpen = false;
+          yield* work.refresh(owner, { sourceId: source.sourceId });
+          const next = started(yield* startNext({ projectId: world.projectId }));
+          assert.strictEqual(key(next.itemRef), key(refOf(source.sourceId, "6")));
+          yield* world.launched(next.deliveryId);
+          assert.deepStrictEqual(yield* deliveredItems(world), [key(next.itemRef)]);
+        }),
+      {
+        githubApi: {
+          graphql: (input) =>
+            Effect.succeed(
+              JSON.stringify({
+                data: {
+                  repository:
+                    input.operation === "work.issues.list"
+                      ? {
+                          issues: {
+                            pageInfo: { hasNextPage: false, endCursor: null },
+                            nodes: [issue()],
+                          },
+                        }
+                      : { issue: issue() },
+                },
+              }),
+            ),
+          rest: () =>
+            Effect.succeed({
+              status: 200,
+              headers: {},
+              body: JSON.stringify({ full_name: "acme/alpha", has_issues: true, id: 1 }),
+              truncated: false,
+              invalidUtf8: false,
+            }),
+        },
+      },
+    );
+  });
+
   it.live("starts the first Ready item in Work's order across sources and pages", () => {
     const faults: WorkFaults = { pageLimit: 2 };
     return withProject(

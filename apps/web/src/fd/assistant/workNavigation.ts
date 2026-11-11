@@ -40,6 +40,67 @@ export function availableWorkerThread(
     : null;
 }
 
+/** How far an idea has come: talked about, written down in Work, or being worked on. */
+export interface IdeaStage {
+  readonly stage: "discussion" | "capturing" | "captured" | "unconfirmed" | "delivery";
+  readonly label: string;
+  /** What that stage means for workers, which no stage before delivery has started. */
+  readonly detail: string;
+}
+
+// An assignment in any other state has ended, or was never started.
+const DELIVERING = new Set([
+  "queued",
+  "launching",
+  "launch-uncertain",
+  "running",
+  "needs-input",
+  "stopping",
+  "stopped",
+  "awaiting-verification",
+]);
+
+/**
+ * The stage an idea's row shows, so a list tells discussion, captured work and active delivery
+ * apart without opening each. A capture is only a Work item: it never reads as work under way.
+ */
+export function ideaStage(idea: Idea, assignment: Assignment | undefined): IdeaStage {
+  if (assignment !== undefined && DELIVERING.has(assignment.state)) {
+    return {
+      stage: "delivery",
+      label: "In delivery",
+      detail: "A worker was started for this idea. Its progress is under Assignments.",
+    };
+  }
+  const state = idea.capture?.state;
+  if (state === undefined) {
+    return {
+      stage: "discussion",
+      label: "Discussion",
+      detail:
+        "Not captured in Work, and no worker has started. Keep shaping it with the assistant.",
+    };
+  }
+  if (state === "captured") {
+    return {
+      stage: "captured",
+      label: "Captured",
+      detail: "Capturing started no worker. Review it to start one.",
+    };
+  }
+  return state === "pending"
+    ? {
+        stage: "capturing",
+        label: "Capturing",
+        detail: "Capturing starts no worker.",
+      }
+    : {
+        stage: "unconfirmed",
+        label: "Capture unconfirmed",
+        detail: "No worker has started.",
+      };
+}
+
 export type AssignmentAction = "stop" | "resume" | "retry" | "cancel";
 
 const ACTIONS: ReadonlyArray<AssignmentAction> = ["stop", "resume", "retry", "cancel"];
