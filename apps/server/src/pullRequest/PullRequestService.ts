@@ -201,6 +201,8 @@ export class PullRequestService extends Context.Service<
       input: PullRequestRef,
       options?: { readonly recoverTransientFailure?: boolean },
     ) => Effect.Effect<PullRequestSummary, PullRequestError>;
+    /** Whether the reference's host batches summary reads; false when it cannot be resolved. */
+    readonly batchesReads: (input: PullRequestRef) => Effect.Effect<boolean>;
     readonly stack: (
       input: PullRequestRef,
       options?: { readonly includeDetails?: boolean },
@@ -219,7 +221,10 @@ export class PullRequestService extends Context.Service<
       input: PullRequestReportStateInput,
     ) => Effect.Effect<void, PullRequestError>;
     readonly subscribeRefreshes: Stream.Stream<number>;
-    readonly refreshAfterTurn: (projectId: ProjectId) => Effect.Effect<void>;
+    readonly refreshAfterTurn: (
+      projectId: ProjectId,
+      options?: { readonly pushed?: boolean },
+    ) => Effect.Effect<void>;
     /** Project and remote lookups inside `effect` read once per filter, e.g. across one sync sweep. */
     readonly withSharedProjectReads: <A, E, R>(
       effect: Effect.Effect<A, E, R>,
@@ -534,6 +539,7 @@ function withRateLimitBackoff(
     ...(api.readsPublicHostWithoutCheckout === undefined
       ? {}
       : { readsPublicHostWithoutCheckout: api.readsPublicHostWithoutCheckout }),
+    ...(api.batchesReads === undefined ? {} : { batchesReads: api.batchesReads }),
     getViewer:
       options?.viewerAllowsPause === true
         ? interactive("getViewer", api.getViewer)
@@ -3077,6 +3083,16 @@ export const make = Effect.gen(function* () {
         );
   };
 
+  const batchesReads: PullRequestService["Service"]["batchesReads"] = Effect.fn(
+    "PullRequestService.batchesReads",
+  )(
+    function* (input) {
+      const project = yield* requireProject(input);
+      return project.api.batchesReads === true;
+    },
+    Effect.orElseSucceed(() => false),
+  );
+
   const stack: PullRequestService["Service"]["stack"] = (input, options) =>
     persistedRead(
       input,
@@ -3645,12 +3661,14 @@ export const make = Effect.gen(function* () {
 
   const refreshAfterTurn: PullRequestService["Service"]["refreshAfterTurn"] = Effect.fn(
     "PullRequestService.refreshAfterTurn",
-  )(function* (projectId) {
+  )(function* (projectId, options) {
     // Everything the provider holds, not just the project's repository: a turn can touch a
     // change request reached through another repository, and no epoch may move until those
     // reads are gone, or a reader in between keeps the old one under the new epoch.
     yield* forgetProviderReads();
-    listingsEpoch = ++epochCounter;
+    const epoch = ++epochCounter;
+    // A push can open or move a PR; a plain turn waits for the listing TTL to spare the API quota.
+    if (options?.pushed === true) listingsEpoch = epoch;
     projectEpochs.delete(projectId);
     if (projectEpochs.size >= REF_EPOCH_CAPACITY) {
       const oldest = projectEpochs.keys().next().value;
@@ -3659,8 +3677,7 @@ export const make = Effect.gen(function* () {
         projectEpochs.delete(oldest);
       }
     }
-    projectEpochs.set(projectId, listingsEpoch);
-    const epoch = listingsEpoch;
+    projectEpochs.set(projectId, epoch);
     yield* readCache.invalidate(`project:${projectId}`);
     yield* SubscriptionRef.set(pullRequestRefreshes, epoch);
   });
@@ -3852,6 +3869,7 @@ export const make = Effect.gen(function* () {
       return yield* listStats({ ...input, refs: refs.flatMap(Option.toArray) });
     }),
     summary: credentialCached(summary),
+    batchesReads,
     stack: credentialCached(stack),
     subscribeMerges: PubSub.subscribe(mergedPullRequests).pipe(
       Effect.map((subscription) => Stream.fromSubscription(subscription)),

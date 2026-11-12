@@ -24,11 +24,16 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { Atom, AtomRegistry, type AsyncResult } from "effect/reactivity";
 
 import * as EnvironmentRegistry from "../connection/registry.ts";
-import { BearerConnectionTarget } from "../connection/model.ts";
+import {
+  AVAILABLE_CONNECTION_STATE,
+  BearerConnectionTarget,
+  type SupervisorConnectionState,
+} from "../connection/model.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import type { StartThreadTurnInput } from "../operations/commands.ts";
 import type { RpcSession } from "../rpc/session.ts";
@@ -99,12 +104,19 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
     reply: Deferred.Deferred<{ sequence: number }, Error>;
   }>();
   const reconciled = yield* Queue.unbounded<ThreadId>();
+  const connectionFollowed = yield* Deferred.make<void>();
+  const connection = yield* SubscriptionRef.make<SupervisorConnectionState>({
+    ...AVAILABLE_CONNECTION_STATE,
+    desired: true,
+    phase: "connected",
+  });
   const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
     target: new BearerConnectionTarget({
       environmentId: ENVIRONMENT_ID,
       label: "Test",
       connectionId: "test",
     }),
+    state: connection,
     session: yield* SubscriptionRef.make(
       Option.some({
         initialConfig: Effect.succeed({ environment: { capabilities: {} } }),
@@ -124,6 +136,12 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
       Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, {
         run: (_environmentId, effect) =>
           Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        followStream: (_environmentId, stream) =>
+          Stream.provideService(
+            stream,
+            EnvironmentSupervisor.EnvironmentSupervisor,
+            supervisor,
+          ).pipe(Stream.onStart(Deferred.succeed(connectionFollowed, undefined))),
       } as EnvironmentRegistry.EnvironmentRegistry["Service"]),
       Layer.succeed(
         SecureRandom.SecureRandom,
@@ -141,14 +159,26 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
       ),
     ),
   );
-  const snapshotAtom = Atom.family((_environmentId: EnvironmentId) => Atom.make(SNAPSHOT));
+  const snapshotAtom = Atom.family((_environmentId: EnvironmentId) =>
+    Atom.make<OrchestrationV2ShellSnapshot | null>(SNAPSHOT),
+  );
   const serverConfigsAtom = Atom.make<ReadonlyMap<EnvironmentId, ServerConfig>>(new Map());
   const commands = createThreadEnvironmentAtoms(runtime, snapshotAtom, serverConfigsAtom);
   const registry = AtomRegistry.make();
   yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
   const visibleAtom = commands.snapshotAtom(ENVIRONMENT_ID);
   registry.mount(visibleAtom);
-  return { registry, commands, snapshotAtom, serverConfigsAtom, visibleAtom, requests, reconciled };
+  return {
+    registry,
+    commands,
+    snapshotAtom,
+    serverConfigsAtom,
+    visibleAtom,
+    requests,
+    reconciled,
+    connection,
+    connectionFollowed,
+  };
 });
 
 type Harness = Effect.Success<ReturnType<typeof makeHarness>>;
@@ -475,6 +505,93 @@ describe("interrupt turn", () => {
   );
 });
 
+describe("title regeneration", () => {
+  it.effect("resolves with the outcome recorded for its own request", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      const source = h.snapshotAtom(ENVIRONMENT_ID);
+      const thread = SNAPSHOT.threads[0]!;
+      const target = { environmentId: ENVIRONMENT_ID, input: { threadId: THREAD_ID } };
+      const earlier = {
+        requestId: CommandId.make("earlier"),
+        status: "renamed" as const,
+        completedAt: NOW,
+      };
+
+      h.registry.set(source, null);
+      const result = h.commands.regenerateTitle.run(h.registry, target);
+      const request = yield* Queue.take(h.requests);
+      const requestId = request.command.commandId;
+      yield* Deferred.succeed(request.reply, { sequence: 2 });
+      yield* Deferred.await(h.connectionFollowed);
+      h.registry.set(source, {
+        ...SNAPSHOT,
+        snapshotSequence: 2,
+        threads: [
+          {
+            ...thread,
+            titleRegeneration: { requestId, startedAt: NOW },
+            lastTitleRegeneration: earlier,
+          },
+        ],
+      });
+      h.registry.set(source, {
+        ...SNAPSHOT,
+        snapshotSequence: 3,
+        threads: [],
+        archivedThreads: [
+          {
+            ...thread,
+            archivedAt: NOW,
+            titleRegeneration: null,
+            lastTitleRegeneration: {
+              requestId,
+              status: "failed",
+              message: "model unavailable",
+              completedAt: NOW,
+            },
+          },
+        ],
+      });
+      const outcome = yield* Effect.promise(() => result);
+      expect(outcome).toMatchObject({
+        _tag: "Success",
+        value: { status: "failed", message: "model unavailable" },
+      });
+
+      const superseded = h.commands.regenerateTitle.run(h.registry, target);
+      const second = yield* Queue.take(h.requests);
+      h.registry.set(source, {
+        ...SNAPSHOT,
+        snapshotSequence: 4,
+        threads: [{ ...thread, titleRegeneration: null, lastTitleRegeneration: earlier }],
+      });
+      yield* Deferred.succeed(second.reply, { sequence: 4 });
+      expect(yield* Effect.promise(() => superseded)).toMatchObject({
+        _tag: "Success",
+        value: null,
+      });
+    }),
+  );
+
+  it.effect("settles without an outcome when the environment disconnects while waiting", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      const result = h.commands.regenerateTitle.run(h.registry, {
+        environmentId: ENVIRONMENT_ID,
+        input: { threadId: THREAD_ID },
+      });
+      const request = yield* Queue.take(h.requests);
+      yield* Deferred.succeed(request.reply, { sequence: 2 });
+      yield* SubscriptionRef.update(h.connection, (state) => ({
+        ...state,
+        phase: "backoff" as const,
+      }));
+      expect(yield* Effect.promise(() => result)).toMatchObject({ _tag: "Success", value: null });
+    }),
+  );
+});
+
 describe("remote thread lifecycle commands", () => {
   it.effect.each([true, false])(
     "rejects incompatible execution before dispatch with retained requirement %s",
@@ -730,6 +847,8 @@ describe("remote thread lifecycle commands", () => {
       });
       const request = yield* Queue.take(h.requests);
       expect(h.registry.get(h.commands.snapshotAtom(otherEnvironment))).toBe(SNAPSHOT);
+      expect(h.registry.get(h.commands.rowActionsAtom(ENVIRONMENT_ID))).toBe(1);
+      expect(h.registry.get(h.commands.rowActionsAtom(otherEnvironment))).toBe(0);
       const removed = { ...SNAPSHOT, snapshotSequence: 2, threads: [] };
       h.registry.set(h.snapshotAtom(ENVIRONMENT_ID), removed);
       expect(h.registry.get(h.visibleAtom)?.threads).toEqual([]);

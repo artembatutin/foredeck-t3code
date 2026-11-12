@@ -1301,8 +1301,12 @@ const continueThrough = (
         Layer.merge(
           Layer.mock(ThreadManagementService.ThreadManagementService)({
             getThreadRecords: () => Effect.succeed(projection),
-            recoverDelegatedTask: (childThreadId, sourceRunId) =>
-              Effect.sync(() => recovered.push([childThreadId, sourceRunId])),
+            recoverDelegatedTask: (childThreadId, options) =>
+              Effect.sync(() => {
+                if (options?.sourceRunId !== undefined) {
+                  recovered.push([childThreadId, options.sourceRunId]);
+                }
+              }),
             dispatch,
           }),
           ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),

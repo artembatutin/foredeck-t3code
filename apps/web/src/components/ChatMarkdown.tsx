@@ -178,6 +178,7 @@ import { filesystemEnvironment } from "../state/filesystem";
 import {
   claimWorkspaceBasenameLookup,
   needsWorkspaceBasenameLookup,
+  pickProjectLinkMatch,
   pickWorkspaceLinkMatch,
   WORKSPACE_BASENAME_LOOKUP_LIMIT,
   workspaceLinkLookupQuery,
@@ -266,6 +267,9 @@ export interface ChatMarkdownContextReference {
   kind: string;
   contextId: string;
   label: string;
+  /** Whether it starts or ends its block, for a reference that renders as a block. */
+  leading?: boolean;
+  trailing?: boolean;
 }
 
 const EMPTY_MARKDOWN_SKILLS: ReadonlyArray<ServerProviderSkill> = [];
@@ -819,7 +823,45 @@ function useChatMarkdownState({
       result._tag === "Success"
         ? pickWorkspaceLinkMatch(workspaceRelativePath, searchCwd, result.value.entries)
         : null;
-    return match && repositoryTarget ? `${searchCwd.replace(/[\\/]+$/, "")}/${match}` : match;
+    if (match !== null) {
+      return repositoryTarget ? `${searchCwd.replace(/[\\/]+$/, "")}/${match}` : match;
+    }
+    // fd: a repository-scoped lookup stays inside its repository.
+    if (repositoryTarget) return null;
+    const otherRoots = projects.flatMap((other) =>
+      other.environmentId === environmentId &&
+      other.id !== thread?.projectId &&
+      other.workspaceRoot !== cwd
+        ? [other.workspaceRoot]
+        : [],
+    );
+    if (otherRoots.length === 0) return null;
+    // Another project's file never replaces a thread-local file the search missed.
+    if (needsWorkspaceBasenameLookup(workspaceRelativePath)) {
+      const metadata = await getFilesystemMetadata({
+        environmentId,
+        input: { paths: [resolveWorkspaceFilePath(workspaceRelativePath, cwd)] },
+      });
+      if (metadata._tag !== "Success" || metadata.value.entries[0] !== null) return null;
+    }
+    const searchRoot = async (root: string) => {
+      const rootQuery = workspaceLinkLookupQuery(workspaceRelativePath, root);
+      if (rootQuery === null) return { root, entries: [] };
+      const rootResult = await searchProjectEntries({
+        environmentId,
+        input: {
+          cwd: root,
+          query: rootQuery,
+          limit: WORKSPACE_BASENAME_LOOKUP_LIMIT,
+          kind: "file",
+        },
+      });
+      return { root, entries: rootResult._tag === "Success" ? rootResult.value.entries : [] };
+    };
+    return pickProjectLinkMatch(
+      workspaceRelativePath,
+      await Promise.all(otherRoots.map(searchRoot)),
+    );
   };
   const openFileInPanel = (fileLinkMeta: MarkdownFileLinkMeta, panelPath: string) => {
     if (!threadRef) return;
@@ -1140,16 +1182,12 @@ const CHAT_MARKDOWN_COMPONENTS = {
     } = use(ChatMarkdownRendererContext);
     const text = use(ChatMarkdownTextContext);
     const citation = href ? parseAssistantCitationHref(href) : null;
+    const before = node?.position?.start.offset;
+    const after = node?.position?.end.offset;
+    const leading = before !== undefined && CITATION_LEADS_BLOCK.test(text.slice(0, before));
+    const trailing = after !== undefined && CITATION_ENDS_BLOCK.test(text.slice(after));
     if (citation) {
-      const before = node?.position?.start.offset;
-      const after = node?.position?.end.offset;
-      return (
-        <AssistantCitationEmbed
-          citation={citation}
-          leading={before !== undefined && CITATION_LEADS_BLOCK.test(text.slice(0, before))}
-          trailing={after !== undefined && CITATION_ENDS_BLOCK.test(text.slice(after))}
-        />
-      );
+      return <AssistantCitationEmbed citation={citation} leading={leading} trailing={trailing} />;
     }
     const threadLink = href ? parseThreadLinkHref(href) : null;
     if (threadLink) {
@@ -1166,7 +1204,7 @@ const CHAT_MARKDOWN_COMPONENTS = {
     if (contextReference) {
       const label = hastPlainTextDeep(node) || contextReference.contextId;
       return renderContextReference ? (
-        renderContextReference({ ...contextReference, label })
+        renderContextReference({ ...contextReference, label, leading, trailing })
       ) : (
         <span>{label}</span>
       );
@@ -1616,6 +1654,7 @@ const CHAT_MARKDOWN_COMPONENTS = {
             _tag: "media-file",
             threadId: threadRef.threadId,
             path: imageSource.path,
+            ...(imageSource.relative ? { hostOnly: true as const } : {}),
           }}
           alt={altText}
           kind={kind}

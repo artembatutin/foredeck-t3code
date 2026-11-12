@@ -99,6 +99,23 @@ interface ReadPlan {
   readonly activity: boolean;
 }
 
+interface Wake {
+  readonly text: string;
+  readonly notification: OrchestrationV2Notification;
+  readonly includesRemarks?: boolean;
+  readonly ending: AutomaticTurnGate.PullRequestWakeTurn["ending"];
+}
+
+/** A wake a pass holds back so each thread gets one for everything the pass found. */
+interface HeldWake {
+  readonly groupKey: string;
+  readonly target: WatchTarget;
+  readonly next: ThreadPullRequestWatch | null;
+  readonly endedWatch?: ThreadPullRequestWatch;
+  readonly wake: Wake;
+  readonly reason?: WatchEndReason;
+}
+
 const watchKey = ({ thread, watch }: WatchTarget) => `${thread.id} ${watch.startedAt}`;
 
 type WatchEndReason =
@@ -288,12 +305,7 @@ export const make = Effect.gen(function* () {
   const record = Effect.fn("PullRequestWatchReactor.record")(function* (
     target: WatchTarget,
     next: ThreadPullRequestWatch | null,
-    wake?: {
-      readonly text: string;
-      readonly notification: OrchestrationV2Notification;
-      readonly includesRemarks?: boolean;
-      readonly ending: AutomaticTurnGate.PullRequestWakeTurn["ending"];
-    },
+    wake?: Wake,
     endedWatch?: ThreadPullRequestWatch,
   ) {
     const uuid = yield* random.uuidV4();
@@ -457,20 +469,55 @@ export const make = Effect.gen(function* () {
       ),
   );
 
-  const closed = (target: WatchTarget) =>
-    record(target, null, {
-      text: `Pull request #${target.link.number} (${target.link.url}) was closed, so T3 Code stopped watching it. Call watch_pull_request if it reopens.`,
-      notification: {
-        source: { kind: "monitor" },
-        outcome: "updated",
-        summary: `#${target.link.number}: closed, stopped watching`,
-      },
-      ending: "closed",
-    }).pipe(
-      Effect.tap((landed) =>
-        landed ? woke(target).pipe(Effect.andThen(ended(target, "closed"))) : Effect.void,
+  /** Wakes the current pass found, sent by `sendHeld` once every read of the pass is done. */
+  let held: Array<HeldWake> = [];
+  const hold = (wake: HeldWake) => Effect.sync(() => void held.push(wake));
+
+  // fd: each wake goes through the automatic turn gate on its own, keyed by its pull request, so
+  // a pass's wakes are not combined. A wake the gate holds back records nothing; the next pass
+  // asks again without waiting for the quiet reread.
+  const sendOne = (item: HeldWake) =>
+    record(item.target, item.next, item.wake, item.endedWatch).pipe(
+      Effect.flatMap((landed) =>
+        landed
+          ? woke(item.target).pipe(
+              Effect.andThen(
+                item.reason === undefined ? Effect.void : ended(item.target, item.reason),
+              ),
+            )
+          : Effect.sync(() => void lastReads.delete(item.groupKey)),
       ),
+      Effect.catchCause((cause) => {
+        lastReads.delete(item.groupKey);
+        return logFailure("pull request watch update failed", {
+          threadId: item.target.thread.id,
+          pullRequest: item.groupKey,
+        })(cause);
+      }),
     );
+
+  const sendHeld = Effect.suspend(() => {
+    const items = held;
+    held = [];
+    return Effect.forEach(items, sendOne, { discard: true });
+  });
+
+  const closed = (groupKey: string, target: WatchTarget) =>
+    hold({
+      groupKey,
+      target,
+      next: null,
+      wake: {
+        text: `Pull request #${target.link.number} (${target.link.url}) was closed, so T3 Code stopped watching it. Call watch_pull_request if it reopens.`,
+        notification: {
+          source: { kind: "monitor" },
+          outcome: "updated",
+          summary: `#${target.link.number}: closed, stopped watching`,
+        },
+        ending: "closed",
+      },
+      reason: "closed",
+    }).pipe(Effect.as(true));
 
   const endsWithoutRead = ({ thread, link }: WatchTarget): WatchEndReason | undefined =>
     link.snapshot?.state === "merged"
@@ -597,7 +644,7 @@ export const make = Effect.gen(function* () {
       lastReads.delete(group.key);
       return yield* eachTarget(group, (target) =>
         detail.state === "closed"
-          ? closed(target)
+          ? closed(group.key, target)
           : record(target, null).pipe(Effect.tap(() => ended(target, "merged"))),
       );
     }
@@ -641,19 +688,18 @@ export const make = Effect.gen(function* () {
           ending: report.exhausted ? ("comment-limit" as const) : null,
         };
         // An ending watch keeps what this pass saw, so watching again starts from it.
-        return (
+        return hold(
           report.exhausted
-            ? record(target, null, wake, report.next)
-            : record(target, report.next, wake)
-        ).pipe(
-          Effect.tap((landed) =>
-            landed
-              ? woke(target).pipe(
-                  Effect.andThen(report.exhausted ? ended(target, "comment-limit") : Effect.void),
-                )
-              : Effect.void,
-          ),
-        );
+            ? {
+                groupKey: group.key,
+                target,
+                next: null,
+                endedWatch: report.next,
+                wake,
+                reason: "comment-limit",
+              }
+            : { groupKey: group.key, target, next: report.next, wake },
+        ).pipe(Effect.as(true));
       }
       return watchesEqual(report.next, target.watch)
         ? Effect.succeed(true)
@@ -664,6 +710,7 @@ export const make = Effect.gen(function* () {
   /** Every watch, or with `changed`, only that pull request's after its host reported a change. */
   // The sweep and change reads each name their own span.
   const pass = Effect.fnUntraced(function* (changed: string | undefined) {
+    held = [];
     const threads = yield* projections.getThreadsWithPullRequests();
     const targets = threads.flatMap((thread) =>
       visibleThreadPullRequests(thread.pullRequests ?? []).flatMap((link) =>
@@ -757,6 +804,7 @@ export const make = Effect.gen(function* () {
         ),
       { concurrency: "unbounded", discard: true },
     );
+    yield* sendHeld;
   }, passes.withPermit);
 
   const sweep = pass(undefined).pipe(

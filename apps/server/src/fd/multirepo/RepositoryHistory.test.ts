@@ -48,7 +48,8 @@ const storeLayer = CheckpointStore.layer.pipe(
   Layer.provide(NodeServices.layer),
 );
 const checkpointLayer = CheckpointService.layer.pipe(
-  Layer.provideMerge(Layer.mergeAll(storeLayer, IdAllocator.layer, NodeCrypto.layer)),
+  Layer.provideMerge(Layer.mergeAll(storeLayer, IdAllocator.layer)),
+  Layer.provideMerge(NodeCrypto.layer),
 );
 const queryLayer = CheckpointDiffQuery.layer.pipe(
   Layer.provide(
