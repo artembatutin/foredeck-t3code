@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -28,6 +29,8 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
+import * as DocumentText from "../../provider/DocumentText.ts";
+import { explicitBare } from "./testkit/gitCommand.ts";
 
 // Loaded before the MCP modules, as the core toolkit tests do, so their import cycle resolves.
 import * as ThreadLaunch from "../../orchestration-v2/ThreadLaunchService.ts";
@@ -260,6 +263,8 @@ const makeLayer = (world: World) =>
     Layer.provideMerge(GitVcsDriver.layer),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-parent-pr-" })),
     Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(DocumentText.layer.pipe(Layer.provide(NodeServices.layer))),
+    Layer.provideMerge(NodeCrypto.layer),
     Layer.provideMerge(NodeServices.layer),
   );
 
@@ -276,7 +281,9 @@ const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
 const ada = ["-c", "user.name=Ada Lovelace", "-c", "user.email=ada@example.com"];
 const git = (cwd: string, args: ReadonlyArray<string>) =>
   Effect.flatMap(GitVcsDriver.GitVcsDriver, (driver) =>
-    driver.execute({ operation: "test.git", cwd, args, timeoutMs: 30_000 }),
+    Effect.flatMap(explicitBare(cwd, args), (args) =>
+      driver.execute({ operation: "test.git", cwd, args, timeoutMs: 30_000 }),
+    ),
   ).pipe(
     Effect.map((result) => result.stdout.trim()),
     Effect.orDie,
@@ -331,11 +338,10 @@ const childReview = (headSha: string, round: number, low: number): FactoryAccept
 });
 
 /**
- * Stores the parent as integrate left it: its plan approved, its children's items recorded on its
- * tasks and each child approved for the commit it made on the branch, the branch verified at the
- * worktree's HEAD (its verify attempt passed) and its integrate reviewer's run awaited. `after`
- * events follow. `firstMessage` is its first child's commit message. Returns the worktree with its
- * commits.
+ * Stores the parent as integrate left it: plan approved, children's items on its tasks and each
+ * approved for its branch commit, the branch verified at HEAD and the integrate reviewer's run
+ * awaited. `after` events follow; `firstMessage` is the first child's commit message. Returns the
+ * worktree with its commits.
  */
 const seed = (
   after: ReadonlyArray<FactoryEvent> = [],

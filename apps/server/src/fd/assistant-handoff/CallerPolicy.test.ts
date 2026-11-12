@@ -206,7 +206,7 @@ const call = (tool: string, args: unknown = {}): McpCallerPolicy.McpToolCall => 
   arguments: args,
 });
 const answer = (args: Record<string, unknown> = { threadId: child, requestId: "request" }) =>
-  call("t3_pending_request_respond", args);
+  call("t3_pending_request", { action: "respond", ...args });
 
 const refused = (message: string) => ({ type: "refuse" as const, text: message });
 const allowed = { type: "allow" as const };
@@ -242,13 +242,13 @@ describe("the caller policy's screen", () => {
     "t3_thread_launch",
     "create_threads",
     "schedule_task",
-    "update_scheduled_task",
     "run_scheduled_task_now",
     "t3_worktree_handoff",
-    "t3_thread_fork",
-    "t3_thread_merge_back",
-    "t3_queue_edit",
-    "t3_queue_promote_to_steer",
+    "t3_environment_link",
+    "t3_environment_unlink",
+    // Action-taking tools without a known action.
+    "t3_queue",
+    "t3_thread_transfer",
     "watch_pull_request",
     "work_start_thread",
     "factory_deliver",
@@ -265,6 +265,30 @@ describe("the caller policy's screen", () => {
           yield* screen({ ...active, management }, author, [call(tool)]),
           refused(text.retired),
         );
+      }
+    }),
+  );
+
+  it.effect("classes action-taking tools by their action", () =>
+    Effect.gen(function* () {
+      for (const [tool, action] of [
+        ["t3_queue", "edit"],
+        ["t3_queue", "promote_to_steer"],
+        ["t3_thread_transfer", "fork"],
+        ["t3_thread_transfer", "merge_back"],
+      ] as const) {
+        assert.deepStrictEqual(
+          yield* screen(active, author, [call(tool, { action })]),
+          refused(text.active),
+        );
+      }
+      for (const [tool, action] of [
+        ["t3_queue", "list"],
+        ["t3_queue", "cancel"],
+        ["t3_thread_transfer", "status"],
+        ["t3_pending_request", "read"],
+      ] as const) {
+        assert.deepStrictEqual(yield* screen(active, author, [call(tool, { action })]), allowed);
       }
     }),
   );

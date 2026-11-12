@@ -197,6 +197,7 @@ export const toolLayer = McpToolAccess.toLayer(AssistantToolkit, {
           }),
         );
       }),
+    { refused: "assign work to this environment's assistant" },
   ),
   assistant_control: McpToolAccess.writesThreads(
     () => [],

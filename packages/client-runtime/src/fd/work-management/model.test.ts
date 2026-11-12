@@ -244,7 +244,7 @@ describe("helpers", () => {
         locator: ".foredeck/work/a.md",
       }),
     ).toBe(
-      `Work item fd-7k3qa2: Add sync (.foredeck/work/a.md) — read it with work_read ${sourceId}:fd-7k3qa2`,
+      `Work item fd-7k3qa2: Add sync (.foredeck/work/a.md). Read it with work_read ${sourceId}:fd-7k3qa2`,
     );
   });
 

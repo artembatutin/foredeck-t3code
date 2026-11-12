@@ -374,7 +374,7 @@ it.layer(NodeServices.layer)("a frozen stage on disk", (it) => {
       });
       if ("problems" in planned) return assert.fail(planned.problems.join("; "));
 
-      const hash = "f2fe901c61cde17986240002d05c172d5d0272d83ffaab8d0ebeb922763be414";
+      const hash = "f1e680afec85f650699ea756f91f469844ec4c976f4f168492a45c6b3f67d651";
       const nodePty = `node-pty@1.2.0-beta.15(patch_hash=${hash})`;
       assert.deepStrictEqual(planned.lockfile.importers["."]?.dependencies?.["node-pty"], {
         specifier: "^1.2.0-beta.15",

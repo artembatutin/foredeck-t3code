@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -26,6 +27,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as DocumentText from "../../provider/DocumentText.ts";
 
 import * as ServerConfig from "../../config.ts";
 import * as GitWorkflow from "../../git/GitWorkflowService.ts";
@@ -217,6 +219,8 @@ const afterRestart = <SE, A, E, R>(
     Effect.provide(
       Factory.layerPersistence.pipe(
         Layer.provideMerge(corePersistence(SqlitePersistence.layerMemory)),
+        Layer.provideMerge(DocumentText.layer.pipe(Layer.provide(NodeServices.layer))),
+        Layer.provideMerge(NodeCrypto.layer),
         Layer.provideMerge(NodeServices.layer),
       ),
     ),
@@ -469,6 +473,8 @@ describe("Factory server layers", () => {
         Effect.provide(
           Factory.layerPersistence.pipe(
             Layer.provideMerge(corePersistence(SqlitePersistence.layerMemory)),
+            Layer.provideMerge(DocumentText.layer.pipe(Layer.provide(NodeServices.layer))),
+            Layer.provideMerge(NodeCrypto.layer),
             Layer.provideMerge(NodeServices.layer),
           ),
         ),
@@ -520,6 +526,15 @@ describe("Factory server layers", () => {
           assert.deepStrictEqual(delivery.state, awaitingLaunch);
         }),
       );
-    }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          DocumentText.layer.pipe(Layer.provide(NodeServices.layer)),
+          NodeCrypto.layer,
+          NodeServices.layer,
+        ),
+      ),
+      Effect.scoped,
+    ),
   );
 });

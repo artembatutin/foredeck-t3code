@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -20,6 +21,7 @@ import {
   ProviderTurnId,
   type RunId,
   RuntimeRequestId,
+  SourceControlProviderError,
   SourceControlProviderKind,
   TurnItemId,
   type ProviderRequestKind,
@@ -40,8 +42,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
-import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
-import * as GitHubSourceControlProvider from "@t3tools/source-control-github/server/GitHubSourceControlProvider";
+import * as GitHubDriver from "@t3tools/source-control-github/server/driver";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -56,6 +57,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import type { ChildProcess } from "effect/process";
+import { explicitBare } from "./gitCommand.ts";
 
 import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../../../config.ts";
@@ -89,6 +91,7 @@ import * as PullRequestService from "../../../pullRequest/PullRequestService.ts"
 import * as ProjectSetupScriptRunner from "../../../project/ProjectSetupScriptRunner.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
 import * as WorktreeSetupTracker from "../../../project/WorktreeSetupTracker.ts";
+import * as DocumentText from "../../../provider/DocumentText.ts";
 import * as ProviderInstanceRegistry from "../../../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as ProviderRegistryMock from "../../../provider/testUtils/providerRegistryMock.ts";
@@ -727,6 +730,7 @@ const projectEnrichment = ProjectEnrichmentService.layer.pipe(
       }),
       Layer.succeed(ProjectFaviconResolver.ProjectFaviconResolver, {
         resolvePath: () => Effect.succeed(null),
+        invalidate: () => Effect.void,
       }),
     ),
   ),
@@ -750,6 +754,16 @@ const gitWorkflow = GitWorkflow.layer.pipe(
           ProviderRegistryMock.layer(),
           Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
             resolveLink: () => undefined,
+            // No host provider: the worktree records no branch base with one.
+            resolve: ({ cwd }) =>
+              Effect.fail(
+                new SourceControlProviderError({
+                  provider: SourceControlProviderKind.make("unknown"),
+                  operation: "detectProvider",
+                  cwd,
+                  detail: "No source control provider in this test.",
+                }),
+              ),
           }),
         ),
       ),
@@ -758,13 +772,10 @@ const gitWorkflow = GitWorkflow.layer.pipe(
 );
 
 /**
- * The fake PR service: the Git workflow Factory's PR stages call. Its stacked action records the
- * call with the worktree's HEAD and branch at that moment, pushes to the project's bare `origin`
- * the way `create_pr` does (the expected commit by its id, tracked as the branch's upstream, or
- * HEAD when given none), and reports the pull request open. With `publishing.throughDriver` it
- * pushes through the Git driver's own push instead, bound to the target Factory checked, as the
- * real action does: a push that would go anywhere else fails before writing anything, and nothing
- * is reported open. A worktree removal is recorded, then run by the real git driver.
+ * The fake PR service: its stacked action records the call with HEAD and branch, pushes to the bare
+ * `origin` like `create_pr` (expected commit as upstream, else HEAD) and reports the PR open. With
+ * `publishing.throughDriver` it pushes via the driver bound to the checked target: a push elsewhere
+ * fails before writing and nothing opens. Worktree removals are recorded, then run by real git.
  */
 const fakePullRequests = (
   calls: Array<PullRequestCall>,
@@ -857,18 +868,20 @@ const sourceControlRegistry = (environment: World["hostEnvironment"]) =>
   Layer.effect(
     SourceControlProviderRegistry.SourceControlProviderRegistry,
     Effect.gen(function* () {
+      const github = yield* GitHubDriver.driver.make;
       return yield* SourceControlProviderRegistry.makeWithProviders([
         {
-          kind: SourceControlProviderKind.make("github"),
-          provider: yield* GitHubSourceControlProvider.make,
-          discovery: yield* GitHubSourceControlProvider.makeDiscovery,
+          kind: GitHubDriver.driver.kind,
+          provider: github.sourceControl,
+          discovery: github.discovery,
         },
       ]);
     }),
   ).pipe(
     Layer.provide(ServerSourceControlHost.layer),
     Layer.provide(VcsDriverRegistry.layer),
-    Layer.provide(Layer.mock(GitHubApi.GitHubApi)({})),
+    Layer.provide(SourceControlRateLimit.layer),
+    Layer.provide(FetchHttpClient.layer),
     Layer.provide(Layer.sync(HostProcess.Environment, () => ({ ...environment }))),
   );
 
@@ -902,6 +915,7 @@ const threadLaunch = (setupScripts: World["setupScripts"]) =>
         Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
           namedProjectsRoot: "/nowhere",
           folderForThread: () => Effect.succeedNone,
+          isScratchProject: () => Effect.succeed(false),
         }),
         gitWorkflow,
         hookedSetupScripts(setupScripts),
@@ -912,11 +926,11 @@ const threadLaunch = (setupScripts: World["setupScripts"]) =>
   );
 
 /** Work as the server builds it, with real source adapters and an optional fake GitHub host. */
-const work = (githubApi: Partial<GitHubApi.GitHubApi["Service"]> = {}) =>
+const work = (githubApi: Partial<WorkManagement.WorkGitHubApi["Service"]> = {}) =>
   WorkManagement.WorkService.layer.pipe(
     Layer.provide(WorkManagement.layerAdapters),
     Layer.provideMerge(WorkManagement.layerPersistence),
-    Layer.provide(Layer.mock(GitHubApi.GitHubApi)(githubApi)),
+    Layer.provide(Layer.mock(WorkManagement.WorkGitHubApi)(githubApi)),
     Layer.provide(SourceControlRateLimit.layer),
     Layer.provide(FetchHttpClient.layer),
     // Markdown sources hold no credential.
@@ -929,7 +943,7 @@ type WorkServiceShape = WorkManagement.WorkService.WorkService["Service"];
 const recordingWork = (
   calls: Array<CommentCall>,
   wrap: (service: WorkServiceShape) => WorkServiceShape,
-  githubApi: Partial<GitHubApi.GitHubApi["Service"]> | undefined,
+  githubApi: Partial<WorkManagement.WorkGitHubApi["Service"]> | undefined,
 ) =>
   Layer.effect(
     WorkManagement.WorkService.WorkService,
@@ -1033,7 +1047,7 @@ interface ServerInput {
   readonly setupScripts: World["setupScripts"];
   readonly commentCalls: Array<CommentCall>;
   readonly wrapWork: (service: WorkServiceShape) => WorkServiceShape;
-  readonly githubApi: Partial<GitHubApi.GitHubApi["Service"]> | undefined;
+  readonly githubApi: Partial<WorkManagement.WorkGitHubApi["Service"]> | undefined;
   readonly wrapProviders: ProviderRegistryWrapper | undefined;
   readonly manualReactor: boolean;
   readonly admission: typeof Factory.FactoryAdmission.FactoryAdmission.Service | undefined;
@@ -1083,11 +1097,10 @@ const observedGate = (observe: GateConsults) =>
   ).pipe(Layer.provideMerge(AutomaticTurnGate.layerInstallable));
 
 /**
- * With `on`, the one installable automatic turn gate the server provides beneath its runtime, so
- * core's producers here (restart continuations and the continuation worker's native wakes and
- * delegated completions) consult the gate Factory installs; and the continuation requests queue
- * those offers go through, which the adapters and the worker share. Otherwise Factory installs its
- * gate nowhere.
+ * With `on`, the server's one installable automatic turn gate beneath its runtime, so core's
+ * producers (restart continuations, native wakes, delegated completions) consult Factory's gate,
+ * plus the continuation request queue the adapters and worker share. Otherwise Factory installs
+ * its gate nowhere.
  */
 const automaticTurnGate = (
   on: boolean,
@@ -1114,6 +1127,8 @@ const coreLayer = (input: ServerInput) => {
     Layer.provide(providerInstances(input.supportedRuntimeModes, input.hostPolicy)),
     Layer.provide(ProjectStore.layer),
     Layer.provide(database),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(NodeCrypto.layer),
     Layer.provide(serverConfig),
     Layer.provide(NodeServices.layer),
     // The database is the harness's own, already built, so it never fails this build.
@@ -1156,6 +1171,8 @@ const coreLayer = (input: ServerInput) => {
     Layer.provideMerge(database),
     Layer.provideMerge(ServerSettings.layerTest()),
     Layer.provideMerge(serverConfig),
+    Layer.provideMerge(NodeCrypto.layer),
+    Layer.provideMerge(DocumentText.layer.pipe(Layer.provide(NodeServices.layer))),
     Layer.provideMerge(VcsProcess.layer),
     Layer.provideMerge(automaticTurnGate(input.automaticTurnGate, input.gateConsults)),
   );
@@ -1260,11 +1277,10 @@ type FactoryPortWrapper = (
 ) => typeof HandoffBackend.HandoffFactory.Service;
 
 /**
- * The project assistant and its Work capture over the bridge's Work and Factory ports and the one
- * admission instance, as the server composes them, with its thread service wrapped by
- * `assistantThreads` and its Factory port by `assistantFactory` when given. Built and rebuilt with
- * Factory, so a rebuild is a new assistant instance as a new process would be. No tick runs: a
- * test drives the assistant's services itself.
+ * The project assistant and Work capture over the bridge's ports and the one admission instance, as
+ * the server composes them, optionally wrapped by `assistantThreads` and `assistantFactory`. Rebuilt
+ * with Factory, so a rebuild is a new instance as in a new process. No tick runs: a test drives the
+ * assistant's services itself.
  */
 const assistantLayer = (input: ServerInput, handoff: ReturnType<typeof handoffLayer>) =>
   ProjectAssistant.layerLive.pipe(
@@ -1304,12 +1320,10 @@ const recoverCore = Effect.gen(function* () {
 );
 
 /**
- * The server on the harness's database: the core services, and Factory with the assistant, each
- * built in a scope of its own under `parent`. `restart` closes Factory's, and with
- * `orchestration` the core's too, then builds them anew over the same database, as a new server
- * process would: lanes, locks, jobs, writers, reactors, sessions and every other in-memory state
- * go with the closed scopes. A rebuilt core runs core's startup recovery before Factory is built
- * over it.
+ * The server on the harness's database: core, and Factory with the assistant, each in its own scope
+ * under `parent`. `restart` closes Factory's (with `orchestration`, core's too) and rebuilds them
+ * over the same database like a new process, dropping all in-memory state. A rebuilt core runs its
+ * startup recovery before Factory is built over it.
  */
 const makeServer = (input: ServerInput, parent: Scope.Scope) =>
   Effect.gen(function* () {
@@ -1350,7 +1364,9 @@ const makeServer = (input: ServerInput, parent: Scope.Scope) =>
 
 export const git = (cwd: string, args: ReadonlyArray<string>) =>
   Effect.flatMap(GitVcsDriver.GitVcsDriver, (driver) =>
-    driver.execute({ operation: "test.git", cwd, args, timeoutMs: 30_000 }),
+    Effect.flatMap(explicitBare(cwd, args), (args) =>
+      driver.execute({ operation: "test.git", cwd, args, timeoutMs: 30_000 }),
+    ),
   ).pipe(Effect.map((result) => result.stdout.trim()));
 
 const decodeSettings = Schema.decodeUnknownSync(FactoryProjectSettings);
@@ -1517,12 +1533,10 @@ export interface World {
    */
   readonly boot: <A, E>(body: Effect.Effect<A, E, Services>) => Effect.Effect<A, E, Services>;
   /**
-   * Runs `body` on a server restarted over the same database: Factory's services (its worker,
-   * service and reactor) are closed and built anew, dropping their lanes, locks, jobs and other
-   * in-memory state, and with `orchestration` so is the orchestration runtime with every service
-   * above it, which runs core's startup recovery first. A rebuilt Factory's reactor runs its boot
-   * sweep as any boot does (with `manualReactor`, inside `world.boot`). The services in effect
-   * before are closed, so everything that runs after the restart belongs in `body`.
+   * Runs `body` on a server restarted over the same database: Factory's services are rebuilt (with
+   * `orchestration`, the core runtime too, running startup recovery first), dropping in-memory
+   * state; the reactor runs its boot sweep (with `manualReactor`, inside `world.boot`). The old
+   * services are closed, so everything after the restart belongs in `body`.
    */
   readonly rebuild: <A, E>(
     body: Effect.Effect<A, E, Services>,
@@ -1579,7 +1593,7 @@ export const withProject = <A, E>(
     /** Wraps the Work service the server runs with, to fail some of its calls. */
     readonly work?: (service: WorkServiceShape) => WorkServiceShape;
     /** Fake GitHub transport for tests of the real Work GitHub adapter. */
-    readonly githubApi?: Partial<GitHubApi.GitHubApi["Service"]>;
+    readonly githubApi?: Partial<WorkManagement.WorkGitHubApi["Service"]>;
     /** Wraps the provider registry Factory reads, to act while one of its reads runs. */
     readonly wrapProviders?: ProviderRegistryWrapper;
     /** Factory's reactor runs only inside `world.boot`; see there. */
@@ -1840,7 +1854,10 @@ export const withProject = <A, E>(
         launchScope: (body) =>
           body.pipe(
             Effect.provide(
-              threadLaunch(setupScripts).pipe(Layer.provideMerge(WorktreeSetupTracker.layer)),
+              threadLaunch(setupScripts).pipe(
+                Layer.provideMerge(WorktreeSetupTracker.layer),
+                Layer.orDie,
+              ),
               { local: true },
             ),
             Effect.scoped,

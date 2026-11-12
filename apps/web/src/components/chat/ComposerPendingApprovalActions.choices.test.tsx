@@ -1,12 +1,15 @@
 import { type ProviderApprovalDecision, RuntimeRequestId } from "@t3tools/contracts";
 import type { ReactNode } from "react";
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 const mocks = vi.hoisted(() => ({
   passthrough: ({ children }: { children?: unknown }) => children ?? null,
 }));
-vi.mock("../ui/button", () => ({ Button: (props: object) => <button {...props} /> }));
+vi.mock("../ui/button", () => ({
+  Button: (props: object) => <button {...props} />,
+  InlineButton: (props: object) => <button {...props} />,
+}));
 vi.mock("../ui/menu", () => ({
   Menu: mocks.passthrough,
   MenuItem: (props: object) => <button {...props} />,
@@ -29,13 +32,9 @@ const textOf = (node: ReactTestInstance): string =>
 
 describe("the choices an approval offers", () => {
   let renderer: ReactTestRenderer | undefined;
-  beforeEach(() => {
-    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  });
   afterEach(() => {
     act(() => renderer?.unmount());
     renderer = undefined;
-    vi.unstubAllGlobals();
   });
 
   const render = (

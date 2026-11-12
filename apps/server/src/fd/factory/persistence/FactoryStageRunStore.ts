@@ -231,8 +231,10 @@ const make = Effect.gen(function* () {
     `,
   });
 
-  const append: FactoryStageRunStore["Service"]["append"] = (input) =>
-    Effect.gen(function* () {
+  const append: FactoryStageRunStore["Service"]["append"] = Effect.fn(
+    "FactoryStageRunStore.append",
+  )(
+    function* (input) {
       const [next] = yield* selectNextAttempt({ deliveryId: input.deliveryId, stage: input.stage });
       const run: StoredFactoryStageRun = {
         deliveryId: input.deliveryId,
@@ -248,10 +250,10 @@ const make = Effect.gen(function* () {
       };
       yield* insertRun(run);
       return run;
-    }).pipe(
-      sql.withTransaction,
-      Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.append")),
-    );
+    },
+    sql.withTransaction,
+    Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.append")),
+  );
 
   const selectActive = (input: {
     readonly deliveryId: FactoryDeliveryId;
@@ -265,8 +267,10 @@ const make = Effect.gen(function* () {
       activeOnly: true,
     }).pipe(Effect.map((rows) => Option.fromUndefinedOr(rows[0])));
 
-  const assignRun: FactoryStageRunStore["Service"]["assignRun"] = (input) =>
-    Effect.gen(function* () {
+  const assignRun: FactoryStageRunStore["Service"]["assignRun"] = Effect.fn(
+    "FactoryStageRunStore.assignRun",
+  )(
+    function* (input) {
       const active = yield* selectActive(input);
       if (Option.isNone(active)) return active;
       const assigned: StoredFactoryStageRun = {
@@ -276,13 +280,15 @@ const make = Effect.gen(function* () {
       };
       yield* writeRun(assigned);
       return Option.some(assigned);
-    }).pipe(
-      sql.withTransaction,
-      Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.assignRun")),
-    );
+    },
+    sql.withTransaction,
+    Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.assignRun")),
+  );
 
-  const finish: FactoryStageRunStore["Service"]["finish"] = (input) =>
-    Effect.gen(function* () {
+  const finish: FactoryStageRunStore["Service"]["finish"] = Effect.fn(
+    "FactoryStageRunStore.finish",
+  )(
+    function* (input) {
       const active = yield* selectActive(input);
       if (Option.isNone(active)) return active;
       const finished: StoredFactoryStageRun = {
@@ -294,41 +300,45 @@ const make = Effect.gen(function* () {
       };
       yield* writeOutcome(finished);
       return Option.some(finished);
-    }).pipe(
-      sql.withTransaction,
-      Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.finish")),
-    );
+    },
+    sql.withTransaction,
+    Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.finish")),
+  );
 
   return FactoryStageRunStore.of({
     append,
     assignRun,
     finish,
-    findActiveByThread: (threadId) =>
+    findActiveByThread: Effect.fn("FactoryStageRunStore.findActiveByThread")((threadId) =>
       selectRuns({ threadId, activeOnly: true }).pipe(
         Effect.map((rows) => Option.fromUndefinedOr(rows[0])),
         Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.findActiveByThread")),
       ),
-    listByDelivery: (deliveryId) =>
+    ),
+    listByDelivery: Effect.fn("FactoryStageRunStore.listByDelivery")((deliveryId) =>
       selectRuns({ deliveryId }).pipe(
         Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.listByDelivery")),
       ),
-    listNewestByDeliveries: ({ deliveryIds, limit }) =>
-      (deliveryIds.length === 0
-        ? Effect.succeed([])
-        : selectNewestRuns({ deliveryIds, limit })
-      ).pipe(
-        Effect.map((rows) => {
-          const byDelivery = new Map<FactoryDeliveryId, Array<StoredFactoryStageRun>>();
-          for (const row of rows) {
-            const runs = byDelivery.get(row.deliveryId);
-            if (runs === undefined) byDelivery.set(row.deliveryId, [row]);
-            else runs.push(row);
-          }
-          return byDelivery;
-        }),
-        Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.listNewestByDeliveries")),
-      ),
-    attemptTotals: (deliveryIds) =>
+    ),
+    listNewestByDeliveries: Effect.fn("FactoryStageRunStore.listNewestByDeliveries")(
+      ({ deliveryIds, limit }) =>
+        (deliveryIds.length === 0
+          ? Effect.succeed([])
+          : selectNewestRuns({ deliveryIds, limit })
+        ).pipe(
+          Effect.map((rows) => {
+            const byDelivery = new Map<FactoryDeliveryId, Array<StoredFactoryStageRun>>();
+            for (const row of rows) {
+              const runs = byDelivery.get(row.deliveryId);
+              if (runs === undefined) byDelivery.set(row.deliveryId, [row]);
+              else runs.push(row);
+            }
+            return byDelivery;
+          }),
+          Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.listNewestByDeliveries")),
+        ),
+    ),
+    attemptTotals: Effect.fn("FactoryStageRunStore.attemptTotals")((deliveryIds) =>
       (deliveryIds.length === 0 ? Effect.succeed([]) : selectAttemptTotals(deliveryIds)).pipe(
         Effect.map((rows) => {
           const totals = new Map<FactoryDeliveryId, Partial<Record<FactoryStageName, number>>>();
@@ -339,6 +349,7 @@ const make = Effect.gen(function* () {
         }),
         Effect.catchTags(FactoryStoreError.catchStorage("stageRuns.attemptTotals")),
       ),
+    ),
   });
 });
 

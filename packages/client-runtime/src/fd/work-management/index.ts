@@ -6,12 +6,8 @@ export {
   type WorkPagedSource,
 } from "./atoms.ts";
 export {
-  collectWorkPages,
   refreshWork,
   shouldAutoLoadWorkPage,
-  WORK_AUTO_PAGE_LIMIT,
-  WORK_WANTED_VISIBLE,
-  workPageLimit,
   workViewStatuses,
   type WorkSourcePages,
 } from "./paging.ts";
@@ -20,7 +16,6 @@ export {
   beginWorkRelationshipDraft,
   editWorkDraft,
   mergeComposerText,
-  parseWorkItemIds,
   rebaseWorkDraft,
   settleWorkDraft,
   workDraftChanged,
@@ -41,7 +36,6 @@ export {
 } from "./writes.ts";
 export {
   changedSinceLink,
-  DEFAULT_WORK_LIST_PREFERENCES,
   defaultWorkWorkspace,
   itemInView,
   linkPrompts,

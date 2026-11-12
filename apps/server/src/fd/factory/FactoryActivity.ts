@@ -62,14 +62,10 @@ export class FactoryOwnershipReadError extends Schema.TaggedError<FactoryOwnersh
 export type FactoryActivityPhase = "proceeding" | "parked" | "terminal" | "missing";
 
 /**
- * What a root delivery's family is doing. `busy`: a job of this process runs for it, or work on
- * its threads is under way or about to start that Factory cannot show to be the owner's. Threads
- * are read only once it is parked or terminal, the phases where that decides anything, so before
- * then `busy` counts jobs alone. `deferred`: an effect waits for admission with no job.
- * `backgroundWaits`: work its runs await that ends in an automatic turn, which is no work of the
- * family's until that turn is admitted: each provider thread holding awaited native work still
- * open, as core judges it for a restart, and each delegated cohort not delivered. `unknown`:
- * something could not be read, so the report says nothing is idle.
+ * `busy`: a job runs for the family, or thread work not shown to be the owner's (threads are read
+ * only once parked or terminal). `deferred`: an effect awaits admission with no job.
+ * `backgroundWaits`: open awaited native work per provider thread plus undelivered delegated
+ * cohorts; not the family's work until its automatic turn is admitted. `unknown`: never idle.
  */
 export interface FactoryActivityReport {
   readonly phase: FactoryActivityPhase;
@@ -311,19 +307,18 @@ const make = Effect.gen(function* () {
         ),
       ),
     );
-    const wake = (threadId: ThreadId, runId: RunId) =>
-      Effect.gen(function* () {
-        const created = (yield* runCreations(threadId)).get(runId);
-        if (created === undefined) return undefined;
-        const receipt = Option.getOrUndefined(yield* receipts.getByCommandId(created.commandId));
-        if (receipt?.status !== "accepted" || receipt.commandType !== WATCH_SYNC_COMMAND) {
-          return undefined;
-        }
-        const committed = yield* events
-          .readByCommandId({ commandId: created.commandId })
-          .pipe(Stream.runCollect);
-        return wakeOf(created, receipt.commandType, committed);
-      });
+    const wake = Effect.fn("FactoryActivity.wake")(function* (threadId: ThreadId, runId: RunId) {
+      const created = (yield* runCreations(threadId)).get(runId);
+      if (created === undefined) return undefined;
+      const receipt = Option.getOrUndefined(yield* receipts.getByCommandId(created.commandId));
+      if (receipt?.status !== "accepted" || receipt.commandType !== WATCH_SYNC_COMMAND) {
+        return undefined;
+      }
+      const committed = yield* events
+        .readByCommandId({ commandId: created.commandId })
+        .pipe(Stream.runCollect);
+      return wakeOf(created, receipt.commandType, committed);
+    });
     const recorded = (threadId: ThreadId, messageId: MessageId) =>
       turns.get({ threadId, messageId }).pipe(
         Effect.map(
@@ -357,177 +352,168 @@ const make = Effect.gen(function* () {
    * effect, numbered up to the effects it issued) and every thread delegated from one, to
    * `MAX_FAMILY_DEPTH` levels.
    */
-  const familyThreads = <E>(
+  const familyThreads = Effect.fn("FactoryActivity.familyThreads")(function* <E>(
     reads: Pick<FactoryOwnership.OwnershipReads<E>, "thread">,
     family: ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>,
-  ) =>
-    Effect.gen(function* () {
-      const pending: Array<{
-        readonly threadId: ThreadId;
-        readonly parent: ThreadId | null;
-        readonly depth: number;
-      }> = family.flatMap(({ deliveryId, state }) =>
-        Array.from({ length: state.effectsIssued }, (_, index) => ({
-          threadId: launchThreadId(deliveryId, index + 1),
-          parent: null,
-          depth: 0,
-        })),
-      );
-      const seen = new Set<ThreadId>();
-      const found: Array<{
-        readonly threadId: ThreadId;
-        readonly thread: FactoryOwnership.FamilyThread;
-      }> = [];
-      for (const { threadId, parent, depth } of pending) {
-        if (seen.has(threadId)) continue;
-        seen.add(threadId);
-        const thread = yield* reads.thread(threadId);
-        if (thread === undefined) continue;
-        // A task's thread belongs to the family only as its lineage child.
-        if (
-          parent !== null &&
-          (thread.lineage.relationshipToParent !== "subagent" ||
-            thread.lineage.parentThreadId !== parent)
-        ) {
-          continue;
-        }
-        for (const task of thread.subagents) {
-          if (task.childThreadId === null) continue;
-          if (depth === FactoryOwnership.MAX_FAMILY_DEPTH) {
-            return yield* new FactoryOwnership.FactoryFamilyDepthError({
-              threadId: task.childThreadId,
-            });
-          }
-          pending.push({ threadId: task.childThreadId, parent: threadId, depth: depth + 1 });
-        }
-        found.push({ threadId, thread });
+  ) {
+    const pending: Array<{
+      readonly threadId: ThreadId;
+      readonly parent: ThreadId | null;
+      readonly depth: number;
+    }> = family.flatMap(({ deliveryId, state }) =>
+      Array.from({ length: state.effectsIssued }, (_, index) => ({
+        threadId: launchThreadId(deliveryId, index + 1),
+        parent: null,
+        depth: 0,
+      })),
+    );
+    const seen = new Set<ThreadId>();
+    const found: Array<{
+      readonly threadId: ThreadId;
+      readonly thread: FactoryOwnership.FamilyThread;
+    }> = [];
+    for (const { threadId, parent, depth } of pending) {
+      if (seen.has(threadId)) continue;
+      seen.add(threadId);
+      const thread = yield* reads.thread(threadId);
+      if (thread === undefined) continue;
+      // A task's thread belongs to the family only as its lineage child.
+      if (
+        parent !== null &&
+        (thread.lineage.relationshipToParent !== "subagent" ||
+          thread.lineage.parentThreadId !== parent)
+      ) {
+        continue;
       }
-      return found;
-    });
+      for (const task of thread.subagents) {
+        if (task.childThreadId === null) continue;
+        if (depth === FactoryOwnership.MAX_FAMILY_DEPTH) {
+          return yield* new FactoryOwnership.FactoryFamilyDepthError({
+            threadId: task.childThreadId,
+          });
+        }
+        pending.push({ threadId: task.childThreadId, parent: threadId, depth: depth + 1 });
+      }
+      found.push({ threadId, thread });
+    }
+    return found;
+  });
 
   /** The root's delivery with its children; a child it names that is not stored has no row. */
-  const readFamily = (root: FactoryDeliveryId) =>
-    Effect.gen(function* () {
-      const rootDelivery = Option.getOrUndefined(yield* deliveries.get(root));
-      if (rootDelivery === undefined) return [];
-      const children = yield* Effect.forEach(rootDelivery.state.children, (childId) =>
-        deliveries.get(childId),
-      );
-      return [rootDelivery, ...children.flatMap(Option.toArray)];
-    });
+  const readFamily = Effect.fn("FactoryActivity.readFamily")(function* (root: FactoryDeliveryId) {
+    const rootDelivery = Option.getOrUndefined(yield* deliveries.get(root));
+    if (rootDelivery === undefined) return [];
+    const children = yield* Effect.forEach(rootDelivery.state.children, (childId) =>
+      deliveries.get(childId),
+    );
+    return [rootDelivery, ...children.flatMap(Option.toArray)];
+  });
 
   /**
    * Whether work on the family's threads is under way or about to start, and what its runs wait
    * for, on every thread of the family.
    */
-  const probeThreads = (
+  const probeThreads = Effect.fn("FactoryActivity.probeThreads")(function* (
     root: FactoryDeliveryId,
     owner: FactoryDeliveryState,
     family: ReadonlyArray<FactoryDeliveryStore.StoredFactoryDelivery>,
-  ) =>
-    Effect.gen(function* () {
-      const reads = makeReads();
-      const classes = FactoryOwnership.classifier(reads, root);
-      let busy = false;
-      let backgroundWaits = 0;
-      for (const { threadId, thread } of yield* familyThreads(reads, family)) {
-        for (const run of thread.runs) {
-          if (isOpenRun(run.status) && counts(yield* classes.run(threadId, run.id))) busy = true;
-          if (
-            run.delegatedCompletion?.disposition === "open" &&
-            counts(yield* classes.run(threadId, run.id))
-          ) {
-            backgroundWaits += 1;
-          }
-        }
-        // A restart cut the run its continuation carries on, which has yet to run or decline.
-        // That run is core's (see `restartContinuationRun`): the latest that started, by
-        // `runRanAfter`. A queued run never started, held behind the cut one, and once a later
-        // run starts core delivers no continuation for an earlier one.
-        const source = thread.runs.reduce<(typeof thread.runs)[number] | undefined>(
-          (last, run) =>
-            run.status !== "queued" && (last === undefined || runRanAfter(run, last)) ? run : last,
-          undefined,
-        );
+  ) {
+    const reads = makeReads();
+    const classes = FactoryOwnership.classifier(reads, root);
+    let busy = false;
+    let backgroundWaits = 0;
+    for (const { threadId, thread } of yield* familyThreads(reads, family)) {
+      for (const run of thread.runs) {
+        if (isOpenRun(run.status) && counts(yield* classes.run(threadId, run.id))) busy = true;
         if (
-          source !== undefined &&
-          !isOpenRun(source.status) &&
-          counts(yield* classes.run(threadId, source.id))
+          run.delegatedCompletion?.disposition === "open" &&
+          counts(yield* classes.run(threadId, run.id))
         ) {
-          const continuation = yield* outbox.get(`effect:restart-continuation:${source.id}`);
-          if (
-            Option.exists(
-              continuation,
-              (effect) => effect.status === "pending" || effect.status === "running",
-            )
-          ) {
-            busy = true;
-          }
+          backgroundWaits += 1;
         }
-        // Work its runs await, as core judges what a restart continues for (`hasOpenAwaitedWork`
-        // in RestartContinuation.ts): a native subagent, task or monitor still open, judged by
-        // the run that started it, or one the provider's root thread still lists, judged by
-        // every run on that provider thread. A background shell command is awaited by nothing,
-        // and an app-owned delegation reports back from its own thread, counted there. Each
-        // provider thread holding such work is one wait.
-        const awaiting = new Set<string>();
-        for (const item of yield* reads.openTurnItems(threadId)) {
-          if (
-            item.type === "subagent" &&
-            item.origin === "app_owned" &&
-            item.childThreadId !== null
+      }
+      // A restart cut the run its continuation carries on, which has yet to run or decline.
+      // That run is core's (see `restartContinuationRun`): the latest that started, by
+      // `runRanAfter`. A queued run never started, held behind the cut one, and once a later
+      // run starts core delivers no continuation for an earlier one.
+      const source = thread.runs.reduce<(typeof thread.runs)[number] | undefined>(
+        (last, run) =>
+          run.status !== "queued" && (last === undefined || runRanAfter(run, last)) ? run : last,
+        undefined,
+      );
+      if (
+        source !== undefined &&
+        !isOpenRun(source.status) &&
+        counts(yield* classes.run(threadId, source.id))
+      ) {
+        const continuation = yield* outbox.get(`effect:restart-continuation:${source.id}`);
+        if (
+          Option.exists(
+            continuation,
+            (effect) => effect.status === "pending" || effect.status === "running",
           )
-            continue;
-          const work = cancelledTurnItemWork(item);
-          if (work === undefined || !isAwaitedWork(work)) continue;
-          const providerThreadId =
-            item.providerThreadId ??
-            thread.runs.find((run) => run.id === item.runId)?.providerThreadId ??
-            null;
-          const key = providerThreadId ?? item.id;
-          if (awaiting.has(key)) continue;
-          const provenance =
-            item.runId !== null
-              ? yield* classes.run(threadId, item.runId)
-              : providerThreadId !== null
-                ? yield* classes.providerThread(threadId, providerThreadId)
-                : undefined;
-          if (provenance === undefined || counts(provenance)) awaiting.add(key);
-        }
-        for (const providerThread of thread.providerThreads) {
-          if (
-            awaiting.has(providerThread.id) ||
-            providerThread.ownerNodeId !== null ||
-            !(providerThread.pendingBackgroundTasks ?? []).some((task) =>
-              isAwaitedWork(cancelledRosterTaskWork(task)),
-            )
-          ) {
-            continue;
-          }
-          if (counts(yield* classes.providerThread(threadId, providerThread.id))) {
-            awaiting.add(providerThread.id);
-          }
-        }
-        backgroundWaits += awaiting.size;
-      }
-      // A wake of the root's own pull request that it has not taken yet: Factory takes it as a
-      // round (or, cancelled, to stop it), whether its run still goes on or has already ended.
-      const followed = followedThread(owner);
-      const { followThrough } = owner;
-      if (followed !== undefined && followThrough !== undefined) {
-        for (const created of (yield* reads.runCreations(followed)).values()) {
-          if (
-            created.sequence <= followThrough.watchedAfter ||
-            followThrough.runs.includes(created.runId)
-          ) {
-            continue;
-          }
-          const wake = yield* reads.wake(followed, created.runId);
-          if (wake !== undefined && ownsWake(owner, wake)) busy = true;
+        ) {
+          busy = true;
         }
       }
-      return { busy, backgroundWaits };
-    });
+      // Awaited work as core judges it for a restart (`hasOpenAwaitedWork`): open native work,
+      // classed by its run, or listed by the provider's root thread, classed by every run there.
+      // App-owned delegations count on their own thread. Each provider thread holding such work
+      // is one wait.
+      const awaiting = new Set<string>();
+      for (const item of yield* reads.openTurnItems(threadId)) {
+        if (item.type === "subagent" && item.origin === "app_owned" && item.childThreadId !== null)
+          continue;
+        const work = cancelledTurnItemWork(item);
+        if (work === undefined || !isAwaitedWork(work)) continue;
+        const providerThreadId =
+          item.providerThreadId ??
+          thread.runs.find((run) => run.id === item.runId)?.providerThreadId ??
+          null;
+        const key = providerThreadId ?? item.id;
+        if (awaiting.has(key)) continue;
+        const provenance =
+          item.runId !== null
+            ? yield* classes.run(threadId, item.runId)
+            : providerThreadId !== null
+              ? yield* classes.providerThread(threadId, providerThreadId)
+              : undefined;
+        if (provenance === undefined || counts(provenance)) awaiting.add(key);
+      }
+      for (const providerThread of thread.providerThreads) {
+        if (
+          awaiting.has(providerThread.id) ||
+          providerThread.ownerNodeId !== null ||
+          !(providerThread.pendingBackgroundTasks ?? []).some((task) =>
+            isAwaitedWork(cancelledRosterTaskWork(task)),
+          )
+        ) {
+          continue;
+        }
+        if (counts(yield* classes.providerThread(threadId, providerThread.id))) {
+          awaiting.add(providerThread.id);
+        }
+      }
+      backgroundWaits += awaiting.size;
+    }
+    // A wake of the root's own pull request that it has not taken yet: Factory takes it as a
+    // round (or, cancelled, to stop it), whether its run still goes on or has already ended.
+    const followed = followedThread(owner);
+    const { followThrough } = owner;
+    if (followed !== undefined && followThrough !== undefined) {
+      for (const created of (yield* reads.runCreations(followed)).values()) {
+        if (
+          created.sequence <= followThrough.watchedAfter ||
+          followThrough.runs.includes(created.runId)
+        ) {
+          continue;
+        }
+        const wake = yield* reads.wake(followed, created.runId);
+        if (wake !== undefined && ownsWake(owner, wake)) busy = true;
+      }
+    }
+    return { busy, backgroundWaits };
+  });
 
   const activity: FactoryActivity["Service"]["activity"] = Effect.fn("FactoryActivity.activity")(
     function* (root) {
@@ -580,11 +566,10 @@ const make = Effect.gen(function* () {
     },
   );
 
-  const requestOwnership: FactoryActivity["Service"]["requestOwnership"] = ({
-    threadId,
-    requestId,
-  }) =>
-    Effect.gen(function* () {
+  const requestOwnership: FactoryActivity["Service"]["requestOwnership"] = Effect.fn(
+    "FactoryActivity.requestOwnership",
+  )(
+    function* ({ threadId, requestId }) {
       const reads = makeReads();
       const family = yield* FactoryOwnership.familyOf(reads, threadId);
       if (family === null) return { root: null, request: null, run: null };
@@ -619,7 +604,9 @@ const make = Effect.gen(function* () {
                 )).class,
               },
       } satisfies FactoryRequestOwnership;
-    }).pipe(Effect.mapError(readFailed(threadId)));
+    },
+    (effect, { threadId }) => effect.pipe(Effect.mapError(readFailed(threadId))),
+  );
 
   const turnRunState: FactoryActivity["Service"]["turnRunState"] = ({ threadId, messageId }) =>
     projections.getThreadRecords(threadId, ["runs"]).pipe(
@@ -638,51 +625,52 @@ const make = Effect.gen(function* () {
     );
 
   /** The requests pending on one thread of a family, each with its run's class on that family. */
-  const threadRequests = (
+  const threadRequests = Effect.fn("FactoryActivity.threadRequests")(function* (
     threadId: ThreadId,
     thread: FactoryOwnership.FamilyThread,
     classes: ReturnType<typeof FactoryOwnership.classifier<ReadFailure>>,
-  ) =>
-    Effect.gen(function* () {
-      const records = yield* projections.getThreadRecords(
-        threadId,
-        ["runtimeRequests", "nodes", "turnItems"],
-        { turnItemTypes: ["user_input_request", "approval_request"] },
+  ) {
+    const records = yield* projections.getThreadRecords(
+      threadId,
+      ["runtimeRequests", "nodes", "turnItems"],
+      { turnItemTypes: ["user_input_request", "approval_request"] },
+    );
+    const found: Array<FactoryFamilyRequest> = [];
+    for (const request of records.runtimeRequests) {
+      if (request.status !== "pending") continue;
+      // Core answers a request in the run its node belongs to.
+      const runId = records.nodes.find((node) => node.id === request.nodeId)?.runId;
+      const run = thread.runs.find((candidate) => candidate.id === runId);
+      const question = records.turnItems.find(
+        (item) => item.type === "user_input_request" && item.requestId === request.id,
       );
-      const found: Array<FactoryFamilyRequest> = [];
-      for (const request of records.runtimeRequests) {
-        if (request.status !== "pending") continue;
-        // Core answers a request in the run its node belongs to.
-        const runId = records.nodes.find((node) => node.id === request.nodeId)?.runId;
-        const run = thread.runs.find((candidate) => candidate.id === runId);
-        const question = records.turnItems.find(
-          (item) => item.type === "user_input_request" && item.requestId === request.id,
-        );
-        const approval = records.turnItems.find(
-          (item) => item.type === "approval_request" && item.requestId === request.id,
-        );
-        found.push({
-          threadId,
-          requestId: request.id,
-          kind: request.kind,
-          capability: request.responseCapability.type,
-          run:
-            run === undefined
-              ? null
-              : { status: run.status, class: (yield* classes.run(threadId, run.id)).class },
-          questions: question?.type === "user_input_request" ? question.questions : null,
-          projectId: records.thread.projectId,
-          runtimeMode: records.thread.runtimeMode,
-          ...(approval?.type === "approval_request" && approval.reason
-            ? { reason: approval.reason }
-            : {}),
-        });
-      }
-      return records.thread.deletedAt === null ? found : [];
-    });
+      const approval = records.turnItems.find(
+        (item) => item.type === "approval_request" && item.requestId === request.id,
+      );
+      found.push({
+        threadId,
+        requestId: request.id,
+        kind: request.kind,
+        capability: request.responseCapability.type,
+        run:
+          run === undefined
+            ? null
+            : { status: run.status, class: (yield* classes.run(threadId, run.id)).class },
+        questions: question?.type === "user_input_request" ? question.questions : null,
+        projectId: records.thread.projectId,
+        runtimeMode: records.thread.runtimeMode,
+        ...(approval?.type === "approval_request" && approval.reason
+          ? { reason: approval.reason }
+          : {}),
+      });
+    }
+    return records.thread.deletedAt === null ? found : [];
+  });
 
-  const familyRequests: FactoryActivity["Service"]["familyRequests"] = (root) =>
-    Effect.gen(function* () {
+  const familyRequests: FactoryActivity["Service"]["familyRequests"] = Effect.fn(
+    "FactoryActivity.familyRequests",
+  )(
+    function* (root) {
       const reads = makeReads();
       const classes = FactoryOwnership.classifier(reads, root);
       const found: Array<FactoryFamilyRequest> = [];
@@ -690,7 +678,9 @@ const make = Effect.gen(function* () {
         found.push(...(yield* threadRequests(threadId, thread, classes)));
       }
       return found;
-    }).pipe(Effect.mapError(readFailed(ThreadId.make(root))));
+    },
+    (effect, root) => effect.pipe(Effect.mapError(readFailed(ThreadId.make(root)))),
+  );
 
   const pendingRequests: FactoryActivity["Service"]["pendingRequests"] = Effect.gen(function* () {
     const reads = makeReads();
@@ -715,12 +705,14 @@ const make = Effect.gen(function* () {
     turnRunState,
     familyRequests,
     pendingRequests,
-    family: (threadId) =>
+    family: Effect.fn("FactoryActivity.family")((threadId) =>
       FactoryOwnership.familyOf(makeReads(), threadId).pipe(Effect.mapError(readFailed(threadId))),
-    classify: (turn, root) =>
+    ),
+    classify: Effect.fn("FactoryActivity.classify")((turn, root) =>
       FactoryOwnership.classifier(makeReads(), root)
         .turn(turn)
         .pipe(Effect.mapError(readFailed(turn.threadId))),
+    ),
     requestOwnership,
     activity,
   });

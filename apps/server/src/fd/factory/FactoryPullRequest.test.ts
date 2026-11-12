@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -29,6 +30,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import type { ChildProcess } from "effect/process";
 import * as Schema from "effect/Schema";
+import { explicitBare } from "./testkit/gitCommand.ts";
 
 import * as ServerConfig from "../../config.ts";
 import * as GitWorkflow from "../../git/GitWorkflowService.ts";
@@ -129,19 +131,17 @@ interface World {
   saved: (sent: Saved) => Effect.Effect<Saved, PullRequestService.PullRequestError>;
   readonly calls: Array<GitRunStackedActionInput>;
   /** The remote branch each call's push was bound to, in call order. */
-  readonly pushTargets: Array<GitVcsDriver.GitPushTarget | undefined>;
+  readonly pushTargets: Array<GitVcsDriver.GitCheckedPushTarget | undefined>;
   /** How often the saved pull request was read, each after its cache was dropped. */
   readonly savedReads: Array<"invalidated" | "read">;
   readonly dispatched: Array<OrchestrationV2ServerCommand>;
 }
 
 /**
- * The fake PR service: the Git workflow, whose stacked action records the call and pushes the way
- * `create_pr` does, to the remote branch it is bound to (`origin`'s branch when it is bound to
- * none): the expected commit by its id, tracked as the branch's upstream, or HEAD as it then is when
- * given none, or with `pushesThroughDriver` through the driver's own push. It answers as the test
- * says. `exactCommitPush.test.ts` holds the real action to this, and refusing a push the target no
- * longer describes.
+ * The fake PR service: its stacked action records the call and pushes like `create_pr` to its bound
+ * remote branch (else `origin`'s): the expected commit as upstream, else HEAD, or with
+ * `pushesThroughDriver` via the driver's push. `exactCommitPush.test.ts` holds the real action to
+ * this, including refusing a push the target no longer describes.
  */
 const fakeGitWorkflow = (world: World) =>
   Layer.unwrap(
@@ -268,6 +268,7 @@ const makeLayer = (world: World) =>
     Layer.provide(spawningThrough((command) => world.beforeGit(command))),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-pr-" })),
     Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(NodeCrypto.layer),
     Layer.provideMerge(NodeServices.layer),
   );
 
@@ -294,7 +295,9 @@ const ada = ["-c", "user.name=Ada Lovelace", "-c", "user.email=ada@example.com"]
 const git = (cwd: string, args: ReadonlyArray<string>) =>
   Effect.gen(function* () {
     const driver = yield* GitVcsDriver.GitVcsDriver;
-    const result = yield* driver.execute({ operation: "test.git", cwd, args, timeoutMs: 10_000 });
+    const result = yield* Effect.flatMap(explicitBare(cwd, args), (args) =>
+      driver.execute({ operation: "test.git", cwd, args, timeoutMs: 10_000 }),
+    );
     return result.stdout.trim();
   });
 const writeFile = (cwd: string, name: string, text: string) =>
@@ -364,11 +367,10 @@ const passingReview = {
 };
 
 /**
- * A repository standing in for the delivery worktree, with a bare `origin` the fake action pushes
- * to, and a started delivery whose author's commit passed verify and whose reviewer submitted a
- * passing review, still awaiting the reviewer run's end. Returns the delivery and the reviewed
- * commit. `verifyArgs` follow the verify script in the project's command. `earlier` makes commits
- * on the branch before the author's, which the delivery does not judge until `judgeFromRoot`.
+ * A worktree repository with a bare `origin`, and a delivery whose verified commit has a passing
+ * review still awaiting the reviewer run's end. Returns the delivery and the reviewed commit.
+ * `verifyArgs` follow the project's verify script; `earlier` commits before the author's, which
+ * the delivery does not judge until `judgeFromRoot`.
  */
 const reviewAccepted = (
   world: World,
@@ -2324,7 +2326,7 @@ describe("the PR stage", () => {
             const other = yield* bare;
             // As the push records the base it was cut from, after it last read where it goes.
             const hold = yield* holdFirst(
-              (args) => args[0] === "config" && args[1] === `branch.${branch}.gh-merge-base`,
+              (args) => args[0] === "config" && args[1] === `branch.${branch}.t3-merge-base`,
             );
             world.beforeGit = hold.before;
 
@@ -2414,7 +2416,7 @@ describe("the PR stage", () => {
               assert.deepStrictEqual(world.pushTargets, [judged, judged]);
               assert.strictEqual(yield* branchAt(origin), reviewed);
               assert.strictEqual(
-                yield* git(cwd, ["config", "--get", `branch.${branch}.gh-merge-base`]),
+                yield* git(cwd, ["config", "--get", `branch.${branch}.t3-merge-base`]),
                 "main",
               );
             }),

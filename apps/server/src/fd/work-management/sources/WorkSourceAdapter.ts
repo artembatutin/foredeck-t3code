@@ -136,7 +136,7 @@ export class WorkSourceAdapterRegistry extends Context.Service<
   }
 >()("t3/fd/work-management/sources/WorkSourceAdapter/WorkSourceAdapterRegistry") {}
 
-export const makeRegistry = (
+const makeRegistry = (
   adapters: ReadonlyArray<WorkSourceAdapter>,
 ): WorkSourceAdapterRegistry["Service"] => {
   const byKind = new Map(adapters.map((adapter) => [adapter.kind, adapter] as const));

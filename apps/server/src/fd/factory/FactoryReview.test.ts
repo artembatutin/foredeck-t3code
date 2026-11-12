@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -28,6 +29,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as DocumentText from "../../provider/DocumentText.ts";
 
 import * as ServerConfig from "../../config.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
@@ -194,6 +196,8 @@ const fakes = (world: World) =>
             createdAt: "2026-10-24T00:00:00.000Z",
             updatedAt: "2026-10-24T00:00:00.000Z",
             deletedAt: null,
+            pinnedAt: null,
+            archivedAt: null,
           }),
         ),
     }),
@@ -243,7 +247,13 @@ const makeLayer = (world: World) =>
     Layer.provideMerge(GitVcsDriver.layer),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-review-" })),
     Layer.provideMerge(VcsProcess.layer),
-    Layer.provideMerge(NodeServices.layer),
+    Layer.provideMerge(
+      Layer.mergeAll(
+        DocumentText.layer.pipe(Layer.provide(NodeServices.layer)),
+        NodeCrypto.layer,
+        NodeServices.layer,
+      ),
+    ),
   );
 
 const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {

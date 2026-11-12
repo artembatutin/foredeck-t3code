@@ -184,17 +184,15 @@ const layerOf = (fakes: Fakes) => {
     }),
     Layer.mock(ProjectStore.ProjectStoreV2)({
       get: (projectId) =>
-        Effect.succeed(
-          Option.some({
-            projectId,
-            title: "Alpha",
-            workspaceRoot: "/projects/alpha",
-            createdAt: at,
-            updatedAt: at,
-            deletedAt: null,
-            repositories: [],
-          } as never),
-        ),
+        Effect.succeedSome({
+          projectId,
+          title: "Alpha",
+          workspaceRoot: "/projects/alpha",
+          createdAt: at,
+          updatedAt: at,
+          deletedAt: null,
+          repositories: [],
+        } as never),
     }),
   );
   const admission = HandoffAdmission.layer.pipe(
@@ -212,18 +210,16 @@ const layerOf = (fakes: Fakes) => {
     Layer.mock(Looper.Looper)({}),
     Layer.mock(Projects.ProjectService)({
       getById: (id) =>
-        Effect.succeed(
-          Option.some({
-            id,
-            title: id,
-            workspaceRoot: `/projects/${id}`,
-            repositories: [],
-            scripts: [],
-            createdAt: at,
-            updatedAt: at,
-            deletedAt: null,
-          } as never),
-        ),
+        Effect.succeedSome({
+          id,
+          title: id,
+          workspaceRoot: `/projects/${id}`,
+          repositories: [],
+          scripts: [],
+          createdAt: at,
+          updatedAt: at,
+          deletedAt: null,
+        } as never),
     }),
     Layer.mock(Git.GitVcsDriver)({}),
     Layer.mock(Launches.ThreadLaunchService)({}),

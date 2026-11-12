@@ -82,8 +82,10 @@ const make = Effect.gen(function* () {
     `,
   });
 
-  const record: FactoryAutomaticTurnStore["Service"]["record"] = (decision) =>
-    Effect.gen(function* () {
+  const record: FactoryAutomaticTurnStore["Service"]["record"] = Effect.fn(
+    "FactoryAutomaticTurnStore.record",
+  )(
+    function* (decision) {
       const recordedAt = DateTime.formatIso(yield* DateTime.now);
       yield* insert({ ...decision, recordedAt });
       // Rows are never deleted, so this is the insert or the decision it lost to.
@@ -93,11 +95,14 @@ const make = Effect.gen(function* () {
         operation: "automaticTurns.record",
         cause: "The decision was not stored.",
       });
-    }).pipe(Effect.catchTags(FactoryStoreError.catchStorage("automaticTurns.record")));
+    },
+    Effect.catchTags(FactoryStoreError.catchStorage("automaticTurns.record")),
+  );
 
   return FactoryAutomaticTurnStore.of({
-    get: (key) =>
+    get: Effect.fn("FactoryAutomaticTurnStore.get")((key) =>
       select(key).pipe(Effect.catchTags(FactoryStoreError.catchStorage("automaticTurns.get"))),
+    ),
     record,
   });
 });

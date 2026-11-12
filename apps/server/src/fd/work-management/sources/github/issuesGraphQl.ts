@@ -1,11 +1,7 @@
 /**
- * GraphQL documents for GitHub Issues. Lists use the repository's issue connection, whose
- * cursor is stable, never returns pull requests and is accounted under the graphql quota; text
- * search uses the search connection for the same reasons (REST `search/issues` would be charged
- * to the wrong quota resource). Nested connections stay at 50 or fewer, which bounds their cost.
- *
- * The `full` fragments read sub-issue and dependency fields that older GitHub Enterprise Server
- * releases do not have; the `basic` ones leave them out and are used after such a server refuses.
+ * GitHub Issues GraphQL documents. Lists and search stay on GraphQL (stable cursors, no pull
+ * requests, the graphql quota); nested connections stay at 50 or fewer to bound cost. `basic`
+ * fragments drop sub-issue and dependency fields for older Enterprise Servers that refuse `full`.
  */
 
 const SUMMARY_BASIC = `
@@ -22,8 +18,7 @@ const SUMMARY_FULL = `${SUMMARY_BASIC}
 
 export type IssueFieldSet = "full" | "basic";
 
-export const summaryFields = (fields: IssueFieldSet) =>
-  fields === "full" ? SUMMARY_FULL : SUMMARY_BASIC;
+const summaryFields = (fields: IssueFieldSet) => (fields === "full" ? SUMMARY_FULL : SUMMARY_BASIC);
 
 export const listIssuesQuery = (fields: IssueFieldSet) => `
   query WorkIssues($owner: String!, $name: String!, $first: Int!, $after: String,

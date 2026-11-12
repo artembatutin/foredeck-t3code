@@ -1,14 +1,9 @@
-import type { ProviderOptionDescriptor, RuntimeMode } from "@t3tools/contracts";
+import {
+  managedRuntimeModeDenial,
+  type ManagedPolicySummary,
+  type RuntimeMode,
+} from "@t3tools/contracts";
 import { runtimeModeMeaning } from "@t3tools/shared/fd/approvals";
-
-/**
- * Desktop-oriented effort keywords that don't belong in the phone picker.
- * Prompt-injected values (ultrathink and friends) are filtered from the
- * descriptor metadata; ultracode is a real option but a workflow trigger, not
- * a reasoning level. A value set elsewhere still displays, it just isn't
- * offered.
- */
-const HIDDEN_EFFORT_OPTION_IDS: ReadonlySet<string> = new Set(["ultracode"]);
 
 export const RUNTIME_MODE_CHOICES: ReadonlyArray<{
   readonly mode: RuntimeMode;
@@ -53,6 +48,41 @@ export function runtimeModeChoicesForSupportedModes(
       }));
 }
 
+export type RuntimeModeChoice = (typeof RUNTIME_MODE_CHOICES)[number] & {
+  /** Set when a target environment's managed policy caps runtime modes below this one. */
+  readonly disabledReason?: string;
+};
+
+/**
+ * Marks modes above a managed runtime ceiling. A control acting on several environments is
+ * managed when any of them is, so the first target that refuses a mode supplies its reason.
+ */
+export function withManagedRuntimeModeLimits(
+  choices: ReadonlyArray<RuntimeModeChoice>,
+  policies: ReadonlyArray<ManagedPolicySummary | undefined>,
+): ReadonlyArray<RuntimeModeChoice> {
+  return choices.map((choice) => {
+    const reason = policies
+      .map((policy) => managedRuntimeModeDenial(policy, choice.mode))
+      .find((denial) => denial !== undefined);
+    return reason === undefined ? choice : { ...choice, disabledReason: reason };
+  });
+}
+
+/**
+ * A new thread's mode: the draft's choice unless the managed ceiling refuses it, then the
+ * default, which the server already reads back at or below the ceiling.
+ */
+export function resolveNewThreadRuntimeMode(
+  draftMode: RuntimeMode | undefined,
+  defaultMode: RuntimeMode,
+  policy: ManagedPolicySummary | undefined,
+): RuntimeMode {
+  return draftMode !== undefined && managedRuntimeModeDenial(policy, draftMode) === undefined
+    ? draftMode
+    : defaultMode;
+}
+
 export function compatibleRuntimeModeForChoices(
   runtimeMode: RuntimeMode,
   choices: ReadonlyArray<{ readonly mode: RuntimeMode }>,
@@ -62,11 +92,4 @@ export function compatibleRuntimeModeForChoices(
     : (choices[0]?.mode ?? runtimeMode);
 }
 
-export function selectableChoices(
-  descriptor: Extract<ProviderOptionDescriptor, { type: "select" }>,
-) {
-  const injected = new Set(descriptor.promptInjectedValues ?? []);
-  return descriptor.options.filter(
-    (option) => !injected.has(option.id) && !HIDDEN_EFFORT_OPTION_IDS.has(option.id),
-  );
-}
+export { selectableProviderOptionChoices as selectableChoices } from "@t3tools/client-runtime/model-traits";

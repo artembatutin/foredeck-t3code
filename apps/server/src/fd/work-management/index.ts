@@ -8,6 +8,7 @@ import * as WorkSourceStore from "./persistence/WorkSourceStore.ts";
 import * as GitHubIssuesSource from "./sources/github/GitHubIssuesSource.ts";
 import * as JiraSource from "./sources/jira/JiraSource.ts";
 import * as MarkdownSource from "./sources/markdown/MarkdownSource.ts";
+import * as WorkGitHubApi from "./sources/github/WorkGitHubApi.ts";
 import { layerRegistry } from "./sources/WorkSourceAdapter.ts";
 import * as WorkService from "./WorkService.ts";
 import * as WorkSyncReactor from "./sync/WorkSyncReactor.ts";
@@ -18,7 +19,7 @@ export type { WorkDomainError } from "./errors.ts";
 export { canWriteMarkdownItem } from "./documents/taskDocument.ts";
 export { workBranchName } from "./model/prompt.ts";
 export { workItemNotes, workItemScopeFingerprint } from "./model/scope.ts";
-export { actorFromSession, layerWsRpc, WS_METHOD_TAGS, wsHandlers } from "./rpc/handlers.ts";
+export { actorFromSession, layerWsRpc, WS_METHOD_TAGS } from "./rpc/handlers.ts";
 export * as WorkService from "./WorkService.ts";
 export * as WorkSyncReactor from "./sync/WorkSyncReactor.ts";
 export * as WorkThreads from "./WorkThreads.ts";
@@ -26,6 +27,7 @@ export { actorFromCaller } from "./mcp/actor.ts";
 export { toolLayer as workToolLayer } from "./mcp/handlers.ts";
 export { parseWorkItemReference, resolveWorkTarget } from "./mcp/target.ts";
 export { WorkToolkit } from "./mcp/tools.ts";
+export { WorkGitHubApi } from "./sources/github/WorkGitHubApi.ts";
 
 /**
  * Work persistence on the core-migrated SQL client. The `fd_work_migrations` ledger migrates
@@ -46,8 +48,14 @@ export const layerAdapters = Layer.unwrap(
 );
 
 /**
+ * Work's GitHub client for the GitHub Issues source, over the server's source control host,
+ * HTTP client and rate-limit pauses.
+ */
+export const layerGitHub = WorkGitHubApi.layer;
+
+/**
  * The Work service and thread starts for transports; needs the persistence layer, project
- * stores, secrets and the orchestration application (thread launches, settings).
+ * stores, secrets, `layerGitHub` and the orchestration application (thread launches, settings).
  */
 export const layerLive = WorkThreads.layer.pipe(
   Layer.provideMerge(WorkService.layer),

@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -14,7 +15,6 @@ import {
 import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import { type WorkItemRef, workItemScopeChanged } from "@t3tools/contracts/fd/work-management";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
-import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -23,6 +23,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as TestClock from "effect/testing/TestClock";
+import * as DocumentText from "../../provider/DocumentText.ts";
 
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../../config.ts";
@@ -156,6 +157,8 @@ const fakes = (world: World) =>
             createdAt: "2026-10-24T00:00:00.000Z",
             updatedAt: "2026-10-24T00:00:00.000Z",
             deletedAt: null,
+            pinnedAt: null,
+            archivedAt: null,
           }),
         ),
     }),
@@ -167,7 +170,7 @@ const fakes = (world: World) =>
 const workLayer = WorkManagement.WorkService.layer.pipe(
   Layer.provide(WorkManagement.layerAdapters),
   Layer.provideMerge(WorkManagement.layerPersistence),
-  Layer.provide(Layer.mock(GitHubApi.GitHubApi)({})),
+  Layer.provide(Layer.mock(WorkManagement.WorkGitHubApi)({})),
   Layer.provide(SourceControlRateLimit.layer),
   Layer.provide(FetchHttpClient.layer),
 );
@@ -196,6 +199,8 @@ const makeLayer = (world: World) =>
     Layer.provideMerge(GitVcsDriver.layer),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-work-link-" })),
     Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(DocumentText.layer.pipe(Layer.provide(NodeServices.layer))),
+    Layer.provideMerge(NodeCrypto.layer),
     Layer.provideMerge(NodeServices.layer),
   );
 

@@ -2,7 +2,7 @@ import { readCommandOutput } from "./commandOutput.ts";
 import { TextGenerationError } from "@t3tools/contracts";
 import * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import * as Operations from "@t3tools/provider-core/server/textGenerationOperations";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -20,10 +20,10 @@ export const makeDevinTextGeneration = Effect.fn("makeDevinTextGeneration")(func
   environment: NodeJS.ProcessEnv,
 ) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  const crypto = yield* Crypto.Crypto;
+  const random = yield* SecureRandom.SecureRandom;
   const fs = yield* FileSystem.FileSystem;
-  const run: Operations.Runner = (request) =>
-    Effect.gen(function* () {
+  const run: Operations.Runner = Effect.fn("DevinTextGeneration.run")(
+    function* (request) {
       if (request.attachments?.length)
         return yield* new TextGenerationError({
           operation: request.operation,
@@ -51,7 +51,7 @@ export const makeDevinTextGeneration = Effect.fn("makeDevinTextGeneration")(func
           Layer.provide(
             Layer.mergeAll(
               Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
-              Layer.succeed(Crypto.Crypto, crypto),
+              Layer.succeed(SecureRandom.SecureRandom, random),
             ),
           ),
         ),
@@ -75,20 +75,23 @@ export const makeDevinTextGeneration = Effect.fn("makeDevinTextGeneration")(func
           detail: `Devin text generation stopped: ${result.stopReason}.`,
         });
       return yield* Operations.decodeJsonReply(request, "Devin CLI", yield* Ref.get(output));
-    }).pipe(
-      Effect.timeout("90 seconds"),
-      Effect.mapError((cause) =>
-        isTextGenerationError(cause)
-          ? cause
-          : new TextGenerationError({
-              operation: request.operation,
-              detail:
-                "Devin tool-free text generation failed. This CLI must support acp --agent-type summarizer.",
-              cause,
-            }),
+    },
+    (effect, request) =>
+      effect.pipe(
+        Effect.timeout("90 seconds"),
+        Effect.mapError((cause) =>
+          isTextGenerationError(cause)
+            ? cause
+            : new TextGenerationError({
+                operation: request.operation,
+                detail:
+                  "Devin tool-free text generation failed. This CLI must support acp --agent-type summarizer.",
+                cause,
+              }),
+        ),
+        Effect.scoped,
       ),
-      Effect.scoped,
-    );
+  );
   return Operations.fromRunner(
     "DevinTextGeneration",
     Operations.withoutInvestigation("Devin CLI", run),

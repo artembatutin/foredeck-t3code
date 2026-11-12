@@ -24,11 +24,10 @@ import Plist from "plist";
 import serverPackageJson from "../../apps/server/package.json" with { type: "json" };
 
 /**
- * The local development build, installed as Foredeck: an identity of its own (bundle, URL scheme,
- * profile and T3 home), built from the accepted lock's frozen closure and installed beside the
- * assistant preview without touching it. Its home is baked into the build, so Finder
- * opens it there; these helpers build, install, check and launch it, and judge every home and
- * launch input from strings alone, before anything is spawned.
+ * Builds, installs, checks and launches the local dev build as Foredeck: its own bundle, URL
+ * scheme, profile and baked-in T3 home, from the accepted lock's frozen closure, beside the
+ * assistant preview without touching it. Homes and launch inputs are judged from strings alone,
+ * before anything is spawned.
  */
 
 /**
@@ -141,11 +140,10 @@ export function planUxPreviewLaunch(input: {
 }
 
 /**
- * The build's environment: the home to bake in, no development origin to bake in with it, and a
- * compile of this checkout. Removing the inherited origins is not enough, since the web build
- * merges `.env` and `.env.local` underneath and would restore them, so it is also told to bake
- * none (see `resolveWebBuildOrigins`). Inherited switches that package compiled output already on
- * disk are turned off, or a stale bundle would carry this commit's manifest and metadata.
+ * The build's environment: the home to bake in and no dev origin. Dropping inherited origins is not
+ * enough, since the web build merges `.env`/`.env.local` back, so it is told to bake none (see
+ * `resolveWebBuildOrigins`). Switches that package prebuilt output are off, or a stale bundle would
+ * carry this commit's manifest.
  */
 export function uxPreviewBuildEnv(
   env: Readonly<Record<string, string | undefined>>,
@@ -240,28 +238,35 @@ export class UxPreviewLauncher extends Context.Service<
 export const layerNodeLauncher = Layer.succeed(
   UxPreviewLauncher,
   UxPreviewLauncher.of({
-    spawnDetached: ({ executable, env }) =>
-      Effect.try({
+    spawnDetached: Effect.fn("UxPreviewLauncher.spawnDetached")(function* ({
+      executable,
+      env,
+    }: {
+      readonly executable: string;
+      readonly env: Readonly<Record<string, string>>;
+    }) {
+      yield* Effect.try({
         try: () =>
           NodeChildProcess.spawn(executable, [], { env, detached: true, stdio: "ignore" }).unref(),
         catch: () => new UxPreviewError({ step: "launch", problems: ["the app did not start"] }),
-      }),
+      });
+    }),
   }),
 );
 
 /** Runs a command to its end and returns its output; a nonzero exit fails naming `label`. */
-const run = (
-  step: UxPreviewError["step"],
-  label: string,
-  command: string,
-  args: ReadonlyArray<string>,
-  options: {
-    readonly cwd?: string;
-    readonly env?: Readonly<Record<string, string>>;
-    readonly inherit?: boolean;
-  } = {},
-) =>
-  Effect.gen(function* () {
+const run = Effect.fn("uxPreview.run")(
+  function* (
+    step: UxPreviewError["step"],
+    label: string,
+    command: string,
+    args: ReadonlyArray<string>,
+    options: {
+      readonly cwd?: string;
+      readonly env?: Readonly<Record<string, string>>;
+      readonly inherit?: boolean;
+    } = {},
+  ) {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const child = yield* spawner.spawn(
       ChildProcess.make(command, [...args], {
@@ -279,20 +284,23 @@ const run = (
       return yield* refuse(step, [`${label} exited with ${Number(exitCode)}`]);
     }
     return stdout;
-  }).pipe(
-    Effect.scoped,
-    Effect.catchTags({
-      PlatformError: () => refuse(step, [`${label} could not start`]),
-    }),
-  );
+  },
+  (effect, step, label) =>
+    effect.pipe(
+      Effect.scoped,
+      Effect.catchTags({
+        PlatformError: () => refuse(step, [`${label} could not start`]),
+      }),
+    ),
+);
 
 const sha256Of = (path: string) =>
   Effect.flatMap(FileSystem.FileSystem, (fileSystem) => fileSystem.readFile(path)).pipe(
     Effect.map((bytes) => NodeCrypto.createHash("sha256").update(bytes).digest("hex")),
   );
 
-const readManifest = (evidenceDir: string) =>
-  Effect.gen(function* () {
+const readManifest = Effect.fn("readManifest")(
+  function* (evidenceDir: string) {
     const fileSystem = yield* FileSystem.FileSystem;
     const { version } = yield* decodeCurrentBuild(
       yield* fileSystem.readFileString(currentBuildOf(evidenceDir)),
@@ -300,18 +308,18 @@ const readManifest = (evidenceDir: string) =>
     return yield* decodeManifest(
       yield* fileSystem.readFileString(`${buildDirOf(evidenceDir, version)}/manifest.json`),
     );
-  }).pipe(
-    Effect.catchTags({
-      PlatformError: () => refuse("check", ["no UX preview build is recorded for this evidence"]),
-      SchemaError: () => refuse("check", ["the recorded UX preview build is unreadable"]),
-    }),
-  );
+  },
+  Effect.catchTags({
+    PlatformError: () => refuse("check", ["no UX preview build is recorded for this evidence"]),
+    SchemaError: () => refuse("check", ["the recorded UX preview build is unreadable"]),
+  }),
+);
 
 const stringOrNull = (value: unknown) => (typeof value === "string" ? value : null);
 
 /** Reads what an app bundle says it is: its Info.plist, its package metadata and update feed. */
-export const observeUxPreviewApp = (appPath: string) =>
-  Effect.gen(function* () {
+export const observeUxPreviewApp = Effect.fn("observeUxPreviewApp")(
+  function* (appPath: string) {
     const fileSystem = yield* FileSystem.FileSystem;
     const info = Plist.parse(
       yield* fileSystem.readFileString(`${appPath}/Contents/Info.plist`),
@@ -347,40 +355,42 @@ export const observeUxPreviewApp = (appPath: string) =>
       home: stringOrNull(metadata[UX_PREVIEW_HOME_METADATA_KEY]),
       updateFeed: yield* fileSystem.exists(`${appPath}/Contents/Resources/app-update.yml`),
     } satisfies UxPreviewIdentity;
-  }).pipe(
-    Effect.catchTags({
-      PlatformError: () => refuse("check", [`${appPath} is not a readable app`]),
-    }),
-  );
+  },
+  (effect, appPath) =>
+    effect.pipe(
+      Effect.catchTags({
+        PlatformError: () => refuse("check", [`${appPath} is not a readable app`]),
+      }),
+    ),
+);
 
 /** Checks the app at `appPath` is the recorded build, failing with every difference. */
-export const checkUxPreview = (input: {
+export const checkUxPreview = Effect.fn("checkUxPreview")(function* (input: {
   readonly evidenceDir: string;
   readonly appPath?: string;
-}) =>
-  Effect.gen(function* () {
-    const manifest = yield* readManifest(input.evidenceDir);
-    const observed = yield* observeUxPreviewApp(input.appPath ?? UX_PREVIEW_APP_PATH);
-    const problems = uxPreviewIdentityProblems(observed, manifest);
-    if (problems.length > 0) return yield* refuse("check", problems);
-    return { manifest, observed };
-  });
+}) {
+  const manifest = yield* readManifest(input.evidenceDir);
+  const observed = yield* observeUxPreviewApp(input.appPath ?? UX_PREVIEW_APP_PATH);
+  const problems = uxPreviewIdentityProblems(observed, manifest);
+  if (problems.length > 0) return yield* refuse("check", problems);
+  return { manifest, observed };
+});
 
 /**
  * Builds the UX preview from this clean checkout for `evidenceDir`'s home: the artifact build
  * bakes the home in and verifies its frozen closure, and the manifest records what it built.
  */
-export const buildUxPreview = (input: {
-  readonly repoRoot: string;
-  readonly evidenceDir: string;
-  readonly userHome: string;
-  readonly env: Readonly<Record<string, string | undefined>>;
-  readonly baseVersion: string;
-  readonly date: Date;
-  readonly run: number;
-  readonly arch: "arm64" | "x64";
-}) =>
-  Effect.gen(function* () {
+export const buildUxPreview = Effect.fn("buildUxPreview")(
+  function* (input: {
+    readonly repoRoot: string;
+    readonly evidenceDir: string;
+    readonly userHome: string;
+    readonly env: Readonly<Record<string, string | undefined>>;
+    readonly baseVersion: string;
+    readonly date: Date;
+    readonly run: number;
+    readonly arch: "arm64" | "x64";
+  }) {
     const fileSystem = yield* FileSystem.FileSystem;
     const home = uxPreviewHomeOf(input.evidenceDir);
     const homeProblems = uxPreviewHomeProblems(home, input.userHome);
@@ -443,22 +453,19 @@ export const buildUxPreview = (input: {
       `${yield* encodeJson({ version })}\n`,
     );
     return manifest;
-  }).pipe(
-    Effect.catchTags({
-      PlatformError: () => refuse("build", ["a file could not be read or written"]),
-      SchemaError: () => refuse("build", ["the build record could not be written"]),
-    }),
-  );
+  },
+  Effect.catchTags({
+    PlatformError: () => refuse("build", ["a file could not be read or written"]),
+    SchemaError: () => refuse("build", ["the build record could not be written"]),
+  }),
+);
 
 /**
  * Installs the recorded build as `/Applications/Foredeck.app`, after checking the extracted app
  * is that build. An app already there is replaced only when it is a UX preview.
  */
-export const installUxPreview = (input: {
-  readonly evidenceDir: string;
-  readonly appPath?: string;
-}) =>
-  Effect.gen(function* () {
+export const installUxPreview = Effect.fn("installUxPreview")(
+  function* (input: { readonly evidenceDir: string; readonly appPath?: string }) {
     const fileSystem = yield* FileSystem.FileSystem;
     const appPath = input.appPath ?? UX_PREVIEW_APP_PATH;
     const manifest = yield* readManifest(input.evidenceDir);
@@ -484,41 +491,40 @@ export const installUxPreview = (input: {
     }
     yield* run("install", "ditto", "ditto", [extractedApp, appPath]);
     return yield* checkUxPreview({ evidenceDir: input.evidenceDir, appPath });
-  }).pipe(
-    Effect.catchTags({
-      PlatformError: () => refuse("install", ["a file could not be read or written"]),
-    }),
-  );
+  },
+  Effect.catchTags({
+    PlatformError: () => refuse("install", ["a file could not be read or written"]),
+  }),
+);
 
 /**
  * Launches the installed UX preview on its home. The plan is judged first, from strings: a refused
  * plan reads nothing and spawns nothing. Only then is the installed app checked and started.
  */
-export const launchUxPreview = (input: {
+export const launchUxPreview = Effect.fn("launchUxPreview")(function* (input: {
   readonly evidenceDir: string;
   readonly userHome: string;
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly appPath?: string;
-}) =>
-  Effect.gen(function* () {
-    const plan = planUxPreviewLaunch({
-      home: uxPreviewHomeOf(input.evidenceDir),
-      userHome: input.userHome,
-      env: input.env,
-      ...(input.appPath === undefined ? {} : { appPath: input.appPath }),
-    });
-    if (plan._tag === "Refused") return yield* refuse("launch", plan.reasons);
-    const { manifest } = yield* checkUxPreview({
-      evidenceDir: input.evidenceDir,
-      ...(input.appPath === undefined ? {} : { appPath: input.appPath }),
-    });
-    if (manifest.home !== plan.env.T3CODE_HOME) {
-      return yield* refuse("launch", ["the installed build runs on another home"]);
-    }
-    const launcher = yield* UxPreviewLauncher;
-    yield* launcher.spawnDetached({ executable: plan.executable, env: plan.env });
-    return plan;
+}) {
+  const plan = planUxPreviewLaunch({
+    home: uxPreviewHomeOf(input.evidenceDir),
+    userHome: input.userHome,
+    env: input.env,
+    ...(input.appPath === undefined ? {} : { appPath: input.appPath }),
   });
+  if (plan._tag === "Refused") return yield* refuse("launch", plan.reasons);
+  const { manifest } = yield* checkUxPreview({
+    evidenceDir: input.evidenceDir,
+    ...(input.appPath === undefined ? {} : { appPath: input.appPath }),
+  });
+  if (manifest.home !== plan.env.T3CODE_HOME) {
+    return yield* refuse("launch", ["the installed build runs on another home"]);
+  }
+  const launcher = yield* UxPreviewLauncher;
+  yield* launcher.spawnDetached({ executable: plan.executable, env: plan.env });
+  return plan;
+});
 
 const evidenceDirFlag = Flag.String("evidence-dir").pipe(
   Flag.withDescription("The evidence directory; the preview's home is its desktop-home."),

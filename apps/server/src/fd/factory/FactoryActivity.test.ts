@@ -772,15 +772,17 @@ const holdingPort = () => {
   const port: typeof FactoryAdmission.FactoryAdmission.Service = {
     ...FactoryAdmission.FactoryAdmission.defaultValue(),
     management: () => Effect.succeed("active"),
+    // A turn it runs counts as arrived once its dispatch returns: core's wake dispatch reads the
+    // thread again before it dispatches, so a waiter woken before it would find no run yet.
     automaticTurn: (turn) =>
-      Effect.sync(
-        () => void reached.push({ kind: turn.turn.kind, messageId: turn.turn.messageId }),
+      (turn.via === "hand"
+        ? Effect.map(turn.dispatch, AutomaticTurnGate.ran)
+        : Effect.succeed(AutomaticTurnGate.notNow("deferred"))
       ).pipe(
-        Effect.andThen(TxRef.update(arrivals, (count) => count + 1)),
-        Effect.andThen(
-          turn.via === "hand"
-            ? Effect.map(turn.dispatch, AutomaticTurnGate.ran)
-            : Effect.succeed(AutomaticTurnGate.notNow("deferred")),
+        Effect.tap(() =>
+          Effect.sync(
+            () => void reached.push({ kind: turn.turn.kind, messageId: turn.turn.messageId }),
+          ).pipe(Effect.andThen(TxRef.update(arrivals, (count) => count + 1))),
         ),
       ),
   };
@@ -918,7 +920,6 @@ describe("FactoryService.activity on the server's real stack", () => {
         { admission: port, automaticTurnGate: true },
       );
     },
-    180_000,
   );
 
   it.live("reports native work outliving the run that started it as a wait, not as busy", () =>

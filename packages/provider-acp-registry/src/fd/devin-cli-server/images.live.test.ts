@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import {
@@ -30,6 +31,7 @@ import * as Stream from "effect/Stream";
 
 const layerInfrastructure = Layer.mergeAll(
   NodeServices.layer,
+  NodeCrypto.layer,
   AcpRegistryRuntimeCoordinator.layer,
   IdAllocator.layer,
   McpProviderSessions.layer,
@@ -46,6 +48,8 @@ const layerInfrastructure = Layer.mergeAll(
 const layerTest = AcpRegistrySupport.layerFromHost.pipe(Layer.provideMerge(layerInfrastructure));
 
 /** Opt-in live PNG test: a synthetic image and one short prompt in a temporary workspace. */
+const devinCommandPath = process.env.DEVIN_CLI_BIN ?? "devin";
+
 it.live.skipIf(process.env.DEVIN_CLI_IMAGE_LIVE !== "1")(
   "starts and completes a PNG turn through the installed CLI",
   () =>
@@ -60,7 +64,7 @@ it.live.skipIf(process.env.DEVIN_CLI_IMAGE_LIVE !== "1")(
         displayName: undefined,
         enabled: true,
         environment: [],
-        config: { ...DEFAULT_DEVIN_SETTINGS, commandPath: process.env.DEVIN_CLI_BIN ?? "devin" },
+        config: { ...DEFAULT_DEVIN_SETTINGS, commandPath: devinCommandPath },
       });
       const modelSelection = { instanceId, model: "default" };
       const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({

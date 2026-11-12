@@ -6,7 +6,6 @@ import {
   WorkSourceId,
 } from "@t3tools/contracts/fd/work-management";
 import * as Effect from "effect/Effect";
-import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as McpToolAccess from "../../../mcp/McpToolAccess.ts";
@@ -41,22 +40,15 @@ const failure = (error: WorkDomainError) => {
 const invalid = (message: string) => new WorkMcpFailure({ code: "invalid_request", message });
 const work = <A>(effect: Effect.Effect<A, WorkDomainError>) => Effect.mapError(effect, failure);
 
-const optionalSourceId = (value: string | undefined) => {
-  if (value === undefined) return Effect.succeed(undefined);
-  const decoded = decodeSourceId(value);
-  return Option.isSome(decoded)
-    ? Effect.succeed(decoded.value)
-    : Effect.fail(invalid(`${value} is not a Work source id.`));
-};
+const optionalSourceId = (value: string | undefined) =>
+  value === undefined
+    ? Effect.undefined
+    : Effect.fromOption(decodeSourceId(value), () => invalid(`${value} is not a Work source id.`));
 
-const itemId = (value: string) => {
-  const decoded = decodeItemId(value);
-  return Option.isSome(decoded)
-    ? Effect.succeed(decoded.value)
-    : Effect.fail(invalid(`${value} is not a Work item id.`));
-};
+const itemId = (value: string) =>
+  Effect.fromOption(decodeItemId(value), () => invalid(`${value} is not a Work item id.`));
 const optionalItemId = (value: string | undefined) =>
-  value === undefined ? Effect.succeed(undefined) : itemId(value);
+  value === undefined ? Effect.undefined : itemId(value);
 const nullableItemId = (value: string | null | undefined) =>
   value === null ? Effect.succeed(null) : optionalItemId(value);
 const isWorkMcpFailure = Schema.is(WorkMcpFailure);
@@ -67,58 +59,59 @@ const context = Effect.gen(function* () {
   return { caller, actor: actorFromCaller(caller) };
 });
 
-const projectSources = (actor: WorkActor, caller: Caller, projectId: ProjectId | undefined) =>
-  Effect.gen(function* () {
-    const service = yield* WorkService.WorkService;
-    const project = yield* resolveProjectId(caller, projectId);
-    const { sources } = yield* work(
-      service.listSources(actor, { projectId: project, includeDisconnected: false }),
-    );
-    return sources;
-  });
+const projectSources = Effect.fn("WorkTools.projectSources")(function* (
+  actor: WorkActor,
+  caller: Caller,
+  projectId: ProjectId | undefined,
+) {
+  const service = yield* WorkService.WorkService;
+  const project = yield* resolveProjectId(caller, projectId);
+  const { sources } = yield* work(
+    service.listSources(actor, { projectId: project, includeDisconnected: false }),
+  );
+  return sources;
+});
 
 /** The item an agent named, in its project unless the reference is already canonical. */
-const resolveItem = (
+const resolveItem = Effect.fn("WorkTools.resolveItem")(function* (
   actor: WorkActor,
   caller: Caller,
   params: { readonly item: string; readonly sourceId?: string; readonly projectId?: ProjectId },
-) =>
-  Effect.gen(function* () {
-    const reference = parseWorkItemReference(params.item);
-    if (reference === undefined) {
-      return yield* invalid(
-        "Name the item as <sourceId>:<itemId>, a key such as fd-7k3qa2, #123 or PROJ-12, or its URL.",
-      );
-    }
-    if (reference.type === "ref") return reference.ref;
-    const sourceId = yield* optionalSourceId(params.sourceId);
-    const resolved = resolveWorkTarget({
-      reference,
-      sources: yield* projectSources(actor, caller, params.projectId),
-      sourceId,
-    });
-    return resolved.ok ? resolved.ref : yield* invalid(resolved.message);
+) {
+  const reference = parseWorkItemReference(params.item);
+  if (reference === undefined) {
+    return yield* invalid(
+      "Name the item as <sourceId>:<itemId>, a key such as fd-7k3qa2, #123 or PROJ-12, or its URL.",
+    );
+  }
+  if (reference.type === "ref") return reference.ref;
+  const sourceId = yield* optionalSourceId(params.sourceId);
+  const resolved = resolveWorkTarget({
+    reference,
+    sources: yield* projectSources(actor, caller, params.projectId),
+    sourceId,
   });
+  return resolved.ok ? resolved.ref : yield* invalid(resolved.message);
+});
 
 /** The source to create in or list: the one named, else the project's only active source. */
-const resolveSource = (
+const resolveSource = Effect.fn("WorkTools.resolveSource")(function* (
   actor: WorkActor,
   caller: Caller,
   params: { readonly sourceId?: string; readonly projectId?: ProjectId },
-) =>
-  Effect.gen(function* () {
-    const named = yield* optionalSourceId(params.sourceId);
-    if (named !== undefined) return named;
-    const sources = yield* projectSources(actor, caller, params.projectId);
-    if (sources.length === 1) return sources[0]!.sourceId;
-    return yield* new OrchestratorMcpFailure({
-      code: "target_required",
-      message:
-        sources.length === 0
-          ? "This project has no active Work sources."
-          : `Pass sourceId. Sources: ${describeSources(sources)}.`,
-    });
+) {
+  const named = yield* optionalSourceId(params.sourceId);
+  if (named !== undefined) return named;
+  const sources = yield* projectSources(actor, caller, params.projectId);
+  if (sources.length === 1) return sources[0]!.sourceId;
+  return yield* new OrchestratorMcpFailure({
+    code: "target_required",
+    message:
+      sources.length === 0
+        ? "This project has no active Work sources."
+        : `Pass sourceId. Sources: ${describeSources(sources)}.`,
   });
+});
 
 /** What a thread linked to an item is doing now. */
 const threadState = (caller: Caller, threadId: ThreadId) =>
@@ -357,5 +350,7 @@ export const toolLayer = McpToolAccess.toLayer(WorkToolkit, {
           }),
         );
       }),
+    // Work threads carry no link origin, so a linked caller cannot start one here.
+    { refused: "start Work threads in this environment" },
   ),
 });

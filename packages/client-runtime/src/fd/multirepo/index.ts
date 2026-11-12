@@ -3,7 +3,6 @@ export { usesSharedCheckouts, MULTIREPO_CHECKOUT_NOTICE } from "./checkoutPolicy
 export { selectRepositoryCheckpoints } from "./checkpointSelection.ts";
 export {
   repositoryFileSurfaceId,
-  repositoryRelativePath,
   resolveRepositoryFileReference,
   repositoryFileRequest,
   isRepositoryFileScope,

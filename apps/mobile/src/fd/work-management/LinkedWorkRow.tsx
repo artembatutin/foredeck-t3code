@@ -3,9 +3,9 @@ import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { useNavigation } from "@react-navigation/native";
 import { Pressable, View } from "react-native";
 
-import { SymbolView } from "../../components/AppSymbol";
-import { AppText as Text } from "../../components/AppText";
-import { ControlPillMenu } from "../../components/ControlPill";
+import { SymbolView } from "../../components/ui/AppSymbol";
+import { AppText as Text } from "../../components/ui/AppText";
+import { Menu } from "../../components/ui/Menu";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { STATUS_LABELS, STATUS_SYMBOLS } from "./shared";
@@ -56,7 +56,7 @@ function LinkedWorkItems(props: {
             ? "Project unavailable"
             : STATUS_LABELS[link.snapshot.status];
         return (
-          <ControlPillMenu
+          <Menu
             key={`${link.ref.sourceId}:${link.ref.itemId}`}
             accessibilityLabel={`Work item ${link.snapshot.key}`}
             shouldOpenOnLongPress
@@ -100,7 +100,7 @@ function LinkedWorkItems(props: {
                 <Text className="text-foreground-tertiary"> · {note}</Text>
               </Text>
             </Pressable>
-          </ControlPillMenu>
+          </Menu>
         );
       })}
     </View>

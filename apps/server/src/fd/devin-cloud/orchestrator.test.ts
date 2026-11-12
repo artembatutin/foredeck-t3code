@@ -20,6 +20,7 @@ import * as ProviderInstanceRegistry from "../../provider/ProviderInstanceRegist
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as RuntimePolicy from "../../orchestration-v2/RuntimePolicy.ts";
+import * as ServerSettings from "../../serverSettings.ts";
 import * as ProviderAdapterRegistry from "../../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "../../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import { makeDevinCloudAdapterV2 } from "./adapter.ts";
@@ -48,6 +49,7 @@ const registryFor = (client: HttpClient.HttpClient, instanceId: ProviderInstance
 
 const runtimePolicyFor = (client: HttpClient.HttpClient, instanceId: ProviderInstanceId) =>
   RuntimePolicy.layerFromProjectStore.pipe(
+    Layer.provide(ServerSettings.layerTest().pipe(Layer.orDie)),
     Layer.provide(Layer.mock(RepositorySet.RepositorySet)({})),
     Layer.provide(
       Layer.unwrap(

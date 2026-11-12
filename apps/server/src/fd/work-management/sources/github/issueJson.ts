@@ -188,7 +188,7 @@ const KNOWN_REASONS: ReadonlySet<string> = new Set([
 ]);
 
 /** An issue's Work status from GraphQL's upper-case enums. */
-export const issueStatus = (state: string, stateReason: string | null | undefined): WorkStatus => {
+const issueStatus = (state: string, stateReason: string | null | undefined): WorkStatus => {
   const normalizedState = state.toLowerCase();
   if (normalizedState !== "open" && normalizedState !== "closed") return "unknown";
   const reason = stateReason?.toLowerCase();
@@ -199,7 +199,7 @@ export const issueStatus = (state: string, stateReason: string | null | undefine
 };
 
 /** `updated_at|node_id`: an edit anywhere on the issue moves it. */
-export const issueRevision = (updatedAt: string, nodeId: string) => `${updatedAt}|${nodeId}`;
+const issueRevision = (updatedAt: string, nodeId: string) => `${updatedAt}|${nodeId}`;
 
 const nodes = <A>(connection: { readonly nodes: ReadonlyArray<A | null> } | null | undefined) =>
   (connection?.nodes ?? []).filter((node): node is A => node !== null);

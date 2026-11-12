@@ -138,36 +138,28 @@ const cannotTell = ({ operation }: { readonly operation: string }) =>
   );
 
 /**
- * The remote and branch the stacked action's push of the checked-out branch lands on, with the URLs
- * Git sends it to, asked of the Git driver that pushes it rather than worked out here: Git can push a
- * branch under another name, and a copy of how it picks one would miss whatever it does not repeat.
- * The action is bound to what this returns, URLs included. Null when the push names none, or the
- * read fails.
+ * Where the stacked action's push of the checked-out branch lands, URLs included, asked of the Git
+ * driver rather than worked out here, since Git can push a branch under another name. The action
+ * is bound to what this returns. Null when the push names none, or the read fails.
  */
 export const readPushTarget = Effect.fn("FactoryBranchFacts.pushTarget")(
   function* (input: { readonly worktreePath: string; readonly branch: string }) {
     const git = yield* GitVcsDriver.GitVcsDriver;
-    return yield* git.resolvePushTarget(input.worktreePath, input.branch);
+    return yield* git.resolveCheckedPushTarget(input.worktreePath, input.branch);
   },
   Effect.catchTags({ GitCommandError: cannotTell }),
 );
 
 /**
- * The commits a push of `headSha` to `target` (see `readPushTarget`) would newly publish, oldest
- * first for each of its push URLs: those its destination does not hold, asked of that destination. A
- * tracking ref cannot answer: it can outlive its branch, a rewrite of that branch or a change of URL,
- * so vouching for a commit the destination lost would let it go out unjudged. A tip of the
- * destination this repository lacks could hold any commit it has: judged without it, a delivery
- * would count all its history as outgoing once the remote's main moved on. So that tip's objects are
- * fetched first, writing no ref. With several push URLs, a push goes to each, so a commit any of them
- * lacks counts. Only the target's URLs are asked, which the push is bound to, each exactly (see
- * `GitVcsDriver.pinUrl`). Null when this cannot be established: a target with no push URL, a URL
- * this Git cannot be held to, a destination or tip that cannot be read, or more than can be read.
+ * Commits a push of `headSha` to `target` would newly publish, oldest first, that any pinned push
+ * URL lacks, asked of the destination itself: tracking refs can be stale. Missing destination tips
+ * are fetched first (objects only), or all history would count as outgoing. Null when this cannot
+ * be established.
  */
 export const readOutgoingCommits = Effect.fn("FactoryBranchFacts.outgoing")(
   function* (input: {
     readonly worktreePath: string;
-    readonly target: GitVcsDriver.GitPushTarget;
+    readonly target: GitVcsDriver.GitCheckedPushTarget;
     readonly headSha: string;
   }) {
     const git = yield* GitVcsDriver.GitVcsDriver;
@@ -233,12 +225,10 @@ export const readOutgoingCommits = Effect.fn("FactoryBranchFacts.outgoing")(
       );
       const fetched = advertised.filter(({ sha }) => missing.has(sha)).map(({ name }) => name);
       if (fetched.length > 0) {
-        // Objects only: no ref moves and no FETCH_HEAD is written. A fetch from a configured remote
-        // maps what it fetches through that remote's refspecs, however the refs are named here, and
-        // can move or force-update its tracking refs and branches; the empty `--refmap` drops those
-        // refspecs, and the pinned spelling names no remote anyway. The prune flags matter too:
-        // `fetch.pruneTags` would otherwise delete each tag the destination lacks. See
-        // `fetchRemoteForStatus` for `--no-auto-gc`.
+        // Objects only: no ref moves and no FETCH_HEAD. The empty `--refmap` stops a configured
+        // remote's refspecs from moving tracking refs or branches; the prune flags stop
+        // `fetch.pruneTags` deleting tags the destination lacks. See `fetchRemoteForStatus` for
+        // `--no-auto-gc`.
         yield* run(
           "fetchTips",
           [

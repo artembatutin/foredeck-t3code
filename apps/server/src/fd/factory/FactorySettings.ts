@@ -95,24 +95,23 @@ const make = Effect.gen(function* () {
 
   return FactorySettings.of({
     get,
-    set: (projectId, settings) =>
-      pipelines.has(settings.pipelineId)
-        ? changes.transact(store.set(projectId, settings)).pipe(
-            Effect.catchTags({
-              FactoryStoreError: (cause) =>
-                Effect.fail(
-                  new FactorySettingsStorageError({ operation: "set", projectId, cause }),
-                ),
-              SqlError: (cause) =>
-                Effect.fail(
-                  new FactorySettingsStorageError({ operation: "set", projectId, cause }),
-                ),
-            }),
-          )
-        : Effect.fail(
-            new FactoryUnknownPipelineError({ projectId, pipelineId: settings.pipelineId }),
-          ),
-    requireDeliverySettings: (projectId) =>
+    set: Effect.fn("FactorySettings.set")(function* (projectId, settings) {
+      if (!pipelines.has(settings.pipelineId)) {
+        return yield* new FactoryUnknownPipelineError({
+          projectId,
+          pipelineId: settings.pipelineId,
+        });
+      }
+      return yield* changes.transact(store.set(projectId, settings)).pipe(
+        Effect.catchTags({
+          FactoryStoreError: (cause) =>
+            Effect.fail(new FactorySettingsStorageError({ operation: "set", projectId, cause })),
+          SqlError: (cause) =>
+            Effect.fail(new FactorySettingsStorageError({ operation: "set", projectId, cause })),
+        }),
+      );
+    }),
+    requireDeliverySettings: Effect.fn("FactorySettings.requireDeliverySettings")((projectId) =>
       get(projectId).pipe(
         Effect.flatMap(({ verifyCommand, ...settings }) =>
           verifyCommand === null
@@ -120,6 +119,7 @@ const make = Effect.gen(function* () {
             : Effect.succeed({ ...settings, verifyCommand }),
         ),
       ),
+    ),
   });
 });
 

@@ -37,7 +37,7 @@ import {
   TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { useState } from "react";
 
 import { WorkspaceBreadcrumb, WorkspaceBreadcrumbItem } from "../../components/WorkspaceBreadcrumb";
 import { WorkspacePageContainer } from "../../components/WorkspacePageContainer";
@@ -67,7 +67,7 @@ import { Spinner } from "../../components/ui/spinner";
 import { Toggle, ToggleGroup } from "../../components/ui/toggle-group";
 import { isElectron } from "../../env";
 import { useLiveRefresh } from "../../hooks/useLiveRefresh";
-import { useEscapeToGoBack } from "../../hooks/useNavigateBack";
+import { useEscapeToGoBack } from "./useEscapeToGoBack";
 import { cn } from "../../lib/utils";
 import {
   useAllEnvironmentShellsBootstrapped,
@@ -161,36 +161,29 @@ export function WorkRouteView({
   startAction?: StartWorkThreadAction;
 }) {
   const navigate = useNavigate();
-  const setSearch = useCallback(
-    (patch: { readonly [Key in keyof WorkSearch]?: WorkSearch[Key] | undefined }) => {
-      const next: Record<string, unknown> = { ...search, ...patch };
-      for (const key of Object.keys(next)) if (next[key] === undefined) delete next[key];
-      void navigate({ to: "/work", search: next as WorkSearch, replace: true });
-    },
-    [navigate, search],
-  );
+  const setSearch = (patch: {
+    readonly [Key in keyof WorkSearch]?: WorkSearch[Key] | undefined;
+  }) => {
+    const next: Record<string, unknown> = { ...search, ...patch };
+    for (const key of Object.keys(next)) if (next[key] === undefined) delete next[key];
+    void navigate({ to: "/work", search: next as WorkSearch, replace: true });
+  };
   useEscapeToGoBack(search.item === undefined ? undefined : () => setSearch({ item: undefined }));
 
   const support = useWorkSupport();
   const readableEnvironments = useReadableWorkEnvironments();
   const projectsKnown = useAllEnvironmentShellsBootstrapped();
   const allProjects = useProjects();
-  const projects = useMemo(
-    () =>
-      allProjects
-        .filter(
-          (project) => readableEnvironments.includes(project.environmentId) && !project.isScratch,
-        )
-        .toSorted((left, right) => left.title.localeCompare(right.title)),
-    [allProjects, readableEnvironments],
-  );
+  const projects = allProjects
+    .filter((project) => readableEnvironments.includes(project.environmentId) && !project.isScratch)
+    .toSorted((left, right) => left.title.localeCompare(right.title));
   const { project: selectedProject, unavailable: projectUnavailable } = selectWorkProject(
     projects,
     search.project,
   );
   const environmentId = selectedProject?.environmentId ?? null;
   const view = search.view ?? readStoredPreferences().view;
-  const commitQuery = useCallback((q: string | undefined) => setSearch({ q }), [setSearch]);
+  const commitQuery = (q: string | undefined) => setSearch({ q });
   const [query, setQuery] = useWorkSearchInput(search, commitQuery);
   const [creating, setCreating] = useState<WorkSource | null>(null);
 
@@ -214,22 +207,17 @@ export function WorkRouteView({
           input: { projectId: selectedProject.id, includeDisconnected: false },
         }),
   );
-  const sources = useMemo(() => sourcesQuery.data?.sources ?? [], [sourcesQuery.data]);
-  const selectedSources = useMemo(
-    () =>
-      sources.filter((source) => search.source === undefined || source.sourceId === search.source),
-    [search.source, sources],
+  const sources = sourcesQuery.data?.sources ?? [];
+  const selectedSources = sources.filter(
+    (source) => search.source === undefined || source.sourceId === search.source,
   );
   const canFilterAssignee = selectedSources.some((source) => source.capabilities.people);
   const assignedToMe =
     canFilterAssignee &&
     (search.assignedToMe ?? (search.item === undefined && readStoredPreferences().assignedToMe)) ===
       true;
-  const shownSources = useMemo(
-    () => workFilterSources(selectedSources, assignedToMe),
-    [assignedToMe, selectedSources],
-  );
-  const labels = useMemo(() => [...(search.labels ?? [])], [search.labels]);
+  const shownSources = workFilterSources(selectedSources, assignedToMe);
+  const labels = [...(search.labels ?? [])];
   const setAssignedToMe = (next: boolean) => {
     try {
       window.localStorage.setItem(
@@ -247,28 +235,22 @@ export function WorkRouteView({
   const listKey = `${environmentId}|${shownSources.map((source) => source.sourceId).join(",")}|${view}|${term ?? ""}|${JSON.stringify(labels)}|${assignedToMe}`;
   const [paging, setPaging] = useState({ key: listKey, pageCount: 1 });
   const pageCount = paging.key === listKey ? paging.pageCount : 1;
-  const loadMore = useCallback(
-    () => setPaging({ key: listKey, pageCount: pageCount + 1 }),
-    [listKey, pageCount],
-  );
-  const listAtom = useMemo(
-    () =>
-      environmentId === null || shownSources.length === 0
-        ? null
-        : workEnvironment.pagedList({
-            environmentId,
-            sources: shownSources.map((source) => ({
-              sourceId: source.sourceId,
-              kind: source.kind,
-            })),
-            search: term,
-            labels,
-            assignee: assignedToMe ? "me" : undefined,
-            statuses: workViewStatuses(view),
-            pageCount,
-          }),
-    [assignedToMe, environmentId, labels, pageCount, shownSources, term, view],
-  );
+  const loadMore = () => setPaging({ key: listKey, pageCount: pageCount + 1 });
+  const listAtom =
+    environmentId === null || shownSources.length === 0
+      ? null
+      : workEnvironment.pagedList({
+          environmentId,
+          sources: shownSources.map((source) => ({
+            sourceId: source.sourceId,
+            kind: source.kind,
+          })),
+          search: term,
+          labels,
+          assignee: assignedToMe ? "me" : undefined,
+          statuses: workViewStatuses(view),
+          pageCount,
+        });
   const lists = useAtomValue(listAtom ?? EMPTY_LISTS_ATOM);
   const refreshList = useAtomRefresh(listAtom ?? EMPTY_LISTS_ATOM);
   const linksQuery = useEnvironmentQuery(
@@ -280,43 +262,31 @@ export function WorkRouteView({
         }),
   );
   const shells = useThreadShells();
-  const runStates = useMemo(() => {
-    const byThread = new Map(
-      shells
-        .filter((shell) => shell.environmentId === environmentId)
-        .map((shell) => [shell.id, shell] as const),
-    );
-    const states = new Map<string, ReadonlyArray<WorkRunState>>();
-    for (const [key, links] of linksByItem(linksQuery.data?.links ?? [])) {
-      states.set(
-        key,
-        links.map((link) => runStateOf(byThread.get(link.threadId))),
-      );
-    }
-    return states;
-  }, [environmentId, linksQuery.data, shells]);
-
-  const sourceById = useMemo(
-    () => new Map(shownSources.map((source) => [source.sourceId, source] as const)),
-    [shownSources],
+  const byThread = new Map(
+    shells
+      .filter((shell) => shell.environmentId === environmentId)
+      .map((shell) => [shell.id, shell] as const),
   );
+  const runStates = new Map<string, ReadonlyArray<WorkRunState>>();
+  for (const [key, links] of linksByItem(linksQuery.data?.links ?? [])) {
+    runStates.set(
+      key,
+      links.map((link) => runStateOf(byThread.get(link.threadId))),
+    );
+  }
+
+  const sourceById = new Map(shownSources.map((source) => [source.sourceId, source] as const));
   const pending = lists.some(({ pages }) => pages.waiting);
   const hasMore = lists.some(({ pages }) => pages.nextCursor !== null);
-  const listedItems = useMemo(
-    () =>
-      lists
-        .flatMap(({ sourceId, pages }) => {
-          const source = sourceById.get(sourceId);
-          return source === undefined ? [] : pages.items.map((item) => ({ source, item }));
-        })
-        .filter(({ item }) =>
-          itemInView(view, item, runStates.get(workItemRefString(item.ref)) ?? []),
-        )
-        .toSorted((left, right) =>
-          (right.item.updatedAt ?? "").localeCompare(left.item.updatedAt ?? ""),
-        ),
-    [lists, runStates, sourceById, view],
-  );
+  const listedItems = lists
+    .flatMap(({ sourceId, pages }) => {
+      const source = sourceById.get(sourceId);
+      return source === undefined ? [] : pages.items.map((item) => ({ source, item }));
+    })
+    .filter(({ item }) => itemInView(view, item, runStates.get(workItemRefString(item.ref)) ?? []))
+    .toSorted((left, right) =>
+      (right.item.updatedAt ?? "").localeCompare(left.item.updatedAt ?? ""),
+    );
   const selectedRef = search.item === undefined ? undefined : parseWorkItemRefString(search.item);
   // All leaves nothing out, so an item open beside it that it does not list is further down than
   // this view reads by itself, however far that is. Its own read, the one the detail makes, lists
@@ -366,14 +336,14 @@ export function WorkRouteView({
   const refreshSources = sourcesQuery.refresh;
   const refreshLinks = linksQuery.refresh;
   const projectId = selectedProject?.id;
-  const refreshQueries = useCallback(() => {
+  const refreshQueries = () => {
     refreshSources();
     refreshLinks();
     refreshList();
-  }, [refreshLinks, refreshList, refreshSources]);
+  };
   // The button drops the server's caches, and every client refetches through the refresh
   // subscription. Focus and the live interval refresh this view's queries alone.
-  const refresh = useCallback(() => {
+  const refresh = () => {
     if (environmentId === null) return;
     void refreshWork({
       requestServerRefresh: () =>
@@ -383,7 +353,7 @@ export function WorkRouteView({
         }),
       refreshQueries,
     });
-  }, [environmentId, projectId, refreshQueries, requestRefresh]);
+  };
   useLiveRefresh(environmentId === null ? null : refreshQueries, {
     key: selectedProject?.id ?? "none",
   });

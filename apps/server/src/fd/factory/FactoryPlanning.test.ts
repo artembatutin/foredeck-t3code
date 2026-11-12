@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -25,6 +26,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as DocumentText from "../../provider/DocumentText.ts";
 
 import * as ServerConfig from "../../config.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
@@ -168,6 +170,8 @@ const fakes = (world: World) =>
             createdAt: "2026-10-24T00:00:00.000Z",
             updatedAt: "2026-10-24T00:00:00.000Z",
             deletedAt: null,
+            pinnedAt: null,
+            archivedAt: null,
           }),
         ),
     }),
@@ -178,7 +182,7 @@ const fakes = (world: World) =>
     }),
     // No provider advertises its runtime modes here, so a launch asks for its bound.
     Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
-      getInstance: () => Effect.succeed(undefined),
+      getInstance: () => Effect.undefined,
     }),
   );
 
@@ -195,6 +199,8 @@ const makeLayer = (world: World) =>
     Layer.provideMerge(GitVcsDriver.layer),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-planning-" })),
     Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(DocumentText.layer.pipe(Layer.provide(NodeServices.layer))),
+    Layer.provideMerge(NodeCrypto.layer),
     Layer.provideMerge(NodeServices.layer),
   );
 

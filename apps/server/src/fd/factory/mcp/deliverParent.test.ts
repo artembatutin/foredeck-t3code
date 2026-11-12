@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
@@ -91,6 +92,7 @@ const layer = FactoryService.layer.pipe(
   Layer.provideMerge(FactorySettings.layer),
   Layer.provideMerge(Factory.layerPersistence),
   Layer.provideMerge(SqlitePersistence.layerMemory),
+  Layer.provideMerge(NodeCrypto.layer),
   Layer.provideMerge(NodeServices.layer),
 );
 

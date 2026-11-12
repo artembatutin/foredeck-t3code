@@ -1,24 +1,23 @@
-import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import type * as ChildProcess from "effect/process/ChildProcess";
 import type * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
-class NativeCommandFailed extends Data.TaggedError("NativeCommandFailed")<{
-  readonly code: number;
-}> {}
+class NativeCommandFailed extends Schema.TaggedError<NativeCommandFailed>()("NativeCommandFailed", {
+  code: Schema.Number,
+}) {}
 
 /** stdout alone does not establish command success: Effect's string helper ignores exit status. */
-export const readCommandOutput = (
+export const readCommandOutput = Effect.fn("readCommandOutput")(function* (
   spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
   command: ChildProcess.Command,
-) =>
-  Effect.gen(function* () {
-    const child = yield* spawner.spawn(command);
-    const [output, code] = yield* Effect.all(
-      [Stream.mkString(Stream.decodeText(child.stdout)), child.exitCode],
-      { concurrency: "unbounded" },
-    );
-    if (code !== 0) return yield* Effect.fail(new NativeCommandFailed({ code }));
-    return output;
-  }).pipe(Effect.scoped);
+) {
+  const child = yield* spawner.spawn(command);
+  const [output, code] = yield* Effect.all(
+    [Stream.mkString(Stream.decodeText(child.stdout)), child.exitCode],
+    { concurrency: "unbounded" },
+  );
+  if (code !== 0) return yield* new NativeCommandFailed({ code });
+  return output;
+}, Effect.scoped);

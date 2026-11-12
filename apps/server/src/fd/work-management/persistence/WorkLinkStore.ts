@@ -254,8 +254,8 @@ const make = Effect.gen(function* () {
     `,
   });
 
-  const link: WorkLinkStore["Service"]["link"] = (input) =>
-    Effect.gen(function* () {
+  const link: WorkLinkStore["Service"]["link"] = Effect.fn("WorkLinkStore.link")(
+    function* (input) {
       const key: LinkKey = {
         sourceId: input.sourceId,
         itemId: input.itemId,
@@ -273,47 +273,65 @@ const make = Effect.gen(function* () {
       };
       yield* insertLink(created);
       return { link: created, inserted: true };
-    }).pipe(sql.withTransaction, Effect.catchTags(storageFailure("link")));
+    },
+    sql.withTransaction,
+    Effect.catchTags(storageFailure("link")),
+  );
 
   const list = (operation: string, request: Parameters<typeof selectLinks>[0]) =>
     selectLinks(request).pipe(Effect.catchTags(storageFailure(operation)));
 
   return WorkLinkStore.of({
     link,
-    unlink: (sourceId, itemId, threadId) =>
+    unlink: Effect.fn("WorkLinkStore.unlink")((sourceId, itemId, threadId) =>
       deleteLink({ sourceId, itemId, threadId }).pipe(
         Effect.map((rows) => rows.length > 0),
         Effect.catchTags(storageFailure("unlink")),
       ),
-    unlinkThread: (threadId, options) =>
+    ),
+    unlinkThread: Effect.fn("WorkLinkStore.unlinkThread")((threadId, options) =>
       deleteByThread({ threadId, linkedUpTo: options?.linkedUpTo ?? null }).pipe(
         Effect.map((rows) => rows.length),
         Effect.catchTags(storageFailure("unlinkThread")),
       ),
-    deleteBySource: (sourceId) =>
+    ),
+    deleteBySource: Effect.fn("WorkLinkStore.deleteBySource")((sourceId) =>
       deleteBySourceId(sourceId).pipe(
         Effect.map((rows) => rows.length),
         Effect.catchTags(storageFailure("deleteBySource")),
       ),
-    listByThread: (threadId) => list("listByThread", { threadId }),
-    listByItem: (sourceId, itemId) => list("listByItem", { sourceId, itemId }),
-    listByProject: (projectId) => list("listByProject", { projectId }),
-    listAll: (limit) =>
+    ),
+    listByThread: Effect.fn("WorkLinkStore.listByThread")((threadId) =>
+      list("listByThread", { threadId }),
+    ),
+    listByItem: Effect.fn("WorkLinkStore.listByItem")((sourceId, itemId) =>
+      list("listByItem", { sourceId, itemId }),
+    ),
+    listByProject: Effect.fn("WorkLinkStore.listByProject")((projectId) =>
+      list("listByProject", { projectId }),
+    ),
+    listAll: Effect.fn("WorkLinkStore.listAll")((limit) =>
       list("listAll", { limit: limit + 1 }).pipe(
         Effect.map((rows) => ({ links: rows.slice(0, limit), truncated: rows.length > limit })),
       ),
-    updateSnapshot: (sourceId, itemId, threadId, snapshot) =>
-      writeSnapshot({ sourceId, itemId, threadId, snapshot }).pipe(
-        Effect.catchTags(storageFailure("updateSnapshot")),
-      ),
-    updateSnapshotDisplay: (sourceId, itemId, threadId, display) =>
-      writeSnapshotDisplay({ sourceId, itemId, threadId, ...display }).pipe(
-        Effect.catchTags(storageFailure("updateSnapshotDisplay")),
-      ),
-    updateRun: (sourceId, itemId, threadId, run) =>
+    ),
+    updateSnapshot: Effect.fn("WorkLinkStore.updateSnapshot")(
+      (sourceId, itemId, threadId, snapshot) =>
+        writeSnapshot({ sourceId, itemId, threadId, snapshot }).pipe(
+          Effect.catchTags(storageFailure("updateSnapshot")),
+        ),
+    ),
+    updateSnapshotDisplay: Effect.fn("WorkLinkStore.updateSnapshotDisplay")(
+      (sourceId, itemId, threadId, display) =>
+        writeSnapshotDisplay({ sourceId, itemId, threadId, ...display }).pipe(
+          Effect.catchTags(storageFailure("updateSnapshotDisplay")),
+        ),
+    ),
+    updateRun: Effect.fn("WorkLinkStore.updateRun")((sourceId, itemId, threadId, run) =>
       writeRun({ sourceId, itemId, threadId, run }).pipe(
         Effect.catchTags(storageFailure("updateRun")),
       ),
+    ),
   });
 });
 

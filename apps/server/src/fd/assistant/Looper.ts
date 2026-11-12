@@ -1,6 +1,6 @@
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import * as Crypto from "effect/Crypto";
 import * as Context from "effect/Context";
+import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -80,15 +80,8 @@ const wrap =
   <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(Effect.mapError((cause) => new LooperError({ operation, cause })));
 const make = Effect.gen(function* () {
-  const crypto = yield* Crypto.Crypto;
-  const hash = (text: string) =>
-    crypto
-      .digest("SHA-256", new TextEncoder().encode(text))
-      .pipe(
-        Effect.map((bytes) =>
-          Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""),
-        ),
-      );
+  const digest = yield* Digest.Digest;
+  const hash = (text: string) => digest.digestHex(Digest.sha256, new TextEncoder().encode(text));
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const process = yield* ProcessRunner.ProcessRunner;
@@ -121,70 +114,73 @@ const make = Effect.gen(function* () {
       return yield* new LooperError({ operation: "configuration changed since authorization" });
   });
   return Looper.of({
-    prepare: (configPath, projectRoot, brief) =>
-      Effect.gen(function* () {
-        if (!path.isAbsolute(configPath))
-          return yield* new LooperError({ operation: "absolute configuration path required" });
-        const text = yield* fs.readFileString(configPath);
-        const config = yield* decodeConfig(text);
-        const root = yield* fs.realPath(path.resolve(path.dirname(configPath), config.projectRoot));
-        if (root !== (yield* fs.realPath(projectRoot)))
-          return yield* new LooperError({ operation: "project identity" });
-        if (
-          config.profiles.author.provider === config.profiles.reviewer.provider ||
-          config.profiles.repair.provider === config.profiles.reviewer.provider
-        )
-          return yield* new LooperError({ operation: "independent reviewer required" });
-        if (path.isAbsolute(config.goalPath) || config.goalPath.split(/[\\/]/).includes(".."))
-          return yield* new LooperError({ operation: "project-local goal required" });
-        const goal = yield* fs.readFileString(path.resolve(root, config.goalPath));
-        if (goal.trim() !== brief.trim())
-          return yield* new LooperError({
-            operation: "goal must match the authoritative assignment brief exactly",
-          });
-        const worktree = path.resolve(root, config.worktree),
-          runtimeDir = path.resolve(path.dirname(configPath), config.runtimeDir);
-        if (worktree === root || runtimeDir === root || worktree === runtimeDir)
-          return yield* new LooperError({ operation: "isolated worktree and runtime required" });
-        const prepared = {
-          configPath: yield* fs.realPath(configPath),
-          projectRoot: root,
-          runtimeDir,
-          worktree,
-          configHash: yield* hash(text),
-          goalHash: yield* hash(goal),
-        };
-        if (yield* fs.exists(path.join(runtimeDir, "status.json")))
-          return yield* new LooperError({ operation: "new assignment requires a fresh runtime" });
-        yield* run(["doctor", "--config", prepared.configPath, "--json"], root);
-        yield* run(["check", "--config", prepared.configPath, "--json"], root);
-        return prepared;
-      }).pipe(wrap("preflight")),
-    start: (config, resume) =>
-      Effect.gen(function* () {
-        yield* checkSnapshot(config);
-        yield* run(["doctor", "--config", config.configPath, "--json"], config.projectRoot);
-        yield* run(["check", "--config", config.configPath, "--json"], config.projectRoot);
-        yield* checkSnapshot(config);
-        const output = yield* run(
-          [resume ? "resume" : "start", "--config", config.configPath, "--json"],
-          config.projectRoot,
-        );
-        const result = yield* decodeAcknowledgment(output);
-        const acknowledged = result.find((item) => item.configPath === config.configPath);
-        if (!acknowledged) return yield* new LooperError({ operation: "launch acknowledgment" });
-        return acknowledged.runId;
-      }).pipe(wrap("launch")),
-    inspect: (config) => inspect(config).pipe(wrap("inspect")),
-    stop: (config, runId) =>
-      Effect.gen(function* () {
-        yield* checkSnapshot(config);
-        const status = yield* inspect(config);
-        if (!status || status.runId !== runId)
-          return yield* new LooperError({ operation: "stop run identity" });
-        if (["completed", "blocked", "stopped", "error"].includes(status.status)) return;
-        yield* run(["stop", "--config", config.configPath, "--json"], config.projectRoot);
-      }).pipe(wrap("stop")),
+    prepare: Effect.fn("Looper.prepare")(function* (
+      configPath: string,
+      projectRoot: string,
+      brief: string,
+    ) {
+      if (!path.isAbsolute(configPath))
+        return yield* new LooperError({ operation: "absolute configuration path required" });
+      const text = yield* fs.readFileString(configPath);
+      const config = yield* decodeConfig(text);
+      const root = yield* fs.realPath(path.resolve(path.dirname(configPath), config.projectRoot));
+      if (root !== (yield* fs.realPath(projectRoot)))
+        return yield* new LooperError({ operation: "project identity" });
+      if (
+        config.profiles.author.provider === config.profiles.reviewer.provider ||
+        config.profiles.repair.provider === config.profiles.reviewer.provider
+      )
+        return yield* new LooperError({ operation: "independent reviewer required" });
+      if (path.isAbsolute(config.goalPath) || config.goalPath.split(/[\\/]/).includes(".."))
+        return yield* new LooperError({ operation: "project-local goal required" });
+      const goal = yield* fs.readFileString(path.resolve(root, config.goalPath));
+      if (goal.trim() !== brief.trim())
+        return yield* new LooperError({
+          operation: "goal must match the authoritative assignment brief exactly",
+        });
+      const worktree = path.resolve(root, config.worktree),
+        runtimeDir = path.resolve(path.dirname(configPath), config.runtimeDir);
+      if (worktree === root || runtimeDir === root || worktree === runtimeDir)
+        return yield* new LooperError({ operation: "isolated worktree and runtime required" });
+      const prepared = {
+        configPath: yield* fs.realPath(configPath),
+        projectRoot: root,
+        runtimeDir,
+        worktree,
+        configHash: yield* hash(text),
+        goalHash: yield* hash(goal),
+      };
+      if (yield* fs.exists(path.join(runtimeDir, "status.json")))
+        return yield* new LooperError({ operation: "new assignment requires a fresh runtime" });
+      yield* run(["doctor", "--config", prepared.configPath, "--json"], root);
+      yield* run(["check", "--config", prepared.configPath, "--json"], root);
+      return prepared;
+    }, wrap("preflight")),
+    start: Effect.fn("Looper.start")(function* (config: Prepared, resume: boolean) {
+      yield* checkSnapshot(config);
+      yield* run(["doctor", "--config", config.configPath, "--json"], config.projectRoot);
+      yield* run(["check", "--config", config.configPath, "--json"], config.projectRoot);
+      yield* checkSnapshot(config);
+      const output = yield* run(
+        [resume ? "resume" : "start", "--config", config.configPath, "--json"],
+        config.projectRoot,
+      );
+      const result = yield* decodeAcknowledgment(output);
+      const acknowledged = result.find((item) => item.configPath === config.configPath);
+      if (!acknowledged) return yield* new LooperError({ operation: "launch acknowledgment" });
+      return acknowledged.runId;
+    }, wrap("launch")),
+    inspect: Effect.fn("Looper.inspect")((config: Prepared) =>
+      inspect(config).pipe(wrap("inspect")),
+    ),
+    stop: Effect.fn("Looper.stop")(function* (config: Prepared, runId: string) {
+      yield* checkSnapshot(config);
+      const status = yield* inspect(config);
+      if (!status || status.runId !== runId)
+        return yield* new LooperError({ operation: "stop run identity" });
+      if (["completed", "blocked", "stopped", "error"].includes(status.status)) return;
+      yield* run(["stop", "--config", config.configPath, "--json"], config.projectRoot);
+    }, wrap("stop")),
   });
 });
 export const layer = Layer.effect(Looper, make);

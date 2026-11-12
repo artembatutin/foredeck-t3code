@@ -59,16 +59,19 @@ const make = Effect.gen(function* () {
   });
 
   return FactorySettingsStore.of({
-    get: (projectId) =>
+    get: Effect.fn("FactorySettingsStore.get")((projectId) =>
       selectSettings(projectId).pipe(
         Effect.map(Option.map((row) => row.settings)),
         Effect.catchTags(FactoryStoreError.catchStorage("settings.get")),
       ),
-    set: (projectId, settings) =>
-      Effect.gen(function* () {
+    ),
+    set: Effect.fn("FactorySettingsStore.set")(
+      function* (projectId, settings) {
         const updatedAt = DateTime.formatIso(yield* DateTime.now);
         yield* upsertSettings({ projectId, settings, updatedAt });
-      }).pipe(Effect.catchTags(FactoryStoreError.catchStorage("settings.set"))),
+      },
+      Effect.catchTags(FactoryStoreError.catchStorage("settings.set")),
+    ),
   });
 });
 

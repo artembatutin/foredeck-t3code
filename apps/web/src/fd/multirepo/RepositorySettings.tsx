@@ -9,12 +9,14 @@ import {
 } from "@t3tools/client-runtime/fd/multirepo";
 import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import type { ProjectRepositoryInputs, ServerConfig } from "@t3tools/contracts";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { connectionAtomRuntime } from "../../connection/runtime";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { SettingsSection } from "../../components/settings/settingsLayout";
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
+
+const commands = createRepositoryCommands(connectionAtomRuntime, createEnvironmentRpcCommand);
 
 export function RepositorySettings({
   project,
@@ -22,13 +24,9 @@ export function RepositorySettings({
   environmentLabel,
 }: {
   project: EnvironmentProject;
-  serverConfig: ServerConfig | null;
+  serverConfig: Pick<ServerConfig, "environment"> | null;
   environmentLabel: string;
 }) {
-  const commands = useMemo(
-    () => createRepositoryCommands(connectionAtomRuntime, createEnvironmentRpcCommand),
-    [],
-  );
   const permitted = useAtomValue(commands.setRepositories.permissionAtom(project.environmentId));
   const supported =
     serverConfig !== null && supportsRepositories(serverConfig.environment.capabilities);

@@ -76,23 +76,24 @@ export const make = Effect.gen(function* () {
   const work = yield* WorkService.WorkService;
 
   /** Every page of a listing: its items, and whether any page was stale. */
-  const listAll = (query: Omit<WorkListQuery, "cursor" | "limit">) =>
-    Effect.gen(function* () {
-      const items: Array<WorkItemSummary> = [];
-      let stale = false;
-      let cursor: string | null = null;
-      do {
-        const page: WorkListResult = yield* work.listItems(reader, {
-          ...query,
-          limit: LOOKUP_PAGE,
-          ...(cursor === null ? {} : { cursor }),
-        });
-        stale ||= page.stale;
-        items.push(...page.items);
-        cursor = page.nextCursor;
-      } while (cursor !== null);
-      return { items, stale };
-    });
+  const listAll = Effect.fn("WorkBackend.listAll")(function* (
+    query: Omit<WorkListQuery, "cursor" | "limit">,
+  ) {
+    const items: Array<WorkItemSummary> = [];
+    let stale = false;
+    let cursor: string | null = null;
+    do {
+      const page: WorkListResult = yield* work.listItems(reader, {
+        ...query,
+        limit: LOOKUP_PAGE,
+        ...(cursor === null ? {} : { cursor }),
+      });
+      stale ||= page.stale;
+      items.push(...page.items);
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+    return { items, stale };
+  });
 
   const read: Backend["read"] = (ref) =>
     work
@@ -103,37 +104,36 @@ export const make = Effect.gen(function* () {
         Effect.mapError(failed("read")),
       );
 
-  const summaries: Backend["summaries"] = (refs) =>
-    Effect.gen(function* () {
-      const bySource = new Map<WorkSourceId, Array<WorkItemId>>();
-      for (const { sourceId, itemId } of refs) {
-        bySource.set(sourceId, [...(bySource.get(sourceId) ?? []), itemId]);
-      }
-      const read = yield* Effect.forEach(
-        [...bySource],
-        ([sourceId, itemIds]) =>
-          work.currentSummaries(sourceId, itemIds).pipe(
-            Effect.timeoutOption(SUMMARIES_TIMEOUT),
-            Effect.map(Option.getOrElse(() => [])),
-            Effect.catchCause((cause) =>
-              Cause.hasInterruptsOnly(cause)
-                ? Effect.interrupt
-                : Effect.as(Effect.logWarning("assistant overview read no Work facts", cause), []),
-            ),
+  const summaries: Backend["summaries"] = Effect.fn("WorkBackend.summaries")(function* (refs) {
+    const bySource = new Map<WorkSourceId, Array<WorkItemId>>();
+    for (const { sourceId, itemId } of refs) {
+      bySource.set(sourceId, [...(bySource.get(sourceId) ?? []), itemId]);
+    }
+    const read = yield* Effect.forEach(
+      [...bySource],
+      ([sourceId, itemIds]) =>
+        work.currentSummaries(sourceId, itemIds).pipe(
+          Effect.timeoutOption(SUMMARIES_TIMEOUT),
+          Effect.map(Option.getOrElse(() => [])),
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.as(Effect.logWarning("assistant overview read no Work facts", cause), []),
           ),
-        { concurrency: "unbounded" },
-      );
-      return read.flat().map((summary) => ({
-        ref: summary.ref,
-        title: summary.title,
-        status: summary.status,
-        statusName: summary.nativeStatus?.name ?? null,
-        assignee: summary.assignee?.label ?? null,
-      }));
-    });
+        ),
+      { concurrency: "unbounded" },
+    );
+    return read.flat().map((summary) => ({
+      ref: summary.ref,
+      title: summary.title,
+      status: summary.status,
+      statusName: summary.nativeStatus?.name ?? null,
+      assignee: summary.assignee?.label ?? null,
+    }));
+  });
 
-  const findByMarker: Backend["findByMarker"] = ({ sourceId, marker }) =>
-    Effect.gen(function* () {
+  const findByMarker: Backend["findByMarker"] = Effect.fn("WorkBackend.findByMarker")(
+    function* ({ sourceId, marker }) {
       yield* work.refresh(reader, {});
       const { stored } = yield* work.resolveSource(sourceId);
       const searched = yield* listAll({ sourceId, search: marker });
@@ -151,10 +151,12 @@ export const make = Effect.gen(function* () {
         items,
         complete: !whole.stale && whole.items.every(({ invalid }) => invalid === null),
       };
-    }).pipe(Effect.mapError(failed("find")));
+    },
+    Effect.mapError(failed("find")),
+  );
 
   return HandoffBackend.HandoffBackend.of({
-    sources: (projectId) =>
+    sources: Effect.fn("HandoffBackend.sources")((projectId) =>
       work.listSources(reader, { projectId, includeDisconnected: false }).pipe(
         Effect.map(({ sources }) =>
           sources.map(({ sourceId, kind, label, identity, version }) => ({
@@ -167,6 +169,7 @@ export const make = Effect.gen(function* () {
         ),
         Effect.mapError(failed("sources")),
       ),
+    ),
     read,
     summaries,
     // What a capture writes is the whole body, as written: a read of it fingerprints the same.
@@ -175,20 +178,22 @@ export const make = Effect.gen(function* () {
     findByMarker,
     // An owner writes under their own session's grants, as their client reaches Work. An agent
     // takes Work's own grant for agents: a read-only client or a plan-mode thread only reads.
-    writer: (input) => {
+    writer: Effect.fn("HandoffBackend.writer")(function* (input) {
       const actor = HandoffBackend.isHandoffOwner(input)
         ? actorFromSession(input)
         : actorFromCaller(input);
-      return actor.grants.includes(AuthWorkWriteScope)
-        ? Effect.succeed(actor)
-        : Effect.fail(new HandoffBackend.HandoffWriteRefused());
-    },
-    create: (writer, input) =>
+      if (!actor.grants.includes(AuthWorkWriteScope))
+        return yield* new HandoffBackend.HandoffWriteRefused();
+      return actor;
+    }),
+    create: Effect.fn("HandoffBackend.create")((writer, input) =>
       work.createItem(writer, input).pipe(
         Effect.map(({ ref, key, url }) => ({ ref, key, url })),
         Effect.mapError(failed("create")),
       ),
-    update: (writer, input) =>
+    ),
+    update: Effect.fn("HandoffBackend.update")((writer, input) =>
       work.updateItem(writer, input).pipe(Effect.asVoid, Effect.mapError(failed("update"))),
+    ),
   });
 });

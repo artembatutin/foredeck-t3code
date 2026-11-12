@@ -190,45 +190,48 @@ export const makeDevinCloudAdapterV2 = Effect.fn("makeDevinCloudAdapterV2")(func
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: options.instanceId,
     driver,
-    getCapabilities: () => Effect.succeed(capabilities),
-    interruptDetachedTurn: (input) =>
-      Effect.gen(function* () {
-        const current = input.providerThread;
-        const id = current.nativeThreadRef?.nativeId;
-        if (
-          !options.settings.enabled ||
-          !options.apiKey ||
-          !options.settings.organizationId ||
-          current.driver !== driver ||
-          current.providerInstanceId !== options.instanceId ||
-          current.nativeThreadRef?.driver !== driver ||
-          !id
-        )
-          return yield* protocolError(
-            "Configure and enable the owning Cloud instance to stop this remote session",
-          );
-        yield* api.stop(id).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapter.ProviderAdapterInterruptError({
-                driver,
-                providerThreadId: current.id,
-                providerTurnId: input.providerTurnId,
-                cause,
-              }),
-          ),
+    getCapabilities: Effect.fn("DevinCloudAdapter.getCapabilities")(() =>
+      Effect.succeed(capabilities),
+    ),
+    interruptDetachedTurn: Effect.fn("DevinCloudAdapter.interruptDetachedTurn")(function* (input) {
+      const current = input.providerThread;
+      const id = current.nativeThreadRef?.nativeId;
+      if (
+        !options.settings.enabled ||
+        !options.apiKey ||
+        !options.settings.organizationId ||
+        current.driver !== driver ||
+        current.providerInstanceId !== options.instanceId ||
+        current.nativeThreadRef?.driver !== driver ||
+        !id
+      )
+        return yield* protocolError(
+          "Configure and enable the owning Cloud instance to stop this remote session",
         );
-      }),
-    planSelectionTransition: ({ current, target }) =>
-      Effect.succeed(
-        current.model === target.model && (target.options?.length ?? 0) === 0
-          ? turnScopedSelectionTransition()
-          : {
-              type: "reject" as const,
-              reason:
-                "Devin Cloud agent mode is fixed for each remote session. Start a new thread to change it.",
-            },
-      ),
+      yield* api.stop(id).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapter.ProviderAdapterInterruptError({
+              driver,
+              providerThreadId: current.id,
+              providerTurnId: input.providerTurnId,
+              cause,
+            }),
+        ),
+      );
+    }),
+    planSelectionTransition: Effect.fn("DevinCloudAdapter.planSelectionTransition")(
+      ({ current, target }) =>
+        Effect.succeed(
+          current.model === target.model && (target.options?.length ?? 0) === 0
+            ? turnScopedSelectionTransition()
+            : {
+                type: "reject" as const,
+                reason:
+                  "Devin Cloud agent mode is fixed for each remote session. Start a new thread to change it.",
+              },
+        ),
+    ),
     openSession: Effect.fn("DevinCloudAdapter.openSession")(function* (input) {
       if (!options.settings.enabled || !options.apiKey || !options.settings.organizationId)
         return yield* protocolError(
@@ -448,8 +451,8 @@ export const makeDevinCloudAdapterV2 = Effect.fn("makeDevinCloudAdapterV2")(func
           yield* finish(turn, "completed");
         }
       });
-      const poll = (turn: ActiveTurn): Effect.Effect<void> =>
-        Effect.gen(function* () {
+      const poll: (turn: ActiveTurn) => Effect.Effect<void> = Effect.fn("DevinCloudAdapter.poll")(
+        function* (turn: ActiveTurn) {
           let consecutiveFailures = 0;
           while (true) {
             if (active !== turn) return;
@@ -488,7 +491,8 @@ export const makeDevinCloudAdapterV2 = Effect.fn("makeDevinCloudAdapterV2")(func
             if (options.pollIntervalMs === 0) yield* Effect.yieldNow;
             else yield* Effect.sleep(options.pollIntervalMs ?? 2_000);
           }
-        });
+        },
+      );
       const attach = Effect.fnUntraced(function* (
         args: ProviderAdapter.ProviderAdapterV2EnsureThreadInput,
       ) {
@@ -818,31 +822,30 @@ export const makeDevinCloudAdapterV2 = Effect.fn("makeDevinCloudAdapterV2")(func
               "Cloud approvals and structured questions are handled in the remote Devin session",
             ),
           ),
-        readThreadSnapshot: (args) =>
-          Effect.gen(function* () {
-            if (!validateThread(args.providerThread) || !thread)
-              return yield* protocolError("Cloud thread is not attached to this runtime");
-            const id = nativeId();
-            const history = id
-              ? yield* api.messages(id).pipe(
-                  Effect.mapError(
-                    (cause) =>
-                      new ProviderAdapter.ProviderAdapterReadThreadSnapshotError({
-                        driver,
-                        providerThreadId: args.providerThread.id,
-                        cause,
-                      }),
-                  ),
-                )
-              : { items: [] };
-            const current = thread;
-            return {
-              providerThread: thread,
-              providerTurns,
-              messages: history.items.map((entry) => message(entry, current)),
-              runtimeRequests: [],
-            };
-          }),
+        readThreadSnapshot: Effect.fn("DevinCloudAdapter.readThreadSnapshot")(function* (args) {
+          if (!validateThread(args.providerThread) || !thread)
+            return yield* protocolError("Cloud thread is not attached to this runtime");
+          const id = nativeId();
+          const history = id
+            ? yield* api.messages(id).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapter.ProviderAdapterReadThreadSnapshotError({
+                      driver,
+                      providerThreadId: args.providerThread.id,
+                      cause,
+                    }),
+                ),
+              )
+            : { items: [] };
+          const current = thread;
+          return {
+            providerThread: thread,
+            providerTurns,
+            messages: history.items.map((entry) => message(entry, current)),
+            runtimeRequests: [],
+          };
+        }),
         rollbackThread: (args) =>
           Effect.fail(
             new ProviderAdapter.ProviderAdapterRollbackThreadError({

@@ -1,3 +1,4 @@
+import * as PlatformNodeCrypto from "@effect/platform-node/NodeCrypto";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- hashes the log to compare with the receipt.
 import * as NodeCrypto from "node:crypto";
 
@@ -52,11 +53,25 @@ const makeLayer = <E, R>(
     Layer.provideMerge(gitDriver),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-verify-" })),
     Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(PlatformNodeCrypto.layer),
     Layer.provideMerge(NodeServices.layer),
   );
 
 const decodeSettings = Schema.decodeUnknownSync(FactoryProjectSettings);
 const decodeReceiptJson = Schema.decodeUnknownSync(Schema.fromJsonString(FactoryVerifyReceipt));
+
+/** Moves the process to `directory` with the `PATH` given, returning what to restore. */
+const enterProcess = (directory: string, path: (previous: string | undefined) => string) => {
+  const previous = { cwd: process.cwd(), PATH: process.env.PATH };
+  process.chdir(directory);
+  process.env.PATH = path(previous.PATH);
+  return previous;
+};
+
+const restoreProcess = (previous: ReturnType<typeof enterProcess>) => {
+  process.chdir(previous.cwd);
+  process.env.PATH = previous.PATH;
+};
 
 /** Settings whose verify command runs `script` with the current Node executable. */
 const nodeVerify = (
@@ -415,19 +430,10 @@ it.layer(makeLayer(ProcessRunner.layer), { excludeTestServices: true })(
       /** The server's directory and PATH for the effect's length, as a real run inherits them. */
       const serverAt = <A, E, R>(directory: string, effect: Effect.Effect<A, E, R>) =>
         Effect.acquireUseRelease(
-          Effect.sync(() => {
-            const previous = { cwd: process.cwd(), PATH: process.env.PATH };
-            process.chdir(directory);
-            // Git still has to be found, by whatever follows the relative directory.
-            process.env.PATH = `./bin:${previous.PATH}`;
-            return previous;
-          }),
+          // Git still has to be found, by whatever follows the relative directory.
+          Effect.sync(() => enterProcess(directory, (previous) => `./bin:${previous}`)),
           () => effect,
-          (previous) =>
-            Effect.sync(() => {
-              process.chdir(previous.cwd);
-              process.env.PATH = previous.PATH;
-            }),
+          (previous) => Effect.sync(() => restoreProcess(previous)),
         );
       const makeExecutable = (file: string, text: string) =>
         Effect.gen(function* () {
@@ -834,18 +840,9 @@ describe("with exactly an empty PATH, and the server somewhere else", () => {
   /** The server's directory and exactly `PATH=` for the effect's length, as a real run inherits. */
   const serverAt = <A, E, R>(directory: string, effect: Effect.Effect<A, E, R>) =>
     Effect.acquireUseRelease(
-      Effect.sync(() => {
-        const previous = { cwd: process.cwd(), PATH: process.env.PATH };
-        process.chdir(directory);
-        process.env.PATH = "";
-        return previous;
-      }),
+      Effect.sync(() => enterProcess(directory, () => "")),
       () => effect,
-      (previous) =>
-        Effect.sync(() => {
-          process.chdir(previous.cwd);
-          process.env.PATH = previous.PATH;
-        }),
+      (previous) => Effect.sync(() => restoreProcess(previous)),
     );
 
   const holding = (directory: string, files: Readonly<Record<string, string>>) =>

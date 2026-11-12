@@ -62,15 +62,10 @@ const delegationRefusal = (category: HandoffAdmission.Refusal | "not_holding") =
 };
 
 /**
- * The project assistant's caller policy over MCP (see `McpCallerPolicy`), for the threads of the
- * Factory deliveries it manages: a caller is governed when its thread's family root (see
- * `FactoryService.familyRoot`) has a managed root, active, ending or retired. A governed caller
- * cannot run a tool that starts, messages, schedules, hands off or watches work (see
- * `callerTools`): its credential belongs to the thread, not to one run, so nothing tells the
- * owner's turn from Factory's there, and such a run would escape the delivery's slot. It can
- * answer only a pending live question of a run already counted under a slot its root holds,
- * which continues that run and starts none, and it delegates under that slot. Never-managed
- * deliveries, other threads and outside clients are unchanged. Whatever cannot be read refuses.
+ * MCP caller policy for threads whose family root is a managed root (any state). Such a caller
+ * cannot start, message, schedule, hand off or watch work (see `callerTools`): its credential is
+ * the thread's, so that run would escape the delivery's slot. It may only answer a live question
+ * of a run under its root's slot, and delegate under that slot. Whatever cannot be read refuses.
  */
 export const make = Effect.gen(function* () {
   const factory = yield* FactoryService.FactoryService;
@@ -78,54 +73,52 @@ export const make = Effect.gen(function* () {
   const readWork = readWorkWith(yield* HandoffBackend.HandoffBackend);
 
   /** The governed caller's root and its management, or none for a caller that is not governed. */
-  const governing = (threadId: ThreadId) =>
-    Effect.gen(function* () {
-      const root = yield* factory.familyRoot(threadId);
-      if (root === null) return undefined;
-      const management = yield* admission.management(root);
-      return management === "never" ? undefined : { root, management };
-    });
+  const governing = Effect.fn("CallerPolicy.governing")(function* (threadId: ThreadId) {
+    const root = yield* factory.familyRoot(threadId);
+    if (root === null) return undefined;
+    const management = yield* admission.management(root);
+    return management === "never" ? undefined : { root, management };
+  });
 
   /** An answer to a request: only a pending live question of a counted run of the root's own. */
-  const judgeAnswer = (
+  const judgeAnswer = Effect.fn("CallerPolicy.judgeAnswer")(function* (
     caller: McpInvocationContext.McpThreadCaller,
     governed: {
       readonly root: FactoryDeliveryId;
       readonly management: HandoffAdmission.Management;
     },
     args: unknown,
-  ) =>
-    Effect.gen(function* () {
-      // Every managed answer of an ended management is refused.
-      if (governed.management === "retired") return callerPolicyText.retired;
-      const { threadId, requestId } = Option.getOrElse(decodeRespondArguments(args), () => ({
-        threadId: undefined,
-        requestId: undefined,
-      }));
-      const target = threadId ?? caller.threadId;
-      // An answer that names no request cannot be shown to continue a counted run.
-      if (requestId === undefined) return callerPolicyText.liveOnly(target);
-      const ownership = yield* factory.requestOwnership({ threadId: target, requestId });
-      const slot = yield* admission.slot(governed.root);
-      if (ownership.root !== governed.root) return callerPolicyText.family;
-      const { request, run } = ownership;
-      // Core would resolve it and start a turn with the answer: refused before anything moves.
-      if (request?.capability === "message") return callerPolicyText.message(target);
-      const live =
-        slot === "held" &&
-        request?.status === "pending" &&
-        request.kind === "user_input" &&
-        request.capability === "live" &&
-        run !== null &&
-        !isTerminalRunStatus(run.status) &&
-        run.class !== "explicit";
-      return live ? undefined : callerPolicyText.liveOnly(target);
-    });
+  ) {
+    // Every managed answer of an ended management is refused.
+    if (governed.management === "retired") return callerPolicyText.retired;
+    const { threadId, requestId } = Option.getOrElse(decodeRespondArguments(args), () => ({
+      threadId: undefined,
+      requestId: undefined,
+    }));
+    const target = threadId ?? caller.threadId;
+    // An answer that names no request cannot be shown to continue a counted run.
+    if (requestId === undefined) return callerPolicyText.liveOnly(target);
+    const ownership = yield* factory.requestOwnership({ threadId: target, requestId });
+    const slot = yield* admission.slot(governed.root);
+    if (ownership.root !== governed.root) return callerPolicyText.family;
+    const { request, run } = ownership;
+    // Core would resolve it and start a turn with the answer: refused before anything moves.
+    if (request?.capability === "message") return callerPolicyText.message(target);
+    const live =
+      slot === "held" &&
+      request?.status === "pending" &&
+      request.kind === "user_input" &&
+      request.capability === "live" &&
+      run !== null &&
+      !isTerminalRunStatus(run.status) &&
+      run.class !== "explicit";
+    return live ? undefined : callerPolicyText.liveOnly(target);
+  });
 
   const screen: Policy["screen"] = ({ caller, calls }) => {
     const classed = calls.map((call) => ({
       call,
-      toolClass: CallerTools.callerToolClass(call.tool),
+      toolClass: CallerTools.callerToolClass(call.tool, call.arguments),
     }));
     // Reads only for calls the policy may refuse.
     if (classed.every(({ toolClass }) => toolClass === "allow")) return Effect.succeed(allow);
@@ -159,8 +152,8 @@ export const make = Effect.gen(function* () {
     );
   };
 
-  const delegation: Policy["delegation"] = (scope, handler) =>
-    Effect.gen(function* () {
+  const delegation: Policy["delegation"] = Effect.fn("CallerPolicy.delegation")(
+    function* (scope, handler) {
       const thread = scope.thread;
       if (thread === undefined) return yield* handler;
       const governed = yield* governing(thread.threadId).pipe(Effect.mapError(unconfirmed));
@@ -207,7 +200,8 @@ export const make = Effect.gen(function* () {
         case "needs_work":
           return yield* unconfirmed();
       }
-    });
+    },
+  );
 
   return { screen, delegation } satisfies Policy;
 });

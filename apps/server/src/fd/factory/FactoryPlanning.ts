@@ -30,13 +30,10 @@ const PLAN_EVIDENCE_VERSION = 1;
 const encodeEvidence = Schema.encodeEffect(Schema.fromJsonString(FactoryPlanEvidence));
 
 /**
- * Judges a planner's submissions for its delivery's current plan round (port of Looper's
- * `validatePlan`), by either path: the `factory_submit_plan` tool, or the fenced JSON of the
- * planner run's last assistant message. Task ids the delivery already uses are refused. A valid
- * plan, with tasks or without, is written to the delivery's evidence folder under T3 home as
- * `plan.json`, never to the worktree, and accepted; a later round's accepted plan replaces it, as
- * a task's later approval replaces its approval file. An invalid one goes back with every problem
- * at once. Judging records nothing on the delivery; the engine does, from the judgment.
+ * Judges a planner's submission (the `factory_submit_plan` tool or the run's last fenced JSON) for
+ * the current plan round, refusing task ids already in use and reporting every problem at once.
+ * A valid plan is written as `plan.json` in the evidence folder under T3 home, never the worktree.
+ * Judging records nothing on the delivery; the engine does.
  */
 export class FactoryPlanning extends Context.Service<
   FactoryPlanning,
@@ -143,14 +140,15 @@ const make = Effect.gen(function* () {
         ),
       );
 
-  const judgeFallback: FactoryPlanning["Service"]["judgeFallback"] = (delivery, effect) =>
-    Effect.gen(function* () {
-      const text = yield* lastAssistantText(effect);
-      const used = yield* usedTaskIds(delivery);
-      // A run without a message has no fenced block either.
-      const validation = parseFencedPlan(text ?? "", used);
-      return yield* conclude(delivery, "fallback", effect.threadId, validation);
-    });
+  const judgeFallback: FactoryPlanning["Service"]["judgeFallback"] = Effect.fn(
+    "FactoryPlanning.judgeFallback",
+  )(function* (delivery, effect) {
+    const text = yield* lastAssistantText(effect);
+    const used = yield* usedTaskIds(delivery);
+    // A run without a message has no fenced block either.
+    const validation = parseFencedPlan(text ?? "", used);
+    return yield* conclude(delivery, "fallback", effect.threadId, validation);
+  });
 
   return FactoryPlanning.of({ judge, judgeFallback });
 });

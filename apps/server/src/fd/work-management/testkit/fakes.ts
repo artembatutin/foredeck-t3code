@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AuthSettingsWriteScope,
@@ -102,6 +103,8 @@ export const projectRow = (
   scripts: [],
   createdAt: at,
   updatedAt: at,
+  pinnedAt: null,
+  archivedAt: null,
   deletedAt: null,
 });
 
@@ -135,7 +138,7 @@ export const threadShell = (
   ...overrides,
 });
 
-export const fakeCapabilities = (kind: WorkSourceKind): WorkSourceCapabilities => ({
+const fakeCapabilities = (kind: WorkSourceKind): WorkSourceCapabilities => ({
   create: true,
   statuses: ["todo", "in_progress", "done", "cancelled"],
   fields: ["title", "body", "labels"],
@@ -144,7 +147,7 @@ export const fakeCapabilities = (kind: WorkSourceKind): WorkSourceCapabilities =
   people: kind !== "markdown",
 });
 
-export const fakeDetail = (
+const fakeDetail = (
   ref: WorkItemRef,
   kind: WorkSourceKind,
   title: string,
@@ -178,7 +181,7 @@ export const fakeDetail = (
   return { ...detail, scopeFingerprint: workItemContentFingerprint(detail) };
 };
 
-export const summaryOf = (detail: WorkSourceItemDetail): WorkItemSummary => ({
+const summaryOf = (detail: WorkSourceItemDetail): WorkItemSummary => ({
   ref: detail.ref,
   kind: detail.kind,
   key: detail.key,
@@ -563,6 +566,7 @@ export const makeHarness = (adapters: ReadonlyArray<WorkSourceAdapter>) => {
     Layer.provideMerge(stores),
     Layer.provideMerge(persistence),
     Layer.provide(NodeServices.layer),
+    Layer.provide(NodeCrypto.layer),
   );
   return { layer, projects, threads, runs, secrets };
 };

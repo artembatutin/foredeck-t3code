@@ -3,10 +3,10 @@ import type { WorkStatus } from "@t3tools/contracts/fd/work-management";
 import type { ReactNode } from "react";
 import { Platform, View } from "react-native";
 
-import type { AppSymbolName } from "../../components/AppSymbol";
-import { AppText as Text } from "../../components/AppText";
-import { ControlPill } from "../../components/ControlPill";
-import { EmptyState } from "../../components/EmptyState";
+import type { AppSymbolName } from "../../components/ui/AppSymbol";
+import { AppText as Text } from "../../components/ui/AppText";
+import { ControlPill } from "../../components/ui/ControlPill";
+import { EmptyState } from "../../components/ui/EmptyState";
 
 export const STATUS_LABELS: Record<WorkStatus, string> = {
   todo: "To do",

@@ -27,12 +27,10 @@ import {
 } from "./pipeline/state.ts";
 
 /**
- * Whose work a turn or run on a Factory family thread carries on, decided from its exact causal
- * source and never from neighbouring runs or timestamps: `factory` for a root delivery's own work,
- * `explicit` for work someone started on purpose (the owner, a schedule, or an agent outside the
- * family), `unknown` when nothing shows which. The decision is pure over records the caller reads:
- * a family thread's lineage, runs and delegated tasks, Factory's deliveries, the recorded
- * automatic turns and the management of a sender's root.
+ * Whose work a turn or run on a Factory family thread carries on, decided purely from its exact
+ * causal source, never from neighbouring runs or timestamps: `factory` for a root delivery's own
+ * work, `explicit` for work someone started on purpose (the owner, a schedule, or an agent outside
+ * the family), `unknown` when nothing shows which.
  */
 export type FactoryProvenance =
   | { readonly class: "factory"; readonly root: FactoryDeliveryId }
@@ -118,34 +116,32 @@ const isSubagentChild = (lineage: OrchestrationV2AppThreadLineage | undefined) =
   lineage?.relationshipToParent === "subagent" && lineage.parentThreadId !== null;
 
 /**
- * The family a thread belongs to, structurally: a thread a Factory launch made belongs to that
- * delivery's root (a child's maps to its parent), and a thread delegated from a family thread, as
- * an app-owned task or a provider-native mirror, belongs to its parent's family, up to
- * `MAX_FAMILY_DEPTH` levels. Any other thread, including one delegated from a non-family thread,
- * has none. A lineage deeper than that fails, as a read does.
+ * The family a thread belongs to, structurally: a Factory-launched thread belongs to its
+ * delivery's root (a child's maps to its parent), and a thread delegated from a family thread
+ * belongs to its parent's family, up to `MAX_FAMILY_DEPTH` levels; deeper lineages fail as a read
+ * does. Any other thread has none.
  */
-export const familyOf = <E>(
+export const familyOf = Effect.fn("FactoryOwnership.familyOf")(function* <E>(
   reads: Pick<OwnershipReads<E>, "delivery" | "lineage">,
   threadId: ThreadId,
-) =>
-  Effect.gen(function* () {
-    let current = threadId;
-    for (let levels = 0; ; levels += 1) {
-      const launchedBy = launchDeliveryId(current);
-      if (launchedBy !== undefined) {
-        const delivery = yield* reads.delivery(launchedBy);
-        return delivery === undefined
-          ? null
-          : ({ root: delivery.parentId ?? launchedBy, launchedBy } satisfies FactoryFamily);
-      }
-      const lineage = yield* reads.lineage(current);
-      if (lineage === undefined || lineage.parentThreadId === null || !isSubagentChild(lineage)) {
-        return null;
-      }
-      if (levels === MAX_FAMILY_DEPTH) return yield* new FactoryFamilyDepthError({ threadId });
-      current = lineage.parentThreadId;
+) {
+  let current = threadId;
+  for (let levels = 0; ; levels += 1) {
+    const launchedBy = launchDeliveryId(current);
+    if (launchedBy !== undefined) {
+      const delivery = yield* reads.delivery(launchedBy);
+      return delivery === undefined
+        ? null
+        : ({ root: delivery.parentId ?? launchedBy, launchedBy } satisfies FactoryFamily);
     }
-  });
+    const lineage = yield* reads.lineage(current);
+    if (lineage === undefined || lineage.parentThreadId === null || !isSubagentChild(lineage)) {
+      return null;
+    }
+    if (levels === MAX_FAMILY_DEPTH) return yield* new FactoryFamilyDepthError({ threadId });
+    current = lineage.parentThreadId;
+  }
+});
 
 /** Sources of the owner's own messages: a client of theirs, never the server. */
 const OWNER_SOURCES: ReadonlySet<OrchestrationV2CreationSource> = new Set(["web", "mobile", "mcp"]);
@@ -186,38 +182,16 @@ const forRoot = (provenance: FactoryProvenance, root: FactoryDeliveryId) =>
   provenance.class === "factory" && provenance.root !== root ? unknown : provenance;
 
 /**
- * Classifies runs and automatic turns on the family threads of `root` (see `familyOf`) over the
- * given reads. A run's class is its message's, by the first rule that matches:
- *
- * - P1: a message Factory sent is Factory's.
- * - P2: a pull request watch's wake is Factory's when it is the root's own pull request on the
- *   thread it follows (see `ownsWake`), or one the root took, and explicit otherwise.
- * - P3: a restart continuation is its source run's class.
- * - P4: a recorded automatic turn keeps its recorded class.
- * - P5, P6: a delegated cohort's result and a delegated task's question are Factory's only when
- *   the run that delegated is; otherwise unknown.
- * - P7: a delegated thread's run, the one its delegation started or a follow-up naming its task,
- *   is Factory's only when the run that delegated the task is Factory's for the same root;
- *   otherwise unknown.
- * - P8: an asynchronous answer, the owner's own message, a schedule's prompt, and an agent's MCP
- *   message with no sender or a sender outside every managed family are explicit; an agent's
- *   message from a managed family is unknown. The owner's part comes before P7, since a follow-up
- *   the owner sends a delegated thread names a task that no run of theirs delegated.
- * - P9: anything else is unknown.
- *
- * An automatic turn takes its exact source's class: a pull request wake the P2 predicate's, a
- * restart continuation and a usage-limit resume the class of the run they continue, a question
- * and a completion the delegating run's when that is Factory's, and a native wake every run's on
- * its provider thread (see `providerThread`).
+ * Classifies runs and automatic turns on the family threads of `root` (see `familyOf`). A run's
+ * class is its message's, by the first matching rule P1 to P9 (see `messageClass`); the owner's
+ * part of P8 precedes P7, since an owner's follow-up on a delegated thread names a task no run of
+ * theirs delegated. An automatic turn takes its exact source's class.
  */
 export const classifier = <E>(reads: OwnershipReads<E>, root: FactoryDeliveryId) => {
+  type Classified = Effect.Effect<FactoryProvenance, E | FactoryFamilyDepthError>;
   // Runs already on the path being classified: a source that leads back to one is unknown.
-  const runClass = (
-    threadId: ThreadId,
-    runId: RunId,
-    path: ReadonlySet<string>,
-  ): Effect.Effect<FactoryProvenance, E | FactoryFamilyDepthError> =>
-    Effect.gen(function* () {
+  const runClass: (threadId: ThreadId, runId: RunId, path: ReadonlySet<string>) => Classified =
+    Effect.fn("FactoryOwnership.runClass")(function* (threadId, runId, path) {
       const key = `${threadId}\u0000${runId}`;
       if (path.has(key)) return unknown;
       const thread = yield* reads.thread(threadId);
@@ -227,13 +201,13 @@ export const classifier = <E>(reads: OwnershipReads<E>, root: FactoryDeliveryId)
     });
 
   /** The class of the message that started the run: its first matching rule, P1 to P9. */
-  const messageClass = (
+  const messageClass: (
     threadId: ThreadId,
     thread: FamilyThread,
     run: OrchestrationV2Run,
     path: ReadonlySet<string>,
-  ): Effect.Effect<FactoryProvenance, E | FactoryFamilyDepthError> =>
-    Effect.gen(function* () {
+  ) => Classified = Effect.fn("FactoryOwnership.messageClass")(
+    function* (threadId, thread, run, path) {
       // P1: a message Factory sent is the root's of the delivery it names.
       const sender = factoryMessageDeliveryId(run.userMessageId);
       if (sender !== undefined) {
@@ -305,24 +279,27 @@ export const classifier = <E>(reads: OwnershipReads<E>, root: FactoryDeliveryId)
       }
       // P9: anything else, an unrecorded native wake or usage-limit resume included.
       return unknown;
-    });
+    },
+  );
 
   /**
    * A native wake's class: every run on its provider thread, where the background work it reports
    * could only have been started, decides it. All Factory's for this root is Factory's, all
    * explicit is explicit, and anything else (mixed, unknown, another root, or no run) is unknown.
    */
-  const providerThreadClass = (threadId: ThreadId, providerThreadId: ProviderThreadId) =>
-    Effect.gen(function* () {
-      const thread = yield* reads.thread(threadId);
-      const runs = (thread?.runs ?? []).filter((run) => run.providerThreadId === providerThreadId);
-      if (runs.length === 0) return unknown;
-      const classes = yield* Effect.forEach(runs, (run) => runClass(threadId, run.id, new Set()));
-      if (classes.every((provenance) => onlyFactory(provenance, root).class === "factory")) {
-        return factory(root);
-      }
-      return classes.every((provenance) => provenance.class === "explicit") ? explicit : unknown;
-    });
+  const providerThreadClass = Effect.fn("FactoryOwnership.providerThreadClass")(function* (
+    threadId: ThreadId,
+    providerThreadId: ProviderThreadId,
+  ) {
+    const thread = yield* reads.thread(threadId);
+    const runs = (thread?.runs ?? []).filter((run) => run.providerThreadId === providerThreadId);
+    if (runs.length === 0) return unknown;
+    const classes = yield* Effect.forEach(runs, (run) => runClass(threadId, run.id, new Set()));
+    if (classes.every((provenance) => onlyFactory(provenance, root).class === "factory")) {
+      return factory(root);
+    }
+    return classes.every((provenance) => provenance.class === "explicit") ? explicit : unknown;
+  });
 
   return {
     run: (threadId: ThreadId, runId: RunId) =>
@@ -331,37 +308,36 @@ export const classifier = <E>(reads: OwnershipReads<E>, root: FactoryDeliveryId)
       ),
     providerThread: providerThreadClass,
     /** An automatic turn's class, from the exact source its producer presents. */
-    turn: (turn: AutomaticTurn): Effect.Effect<FactoryProvenance, E | FactoryFamilyDepthError> =>
-      Effect.gen(function* () {
-        switch (turn.kind) {
-          case "pull_request_wake": {
-            const owner = yield* reads.delivery(root);
-            const own =
-              owner !== undefined &&
-              ownsWake(owner.state, {
-                threadId: turn.threadId,
-                number: turn.pullRequest.number,
-                url: turn.pullRequest.url,
-                watchStartedAt: turn.watchStartedAt,
-              });
-            return own ? factory(root) : explicit;
-          }
-          case "restart_continuation":
-            return forRoot(yield* runClass(turn.threadId, turn.sourceRunId, new Set()), root);
-          case "usage_limit_resume":
-            return forRoot(
-              yield* runClass(turn.threadId, turn.usageLimitContinuationOfRunId, new Set()),
-              root,
-            );
-          case "delegated_question":
-            return turn.delegatingRunId === null
-              ? unknown
-              : onlyFactory(yield* runClass(turn.threadId, turn.delegatingRunId, new Set()), root);
-          case "delegated_completion":
-            return onlyFactory(yield* runClass(turn.threadId, turn.parentRunId, new Set()), root);
-          case "background_wake":
-            return yield* providerThreadClass(turn.threadId, turn.providerThreadId);
+    turn: Effect.fn("FactoryOwnership.turn")(function* (turn: AutomaticTurn) {
+      switch (turn.kind) {
+        case "pull_request_wake": {
+          const owner = yield* reads.delivery(root);
+          const own =
+            owner !== undefined &&
+            ownsWake(owner.state, {
+              threadId: turn.threadId,
+              number: turn.pullRequest.number,
+              url: turn.pullRequest.url,
+              watchStartedAt: turn.watchStartedAt,
+            });
+          return own ? factory(root) : explicit;
         }
-      }),
+        case "restart_continuation":
+          return forRoot(yield* runClass(turn.threadId, turn.sourceRunId, new Set()), root);
+        case "usage_limit_resume":
+          return forRoot(
+            yield* runClass(turn.threadId, turn.usageLimitContinuationOfRunId, new Set()),
+            root,
+          );
+        case "delegated_question":
+          return turn.delegatingRunId === null
+            ? unknown
+            : onlyFactory(yield* runClass(turn.threadId, turn.delegatingRunId, new Set()), root);
+        case "delegated_completion":
+          return onlyFactory(yield* runClass(turn.threadId, turn.parentRunId, new Set()), root);
+        case "background_wake":
+          return yield* providerThreadClass(turn.threadId, turn.providerThreadId);
+      }
+    }),
   };
 };

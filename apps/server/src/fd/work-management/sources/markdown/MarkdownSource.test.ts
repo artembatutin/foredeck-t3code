@@ -3,6 +3,7 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProjectId } from "@t3tools/contracts";
@@ -136,7 +137,7 @@ describe("MarkdownSource", () => {
         nextCursor: null,
         stale: false,
       });
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("creates an item atomically and reads it back", () =>
@@ -220,7 +221,7 @@ describe("MarkdownSource", () => {
       );
       const missing = yield* failure(adapter.get(runtime, id("fd-zzzzzz")));
       assert.strictEqual(missing._tag, "WorkItemNotFound");
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("lists, filters, searches, sorts and paginates the directory", () =>
@@ -303,7 +304,7 @@ describe("MarkdownSource", () => {
       ]);
       const hidden = yield* failure(adapter.get(runtime, id("fd-eeeeee")));
       assert.strictEqual(hidden._tag, "WorkItemNotFound");
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("derives blocked from open blockers and relates parents and children", () =>
@@ -343,7 +344,7 @@ describe("MarkdownSource", () => {
         actor,
       );
       assert.isFalse((yield* adapter.get(runtime, id("fd-aaaaaa"))).blocked);
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("lists unreadable and duplicated files read-only with the reason", () =>
@@ -384,7 +385,7 @@ describe("MarkdownSource", () => {
       const duplicate = yield* adapter.get(runtime, id("FD-AAAAAA"));
       assert.strictEqual(duplicate.title, "First");
       assert.strictEqual(duplicate.invalid?.code, "duplicate_id");
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("refuses a stale revision with the current item and leaves the file alone", () =>
@@ -411,7 +412,7 @@ describe("MarkdownSource", () => {
       );
       assert.strictEqual(renamed.title, "Renamed");
       assert.notStrictEqual(renamed.revision, created.revision);
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("patches fields in place, merges labels and bumps updated on every write", () =>
@@ -535,7 +536,7 @@ describe("MarkdownSource", () => {
         yield* listDirectory,
         [`${other.ref.itemId}-other.md`, filename].toSorted(),
       );
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("appends comments under a Notes heading and reads them back", () =>
@@ -584,7 +585,7 @@ describe("MarkdownSource", () => {
         `Intro\n\n## Notes\n- ${EPOCH} (Artem) First note\n- 1970-01-01T00:01:00.000Z (Worker) Second line\n`,
       );
       assert.isTrue((yield* readTask(`${created.ref.itemId}-alpha.md`)).endsWith(detail.body));
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("keeps the file's notes when a body is replaced", () =>
@@ -617,7 +618,7 @@ describe("MarkdownSource", () => {
         detail.comments.map((comment) => comment.body),
         ["First note"],
       );
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("lists symbolic links read-only and never reads or writes through them", () =>
@@ -668,7 +669,7 @@ describe("MarkdownSource", () => {
       const beta = yield* adapter.get(runtime, id("fd-bbbbbb"));
       assert.strictEqual(beta.title, "Beta");
       assert.isNull(beta.invalid);
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   // Root reads any file, so permission bits cannot make one unreadable.
@@ -704,7 +705,7 @@ describe("MarkdownSource", () => {
         const beta = yield* adapter.get(runtime, id("fd-bbbbbb"));
         assert.strictEqual(beta.title, "Beta");
         assert.isNull(beta.invalid);
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect(
@@ -743,7 +744,7 @@ describe("MarkdownSource", () => {
         );
         assert.strictEqual(again.priority, "high");
         assert.strictEqual(again.revision, revisionOf(yield* fs.readFile(filePath)));
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("caps oversized notes on read and refuses a comment that would not fit", () =>
@@ -768,7 +769,7 @@ describe("MarkdownSource", () => {
       });
       const after = yield* adapter.get(runtime, alphaRef.itemId);
       assert.strictEqual(after.comments[1]?.body, fitting);
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("writes into blank optional keys instead of refusing the edit", () =>
@@ -792,7 +793,7 @@ describe("MarkdownSource", () => {
           "",
         ].join("\n"),
       );
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("lists an oversized file read-only without reading it", () =>
@@ -811,7 +812,7 @@ describe("MarkdownSource", () => {
         reads.map((read) => path.basename(read)),
         ["fd-aaaaaa.md"],
       );
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("merges labels against the file's whole list and refuses more than the cap", () =>
@@ -837,7 +838,7 @@ describe("MarkdownSource", () => {
       const expected = [...labels.slice(9), "new"];
       assert.deepStrictEqual(trimmed.labels, expected);
       assert.include(yield* readTask("fd-aaaaaa.md"), `labels: ${expected.join(", ")}\n`);
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   describe("the scope fingerprint of a body past the wire cap", () => {
@@ -859,7 +860,7 @@ describe("MarkdownSource", () => {
         assert.isTrue(after.bodyTruncated);
         assert.notStrictEqual(after.revision, before.revision);
         assert.strictEqual(after.scopeFingerprint, before.scopeFingerprint);
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
     );
 
     it.effect("stays for a comment on a body already past the cap", () =>
@@ -871,7 +872,7 @@ describe("MarkdownSource", () => {
         const after = yield* adapter.get(runtime, alphaRef.itemId);
         assert.notStrictEqual(after.revision, before.revision);
         assert.strictEqual(after.scopeFingerprint, before.scopeFingerprint);
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
     );
 
     it.effect("moves for an edit of criteria past the cap, which the served body cannot show", () =>
@@ -889,7 +890,7 @@ describe("MarkdownSource", () => {
         const after = yield* adapter.get(runtime, alphaRef.itemId);
         assert.strictEqual(after.body, before.body);
         assert.notStrictEqual(after.scopeFingerprint, before.scopeFingerprint);
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
     );
 
     it.effect("moves for an edit of a long description past the cap", () =>
@@ -901,7 +902,7 @@ describe("MarkdownSource", () => {
         const after = yield* adapter.get(runtime, alphaRef.itemId);
         assert.strictEqual(after.body, before.body);
         assert.notStrictEqual(after.scopeFingerprint, before.scopeFingerprint);
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
     );
 
     it.effect("is what an item of the same text written whole fingerprints", () =>
@@ -920,7 +921,7 @@ describe("MarkdownSource", () => {
             bodyFidelity: "exact",
           }),
         );
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
     );
   });
 
@@ -951,7 +952,7 @@ describe("MarkdownSource", () => {
           (yield* adapter.list(runtime, query({ search: "alpha" }))).items.length,
           1,
         );
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("lists an undecodable file whose name is not an id under a stable hashed id", () =>
@@ -973,7 +974,7 @@ describe("MarkdownSource", () => {
       assert.strictEqual(refusal._tag, "WorkUnsupported");
       const [again] = (yield* adapter.list(runtime, query())).items;
       assert.strictEqual(again?.ref.itemId, itemId);
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("refuses a body edit of an item whose body is longer than the served view", () =>
@@ -997,7 +998,7 @@ describe("MarkdownSource", () => {
       const titled = yield* adapter.update(runtime, { ref: alphaRef, title: "Alpha prime" }, actor);
       assert.strictEqual(titled.title, "Alpha prime");
       assert.include(yield* readTask("fd-aaaaaa.md"), `${tail}\n\n## Notes\n`);
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   describe("the scope fingerprint of a body whose code fence never closes", () => {
@@ -1026,7 +1027,7 @@ describe("MarkdownSource", () => {
           twice.comments.map((comment) => comment.body),
           ["First", "Second"],
         );
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
     );
 
     it.effect("moves for an edit inside the fence, after a comment as before one", () =>
@@ -1048,7 +1049,7 @@ describe("MarkdownSource", () => {
           ["First"],
         );
         assert.notStrictEqual(edited.scopeFingerprint, commented.scopeFingerprint);
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
     );
   });
 
@@ -1083,7 +1084,7 @@ describe("MarkdownSource", () => {
           "",
         ].join("\n"),
       );
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("lists a file under its stem id in any casing, yielding to a frontmatter id", () =>
@@ -1117,7 +1118,7 @@ describe("MarkdownSource", () => {
         actor,
       );
       assert.strictEqual(renamed.title, "Alpha prime");
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("attributes a note to someone when the actor has no usable label", () =>
@@ -1133,7 +1134,7 @@ describe("MarkdownSource", () => {
         detail.comments.map((comment) => [comment.author?.label, comment.body]),
         [["someone", "Hi"]],
       );
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("checks for links only when a file is first seen, changed or written", () =>
@@ -1158,7 +1159,7 @@ describe("MarkdownSource", () => {
       links.length = 0;
       yield* adapter.update(runtime, { ref: alphaRef, title: "Alpha prime" }, actor);
       assert.deepStrictEqual(names(), ["fd-aaaaaa.md"]);
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("starts a Notes block with the file's line break when the body has none", () =>
@@ -1171,7 +1172,7 @@ describe("MarkdownSource", () => {
         yield* fs.readFileString(filePath),
         `---\r\n${ROWS.join("\r\n")}\r\nupdated: "${EPOCH}"\r\n---\r\n## Notes\r\n- ${EPOCH} (Artem) Hi\r\n`,
       );
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("ends the watch stream quietly when the directory is missing", () =>
@@ -1179,7 +1180,7 @@ describe("MarkdownSource", () => {
       const { root, adapter } = yield* setup;
       const events = yield* Stream.runCollect(watching(adapter, runtimeFor(root, "work/missing")));
       assert.deepStrictEqual(events, []);
-    }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 });
 
@@ -1210,6 +1211,6 @@ describe("MarkdownSource watching", () => {
       );
       yield* adapter.create(runtime, { sourceId, title: "Alpha" }, actor);
       yield* Queue.take(seen).pipe(Effect.timeout("30 seconds"));
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 });

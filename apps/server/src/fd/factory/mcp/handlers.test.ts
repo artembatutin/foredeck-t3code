@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -112,6 +113,7 @@ const layer = FactoryService.layer.pipe(
   Layer.provideMerge(GitVcsDriver.layer),
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-mcp-" })),
   Layer.provideMerge(VcsProcess.layer),
+  Layer.provideMerge(NodeCrypto.layer),
   Layer.provideMerge(NodeServices.layer),
 );
 

@@ -363,23 +363,21 @@ const layerOf = (fakes: Fakes) => {
     }),
     Layer.mock(ProjectStore.ProjectStoreV2)({
       get: (projectId) =>
-        Effect.succeed(
-          Option.some({
-            projectId,
-            title: "Alpha",
-            workspaceRoot: "/projects/alpha",
-            defaultModelSelection: null,
-            defaultThreadEnvMode: null,
-            autoPull: false,
-            faviconPath: null,
-            projectIcon: null,
-            scripts: [],
-            createdAt: at,
-            updatedAt: at,
-            deletedAt: null,
-            repositories: [],
-          } as never),
-        ),
+        Effect.succeedSome({
+          projectId,
+          title: "Alpha",
+          workspaceRoot: "/projects/alpha",
+          defaultModelSelection: null,
+          defaultThreadEnvMode: null,
+          autoPull: false,
+          faviconPath: null,
+          projectIcon: null,
+          scripts: [],
+          createdAt: at,
+          updatedAt: at,
+          deletedAt: null,
+          repositories: [],
+        } as never),
     }),
   );
   const admission = HandoffAdmission.layer.pipe(

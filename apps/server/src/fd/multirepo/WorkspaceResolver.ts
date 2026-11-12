@@ -51,9 +51,7 @@ export const make = Effect.gen(function* () {
     function* (threadId: ThreadId, requestedPath: string) {
       const thread = yield* threads
         .getThread(threadId)
-        .pipe(
-          Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed(undefined) }),
-        );
+        .pipe(Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.undefined }));
       const binding = thread?.workspaceBinding;
       if (!RepositorySet.isMultiRepo(binding?.repositories) || binding === undefined)
         return undefined;
@@ -153,7 +151,7 @@ export const make = Effect.gen(function* () {
         if (supportsRepositories && input.cwd === undefined) return input;
         const thread = yield* threads.getThread(ThreadIdSchema.make(input.threadId)).pipe(
           Effect.catchTags({
-            ProjectionStoreThreadNotFoundError: () => Effect.succeed(undefined),
+            ProjectionStoreThreadNotFoundError: () => Effect.undefined,
           }),
         );
         if (!supportsRepositories) {
@@ -209,3 +207,18 @@ export const make = Effect.gen(function* () {
   };
   return { ...forClient(true), forClient };
 });
+
+/** Core behavior for a connection that negotiated no repository support and has no resolver. */
+export const passthrough: ReturnType<Effect.Success<typeof make>["forClient"]> = {
+  resolve: () =>
+    Effect.fail(
+      new RepositoryTargetError({
+        detail: "Repository targets are unavailable on this connection.",
+      }),
+    ),
+  resolveThreadPath: () => Effect.undefined,
+  resolveInput: (input) => Effect.succeed(input),
+  resolveTerminalInput: (input) => Effect.succeed(input),
+  run: (input, use) => use(input),
+  stream: (input, use) => use(input),
+};

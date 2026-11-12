@@ -1,4 +1,4 @@
-import { RequestActionButton } from "./RequestActionButton";
+import { Button } from "../../components/ui/Button";
 import type { ProviderApprovalDecision, RuntimeMode, RuntimeRequestId } from "@t3tools/contracts";
 import {
   approvalChoiceNote,
@@ -6,9 +6,14 @@ import {
   approvalOptionLabel,
   pendingApprovalReason,
 } from "@t3tools/shared/fd/approvals";
-import { View } from "react-native";
+import {
+  FULL_ACCESS_OVERRIDE_QUESTION,
+  fullAccessOverrideExplanation,
+} from "@t3tools/client-runtime/state/thread-requests";
+import { useState } from "react";
+import { Pressable, View } from "react-native";
 
-import { AppText as Text } from "../../components/AppText";
+import { AppText as Text } from "../../components/ui/AppText";
 import type { PendingApproval } from "../../lib/threadActivity";
 
 export interface PendingApprovalCardProps {
@@ -16,7 +21,7 @@ export interface PendingApprovalCardProps {
   readonly approval: PendingApproval;
   readonly respondingApprovalId: RuntimeRequestId | null;
   /** The thread's mode, which says what this approval was not already covered by. */
-  readonly runtimeMode: RuntimeMode | undefined;
+  readonly runtimeMode?: RuntimeMode | undefined;
   readonly onRespond: (
     requestId: RuntimeRequestId,
     decision: ProviderApprovalDecision,
@@ -26,10 +31,9 @@ export interface PendingApprovalCardProps {
 export function PendingApprovalCard(props: PendingApprovalCardProps) {
   const options = approvalChoices(props.approval.options);
   const warning = options.find((option) => option.warning)?.warning;
-  // Opaque for the same reason as PendingUserInputCard: nothing blurs the feed
-  // behind this card, so a translucent surface bleeds messages through it.
   const canRespond = props.approval.responseCapability === "live";
   const disabled = !canRespond || props.respondingApprovalId === props.approval.requestId;
+  const [explanationOpen, setExplanationOpen] = useState(false);
   return (
     <View className="gap-2.5 rounded-[20px] border border-border bg-card-alt p-4">
       <Text className="font-t3-bold text-2xs uppercase tracking-[1.1px] text-foreground-secondary">
@@ -52,6 +56,22 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
         })}{" "}
         {approvalChoiceNote(options)}
       </Text>
+      {props.approval.fullAccessOverride ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityState={{ expanded: explanationOpen }}
+          onPress={() => setExplanationOpen((open) => !open)}
+        >
+          <Text className="font-t3-bold text-xs text-foreground-secondary underline">
+            {FULL_ACCESS_OVERRIDE_QUESTION}
+          </Text>
+          {explanationOpen ? (
+            <Text className="mt-1 font-sans text-xs leading-normal text-foreground-muted">
+              {fullAccessOverrideExplanation(props.approval.fullAccessOverride)}
+            </Text>
+          ) : null}
+        </Pressable>
+      ) : null}
       {!canRespond ? (
         <Text className="font-sans text-sm leading-5 text-foreground-muted">
           The provider process for this request is no longer available. Interrupt or restart the run
@@ -61,9 +81,9 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
       {warning ? (
         <Text className="font-sans text-xs leading-normal text-warning-foreground">{warning}</Text>
       ) : null}
-      <View className="flex-row flex-wrap gap-2.5">
+      <View className="gap-2">
         {options.map((option) => (
-          <RequestActionButton
+          <Button
             key={option.decision}
             label={approvalOptionLabel(option)}
             tone={
@@ -75,6 +95,7 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
             }
             disabled={disabled || !props.canOperateThread}
             onPress={() => void props.onRespond(props.approval.requestId, option.decision)}
+            fullWidth
           />
         ))}
       </View>

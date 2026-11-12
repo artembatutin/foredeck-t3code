@@ -9,14 +9,14 @@ import type {
 import { type ReactNode, useState } from "react";
 import { View } from "react-native";
 
-import { AppText as Text, AppTextInput } from "../../components/AppText";
-import { ErrorBanner } from "../../components/ErrorBanner";
-import { ListRowLayout } from "../../components/ListRowLayout";
-import { ListSection } from "../../components/ListSection";
-import { RowPressable } from "../../components/RowPressable";
-import { SegmentedControl } from "../../components/SegmentedControl";
+import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
+import { ErrorBanner } from "../../components/ui/ErrorBanner";
+import { ListRowLayout } from "../../components/ui/ListRowLayout";
+import { ListSection } from "../../components/ui/ListSection";
+import { RowPressable } from "../../components/ui/RowPressable";
+import { SegmentedControl } from "../../components/ui/SegmentedControl";
 import { StatusPill } from "../../components/StatusPill";
-import { ThemedSwitch } from "../../components/ThemedSwitch";
+import { ThemedSwitch } from "../../components/ui/ThemedSwitch";
 import { useEnvironmentQuery } from "../../state/query";
 import { useEnvironmentScope } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -42,7 +42,7 @@ function Field({ label, children }: { readonly label: string; readonly children:
 /** A project member's Work sources: view, test, disconnect, restore, remove token and add. */
 export function WorkSources(props: {
   readonly project: EnvironmentProject;
-  readonly serverConfig: ServerConfig | null;
+  readonly serverConfig: Pick<ServerConfig, "environment"> | null;
   readonly environmentLabel: string;
 }) {
   const support = workSupport(props.serverConfig);

@@ -21,14 +21,21 @@ const git = (cwd: string, args: string[]) =>
 
 const entries = (output: string) => output.split("\0").filter(Boolean);
 
-/** Compare mode and object identity too: a symlink is not an upstream source file. */
-const treeEntries = (cwd: string, tree: string, paths: string[]) =>
-  new Map(
-    entries(git(cwd, ["ls-tree", "-rz", tree, "--", ...paths])).map((entry) => {
-      const tab = entry.indexOf("\t");
-      return [entry.slice(tab + 1), entry.slice(0, tab)];
-    }),
-  );
+/**
+ * Compare mode and object identity too: a symlink is not an upstream source file.
+ * Lists the whole tree and filters in memory, because an upstream update can change more
+ * paths than fit in one command line.
+ */
+const treeEntries = (cwd: string, tree: string, paths: string[]) => {
+  const wanted = new Set(paths);
+  const result = new Map<string, string>();
+  for (const entry of entries(git(cwd, ["ls-tree", "-rz", tree]))) {
+    const tab = entry.indexOf("\t");
+    const path = entry.slice(tab + 1);
+    if (wanted.has(path)) result.set(path, entry.slice(0, tab));
+  }
+  return result;
+};
 
 function readPolicy(content: string): Set<string> {
   const policy: unknown = JSON.parse(content);

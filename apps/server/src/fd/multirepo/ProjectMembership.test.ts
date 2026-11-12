@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
@@ -38,6 +39,7 @@ const layer = Layer.mergeAll(
     Layer.merge(
       Layer.succeed(ProjectFavicon.ProjectFaviconResolver, {
         resolvePath: () => Effect.succeed(null),
+        invalidate: () => Effect.void,
       }),
       Layer.succeed(RepositoryIdentity.RepositoryIdentityResolver, {
         resolve: () => Effect.succeed(null),
@@ -50,6 +52,7 @@ const layer = Layer.mergeAll(
   Layer.provide(ServerSettings.layerTest()),
   Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "fd-membership-" })),
   Layer.provideMerge(NodeServices.layer),
+  Layer.provide(NodeCrypto.layer),
 );
 
 it.layer(layer)("project repository integration", (it) => {

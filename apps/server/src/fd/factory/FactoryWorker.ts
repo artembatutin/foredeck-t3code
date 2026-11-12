@@ -85,11 +85,9 @@ class FactoryLaunchWithdrawnError extends Schema.TaggedError<FactoryLaunchWithdr
 }
 
 /**
- * A parent's child cannot start, or its start be taken, on the parent's branch: its delivery is
- * not stored among the parent's children, it has no worktree to share, which commit it starts from
- * cannot be established (the task before it records no approved commit, or the parent recorded no
- * branch start and its branch's reflog does not hold it), or the parent's first child started from
- * a commit other than where the branch started. Nothing was started or taken.
+ * A parent's child cannot start (or its start be taken) on the parent's branch: it is not among
+ * the parent's children, has no worktree to share, its starting commit cannot be established, or
+ * the first child started somewhere other than where the branch started. Nothing was started.
  */
 class FactoryChildStartError extends Schema.TaggedError<FactoryChildStartError>()(
   "FactoryChildStartError",
@@ -113,24 +111,10 @@ class FactoryChildStartError extends Schema.TaggedError<FactoryChildStartError>(
 }
 
 /**
- * Drives deliveries through the pure engine. A step folds one event into the stored delivery,
- * stores the new state with its stage attempts, then queues the effects the engine returned;
- * each effect's result (or failure) is fed back as the delivery's next step. A step that moves
- * the delivery into a status its item announces records that Work comment with the new state and
- * then queues it. A step that approves a parent's plan stores its tasks, in plan order, with the
- * approval. Each step that stores something moves the deliveries' change epoch once it has
- * committed.
- *
- * A parent runs its children one at a time on its branch and worktree: the worker starts the
- * child the parent waits for, and hands the parent each child's approval once it is stored. A
- * cancelled parent cancels its children that are not approved, and a child cancelled on its own
- * cancels its parent, so its unfinished siblings too (owner decision). A parent done once its
- * merged pull request is closed out makes its approved children done. A parent's lock is taken
- * before its children's, never while one of theirs is held.
- *
- * Before each effect but a close-out, the worker asks the admission port (see
- * `FactoryAdmission`), and runs the effect only once admitted. A deferred effect stays awaited and
- * marked, with no job, until a redispatch queues one; a refused one fails, blocking the delivery.
+ * Drives deliveries through the pure engine: a step stores the new state, then queues its effects,
+ * whose results feed back as the next step. A parent runs its children one at a time on its
+ * worktree; take a parent's lock before its children's, never while one of theirs is held. Every
+ * effect but a close-out runs only once `FactoryAdmission` admits it.
  */
 export class FactoryWorker extends Context.Service<
   FactoryWorker,
@@ -148,12 +132,9 @@ export class FactoryWorker extends Context.Service<
       FactoryStoreError
     >;
     /**
-     * Decides an event from the stored delivery, then steps it, both under the delivery's lock:
-     * no other step of the delivery runs between what `decide` read and the step. A decision
-     * that fails steps nothing. Returns the stored result, its newest stage attempts as a
-     * snapshot carries them (read under the same lock, so they are that result's and no later
-     * step's) and the decision's value; none for an unknown delivery, where `decide` does not
-     * run.
+     * Decides an event from the stored delivery, then steps it, both under the delivery's lock so
+     * no other step runs in between. A failed decision steps nothing. Returns the stored result,
+     * its stage attempts read under the same lock, and the decision; none for an unknown delivery.
      */
     readonly stepWith: <A, E>(
       deliveryId: FactoryDeliveryId,
@@ -171,21 +152,14 @@ export class FactoryWorker extends Context.Service<
     >;
     /**
      * Steps the deliveries the event's thread belongs to. A run's end goes to the delivery whose
-     * active stage attempt names the thread; a deletion goes to every active delivery that records
-     * the thread, since a delivery keeps its threads after their attempts finish, or follows its
-     * pull request there (a parent, on its last child's author thread). A delivery whose launch or
-     * turn result naming the thread is being stored gets either.
+     * active attempt names the thread; a deletion to every active delivery that records or follows
+     * it. A delivery storing a launch or turn result naming the thread gets either.
      */
     readonly stepThread: (event: FactoryThreadEvent) => Effect.Effect<void, FactoryStoreError>;
     /**
-     * Blocks a delivery that awaits an effect no job of this process runs, whatever its status:
-     * the queue that held it ended with an earlier server process. Nothing is re-run. An effect
-     * waiting for admission (see `FactoryAdmission`) keeps waiting for its redispatch, marked; one
-     * stored unmarked is marked when the admission port still holds its deferral (a mark that
-     * could not be stored), and blocks when the port holds none or cannot be read. A child's
-     * start is stored before its parent takes the result, though, so a parent awaiting the start
-     * of a child that started takes that start, then the child's approval if it is stored. Any
-     * other delivery is left as it is; an unknown one returns none.
+     * Blocks a delivery awaiting an effect whose job died with an earlier process; nothing re-runs.
+     * An effect deferred by admission stays marked for redispatch (marked now if the port still
+     * holds it). A parent awaiting a child that started takes that start, then any stored approval.
      */
     readonly failInterruptedEffect: (
       deliveryId: FactoryDeliveryId,
@@ -194,26 +168,18 @@ export class FactoryWorker extends Context.Service<
       FactoryStoreError
     >;
     /**
-     * Recovers what a PR stage whose result a restart lost after its watch command did, for a
-     * delivery blocked on that interrupted `open_pr` with no pull request recorded (see
-     * `failInterruptedEffect`), from that command's records (see `FactoryPullRequest.recover`):
-     * the delivery records the pull request, the thread it is linked to and the watch there, and
-     * stays blocked, then takes the wakes core committed there since and the pull request's merge
-     * or close if it left `open`. A resume publishes to that pull request, and a cancel at any
-     * stage after releases Factory's watch. Reports what it found: `unknown` when the records
-     * prove the stage published but not which pull request, so a resume must not publish again;
-     * `none` for any other delivery, or when nothing proves the stage published. A read that
-     * fails fails, and changes nothing. The boot sweep and every resume call this.
+     * For a delivery blocked on an interrupted `open_pr`, records what the PR stage published (see
+     * `FactoryPullRequest.recover`), keeping it blocked. `unknown` when it published but not which
+     * pull request, so a resume must not publish again; `none` otherwise. The boot sweep and every
+     * resume call this; a failed read changes nothing.
      */
     readonly recoverPullRequest: (
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<"none" | "unknown" | "recovered", FactoryStoreError>;
     /**
-     * Runs the awaited effect `effectId` that waits for admission, once: under the delivery's
-     * lock, and only while the delivery awaits it, it is marked waiting and no job of the
-     * delivery is in flight. The job is counted, the mark cleared (`admission.granted`) and the
-     * job queued; it asks the admission port again before it runs. `stale`, changing nothing, for
-     * any other effect or an unknown delivery.
+     * Queues the admission-deferred effect `effectId` once, under the delivery's lock, only while
+     * it is awaited, marked waiting and no job is in flight; the job asks admission again before it
+     * runs. `stale`, changing nothing, otherwise.
      */
     readonly redispatch: (
       deliveryId: FactoryDeliveryId,
@@ -235,38 +201,26 @@ export class FactoryWorker extends Context.Service<
      */
     readonly jobsInFlight: (deliveryId: FactoryDeliveryId) => Effect.Effect<number>;
     /**
-     * Steps a parent with the approval of the child it waits for, once that child is approved;
-     * the parent then waits for something else, so the approval is taken once. A parent without a
-     * recorded branch start takes that child's start again first (see `advance`). Any other
-     * parent, or delivery, is left as it is. The boot sweep calls this for a parent whose child
-     * was approved while no server handed the approval on.
+     * Steps a parent with the approval of the child it waits for, once; a parent without a recorded
+     * branch start takes that child's start again first. The boot sweep calls this for a child
+     * approved while no server handed the approval on.
      */
     readonly takeChildApproval: (
       parentId: FactoryDeliveryId,
     ) => Effect.Effect<void, FactoryStoreError>;
     /**
-     * Completes what a restart cut short between a parent and its children. A parent's cancel is
-     * stored before its children's, and a child's before its parent's, so a child whose parent is
-     * cancelled is cancelled, approved or not, and a parent with a cancelled child is cancelled
-     * with its unfinished children; each stops what its threads run. A merged parent is done
-     * before its children, so an approved child whose parent is done is done. Any other delivery
-     * is left as it is. The boot sweep calls this for every delivery that is not done or cancelled.
+     * Completes a family cancel or close-out a restart cut short: a cancelled parent cancels its
+     * children, a cancelled child its parent and unfinished siblings, and a done parent finishes
+     * its approved children. The boot sweep calls this for every delivery not done or cancelled.
      */
     readonly finishFamily: (
       deliveryId: FactoryDeliveryId,
     ) => Effect.Effect<void, FactoryStoreError>;
     /**
-     * Interrupts a live run on a thread of a cancelled delivery when it carries on a turn Factory
-     * sent, or a pull request wake the delivery adopted as a follow-through round. A cancel
-     * commits before it interrupts what its threads run, so a server that stopped in between
-     * leaves that work to core's restart continuation, which carries it on in a new run the
-     * cancelled delivery never takes; a wake run queued behind another run cannot be interrupted
-     * before it starts. The owner's own turns on the thread are left alone. A run on a child's
-     * author thread is judged for the child's parent first when the parent's pull request is
-     * linked there, so a cancelled parent stops its rounds' runs while its approved child stays
-     * approved. A failure is logged, as a cancel's interrupt is. The reactor calls this as such a
-     * run goes live, and a cancel for the runs on the threads its delivery no longer records per
-     * role.
+     * Interrupts a cancelled delivery's run carrying a turn Factory sent or a wake it adopted; the
+     * owner's own turns stay. Called as such a run goes live, since a restart or queued wake can
+     * start one after the cancel committed. A child's author thread is judged for its parent first
+     * when the parent's pull request is linked there. Failures are logged.
      */
     readonly stopCancelledRun: (run: {
       readonly threadId: ThreadId;
@@ -353,13 +307,10 @@ const refusalDetail = (effect: FactoryEffect, category: FactoryAdmission.Factory
   `Factory did not ${describeEffect(effect)}. ${FactoryAdmission.admissionRefusalText[category]}`;
 
 /**
- * The `effect.failed` detail: what failed and the failure's tag. Never its message or cause,
- * which can carry command output or provider text, except a setup failure's message, which is
- * fixed text naming how the command ended, a prompt override's message naming only the prompt, a
- * publication's refusal, which is fixed text naming the rule broken and what to do, a reviewed
- * delivery's refusal, which is fixed text naming what differs from its review, or a host policy's
- * refusal, naming the mode and what that policy allows. A launch whose opening was refused reads as
- * a refused effect does.
+ * The `effect.failed` detail: what failed and the failure's tag. Never a message or cause, which
+ * can carry command output or provider text, except fixed-text ones (setup, prompt override,
+ * publication, reviewed delivery and host policy refusals). A refused launch opening reads as a
+ * refused effect.
  */
 const failureDetail = (effect: FactoryEffect, cause: Cause.Cause<unknown>) => {
   const error = Option.getOrUndefined(Cause.findErrorOption(cause));
@@ -539,62 +490,58 @@ const make = Effect.gen(function* () {
   const checkSettle = (state: FactoryDeliveryState): Effect.Effect<FactorySettleResult> =>
     readSettle(state).pipe(Effect.provideContext(gitContext));
 
-  const runCommand = (
+  const runCommand = Effect.fn("FactoryWorker.runCommand")(function* (
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,
     stage: FactoryStageName,
-  ) =>
-    Effect.gen(function* () {
-      const { worktreePath } = delivery.state;
-      if (stage !== "verify" || worktreePath === null) {
-        return yield* new FactoryStageCommandError({ stage });
-      }
-      // Read when the command runs, not when the delivery started: a verify command removed
-      // since then fails the effect before anything runs. A reviewed delivery runs what its owner
-      // reviewed, whatever the settings say now.
-      const { reviewedExecution: reviewed } = delivery.state;
-      const runSettings = reviewed ?? (yield* settings.requireDeliverySettings(delivery.projectId));
-      return yield* verifyRunner.run({
-        deliveryId: delivery.deliveryId,
-        worktreePath,
-        settings: runSettings,
-      });
+  ) {
+    const { worktreePath } = delivery.state;
+    if (stage !== "verify" || worktreePath === null) {
+      return yield* new FactoryStageCommandError({ stage });
+    }
+    // Read when the command runs, not when the delivery started: a verify command removed
+    // since then fails the effect before anything runs. A reviewed delivery runs what its owner
+    // reviewed, whatever the settings say now.
+    const { reviewedExecution: reviewed } = delivery.state;
+    const runSettings = reviewed ?? (yield* settings.requireDeliverySettings(delivery.projectId));
+    return yield* verifyRunner.run({
+      deliveryId: delivery.deliveryId,
+      worktreePath,
+      settings: runSettings,
     });
+  });
 
   /**
-   * What an author's launch runs in its worktree before its opening turn (see
-   * `FactoryThreadEffects.launchThread`): the project's setup command, as the settings read when
-   * the launch runs name it or as its owner reviewed it, under the verify timeout, then a check
-   * that the delivery still awaits the launch, so a delivery cancelled while setup ran gets no
-   * opening turn. None for any other launch, or without a setup command.
+   * The project's setup command an author launch runs before its opening turn (current settings
+   * or the reviewed one, under the verify timeout), then a check that the delivery still awaits
+   * the launch, so one cancelled during setup gets no opening turn. None for other launches.
    */
-  const openingSetup = (
+  const openingSetup = Effect.fn("FactoryWorker.openingSetup")(function* (
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,
     effect: Extract<FactoryEffect, { readonly type: "launch_thread" }>,
-  ) =>
-    Effect.gen(function* () {
-      if (effect.role !== "author") return undefined;
-      const { setupCommand, limits } =
-        delivery.state.reviewedExecution ?? (yield* settings.get(delivery.projectId));
-      if (setupCommand === null) return undefined;
-      const { deliveryId } = delivery;
-      return (worktreePath: string) =>
-        verifyRunner
-          .setup({
-            deliveryId,
-            worktreePath,
-            command: setupCommand,
-            timeoutMinutes: limits.verifyTimeoutMinutes,
-          })
-          .pipe(
-            Effect.andThen(deliveries.get(deliveryId)),
-            Effect.flatMap((current) => {
-              const awaiting = Option.getOrUndefined(current)?.state.awaiting;
-              return awaiting?.type === "effect" && awaiting.effect.id === effect.id
-                ? Effect.void
-                : Effect.fail(new FactoryLaunchWithdrawnError({ deliveryId }));
-            }),
-          );
-    });
+  ) {
+    if (effect.role !== "author") return undefined;
+    const { setupCommand, limits } =
+      delivery.state.reviewedExecution ?? (yield* settings.get(delivery.projectId));
+    if (setupCommand === null) return undefined;
+    const { deliveryId } = delivery;
+    return (worktreePath: string) =>
+      verifyRunner
+        .setup({
+          deliveryId,
+          worktreePath,
+          command: setupCommand,
+          timeoutMinutes: limits.verifyTimeoutMinutes,
+        })
+        .pipe(
+          Effect.andThen(deliveries.get(deliveryId)),
+          Effect.flatMap((current) => {
+            const awaiting = Option.getOrUndefined(current)?.state.awaiting;
+            return awaiting?.type === "effect" && awaiting.effect.id === effect.id
+              ? Effect.void
+              : Effect.fail(new FactoryLaunchWithdrawnError({ deliveryId }));
+          }),
+        );
+  });
 
   /** A failed run's outcome with its failure fingerprint: verify failed on its tree. */
   const withFingerprint = (outcome: FactoryCommandOutcome): FactoryCommandOutcome =>
@@ -707,14 +654,10 @@ const make = Effect.gen(function* () {
   };
 
   /**
-   * Records the stage attempts a step implies. Leaving a stage finishes its active attempt:
-   * failed when the delivery left it for a repair round or the owner sent its plan back from the
-   * gate, passed when it advanced otherwise, and by how it stopped proceeding when it did.
-   * Entering one appends the next attempt, and the attempt carries the run the delivery now
-   * awaits; a resumed delivery enters its stage again, since the attempt it stopped or blocked in
-   * has ended. An approved delivery still proceeds: its PR attempt ends when the pull request is
-   * open or the delivery blocks. A delivery waiting at the plan gate keeps the gate's attempt
-   * open until its owner decides.
+   * Records the stage attempts a step implies: leaving a stage finishes its attempt (failed for a
+   * repair round or replan, else passed or as it stopped), entering one appends the next with the
+   * awaited run. A resume re-enters its stage. The plan gate's attempt stays open until the owner
+   * decides, and an approved delivery's PR attempt until the pull request opens or it blocks.
    */
   const recordAttempts = Effect.fn("FactoryWorker.recordAttempts")(function* (
     deliveryId: FactoryDeliveryId,
@@ -801,23 +744,22 @@ const make = Effect.gen(function* () {
    * record: however it failed, from a refusal to a restart that lost its job, nothing else tells
    * the turn that ran from the turn that did not.
    */
-  const withUnsentTurn = (
+  const withUnsentTurn = Effect.fn("FactoryWorker.withUnsentTurn")(function* (
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,
     event: FactoryEvent,
-  ): Effect.Effect<FactoryEvent> =>
-    Effect.gen(function* () {
-      const { reviewedExecution, awaiting } = delivery.state;
-      if (
-        event.type !== "effect.failed" ||
-        reviewedExecution === undefined ||
-        awaiting?.type !== "effect" ||
-        awaiting.effect.id !== event.effectId
-      ) {
-        return event;
-      }
-      const sent = yield* threads.chargedTurnSent(delivery, awaiting.effect);
-      return sent ? event : { ...event, unsent: true as const };
-    });
+  ): Effect.fn.Return<FactoryEvent> {
+    const { reviewedExecution, awaiting } = delivery.state;
+    if (
+      event.type !== "effect.failed" ||
+      reviewedExecution === undefined ||
+      awaiting?.type !== "effect" ||
+      awaiting.effect.id !== event.effectId
+    ) {
+      return event;
+    }
+    const sent = yield* threads.chargedTurnSent(delivery, awaiting.effect);
+    return sent ? event : { ...event, unsent: true as const };
+  });
 
   const stepLocked = Effect.fn("FactoryWorker.step")(function* (
     deliveryId: FactoryDeliveryId,
@@ -916,118 +858,108 @@ const make = Effect.gen(function* () {
    * Stops the run live on the thread a cancelled delivery's pull request is linked to when it is
    * Factory's (see `followedThread`).
    */
-  const stopTakenWakes = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
-    Effect.gen(function* () {
+  const stopTakenWakes = Effect.fn("FactoryWorker.stopTakenWakes")(
+    function* (delivery: FactoryDeliveryStore.StoredFactoryDelivery) {
       const threadId = followedThread(delivery.state);
       if (threadId === undefined) return;
       const runs = yield* Effect.suspend(() => threads.liveRunsOn([threadId]));
       yield* Effect.forEach(runs, stopCancelledRun, { discard: true });
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause)
-          ? Effect.interrupt
-          : Effect.logWarning(
-              "factory could not read the thread a cancelled delivery's pull request is linked to",
-              cause,
-            ),
-      ),
-    );
+    },
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.interrupt
+        : Effect.logWarning(
+            "factory could not read the thread a cancelled delivery's pull request is linked to",
+            cause,
+          ),
+    ),
+  );
 
   /**
-   * Releases the watch as the delivery's state asks (see `FactoryPullRequest.release`): ends
-   * Factory's watch while it is still that watch, steps where it ended and the wakes core
-   * committed, so the cancelled delivery stops the runs its watch set off, then steps that the
-   * release is done. A watch someone else started stays. A failure is logged and leaves the
-   * release marked, for the next boot sweep. Undefined when nothing was stepped.
+   * Releases the watch as the delivery's state asks (see `FactoryPullRequest.release`), stepping
+   * where it ended and the wakes core committed, then `watch.released`. A watch someone else
+   * started stays. A failure is logged and leaves the release marked for the next boot sweep.
+   * Undefined when nothing was stepped.
    */
   // Annotated: it closes the cycle `stepLocked` → `releaseWatch`.
-  const releaseWatch = (
+  const releaseWatch = Effect.fn("FactoryWorker.releaseWatch")(function* (
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,
-  ): Effect.Effect<
+  ): Effect.fn.Return<
     Option.Option<FactoryDeliveryStore.StoredFactoryDelivery> | undefined,
     FactoryStoreError
-  > =>
-    Effect.gen(function* () {
-      const { deliveryId, state } = delivery;
-      if (state.releaseWatch !== true) return undefined;
-      const released = yield* Effect.exit(Effect.suspend(() => pullRequests.release(delivery)));
-      if (Exit.isFailure(released)) {
-        if (Cause.hasInterruptsOnly(released.cause)) return yield* Effect.interrupt;
-        yield* Effect.logWarning("factory could not end its pull request watch", released.cause);
-        return undefined;
+  > {
+    const { deliveryId, state } = delivery;
+    if (state.releaseWatch !== true) return undefined;
+    const released = yield* Effect.exit(Effect.suspend(() => pullRequests.release(delivery)));
+    if (Exit.isFailure(released)) {
+      if (Cause.hasInterruptsOnly(released.cause)) return yield* Effect.interrupt;
+      yield* Effect.logWarning("factory could not end its pull request watch", released.cause);
+      return undefined;
+    }
+    if (Option.isSome(released.value)) {
+      const { threadId, startedAt, pullRequest, at, firstAt, wakes } = released.value.value;
+      if (at !== null) {
+        yield* stepLocked(deliveryId, {
+          type: "watch.ended",
+          startedAt,
+          at,
+          firstAt,
+          number: pullRequest.number,
+          url: pullRequest.url,
+          threadId,
+        });
       }
-      if (Option.isSome(released.value)) {
-        const { threadId, startedAt, pullRequest, at, firstAt, wakes } = released.value.value;
-        if (at !== null) {
-          yield* stepLocked(deliveryId, {
-            type: "watch.ended",
-            startedAt,
-            at,
-            firstAt,
-            number: pullRequest.number,
-            url: pullRequest.url,
-            threadId,
-          });
-        }
-        for (const wake of wakes) yield* stepLocked(deliveryId, wake);
-      }
-      return yield* stepLocked(deliveryId, { type: "watch.released" });
-    });
+      for (const wake of wakes) yield* stepLocked(deliveryId, wake);
+    }
+    return yield* stepLocked(deliveryId, { type: "watch.released" });
+  });
 
   /**
-   * Steps the end of a wake run the step just adopted as a round, when that run has already
-   * ended: the step stored the stage attempt naming its thread, and an end committed before that
-   * found no attempt to reach. One that ends later reaches it as any run's end does. Undefined
-   * when there is nothing to take; a read that fails is logged, and the boot sweep reads the run
-   * again.
+   * Steps the end of a wake run the step just adopted, when that run already ended: an end
+   * committed before the step stored the attempt naming its thread found nothing to reach.
+   * Undefined when there is nothing to take; a failed read is logged and the boot sweep retries.
    */
   // Annotated: it closes the cycle `stepLocked` → `takeEndedWake`.
-  const takeEndedWake = (
+  const takeEndedWake = Effect.fn("FactoryWorker.takeEndedWake")(function* (
     deliveryId: FactoryDeliveryId,
     before: FactoryDeliveryState,
     after: FactoryDeliveryState,
-  ): Effect.Effect<
+  ): Effect.fn.Return<
     Option.Option<FactoryDeliveryStore.StoredFactoryDelivery> | undefined,
     FactoryStoreError
-  > =>
-    Effect.gen(function* () {
-      const awaited = after.awaiting;
-      if (
-        awaited?.type !== "run" ||
-        !adoptedRuns(after).includes(awaited.runId) ||
-        (before.awaiting?.type === "run" && before.awaiting.runId === awaited.runId)
-      ) {
-        return undefined;
-      }
-      const ended = yield* Effect.exit(
-        Effect.suspend(() => threads.runEnded(awaited.threadId, awaited.runId)),
-      );
-      if (Exit.isFailure(ended)) {
-        if (Cause.hasInterruptsOnly(ended.cause)) return yield* Effect.interrupt;
-        yield* Effect.logWarning("factory could not read an adopted wake run", ended.cause);
-        return undefined;
-      }
-      if (Option.isNone(ended.value)) return undefined;
-      return yield* stepLocked(deliveryId, {
-        type: "run.finished",
-        threadId: awaited.threadId,
-        runId: awaited.runId,
-        status: ended.value.value,
-      });
+  > {
+    const awaited = after.awaiting;
+    if (
+      awaited?.type !== "run" ||
+      !adoptedRuns(after).includes(awaited.runId) ||
+      (before.awaiting?.type === "run" && before.awaiting.runId === awaited.runId)
+    ) {
+      return undefined;
+    }
+    const ended = yield* Effect.exit(
+      Effect.suspend(() => threads.runEnded(awaited.threadId, awaited.runId)),
+    );
+    if (Exit.isFailure(ended)) {
+      if (Cause.hasInterruptsOnly(ended.cause)) return yield* Effect.interrupt;
+      yield* Effect.logWarning("factory could not read an adopted wake run", ended.cause);
+      return undefined;
+    }
+    if (Option.isNone(ended.value)) return undefined;
+    return yield* stepLocked(deliveryId, {
+      type: "run.finished",
+      threadId: awaited.threadId,
+      runId: awaited.runId,
+      status: ended.value.value,
     });
+  });
 
   /**
-   * Stops what a cancelled delivery's retired threads still run: those its stage attempts name
-   * and no role records any more, such as the integrate reviewer a resume replaced while the turn
-   * its invalid submissions blocked went on. Each live run there is stopped as
-   * `stopCancelledRun` stops one, so only while it carries on a turn Factory sent: the owner may
-   * have taken the thread over since. A failure is logged, as a cancel's interrupt is.
+   * Stops what a cancelled delivery's retired threads still run (named by its attempts, recorded
+   * by no role, e.g. a reviewer a resume replaced). Uses `stopCancelledRun`, so only Factory's
+   * turns stop: the owner may have taken the thread over. Failures are logged.
    */
-  const stopRetiredRuns = (
-    deliveryId: FactoryDeliveryId,
-    recorded: ReadonlySet<ThreadId | undefined>,
-  ) =>
-    Effect.gen(function* () {
+  const stopRetiredRuns = Effect.fn("FactoryWorker.stopRetiredRuns")(
+    function* (deliveryId: FactoryDeliveryId, recorded: ReadonlySet<ThreadId | undefined>) {
       const retired = new Set<ThreadId>();
       for (const { threadId } of yield* stageRuns.listByDelivery(deliveryId)) {
         if (threadId !== null && !recorded.has(threadId)) retired.add(threadId);
@@ -1035,16 +967,13 @@ const make = Effect.gen(function* () {
       if (retired.size === 0) return;
       const runs = yield* Effect.suspend(() => threads.liveRunsOn([...retired]));
       yield* Effect.forEach(runs, stopCancelledRun, { discard: true });
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause)
-          ? Effect.interrupt
-          : Effect.logWarning(
-              "factory could not read a cancelled delivery's retired threads",
-              cause,
-            ),
-      ),
-    );
+    },
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.interrupt
+        : Effect.logWarning("factory could not read a cancelled delivery's retired threads", cause),
+    ),
+  );
 
   /** Cancels a cancelled parent's child, under the child's lock, approved or not. */
   // Annotated: it closes the cycle `stepLocked` → `cancelChild`.
@@ -1084,71 +1013,64 @@ const make = Effect.gen(function* () {
       : { type: "child.started", effectId, baseline: branchStart };
 
   /**
-   * Where a parent's branch started, when the parent recorded none: one stored before planner
-   * launches recorded it. Read from its branch's reflog, never from the worktree's HEAD, which
-   * commits since may have moved. Its first child, once started, must have started there: an
-   * earlier server started one from that HEAD, and its settle check and review then missed the
-   * commits before it. None for a parent that recorded it. Refused when it cannot be
-   * established, or the first child started elsewhere.
+   * Where a legacy parent's branch started, read from its reflog, never the worktree's HEAD,
+   * which later commits moved. Refused when unknown or when the first child started elsewhere (an
+   * older server used HEAD, so its review missed earlier commits). None once recorded.
    */
-  const unrecordedBranchStart = (
+  const unrecordedBranchStart = Effect.fn("FactoryWorker.unrecordedBranchStart")(function* (
     parent: FactoryDeliveryStore.StoredFactoryDelivery,
     refuse: (reason: FactoryChildStartError["reason"]) => FactoryChildStartError,
-  ) =>
-    Effect.gen(function* () {
-      const { baseline, worktreePath, branch, children } = parent.state;
-      if (baseline !== null) return null;
-      if (worktreePath === null) return yield* refuse("no_worktree");
-      const created = yield* readBranchCreation(worktreePath, branch).pipe(
-        Effect.provideContext(gitContext),
-      );
-      if (Option.isNone(created)) return yield* refuse("no_baseline");
-      const [firstId] = children;
-      const first =
-        firstId === undefined ? undefined : Option.getOrUndefined(yield* deliveries.get(firstId));
-      if (
-        first !== undefined &&
-        first.state.status !== "queued" &&
-        first.state.baseline !== created.value
-      ) {
-        return yield* refuse("baseline_mismatch");
-      }
-      return created.value;
-    });
+  ) {
+    const { baseline, worktreePath, branch, children } = parent.state;
+    if (baseline !== null) return null;
+    if (worktreePath === null) return yield* refuse("no_worktree");
+    const created = yield* readBranchCreation(worktreePath, branch).pipe(
+      Effect.provideContext(gitContext),
+    );
+    if (Option.isNone(created)) return yield* refuse("no_baseline");
+    const [firstId] = children;
+    const first =
+      firstId === undefined ? undefined : Option.getOrUndefined(yield* deliveries.get(firstId));
+    if (
+      first !== undefined &&
+      first.state.status !== "queued" &&
+      first.state.baseline !== created.value
+    ) {
+      return yield* refuse("baseline_mismatch");
+    }
+    return created.value;
+  });
 
   /**
    * A child's task baseline: where the parent's branch started (`branchStart` when the parent
    * recorded none) for the first child, and the commit the task before it was approved for after
    * that, so its settle check and review judge only the commits made since.
    */
-  const childBaseline = (
+  const childBaseline = Effect.fn("FactoryWorker.childBaseline")(function* (
     parent: FactoryDeliveryStore.StoredFactoryDelivery,
     childId: FactoryDeliveryId,
     branchStart: string | null,
     refuse: (reason: FactoryChildStartError["reason"]) => FactoryChildStartError,
-  ) =>
-    Effect.gen(function* () {
-      const { children, baseline } = parent.state;
-      const index = children.indexOf(childId);
-      if (index < 0) return yield* refuse("missing");
-      const previous = children[index - 1];
-      if (previous === undefined) {
-        return baseline ?? branchStart ?? (yield* refuse("no_baseline"));
-      }
-      const stored = yield* tasks.listByDelivery(parent.deliveryId);
-      const task = FactoryChildren.taskOfChild(parent.deliveryId, stored, previous);
-      return task?.lastReviewedSha ?? (yield* refuse("no_baseline"));
-    });
+  ) {
+    const { children, baseline } = parent.state;
+    const index = children.indexOf(childId);
+    if (index < 0) return yield* refuse("missing");
+    const previous = children[index - 1];
+    if (previous === undefined) {
+      return baseline ?? branchStart ?? (yield* refuse("no_baseline"));
+    }
+    const stored = yield* tasks.listByDelivery(parent.deliveryId);
+    const task = FactoryChildren.taskOfChild(parent.deliveryId, stored, previous);
+    return task?.lastReviewedSha ?? (yield* refuse("no_baseline"));
+  });
 
   const childRefusal = (childId: FactoryDeliveryId) => (reason: FactoryChildStartError["reason"]) =>
     new FactoryChildStartError({ child: childId, reason });
 
   /**
-   * Carries out `start_child` under the parent's lock while the parent still awaits it: a parent
-   * cancelled meanwhile starts none. Starts the child, which is queued, on the parent's worktree
-   * and branch from its task baseline (see `childBaseline`), or takes one that started before as
-   * it is. Either way a parent without a recorded branch start establishes it first (see
-   * `unrecordedBranchStart`). Returns the result to feed back.
+   * Carries out `start_child` under the parent's lock while it still awaits it, so a cancelled
+   * parent starts none: starts the queued child from `childBaseline`, or takes an earlier start,
+   * after `unrecordedBranchStart`. Returns the result to feed back.
    */
   const startChild = (
     parent: FactoryDeliveryStore.StoredFactoryDelivery,
@@ -1182,14 +1104,15 @@ const make = Effect.gen(function* () {
     );
 
   /** `takeChildApproval` under the parent's lock. */
-  const takeChildApprovalLocked = (parentId: FactoryDeliveryId) =>
-    Effect.gen(function* () {
-      const awaiting = Option.getOrUndefined(yield* deliveries.get(parentId))?.state.awaiting;
-      if (awaiting?.type !== "child") return;
-      const child = yield* deliveries.get(awaiting.deliveryId);
-      if (Option.isNone(child) || child.value.state.status !== "approved") return;
-      yield* stepLocked(parentId, { type: "child.approved", deliveryId: awaiting.deliveryId });
-    });
+  const takeChildApprovalLocked = Effect.fn("FactoryWorker.takeChildApprovalLocked")(function* (
+    parentId: FactoryDeliveryId,
+  ) {
+    const awaiting = Option.getOrUndefined(yield* deliveries.get(parentId))?.state.awaiting;
+    if (awaiting?.type !== "child") return;
+    const child = yield* deliveries.get(awaiting.deliveryId);
+    if (Option.isNone(child) || child.value.state.status !== "approved") return;
+    yield* stepLocked(parentId, { type: "child.approved", deliveryId: awaiting.deliveryId });
+  });
 
   const takeChildApproval: FactoryWorker["Service"]["takeChildApproval"] = (parentId) =>
     locks.withLock(parentId, takeChildApprovalLocked(parentId));
@@ -1279,15 +1202,10 @@ const make = Effect.gen(function* () {
   };
 
   /**
-   * Feeds back an opened pull request: has its watch started on the thread it is linked to (see
-   * `FactoryPullRequest.watch`), then stores the result with what that left, and then each wake
-   * core committed since the delivery's first watch command, all under the delivery's lock and
-   * only while the delivery still awaits this effect. A wake committed later steps the delivery
-   * only once the pull request is stored, so none falls in between, and one committed before is
-   * taken here, the end of a watch included. A watch core ended is not started again here. A
-   * watch that cannot start is reported with the pull request, which is published either way and
-   * is recorded. A pull request that does not comply as saved starts none: a resume decides, and
-   * its feedback must not wake an agent first.
+   * Feeds back an opened pull request under the delivery's lock while it still awaits the effect:
+   * starts its watch, stores the result, then steps the wakes core committed since the first
+   * watch command, so none is lost in between. A noncompliant pull request starts no watch: a
+   * resume decides before its feedback may wake an agent.
    */
   const openedPullRequest = (job: Job, event: Extract<FactoryEvent, { type: "pr.opened" }>) => {
     const { deliveryId } = job.delivery;
@@ -1340,17 +1258,10 @@ const make = Effect.gen(function* () {
   };
 
   /**
-   * Feeds an effect's result back. A launch or turn result names a run that can end before the
-   * result is stored, and the run's terminal event then finds the delivery still awaiting the
-   * effect and changes nothing. So that run is read under the delivery's lock right before the
-   * result is stored: an end the read misses arrives as an event whose step waits for the lock,
-   * and an end it sees is fed right after the result. A read that fails fails the effect
-   * instead, so the delivery records none of the result rather than wait on a run that ended.
-   *
-   * The thread is entered in `storing` before the read, so `stepThread` loses no end: one looked
-   * up before the entry exists was committed before the read, which sees it (a deletion cancels
-   * the thread's active runs in the same commit); one looked up while the entry stands is routed
-   * by it; one looked up after finds what the store recorded.
+   * Feeds an effect's result back. A launch or turn's run can end before the result is stored, so
+   * it is entered in `storing` and read under the lock first: an end the read sees is fed after
+   * the result, one it misses steps after the lock. A failed read fails the effect rather than
+   * wait on a run that ended.
    */
   // Annotated like `step`: it closes the cycle `stepLocked` → lane → `runJob` → `feed`.
   const feed = (job: Job, event: FactoryEvent): ReturnType<FactoryWorker["Service"]["step"]> => {
@@ -1401,23 +1312,22 @@ const make = Effect.gen(function* () {
   };
 
   /** The deliveries `stepThread` steps; see there. */
-  const ownersOf = (event: FactoryThreadEvent) =>
-    Effect.gen(function* () {
-      // The entry first: once it is gone, the store that held it has recorded the thread.
-      const storingFor = storing.get(event.threadId);
-      if (storingFor !== undefined) return [storingFor];
-      if (event.type === "run.finished") {
-        const attempt = yield* stageRuns.findActiveByThread(event.threadId);
-        return Option.toArray(Option.map(attempt, (run) => run.deliveryId));
-      }
-      return (yield* deliveries.listActive())
-        .filter(
-          ({ state }) =>
-            Object.values(state.threads).includes(event.threadId) ||
-            followedThread(state) === event.threadId,
-        )
-        .map((delivery) => delivery.deliveryId);
-    });
+  const ownersOf = Effect.fn("FactoryWorker.ownersOf")(function* (event: FactoryThreadEvent) {
+    // The entry first: once it is gone, the store that held it has recorded the thread.
+    const storingFor = storing.get(event.threadId);
+    if (storingFor !== undefined) return [storingFor];
+    if (event.type === "run.finished") {
+      const attempt = yield* stageRuns.findActiveByThread(event.threadId);
+      return Option.toArray(Option.map(attempt, (run) => run.deliveryId));
+    }
+    return (yield* deliveries.listActive())
+      .filter(
+        ({ state }) =>
+          Object.values(state.threads).includes(event.threadId) ||
+          followedThread(state) === event.threadId,
+      )
+      .map((delivery) => delivery.deliveryId);
+  });
 
   const stepThread: FactoryWorker["Service"]["stepThread"] = (event) =>
     ownersOf(event).pipe(
@@ -1587,24 +1497,27 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const finishFamily: FactoryWorker["Service"]["finishFamily"] = (deliveryId) =>
-    Effect.gen(function* () {
-      const delivery = Option.getOrUndefined(yield* deliveries.get(deliveryId));
-      if (delivery === undefined || isTerminal(delivery.state)) return;
-      if (delivery.parentId !== null) {
-        const parent = Option.getOrUndefined(yield* deliveries.get(delivery.parentId));
-        if (parent?.state.status === "cancelled") yield* cancelChild(deliveryId);
-        if (parent?.state.status === "done") yield* finishChild(deliveryId);
-        return;
-      }
-      for (const childId of delivery.state.children) {
-        const child = Option.getOrUndefined(yield* deliveries.get(childId));
-        if (child?.state.status === "cancelled") return yield* cancelParent(deliveryId);
-      }
-    });
+  const finishFamily: FactoryWorker["Service"]["finishFamily"] = Effect.fn(
+    "FactoryWorker.finishFamily",
+  )(function* (deliveryId) {
+    const delivery = Option.getOrUndefined(yield* deliveries.get(deliveryId));
+    if (delivery === undefined || isTerminal(delivery.state)) return;
+    if (delivery.parentId !== null) {
+      const parent = Option.getOrUndefined(yield* deliveries.get(delivery.parentId));
+      if (parent?.state.status === "cancelled") yield* cancelChild(deliveryId);
+      if (parent?.state.status === "done") yield* finishChild(deliveryId);
+      return;
+    }
+    for (const childId of delivery.state.children) {
+      const child = Option.getOrUndefined(yield* deliveries.get(childId));
+      if (child?.state.status === "cancelled") return yield* cancelParent(deliveryId);
+    }
+  });
 
-  const stopCancelledRun: FactoryWorker["Service"]["stopCancelledRun"] = (run) =>
-    Effect.gen(function* () {
+  const stopCancelledRun: FactoryWorker["Service"]["stopCancelledRun"] = Effect.fn(
+    "FactoryWorker.stopCancelledRun",
+  )(
+    function* (run) {
       const launchedBy = FactoryThreadEffects.launchDeliveryId(run.threadId);
       if (launchedBy === undefined) return;
       const launcher = Option.getOrUndefined(yield* deliveries.get(launchedBy));
@@ -1625,13 +1538,13 @@ const make = Effect.gen(function* () {
         if (!(yield* threads.carriesFactoryTurn(run.threadId, run.runId, adopted))) continue;
         return yield* interruptCancelled(delivery, run);
       }
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause)
-          ? Effect.interrupt
-          : Effect.logWarning("factory could not stop a cancelled delivery's run", cause),
-      ),
-    );
+    },
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.interrupt
+        : Effect.logWarning("factory could not stop a cancelled delivery's run", cause),
+    ),
+  );
 
   const stopCancelledRuns: FactoryWorker["Service"]["stopCancelledRuns"] = Effect.suspend(
     () => threads.launchedLiveRuns,
@@ -1670,11 +1583,9 @@ const make = Effect.gen(function* () {
   });
 
   /**
-   * Leaves the job's effect waiting for admission, running nothing: under the delivery's lock it
-   * steps `admission.deferred` and releases the job, so whoever takes the lock next finds the
-   * effect marked with no job in flight. A mark that cannot be stored is logged and leaves the
-   * effect awaited, unmarked and without a job: `ensureDeferred` marks it later, and only a marked
-   * effect is ever redispatched.
+   * Leaves the effect waiting for admission: under the lock, steps `admission.deferred` and
+   * releases the job. A mark that cannot be stored is logged; `ensureDeferred` marks it later,
+   * and only a marked effect is ever redispatched.
    */
   // Annotated: it closes the cycle `stepLocked` → lane → `runJob` → `defer`.
   const defer = (job: Job): Effect.Effect<void> => {
@@ -1703,11 +1614,9 @@ const make = Effect.gen(function* () {
       : threads.checkReviewed(delivery, effect);
 
   /**
-   * Runs an effect once the admission port admits it and a reviewed delivery's review still allows
-   * it, and feeds its result back. A refusal is fed back as the effect's failure, and a deferral
-   * feeds nothing (see `defer`). Suspended, so an executor that throws while building its effect
-   * fails the effect like any other failure, as does a port that cannot decide. Interruption
-   * (shutdown) feeds nothing.
+   * Runs an effect once admitted (and allowed by a reviewed delivery's review) and feeds back its
+   * result; a refusal feeds a failure, a deferral or interruption nothing. Suspended, so an
+   * executor that throws while building fails the effect like any other failure.
    */
   const runJob = (job: Job) =>
     Effect.suspend(() => admit(job)).pipe(
@@ -1739,12 +1648,11 @@ const make = Effect.gen(function* () {
     );
 
   /** Queues a counted job on its delivery's lane; called only under the delivery's lock. */
-  const queueJob = (job: Job) =>
-    Effect.gen(function* () {
-      const lane = yield* laneFor(job.delivery.deliveryId);
-      yield* TxRef.update(outstanding, (count) => count + 1);
-      yield* lane.enqueue(job);
-    });
+  const queueJob = Effect.fn("FactoryWorker.queueJob")(function* (job: Job) {
+    const lane = yield* laneFor(job.delivery.deliveryId);
+    yield* TxRef.update(outstanding, (count) => count + 1);
+    yield* lane.enqueue(job);
+  });
 
   // Called only under the delivery's lock, so a delivery never gets two lanes.
   const laneFor = (deliveryId: FactoryDeliveryId) =>
@@ -1787,7 +1695,9 @@ const make = Effect.gen(function* () {
     failInterruptedEffect,
     redispatch,
     ensureDeferred,
-    jobsInFlight: (deliveryId) => Effect.sync(() => inFlight(deliveryId)),
+    jobsInFlight: Effect.fn("FactoryWorker.jobsInFlight")((deliveryId) =>
+      Effect.sync(() => inFlight(deliveryId)),
+    ),
     recoverPullRequest,
     takeChildApproval,
     finishFamily,

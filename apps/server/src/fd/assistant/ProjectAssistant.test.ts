@@ -17,7 +17,6 @@ import {
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as Threads from "../../orchestration-v2/ThreadManagementService.ts";
@@ -150,19 +149,17 @@ function harness(looperMode = false) {
     }),
     Layer.mock(Projects.ProjectService)({
       getById: (id) =>
-        Effect.succeed(
-          Option.some({
-            id,
-            title: id,
-            workspaceRoot: `/projects/${id}`,
-            repositories: [],
-            defaultModelSelection: null,
-            scripts: [],
-            createdAt: at,
-            updatedAt: at,
-            deletedAt: null,
-          } satisfies Project),
-        ),
+        Effect.succeedSome({
+          id,
+          title: id,
+          workspaceRoot: `/projects/${id}`,
+          repositories: [],
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: at,
+          updatedAt: at,
+          deletedAt: null,
+        } satisfies Project),
     }),
     Layer.mock(Git.GitVcsDriver)({
       execute: () =>

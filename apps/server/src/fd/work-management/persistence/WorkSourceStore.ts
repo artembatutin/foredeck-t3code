@@ -263,8 +263,10 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const insertOrRevive: WorkSourceStore["Service"]["insertOrRevive"] = (input) =>
-    Effect.gen(function* () {
+  const insertOrRevive: WorkSourceStore["Service"]["insertOrRevive"] = Effect.fn(
+    "WorkSourceStore.insertOrRevive",
+  )(
+    function* (input) {
       const key: SourceKey = {
         projectId: input.projectId,
         kind: input.kind,
@@ -311,10 +313,13 @@ const make = Effect.gen(function* () {
       };
       yield* failOnLiveIdentity(input.identity, insertSource(created));
       return created;
-    }).pipe(sql.withTransaction, Effect.catchTags(storageFailure("insertOrRevive")));
+    },
+    sql.withTransaction,
+    Effect.catchTags(storageFailure("insertOrRevive")),
+  );
 
-  const update: WorkSourceStore["Service"]["update"] = (input) =>
-    Effect.gen(function* () {
+  const update: WorkSourceStore["Service"]["update"] = Effect.fn("WorkSourceStore.update")(
+    function* (input) {
       const current = yield* requireSource(input.sourceId);
       yield* requireVersion(current, input.expectedVersion);
       if (input.config !== undefined && input.config.kind !== current.kind) {
@@ -340,10 +345,15 @@ const make = Effect.gen(function* () {
       };
       yield* failOnLiveIdentity(identity, writeSource(updated));
       return updated;
-    }).pipe(sql.withTransaction, Effect.catchTags(storageFailure("update")));
+    },
+    sql.withTransaction,
+    Effect.catchTags(storageFailure("update")),
+  );
 
-  const disconnect: WorkSourceStore["Service"]["disconnect"] = (sourceId, expectedVersion) =>
-    Effect.gen(function* () {
+  const disconnect: WorkSourceStore["Service"]["disconnect"] = Effect.fn(
+    "WorkSourceStore.disconnect",
+  )(
+    function* (sourceId, expectedVersion) {
       const current = yield* requireSource(sourceId);
       // A retried disconnect is satisfied whatever version it carries.
       if (current.state === "disconnected") return current;
@@ -358,10 +368,13 @@ const make = Effect.gen(function* () {
       };
       yield* writeSource(updated);
       return updated;
-    }).pipe(sql.withTransaction, Effect.catchTags(storageFailure("disconnect")));
+    },
+    sql.withTransaction,
+    Effect.catchTags(storageFailure("disconnect")),
+  );
 
-  const restore: WorkSourceStore["Service"]["restore"] = (sourceId, expectedVersion) =>
-    Effect.gen(function* () {
+  const restore: WorkSourceStore["Service"]["restore"] = Effect.fn("WorkSourceStore.restore")(
+    function* (sourceId, expectedVersion) {
       const current = yield* requireSource(sourceId);
       if (current.state === "active") return current;
       yield* requireVersion(current, expectedVersion);
@@ -380,29 +393,37 @@ const make = Effect.gen(function* () {
       };
       yield* failOnLiveIdentity(current.identity, writeSource(updated));
       return updated;
-    }).pipe(sql.withTransaction, Effect.catchTags(storageFailure("restore")));
+    },
+    sql.withTransaction,
+    Effect.catchTags(storageFailure("restore")),
+  );
 
   return WorkSourceStore.of({
-    list: (options) =>
+    list: Effect.fn("WorkSourceStore.list")((options) =>
       selectSources({
         ...(options?.projectId === undefined ? {} : { projectId: options.projectId }),
         ...(options?.includeDisconnected ? {} : { states: ["active"] }),
       }).pipe(Effect.catchTags(storageFailure("list"))),
-    get: (sourceId) => readSource(sourceId).pipe(Effect.catchTags(storageFailure("get"))),
+    ),
+    get: Effect.fn("WorkSourceStore.get")((sourceId) =>
+      readSource(sourceId).pipe(Effect.catchTags(storageFailure("get"))),
+    ),
     insertOrRevive,
     update,
     disconnect,
     restore,
-    countActiveBySecret: (secretName) =>
+    countActiveBySecret: Effect.fn("WorkSourceStore.countActiveBySecret")((secretName) =>
       selectSecretCount(secretName).pipe(
         Effect.map((rows) => rows[0]?.count ?? 0),
         Effect.catchTags(storageFailure("countActiveBySecret")),
       ),
-    listProjectIds: () =>
+    ),
+    listProjectIds: Effect.fn("WorkSourceStore.listProjectIds")(() =>
       selectProjectIds(undefined).pipe(
         Effect.map((rows) => rows.map((row) => row.projectId)),
         Effect.catchTags(storageFailure("listProjectIds")),
       ),
+    ),
   });
 });
 

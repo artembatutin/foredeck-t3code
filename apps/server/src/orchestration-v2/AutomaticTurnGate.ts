@@ -133,14 +133,10 @@ export class AutomaticTurnDecisionError extends Schema.TaggedError<AutomaticTurn
 }
 
 /**
- * Where every automatic turn asks before it runs. A producer hands over the dispatch that
- * starts the turn: `admit` runs it inline when admitted and otherwise runs nothing; `hand`,
- * for native wakes, whose provider output exists only in memory, also lets the gate keep the
- * dispatch to run later, or to `drop`, which clears the adapter's offer and exists only when the
- * offer can be cleared. A kept dispatch is fully provided and checks on its own that its thread
- * and offer are still current when it runs.
- *
- * The default runs every turn inline, as core does without the gate.
+ * Every automatic turn asks here first. `admit` runs the dispatch inline or not at all; `hand`
+ * (native wakes, whose output lives only in memory) may also keep it for later or `drop` it. A kept
+ * dispatch is fully provided and re-checks its thread and offer when it runs. The default runs
+ * every turn inline, as core does without the gate.
  */
 export class AutomaticTurnGate extends Context.Reference<{
   readonly admit: <A, E, R>(
@@ -182,9 +178,21 @@ export const layerInstallable = Layer.effectContext(
     const installed = yield* Ref.make(yield* Deferred.make<typeof AutomaticTurnGate.Service>());
     const current = Effect.flatMap(Ref.get(installed), Deferred.await);
     const gate = AutomaticTurnGate.of({
-      admit: (turn, dispatch) => Effect.flatMap(current, (impl) => impl.admit(turn, dispatch)),
-      hand: (turn, dispatch, options) =>
-        Effect.flatMap(current, (impl) => impl.hand(turn, dispatch, options)),
+      admit: Effect.fn("AutomaticTurnGate.admit")(function* <A, E, R>(
+        turn: Exclude<AutomaticTurn, BackgroundWakeTurn>,
+        dispatch: Effect.Effect<A, E, R>,
+      ) {
+        const impl = yield* current;
+        return yield* impl.admit(turn, dispatch);
+      }),
+      hand: Effect.fn("AutomaticTurnGate.hand")(function* <A, E>(
+        turn: BackgroundWakeTurn,
+        dispatch: Effect.Effect<A, E>,
+        options: { readonly drop?: Effect.Effect<void> },
+      ) {
+        const impl = yield* current;
+        return yield* impl.hand(turn, dispatch, options);
+      }),
     });
     const install: AutomaticTurnGateInstaller["Service"]["install"] = (impl) =>
       Effect.acquireRelease(

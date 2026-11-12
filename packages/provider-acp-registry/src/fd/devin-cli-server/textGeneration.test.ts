@@ -1,3 +1,5 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as Layer from "effect/Layer";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import { ProviderInstanceId } from "@t3tools/contracts";
@@ -101,7 +103,7 @@ describe("tool-free native text generation", () => {
           .filter((request) => request.method === "initialize")
           .every((request) => request.params.clientCapabilities.terminal === false),
       ).toBe(true);
-    }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)), Effect.scoped),
   );
 
   it.effect.each([
@@ -121,6 +123,6 @@ describe("tool-free native text generation", () => {
         .generateThreadTitle({ cwd: directory, message: "title", modelSelection: selection })
         .pipe(Effect.flip);
       expect(failure._tag).toBe("TextGenerationError");
-    }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)), Effect.scoped),
   );
 });

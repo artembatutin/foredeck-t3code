@@ -49,13 +49,13 @@ export const make = Effect.gen(function* () {
         yield* scopes(root),
         (scope) =>
           checkpoints.captureBaseline({ scope, ordinalWithinScope: ordinal }).pipe(
-            Effect.catchCause((cause) =>
-              Cause.hasInterruptsOnly(cause)
-                ? Effect.failCause(cause)
-                : Effect.logWarning("Repository checkpoint baseline unavailable", {
-                    repositoryId: scope.repository?.id,
-                    scopeId: scope.id,
-                  }),
+            Effect.catchCauseIf(
+              (cause) => !Cause.hasInterruptsOnly(cause),
+              () =>
+                Effect.logWarning("Repository checkpoint baseline unavailable", {
+                  repositoryId: scope.repository?.id,
+                  scopeId: scope.id,
+                }),
             ),
           ),
         { concurrency: 2, discard: true },
@@ -89,7 +89,12 @@ export const make = Effect.gen(function* () {
                   ),
               ),
               (ordinalWithinScope) =>
-                checkpoints.materializeBaselineCheckpoint({ scope, ordinalWithinScope }),
+                checkpoints.materializeBaselineCheckpoint({
+                  scope,
+                  ordinalWithinScope,
+                  nodeId: scope.nodeId,
+                  capturedAt: input.run.requestedAt,
+                }),
             );
             const checkpoint = yield* checkpoints.capture({
               scope,

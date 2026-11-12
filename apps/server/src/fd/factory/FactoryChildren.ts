@@ -58,23 +58,10 @@ export class FactoryChildren extends Context.Service<
   FactoryChildren,
   {
     /**
-     * Carries out a parent's `create_children` and returns its child deliveries in plan order.
-     * Each task, in plan order, gets its child item under the parent item, blocked by the previous
-     * task's child, and the item is recorded on the task before the next task's is created. Once
-     * every task has its child, the children's deliveries are stored queued, on the parent's
-     * branch and worktree with its limits, runtime-mode ceiling and review, and the task's risk;
-     * none starts.
-     *
-     * A task that records its child is done. Each task is claimed before its child is created,
-     * so only a claimed one may have a child from a run that stopped before recording it: the item
-     * under the parent whose body carries the task's reference (`childReference`) is taken instead
-     * of creating another. A search cannot match a body Work could not read, and Work's lists are
-     * paged and may be stale, so finding none counts as absence only when every page of the source
-     * was read and none lists an item Work could not read; otherwise, or when two such items are
-     * found, the lookup fails rather than guess. A Work failure fails the effect, keeping every child
-     * recorded so far, and the next run goes on after them. A child delivery stored before is
-     * kept, and none is stored once the parent no longer awaits `effect`, as when it was
-     * cancelled.
+     * Carries out a parent's `create_children`, returning child deliveries in plan order, stored
+     * queued on the parent's branch, worktree, limits and review; none starts. Each child item is
+     * recorded before the next is created, so a rerun resumes after them (see `findChild`). None is
+     * stored once the parent no longer awaits `effect`.
      */
     readonly create: (
       parent: FactoryDeliveryStore.StoredFactoryDelivery,
@@ -116,23 +103,25 @@ const make = Effect.gen(function* () {
   const changes = yield* FactoryChanges.FactoryChanges;
 
   /** Every page of a listing: its items, and whether any page was stale. */
-  const listAll = (actor: WorkActor, query: Omit<WorkListQuery, "cursor" | "limit">) =>
-    Effect.gen(function* () {
-      const items: Array<WorkItemSummary> = [];
-      let stale = false;
-      let cursor: string | null = null;
-      do {
-        const page: WorkListResult = yield* work.listItems(actor, {
-          ...query,
-          limit: LOOKUP_PAGE,
-          ...(cursor === null ? {} : { cursor }),
-        });
-        stale ||= page.stale;
-        items.push(...page.items);
-        cursor = page.nextCursor;
-      } while (cursor !== null);
-      return { items, stale };
-    });
+  const listAll = Effect.fn("FactoryChildren.listAll")(function* (
+    actor: WorkActor,
+    query: Omit<WorkListQuery, "cursor" | "limit">,
+  ) {
+    const items: Array<WorkItemSummary> = [];
+    let stale = false;
+    let cursor: string | null = null;
+    do {
+      const page: WorkListResult = yield* work.listItems(actor, {
+        ...query,
+        limit: LOOKUP_PAGE,
+        ...(cursor === null ? {} : { cursor }),
+      });
+      stale ||= page.stale;
+      items.push(...page.items);
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+    return { items, stale };
+  });
 
   /**
    * The child item a run created for the task and never recorded: the one item under the parent
@@ -140,84 +129,82 @@ const make = Effect.gen(function* () {
    * read every item it lists: an item whose file it could not read is listed as invalid, with no
    * body for a search to match, and could be that child.
    */
-  const findChild = (
+  const findChild = Effect.fn("FactoryChildren.findChild")(function* (
     actor: WorkActor,
     parent: FactoryDeliveryStore.StoredFactoryDelivery,
     taskId: FactoryTaskId,
-  ) =>
-    Effect.gen(function* () {
-      const { sourceId, itemId: parentItemId } = parent.itemRef;
-      const reference = childReference(parent.deliveryId, taskId);
-      const fail = (reason: FactoryChildLookupError["reason"]) =>
-        new FactoryChildLookupError({ deliveryId: parent.deliveryId, taskId, reason });
-      const searched = yield* listAll(actor, { sourceId, search: reference });
-      // A search matches loosely; only the reference as written, in the item's own body, counts.
-      const found = yield* Effect.filter(
-        searched.items.filter((item) => item.parent === parentItemId),
-        ({ ref }) =>
-          work.getItem(actor, { ref }).pipe(Effect.map(({ body }) => body.includes(reference))),
-      );
-      if (found.length > 1) return yield* fail("ambiguous");
-      const [child] = found;
-      if (child !== undefined) return Option.some(child.ref.itemId);
-      const source = searched.stale ? searched : yield* listAll(actor, { sourceId });
-      if (source.stale || source.items.some(({ invalid }) => invalid !== null)) {
-        return yield* fail("incomplete");
-      }
-      return Option.none();
-    });
+  ) {
+    const { sourceId, itemId: parentItemId } = parent.itemRef;
+    const reference = childReference(parent.deliveryId, taskId);
+    const fail = (reason: FactoryChildLookupError["reason"]) =>
+      new FactoryChildLookupError({ deliveryId: parent.deliveryId, taskId, reason });
+    const searched = yield* listAll(actor, { sourceId, search: reference });
+    // A search matches loosely; only the reference as written, in the item's own body, counts.
+    const found = yield* Effect.filter(
+      searched.items.filter((item) => item.parent === parentItemId),
+      ({ ref }) =>
+        work.getItem(actor, { ref }).pipe(Effect.map(({ body }) => body.includes(reference))),
+    );
+    if (found.length > 1) return yield* fail("ambiguous");
+    const [child] = found;
+    if (child !== undefined) return Option.some(child.ref.itemId);
+    const source = searched.stale ? searched : yield* listAll(actor, { sourceId });
+    if (source.stale || source.items.some(({ invalid }) => invalid !== null)) {
+      return yield* fail("incomplete");
+    }
+    return Option.none();
+  });
 
   /**
    * The task's child item, found or created, blocked by the previous task's, and then recorded:
    * a recorded child is complete.
    */
-  const childOf = (
+  const childOf = Effect.fn("FactoryChildren.childOf")(function* (
     actor: WorkActor,
     parent: FactoryDeliveryStore.StoredFactoryDelivery,
     task: FactoryTaskStore.StoredFactoryTask,
     previous: WorkItemId | undefined,
-  ) =>
-    Effect.gen(function* () {
-      if (task.childItemId !== null) return task.childItemId;
-      // Every task of a parent is a plan task; only a single item's task has no plan.
-      if (task.plan === null) return yield* Effect.die("An approved task has no plan.");
-      const { deliveryId } = parent;
-      // Claimed before any create, so an unclaimed task has no child to look for.
-      const found =
-        task.childClaimedAt === null
-          ? yield* tasks
-              .claimChild({ deliveryId, taskId: task.taskId })
-              .pipe(Effect.as(Option.none<WorkItemId>()))
-          : yield* findChild(actor, parent, task.taskId);
-      const itemId = Option.isSome(found)
-        ? found.value
-        : (yield* work.createItem(
-            actor,
-            childItemInput({ parent: parent.itemRef, deliveryId, task: task.plan }),
-          )).ref.itemId;
-      if (previous !== undefined) {
-        yield* work.updateItem(actor, {
-          ref: { sourceId: parent.itemRef.sourceId, itemId },
-          blockedBy: [previous],
-        });
-      }
-      yield* tasks.setChildItem({ deliveryId, taskId: task.taskId, itemId });
-      return itemId;
-    });
+  ) {
+    if (task.childItemId !== null) return task.childItemId;
+    // Every task of a parent is a plan task; only a single item's task has no plan.
+    if (task.plan === null) return yield* Effect.die("An approved task has no plan.");
+    const { deliveryId } = parent;
+    // Claimed before any create, so an unclaimed task has no child to look for.
+    const found =
+      task.childClaimedAt === null
+        ? yield* tasks
+            .claimChild({ deliveryId, taskId: task.taskId })
+            .pipe(Effect.as(Option.none<WorkItemId>()))
+        : yield* findChild(actor, parent, task.taskId);
+    const itemId = Option.isSome(found)
+      ? found.value
+      : (yield* work.createItem(
+          actor,
+          childItemInput({ parent: parent.itemRef, deliveryId, task: task.plan }),
+        )).ref.itemId;
+    if (previous !== undefined) {
+      yield* work.updateItem(actor, {
+        ref: { sourceId: parent.itemRef.sourceId, itemId },
+        blockedBy: [previous],
+      });
+    }
+    yield* tasks.setChildItem({ deliveryId, taskId: task.taskId, itemId });
+    return itemId;
+  });
 
   /**
    * Stores each child's queued delivery that is not stored yet, in one transaction, while the
    * parent still awaits the effect: a parent cancelled meanwhile queues no children.
    */
-  const storeDeliveries = (
-    parent: FactoryDeliveryStore.StoredFactoryDelivery,
-    effectId: number,
-    children: ReadonlyArray<{
-      readonly task: FactoryTaskStore.StoredFactoryTask;
-      readonly itemId: WorkItemId;
-    }>,
-  ) =>
-    Effect.gen(function* () {
+  const storeDeliveries = Effect.fn("FactoryChildren.storeDeliveries")(
+    function* (
+      parent: FactoryDeliveryStore.StoredFactoryDelivery,
+      effectId: number,
+      children: ReadonlyArray<{
+        readonly task: FactoryTaskStore.StoredFactoryTask;
+        readonly itemId: WorkItemId;
+      }>,
+    ) {
       const current = yield* deliveries.get(parent.deliveryId);
       const awaiting = Option.getOrUndefined(current)?.state.awaiting;
       if (awaiting?.type !== "effect" || awaiting.effect.id !== effectId) return Option.none();
@@ -251,14 +238,14 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
-    }).pipe(
-      (write) => changes.transact(write, Option.isSome),
-      Effect.catchTags({
-        SqlError: (cause) =>
-          Effect.fail(new FactoryStoreError({ operation: "children.store", cause })),
-      }),
-      Effect.map(Option.getOrElse((): ReadonlyArray<FactoryDeliveryId> => [])),
-    );
+    },
+    (write) => changes.transact(write, Option.isSome),
+    Effect.catchTags({
+      SqlError: (cause) =>
+        Effect.fail(new FactoryStoreError({ operation: "children.store", cause })),
+    }),
+    Effect.map(Option.getOrElse((): ReadonlyArray<FactoryDeliveryId> => [])),
+  );
 
   const create: FactoryChildren["Service"]["create"] = Effect.fn("FactoryChildren.create")(
     function* (parent, effect) {

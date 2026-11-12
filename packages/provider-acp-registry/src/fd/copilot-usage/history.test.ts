@@ -124,12 +124,15 @@ describe("Copilot usage history", () => {
         config: unknown,
         environment = { HOME: "/users/test", COPILOT_HOME: "~/alternate" },
       ) =>
-        reader.directories({
-          instanceId: ProviderInstanceId.make("test"),
-          config: decodeSettings(config),
-          environment,
-          configured: true,
-        });
+        reader.directories(
+          {
+            instanceId: ProviderInstanceId.make("test"),
+            config: decodeSettings(config),
+            environment,
+            configured: true,
+          },
+          { awaitRefresh: false },
+        );
       expect(yield* directories({ agentId: "github-copilot-cli" })).toEqual([
         { dir: "/users/test/alternate/session-state", fileName: "events.jsonl" },
       ]);

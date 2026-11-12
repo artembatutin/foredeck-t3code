@@ -348,9 +348,11 @@ describe("Factory single-item delivery to its pull request", () => {
         // the gate read origin, the push URL moves: the remote and branch stay.
         world.publishing.throughDriver = true;
         const driver = yield* GitVcsDriver.GitVcsDriver;
+        const fileSystem = yield* FileSystem.FileSystem;
         world.publishHooks.push(
           git(worktreePath, ["remote", "set-url", "--push", "origin", elsewhere]).pipe(
             Effect.provideService(GitVcsDriver.GitVcsDriver, driver),
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
             Effect.orDie,
             Effect.asVoid,
           ),

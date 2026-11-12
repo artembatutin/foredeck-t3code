@@ -133,7 +133,7 @@ const questionWaiting = (world: World, watch: ReturnType<typeof decisionWatch>) 
 
 describe("what waits for a slot across a restart", () => {
   it.live(
-    "a message-capable question on a completed child is delivered once, after a rebuild",
+    "a message-capable question on a completed child is moot once granted after a rebuild",
     () => {
       const watch = decisionWatch();
       return withProject(
@@ -145,21 +145,22 @@ describe("what waits for a slot across a restart", () => {
               Effect.gen(function* () {
                 yield* drainOrchestration;
                 assert.lengthOf(yield* demandsOf(managed.root), 1);
+                const before = (yield* runsOf(author.threadId)).length;
                 yield* release(fillers[0]!);
                 yield* tick;
-                const messageId = `message:delegated-task-question:${author.threadId}:${requestId}`;
-                const run = yield* runOfMessage(messageId);
-                assert.strictEqual((yield* slotOf(managed.root))?.state, "held");
-                yield* tick;
-                yield* tick;
-                assert.lengthOf(
-                  (yield* runsOf(author.threadId)).filter((row) => row.userMessageId === messageId),
-                  1,
-                );
-                yield* runStarted(run);
-                yield* world.endRun(run, "completed");
-                yield* tick;
+                // Core drops a settled task's question wake, so its redelivery wakes nothing and
+                // gives the slot back.
+                yield* drainOrchestration;
                 yield* nothingLeft(managed.root);
+                assert.deepInclude(yield* grantOutcomesOf(managed.root), {
+                  kind: "delegated_question",
+                  outcome: "moot",
+                });
+                const messageId = `message:delegated-task-question:${author.threadId}:${requestId}`;
+                assert.strictEqual((yield* runsOf(author.threadId)).length, before);
+                assert.isFalse(
+                  (yield* runsOf(author.threadId)).some((row) => row.userMessageId === messageId),
+                );
               }),
               { orchestration: true },
             );
@@ -193,19 +194,21 @@ describe("what waits for a slot across a restart", () => {
             WHERE id = ${demand?.id ?? 0}`;
             yield* world.rebuild(
               Effect.gen(function* () {
+                const before = (yield* runsOf(author.threadId)).length;
                 yield* tick;
-                const messageId = `message:delegated-task-question:${author.threadId}:${requestId}`;
-                const run = yield* runOfMessage(messageId);
-                assert.strictEqual((yield* slotOf(managed.root))?.state, "held");
-                yield* tick;
-                assert.lengthOf(
-                  (yield* runsOf(author.threadId)).filter((row) => row.userMessageId === messageId),
-                  1,
-                );
-                yield* runStarted(run);
-                yield* world.endRun(run, "completed");
-                yield* tick;
+                // Redelivered at once, it finds the question moot: core drops a settled task's
+                // question wake.
+                yield* drainOrchestration;
                 yield* nothingLeft(managed.root);
+                assert.deepInclude(yield* grantOutcomesOf(managed.root), {
+                  kind: "delegated_question",
+                  outcome: "moot",
+                });
+                const messageId = `message:delegated-task-question:${author.threadId}:${requestId}`;
+                assert.strictEqual((yield* runsOf(author.threadId)).length, before);
+                assert.isFalse(
+                  (yield* runsOf(author.threadId)).some((row) => row.userMessageId === messageId),
+                );
               }),
               { orchestration: true },
             );
@@ -309,14 +312,16 @@ describe("what waits for a slot across a restart", () => {
           yield* world.endRun(author.runId, "completed");
           yield* reviewPasses(world, author.deliveryId);
 
-          // The owner reads the result, so the delivery is acknowledged.
+          // The author's run reads the result, so the delivery is acknowledged. The run is named:
+          // core takes an unobserved read of a pending result for a late wait, and wakes the idle
+          // parent with it instead of acknowledging it.
           const orchestrator = yield* Orchestrator.OrchestratorV2;
           yield* orchestrator.dispatch({
             type: "delegated_task.completion-delivery.acknowledge",
             commandId: CommandId.make("test-acknowledge"),
             parentThreadId: author.threadId,
             taskId: delegate.taskId,
-            observedByRunId: null,
+            observedByRunId: author.runId,
           });
           yield* drainOrchestration;
 
@@ -411,19 +416,21 @@ describe("what waits for a slot across a restart", () => {
           const opened = yield* openSingle(world);
           const managed = yield* manage(world, opened.deliveryId, { state: "needs-input" });
           yield* tick;
-          const { fillers, messageId, taskId } = yield* completionSteerFellBack(
+          const { fillers, messageId, ownerRun, taskId } = yield* completionSteerFellBack(
             world,
             watch,
             opened,
             managed,
           );
+          // The owner's run reads the result. The run is named: core takes an unobserved read of a
+          // pending result for a late wait, and wakes the idle parent with it instead.
           const orchestrator = yield* Orchestrator.OrchestratorV2;
           yield* orchestrator.dispatch({
             type: "delegated_task.completion-delivery.acknowledge",
             commandId: CommandId.make("test-acknowledge-steer"),
             parentThreadId: opened.threadId,
             taskId,
-            observedByRunId: null,
+            observedByRunId: ownerRun,
           });
           yield* drainOrchestration;
 

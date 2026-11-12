@@ -3,6 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import { isNightlyDesktopVersion } from "../../updates/updateChannels.ts";
 import { previewProfilePath, readUxPreviewBuildHome, resolveUxPreviewHome } from "./index.ts";
 
 describe("installed preview isolation", () => {
@@ -106,4 +107,9 @@ describe.each([
       }),
     ).toEqual({ _tag: "Ordinary" });
   });
+});
+
+it("keeps UX preview and development builds off the nightly label", () => {
+  expect(isNightlyDesktopVersion("0.0.45-uxpreview.20261102.1")).toBe(false);
+  expect(isNightlyDesktopVersion("0.0.45-dev.20261103.1")).toBe(false);
 });

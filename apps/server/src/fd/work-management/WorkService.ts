@@ -46,7 +46,7 @@ import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -236,11 +236,9 @@ export class WorkService extends Context.Service<
     readonly reserveLaunch: (threadId: ThreadId) => Effect.Effect<void, never, Scope.Scope>;
     readonly isLaunching: (threadId: ThreadId) => Effect.Effect<boolean>;
     /**
-     * Runs another server module's launch of a thread for an item, with the item's link written
-     * first under its canonical ref and marked with that module's origin. As with Work's own
-     * starts, the link is reserved while the launch runs, so the thread's runs always find it,
-     * and a launch that ends without its thread removes it. Running the launch again keeps the
-     * one link.
+     * Runs another module's thread launch for an item, writing the item's link (canonical ref,
+     * that module's origin) first so the thread's runs always find it. A launch ending without a
+     * thread removes the link; relaunching keeps the one link.
      */
     readonly linkLaunch: <A, E>(
       input: {
@@ -293,7 +291,7 @@ const make = Effect.gen(function* () {
   const projects = yield* ProjectStore.ProjectStoreV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const secrets = yield* ServerSecretStore.ServerSecretStore;
-  const crypto = yield* Crypto.Crypto;
+  const crypto = yield* SecureRandom.SecureRandom;
 
   // One epoch tells clients to refetch, whatever changed; the wire carries nothing more. Cached
   // reads go stale per source instead, so one source's change leaves the others' caches warm.
@@ -389,11 +387,11 @@ const make = Effect.gen(function* () {
     interactive,
   });
 
-  const resolveStored = (
+  const resolveStored: (
     stored: WorkSourceStore.StoredWorkSource,
     interactive: boolean,
-  ): Effect.Effect<ResolvedSource, WorkDomainError> =>
-    Effect.gen(function* () {
+  ) => Effect.Effect<ResolvedSource, WorkDomainError> = Effect.fn("WorkService.resolveStored")(
+    function* (stored: WorkSourceStore.StoredWorkSource, interactive: boolean) {
       if (stored.state !== "active") {
         return yield* new WorkUnavailable({ detail: "This Work source is disconnected." });
       }
@@ -401,7 +399,8 @@ const make = Effect.gen(function* () {
       const rootPath = yield* projectRoot(stored.projectId);
       const secret = Option.getOrUndefined(yield* readSecret(stored.secretName));
       return { stored, adapter, runtime: toRuntime(stored, rootPath, secret, interactive) };
-    });
+    },
+  );
 
   const resolveSource: WorkService["Service"]["resolveSource"] = (sourceId, options) =>
     sources.get(sourceId).pipe(
@@ -504,8 +503,8 @@ const make = Effect.gen(function* () {
 
   const storeFailure = unavailable("Work storage is unavailable.");
 
-  const listSources: WorkService["Service"]["listSources"] = (actor, input) =>
-    Effect.gen(function* () {
+  const listSources: WorkService["Service"]["listSources"] = Effect.fn("WorkService.listSources")(
+    function* (actor, input) {
       yield* requireGrants(actor, [AuthWorkReadScope]);
       const rows = yield* sources
         .list({
@@ -514,7 +513,8 @@ const make = Effect.gen(function* () {
         })
         .pipe(Effect.mapError(storeFailure));
       return { sources: rows.map((stored) => toWorkSource(stored, registry.get(stored.kind))) };
-    });
+    },
+  );
 
   /** Removes a stored token nobody references any more. */
   const releaseSecret = (name: string | null) =>
@@ -594,8 +594,8 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const saveSource: WorkService["Service"]["saveSource"] = (actor, input) =>
-    Effect.gen(function* () {
+  const saveSource: WorkService["Service"]["saveSource"] = Effect.fn("WorkService.saveSource")(
+    function* (actor, input) {
       yield* requireGrants(actor, [AuthSettingsWriteScope]);
       const adapter = yield* adapterFor(input.config.kind);
       const previous =
@@ -691,8 +691,7 @@ const make = Effect.gen(function* () {
         | WorkUnavailable
       > =
         input.sourceId === undefined
-          ? crypto.randomUUIDv4().pipe(
-              Effect.mapError(unavailable("A source id could not be minted.")),
+          ? crypto.uuidV4().pipe(
               Effect.flatMap((uuid) =>
                 sources.insertOrRevive({
                   sourceId: WorkSourceId.make(uuid.toLowerCase()),
@@ -733,47 +732,48 @@ const make = Effect.gen(function* () {
         yield* releaseSecret(previous.secretName);
       }
       return toWorkSource(stored, adapter);
-    });
+    },
+  );
 
-  const disconnectSource: WorkService["Service"]["disconnectSource"] = (actor, input) =>
-    Effect.gen(function* () {
-      yield* requireGrants(actor, [AuthSettingsWriteScope]);
-      const stored = yield* sources
-        .disconnect(input.sourceId, input.expectedVersion)
-        .pipe(Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }));
-      yield* releaseSecret(stored.secretName);
-      health.delete(stored.sourceId);
-      yield* sourceChanged(stored.sourceId);
-      return toWorkSource(stored, registry.get(stored.kind));
-    });
+  const disconnectSource: WorkService["Service"]["disconnectSource"] = Effect.fn(
+    "WorkService.disconnectSource",
+  )(function* (actor, input) {
+    yield* requireGrants(actor, [AuthSettingsWriteScope]);
+    const stored = yield* sources
+      .disconnect(input.sourceId, input.expectedVersion)
+      .pipe(Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }));
+    yield* releaseSecret(stored.secretName);
+    health.delete(stored.sourceId);
+    yield* sourceChanged(stored.sourceId);
+    return toWorkSource(stored, registry.get(stored.kind));
+  });
 
-  const restoreSource: WorkService["Service"]["restoreSource"] = (actor, input) =>
-    Effect.gen(function* () {
-      yield* requireGrants(actor, [AuthSettingsWriteScope]);
-      // A source cannot come back to a project that is gone.
-      yield* projectRoot((yield* requireSource(input.sourceId)).projectId);
-      const restored = yield* sources
-        .restore(input.sourceId, input.expectedVersion)
-        .pipe(Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }));
-      // The shared token may have been released, or replaced for a sibling, while this source
-      // was disconnected; it uses whatever its site and account hold now.
-      const name = secretNameFor(restored.config);
-      const current = name !== null && Option.isSome(yield* readSecret(name)) ? name : null;
-      const stored =
-        current !== restored.secretName
-          ? yield* sources
-              .update({ sourceId: restored.sourceId, secretName: current })
-              .pipe(
-                Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }),
-              )
-          : restored;
-      health.delete(stored.sourceId);
-      yield* sourceChanged(stored.sourceId);
-      return toWorkSource(stored, registry.get(stored.kind));
-    });
+  const restoreSource: WorkService["Service"]["restoreSource"] = Effect.fn(
+    "WorkService.restoreSource",
+  )(function* (actor, input) {
+    yield* requireGrants(actor, [AuthSettingsWriteScope]);
+    // A source cannot come back to a project that is gone.
+    yield* projectRoot((yield* requireSource(input.sourceId)).projectId);
+    const restored = yield* sources
+      .restore(input.sourceId, input.expectedVersion)
+      .pipe(Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }));
+    // The shared token may have been released, or replaced for a sibling, while this source
+    // was disconnected; it uses whatever its site and account hold now.
+    const name = secretNameFor(restored.config);
+    const current = name !== null && Option.isSome(yield* readSecret(name)) ? name : null;
+    const stored =
+      current !== restored.secretName
+        ? yield* sources
+            .update({ sourceId: restored.sourceId, secretName: current })
+            .pipe(Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }))
+        : restored;
+    health.delete(stored.sourceId);
+    yield* sourceChanged(stored.sourceId);
+    return toWorkSource(stored, registry.get(stored.kind));
+  });
 
-  const testSource: WorkService["Service"]["testSource"] = (actor, input) =>
-    Effect.gen(function* () {
+  const testSource: WorkService["Service"]["testSource"] = Effect.fn("WorkService.testSource")(
+    function* (actor, input) {
       yield* requireGrants(actor, [AuthSettingsWriteScope]);
       const adapter = yield* adapterFor(input.config.kind);
       const rootPath = yield* projectRoot(input.projectId);
@@ -797,7 +797,8 @@ const make = Effect.gen(function* () {
           WorkRateLimited: (error) => Effect.succeed({ ok: false, message: error.message }),
         }),
       );
-    });
+    },
+  );
 
   /** Failures are not worth remembering: the next read after a fix should see it. */
   const liveFor = (ttl: Duration.Input) => (exit: Exit.Exit<unknown, unknown>) =>
@@ -822,12 +823,13 @@ const make = Effect.gen(function* () {
     { capacity: CACHE_CAPACITY, timeToLive: liveFor(ITEM_TTL) },
   );
 
-  const listItems: WorkService["Service"]["listItems"] = (actor, query) =>
-    Effect.gen(function* () {
+  const listItems: WorkService["Service"]["listItems"] = Effect.fn("WorkService.listItems")(
+    function* (actor, query) {
       yield* requireGrants(actor, [AuthWorkReadScope]);
       const at = yield* cacheGeneration(query.sourceId);
       return yield* Cache.get(listCache, encodeListKey([query.sourceId, query, at]));
-    });
+    },
+  );
 
   const toLink = (link: WorkLinkStore.StoredWorkLink): WorkThreadLink => ({
     ref: { sourceId: link.sourceId, itemId: link.itemId },
@@ -839,8 +841,8 @@ const make = Effect.gen(function* () {
     run: link.run,
   });
 
-  const getItem: WorkService["Service"]["getItem"] = (actor, input) =>
-    Effect.gen(function* () {
+  const getItem: WorkService["Service"]["getItem"] = Effect.fn("WorkService.getItem")(
+    function* (actor, input) {
       yield* requireGrants(actor, [AuthWorkReadScope]);
       const { adapter } = yield* resolveSource(input.ref.sourceId, { interactive: true });
       const ref = yield* canonicalRef(input.ref);
@@ -856,10 +858,11 @@ const make = Effect.gen(function* () {
         capabilities: adapter.capabilities,
         ...workItemLinkScope(detail),
       };
-    });
+    },
+  );
 
-  const listPeople: WorkService["Service"]["listPeople"] = (actor, query) =>
-    Effect.gen(function* () {
+  const listPeople: WorkService["Service"]["listPeople"] = Effect.fn("WorkService.listPeople")(
+    function* (actor, query) {
       yield* requireGrants(actor, [AuthWorkReadScope]);
       const { adapter, runtime } = yield* resolveSource(query.sourceId, { interactive: true });
       const itemId =
@@ -869,60 +872,60 @@ const make = Effect.gen(function* () {
         adapter.people(runtime, itemId === undefined ? query : { ...query, itemId }),
       );
       return { people };
-    });
+    },
+  );
 
   /** Replays the stored result of a non-idempotent write retried with the same request id. */
-  const replayed = <A>(
+  const replayed = Effect.fn("WorkService.replayed")(function* <A>(
     actor: WorkActor,
     operation: string,
     requestId: string | undefined,
     write: Effect.Effect<A, WorkDomainError>,
-  ): Effect.Effect<A, WorkDomainError> =>
-    Effect.gen(function* () {
-      if (requestId === undefined) return yield* write;
-      const key = `${actor.id}\0${operation}\0${requestId}`;
-      const now = yield* Clock.currentTimeMillis;
-      for (const [existing, entry] of replays) {
-        if (now - entry.at > REQUEST_REPLAY_MS) replays.delete(existing);
-      }
-      const earlier = replays.get(key);
-      // A retry that lands while the first attempt still runs waits for that attempt.
-      if (earlier !== undefined) return (yield* Deferred.await(earlier.outcome)) as A;
-      if (replays.size >= REQUEST_REPLAY_CAPACITY) {
-        for (const [oldest, entry] of replays) {
-          if (entry.settled) {
-            replays.delete(oldest);
-            break;
-          }
+  ) {
+    if (requestId === undefined) return yield* write;
+    const key = `${actor.id}\0${operation}\0${requestId}`;
+    const now = yield* Clock.currentTimeMillis;
+    for (const [existing, entry] of replays) {
+      if (now - entry.at > REQUEST_REPLAY_MS) replays.delete(existing);
+    }
+    const earlier = replays.get(key);
+    // A retry that lands while the first attempt still runs waits for that attempt.
+    if (earlier !== undefined) return (yield* Deferred.await(earlier.outcome)) as A;
+    if (replays.size >= REQUEST_REPLAY_CAPACITY) {
+      for (const [oldest, entry] of replays) {
+        if (entry.settled) {
+          replays.delete(oldest);
+          break;
         }
       }
-      const entry: ReplayEntry = {
-        at: now,
-        outcome: yield* Deferred.make<unknown, WorkDomainError>(),
-        settled: false,
-      };
-      replays.set(key, entry);
-      // The bookkeeping is a finalizer: an interrupted first attempt (the client dropped) must
-      // still settle its waiters and free the id, or every retry would hang on it.
-      return yield* write.pipe(
-        Effect.onExit((exit) =>
-          Effect.suspend(() => {
-            entry.settled = true;
-            if (Exit.isFailure(exit)) replays.delete(key);
-            const settled: Exit.Exit<unknown, WorkDomainError> =
-              Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
-                ? Exit.fail(
-                    new WorkUnavailable({ detail: "The first attempt was cancelled; try again." }),
-                  )
-                : exit;
-            return Deferred.done(entry.outcome, settled);
-          }),
-        ),
-      );
-    });
+    }
+    const entry: ReplayEntry = {
+      at: now,
+      outcome: yield* Deferred.make<unknown, WorkDomainError>(),
+      settled: false,
+    };
+    replays.set(key, entry);
+    // The bookkeeping is a finalizer: an interrupted first attempt (the client dropped) must
+    // still settle its waiters and free the id, or every retry would hang on it.
+    return yield* write.pipe(
+      Effect.onExit((exit) =>
+        Effect.suspend(() => {
+          entry.settled = true;
+          if (Exit.isFailure(exit)) replays.delete(key);
+          const settled: Exit.Exit<unknown, WorkDomainError> =
+            Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
+              ? Exit.fail(
+                  new WorkUnavailable({ detail: "The first attempt was cancelled; try again." }),
+                )
+              : exit;
+          return Deferred.done(entry.outcome, settled);
+        }),
+      ),
+    );
+  });
 
-  const createItem: WorkService["Service"]["createItem"] = (actor, input) =>
-    Effect.gen(function* () {
+  const createItem: WorkService["Service"]["createItem"] = Effect.fn("WorkService.createItem")(
+    function* (actor, input) {
       yield* requireGrants(actor, [AuthWorkWriteScope]);
       const { adapter, runtime } = yield* resolveSource(input.sourceId, { interactive: true });
       const created = yield* replayed(
@@ -933,10 +936,11 @@ const make = Effect.gen(function* () {
       );
       yield* sourceChanged(input.sourceId);
       return created;
-    });
+    },
+  );
 
-  const updateItem: WorkService["Service"]["updateItem"] = (actor, input) =>
-    Effect.gen(function* () {
+  const updateItem: WorkService["Service"]["updateItem"] = Effect.fn("WorkService.updateItem")(
+    function* (actor, input) {
       yield* requireGrants(actor, [AuthWorkWriteScope]);
       if (
         (input.title !== undefined || input.body !== undefined) &&
@@ -960,10 +964,11 @@ const make = Effect.gen(function* () {
       const updated = yield* observed(patch.ref.sourceId, adapter.update(runtime, patch, actor));
       yield* sourceChanged(patch.ref.sourceId);
       return updated;
-    });
+    },
+  );
 
-  const setStatus: WorkService["Service"]["setStatus"] = (actor, input) =>
-    Effect.gen(function* () {
+  const setStatus: WorkService["Service"]["setStatus"] = Effect.fn("WorkService.setStatus")(
+    function* (actor, input) {
       yield* requireGrants(actor, [AuthWorkWriteScope]);
       const { adapter, runtime } = yield* resolveSource(input.ref.sourceId, { interactive: true });
       const request = { ...input, ref: yield* canonicalRef(input.ref) };
@@ -973,10 +978,11 @@ const make = Effect.gen(function* () {
       );
       yield* sourceChanged(input.ref.sourceId);
       return updated;
-    });
+    },
+  );
 
-  const addComment: WorkService["Service"]["addComment"] = (actor, input) =>
-    Effect.gen(function* () {
+  const addComment: WorkService["Service"]["addComment"] = Effect.fn("WorkService.addComment")(
+    function* (actor, input) {
       yield* requireGrants(actor, [AuthWorkWriteScope]);
       if (input.body.trim().length === 0) {
         return yield* new WorkInvalid({ detail: "A comment needs some text." });
@@ -998,10 +1004,11 @@ const make = Effect.gen(function* () {
       );
       yield* sourceChanged(ref.sourceId);
       return result;
-    });
+    },
+  );
 
-  const findComment: WorkService["Service"]["findComment"] = (actor, input) =>
-    Effect.gen(function* () {
+  const findComment: WorkService["Service"]["findComment"] = Effect.fn("WorkService.findComment")(
+    function* (actor, input) {
       yield* requireGrants(actor, [AuthWorkReadScope]);
       if (input.text.trim().length === 0) {
         return yield* new WorkInvalid({ detail: "A comment lookup needs some text." });
@@ -1011,7 +1018,8 @@ const make = Effect.gen(function* () {
       const { adapter, runtime } = yield* resolveSource(input.ref.sourceId);
       const ref = yield* canonicalRef(input.ref);
       return yield* observed(ref.sourceId, adapter.findComment(runtime, ref.itemId, input.text));
-    });
+    },
+  );
 
   const isOpenThread = (threadId: WorkThreadLink["threadId"]) =>
     projections.getThreadShell(threadId).pipe(
@@ -1025,8 +1033,8 @@ const make = Effect.gen(function* () {
       Effect.mapError(unavailable("Thread state could not be read.")),
     );
 
-  const listLinks: WorkService["Service"]["listLinks"] = (actor, query) =>
-    Effect.gen(function* () {
+  const listLinks: WorkService["Service"]["listLinks"] = Effect.fn("WorkService.listLinks")(
+    function* (actor, query) {
       yield* requireGrants(actor, [AuthWorkReadScope]);
       if (query.threadId !== undefined) {
         const rows = yield* links.listByThread(query.threadId).pipe(Effect.mapError(storeFailure));
@@ -1052,10 +1060,11 @@ const make = Effect.gen(function* () {
         { concurrency: OPEN_LINK_READ_CONCURRENCY },
       );
       return { links: open.flat().map(toLink), truncated: all.truncated };
-    });
+    },
+  );
 
-  const setLink: WorkService["Service"]["setLink"] = (actor, request) =>
-    Effect.gen(function* () {
+  const setLink: WorkService["Service"]["setLink"] = Effect.fn("WorkService.setLink")(
+    function* (actor, request) {
       yield* requireGrants(actor, [AuthWorkWriteScope]);
       const input = { ...request, ref: yield* canonicalRef(request.ref) };
       if (input.action === "unlink") {
@@ -1092,7 +1101,8 @@ const make = Effect.gen(function* () {
         .pipe(Effect.mapError(storeFailure));
       yield* notifyChanged;
       return { linked: true };
-    });
+    },
+  );
 
   /** Drops a reserved link whose launch ended without creating its thread. */
   const releaseUnlaunched = (ref: WorkItemRef, threadId: ThreadId) =>
@@ -1104,8 +1114,8 @@ const make = Effect.gen(function* () {
       Effect.catchCause((cause) => Effect.logWarning("work launch reservation left", cause)),
     );
 
-  const linkLaunch: WorkService["Service"]["linkLaunch"] = (input, launch) =>
-    Effect.gen(function* () {
+  const linkLaunch: WorkService["Service"]["linkLaunch"] = Effect.fn("WorkService.linkLaunch")(
+    function* (input, launch) {
       const ref = yield* canonicalRef(input.ref);
       // Usually served by the read the caller made before preparing its launch.
       const at = yield* cacheGeneration(ref.sourceId);
@@ -1145,11 +1155,12 @@ const make = Effect.gen(function* () {
       );
       if (inserted) yield* notifyChanged;
       return launched;
-    });
+    },
+  );
 
   /** Drops the cached reads of the sources named (one, a project's, or every one). */
-  const refresh: WorkService["Service"]["refresh"] = (actor, input) =>
-    Effect.gen(function* () {
+  const refresh: WorkService["Service"]["refresh"] = Effect.fn("WorkService.refresh")(
+    function* (actor, input) {
       yield* requireGrants(actor, [AuthWorkReadScope]);
       if (input.sourceId !== undefined) return yield* sourceChanged(input.sourceId);
       if (input.projectId === undefined) return yield* bumpEpoch;
@@ -1158,7 +1169,8 @@ const make = Effect.gen(function* () {
         .pipe(Effect.mapError(storeFailure));
       for (const row of rows) staleSource(row.sourceId);
       yield* notifyChanged;
-    });
+    },
+  );
 
   const watchableSources: WorkService["Service"]["watchableSources"] = sources.list().pipe(
     Effect.mapError(storeFailure),
@@ -1201,22 +1213,23 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const retireProject: WorkService["Service"]["retireProject"] = (projectId) =>
-    Effect.gen(function* () {
-      // Tombstones keep their links until their project goes; a tombstone's token is released too.
-      const rows = yield* sources
-        .list({ projectId, includeDisconnected: true })
-        .pipe(Effect.mapError(storeFailure));
-      for (const stored of rows) {
-        yield* links.deleteBySource(stored.sourceId).pipe(Effect.mapError(storeFailure));
-        yield* sources
-          .disconnect(stored.sourceId)
-          .pipe(Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }));
-        yield* releaseSecret(stored.secretName);
-        health.delete(stored.sourceId);
-      }
-      if (rows.length > 0) yield* bumpEpoch;
-    });
+  const retireProject: WorkService["Service"]["retireProject"] = Effect.fn(
+    "WorkService.retireProject",
+  )(function* (projectId) {
+    // Tombstones keep their links until their project goes; a tombstone's token is released too.
+    const rows = yield* sources
+      .list({ projectId, includeDisconnected: true })
+      .pipe(Effect.mapError(storeFailure));
+    for (const stored of rows) {
+      yield* links.deleteBySource(stored.sourceId).pipe(Effect.mapError(storeFailure));
+      yield* sources
+        .disconnect(stored.sourceId)
+        .pipe(Effect.catchTags({ WorkStoreError: (error) => Effect.fail(storeFailure(error)) }));
+      yield* releaseSecret(stored.secretName);
+      health.delete(stored.sourceId);
+    }
+    if (rows.length > 0) yield* bumpEpoch;
+  });
 
   return WorkService.of({
     listSources,

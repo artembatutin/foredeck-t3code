@@ -71,8 +71,8 @@ export const make = Effect.gen(function* () {
       }
     }
   });
-  const withMutation: Coordination["withMutation"] = (input, effect) =>
-    Effect.gen(function* () {
+  const withMutation: Coordination["withMutation"] = Effect.fn("CheckoutCoordination.withMutation")(
+    function* <A, E, R>(input: Mutation, effect: Effect.Effect<A, E, R>) {
       const repository = yield* git.execute({
         operation: input.operation,
         cwd: input.cwd,
@@ -136,6 +136,7 @@ export const make = Effect.gen(function* () {
           return yield* effect;
         }),
       );
-    });
+    },
+  );
   return { withMutation } satisfies Coordination;
 });

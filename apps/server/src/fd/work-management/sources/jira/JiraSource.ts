@@ -76,7 +76,7 @@ const originOf = (config: JiraConfig) => {
   return "origin" in site ? site.origin : config.siteUrl;
 };
 
-export const jiraIdentity = (config: JiraConfig) =>
+const jiraIdentity = (config: JiraConfig) =>
   `${new URL(originOf(config)).host.toLowerCase()}/${config.projectKey.trim().toUpperCase()}`;
 
 /** Whether an upper-cased issue key belongs to the source's project. */
@@ -106,614 +106,585 @@ const projectIssueKey = (
 export type JiraSourceOptions = JiraApi.JiraApiOptions;
 
 /** Jira Cloud issues of one project, through an unscoped API token stored on the server. */
-export const make = (options: JiraSourceOptions = {}) =>
-  Effect.gen(function* () {
-    const api = yield* JiraApi.make(options);
-    const issueLocks = new Map<string, Semaphore.Semaphore>();
-    /** Issue ids written recently per source, named in searches until the index has them. */
-    const recentWrites = new Map<string, Map<string, number>>();
+export const make = Effect.fn("JiraSource.make")(function* (options: JiraSourceOptions = {}) {
+  const api = yield* JiraApi.make(options);
+  const issueLocks = new Map<string, Semaphore.Semaphore>();
+  /** Issue ids written recently per source, named in searches until the index has them. */
+  const recentWrites = new Map<string, Map<string, number>>();
 
-    const credentialOf = (runtime: Pick<WorkSourceRuntime, "config" | "secret">) =>
-      runtime.secret === undefined
+  const credentialOf = (runtime: Pick<WorkSourceRuntime, "config" | "secret">) =>
+    runtime.secret === undefined
+      ? undefined
+      : { email: configOf(runtime).email, token: runtime.secret };
+
+  const call = (runtime: WorkSourceRuntime, request: Omit<JiraApi.JiraRequest, "interactive">) =>
+    api.request(configOf(runtime).siteUrl, credentialOf(runtime), {
+      ...request,
+      interactive: runtime.interactive,
+    });
+
+  const remember = (runtime: WorkSourceRuntime, issueId: string) =>
+    Clock.currentTimeMillis.pipe(
+      Effect.map((now) => {
+        const writes = recentWrites.get(runtime.sourceId) ?? new Map<string, number>();
+        writes.set(issueId, now);
+        recentWrites.set(runtime.sourceId, writes);
+      }),
+    );
+
+  const reconcileIds = (runtime: WorkSourceRuntime) =>
+    Clock.currentTimeMillis.pipe(
+      Effect.map((now) => {
+        const writes = recentWrites.get(runtime.sourceId);
+        if (writes === undefined) return [];
+        for (const [id, at] of writes) if (now - at > RECONCILE_WINDOW_MS) writes.delete(id);
+        return [...writes.keys()].map(Number).filter(Number.isSafeInteger);
+      }),
+    );
+
+  /**
+   * Writes to one issue run one at a time; the transport spaces each of their requests. The
+   * lock is per site and issue, not per source: two sources over one Jira project write the
+   * same issues.
+   */
+  const issueWrite = <A>(
+    runtime: WorkSourceRuntime,
+    key: string,
+    effect: Effect.Effect<A, WorkDomainError>,
+  ) =>
+    Effect.suspend(() => {
+      const lockKey = `${originOf(configOf(runtime))}\0${key}`;
+      let lock = issueLocks.get(lockKey);
+      if (lock === undefined) {
+        lock = Semaphore.makeUnsafe(1);
+        issueLocks.set(lockKey, lock);
+      }
+      return lock.withPermits(1)(effect);
+    });
+
+  const readIssue = (runtime: WorkSourceRuntime, key: string, expand?: string) =>
+    call(runtime, {
+      operation: "jira.issue",
+      kind: "read",
+      path: `/rest/api/3/issue/${encodeURIComponent(key)}`,
+      query: { fields: "*navigable,-comment", ...(expand === undefined ? {} : { expand }) },
+      itemId: key,
+    }).pipe(
+      Effect.flatMap((response) => decodeIssue(response.body).pipe(Effect.mapError(unexpected))),
+      // Jira answers an old key with the issue it now names, which may have moved project.
+      Effect.filterOrFail(
+        (issue) => inProject(configOf(runtime), normalizeIssueKey(issue.key)),
+        (issue) =>
+          new WorkItemNotFound({
+            itemId: key,
+            detail: `It moved to ${normalizeIssueKey(issue.key)}, outside this project.`,
+          }),
+      ),
+    );
+
+  const detail = Effect.fn("JiraSource.detail")(function* (
+    runtime: WorkSourceRuntime,
+    itemId: string,
+  ) {
+    const key = yield* projectIssueKey(runtime, itemId);
+    const issue = yield* readIssue(runtime, key, "transitions");
+    const comments = yield* call(runtime, {
+      operation: "jira.comments",
+      kind: "read",
+      path: `/rest/api/3/issue/${encodeURIComponent(key)}/comment`,
+      query: { maxResults: "50", orderBy: "-created" },
+      itemId: key,
+    }).pipe(
+      Effect.flatMap((response) => decodeComments(response.body).pipe(Effect.mapError(unexpected))),
+    );
+    return toDetail(runtime.sourceId, originOf(configOf(runtime)), issue, comments);
+  });
+
+  const summary = (runtime: WorkSourceRuntime, key: string) =>
+    readIssue(runtime, key).pipe(
+      Effect.map((issue) => toSummary(runtime.sourceId, originOf(configOf(runtime)), issue)),
+    );
+
+  const checkRevision = (runtime: WorkSourceRuntime, key: string, expected: string | undefined) =>
+    expected === undefined
+      ? Effect.void
+      : summary(runtime, key).pipe(
+          Effect.flatMap((current) =>
+            current.revision === expected
+              ? Effect.void
+              : Effect.fail(new WorkStale({ itemId: key, current })),
+          ),
+        );
+
+  const search = Effect.fn("JiraSource.search")(function* (
+    runtime: WorkSourceRuntime,
+    jql: string,
+    limit: number,
+    cursor: string | undefined,
+  ) {
+    const reconcileIssues = yield* reconcileIds(runtime);
+    const response = yield* call(runtime, {
+      operation: "jira.search",
+      kind: "read",
+      method: "POST",
+      path: "/rest/api/3/search/jql",
+      body: {
+        jql,
+        fields: SEARCH_FIELDS,
+        maxResults: limit,
+        ...(cursor === undefined ? {} : { nextPageToken: cursor }),
+        ...(reconcileIssues.length === 0 ? {} : { reconcileIssues }),
+      },
+    }).pipe(
+      Effect.catchTags({
+        // An expired page token is a bad request; the client restarts from the first page.
+        WorkInvalid: (error) =>
+          cursor === undefined
+            ? Effect.fail(error)
+            : Effect.fail(new WorkInvalid({ detail: "This page expired; reload the list." })),
+      }),
+    );
+    return yield* decodeSearch(response.body).pipe(Effect.mapError(unexpected));
+  });
+
+  const people = Effect.fn("JiraSource.people")(function* (
+    runtime: WorkSourceRuntime,
+    query: string,
+    itemId?: string,
+  ) {
+    const issueKey = itemId === undefined ? undefined : yield* projectIssueKey(runtime, itemId);
+    const response = yield* call(runtime, {
+      operation: "jira.assignable",
+      kind: "read",
+      path: "/rest/api/3/user/assignable/search",
+      query: {
+        query,
+        maxResults: "20",
+        ...(issueKey === undefined
+          ? { project: configOf(runtime).projectKey.toUpperCase() }
+          : { issueKey }),
+      },
+    });
+    const users = yield* decodeUsers(response.body).pipe(Effect.mapError(unexpected));
+    return users.map((user) => ({
+      id: user.accountId,
+      label: user.displayName ?? user.accountId,
+    }));
+  });
+
+  const issueTypeFor = (runtime: WorkSourceRuntime) =>
+    call(runtime, {
+      operation: "jira.createmeta",
+      kind: "read",
+      path: `/rest/api/3/issue/createmeta/${encodeURIComponent(configOf(runtime).projectKey.toUpperCase())}/issuetypes`,
+    }).pipe(
+      Effect.flatMap((response) =>
+        decodeIssueTypes(response.body).pipe(Effect.mapError(unexpected)),
+      ),
+      Effect.flatMap((types) => {
+        const all = [...(types.issueTypes ?? types.values ?? [])].filter(
+          (type) => type.subtask !== true,
+        );
+        const preferred =
+          PREFERRED_TYPES.map((name) => all.find((type) => type.name.toLowerCase() === name)).find(
+            (type) => type !== undefined,
+          ) ?? all[0];
+        return preferred === undefined
+          ? Effect.fail(
+              new WorkUnsupported({
+                detail: "This Jira project offers no issue type to create.",
+              }),
+            )
+          : Effect.succeed(preferred.id);
+      }),
+    );
+
+  /** Applies the unique transition reaching a status, or answers with the choices. */
+  const transitionTo = Effect.fn("JiraSource.transitionTo")(function* (
+    runtime: WorkSourceRuntime,
+    key: string,
+    input: { status?: string; transitionId?: string },
+  ) {
+    const response = yield* call(runtime, {
+      operation: "jira.transitions",
+      kind: "read",
+      path: `/rest/api/3/issue/${encodeURIComponent(key)}/transitions`,
+      query: { expand: "transitions.fields" },
+      itemId: key,
+    });
+    const { transitions } = yield* decodeTransitions(response.body).pipe(
+      Effect.mapError(unexpected),
+    );
+    const chosen =
+      input.transitionId !== undefined
+        ? transitions.find((transition) => transition.id === input.transitionId)
+        : undefined;
+    let transition = chosen;
+    if (input.transitionId !== undefined && chosen === undefined) {
+      return yield* new WorkInvalid({
+        detail: "That transition is not available for this issue now.",
+      });
+    }
+    if (transition === undefined) {
+      if (input.status === "cancelled") {
+        return yield* new WorkUnsupported({
+          detail: "Choose the Jira transition that cancels this issue.",
+        });
+      }
+      const category = jiraCategoryFor(input.status as Parameters<typeof jiraCategoryFor>[0]);
+      const candidates = transitions.filter((entry) => entry.to?.statusCategory?.key === category);
+      if (candidates.length === 0) {
+        return yield* new WorkUnsupported({
+          detail: "No Jira transition reaches that status from here.",
+        });
+      }
+      if (candidates.length > 1) {
+        return yield* new WorkConflict({
+          detail: "Several Jira transitions reach that status; choose one.",
+          candidates: candidates.map(toTransition),
+        });
+      }
+      transition = candidates[0]!;
+    }
+    if (toTransition(transition).requiresFields) {
+      return yield* new WorkUnsupported({
+        detail: `The ${transition.name} transition needs fields Work cannot fill; use Jira.`,
+      });
+    }
+    const resolutionField = transition.fields?.resolution;
+    const resolutions = resolutionField?.allowedValues ?? [];
+    const resolution =
+      resolutionField === undefined
         ? undefined
-        : { email: configOf(runtime).email, token: runtime.secret };
+        : (resolutions.find((value) => value.name === "Done") ?? resolutions[0]);
+    yield* call(runtime, {
+      operation: "jira.transition",
+      kind: "write",
+      method: "POST",
+      path: `/rest/api/3/issue/${encodeURIComponent(key)}/transitions`,
+      body: {
+        transition: { id: transition.id },
+        ...(resolution === undefined
+          ? {}
+          : {
+              fields: {
+                resolution:
+                  resolution.id !== undefined ? { id: resolution.id } : { name: resolution.name },
+              },
+            }),
+      },
+      itemId: key,
+    });
+  });
 
-    const call = (runtime: WorkSourceRuntime, request: Omit<JiraApi.JiraRequest, "interactive">) =>
-      api.request(configOf(runtime).siteUrl, credentialOf(runtime), {
-        ...request,
-        interactive: runtime.interactive,
-      });
+  const after = (runtime: WorkSourceRuntime, key: string) =>
+    summary(runtime, key).pipe(Effect.tap((item) => remember(runtime, item.nativeId ?? "")));
 
-    const remember = (runtime: WorkSourceRuntime, issueId: string) =>
-      Clock.currentTimeMillis.pipe(
-        Effect.map((now) => {
-          const writes = recentWrites.get(runtime.sourceId) ?? new Map<string, number>();
-          writes.set(issueId, now);
-          recentWrites.set(runtime.sourceId, writes);
-        }),
-      );
-
-    const reconcileIds = (runtime: WorkSourceRuntime) =>
-      Clock.currentTimeMillis.pipe(
-        Effect.map((now) => {
-          const writes = recentWrites.get(runtime.sourceId);
-          if (writes === undefined) return [];
-          for (const [id, at] of writes) if (now - at > RECONCILE_WINDOW_MS) writes.delete(id);
-          return [...writes.keys()].map(Number).filter(Number.isSafeInteger);
-        }),
-      );
-
-    /**
-     * Writes to one issue run one at a time; the transport spaces each of their requests. The
-     * lock is per site and issue, not per source: two sources over one Jira project write the
-     * same issues.
-     */
-    const issueWrite = <A>(
-      runtime: WorkSourceRuntime,
-      key: string,
-      effect: Effect.Effect<A, WorkDomainError>,
-    ) =>
-      Effect.suspend(() => {
-        const lockKey = `${originOf(configOf(runtime))}\0${key}`;
-        let lock = issueLocks.get(lockKey);
-        if (lock === undefined) {
-          lock = Semaphore.makeUnsafe(1);
-          issueLocks.set(lockKey, lock);
-        }
-        return lock.withPermits(1)(effect);
-      });
-
-    const readIssue = (runtime: WorkSourceRuntime, key: string, expand?: string) =>
-      call(runtime, {
-        operation: "jira.issue",
+  const adapter: WorkSourceAdapter = {
+    kind: "jira",
+    capabilities: {
+      create: true,
+      statuses: JIRA_WRITABLE_STATUSES,
+      fields: ["title", "body", "priority", "labels", "assignee", "parent"],
+      comments: "add",
+      transitions: true,
+      people: true,
+    },
+    identity: (config) => (config.kind === "jira" ? jiraIdentity(config) : ""),
+    test: Effect.fn("JiraSource.test")(function* ({ config, secret }) {
+      if (config.kind !== "jira") return yield* new WorkInvalid({ detail: "Not a Jira source." });
+      const projectKey = config.projectKey.trim().toUpperCase();
+      if (!JIRA_PROJECT_KEY.test(projectKey)) {
+        return yield* new WorkInvalid({ detail: "Enter the Jira project key, such as PROJ." });
+      }
+      const credential = secret === undefined ? undefined : { email: config.email, token: secret };
+      const request = (input: Omit<JiraApi.JiraRequest, "interactive">) =>
+        api.request(config.siteUrl, credential, { ...input, interactive: true });
+      yield* request({
+        operation: "jira.myself",
         kind: "read",
-        path: `/rest/api/3/issue/${encodeURIComponent(key)}`,
-        query: { fields: "*navigable,-comment", ...(expand === undefined ? {} : { expand }) },
-        itemId: key,
+        path: "/rest/api/3/myself",
       }).pipe(
-        Effect.flatMap((response) => decodeIssue(response.body).pipe(Effect.mapError(unexpected))),
-        // Jira answers an old key with the issue it now names, which may have moved project.
-        Effect.flatMap((issue) =>
-          inProject(configOf(runtime), normalizeIssueKey(issue.key))
-            ? Effect.succeed(issue)
-            : Effect.fail(
-                new WorkItemNotFound({
-                  itemId: key,
-                  detail: `It moved to ${normalizeIssueKey(issue.key)}, outside this project.`,
-                }),
-              ),
+        Effect.flatMap((response) => decodeMyself(response.body).pipe(Effect.mapError(unexpected))),
+        // A rejected token here is most often a scoped one, which only works through the gateway.
+        Effect.catchTags({
+          WorkUnauthenticated: (error) =>
+            Effect.fail(
+              secret === undefined
+                ? error
+                : new WorkUnauthenticated({ detail: JiraApi.SCOPED_TOKEN_MESSAGE }),
+            ),
+        }),
+      );
+      const info = yield* request({
+        operation: "jira.serverInfo",
+        kind: "read",
+        path: "/rest/api/3/serverInfo",
+      }).pipe(
+        Effect.flatMap((response) =>
+          decodeServerInfo(response.body).pipe(Effect.mapError(unexpected)),
         ),
       );
-
-    const detail = (runtime: WorkSourceRuntime, itemId: string) =>
-      Effect.gen(function* () {
-        const key = yield* projectIssueKey(runtime, itemId);
-        const issue = yield* readIssue(runtime, key, "transitions");
-        const comments = yield* call(runtime, {
+      if (info.deploymentType !== undefined && info.deploymentType !== "Cloud") {
+        return yield* new WorkUnsupported({ detail: "Only Jira Cloud sites are supported." });
+      }
+      yield* request({
+        operation: "jira.project",
+        kind: "read",
+        path: `/rest/api/3/project/${encodeURIComponent(projectKey)}`,
+      }).pipe(
+        Effect.flatMap((response) =>
+          decodeProject(response.body).pipe(Effect.mapError(unexpected)),
+        ),
+      );
+      return { identity: jiraIdentity(config) };
+    }),
+    prepare: () => Effect.void,
+    list: Effect.fn("JiraSource.list")(function* (runtime, query) {
+      const config = configOf(runtime);
+      const result = yield* search(
+        runtime,
+        listJql(config.projectKey.toUpperCase(), query),
+        Math.min(query.limit, 50),
+        query.cursor,
+      );
+      // Done and Cancelled share Jira's done category. Filter after normalization, keeping
+      // the remote page's cursor even when all its issues were excluded.
+      const statuses = query.statuses;
+      const items = result.issues
+        .map((issue) => toSummary(runtime.sourceId, originOf(config), issue))
+        .filter(
+          (item) =>
+            statuses === undefined ||
+            statuses.length === 0 ||
+            statuses.some((status) => status === item.status),
+        );
+      const token = result.nextPageToken ?? null;
+      // A token that does not move would page forever; stop instead.
+      const nextCursor =
+        result.isLast === true || token === null || token === query.cursor ? null : token;
+      return { items, nextCursor, stale: false };
+    }),
+    get: detail,
+    people: (runtime, query) => people(runtime, query.query, query.itemId),
+    create: Effect.fn("JiraSource.create")(function* (runtime, input) {
+      const config = configOf(runtime);
+      const issueType = yield* issueTypeFor(runtime);
+      const response = yield* call(runtime, {
+        operation: "jira.create",
+        kind: "write",
+        method: "POST",
+        path: "/rest/api/3/issue",
+        body: {
+          fields: {
+            project: { key: config.projectKey.toUpperCase() },
+            issuetype: { id: issueType },
+            summary: input.title,
+            ...(input.body === undefined ? {} : { description: markdownToAdf(input.body) }),
+            ...(input.labels === undefined ? {} : { labels: input.labels }),
+            ...(input.priority === undefined
+              ? {}
+              : { priority: { name: PRIORITY_NAMES[input.priority] } }),
+            ...(input.parent === undefined
+              ? {}
+              : { parent: { key: normalizeIssueKey(input.parent) } }),
+            ...(input.assignee === undefined ? {} : { assignee: { accountId: input.assignee } }),
+          },
+        },
+      });
+      const created = yield* decodeCreated(response.body).pipe(Effect.mapError(unexpected));
+      yield* remember(runtime, created.id);
+      return yield* summary(runtime, normalizeIssueKey(created.key));
+    }),
+    update: (runtime, patch) => {
+      const key = normalizeIssueKey(patch.ref.itemId);
+      return issueWrite(
+        runtime,
+        key,
+        Effect.gen(function* () {
+          yield* projectIssueKey(runtime, key);
+          if (patch.blockedBy !== undefined) {
+            return yield* new WorkUnsupported({ detail: "Change Jira issue links in Jira." });
+          }
+          if (patch.body !== undefined) {
+            const current = yield* detail(runtime, key);
+            // A description Work shows only in part, or cannot write back as it reads, would
+            // lose content on save.
+            if (current.bodyFidelity === "lossy" || current.bodyTruncated) {
+              return yield* new WorkUnsupported({
+                detail: "This description has content Work cannot show; edit it in Jira.",
+              });
+            }
+            if (
+              patch.expectedRevision !== undefined &&
+              current.revision !== patch.expectedRevision
+            ) {
+              return yield* new WorkStale({ itemId: key, current: summaryOf(current) });
+            }
+          } else {
+            yield* checkRevision(runtime, key, patch.expectedRevision);
+          }
+          const fields = {
+            ...(patch.title === undefined ? {} : { summary: patch.title }),
+            ...(patch.body === undefined ? {} : { description: markdownToAdf(patch.body) }),
+            ...(patch.priority === undefined
+              ? {}
+              : {
+                  priority:
+                    patch.priority === null ? null : { name: PRIORITY_NAMES[patch.priority] },
+                }),
+            ...(patch.parent === undefined
+              ? {}
+              : {
+                  parent: patch.parent === null ? null : { key: normalizeIssueKey(patch.parent) },
+                }),
+          };
+          const labels =
+            patch.labels === undefined
+              ? []
+              : [
+                  ...patch.labels.add.map((label) => ({ add: label })),
+                  ...patch.labels.remove.map((label) => ({ remove: label })),
+                ];
+          if (Object.keys(fields).length > 0 || labels.length > 0) {
+            yield* call(runtime, {
+              operation: "jira.update",
+              kind: "write",
+              method: "PUT",
+              path: `/rest/api/3/issue/${encodeURIComponent(key)}`,
+              body: {
+                ...(Object.keys(fields).length === 0 ? {} : { fields }),
+                ...(labels.length === 0 ? {} : { update: { labels } }),
+              },
+              itemId: key,
+            });
+          }
+          if (patch.assignee !== undefined) {
+            yield* call(runtime, {
+              operation: "jira.assign",
+              kind: "write",
+              method: "PUT",
+              path: `/rest/api/3/issue/${encodeURIComponent(key)}/assignee`,
+              body: { accountId: patch.assignee },
+              itemId: key,
+            });
+          }
+          return yield* after(runtime, key);
+        }),
+      );
+    },
+    setStatus: (runtime, input) => {
+      const key = normalizeIssueKey(input.ref.itemId);
+      return issueWrite(
+        runtime,
+        key,
+        Effect.gen(function* () {
+          yield* projectIssueKey(runtime, key);
+          yield* checkRevision(runtime, key, input.expectedRevision);
+          yield* transitionTo(runtime, key, {
+            ...(input.status === undefined ? {} : { status: input.status }),
+            ...(input.transitionId === undefined ? {} : { transitionId: input.transitionId }),
+          });
+          return yield* after(runtime, key);
+        }),
+      );
+    },
+    comment: (runtime, itemId, body) => {
+      const key = normalizeIssueKey(itemId);
+      return issueWrite(
+        runtime,
+        key,
+        projectIssueKey(runtime, key).pipe(
+          Effect.andThen(
+            call(runtime, {
+              operation: "jira.comment",
+              kind: "write",
+              method: "POST",
+              path: `/rest/api/3/issue/${encodeURIComponent(key)}/comment`,
+              body: { body: markdownToAdf(body) },
+              itemId: key,
+            }).pipe(
+              Effect.flatMap((response) =>
+                decodeCommentCreated(response.body).pipe(Effect.mapError(unexpected)),
+              ),
+              Effect.map((created) => ({ commentId: created.id })),
+            ),
+          ),
+        ),
+      );
+    },
+    findComment: Effect.fn("JiraSource.findComment")(function* (runtime, itemId, text) {
+      const key = yield* projectIssueKey(runtime, itemId);
+      const page = (startAt: number) =>
+        call(runtime, {
           operation: "jira.comments",
           kind: "read",
           path: `/rest/api/3/issue/${encodeURIComponent(key)}/comment`,
-          query: { maxResults: "50", orderBy: "-created" },
+          query: {
+            startAt: String(startAt),
+            maxResults: String(COMMENTS_PAGE),
+            orderBy: "-created",
+          },
           itemId: key,
         }).pipe(
           Effect.flatMap((response) =>
             decodeComments(response.body).pipe(Effect.mapError(unexpected)),
           ),
-        );
-        return toDetail(runtime.sourceId, originOf(configOf(runtime)), issue, comments);
-      });
-
-    const summary = (runtime: WorkSourceRuntime, key: string) =>
-      readIssue(runtime, key).pipe(
-        Effect.map((issue) => toSummary(runtime.sourceId, originOf(configOf(runtime)), issue)),
-      );
-
-    const checkRevision = (
-      runtime: WorkSourceRuntime,
-      key: string,
-      expected: string | undefined,
-    ) =>
-      expected === undefined
-        ? Effect.void
-        : summary(runtime, key).pipe(
-            Effect.flatMap((current) =>
-              current.revision === expected
-                ? Effect.void
-                : Effect.fail(new WorkStale({ itemId: key, current })),
-            ),
-          );
-
-    const search = (
-      runtime: WorkSourceRuntime,
-      jql: string,
-      limit: number,
-      cursor: string | undefined,
-    ) =>
-      Effect.gen(function* () {
-        const reconcileIssues = yield* reconcileIds(runtime);
-        const response = yield* call(runtime, {
-          operation: "jira.search",
-          kind: "read",
-          method: "POST",
-          path: "/rest/api/3/search/jql",
-          body: {
-            jql,
-            fields: SEARCH_FIELDS,
-            maxResults: limit,
-            ...(cursor === undefined ? {} : { nextPageToken: cursor }),
-            ...(reconcileIssues.length === 0 ? {} : { reconcileIssues }),
-          },
-        }).pipe(
-          Effect.catchTags({
-            // An expired page token is a bad request; the client restarts from the first page.
-            WorkInvalid: (error) =>
-              cursor === undefined
-                ? Effect.fail(error)
-                : Effect.fail(new WorkInvalid({ detail: "This page expired; reload the list." })),
-          }),
-        );
-        return yield* decodeSearch(response.body).pipe(Effect.mapError(unexpected));
-      });
-
-    const people = (runtime: WorkSourceRuntime, query: string, itemId?: string) =>
-      Effect.gen(function* () {
-        const issueKey = itemId === undefined ? undefined : yield* projectIssueKey(runtime, itemId);
-        const response = yield* call(runtime, {
-          operation: "jira.assignable",
-          kind: "read",
-          path: "/rest/api/3/user/assignable/search",
-          query: {
-            query,
-            maxResults: "20",
-            ...(issueKey === undefined
-              ? { project: configOf(runtime).projectKey.toUpperCase() }
-              : { issueKey }),
-          },
-        });
-        const users = yield* decodeUsers(response.body).pipe(Effect.mapError(unexpected));
-        return users.map((user) => ({
-          id: user.accountId,
-          label: user.displayName ?? user.accountId,
-        }));
-      });
-
-    const issueTypeFor = (runtime: WorkSourceRuntime) =>
-      call(runtime, {
-        operation: "jira.createmeta",
-        kind: "read",
-        path: `/rest/api/3/issue/createmeta/${encodeURIComponent(configOf(runtime).projectKey.toUpperCase())}/issuetypes`,
-      }).pipe(
-        Effect.flatMap((response) =>
-          decodeIssueTypes(response.body).pipe(Effect.mapError(unexpected)),
-        ),
-        Effect.flatMap((types) => {
-          const all = [...(types.issueTypes ?? types.values ?? [])].filter(
-            (type) => type.subtask !== true,
-          );
-          const preferred =
-            PREFERRED_TYPES.map((name) =>
-              all.find((type) => type.name.toLowerCase() === name),
-            ).find((type) => type !== undefined) ?? all[0];
-          return preferred === undefined
-            ? Effect.fail(
-                new WorkUnsupported({
-                  detail: "This Jira project offers no issue type to create.",
-                }),
-              )
-            : Effect.succeed(preferred.id);
-        }),
-      );
-
-    /** Applies the unique transition reaching a status, or answers with the choices. */
-    const transitionTo = (
-      runtime: WorkSourceRuntime,
-      key: string,
-      input: { status?: string; transitionId?: string },
-    ) =>
-      Effect.gen(function* () {
-        const response = yield* call(runtime, {
-          operation: "jira.transitions",
-          kind: "read",
-          path: `/rest/api/3/issue/${encodeURIComponent(key)}/transitions`,
-          query: { expand: "transitions.fields" },
-          itemId: key,
-        });
-        const { transitions } = yield* decodeTransitions(response.body).pipe(
-          Effect.mapError(unexpected),
-        );
-        const chosen =
-          input.transitionId !== undefined
-            ? transitions.find((transition) => transition.id === input.transitionId)
-            : undefined;
-        let transition = chosen;
-        if (input.transitionId !== undefined && chosen === undefined) {
-          return yield* new WorkInvalid({
-            detail: "That transition is not available for this issue now.",
-          });
-        }
-        if (transition === undefined) {
-          if (input.status === "cancelled") {
-            return yield* new WorkUnsupported({
-              detail: "Choose the Jira transition that cancels this issue.",
-            });
-          }
-          const category = jiraCategoryFor(input.status as Parameters<typeof jiraCategoryFor>[0]);
-          const candidates = transitions.filter(
-            (entry) => entry.to?.statusCategory?.key === category,
-          );
-          if (candidates.length === 0) {
-            return yield* new WorkUnsupported({
-              detail: "No Jira transition reaches that status from here.",
-            });
-          }
-          if (candidates.length > 1) {
-            return yield* new WorkConflict({
-              detail: "Several Jira transitions reach that status; choose one.",
-              candidates: candidates.map(toTransition),
-            });
-          }
-          transition = candidates[0]!;
-        }
-        if (toTransition(transition).requiresFields) {
-          return yield* new WorkUnsupported({
-            detail: `The ${transition.name} transition needs fields Work cannot fill; use Jira.`,
-          });
-        }
-        const resolutionField = transition.fields?.resolution;
-        const resolutions = resolutionField?.allowedValues ?? [];
-        const resolution =
-          resolutionField === undefined
-            ? undefined
-            : (resolutions.find((value) => value.name === "Done") ?? resolutions[0]);
-        yield* call(runtime, {
-          operation: "jira.transition",
-          kind: "write",
-          method: "POST",
-          path: `/rest/api/3/issue/${encodeURIComponent(key)}/transitions`,
-          body: {
-            transition: { id: transition.id },
-            ...(resolution === undefined
-              ? {}
-              : {
-                  fields: {
-                    resolution:
-                      resolution.id !== undefined
-                        ? { id: resolution.id }
-                        : { name: resolution.name },
-                  },
-                }),
-          },
-          itemId: key,
-        });
-      });
-
-    const after = (runtime: WorkSourceRuntime, key: string) =>
-      summary(runtime, key).pipe(Effect.tap((item) => remember(runtime, item.nativeId ?? "")));
-
-    const adapter: WorkSourceAdapter = {
-      kind: "jira",
-      capabilities: {
-        create: true,
-        statuses: JIRA_WRITABLE_STATUSES,
-        fields: ["title", "body", "priority", "labels", "assignee", "parent"],
-        comments: "add",
-        transitions: true,
-        people: true,
-      },
-      identity: (config) => (config.kind === "jira" ? jiraIdentity(config) : ""),
-      test: ({ config, secret }) =>
-        Effect.gen(function* () {
-          if (config.kind !== "jira")
-            return yield* new WorkInvalid({ detail: "Not a Jira source." });
-          const projectKey = config.projectKey.trim().toUpperCase();
-          if (!JIRA_PROJECT_KEY.test(projectKey)) {
-            return yield* new WorkInvalid({ detail: "Enter the Jira project key, such as PROJ." });
-          }
-          const credential =
-            secret === undefined ? undefined : { email: config.email, token: secret };
-          const request = (input: Omit<JiraApi.JiraRequest, "interactive">) =>
-            api.request(config.siteUrl, credential, { ...input, interactive: true });
-          yield* request({
-            operation: "jira.myself",
-            kind: "read",
-            path: "/rest/api/3/myself",
-          }).pipe(
-            Effect.flatMap((response) =>
-              decodeMyself(response.body).pipe(Effect.mapError(unexpected)),
-            ),
-            // A rejected token here is most often a scoped one, which only works through the gateway.
-            Effect.catchTags({
-              WorkUnauthenticated: (error) =>
-                Effect.fail(
-                  secret === undefined
-                    ? error
-                    : new WorkUnauthenticated({ detail: JiraApi.SCOPED_TOKEN_MESSAGE }),
-                ),
-            }),
-          );
-          const info = yield* request({
-            operation: "jira.serverInfo",
-            kind: "read",
-            path: "/rest/api/3/serverInfo",
-          }).pipe(
-            Effect.flatMap((response) =>
-              decodeServerInfo(response.body).pipe(Effect.mapError(unexpected)),
-            ),
-          );
-          if (info.deploymentType !== undefined && info.deploymentType !== "Cloud") {
-            return yield* new WorkUnsupported({ detail: "Only Jira Cloud sites are supported." });
-          }
-          yield* request({
-            operation: "jira.project",
-            kind: "read",
-            path: `/rest/api/3/project/${encodeURIComponent(projectKey)}`,
-          }).pipe(
-            Effect.flatMap((response) =>
-              decodeProject(response.body).pipe(Effect.mapError(unexpected)),
-            ),
-          );
-          return { identity: jiraIdentity(config) };
-        }),
-      prepare: () => Effect.void,
-      list: (runtime, query) =>
-        Effect.gen(function* () {
-          const config = configOf(runtime);
-          const result = yield* search(
-            runtime,
-            listJql(config.projectKey.toUpperCase(), query),
-            Math.min(query.limit, 50),
-            query.cursor,
-          );
-          // Done and Cancelled share Jira's done category. Filter after normalization, keeping
-          // the remote page's cursor even when all its issues were excluded.
-          const statuses = query.statuses;
-          const items = result.issues
-            .map((issue) => toSummary(runtime.sourceId, originOf(config), issue))
-            .filter(
-              (item) =>
-                statuses === undefined ||
-                statuses.length === 0 ||
-                statuses.some((status) => status === item.status),
-            );
-          const token = result.nextPageToken ?? null;
-          // A token that does not move would page forever; stop instead.
-          const nextCursor =
-            result.isLast === true || token === null || token === query.cursor ? null : token;
-          return { items, nextCursor, stale: false };
-        }),
-      get: detail,
-      people: (runtime, query) => people(runtime, query.query, query.itemId),
-      create: (runtime, input) =>
-        Effect.gen(function* () {
-          const config = configOf(runtime);
-          const issueType = yield* issueTypeFor(runtime);
-          const response = yield* call(runtime, {
-            operation: "jira.create",
-            kind: "write",
-            method: "POST",
-            path: "/rest/api/3/issue",
-            body: {
-              fields: {
-                project: { key: config.projectKey.toUpperCase() },
-                issuetype: { id: issueType },
-                summary: input.title,
-                ...(input.body === undefined ? {} : { description: markdownToAdf(input.body) }),
-                ...(input.labels === undefined ? {} : { labels: input.labels }),
-                ...(input.priority === undefined
-                  ? {}
-                  : { priority: { name: PRIORITY_NAMES[input.priority] } }),
-                ...(input.parent === undefined
-                  ? {}
-                  : { parent: { key: normalizeIssueKey(input.parent) } }),
-                ...(input.assignee === undefined
-                  ? {}
-                  : { assignee: { accountId: input.assignee } }),
-              },
-            },
-          });
-          const created = yield* decodeCreated(response.body).pipe(Effect.mapError(unexpected));
-          yield* remember(runtime, created.id);
-          return yield* summary(runtime, normalizeIssueKey(created.key));
-        }),
-      update: (runtime, patch) => {
-        const key = normalizeIssueKey(patch.ref.itemId);
-        return issueWrite(
-          runtime,
-          key,
-          Effect.gen(function* () {
-            yield* projectIssueKey(runtime, key);
-            if (patch.blockedBy !== undefined) {
-              return yield* new WorkUnsupported({ detail: "Change Jira issue links in Jira." });
-            }
-            if (patch.body !== undefined) {
-              const current = yield* detail(runtime, key);
-              // A description Work shows only in part, or cannot write back as it reads, would
-              // lose content on save.
-              if (current.bodyFidelity === "lossy" || current.bodyTruncated) {
-                return yield* new WorkUnsupported({
-                  detail: "This description has content Work cannot show; edit it in Jira.",
-                });
-              }
-              if (
-                patch.expectedRevision !== undefined &&
-                current.revision !== patch.expectedRevision
-              ) {
-                return yield* new WorkStale({ itemId: key, current: summaryOf(current) });
-              }
-            } else {
-              yield* checkRevision(runtime, key, patch.expectedRevision);
-            }
-            const fields = {
-              ...(patch.title === undefined ? {} : { summary: patch.title }),
-              ...(patch.body === undefined ? {} : { description: markdownToAdf(patch.body) }),
-              ...(patch.priority === undefined
-                ? {}
-                : {
-                    priority:
-                      patch.priority === null ? null : { name: PRIORITY_NAMES[patch.priority] },
-                  }),
-              ...(patch.parent === undefined
-                ? {}
-                : {
-                    parent: patch.parent === null ? null : { key: normalizeIssueKey(patch.parent) },
-                  }),
-            };
-            const labels =
-              patch.labels === undefined
-                ? []
-                : [
-                    ...patch.labels.add.map((label) => ({ add: label })),
-                    ...patch.labels.remove.map((label) => ({ remove: label })),
-                  ];
-            if (Object.keys(fields).length > 0 || labels.length > 0) {
-              yield* call(runtime, {
-                operation: "jira.update",
-                kind: "write",
-                method: "PUT",
-                path: `/rest/api/3/issue/${encodeURIComponent(key)}`,
-                body: {
-                  ...(Object.keys(fields).length === 0 ? {} : { fields }),
-                  ...(labels.length === 0 ? {} : { update: { labels } }),
-                },
-                itemId: key,
-              });
-            }
-            if (patch.assignee !== undefined) {
-              yield* call(runtime, {
-                operation: "jira.assign",
-                kind: "write",
-                method: "PUT",
-                path: `/rest/api/3/issue/${encodeURIComponent(key)}/assignee`,
-                body: { accountId: patch.assignee },
-                itemId: key,
-              });
-            }
-            return yield* after(runtime, key);
-          }),
-        );
-      },
-      setStatus: (runtime, input) => {
-        const key = normalizeIssueKey(input.ref.itemId);
-        return issueWrite(
-          runtime,
-          key,
-          Effect.gen(function* () {
-            yield* projectIssueKey(runtime, key);
-            yield* checkRevision(runtime, key, input.expectedRevision);
-            yield* transitionTo(runtime, key, {
-              ...(input.status === undefined ? {} : { status: input.status }),
-              ...(input.transitionId === undefined ? {} : { transitionId: input.transitionId }),
-            });
-            return yield* after(runtime, key);
-          }),
-        );
-      },
-      comment: (runtime, itemId, body) => {
-        const key = normalizeIssueKey(itemId);
-        return issueWrite(
-          runtime,
-          key,
-          projectIssueKey(runtime, key).pipe(
-            Effect.andThen(
-              call(runtime, {
-                operation: "jira.comment",
-                kind: "write",
-                method: "POST",
-                path: `/rest/api/3/issue/${encodeURIComponent(key)}/comment`,
-                body: { body: markdownToAdf(body) },
-                itemId: key,
-              }).pipe(
-                Effect.flatMap((response) =>
-                  decodeCommentCreated(response.body).pipe(Effect.mapError(unexpected)),
-                ),
-                Effect.map((created) => ({ commentId: created.id })),
-              ),
-            ),
+          Effect.filterOrFail(
+            (read) => read.startAt === undefined || read.startAt === startAt,
+            () => new WorkUnavailable({ detail: "Jira answered for other comments." }),
           ),
         );
-      },
-      findComment: (runtime, itemId, text) =>
-        Effect.gen(function* () {
-          const key = yield* projectIssueKey(runtime, itemId);
-          const page = (startAt: number) =>
-            call(runtime, {
-              operation: "jira.comments",
-              kind: "read",
-              path: `/rest/api/3/issue/${encodeURIComponent(key)}/comment`,
-              query: {
-                startAt: String(startAt),
-                maxResults: String(COMMENTS_PAGE),
-                orderBy: "-created",
-              },
-              itemId: key,
-            }).pipe(
-              Effect.flatMap((response) =>
-                decodeComments(response.body).pipe(Effect.mapError(unexpected)),
-              ),
-              Effect.flatMap((read) =>
-                read.startAt === undefined || read.startAt === startAt
-                  ? Effect.succeed(read)
-                  : Effect.fail(
-                      new WorkUnavailable({ detail: "Jira answered for other comments." }),
-                    ),
-              ),
-            );
-          // Newest first, so a recent comment ends the walk early. Offsets move when comments
-          // are added or deleted between pages, so each page after the first starts at the last
-          // comment already read, and the walk goes on after wherever that comment is now: an
-          // added comment only repeats one, a deleted one would hide one. A walk that loses that
-          // comment, or ends before the total it was told, starts over; one that keeps losing
-          // it cannot answer. Without a total, a page with nothing new is the end only when it
-          // holds nothing but the last comment read, or is the first and empty: one that ends at
-          // that comment further down only repeated comments added since, and older ones may
-          // still be unread.
-          for (let walk = 0; walk < COMMENT_WALKS; walk += 1) {
-            let start = 0;
-            let boundary: string | undefined;
-            for (;;) {
-              const read: typeof CommentsResponse.Type = yield* page(start);
-              const at =
-                boundary === undefined
-                  ? -1
-                  : read.comments.findIndex((comment) => comment.id === boundary);
-              if (boundary !== undefined && at === -1) break;
-              const fresh = read.comments.slice(at + 1);
-              const found = fresh.find((comment) => commentText(comment).includes(text));
-              if (found !== undefined) return Option.some(toComment(found));
-              const end = start + read.comments.length;
-              const readAll = read.total !== undefined && end >= read.total;
-              if (fresh.length === 0 || readAll) {
-                // `at` is -1 on an empty first page and 0 on a page of only the last comment read.
-                if (readAll || (read.total === undefined && at <= 0)) return Option.none();
-                break;
-              }
-              boundary = read.comments.at(-1)?.id;
-              start = end - 1;
-            }
+      // Newest first. Offsets shift as comments change, so each later page resumes at the last
+      // comment read; a walk that loses it or ends short of the total restarts (bounded). With no
+      // total, a page with nothing new ends the walk only if it holds just that last comment or is
+      // the first and empty; otherwise older comments may still be unread.
+      for (let walk = 0; walk < COMMENT_WALKS; walk += 1) {
+        let start = 0;
+        let boundary: string | undefined;
+        for (;;) {
+          const read: typeof CommentsResponse.Type = yield* page(start);
+          const at =
+            boundary === undefined
+              ? -1
+              : read.comments.findIndex((comment) => comment.id === boundary);
+          if (boundary !== undefined && at === -1) break;
+          const fresh = read.comments.slice(at + 1);
+          const found = fresh.find((comment) => commentText(comment).includes(text));
+          if (found !== undefined) return Option.some(toComment(found));
+          const end = start + read.comments.length;
+          const readAll = read.total !== undefined && end >= read.total;
+          if (fresh.length === 0 || readAll) {
+            // `at` is -1 on an empty first page and 0 on a page of only the last comment read.
+            if (readAll || (read.total === undefined && at <= 0)) return Option.none();
+            break;
           }
-          return yield* new WorkUnavailable({
-            detail: "Jira's comments changed while they were read.",
-          });
-        }),
-      snapshots: (runtime, itemIds) =>
-        Effect.gen(function* () {
-          const config = configOf(runtime);
-          const summaries: Array<WorkItemSummary> = [];
-          const keys = itemIds.map(normalizeIssueKey).filter((key) => inProject(config, key));
-          for (let index = 0; index < keys.length; index += SNAPSHOT_BATCH) {
-            const batch = keys.slice(index, index + SNAPSHOT_BATCH);
-            const result = yield* search(runtime, keysJql(batch), batch.length, undefined);
-            summaries.push(
-              ...result.issues
-                .filter((issue) => inProject(config, normalizeIssueKey(issue.key)))
-                .map((issue) => toSummary(runtime.sourceId, originOf(config), issue)),
-            );
-          }
-          return summaries;
-        }),
-    };
-    return adapter;
-  });
+          boundary = read.comments.at(-1)?.id;
+          start = end - 1;
+        }
+      }
+      return yield* new WorkUnavailable({
+        detail: "Jira's comments changed while they were read.",
+      });
+    }),
+    snapshots: Effect.fn("JiraSource.snapshots")(function* (runtime, itemIds) {
+      const config = configOf(runtime);
+      const summaries: Array<WorkItemSummary> = [];
+      const keys = itemIds.map(normalizeIssueKey).filter((key) => inProject(config, key));
+      for (let index = 0; index < keys.length; index += SNAPSHOT_BATCH) {
+        const batch = keys.slice(index, index + SNAPSHOT_BATCH);
+        const result = yield* search(runtime, keysJql(batch), batch.length, undefined);
+        summaries.push(
+          ...result.issues
+            .filter((issue) => inProject(config, normalizeIssueKey(issue.key)))
+            .map((issue) => toSummary(runtime.sourceId, originOf(config), issue)),
+        );
+      }
+      return summaries;
+    }),
+  };
+  return adapter;
+});
 
 const summaryOf = (detail: ReturnType<typeof toDetail>): WorkItemSummary => {
   const {

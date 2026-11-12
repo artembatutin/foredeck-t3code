@@ -1699,6 +1699,8 @@ describe("a reviewed delivery's threads no role names", () => {
       (world) =>
         Effect.gen(function* () {
           const { thread, run } = yield* delegatedThread(world);
+          // Core refuses a model switch while a turn runs; the restart this continues ended it.
+          yield* world.endRun(run, "failed");
           const chosen = selection("other-model", "low");
           yield* threadSelection(thread, chosen, "delegated-choice");
           const record = { ran: [] as Array<string> };

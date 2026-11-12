@@ -1,7 +1,12 @@
 import { openRepositoryFile } from "./fd/multirepo";
 import type { RepositoryFileScope } from "@t3tools/client-runtime/fd/multirepo";
 import type { ScopedThreadRef } from "@t3tools/contracts";
-import { isWindowsAbsolutePath, normalizeProjectPathForComparison } from "@t3tools/shared/path";
+import {
+  isAbsolutePath,
+  isWindowsAbsolutePath,
+  normalizeProjectPathForComparison,
+  workspaceRelativeFilePath,
+} from "@t3tools/shared/path";
 
 import { resolvePathLinkTarget } from "@t3tools/shared/fileLinks";
 
@@ -54,6 +59,13 @@ export function resolveDiffPathForWorkspace(input: {
   readonly workspaceRoot: string | undefined;
   readonly repositoryRoot: string | undefined;
 }): string | null {
+  // Claude and ACP tool-call diffs name files by absolute path.
+  if (isAbsolutePath(input.filePath)) {
+    const relativePath = workspaceRelativeFilePath(input.filePath, input.workspaceRoot);
+    const segments = relativePath === null ? null : normalizedRelativePathSegments(relativePath);
+    return segments ? segments.join("/") : null;
+  }
+
   const fileSegments = normalizedRelativePathSegments(input.filePath);
   if (!fileSegments) return null;
 

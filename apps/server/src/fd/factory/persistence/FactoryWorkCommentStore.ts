@@ -161,8 +161,10 @@ const make = Effect.gen(function* () {
     `,
   });
 
-  const record: FactoryWorkCommentStore["Service"]["record"] = ({ deliveryId, comment }) =>
-    Effect.gen(function* () {
+  const record: FactoryWorkCommentStore["Service"]["record"] = Effect.fn(
+    "FactoryWorkCommentStore.record",
+  )(
+    function* ({ deliveryId, comment }) {
       const [next] = yield* selectNextTransition({ deliveryId });
       const row: StoredFactoryWorkComment = {
         deliveryId,
@@ -175,13 +177,15 @@ const make = Effect.gen(function* () {
       };
       yield* insertComment(row);
       return row;
-    }).pipe(
-      sql.withTransaction,
-      Effect.catchTags(FactoryStoreError.catchStorage("workComments.record")),
-    );
+    },
+    sql.withTransaction,
+    Effect.catchTags(FactoryStoreError.catchStorage("workComments.record")),
+  );
 
-  const claim: FactoryWorkCommentStore["Service"]["claim"] = ({ deliveryId, transition }) =>
-    Effect.gen(function* () {
+  const claim: FactoryWorkCommentStore["Service"]["claim"] = Effect.fn(
+    "FactoryWorkCommentStore.claim",
+  )(
+    function* ({ deliveryId, transition }) {
       const marked = yield* markAttempted({
         deliveryId,
         transition,
@@ -191,24 +195,29 @@ const make = Effect.gen(function* () {
       // Rows are never deleted, so the comment is stored; one claimed already has run or runs.
       const [row] = yield* selectFinished({ deliveryId, transition });
       return row?.finishedAt === null ? ("unfinished" as const) : ("finished" as const);
-    }).pipe(
-      sql.withTransaction,
-      Effect.catchTags(FactoryStoreError.catchStorage("workComments.claim")),
-    );
+    },
+    sql.withTransaction,
+    Effect.catchTags(FactoryStoreError.catchStorage("workComments.claim")),
+  );
 
-  const finish: FactoryWorkCommentStore["Service"]["finish"] = ({ deliveryId, transition }) =>
-    Effect.gen(function* () {
+  const finish: FactoryWorkCommentStore["Service"]["finish"] = Effect.fn(
+    "FactoryWorkCommentStore.finish",
+  )(
+    function* ({ deliveryId, transition }) {
       yield* markFinished({ deliveryId, transition, finishedAt: yield* now });
-    }).pipe(Effect.catchTags(FactoryStoreError.catchStorage("workComments.finish")));
+    },
+    Effect.catchTags(FactoryStoreError.catchStorage("workComments.finish")),
+  );
 
   return FactoryWorkCommentStore.of({
     record,
     claim,
     finish,
-    listUnfinished: () =>
+    listUnfinished: Effect.fn("FactoryWorkCommentStore.listUnfinished")(() =>
       selectUnfinished(undefined).pipe(
         Effect.catchTags(FactoryStoreError.catchStorage("workComments.listUnfinished")),
       ),
+    ),
   });
 });
 

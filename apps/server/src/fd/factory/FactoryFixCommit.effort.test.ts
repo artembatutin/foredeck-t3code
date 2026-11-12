@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -25,11 +26,13 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
+import * as DocumentText from "../../provider/DocumentText.ts";
 
 import * as ServerConfig from "../../config.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as EventStore from "../../orchestration-v2/EventStore.ts";
 import * as ProjectionMaintenance from "../../orchestration-v2/ProjectionMaintenance.ts";
+import { pruneEventLog } from "./testkit/eventLogPruning.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
@@ -205,6 +208,8 @@ const fakes = (world: World) =>
             createdAt: "2026-10-27T00:00:00.000Z",
             updatedAt: "2026-10-27T00:00:00.000Z",
             deletedAt: null,
+            pinnedAt: null,
+            archivedAt: null,
           }),
         ),
     }),
@@ -253,6 +258,8 @@ const makeLayer = (world: World) =>
     Layer.provideMerge(GitVcsDriver.layer),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-mechanical-" })),
     Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(DocumentText.layer.pipe(Layer.provide(NodeServices.layer))),
+    Layer.provideMerge(NodeCrypto.layer),
     Layer.provideMerge(NodeServices.layer),
   );
 const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
@@ -363,7 +370,10 @@ describe("Factory fix-commit effort", () => {
             const author = yield* world.start;
             const threads = yield* ThreadManagement.ThreadManagementService;
             const projection = () =>
-              threads.getProjectThread({ projectId: world.projectId, threadId: author.threadId });
+              threads.getProjectThreadRecords(
+                { projectId: world.projectId, threadId: author.threadId },
+                ["runs"],
+              );
             const before = {
               ...(yield* projection()).thread.modelSelection,
               options: original.options,
@@ -421,8 +431,7 @@ describe("Factory fix-commit effort", () => {
                 yield* sql`DELETE FROM orchestration_events WHERE event_id = ${event.id}`;
               }
             }
-            const compacted = yield* (yield* ProjectionMaintenance.ProjectionMaintenanceV2)
-              .compactEventStore;
+            const compacted = yield* pruneEventLog;
             assert.isAbove(compacted.deletedEventCount, 0);
             const remaining = yield* events
               .read({ threadId: author.threadId, eventType: "thread.model-selection-updated" })
@@ -484,7 +493,10 @@ describe("Factory fix-commit effort", () => {
             assert.strictEqual((yield* stateOf(author.deliveryId)).status, "stopped");
             const threads = yield* ThreadManagement.ThreadManagementService;
             const projection = () =>
-              threads.getProjectThread({ projectId: world.projectId, threadId: author.threadId });
+              threads.getProjectThreadRecords(
+                { projectId: world.projectId, threadId: author.threadId },
+                ["runs"],
+              );
             const before = { instanceId: integratedInstanceId, model: "test/reasoning" };
             const low = { ...before, options: [{ id: "thinking", value: "low" }] };
             yield* threads.dispatch({
@@ -616,7 +628,10 @@ describe("Factory fix-commit effort", () => {
             const threads = yield* ThreadManagement.ThreadManagementService;
             const projection = () =>
               threads
-                .getProjectThread({ projectId: world.projectId, threadId: author.threadId })
+                .getProjectThreadRecords(
+                  { projectId: world.projectId, threadId: author.threadId },
+                  ["runs"],
+                )
                 .pipe(Effect.orDie);
             const before = {
               ...(yield* projection()).thread.modelSelection,
@@ -706,7 +721,9 @@ describe("Factory fix-commit effort", () => {
           const threads = yield* ThreadManagement.ThreadManagementService;
           const projection = () =>
             threads
-              .getProjectThread({ projectId: world.projectId, threadId: author.threadId })
+              .getProjectThreadRecords({ projectId: world.projectId, threadId: author.threadId }, [
+                "runs",
+              ])
               .pipe(Effect.orDie);
           const before = {
             ...(yield* projection()).thread.modelSelection,
@@ -800,7 +817,9 @@ describe("Factory fix-commit effort", () => {
           const threads = yield* ThreadManagement.ThreadManagementService;
           const projection = () =>
             threads
-              .getProjectThread({ projectId: world.projectId, threadId: author.threadId })
+              .getProjectThreadRecords({ projectId: world.projectId, threadId: author.threadId }, [
+                "runs",
+              ])
               .pipe(Effect.orDie);
           const before = {
             ...(yield* projection()).thread.modelSelection,
@@ -911,7 +930,10 @@ describe("Factory fix-commit effort", () => {
             const threads = yield* ThreadManagement.ThreadManagementService;
             const service = yield* FactoryService.FactoryService;
             const projection = () =>
-              threads.getProjectThread({ projectId: world.projectId, threadId: author.threadId });
+              threads.getProjectThreadRecords(
+                { projectId: world.projectId, threadId: author.threadId },
+                ["runs"],
+              );
             const before = {
               ...(yield* projection()).thread.modelSelection,
               options: original.options,
@@ -1040,7 +1062,10 @@ describe("Factory fix-commit effort", () => {
             const author = yield* world.start;
             const threads = yield* ThreadManagement.ThreadManagementService;
             const projection = () =>
-              threads.getProjectThread({ projectId: world.projectId, threadId: author.threadId });
+              threads.getProjectThreadRecords(
+                { projectId: world.projectId, threadId: author.threadId },
+                ["runs"],
+              );
             const before = {
               ...(yield* projection()).thread.modelSelection,
               options: original.options,
@@ -1096,10 +1121,7 @@ describe("Factory fix-commit effort", () => {
               assert.deepStrictEqual((yield* projection()).thread.modelSelection, selected);
             }
             if (scenario === "direct high-to-medium effort across compaction")
-              yield* Effect.flatMap(
-                ProjectionMaintenance.ProjectionMaintenanceV2,
-                (maintenance) => maintenance.compactEventStore,
-              ).pipe(
+              yield* pruneEventLog.pipe(
                 Effect.provide(ProjectionMaintenance.layer.pipe(Layer.provide(EventStore.layer))),
               );
             yield* world.endRun(owner.run.id, "completed");
@@ -1394,10 +1416,10 @@ describe("Factory fix-commit effort", () => {
           assert.deepStrictEqual(pi.levels(), []);
           assert.isFalse(pi.requests.some((request) => request["type"] === "prompt"));
           assert.deepStrictEqual(
-            (yield* threads.getProjectThread({
-              projectId: world.projectId,
-              threadId: author.threadId,
-            })).thread.modelSelection,
+            (yield* threads.getProjectThreadRecords(
+              { projectId: world.projectId, threadId: author.threadId },
+              ["runs"],
+            )).thread.modelSelection,
             before,
           );
           assert.lengthOf(
@@ -1422,7 +1444,10 @@ describe("Factory fix-commit effort", () => {
             const threads = yield* ThreadManagement.ThreadManagementService;
             const projection = () =>
               threads
-                .getProjectThread({ projectId: world.projectId, threadId: author.threadId })
+                .getProjectThreadRecords(
+                  { projectId: world.projectId, threadId: author.threadId },
+                  ["runs"],
+                )
                 .pipe(Effect.orDie);
             const before = {
               ...(yield* projection()).thread.modelSelection,

@@ -1,7 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import { ProjectId } from "@t3tools/contracts";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
-import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
+import * as GitHubApi from "./WorkGitHubApi.ts";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -72,7 +72,7 @@ interface Call {
 /** A GitHubApi whose answers come from a handler per operation. */
 const stubApi = (answer: (call: Call) => Effect.Effect<string, GitHubApi.GitHubApiError>) => {
   const calls: Array<Call> = [];
-  const layer = Layer.mock(GitHubApi.GitHubApi)({
+  const layer = Layer.mock(GitHubApi.WorkGitHubApi)({
     graphql: (input) => {
       const call: Call = {
         kind: "graphql",

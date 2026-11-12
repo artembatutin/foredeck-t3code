@@ -83,55 +83,50 @@ const make = Effect.gen(function* () {
       );
 
   /**
-   * Where the turn goes. A thread of no Factory family, or of a root nothing manages, runs it
-   * inline and records nothing. On a managed root's family thread, the turn's class is decided once
-   * from its exact source and recorded, and a turn presented again keeps the recorded one: an
-   * explicit turn runs inline, and Factory's own or unknown work goes to the manager, marked with
-   * whether its management is active or has ended.
+   * Where the turn goes. Outside a managed root's family it runs inline, unrecorded. Inside, its
+   * class is decided once and recorded (a turn presented again keeps it): explicit runs inline,
+   * Factory's or unknown goes to the manager, marked active or ended.
    */
-  const route = (turn: AutomaticTurn) =>
-    Effect.gen(function* () {
-      const family = yield* familyOf(turn);
-      if (family === null) return { type: "inline", family } satisfies Route;
-      const management = yield* admission
-        .management(family.root)
-        .pipe(Effect.mapError(failed(turn, "read")));
-      if (management === "never") return { type: "inline", family } satisfies Route;
-      const key = { threadId: turn.threadId, messageId: turn.messageId };
-      const known = yield* turns.get(key).pipe(Effect.mapError(failed(turn, "record")));
-      const decision = Option.isSome(known)
-        ? known.value
-        : yield* activity.classify(turn, family.root).pipe(
-            Effect.mapError(failed(turn, "read")),
-            Effect.flatMap((provenance) =>
-              turns
-                .record({
-                  ...key,
-                  root: family.root,
-                  deliveryId: family.launchedBy,
-                  kind: turn.kind,
-                  class: provenance.class,
-                  sourceRunId: sourceRunOf(turn),
-                })
-                .pipe(Effect.mapError(failed(turn, "record"))),
-            ),
-          );
-      if (decision.class === "explicit") return { type: "inline", family } satisfies Route;
-      return {
-        type: "manager",
-        root: family.root,
-        launchedBy: family.launchedBy,
-        provenance: decision.class,
-        management,
-      } satisfies Route;
-    });
+  const route = Effect.fn("FactoryAutomaticTurns.route")(function* (turn: AutomaticTurn) {
+    const family = yield* familyOf(turn);
+    if (family === null) return { type: "inline", family } satisfies Route;
+    const management = yield* admission
+      .management(family.root)
+      .pipe(Effect.mapError(failed(turn, "read")));
+    if (management === "never") return { type: "inline", family } satisfies Route;
+    const key = { threadId: turn.threadId, messageId: turn.messageId };
+    const known = yield* turns.get(key).pipe(Effect.mapError(failed(turn, "record")));
+    const decision = Option.isSome(known)
+      ? known.value
+      : yield* activity.classify(turn, family.root).pipe(
+          Effect.mapError(failed(turn, "read")),
+          Effect.flatMap((provenance) =>
+            turns
+              .record({
+                ...key,
+                root: family.root,
+                deliveryId: family.launchedBy,
+                kind: turn.kind,
+                class: provenance.class,
+                sourceRunId: sourceRunOf(turn),
+              })
+              .pipe(Effect.mapError(failed(turn, "record"))),
+          ),
+        );
+    if (decision.class === "explicit") return { type: "inline", family } satisfies Route;
+    return {
+      type: "manager",
+      root: family.root,
+      launchedBy: family.launchedBy,
+      provenance: decision.class,
+      management,
+    } satisfies Route;
+  });
 
   /**
-   * Holds any automatic turn to the host's policy before it can run: one in a mode that policy
-   * refuses would only fail, however it came and whoever's it is. So the consult fails, dispatching
-   * nothing and leaving the thread's mode and provider as they are, for its producer to ask again;
-   * once the owner has changed the mode, the next ask runs it. A family's refused turn is also
-   * noted, since nothing else tells its owner why it does not run.
+   * Holds any automatic turn to the host's policy: a refused mode fails the consult, dispatching
+   * nothing and changing nothing, so the producer asks again once the owner changes the mode.
+   * A family's refused turn is noted, since nothing else tells its owner why it does not run.
    */
   const judgeHostPolicy = (turn: AutomaticTurn, family: FactoryFamily | null) =>
     threads.checkThreadHostPolicy(turn.threadId, family?.launchedBy ?? null).pipe(
@@ -147,13 +142,10 @@ const make = Effect.gen(function* () {
     );
 
   /**
-   * Holds an automatic turn of a reviewed delivery to its review before it can run: core runs such
-   * a turn with the thread's selection, which drifted or still holds a mechanical turn's effort.
-   * A delivery's manager runs only a turn the review still allows. One it does not fails the
-   * consult, dispatching nothing, for its producer to ask again; a delivery waiting on its pull
-   * request would otherwise show nothing, so it blocks saying why. A root whose management ended
-   * only declines the turn, which needs no judging. The host's policy is judged after the review,
-   * whose refusal blocks the delivery and which may have just set the thread's provider back.
+   * Holds a reviewed delivery's automatic turn to its review, since core runs it with the thread's
+   * possibly drifted selection. A refusal fails the consult and blocks the delivery saying why.
+   * Ended management only declines, so needs no judging. Host policy is judged after the review,
+   * which may have just set the thread's provider back.
    */
   const prepareManaged = (turn: AutomaticTurn, to: Extract<Route, { readonly type: "manager" }>) =>
     (to.management === "active"
@@ -176,7 +168,7 @@ const make = Effect.gen(function* () {
 
   yield* installer.install(
     AutomaticTurnGate.of({
-      admit: (turn, dispatch) =>
+      admit: Effect.fn("AutomaticTurnGate.admit")((turn, dispatch) =>
         Effect.flatMap(route(turn), (to) =>
           to.type === "inline"
             ? judgeHostPolicy(turn, to.family).pipe(
@@ -196,8 +188,10 @@ const make = Effect.gen(function* () {
                 ),
               ),
         ),
+      ),
       // A native wake can be kept for long, so its dispatch is judged when it runs, not when it
       // was handed; `allowed` lets a kept one that may not run yet wait rather than be lost.
+      // @effect-diagnostics-next-line effectFnOpportunity:off - only the gate's generic signature infers this turn's requirements as never.
       hand: (turn, dispatch, options) =>
         Effect.flatMap(route(turn), (to) =>
           to.type === "inline"
@@ -224,17 +218,10 @@ const make = Effect.gen(function* () {
 });
 
 /**
- * Factory's automatic turn gate, installed into core's installable gate (see
- * `AutomaticTurnGate.layerInstallable`) for as long as Factory's layers are built. Every run core
- * starts on its own asks it first: a pull request wake, a restart continuation, a usage-limit
- * resume, a delegated task's question or result, and a native background wake. A turn on a
- * managed root's family thread that Factory cannot show to be someone's on purpose reaches the
- * root's manager through `FactoryAdmission.automaticTurn`, once a reviewed delivery's review allows
- * it; every other turn runs inline. Any turn but one a retired manager declines must also be in a
- * mode the host's policy allows. A refusal, or a read or record that fails, decides nothing: the
- * consult fails with `AutomaticTurnDecisionError`, nothing is dispatched, and the turn's producer
- * asks again by its own means. A failed family read is the exception while no root is or ever was
- * managed: no managed family can hold the thread, so the turn runs.
+ * Factory's gate in `AutomaticTurnGate.layerInstallable` while its layers are built: non-explicit
+ * turns on a managed family go to `FactoryAdmission.automaticTurn`, others run inline. A refusal
+ * or failed read fails with `AutomaticTurnDecisionError`, dispatching nothing; a failed family
+ * read still runs the turn while no root was ever managed.
  */
 export const layer = Layer.effectDiscard(make).pipe(Layer.provide(FactoryActivity.layer));
 

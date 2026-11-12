@@ -15,6 +15,8 @@ import {
   waitForThreadShell,
 } from "~/state/entities";
 import { useEnvironments } from "~/state/environments";
+import { appAtomRegistry } from "~/rpc/atomRegistry";
+import { serverEnvironment } from "~/state/server";
 import { useEnvironmentScope } from "~/state/session";
 import { threadEnvironment } from "~/state/threads";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -89,7 +91,9 @@ export function AssistantEntry({
         await openOnceShellArrives(environmentId, archived.id);
         return;
       }
-      const subscriptionProviders = environment.serverConfig.providers.filter(
+      const subscriptionProviders = (
+        appAtomRegistry.get(serverEnvironment.providersValueAtom(environmentId)) ?? []
+      ).filter(
         (provider) => provider.auth.status === "authenticated" && provider.auth.type === "chatgpt",
       );
       const selected = resolvePromptLinkModelSelection(subscriptionProviders, {

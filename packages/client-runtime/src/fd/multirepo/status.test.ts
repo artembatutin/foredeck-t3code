@@ -4,7 +4,7 @@ import {
   type VcsStatusStreamEvent,
   type VcsStatusSubscriptionInput,
 } from "@t3tools/contracts";
-import * as Data from "effect/Data";
+import * as Schema from "effect/Schema";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -12,7 +12,9 @@ import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import { loadRepositoryStatuses } from "./status.ts";
 
-class MissingCheckout extends Data.TaggedError("MissingCheckout")<{ readonly message: string }> {}
+class MissingCheckout extends Schema.TaggedError<MissingCheckout>()("MissingCheckout", {
+  message: Schema.String,
+}) {}
 
 it.effect(
   "bounds passive snapshots, closes subscriptions and keeps failed checkouts separate",
@@ -42,7 +44,7 @@ it.effect(
             if (count === 2) yield* Deferred.succeed(started, undefined);
             yield* Deferred.await(gate);
             if (input.repositoryTarget?.repositoryId === "1")
-              return yield* Effect.fail(new MissingCheckout({ message: "Checkout missing" }));
+              return yield* new MissingCheckout({ message: "Checkout missing" });
             return {
               _tag: "snapshot",
               local: {

@@ -81,6 +81,8 @@ const projectRow = (overrides: Partial<ProjectRow> = {}): ProjectRow => ({
   scripts: [],
   createdAt: at,
   updatedAt: at,
+  pinnedAt: null,
+  archivedAt: null,
   deletedAt: null,
   ...overrides,
 });

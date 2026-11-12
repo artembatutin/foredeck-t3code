@@ -16,10 +16,12 @@ import * as Stream from "effect/Stream";
 import * as EventStore from "../../orchestration-v2/EventStore.ts";
 import * as ProjectionMaintenance from "../../orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import * as ProjectionReplay from "../../orchestration-v2/testkit/ProjectionReplay.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
+import { pruneEventLog } from "./testkit/eventLogPruning.ts";
 
 // No Factory persistence or runtime: selection provenance is retained for ordinary threads too.
-const layer = ProjectionMaintenance.layer.pipe(
+const layer = Layer.merge(ProjectionMaintenance.layer, ProjectionReplay.layer).pipe(
   Layer.provideMerge(
     Layer.mergeAll(EventStore.layer, ProjectionStore.layer).pipe(
       Layer.provideMerge(SqlitePersistence.layerMemory),
@@ -27,10 +29,10 @@ const layer = ProjectionMaintenance.layer.pipe(
   ),
 );
 
-it.effect("retains every model and provider choice through public compaction and rebuild", () =>
+it.effect("retains every model and provider choice through event log pruning", () =>
   Effect.gen(function* () {
     const events = yield* EventStore.EventStoreV2;
-    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    const replay = yield* ProjectionReplay.ProjectionReplay;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const now = yield* DateTime.now;
     for (const deleted of [false, true]) {
@@ -114,9 +116,9 @@ it.effect("retains every model and provider choice through public compaction and
       if (deleted) {
         yield* append("thread.deleted", { deletedAt: now });
       }
-      assert.isTrue((yield* maintenance.rebuild).valid);
+      assert.isTrue((yield* replay.rebuild).valid);
       const before = yield* projections.getThreadProjection(threadId);
-      const compacted = yield* maintenance.compactEventStore;
+      const compacted = yield* pruneEventLog;
       assert.strictEqual(compacted.deletedEventCount, deleted ? 2 : 1);
       const retained = yield* events.read({ threadId }).pipe(Stream.runCollect);
       assert.deepStrictEqual(
@@ -131,13 +133,12 @@ it.effect("retains every model and provider choice through public compaction and
         retained.at(-1)?.event.type,
         deleted ? "thread.deleted" : "thread.metadata-updated",
       );
-      assert.isTrue((yield* maintenance.rebuild).valid);
       assert.deepStrictEqual(yield* projections.getThreadProjection(threadId), before);
       assert.strictEqual(
         (yield* projections.getThreadRecords(threadId, [])).thread.deletedAt !== null,
         deleted,
       );
-      assert.strictEqual((yield* maintenance.compactEventStore).deletedEventCount, 0);
+      assert.strictEqual((yield* pruneEventLog).deletedEventCount, 0);
     }
   }).pipe(Effect.provide(layer)),
 );

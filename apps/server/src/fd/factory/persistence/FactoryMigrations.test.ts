@@ -52,7 +52,7 @@ const factoryObjects = Effect.map(schemaObjects, (objects) =>
 const coreAndWork = Work.layerPersistence.pipe(Layer.provideMerge(SqlitePersistence.layerMemory));
 
 const alpha = ProjectId.make("project-alpha");
-const settings = Schema.decodeUnknownSync(FactoryProjectSettings)({
+const settings = Schema.decodeSync(FactoryProjectSettings)({
   verifyCommand: { executable: "vp", args: ["test", "run"] },
 });
 

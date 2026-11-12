@@ -38,11 +38,9 @@ const CaptureRow = Schema.Struct({
 });
 
 /**
- * The one Work item an idea was captured as. `pending` is claimed by the writer of
- * `writerInstanceId`, which may have created the item; `uncertain` may have an item nobody
- * recorded; `captured` names it. `itemFingerprint` is null until a read confirmed that the item
- * says what was written, and is then `contentHash`, Work's fingerprint of that content.
- * `sequence` is the capture's latest event: every write appends one, so it versions the row.
+ * `pending` is claimed by `writerInstanceId` (which may have created the item); `uncertain` may
+ * have an unrecorded item; `captured` names it. `itemFingerprint` stays null until a read confirms
+ * the written content. `sequence` is the latest event and versions the row.
  */
 export type StoredCapture = typeof CaptureRow.Type;
 export type CaptureFields = Omit<StoredCapture, "updatedAt" | "sequence">;
@@ -149,8 +147,8 @@ const make = Effect.gen(function* () {
         current.value.captureId !== expected.captureId ||
         current.value.sequence !== expected.sequence;
 
-  const write: WorkCaptureStore["Service"]["write"] = ({ expected, next, event, detail }) =>
-    Effect.gen(function* () {
+  const write: WorkCaptureStore["Service"]["write"] = Effect.fn("WorkCaptureStore.write")(
+    function* ({ expected, next, event, detail }) {
       if (next.itemFingerprint !== null && next.itemFingerprint !== next.contentHash) {
         return yield* Effect.die("A capture's item fingerprint is only ever its content's.");
       }
@@ -199,13 +197,13 @@ const make = Effect.gen(function* () {
         at,
       });
       return Option.some({ ...next, updatedAt: at, sequence });
-    }).pipe(
-      sql.withTransaction,
-      Effect.mapError((cause) => new WorkCaptureStoreError({ operation: "write", cause })),
-    );
+    },
+    sql.withTransaction,
+    Effect.mapError((cause) => new WorkCaptureStoreError({ operation: "write", cause })),
+  );
 
-  const abandon: WorkCaptureStore["Service"]["abandon"] = ({ projectId, ideaId, expected }) =>
-    Effect.gen(function* () {
+  const abandon: WorkCaptureStore["Service"]["abandon"] = Effect.fn("WorkCaptureStore.abandon")(
+    function* ({ projectId, ideaId, expected }) {
       const current = yield* read(projectId, ideaId);
       if (moved(current, expected) || Option.isNone(current)) return "moved" as const;
       const used = yield* sql<{ readonly used: number }>`
@@ -230,16 +228,17 @@ const make = Effect.gen(function* () {
         at,
       });
       return "abandoned" as const;
-    }).pipe(
-      sql.withTransaction,
-      Effect.mapError((cause) => new WorkCaptureStoreError({ operation: "abandon", cause })),
-    );
+    },
+    sql.withTransaction,
+    Effect.mapError((cause) => new WorkCaptureStoreError({ operation: "abandon", cause })),
+  );
 
   return WorkCaptureStore.of({
-    get: (projectId, ideaId) =>
+    get: Effect.fn("WorkCaptureStore.get")((projectId, ideaId) =>
       read(projectId, ideaId).pipe(
         Effect.mapError((cause) => new WorkCaptureStoreError({ operation: "get", cause })),
       ),
+    ),
     write,
     abandon,
   });

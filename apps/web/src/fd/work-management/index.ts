@@ -2,7 +2,7 @@ export { WorkRouteView, validateWorkSearch, type WorkSearch } from "./WorkRouteV
 export { WorkSourcesSettings } from "./WorkSourcesSettings";
 export { LinkedWorkSection } from "./LinkedWorkSection";
 export { ThreadWorkBadge } from "./ThreadWorkBadge";
-export { LinkWorkItemDialogHost, openLinkWorkItemDialog } from "./LinkWorkItemDialog";
+export { LinkWorkItemDialogHost } from "./LinkWorkItemDialog";
 export { WorkSidebarItem } from "./WorkSidebarItem";
 export { workPaletteActions } from "./commands";
 

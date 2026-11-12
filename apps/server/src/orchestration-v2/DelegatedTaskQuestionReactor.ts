@@ -23,11 +23,9 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
 /**
- * Wakes the parent of an app-owned delegated task when the task asks a question. The question
- * blocks the task until someone answers it, and the user rarely watches child threads, so the
- * parent agent is told to answer it or to ask the user. Only questions are routed: approvals
- * cannot be answered through the pending request tools. A wake runs only once the automatic
- * turn gate admits it; one it holds back is delivered later through `redeliver`.
+ * Wakes an app-owned delegated task's parent when the task asks a question, since users rarely
+ * watch child threads. Only questions: approvals cannot be answered via pending request tools.
+ * Wakes pass the automatic turn gate; held ones are delivered later through `redeliver`.
  */
 export class DelegatedTaskQuestionReactor extends Context.Service<
   DelegatedTaskQuestionReactor,
@@ -35,11 +33,9 @@ export class DelegatedTaskQuestionReactor extends Context.Service<
     readonly start: () => Effect.Effect<void, never, Scope.Scope>;
     readonly handle: (event: OrchestrationV2DomainEvent) => Effect.Effect<void>;
     /**
-     * Wakes the parent for a question the gate held back, re-reading it as `handle` does, for
-     * the task of the run the question was asked in: `moot` when the question no longer needs
-     * one (answered, dismissed or expired, its task gone, its parent archived or deleted, a
-     * blocking wait delivering it itself, or no run traceable from it). The wake's command id
-     * makes a repeat dispatch nothing new.
+     * Wakes the parent for a held-back question, re-reading it as `handle` does. `moot` when no
+     * longer needed (resolved, task gone/settled, parent archived/deleted, a blocking wait
+     * delivering it, or no traceable run). The command id makes repeats idempotent.
      */
     readonly redeliver: (input: {
       readonly childThreadId: ThreadId;
@@ -75,7 +71,7 @@ const make = Effect.gen(function* () {
       commandId: CommandId.make(`server:delegated-task-question:${key}`),
       threadId: task.threadId,
       messageId,
-      text: `${situation} Read it with t3_pending_request_read using threadId ${task.childThreadId} and requestId ${request.id}. Answer it with t3_pending_request_respond when the answer follows from the task or the user's instructions; otherwise ask the user, then answer it. If it is no longer pending, it was answered or dismissed.`,
+      text: `${situation} Read it with t3_pending_request action read, threadId ${task.childThreadId}, and requestId ${request.id}. Answer it with action respond when the answer follows from the task or the user's instructions; otherwise ask the user, then answer it. If it is no longer pending, it was answered or dismissed.`,
       notification: {
         source: { kind: "delegated_task", taskIds: [task.id], childThreadId: task.childThreadId },
         outcome: "updated",
@@ -104,8 +100,8 @@ const make = Effect.gen(function* () {
   /**
    * The app-owned task whose pending question, asked during `run` of `child`, wakes the parent:
    * the task that run answers, or for a run naming none the task the child was delegated for.
-   * None while the parent is archived or deleted, or while a blocking delegate_task wait
-   * delivers the question itself.
+   * None once the task has settled, while the parent is archived or deleted, or while a blocking
+   * delegate_task wait delivers the question itself.
    */
   const questionTask = Effect.fnUntraced(function* (
     child: OrchestrationV2AppThread,
@@ -123,7 +119,9 @@ const make = Effect.gen(function* () {
     if (
       task === undefined ||
       parent.thread.archivedAt !== null ||
-      parent.thread.deletedAt !== null
+      parent.thread.deletedAt !== null ||
+      // The orchestrator drops a settled task's question wake (`isStaleQuestionWake`).
+      ["completed", "failed", "cancelled", "interrupted"].includes(task.status)
     ) {
       return undefined;
     }
@@ -142,35 +140,68 @@ const make = Effect.gen(function* () {
     return task;
   });
 
-  const redeliver: DelegatedTaskQuestionReactor["Service"]["redeliver"] = (input) =>
-    Effect.gen(function* () {
-      const child = yield* projections.getThread(input.childThreadId);
-      const parentThreadId = child.lineage.parentThreadId;
-      if (parentThreadId === null) return "moot";
-      const { request, node } = yield* projections.getRuntimeResponseContext(
-        child.id,
-        input.requestId,
-      );
-      if (request?.kind !== "user_input" || request.status !== "pending") return "moot";
-      // The run the question was asked in, through the request's own node: a later follow-up in
-      // the same child conversation answers a task of its own. A question no node ties to a run
-      // cannot be attributed, so it wakes nothing rather than a guessed task's parent.
-      const { runs } = yield* projections.getThreadRecords(child.id, ["runs"]);
-      const run = runs.find((candidate) => candidate.id === node?.runId);
-      if (run === undefined) return "moot";
-      const task = yield* questionTask(child, parentThreadId, run, request.responseCapability);
-      if (task === undefined) return "moot";
-      const outcome = yield* wakeParent(task, request);
-      // A declined wake never runs, like one no longer needed.
-      return outcome?._tag === "Ran"
-        ? "dispatched"
-        : outcome?.reason === "deferred"
-          ? "deferred"
-          : "moot";
-    });
+  const redeliver = Effect.fn("DelegatedTaskQuestionReactor.redeliver")(function* (
+    input: Parameters<DelegatedTaskQuestionReactor["Service"]["redeliver"]>[0],
+  ) {
+    const child = yield* projections.getThread(input.childThreadId);
+    const parentThreadId = child.lineage.parentThreadId;
+    if (parentThreadId === null) return "moot";
+    const { request, node } = yield* projections.getRuntimeResponseContext(
+      child.id,
+      input.requestId,
+    );
+    if (request?.kind !== "user_input" || request.status !== "pending") return "moot";
+    // The run the question was asked in, through the request's own node: a later follow-up in
+    // the same child conversation answers a task of its own. A question no node ties to a run
+    // cannot be attributed, so it wakes nothing rather than a guessed task's parent.
+    const { runs } = yield* projections.getThreadRecords(child.id, ["runs"]);
+    const run = runs.find((candidate) => candidate.id === node?.runId);
+    if (run === undefined) return "moot";
+    const task = yield* questionTask(child, parentThreadId, run, request.responseCapability);
+    if (task === undefined) return "moot";
+    const outcome = yield* wakeParent(task, request);
+    // A declined wake never runs, like one no longer needed.
+    return outcome?._tag === "Ran"
+      ? "dispatched"
+      : outcome?.reason === "deferred"
+        ? "deferred"
+        : "moot";
+  });
 
-  const handle: DelegatedTaskQuestionReactor["Service"]["handle"] = (event) =>
-    Effect.gen(function* () {
+  const cancelQueuedWakes = Effect.fnUntraced(function* (
+    parentThreadId: ThreadId,
+    requestIds: ReadonlyArray<RuntimeRequestId>,
+  ) {
+    const parent = yield* projections.getThreadRecords(parentThreadId, ["runs"]);
+    for (const requestId of requestIds) {
+      const key = `${parentThreadId}:${requestId}`;
+      const messageId = MessageId.make(`message:delegated-task-question:${key}`);
+      const queued = parent.runs.find(
+        (run) => run.status === "queued" && run.userMessageId === messageId,
+      );
+      if (queued === undefined) continue;
+      yield* engine
+        .dispatch({
+          type: "queued-run.cancel",
+          commandId: CommandId.make(`server:delegated-task-question-cancel:${key}`),
+          threadId: parentThreadId,
+          runId: queued.id,
+        })
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("cancelling a delegated task question wake failed", {
+              threadId: parentThreadId,
+              requestId,
+              cause,
+            }),
+          ),
+        );
+    }
+  });
+
+  // Runs for every domain event; most events return before any work is needed.
+  const handle: DelegatedTaskQuestionReactor["Service"]["handle"] = Effect.fnUntraced(
+    function* (event) {
       if (event.type === "run.updated") {
         if (!["completed", "failed", "waiting"].includes(event.payload.status)) return;
         const parent = yield* projections.getThreadRecords(event.threadId, ["subagents"]);
@@ -210,6 +241,46 @@ const make = Effect.gen(function* () {
         }
         return;
       }
+      if (event.type === "subagent.updated") {
+        const task = event.payload;
+        if (
+          task.origin !== "app_owned" ||
+          task.childThreadId === null ||
+          !["completed", "failed", "cancelled", "interrupted"].includes(task.status)
+        ) {
+          return;
+        }
+        // A settled task can no longer use an answer to its still-pending questions.
+        const { runtimeRequests } = yield* projections.getThreadRecords(task.childThreadId, [
+          "runtimeRequests",
+        ]);
+        const questions = runtimeRequests.filter((request) => request.kind === "user_input");
+        if (questions.length === 0) return;
+        const child = yield* projections.getThreadRecords(task.childThreadId, ["runs", "nodes"]);
+        const taskRunIds = new Set(
+          child.runs
+            .filter(
+              (run) =>
+                run.delegatedTaskId === task.id ||
+                (run.delegatedTaskId === undefined &&
+                  child.thread.forkedFrom?.type === "node" &&
+                  child.thread.forkedFrom.nodeId === task.id),
+            )
+            .map((run) => run.id),
+        );
+        const taskNodeIds = new Set(
+          child.nodes
+            .filter((node) => node.runId !== null && taskRunIds.has(node.runId))
+            .map((node) => node.id),
+        );
+        yield* cancelQueuedWakes(
+          task.threadId,
+          questions
+            .filter((request) => taskNodeIds.has(request.nodeId))
+            .map((request) => request.id),
+        );
+        return;
+      }
       if (event.type !== "runtime-request.updated" || event.payload.kind !== "user_input") {
         return;
       }
@@ -217,22 +288,8 @@ const make = Effect.gen(function* () {
       const parentThreadId = child.lineage.parentThreadId;
       if (parentThreadId === null) return;
       const request = yield* projections.getRuntimeRequest(event.threadId, event.payload.id);
-      // Keyed by the request, so a request updated while still pending wakes the parent once.
-      const key = `${parentThreadId}:${event.payload.id}`;
-      const messageId = MessageId.make(`message:delegated-task-question:${key}`);
       if (event.payload.status !== "pending" || request?.status !== "pending") {
-        const parent = yield* projections.getThreadRecords(parentThreadId, ["runs"]);
-        const queued = parent.runs.find(
-          (run) => run.status === "queued" && run.userMessageId === messageId,
-        );
-        if (queued !== undefined) {
-          yield* engine.dispatch({
-            type: "queued-run.cancel",
-            commandId: CommandId.make(`server:delegated-task-question-cancel:${key}`),
-            threadId: parentThreadId,
-            runId: queued.id,
-          });
-        }
+        yield* cancelQueuedWakes(parentThreadId, [event.payload.id]);
         return;
       }
       const { runs } = yield* projections.getThreadRecords(child.id, ["runs"]);
@@ -247,14 +304,17 @@ const make = Effect.gen(function* () {
       );
       if (task === undefined) return;
       yield* wakeParent(task, request);
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("waking the parent of a delegated task question failed", {
-          threadId: event.threadId,
-          cause,
-        }),
+    },
+    (effect, event) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("waking the parent of a delegated task question failed", {
+            threadId: event.threadId,
+            cause,
+          }),
+        ),
       ),
-    );
+  );
 
   const start: DelegatedTaskQuestionReactor["Service"]["start"] = () =>
     forkParked(

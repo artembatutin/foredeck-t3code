@@ -15,14 +15,14 @@ import { truncateText } from "./bounds.ts";
 /** What a started thread reads about its item; links and capabilities are not prompt material. */
 export type WorkPromptItem = Omit<WorkItemDetail, "links" | "capabilities">;
 
-export const PROMPT_BODY_MAX_CHARS = 16_000;
+const PROMPT_BODY_MAX_CHARS = 16_000;
 export const PROMPT_COMMENTS_MAX = 10;
-export const PROMPT_COMMENT_MAX_CHARS = 2_000;
+const PROMPT_COMMENT_MAX_CHARS = 2_000;
 const TITLE_MAX_CHARS = 100;
 const BRANCH_SLUG_MAX_CHARS = 40;
 
 /** The key a branch name can carry: `fd-7k3qa2`, `gh-123`, `PROJ-12`. */
-export const workBranchKey = (item: Pick<WorkPromptItem, "kind" | "ref">): string =>
+const workBranchKey = (item: Pick<WorkPromptItem, "kind" | "ref">): string =>
   item.kind === "github" ? `gh-${item.ref.itemId}` : item.ref.itemId;
 
 /**

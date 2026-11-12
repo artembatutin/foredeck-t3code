@@ -1,4 +1,4 @@
-import { assert, describe, it, vi } from "@effect/vitest";
+import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
   type MessageId,
@@ -92,15 +92,10 @@ import {
   withEndpoint,
 } from "./testkit/mcpEndpoint.ts";
 
-// Real Git, verify commands and rebuilt servers on every path: a loaded machine only takes longer,
-// and nothing here waits on time, so the limit is just where a real hang fails.
-vi.setConfig({ testTimeout: 240_000 });
-
 /**
- * Whose work a turn or a tool call is, judged on the server's real stack by its exact cause: native
- * wakes across runs of different origins, agents' tools through the authenticated MCP endpoint with
- * a credential issued for their thread, and answers to the provider's questions. What is Factory's
- * or cannot be told apart from it waits and counts; what is the owner's runs at once, under any
+ * Whose work a turn or tool call is, judged on the real stack by its exact cause: native wakes,
+ * agents' tools via the authenticated MCP endpoint, and answers to provider questions. Factory's,
+ * or what cannot be told apart from it, waits and counts; the owner's runs at once under any
  * capacity. A decision that cannot be made runs nothing and is asked again.
  */
 
@@ -211,7 +206,6 @@ describe("a native wake's origin, across the runs on its provider thread", () =>
         stack(spy, { handoff: { admission: watch.admission } }),
       );
     },
-    240_000,
   );
 
   it.live(
@@ -452,7 +446,6 @@ describe("a managed delivery's agents and their run-creating tools", () => {
         stack(spy),
       );
     },
-    300_000,
   );
 });
 
@@ -474,135 +467,130 @@ const childrenOf = (threadId: ThreadId) =>
   );
 
 describe("delegate_task from a managed delivery's threads", () => {
-  it.live(
-    "runs once and counted under a held slot, and is refused without fresh authority",
-    () =>
-      Effect.flatMap(makeRetirementProbe, (probe) => {
-        const spy = spyOnFactoryPort();
-        const reads = { on: false };
-        return withProject(
-          verifyCommands.passes,
-          (world) =>
-            withEndpoint(driver, (endpoint) =>
-              probe.guarded(
-                Effect.gen(function* () {
-                  const factory = yield* factoryService;
-                  const admission = yield* HandoffAdmission.HandoffAdmission;
-                  yield* startAssistantThread(world);
-                  const { ref, root } = yield* claimIdea(world, "export");
-                  const author = yield* world.launched(root);
-                  yield* providerTurnRunning(author.threadId);
-                  const agent = yield* endpoint.callerOn(author.threadId);
-                  const delegate = (task: string) => agent.call("delegate_task", { task });
+  it.live("runs once and counted under a held slot, and is refused without fresh authority", () =>
+    Effect.flatMap(makeRetirementProbe, (probe) => {
+      const spy = spyOnFactoryPort();
+      const reads = { on: false };
+      return withProject(
+        verifyCommands.passes,
+        (world) =>
+          withEndpoint(driver, (endpoint) =>
+            probe.guarded(
+              Effect.gen(function* () {
+                const factory = yield* factoryService;
+                const admission = yield* HandoffAdmission.HandoffAdmission;
+                yield* startAssistantThread(world);
+                const { ref, root } = yield* claimIdea(world, "export");
+                const author = yield* world.launched(root);
+                yield* providerTurnRunning(author.threadId);
+                const agent = yield* endpoint.callerOn(author.threadId);
+                const delegate = (task: string) => agent.call("delegate_task", { task });
 
-                  const refusedWith = (label: string, expected: string) =>
-                    Effect.gen(function* () {
-                      const before = yield* writtenRows;
-                      const refused = yield* delegate(`Refused while ${label}.`);
-                      assert.isTrue(refused.isError, label);
-                      assert.include(refused.text, expected, label);
-                      yield* drainOrchestration;
-                      assert.deepStrictEqual(yield* writtenRows, before, label);
-                    });
-
-                  // Refused for each thing that takes its authority away, leaving the holding as it was.
-                  yield* authorizeIdea(world, "export", false);
-                  yield* refusedWith(
-                    "revoked",
-                    Factory.FactoryAdmission.admissionRefusalText.revoked,
-                  );
-                  yield* authorizeIdea(world, "export");
-                  yield* ownerEdits(ref);
-                  yield* refusedWith(
-                    "changed",
-                    Factory.FactoryAdmission.admissionRefusalText.scope_changed,
-                  );
-                  yield* ownerRestores(ref);
-                  reads.on = true;
-                  yield* refusedWith(
-                    "unreadable",
-                    Factory.FactoryAdmission.admissionRefusalText.unreadable,
-                  );
-                  reads.on = false;
-                  assert.strictEqual(yield* childrenOf(author.threadId), 0);
-
-                  // Under its held slot with fresh Work it is admitted, and from that commit it keeps the
-                  // slot: the release pass frees nothing, and no child exists yet.
-                  probe.armed.admitted = true;
-                  const delegating = yield* delegate("Check the CSV export.").pipe(
-                    Effect.forkChild,
-                  );
-                  yield* Deferred.await(probe.gates.admitted.entered);
-                  assert.isTrue(
-                    (yield* admissionsOf(root)).some(
-                      ({ kind, state }) => kind === "delegation" && state === "dispatching",
-                    ),
-                  );
-                  const holding = (yield* slotOf(root)) ?? assert.fail("The root holds no slot.");
-                  assert.strictEqual(yield* admission.release(root, holding.entry_seq), "kept");
-                  assert.strictEqual(yield* childrenOf(author.threadId), 0);
-                  yield* Deferred.succeed(probe.gates.admitted.go, undefined);
-
-                  // Let go: one child, a family thread, counted.
-                  const answered = yield* Fiber.join(delegating);
-                  assert.isFalse(answered.isError, answered.text);
-                  yield* drainOrchestration;
-                  assert.strictEqual(yield* childrenOf(author.threadId), 1);
-                  const { subagents } = yield* threadProjection(author.threadId);
-                  const childThread =
-                    subagents[0]?.childThreadId ?? assert.fail("The delegation made no thread.");
-                  assert.strictEqual(yield* factory.familyRoot(childThread), root);
-                  assert.isTrue(
-                    (yield* admissionsOf(root)).some(
-                      ({ kind, state }) => kind === "delegation" && state === "dispatched",
-                    ),
-                  );
-                  const childRuns = yield* runsOf(childThread);
-                  assert.lengthOf(childRuns, 1);
-                  yield* runStarted(childRuns[0]!.id);
-
-                  // The delegation counts: with its author done and parked, its slot stays until it ends.
-                  yield* authorCommits(author.worktreePath, "feat: add the export button");
-                  yield* world.endRun(author.runId, "completed");
-                  yield* reviewPasses(world, root);
-                  assert.strictEqual((yield* stateOf(root)).status, "pr_open");
-                  yield* tick;
-                  assert.strictEqual((yield* slotOf(root))?.state, "held");
-                  const activity = yield* factory.activity(root);
-                  assert.strictEqual(activity.phase, "parked");
-                  assert.isTrue(activity.busy);
-                  yield* world.endRun(childRuns[0]!.id, "completed");
-                  yield* tick;
-
-                  // The result of the child takes a quantum of its own, then nothing holds the slot.
-                  const [result] = yield* demandsOf(root);
-                  if (result?.messageId != null) {
-                    yield* tick;
-                    const run = yield* runOfMessage(result.messageId);
-                    yield* runStarted(run);
-                    yield* world.endRun(run, "completed");
-                    yield* tick;
-                  }
-                  assert.isUndefined(yield* slotOf(root));
-
-                  // Parked, with no slot to run under: refused, with nothing made, whoever's turn runs.
-                  yield* world.ownerTurn(author.threadId, "Look into a CSV option.");
-                  const parked = yield* endpoint.callerOn(author.threadId);
-                  const before = yield* writtenRows;
-                  const refused = yield* parked.call("delegate_task", {
-                    task: "Refused while parked.",
+                const refusedWith = (label: string, expected: string) =>
+                  Effect.gen(function* () {
+                    const before = yield* writtenRows;
+                    const refused = yield* delegate(`Refused while ${label}.`);
+                    assert.isTrue(refused.isError, label);
+                    assert.include(refused.text, expected, label);
+                    yield* drainOrchestration;
+                    assert.deepStrictEqual(yield* writtenRows, before, label);
                   });
-                  assert.isTrue(refused.isError);
-                  assert.include(refused.text, text.notHolding);
-                  assert.deepStrictEqual(yield* writtenRows, before);
-                  assert.strictEqual(yield* childrenOf(author.threadId), 1);
-                }),
-              ),
+
+                // Refused for each thing that takes its authority away, leaving the holding as it was.
+                yield* authorizeIdea(world, "export", false);
+                yield* refusedWith(
+                  "revoked",
+                  Factory.FactoryAdmission.admissionRefusalText.revoked,
+                );
+                yield* authorizeIdea(world, "export");
+                yield* ownerEdits(ref);
+                yield* refusedWith(
+                  "changed",
+                  Factory.FactoryAdmission.admissionRefusalText.scope_changed,
+                );
+                yield* ownerRestores(ref);
+                reads.on = true;
+                yield* refusedWith(
+                  "unreadable",
+                  Factory.FactoryAdmission.admissionRefusalText.unreadable,
+                );
+                reads.on = false;
+                assert.strictEqual(yield* childrenOf(author.threadId), 0);
+
+                // Under its held slot with fresh Work it is admitted, and from that commit it keeps the
+                // slot: the release pass frees nothing, and no child exists yet.
+                probe.armed.admitted = true;
+                const delegating = yield* delegate("Check the CSV export.").pipe(Effect.forkChild);
+                yield* Deferred.await(probe.gates.admitted.entered);
+                assert.isTrue(
+                  (yield* admissionsOf(root)).some(
+                    ({ kind, state }) => kind === "delegation" && state === "dispatching",
+                  ),
+                );
+                const holding = (yield* slotOf(root)) ?? assert.fail("The root holds no slot.");
+                assert.strictEqual(yield* admission.release(root, holding.entry_seq), "kept");
+                assert.strictEqual(yield* childrenOf(author.threadId), 0);
+                yield* Deferred.succeed(probe.gates.admitted.go, undefined);
+
+                // Let go: one child, a family thread, counted.
+                const answered = yield* Fiber.join(delegating);
+                assert.isFalse(answered.isError, answered.text);
+                yield* drainOrchestration;
+                assert.strictEqual(yield* childrenOf(author.threadId), 1);
+                const { subagents } = yield* threadProjection(author.threadId);
+                const childThread =
+                  subagents[0]?.childThreadId ?? assert.fail("The delegation made no thread.");
+                assert.strictEqual(yield* factory.familyRoot(childThread), root);
+                assert.isTrue(
+                  (yield* admissionsOf(root)).some(
+                    ({ kind, state }) => kind === "delegation" && state === "dispatched",
+                  ),
+                );
+                const childRuns = yield* runsOf(childThread);
+                assert.lengthOf(childRuns, 1);
+                yield* runStarted(childRuns[0]!.id);
+
+                // The delegation counts: with its author done and parked, its slot stays until it ends.
+                yield* authorCommits(author.worktreePath, "feat: add the export button");
+                yield* world.endRun(author.runId, "completed");
+                yield* reviewPasses(world, root);
+                assert.strictEqual((yield* stateOf(root)).status, "pr_open");
+                yield* tick;
+                assert.strictEqual((yield* slotOf(root))?.state, "held");
+                const activity = yield* factory.activity(root);
+                assert.strictEqual(activity.phase, "parked");
+                assert.isTrue(activity.busy);
+                yield* world.endRun(childRuns[0]!.id, "completed");
+                yield* tick;
+
+                // The result of the child takes a quantum of its own, then nothing holds the slot.
+                const [result] = yield* demandsOf(root);
+                if (result?.messageId != null) {
+                  yield* tick;
+                  const run = yield* runOfMessage(result.messageId);
+                  yield* runStarted(run);
+                  yield* world.endRun(run, "completed");
+                  yield* tick;
+                }
+                assert.isUndefined(yield* slotOf(root));
+
+                // Parked, with no slot to run under: refused, with nothing made, whoever's turn runs.
+                yield* world.ownerTurn(author.threadId, "Look into a CSV option.");
+                const parked = yield* endpoint.callerOn(author.threadId);
+                const before = yield* writtenRows;
+                const refused = yield* parked.call("delegate_task", {
+                  task: "Refused while parked.",
+                });
+                assert.isTrue(refused.isError);
+                assert.include(refused.text, text.notHolding);
+                assert.deepStrictEqual(yield* writtenRows, before);
+                assert.strictEqual(yield* childrenOf(author.threadId), 1);
+              }),
             ),
-          stack(spy, { handoff: { probe: probe.probe }, work: unreadableForAssistant(reads) }),
-        );
-      }),
-    300_000,
+          ),
+        stack(spy, { handoff: { probe: probe.probe }, work: unreadableForAssistant(reads) }),
+      );
+    }),
   );
 
   it.live("is refused once its root is ending, and once it is retired", () => {
@@ -665,7 +653,8 @@ const respondedTo = (world: World, requestId: RuntimeRequestId) =>
   world.provider.responded.filter((response) => response.requestId === requestId).length;
 
 const answering = (caller: McpCaller, threadId: ThreadId) => (requestId: RuntimeRequestId) =>
-  caller.call("t3_pending_request_respond", {
+  caller.call("t3_pending_request", {
+    action: "respond",
     threadId,
     requestId,
     answers: { format: "CSV" },
@@ -783,7 +772,6 @@ describe("a governed parent's answers to its child", () => {
         stack(spy),
       );
     },
-    300_000,
   );
 
   it.live.each([{ origin: "factory" as const }, { origin: "unknown" as const }])(
@@ -925,155 +913,147 @@ describe("a governed parent's answers to its child", () => {
           stack(spy, { handoff: { probe: probe.probe } }),
         );
       }),
-    300_000,
   );
 });
 
 describe("everyone else's answers and sends", () => {
-  it.live(
-    "the owner's client and an ordinary thread's agent run inline, as explicit",
-    () => {
-      const spy = spyOnFactoryPort();
-      return withProject(
-        verifyCommands.passes,
-        (world) =>
-          withEndpoint(driver, (endpoint) =>
-            Effect.gen(function* () {
-              const { root, thread } = yield* deliverIdea(world);
-              yield* fill(world, 2);
-              const ownerThread = yield* startOwnerThread(world);
-              const ownerAgent = yield* endpoint.callerOn(ownerThread);
+  it.live("the owner's client and an ordinary thread's agent run inline, as explicit", () => {
+    const spy = spyOnFactoryPort();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        withEndpoint(driver, (endpoint) =>
+          Effect.gen(function* () {
+            const { root, thread } = yield* deliverIdea(world);
+            yield* fill(world, 2);
+            const ownerThread = yield* startOwnerThread(world);
+            const ownerAgent = yield* endpoint.callerOn(ownerThread);
 
-              // An ordinary thread's agent sends to the family's thread: it runs inline, once.
-              const runs = (yield* runsOf(thread)).length;
-              const sent = yield* ownerAgent.call("t3_thread_send", {
-                threadId: thread,
-                message: "Also add a CSV option.",
-                mode: "queue",
-              });
-              assert.isFalse(sent.isError, sent.text);
-              yield* drainOrchestration;
-              const after = yield* runsOf(thread);
-              assert.strictEqual(after.length, runs + 1);
-              const run = after.at(-1) ?? assert.fail("The send started no run.");
-              yield* nothingOfRoot(root);
-              yield* runStarted(run.id);
-              yield* world.endRun(run.id, "completed");
-              yield* tick;
-              yield* nothingOfRoot(root);
+            // An ordinary thread's agent sends to the family's thread: it runs inline, once.
+            const runs = (yield* runsOf(thread)).length;
+            const sent = yield* ownerAgent.call("t3_thread_send", {
+              threadId: thread,
+              message: "Also add a CSV option.",
+              mode: "queue",
+            });
+            assert.isFalse(sent.isError, sent.text);
+            yield* drainOrchestration;
+            const after = yield* runsOf(thread);
+            assert.strictEqual(after.length, runs + 1);
+            const run = after.at(-1) ?? assert.fail("The send started no run.");
+            yield* nothingOfRoot(root);
+            yield* runStarted(run.id);
+            yield* world.endRun(run.id, "completed");
+            yield* tick;
+            yield* nothingOfRoot(root);
 
-              // A child of the owner's turn asks: each of them answers, under the same capacity.
-              const ownerRun = yield* world.ownerTurn(thread, "Split the export.");
-              const child = yield* delegateFrom(thread, ownerRun, "user");
-              const fromAgent = yield* askedOn(world, child.runId, "message");
-              const fromOwner = yield* askedOn(world, child.runId, "message");
-              const fromOutside = yield* askedOn(world, child.runId, "message");
-              const live = yield* askedOn(world, child.runId, "live");
-              const asyncAnswer = (requestId: RuntimeRequestId) => `async-answer:${requestId}`;
-              const answered = (requestId: RuntimeRequestId) =>
-                threadProjection(child.childThreadId).pipe(
-                  Effect.map(({ messages }) =>
-                    messages.some(({ id }) => id === asyncAnswer(requestId)),
-                  ),
-                  Effect.orDie,
-                );
-
-              // Its live question, by the ordinary agent: the provider's one response.
-              yield* continuedOnce(
-                world,
-                answering(ownerAgent, child.childThreadId),
-                child.childThreadId,
-                live,
+            // A child of the owner's turn asks: each of them answers, under the same capacity.
+            const ownerRun = yield* world.ownerTurn(thread, "Split the export.");
+            const child = yield* delegateFrom(thread, ownerRun, "user");
+            const fromAgent = yield* askedOn(world, child.runId, "message");
+            const fromOwner = yield* askedOn(world, child.runId, "message");
+            const fromOutside = yield* askedOn(world, child.runId, "message");
+            const live = yield* askedOn(world, child.runId, "live");
+            const asyncAnswer = (requestId: RuntimeRequestId) => `async-answer:${requestId}`;
+            const answered = (requestId: RuntimeRequestId) =>
+              threadProjection(child.childThreadId).pipe(
+                Effect.map(({ messages }) =>
+                  messages.some(({ id }) => id === asyncAnswer(requestId)),
+                ),
+                Effect.orDie,
               );
 
-              const answerAgent = yield* answering(ownerAgent, child.childThreadId)(fromAgent);
-              assert.isFalse(answerAgent.isError, answerAgent.text);
-              assert.isTrue(yield* answered(fromAgent));
-              const orchestrator = yield* Orchestrator.OrchestratorV2;
-              yield* orchestrator
-                .dispatch({
-                  type: "runtime-request.respond",
-                  commandId: CommandId.make("owner-answer"),
-                  threadId: child.childThreadId,
-                  requestId: fromOwner,
-                  answers: { format: "CSV" },
-                })
-                .pipe(Effect.orDie);
-              assert.isTrue(yield* answered(fromOwner));
-              const outside = yield* endpoint.outsideClient;
-              const outsideAnswer = yield* outside.call("t3_pending_request_respond", {
+            // Its live question, by the ordinary agent: the provider's one response.
+            yield* continuedOnce(
+              world,
+              answering(ownerAgent, child.childThreadId),
+              child.childThreadId,
+              live,
+            );
+
+            const answerAgent = yield* answering(ownerAgent, child.childThreadId)(fromAgent);
+            assert.isFalse(answerAgent.isError, answerAgent.text);
+            assert.isTrue(yield* answered(fromAgent));
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            yield* orchestrator
+              .dispatch({
+                type: "runtime-request.respond",
+                commandId: CommandId.make("owner-answer"),
                 threadId: child.childThreadId,
-                requestId: fromOutside,
+                requestId: fromOwner,
                 answers: { format: "CSV" },
-              });
-              assert.isFalse(outsideAnswer.isError, outsideAnswer.text);
-              assert.isTrue(yield* answered(fromOutside));
-              yield* drainOrchestration;
-              // None of them took a slot or waited.
-              assert.deepStrictEqual(
-                (yield* demandsOf(root)).filter(({ kind }) => kind !== "delegated_completion"),
-                [],
-              );
-              assert.isUndefined(yield* slotOf(root));
-              assert.sameMembers(yield* governedMessages(root), [
-                asyncAnswer(fromAgent),
-                asyncAnswer(fromOwner),
-                asyncAnswer(fromOutside),
-              ]);
-            }),
-          ),
-        stack(spy),
-      );
-    },
-    240_000,
-  );
+              })
+              .pipe(Effect.orDie);
+            assert.isTrue(yield* answered(fromOwner));
+            const outside = yield* endpoint.outsideClient;
+            const outsideAnswer = yield* outside.call("t3_pending_request", {
+              action: "respond",
+              threadId: child.childThreadId,
+              requestId: fromOutside,
+              answers: { format: "CSV" },
+            });
+            assert.isFalse(outsideAnswer.isError, outsideAnswer.text);
+            assert.isTrue(yield* answered(fromOutside));
+            yield* drainOrchestration;
+            // None of them took a slot or waited.
+            assert.deepStrictEqual(
+              (yield* demandsOf(root)).filter(({ kind }) => kind !== "delegated_completion"),
+              [],
+            );
+            assert.isUndefined(yield* slotOf(root));
+            assert.sameMembers(yield* governedMessages(root), [
+              asyncAnswer(fromAgent),
+              asyncAnswer(fromOwner),
+              asyncAnswer(fromOutside),
+            ]);
+          }),
+        ),
+      stack(spy),
+    );
+  });
 
-  it.live(
-    "agents of a delivery no assistant manages send, delegate and answer as ever",
-    () => {
-      const spy = spyOnFactoryPort();
-      return withProject(
-        verifyCommands.passes,
-        (world) =>
-          withEndpoint(driver, (endpoint) =>
-            Effect.gen(function* () {
-              const factory = yield* factoryService;
-              const author = yield* world.start;
-              assert.isUndefined(yield* managedRootOf(author.deliveryId));
-              yield* providerTurnRunning(author.threadId);
-              const agent = yield* endpoint.callerOn(author.threadId);
-              const before = (yield* runsOf(author.threadId)).length;
-              const sent = yield* agent.call("t3_thread_send", {
-                threadId: author.threadId,
-                message: "Note for later.",
-                mode: "queue",
-              });
-              assert.isFalse(sent.isError, sent.text);
-              assert.strictEqual((yield* runsOf(author.threadId)).length, before + 1);
+  it.live("agents of a delivery no assistant manages send, delegate and answer as ever", () => {
+    const spy = spyOnFactoryPort();
+    return withProject(
+      verifyCommands.passes,
+      (world) =>
+        withEndpoint(driver, (endpoint) =>
+          Effect.gen(function* () {
+            const factory = yield* factoryService;
+            const author = yield* world.start;
+            assert.isUndefined(yield* managedRootOf(author.deliveryId));
+            yield* providerTurnRunning(author.threadId);
+            const agent = yield* endpoint.callerOn(author.threadId);
+            const before = (yield* runsOf(author.threadId)).length;
+            const sent = yield* agent.call("t3_thread_send", {
+              threadId: author.threadId,
+              message: "Note for later.",
+              mode: "queue",
+            });
+            assert.isFalse(sent.isError, sent.text);
+            assert.strictEqual((yield* runsOf(author.threadId)).length, before + 1);
 
-              const delegated = yield* agent.call("delegate_task", { task: "Check the export." });
-              assert.isFalse(delegated.isError, delegated.text);
-              yield* drainOrchestration;
-              const { subagents } = yield* threadProjection(author.threadId);
-              const childThread =
-                subagents[0]?.childThreadId ?? assert.fail("The delegation made no thread.");
-              const childRun = (yield* runsOf(childThread))[0] ?? assert.fail("No child run.");
-              yield* runStarted(childRun.id);
-              const message = yield* askedOn(world, childRun.id, "message");
-              const answered = yield* answering(agent, childThread)(message);
-              assert.isFalse(answered.isError, answered.text);
-              // No assistant row was written for any of it.
-              const rows = yield* handoffRows;
-              assert.isTrue(Object.values(rows).every((table) => table.length === 0));
-              assert.strictEqual(yield* factory.familyRoot(childThread), author.deliveryId);
-              assert.strictEqual(spy.count("start"), 0);
-            }),
-          ),
-        stack(spy),
-      );
-    },
-    240_000,
-  );
+            const delegated = yield* agent.call("delegate_task", { task: "Check the export." });
+            assert.isFalse(delegated.isError, delegated.text);
+            yield* drainOrchestration;
+            const { subagents } = yield* threadProjection(author.threadId);
+            const childThread =
+              subagents[0]?.childThreadId ?? assert.fail("The delegation made no thread.");
+            const childRun = (yield* runsOf(childThread))[0] ?? assert.fail("No child run.");
+            yield* runStarted(childRun.id);
+            const message = yield* askedOn(world, childRun.id, "message");
+            const answered = yield* answering(agent, childThread)(message);
+            assert.isFalse(answered.isError, answered.text);
+            // No assistant row was written for any of it.
+            const rows = yield* handoffRows;
+            assert.isTrue(Object.values(rows).every((table) => table.length === 0));
+            assert.strictEqual(yield* factory.familyRoot(childThread), author.deliveryId);
+            assert.strictEqual(spy.count("start"), 0);
+          }),
+        ),
+      stack(spy),
+    );
+  });
 });
 
 const isDecisionError = Schema.is(AutomaticTurnGate.AutomaticTurnDecisionError);
@@ -1210,94 +1190,90 @@ describe("a callback-free native offer the gate could not decide", () => {
   it.effect.each([
     { capacity: "with a slot free", full: false },
     { capacity: "under full capacity", full: true },
-  ])(
-    "runs nothing and clears nothing, then runs once $capacity under the same id",
-    ({ full }) => {
-      const spy = spyOnFactoryPort();
-      const fault = faults();
-      const timers = armedTimers();
-      return timers.on(
-        withProject(
-          verifyCommands.passes,
-          (world) =>
-            Effect.gen(function* () {
-              const { root, opened, thread } = yield* deliverIdea(world);
-              const providerThread = yield* providerThreadOf(thread, opened.runId);
-              const [filler] = full ? yield* fill(world, 2) : [];
-              const native = nativeOffers();
-              const runs = (yield* runsOf(thread)).length;
-              const rows = yield* handoffRows;
-              const nothingMoved = Effect.gen(function* () {
-                assert.strictEqual((yield* runsOf(thread)).length, runs);
-                assert.deepStrictEqual(yield* handoffRows, rows);
-                assert.deepStrictEqual(native.cleared, []);
-                assert.deepStrictEqual(native.dispatched, []);
-              });
-
-              // The ownership read fails: undecided, nothing moves, and its first backoff step is set.
-              fault.control.reads = 1;
-              yield* refuseRecords;
-              yield* timers.forget;
-              yield* offerNative(thread, providerThread, "plain", native, { messageId: false });
-              yield* fault.consulted(1);
-              yield* timers.armed(100);
-              assert.strictEqual(fault.control.reads, 0);
-              yield* nothingMoved;
-
-              // The step ends and it is offered again: the record's write fails, and the next is set.
-              yield* TestClock.adjust("100 millis");
-              yield* fault.consulted(2);
-              const messageId =
-                fault.attempts[0]?.messageId ?? assert.fail("The wake was never consulted.");
-              assert.deepStrictEqual(
-                fault.attempts.map(({ messageId: id, undecided }) => [id, undecided]),
-                [
-                  [messageId, "read"],
-                  [messageId, "record"],
-                ],
-              );
-              yield* timers.armed(200);
-              yield* nothingMoved;
-              yield* allowRecords;
-
-              // Restored, the same wake under the same id decides at last, by its re-offer.
-              yield* TestClock.adjust("200 millis");
-              yield* fault.consulted(3);
-              assert.deepStrictEqual(fault.attempts[2], { messageId, undecided: null });
-              yield* drainOrchestration;
-
-              if (full) {
-                assert.deepStrictEqual(
-                  (yield* demandsOf(root)).map(({ kind, messageId: id }) => [kind, id]),
-                  [["background_wake", messageId]],
-                );
-                assert.strictEqual((yield* runsOf(thread)).length, runs);
-                yield* release(filler!);
-                yield* tick;
-              }
-              const run = yield* runOfMessage(messageId);
-              yield* runStarted(run);
-              assert.strictEqual((yield* slotOf(root))?.state, "held");
-              assert.deepStrictEqual(yield* demandsOf(root), []);
-              yield* world.endRun(run, "completed");
-              yield* tick;
-              assert.lengthOf(yield* runsOfMessage(thread, messageId), 1);
-              assert.strictEqual((yield* runsOf(thread)).length, runs + 1);
-              assert.isUndefined(yield* slotOf(root));
+  ])("runs nothing and clears nothing, then runs once $capacity under the same id", ({ full }) => {
+    const spy = spyOnFactoryPort();
+    const fault = faults();
+    const timers = armedTimers();
+    return timers.on(
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const { root, opened, thread } = yield* deliverIdea(world);
+            const providerThread = yield* providerThreadOf(thread, opened.runId);
+            const [filler] = full ? yield* fill(world, 2) : [];
+            const native = nativeOffers();
+            const runs = (yield* runsOf(thread)).length;
+            const rows = yield* handoffRows;
+            const nothingMoved = Effect.gen(function* () {
+              assert.strictEqual((yield* runsOf(thread)).length, runs);
+              assert.deepStrictEqual(yield* handoffRows, rows);
               assert.deepStrictEqual(native.cleared, []);
+              assert.deepStrictEqual(native.dispatched, []);
+            });
 
-              // Decided, it is offered no more, however far the clock moves.
-              const attempts = fault.attempts.length;
-              yield* TestClock.adjust("1 hour");
-              assert.strictEqual(fault.attempts.length, attempts);
-            }),
-          stack(spy, {
-            handoff: { admission: fault.admission },
-            gateConsults: fault.gateConsults,
+            // The ownership read fails: undecided, nothing moves, and its first backoff step is set.
+            fault.control.reads = 1;
+            yield* refuseRecords;
+            yield* timers.forget;
+            yield* offerNative(thread, providerThread, "plain", native, { messageId: false });
+            yield* fault.consulted(1);
+            yield* timers.armed(100);
+            assert.strictEqual(fault.control.reads, 0);
+            yield* nothingMoved;
+
+            // The step ends and it is offered again: the record's write fails, and the next is set.
+            yield* TestClock.adjust("100 millis");
+            yield* fault.consulted(2);
+            const messageId =
+              fault.attempts[0]?.messageId ?? assert.fail("The wake was never consulted.");
+            assert.deepStrictEqual(
+              fault.attempts.map(({ messageId: id, undecided }) => [id, undecided]),
+              [
+                [messageId, "read"],
+                [messageId, "record"],
+              ],
+            );
+            yield* timers.armed(200);
+            yield* nothingMoved;
+            yield* allowRecords;
+
+            // Restored, the same wake under the same id decides at last, by its re-offer.
+            yield* TestClock.adjust("200 millis");
+            yield* fault.consulted(3);
+            assert.deepStrictEqual(fault.attempts[2], { messageId, undecided: null });
+            yield* drainOrchestration;
+
+            if (full) {
+              assert.deepStrictEqual(
+                (yield* demandsOf(root)).map(({ kind, messageId: id }) => [kind, id]),
+                [["background_wake", messageId]],
+              );
+              assert.strictEqual((yield* runsOf(thread)).length, runs);
+              yield* release(filler!);
+              yield* tick;
+            }
+            const run = yield* runOfMessage(messageId);
+            yield* runStarted(run);
+            assert.strictEqual((yield* slotOf(root))?.state, "held");
+            assert.deepStrictEqual(yield* demandsOf(root), []);
+            yield* world.endRun(run, "completed");
+            yield* tick;
+            assert.lengthOf(yield* runsOfMessage(thread, messageId), 1);
+            assert.strictEqual((yield* runsOf(thread)).length, runs + 1);
+            assert.isUndefined(yield* slotOf(root));
+            assert.deepStrictEqual(native.cleared, []);
+
+            // Decided, it is offered no more, however far the clock moves.
+            const attempts = fault.attempts.length;
+            yield* TestClock.adjust("1 hour");
+            assert.strictEqual(fault.attempts.length, attempts);
           }),
-        ),
-      );
-    },
-    240_000,
-  );
+        stack(spy, {
+          handoff: { admission: fault.admission },
+          gateConsults: fault.gateConsults,
+        }),
+      ),
+    );
+  });
 });

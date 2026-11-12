@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProjectId, RunId, ThreadId } from "@t3tools/contracts";
@@ -46,10 +47,9 @@ import {
 import * as FactoryVerifyRunner from "./verify/FactoryVerifyRunner.ts";
 
 /**
- * A parent's children across server processes. Each `boot` is one process, its reactor, worker
- * and service over the real engine and stores on the test's in-memory SQLite; threads are faked,
- * and every run they report is still going. The tests seed what an earlier process left: a
- * child's start, approval or cancel stored, and its parent never told. Nothing sleeps: each boot
+ * A parent's children across server processes. Each `boot` is one process over the real engine and
+ * the test's in-memory SQLite; threads are faked and every run they report is still going. Tests
+ * seed a child's start, approval or cancel its parent was never told of. Nothing sleeps: each boot
  * drains its sweep and what it set off.
  */
 
@@ -193,6 +193,7 @@ const baseLayer = (world: World) =>
     Layer.provideMerge(GitVcsDriver.layer),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-child-boot-" })),
     Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(NodeCrypto.layer),
     Layer.provideMerge(NodeServices.layer),
   );
 

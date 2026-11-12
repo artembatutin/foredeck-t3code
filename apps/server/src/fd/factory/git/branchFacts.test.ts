@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -6,6 +7,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import type { ChildProcess } from "effect/process";
+import { explicitBare } from "../testkit/gitCommand.ts";
 
 import * as ServerConfig from "../../../config.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
@@ -22,6 +24,7 @@ import { holdFirst, ignoringConfigEnvironment, spawningThrough } from "../testki
 const layer = GitVcsDriver.layer.pipe(
   Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-branch-facts-" })),
   Layer.provideMerge(VcsProcess.layer),
+  Layer.provideMerge(NodeCrypto.layer),
   Layer.provideMerge(NodeServices.layer),
 );
 
@@ -36,6 +39,7 @@ const layerSpawningThrough = (
     Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-branch-facts-" })),
     Layer.provide(spawningThrough(before)),
     Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(NodeCrypto.layer),
     Layer.provideMerge(NodeServices.layer),
   );
 
@@ -45,7 +49,9 @@ const ada = ["-c", "user.name=Ada Lovelace", "-c", "user.email=ada@example.com"]
 const git = (cwd: string, args: ReadonlyArray<string>) =>
   Effect.gen(function* () {
     const driver = yield* GitVcsDriver.GitVcsDriver;
-    const result = yield* driver.execute({ operation: "test.git", cwd, args, timeoutMs: 10_000 });
+    const result = yield* Effect.flatMap(explicitBare(cwd, args), (args) =>
+      driver.execute({ operation: "test.git", cwd, args, timeoutMs: 10_000 }),
+    );
     return result.stdout.trim();
   });
 

@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 /** DEVIN_CLI_LIVE=1 vp test run <this file>. Uses native sign-in, creates empty sessions, sends no prompt. */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
@@ -19,6 +20,7 @@ import { DevinDriver } from "./index.ts";
 
 const layerInfrastructure = Layer.mergeAll(
   NodeServices.layer,
+  NodeCrypto.layer,
   AcpRegistryRuntimeCoordinator.layer,
   IdAllocator.layer,
   McpProviderSessions.layer,
@@ -34,6 +36,8 @@ const layerInfrastructure = Layer.mergeAll(
 );
 const layerTest = AcpRegistrySupport.layerFromHost.pipe(Layer.provideMerge(layerInfrastructure));
 
+const devinCommandPath = process.env.DEVIN_CLI_BIN ?? "devin";
+
 it.live.skipIf(process.env.DEVIN_CLI_LIVE !== "1")(
   "discovers the installed CLI and opens a dedicated empty session",
   () =>
@@ -48,7 +52,7 @@ it.live.skipIf(process.env.DEVIN_CLI_LIVE !== "1")(
         environment: [],
         config: {
           ...DEFAULT_DEVIN_SETTINGS,
-          commandPath: process.env.DEVIN_CLI_BIN ?? "devin",
+          commandPath: devinCommandPath,
         },
       });
       const initial = yield* instance.snapshot.getSnapshot;

@@ -1,10 +1,6 @@
 import type { UsageProviderKind } from "@t3tools/contracts";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 
-/**
- * Series and table order. The chart stacks providers from the bottom in this
- * order, so it also fixes which band sits on top of the bars.
- */
 export const PROVIDER_ORDER: readonly UsageProviderKind[] = [
   "codex",
   "claude",
@@ -13,9 +9,15 @@ export const PROVIDER_ORDER: readonly UsageProviderKind[] = [
   "opencode",
   "antigravity",
   "pi",
+  "muse",
   "devin",
   "copilot",
 ];
+
+export function usageProviderKind(driver: string): UsageProviderKind | null {
+  if (driver === "claudeAgent") return "claude";
+  return PROVIDER_ORDER.find((kind) => kind === driver) ?? null;
+}
 
 export const PROVIDER_LABEL: Record<UsageProviderKind, string> = {
   claude: "Claude Code",
@@ -25,14 +27,11 @@ export const PROVIDER_LABEL: Record<UsageProviderKind, string> = {
   opencode: "OpenCode",
   antigravity: "Antigravity",
   pi: "Pi",
+  muse: "Muse Code",
   devin: "Devin CLI",
   copilot: "GitHub Copilot",
 };
 
-/**
- * Claude's brand orange holds in both themes; Codex and Grok are neutrals and
- * must flip with the theme or their bars vanish against the matching background.
- */
 export function useProviderColors(): Record<UsageProviderKind, string> {
   const { themeAppearance: scheme } = useAppearancePreferences();
   return {
@@ -43,16 +42,12 @@ export function useProviderColors(): Record<UsageProviderKind, string> {
     opencode: "#5b9bbd",
     antigravity: "#8c7bd1",
     pi: "#4d9f8a",
+    muse: "#0866ff",
     devin: "#b88631",
     copilot: "#9b70d0",
   };
 }
 
-/**
- * Neutral steps for cost and token mixes, so they never borrow a provider's
- * color. Matches the web steps: oklab mixes of the codex ink into the
- * background, above the 15 ΔE separation floor for adjacent segments.
- */
 export function useUsageMixColors() {
   const { themeAppearance: scheme } = useAppearancePreferences();
   const dark = scheme === "dark";

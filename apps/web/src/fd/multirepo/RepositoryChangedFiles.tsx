@@ -1,4 +1,7 @@
-import type { ThreadCheckpointSummary } from "@t3tools/client-runtime/state/thread-checkpoints";
+import {
+  checkpointFileTotals,
+  type ThreadCheckpointSummary,
+} from "@t3tools/client-runtime/state/thread-checkpoints";
 import type { EnvironmentId, RunId } from "@t3tools/contracts";
 import { useState } from "react";
 import { ChangedFilesCard } from "../../components/chat/ChangedFilesTree";
@@ -36,6 +39,7 @@ export function RepositoryChangedFiles(props: {
             <ChangedFilesCard
               runId={props.summary.runId}
               files={files}
+              totals={checkpointFileTotals({ files })}
               allDirectoriesExpanded={expanded[repository.id] ?? false}
               resolvedTheme={props.resolvedTheme}
               onToggleAllDirectories={() =>

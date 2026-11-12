@@ -1,7 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import { ProjectId } from "@t3tools/contracts";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
-import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
+import * as GitHubApi from "./WorkGitHubApi.ts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -45,7 +45,7 @@ const pages: Record<string, unknown> = {
 /** The GitHub API answering the comment pages, recording the `before` of each request. */
 const stub = (page: (before: string | null) => unknown) => {
   const befores: Array<string | null> = [];
-  const layer = Layer.mock(GitHubApi.GitHubApi)({
+  const layer = Layer.mock(GitHubApi.WorkGitHubApi)({
     graphql: (input) =>
       Effect.sync(() => {
         const before = (input.variables?.before ?? null) as string | null;

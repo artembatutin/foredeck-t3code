@@ -101,41 +101,39 @@ const nothingReady = (incomplete: boolean) => ({
 });
 
 /** The item a tool names, resolved among its project's sources as `work_read` does. */
-const resolveItem = (params: {
+const resolveItem = Effect.fn("handlers.resolveItem")(function* (params: {
   readonly item: string;
   readonly sourceId?: string;
   readonly projectId?: ProjectId;
-}) =>
-  Effect.gen(function* () {
-    const reference = parseWorkItemReference(params.item);
-    if (reference === undefined) {
-      return yield* invalidRequest(
-        "Name the item as <sourceId>:<itemId>, a key such as fd-7k3qa2, #123 or PROJ-12, or its URL.",
-      );
-    }
-    if (reference.type === "ref") return reference.ref;
-    const sourceId =
-      params.sourceId === undefined ? Option.none() : decodeSourceId(params.sourceId);
-    if (params.sourceId !== undefined && Option.isNone(sourceId)) {
-      return yield* invalidRequest("sourceId is not a Work source id.");
-    }
-    const projectId = yield* resolveProjectId(yield* loadCaller(), params.projectId);
-    const work = yield* WorkService.WorkService;
-    const { sources } = yield* work
-      .listSources(sourceReader, { projectId, includeDisconnected: false })
-      .pipe(Effect.mapError(workUnavailable));
-    const resolved = resolveWorkTarget({
-      reference,
-      sources,
-      sourceId: Option.getOrUndefined(sourceId),
-    });
-    if (resolved.ok) return resolved.ref;
-    return yield* new FactoryMcpFailure({
-      code: "not_found",
-      message:
-        "No single active Work source of the project holds that item. Pass sourceId, or name the item as <sourceId>:<itemId>.",
-    });
+}) {
+  const reference = parseWorkItemReference(params.item);
+  if (reference === undefined) {
+    return yield* invalidRequest(
+      "Name the item as <sourceId>:<itemId>, a key such as fd-7k3qa2, #123 or PROJ-12, or its URL.",
+    );
+  }
+  if (reference.type === "ref") return reference.ref;
+  const sourceId = params.sourceId === undefined ? Option.none() : decodeSourceId(params.sourceId);
+  if (params.sourceId !== undefined && Option.isNone(sourceId)) {
+    return yield* invalidRequest("sourceId is not a Work source id.");
+  }
+  const projectId = yield* resolveProjectId(yield* loadCaller(), params.projectId);
+  const work = yield* WorkService.WorkService;
+  const { sources } = yield* work
+    .listSources(sourceReader, { projectId, includeDisconnected: false })
+    .pipe(Effect.mapError(workUnavailable));
+  const resolved = resolveWorkTarget({
+    reference,
+    sources,
+    sourceId: Option.getOrUndefined(sourceId),
   });
+  if (resolved.ok) return resolved.ref;
+  return yield* new FactoryMcpFailure({
+    code: "not_found",
+    message:
+      "No single active Work source of the project holds that item. Pass sourceId, or name the item as <sourceId>:<itemId>.",
+  });
+});
 
 export const toolLayer = McpToolAccess.toLayer(FactoryToolkit, {
   // Acts as the calling thread, while its run is live, and submits only that thread's own review.
@@ -297,5 +295,7 @@ export const toolLayer = McpToolAccess.toLayer(FactoryToolkit, {
           .pipe(Effect.mapError(startFailure));
         return { delivery: toFactoryDelivery(delivery) };
       }),
+    // Factory threads carry no link origin, so a linked caller cannot start a delivery.
+    { refused: "start Factory deliveries in this environment" },
   ),
 });

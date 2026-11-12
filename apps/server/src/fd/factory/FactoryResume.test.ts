@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -31,6 +32,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
+import { explicitBare } from "./testkit/gitCommand.ts";
 
 import * as ServerConfig from "../../config.ts";
 import * as GitWorkflow from "../../git/GitWorkflowService.ts";
@@ -292,6 +294,7 @@ const makeLayer = (world: World) =>
     Layer.provideMerge(GitVcsDriver.layer),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-resume-" })),
     Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(NodeCrypto.layer),
     Layer.provideMerge(NodeServices.layer),
   );
 
@@ -315,7 +318,9 @@ const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
 const ada = ["-c", "user.name=Ada Lovelace", "-c", "user.email=ada@example.com"];
 const git = (cwd: string, args: ReadonlyArray<string>) =>
   Effect.flatMap(GitVcsDriver.GitVcsDriver, (driver) =>
-    driver.execute({ operation: "test.git", cwd, args, timeoutMs: 10_000 }),
+    Effect.flatMap(explicitBare(cwd, args), (args) =>
+      driver.execute({ operation: "test.git", cwd, args, timeoutMs: 10_000 }),
+    ),
   ).pipe(Effect.map((result) => result.stdout.trim()));
 const writeFile = (cwd: string, name: string, text: string) =>
   Effect.gen(function* () {

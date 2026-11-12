@@ -267,7 +267,7 @@ export const toSummary = (
 };
 
 /** Jira writes `2026-10-20T10:00:00.000+0000`; Work's contracts want an ISO instant. */
-export const normalizeTimestamp = (value: string): string =>
+const normalizeTimestamp = (value: string): string =>
   Option.match(DateTime.make(value.replace(/([+-]\d{2})(\d{2})$/, "$1:$2")), {
     onNone: () => value,
     onSome: DateTime.formatIso,

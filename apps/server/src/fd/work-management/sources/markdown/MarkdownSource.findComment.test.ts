@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProjectId } from "@t3tools/contracts";
@@ -61,7 +62,7 @@ describe("MarkdownSource findComment", () => {
         Option.some({ id: "3", body: "note-003 reviewed." }),
       );
       assert.isTrue(Option.isNone(yield* adapter.findComment(runtime, itemId, "note-056 ")));
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("reads the file as it is now, not the notes the index read before", () =>
@@ -73,7 +74,7 @@ describe("MarkdownSource findComment", () => {
         `${yield* fs.readFileString(file)}- 2026-10-25T09:00:00.000Z (Factory) note-056 posted.\n`,
       );
       assert.isTrue(Option.isSome(yield* adapter.findComment(runtime, itemId, "note-056 ")));
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("refuses an item the source does not hold", () =>
@@ -83,7 +84,7 @@ describe("MarkdownSource findComment", () => {
         adapter.findComment(runtime, WorkItemId.make("fd-bbbbbb"), "note-001"),
       );
       assert.strictEqual(error._tag, "WorkItemNotFound");
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 
   it.effect("cannot answer for a file that does not read as an item, and can once repaired", () =>
@@ -99,6 +100,6 @@ describe("MarkdownSource findComment", () => {
 
       yield* fs.writeFileString(file, repaired);
       assert.isTrue(Option.isSome(yield* adapter.findComment(runtime, itemId, "note-002 ")));
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.scoped, Effect.provide([NodeServices.layer, NodeCrypto.layer])),
   );
 });

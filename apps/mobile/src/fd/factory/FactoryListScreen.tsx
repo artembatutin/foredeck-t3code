@@ -5,10 +5,11 @@ import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { useCallback, useMemo } from "react";
 import { ActivityIndicator, Pressable, RefreshControl, View } from "react-native";
 
-import { SymbolView } from "../../components/AppSymbol";
-import { AppText as Text } from "../../components/AppText";
-import { EmptyState } from "../../components/EmptyState";
-import { ErrorBanner } from "../../components/ErrorBanner";
+import { SymbolView } from "../../components/ui/AppSymbol";
+import { AppText as Text } from "../../components/ui/AppText";
+import { EmptyState } from "../../components/ui/EmptyState";
+import { ErrorBanner } from "../../components/ui/ErrorBanner";
+import { NativeScrollView } from "../../native/NativeScrollViewMarker";
 import { useProjects } from "../../state/entities";
 import { useWorkspaceEnvironments } from "../../state/workspace";
 import { type MobileFleetRow, mobileFleetRows } from "./fleetList";
@@ -61,6 +62,7 @@ export function FactoryListScreen() {
   return (
     <View className="flex-1 bg-screen">
       <LegendList
+        renderScrollComponent={NativeScrollView}
         className="flex-1"
         contentContainerStyle={{ paddingBottom: 32 }}
         contentInsetAdjustmentBehavior="automatic"

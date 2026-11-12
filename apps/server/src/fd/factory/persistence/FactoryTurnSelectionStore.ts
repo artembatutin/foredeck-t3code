@@ -91,15 +91,20 @@ const make = Effect.gen(function* () {
     `,
   });
   return FactoryTurnSelectionStore.of({
-    get: (key) => select(key).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.get"))),
-    list: (threadId) =>
+    get: Effect.fn("FactoryTurnSelectionStore.get")((key) =>
+      select(key).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.get"))),
+    ),
+    list: Effect.fn("FactoryTurnSelectionStore.list")((threadId) =>
       list(threadId).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.list"))),
-    record: (selection) =>
+    ),
+    record: Effect.fn("FactoryTurnSelectionStore.record")((selection) =>
       record(selection).pipe(Effect.catchTags(FactoryStoreError.catchStorage("turns.record"))),
-    legacyHistory: (key) =>
+    ),
+    legacyHistory: Effect.fn("FactoryTurnSelectionStore.legacyHistory")((key) =>
       legacyHistory(key).pipe(
         Effect.catchTags(FactoryStoreError.catchStorage("turns.legacyHistory")),
       ),
+    ),
   });
 });
 

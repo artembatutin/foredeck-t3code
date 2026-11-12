@@ -36,16 +36,16 @@ import {
   runStarted as started,
   runStatus,
   type WakeReport,
+  wakeDroppedBeforeStart,
   wakeThread,
   watchPullRequest,
 } from "./testkit/followThrough.ts";
 
 /**
  * Follow-through rounds across restarts and cancels, on the server's real stack. With
- * `manualReactor`, Factory's reactor runs only while a server boots it, so a wake core's watch
- * queues between two boots reaches Factory only through the next boot sweep, which reads it from
- * the event log. A cancelled delivery stops its adopted wake run as it stops the turns Factory
- * sent, and leaves the owner's own turns on the thread alone. Nothing sleeps or polls.
+ * `manualReactor`, a wake queued between two boots reaches Factory only through the next boot
+ * sweep. A cancel stops its adopted wake run like Factory's turns and leaves the owner's own turns
+ * alone. Nothing sleeps or polls.
  */
 
 const followThroughAttempts = (deliveryId: FactoryDeliveryId) =>
@@ -168,45 +168,41 @@ describe("Factory follow-through cancelled", () => {
     ),
   );
 
-  it.live("interrupts an adopted wake queued behind the owner's turn once it starts", () =>
-    withProject(verifyCommands.passes, (world) =>
-      Effect.gen(function* () {
-        const factory = yield* Factory.FactoryService.FactoryService;
-        const { deliveryId, threadId: author } = yield* openSingle(world);
-        const ownerRun = yield* world.ownerTurn(author, "Rename the export button.");
-        const wakeRun = yield* wakeThread(author, yield* linkOf(author, fakePullRequest.number));
-        yield* drainOrchestration;
-        yield* drainFactory;
-        assert.strictEqual(yield* runStatus(author, wakeRun), "queued");
-        assert.deepStrictEqual((yield* stateOf(deliveryId)).awaiting, {
-          type: "run",
-          threadId: author,
-          runId: wakeRun,
-        });
+  it.live(
+    "drops an adopted wake queued behind the owner's turn once the cancel ends its watch",
+    () =>
+      withProject(verifyCommands.passes, (world) =>
+        Effect.gen(function* () {
+          const factory = yield* Factory.FactoryService.FactoryService;
+          const { deliveryId, threadId: author } = yield* openSingle(world);
+          const ownerRun = yield* world.ownerTurn(author, "Rename the export button.");
+          const wakeRun = yield* wakeThread(author, yield* linkOf(author, fakePullRequest.number));
+          yield* drainOrchestration;
+          yield* drainFactory;
+          assert.strictEqual(yield* runStatus(author, wakeRun), "queued");
+          assert.deepStrictEqual((yield* stateOf(deliveryId)).awaiting, {
+            type: "run",
+            threadId: author,
+            runId: wakeRun,
+          });
 
-        // Cancelled while the owner's turn runs: that turn goes on, and the wake run, queued
-        // behind it, cannot be stopped before it starts.
-        yield* factory.cancel(deliveryId).pipe(Effect.orDie);
-        yield* drainFactory;
-        yield* drainOrchestration;
-        assert.deepStrictEqual(interruptedTurns(world), []);
-        assert.strictEqual(yield* runStatus(author, wakeRun), "queued");
-        assert.strictEqual(yield* world.endRun(ownerRun, "completed"), "completed");
+          // Cancelled while the owner's turn runs: that turn goes on, and the wake run, queued
+          // behind it, cannot be stopped before it starts.
+          yield* factory.cancel(deliveryId).pipe(Effect.orDie);
+          yield* drainFactory;
+          yield* drainOrchestration;
+          assert.deepStrictEqual(interruptedTurns(world), []);
+          assert.strictEqual(yield* runStatus(author, wakeRun), "queued");
+          assert.strictEqual(yield* world.endRun(ownerRun, "completed"), "completed");
 
-        // The adopted wake run goes live after it, as Factory's turn, and is stopped then.
-        yield* drainFactory;
-        yield* drainOrchestration;
-        assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), [wakeRun]);
-        assert.notInclude(interruptedTurns(world), providerTurnOf(world, ownerRun));
-        const stopped = yield* runStatus(author, wakeRun);
-        assert.isTrue(
-          stopped === "interrupted" ||
-            interruptedTurns(world).includes(providerTurnOf(world, wakeRun)),
-          `The wake run went on as ${stopped}.`,
-        );
-        assert.strictEqual((yield* stateOf(deliveryId)).status, "cancelled");
-      }),
-    ),
+          // The cancel ended the watch, so core drops the wake once the owner's turn ends.
+          yield* drainFactory;
+          yield* drainOrchestration;
+          yield* wakeDroppedBeforeStart(world, author, wakeRun);
+          assert.deepStrictEqual(interruptedTurns(world), []);
+          assert.strictEqual((yield* stateOf(deliveryId)).status, "cancelled");
+        }),
+      ),
   );
 });
 
@@ -272,7 +268,7 @@ describe("Factory follow-through: a wake that comes during a round, across resta
     ),
   );
 
-  it.live("stops it as Factory's turn once it starts after a cancel", () =>
+  it.live("drops it once a cancel ends its watch", () =>
     withProject(
       verifyCommands.passes,
       (world) =>
@@ -288,20 +284,15 @@ describe("Factory follow-through: a wake that comes during a round, across resta
               yield* drainOrchestration;
               assert.include(yield* cancelledRuns(author, deliveryId), first);
               assert.include(interruptedTurns(world), providerTurnOf(world, first));
-              // The awaited answer stops (core may end it before its provider reports); the wake
-              // queued behind it then starts, and is stopped too, as Factory's turn.
+              // The awaited answer stops (core may end it before its provider reports); the
+              // cancel ended the watch, so core drops the wake queued behind it.
               if (!isTerminalRunStatus(yield* runStatus(author, first))) {
                 yield* world.endRun(first, "cancelled");
               }
               yield* drainFactory;
               yield* drainOrchestration;
-              assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), [first, second]);
-              const stopped = yield* runStatus(author, second);
-              assert.isTrue(
-                stopped === "interrupted" ||
-                  interruptedTurns(world).includes(providerTurnOf(world, second)),
-                `The queued wake went on as ${stopped}.`,
-              );
+              assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), [first]);
+              yield* wakeDroppedBeforeStart(world, author, second);
             }),
           );
           assert.strictEqual((yield* stateOf(deliveryId)).status, "cancelled");
@@ -392,11 +383,10 @@ describe("Factory follow-through cancelled while the owner works on the author t
 
 describe("Factory follow-through: wakes committed before a republish", () => {
   /**
-   * A round run to its republish with its wake `report` committed first: one server adopts a
-   * round and has its review submitted; while no reactor runs, core's watch commits the wake and
-   * the worker, handed the reviewer's end, records and pushes, and its PR stage reads the watch
-   * and the wakes core committed. Returns the state that left, the wake's run, the watch before
-   * the wake and the PR stage's effect.
+   * A round run to its republish with its wake `report` committed first, while no reactor runs:
+   * the worker records and pushes on the reviewer's end, and its PR stage reads the watch and those
+   * wakes. Returns the resulting state, the wake's run, the watch before the wake and the PR
+   * stage's effect.
    */
   const republishedOverWake = (world: World, report: WakeReport) =>
     Effect.gen(function* () {

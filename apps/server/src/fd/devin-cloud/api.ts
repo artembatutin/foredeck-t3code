@@ -73,14 +73,15 @@ export const makeDevinCloudClient = Effect.fn("makeDevinCloudClient")(function* 
   const root = `https://api.devin.ai/v3/organizations/${encodeURIComponent(input.organizationId)}/sessions`;
   const sessionUrl = (id: string) =>
     `${root}/${encodeURIComponent(id.startsWith("devin-") ? id : `devin-${id}`)}`;
-  const request = <A>(
+  // The timeout wraps an inner program so `A` survives; Effect.fn pipeables erase generics.
+  const request = Effect.fn("DevinCloudClient.request")(function* <A>(
     operation: DevinCloudApiError["operation"],
     method: "GET" | "POST" | "DELETE",
     url: string,
     schema: Schema.Codec<A, unknown>,
     body?: unknown,
-  ) =>
-    Effect.gen(function* () {
+  ) {
+    return yield* Effect.gen(function* () {
       let req = HttpClientRequest.make(method)(url).pipe(
         HttpClientRequest.setHeader("Authorization", `Bearer ${input.apiKey}`),
         HttpClientRequest.setHeader("Accept", "application/json"),
@@ -117,7 +118,7 @@ export const makeDevinCloudClient = Effect.fn("makeDevinCloudClient")(function* 
           (cause) => new DevinCloudApiError({ operation, category: "response", cause }),
         ),
       );
-      return yield* Schema.decodeUnknownEffect(schema)(json).pipe(
+      return yield* Schema.decodeEffect(schema)(json).pipe(
         Effect.mapError(
           (cause) => new DevinCloudApiError({ operation, category: "response", cause }),
         ),
@@ -129,6 +130,7 @@ export const makeDevinCloudClient = Effect.fn("makeDevinCloudClient")(function* 
           Effect.fail(new DevinCloudApiError({ operation, category: "transport", cause })),
       }),
     );
+  });
   return {
     authenticate: () => request("authenticate", "GET", "https://api.devin.ai/v3/self", Identity),
     checkOrganization: () =>
@@ -149,27 +151,26 @@ export const makeDevinCloudClient = Effect.fn("makeDevinCloudClient")(function* 
     send: (id: string, message: string) =>
       request("send", "POST", `${sessionUrl(id)}/messages`, Session, { message }),
     stop: (id: string) => request("stop", "DELETE", `${sessionUrl(id)}?archive=false`, Session),
-    messages: (id: string, after?: string) =>
-      Effect.gen(function* () {
-        const messages: Array<CloudMessage> = [];
-        const cursors = new Set<string>();
-        let cursor = after;
-        // A bounded history read fails explicitly instead of silently truncating a conversation.
-        for (let page = 0; page < 100; page++) {
-          const result = yield* request(
-            "messages",
-            "GET",
-            `${sessionUrl(id)}/messages?first=200${cursor ? `&after=${encodeURIComponent(cursor)}` : ""}`,
-            MessagePage,
-          );
-          messages.push(...result.items);
-          if (!result.has_next_page) return { items: messages, tailCursor: cursor };
-          if (!result.end_cursor || cursors.has(result.end_cursor))
-            return yield* new DevinCloudApiError({ operation: "messages", category: "response" });
-          cursor = result.end_cursor;
-          cursors.add(cursor);
-        }
-        return yield* new DevinCloudApiError({ operation: "messages", category: "response" });
-      }),
+    messages: Effect.fn("DevinCloudApi.messages")(function* (id: string, after?: string) {
+      const messages: Array<CloudMessage> = [];
+      const cursors = new Set<string>();
+      let cursor = after;
+      // A bounded history read fails explicitly instead of silently truncating a conversation.
+      for (let page = 0; page < 100; page++) {
+        const result = yield* request(
+          "messages",
+          "GET",
+          `${sessionUrl(id)}/messages?first=200${cursor ? `&after=${encodeURIComponent(cursor)}` : ""}`,
+          MessagePage,
+        );
+        messages.push(...result.items);
+        if (!result.has_next_page) return { items: messages, tailCursor: cursor };
+        if (!result.end_cursor || cursors.has(result.end_cursor))
+          return yield* new DevinCloudApiError({ operation: "messages", category: "response" });
+        cursor = result.end_cursor;
+        cursors.add(cursor);
+      }
+      return yield* new DevinCloudApiError({ operation: "messages", category: "response" });
+    }),
   };
 });

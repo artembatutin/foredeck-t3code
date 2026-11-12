@@ -24,8 +24,8 @@ import type { FactoryDelivery, FactoryTaskId } from "@t3tools/contracts/fd/facto
 import { useLayoutEffect, useRef, useState } from "react";
 import { Alert, View } from "react-native";
 
-import { AppText as Text, AppTextInput } from "../../components/AppText";
-import { ErrorBanner } from "../../components/ErrorBanner";
+import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
+import { ErrorBanner } from "../../components/ui/ErrorBanner";
 import { StatusPill } from "../../components/StatusPill";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Control, SectionTitle } from "./Control";
@@ -50,13 +50,9 @@ type EditDraft = (change: (draft: FactoryPlanDraft) => FactoryPlanDraft) => void
 const INPUT_CLASS = "min-h-11 py-2.5";
 
 /**
- * The plan a delivery waits on at the plan gate, editable in a draft pinned to that delivery:
- * task titles, summaries, criteria and test plans, their order and which stay. Save sends the
- * edited plan; approve and reject ask first in a native alert, for the plan shown then; replan
- * sends a note to the planner. Nothing applies locally: the view changes when the change epoch
- * refetches the delivery, and a plan changed on the server while the owner edits is flagged for
- * them to keep their edits over it or drop them. The parent keys it by destination, so a draft
- * or note never outlives its delivery.
+ * The plan gate's editable draft. Nothing applies locally: the view changes when the change epoch
+ * refetches the delivery, and a server change during an edit is flagged to keep or drop the edits.
+ * The parent keys it by destination, so a draft or note never outlives its delivery.
  */
 export function FactoryPlanGate({
   gate,
@@ -78,15 +74,13 @@ export function FactoryPlanGate({
   const draft = following.draft;
   // An alert's press reads the gate and draft as they are then, not as they were when it opened.
   const latest = useRef<{ gate: FactoryPlanGateModel; draft: FactoryPlanDraft } | null>(null);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- hands the committed gate and draft to an open native Alert's press, and clears them on unmount so a late press does nothing
   useLayoutEffect(() => {
     latest.current = { gate, draft };
-  });
-  useLayoutEffect(
-    () => () => {
+    return () => {
       latest.current = null;
-    },
-    [],
-  );
+    };
+  });
 
   const { destination } = gate;
   const edit: EditDraft = (change) => setHeld((current) => changeMobilePlanEdit(current, change));

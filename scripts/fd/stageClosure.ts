@@ -8,12 +8,10 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 /**
- * A UX preview stage installs what the accepted `pnpm-lock.yaml` resolved, never a fresh
- * resolution of the stage's ranges: the roots' versions, every transitive package and every
- * registered patch on any of them are copied into the stage's own lockfile, which pnpm installs
- * with `--frozen-lockfile`. Overrides and package extensions only steer a resolution, and a frozen
- * install runs none, so the stage carries neither and the repository's lock and workspace stay as
- * they are. Once installed, `verifyStageClosure` compares what pnpm recorded with the accepted lock.
+ * A UX preview stage installs exactly what the accepted `pnpm-lock.yaml` resolved: roots,
+ * transitive packages and patches are copied into the stage lockfile and installed with
+ * `--frozen-lockfile` (so overrides and extensions are omitted; the repo lock stays untouched).
+ * `verifyStageClosure` then compares what pnpm recorded with the accepted lock.
  */
 
 const DependencyRef = Schema.Struct({ specifier: Schema.String, version: Schema.String });
@@ -31,6 +29,7 @@ export const PnpmLockfile = Schema.Struct({
   settings: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   catalogs: Schema.optional(Catalogs),
   patchedDependencies: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+  overrides: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   importers: Schema.Record(Schema.String, Importer),
   packages: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   snapshots: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
@@ -93,6 +92,11 @@ export function resolveAcceptedRoot(
   specifier: string,
 ): { readonly version: string } | { readonly problem: string } {
   const versions = new Set<string>();
+  // A workspace override pins the version and the importers record the pin as their specifier.
+  // Honored only for the range whose floor is that pin, so another range is still refused.
+  const pinned = lock.overrides?.[name];
+  const recorded =
+    pinned !== undefined && specifier.replace(/^[\^~]/, "") === pinned ? pinned : specifier;
   for (const importerId of SHIPPED_IMPORTERS) {
     const importer = lock.importers[importerId];
     for (const refs of [importer?.dependencies, importer?.optionalDependencies]) {
@@ -100,7 +104,7 @@ export function resolveAcceptedRoot(
       if (ref === undefined) continue;
       const resolved =
         ref.specifier === "catalog:" ? lock.catalogs?.default?.[name]?.specifier : ref.specifier;
-      if (resolved === specifier) versions.add(ref.version);
+      if (resolved === recorded) versions.add(ref.version);
     }
   }
   if (versions.size > 1) {
@@ -303,8 +307,13 @@ export function verifyStageClosure(input: {
   };
 }
 
+/** pnpm 12 writes its own package-manager lock as a first YAML document; the project's is last. */
+const projectLockfileDocument = (text: string) =>
+  text.split(/^---[ \t]*$/m).findLast((document) => document.trim() !== "") ?? text;
+
 const readLockfile = (path: string) =>
   Effect.flatMap(FileSystem.FileSystem, (fileSystem) => fileSystem.readFileString(path)).pipe(
+    Effect.map(projectLockfileDocument),
     Effect.flatMap(decodeLockfileYaml),
     Effect.mapError(
       () =>

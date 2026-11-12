@@ -169,8 +169,8 @@ const make = Effect.gen(function* () {
     `,
   });
 
-  const insert: FactoryTaskStore["Service"]["insert"] = (input) =>
-    Effect.gen(function* () {
+  const insert: FactoryTaskStore["Service"]["insert"] = Effect.fn("FactoryTaskStore.insert")(
+    function* (input) {
       const [next] = yield* selectNextPosition(input.deliveryId);
       const at = yield* now;
       const task: StoredFactoryTask = {
@@ -186,46 +186,56 @@ const make = Effect.gen(function* () {
       };
       yield* insertTask(task);
       return task;
-    }).pipe(sql.withTransaction, Effect.catchTags(FactoryStoreError.catchStorage("tasks.insert")));
+    },
+    sql.withTransaction,
+    Effect.catchTags(FactoryStoreError.catchStorage("tasks.insert")),
+  );
 
-  const setLastReviewedSha: FactoryTaskStore["Service"]["setLastReviewedSha"] = (input) =>
-    Effect.gen(function* () {
+  const setLastReviewedSha: FactoryTaskStore["Service"]["setLastReviewedSha"] = Effect.fn(
+    "FactoryTaskStore.setLastReviewedSha",
+  )(
+    function* (input) {
       const updatedAt = yield* now;
       yield* writeLastReviewedSha({ ...input, updatedAt });
       const [task] = yield* selectTasks({ deliveryId: input.deliveryId, taskId: input.taskId });
       return Option.fromUndefinedOr(task);
-    }).pipe(
-      sql.withTransaction,
-      Effect.catchTags(FactoryStoreError.catchStorage("tasks.setLastReviewedSha")),
-    );
+    },
+    sql.withTransaction,
+    Effect.catchTags(FactoryStoreError.catchStorage("tasks.setLastReviewedSha")),
+  );
 
-  const claimChild: FactoryTaskStore["Service"]["claimChild"] = (input) =>
-    Effect.gen(function* () {
+  const claimChild: FactoryTaskStore["Service"]["claimChild"] = Effect.fn(
+    "FactoryTaskStore.claimChild",
+  )(
+    function* (input) {
       yield* writeChildClaim({ ...input, claimedAt: yield* now });
       const [task] = yield* selectTasks(input);
       return Option.fromUndefinedOr(task);
-    }).pipe(
-      sql.withTransaction,
-      Effect.catchTags(FactoryStoreError.catchStorage("tasks.claimChild")),
-    );
+    },
+    sql.withTransaction,
+    Effect.catchTags(FactoryStoreError.catchStorage("tasks.claimChild")),
+  );
 
-  const setChildItem: FactoryTaskStore["Service"]["setChildItem"] = (input) =>
-    Effect.gen(function* () {
+  const setChildItem: FactoryTaskStore["Service"]["setChildItem"] = Effect.fn(
+    "FactoryTaskStore.setChildItem",
+  )(
+    function* (input) {
       const updatedAt = yield* now;
       yield* writeChildItem({ ...input, updatedAt });
       const [task] = yield* selectTasks({ deliveryId: input.deliveryId, taskId: input.taskId });
       return Option.fromUndefinedOr(task);
-    }).pipe(
-      sql.withTransaction,
-      Effect.catchTags(FactoryStoreError.catchStorage("tasks.setChildItem")),
-    );
+    },
+    sql.withTransaction,
+    Effect.catchTags(FactoryStoreError.catchStorage("tasks.setChildItem")),
+  );
 
   return FactoryTaskStore.of({
     insert,
-    listByDelivery: (deliveryId) =>
+    listByDelivery: Effect.fn("FactoryTaskStore.listByDelivery")((deliveryId) =>
       selectTasks({ deliveryId }).pipe(
         Effect.catchTags(FactoryStoreError.catchStorage("tasks.listByDelivery")),
       ),
+    ),
     setLastReviewedSha,
     claimChild,
     setChildItem,

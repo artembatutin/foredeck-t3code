@@ -222,27 +222,10 @@ export interface CaptureResult {
 }
 
 /**
- * The one Work item an idea is captured as: the agreed brief written to the owner's Work source
- * on the owner's explicit request, and kept up to date on later requests. A capture never
- * launches, queues, calls Factory or grants execution; a capture that changes what the item says
- * clears the brief's execution authorization, in the transaction that records it, so the owner
- * reviews the item before authorizing again.
- *
- * Every item opens with its capture's marker, which names the capture id, so a capture finds its
- * item again after a write it could not record. What an item says is the capture's only when a read
- * shows it says exactly what the capture wrote (or would write now), by Work's own fingerprint: an
- * item edited since, or one no read has confirmed and that says something else, is never rewritten
- * without `overwrite`.
- *
- * One writer per idea runs in the service's scope, and callers join it: a caller that goes away
- * leaves it running. The capture is claimed, with this instance, before the item is created, and
- * the source write and its read-back run uninterruptibly.
- * A claim no writer here can still write (the claiming instance shut down, since one server owns a
- * T3 home, or its writer here has ended) is reconciled by the marker. In a Markdown source read
- * whole, its one item is adopted, or with none the item is created once, with the same marker. A
- * GitHub or Jira item is created at most once and never again, since its search can miss a new
- * item: the one its search shows is adopted, and otherwise `recoverItem` adopts it or the capture
- * is abandoned. Anything else stays uncertain.
+ * Writes an idea's agreed brief to one Work item on the owner's request. Never launches or grants
+ * execution; a content change clears the brief's authorization in the same transaction. Items
+ * carry a capture-id marker for recovery, and an item not confirmed as ours by fingerprint is
+ * never rewritten without `overwrite`. GitHub/Jira items are created at most once.
  */
 export class WorkCapture extends Context.Service<
   WorkCapture,
@@ -482,13 +465,9 @@ const make = Effect.gen(function* () {
     });
 
   /**
-   * Stores `next` with its event and, when `clear`, clears the brief's execution authorization in
-   * the same transaction. None when the capture moved since it was read.
-   *
-   * The item's fingerprint is the baseline execution and later updates are judged against, so it
-   * is recorded only when it is the content recorded with it (`contentHash`): a read showing
-   * anything else, even right after the capture's own write, may show an edit that landed in
-   * between, and leaves the item unconfirmed for the next capture to confirm or refuse.
+   * Stores `next` with its event, clearing the brief's authorization when `clear`; none when the
+   * capture moved since read. The fingerprint is recorded only when it equals `contentHash`: any
+   * other read, even right after our write, may include a concurrent edit, so it stays unconfirmed.
    */
   const commit = (
     capture: WorkCaptureStore.StoredCapture,
@@ -601,107 +580,105 @@ const make = Effect.gen(function* () {
     );
 
   /** Records an item the capture's write created, clearing authorization with it. */
-  const recordCreated = (
+  const recordCreated = Effect.fn("WorkCapture.recordCreated")(function* (
     capture: WorkCaptureStore.StoredCapture,
     written: Omit<Unrecorded, "captureId">,
-  ) =>
-    Effect.gen(function* () {
-      const key = keyOf(capture.projectId, capture.ideaId);
-      const { created, fingerprint } = written;
-      const committed = yield* commit(
-        capture,
+  ) {
+    const key = keyOf(capture.projectId, capture.ideaId);
+    const { created, fingerprint } = written;
+    const committed = yield* commit(
+      capture,
+      {
+        ...fieldsOf(capture),
+        state: "captured",
+        writerInstanceId: instanceId,
+        itemId: created.ref.itemId,
+        itemKey: created.key,
+        itemUrl: created.url,
+        itemFingerprint: fingerprint,
+      },
+      "created",
+      { clear: true, authorized: false },
+    ).pipe(
+      Effect.flatMap(
+        Option.match({
+          onNone: () => Effect.fail(new WorkCaptureFailed({ stage: "record" })),
+          onSome: Effect.succeed,
+        }),
+      ),
+      // The item exists: the next writer here records it instead of creating another.
+      Effect.tapError(() =>
+        Effect.sync(() => unrecorded.set(key, { captureId: capture.captureId, ...written })),
+      ),
+    );
+    unrecorded.delete(key);
+    return done(
+      resultOf(
+        committed.saved,
         {
-          ...fieldsOf(capture),
-          state: "captured",
-          writerInstanceId: instanceId,
+          sourceId: created.ref.sourceId,
           itemId: created.ref.itemId,
-          itemKey: created.key,
-          itemUrl: created.url,
-          itemFingerprint: fingerprint,
+          key: created.key,
+          url: created.url,
         },
         "created",
-        { clear: true, authorized: false },
-      ).pipe(
-        Effect.flatMap(
-          Option.match({
-            onNone: () => Effect.fail(new WorkCaptureFailed({ stage: "record" })),
-            onSome: Effect.succeed,
-          }),
-        ),
-        // The item exists: the next writer here records it instead of creating another.
-        Effect.tapError(() =>
-          Effect.sync(() => unrecorded.set(key, { captureId: capture.captureId, ...written })),
-        ),
-      );
-      unrecorded.delete(key);
-      return done(
-        resultOf(
-          committed.saved,
-          {
-            sourceId: created.ref.sourceId,
-            itemId: created.ref.itemId,
-            key: created.key,
-            url: created.url,
-          },
-          "created",
-          committed.authorized,
-        ),
-      );
-    });
+        committed.authorized,
+      ),
+    );
+  });
 
   /**
    * Claims the capture for this instance (a new one when `expected` is null), then creates its
    * item and reads it back without interruption, and records it. A create that fails leaves the
    * capture uncertain: the source may hold the item all the same.
    */
-  const create = (
+  const create = Effect.fn("WorkCapture.create")(function* (
     input: CaptureRequest,
     brief: Portfolio.ProjectBrief,
     source: HandoffBackend.HandoffSource,
     writer: HandoffBackend.HandoffWriter,
     expected: WorkCaptureStore.StoredCapture | null,
     captureId: string,
-  ) =>
-    Effect.gen(function* () {
-      const content = renderCaptured(brief, captureId, newItemTitle(brief));
-      const claimed = yield* captures
-        .write({
-          expected: expected === null ? null : versionOf(expected),
-          next: {
-            projectId: input.projectId,
-            ideaId: input.ideaId,
-            captureId,
-            sourceId: source.sourceId,
-            kind: input.kind,
-            state: "pending",
-            writerInstanceId: instanceId,
-            itemId: null,
-            itemKey: null,
-            itemUrl: null,
-            itemFingerprint: null,
-            contentHash: fingerprintOf(source, content),
-            scopeHash: Portfolio.briefScopeHash(brief),
-            briefRevision: brief.revision,
-          },
-          event: "claimed",
-        })
-        .pipe(Effect.mapError(storageFailed));
-      if (Option.isNone(claimed)) return again();
-      const written = yield* Effect.uninterruptible(
-        backend
-          .create(writer, { sourceId: source.sourceId, title: content.title, body: content.body })
-          .pipe(
-            Effect.flatMap((created) =>
-              readBack(created.ref).pipe(Effect.map((fingerprint) => ({ created, fingerprint }))),
-            ),
-            Effect.result,
+  ) {
+    const content = renderCaptured(brief, captureId, newItemTitle(brief));
+    const claimed = yield* captures
+      .write({
+        expected: expected === null ? null : versionOf(expected),
+        next: {
+          projectId: input.projectId,
+          ideaId: input.ideaId,
+          captureId,
+          sourceId: source.sourceId,
+          kind: input.kind,
+          state: "pending",
+          writerInstanceId: instanceId,
+          itemId: null,
+          itemKey: null,
+          itemUrl: null,
+          itemFingerprint: null,
+          contentHash: fingerprintOf(source, content),
+          scopeHash: Portfolio.briefScopeHash(brief),
+          briefRevision: brief.revision,
+        },
+        event: "claimed",
+      })
+      .pipe(Effect.mapError(storageFailed));
+    if (Option.isNone(claimed)) return again();
+    const written = yield* Effect.uninterruptible(
+      backend
+        .create(writer, { sourceId: source.sourceId, title: content.title, body: content.body })
+        .pipe(
+          Effect.flatMap((created) =>
+            readBack(created.ref).pipe(Effect.map((fingerprint) => ({ created, fingerprint }))),
           ),
-      );
-      if (Result.isFailure(written)) {
-        return yield* uncertain(claimed.value, source, "unconfirmed", written.failure);
-      }
-      return yield* recordCreated(claimed.value, written.success);
-    });
+          Effect.result,
+        ),
+    );
+    if (Result.isFailure(written)) {
+      return yield* uncertain(claimed.value, source, "unconfirmed", written.failure);
+    }
+    return yield* recordCreated(claimed.value, written.success);
+  });
 
   /**
    * Records an item found for the capture; the next step brings it up to date with the brief.
@@ -735,269 +712,269 @@ const make = Effect.gen(function* () {
     );
 
   /** A capture no writer can still be writing: find its item by the marker, or create it once. */
-  const reconcile = (
+  const reconcile = Effect.fn("WorkCapture.reconcile")(function* (
     input: CaptureRequest,
     brief: Portfolio.ProjectBrief,
     source: HandoffBackend.HandoffSource,
     writer: HandoffBackend.HandoffWriter,
     capture: WorkCaptureStore.StoredCapture,
-  ) =>
-    Effect.gen(function* () {
-      const found = yield* backend
-        .findByMarker({ sourceId: capture.sourceId, marker: capture.captureId })
-        .pipe(Effect.result);
-      if (Result.isFailure(found)) {
-        return yield* uncertain(capture, source, "incomplete", found.failure);
-      }
-      const matches = found.success.items.filter((item) =>
-        opensWithMarker(item.body, capture.captureId),
-      );
-      const [match, ...others] = matches;
-      if (match !== undefined && others.length > 0) {
-        return yield* uncertain(capture, source, "ambiguous");
-      }
-      // A Markdown capture may be created again once a whole read finds none, so only a whole read
-      // shows that its one match is the only item, or that it has none. A tracker's is created at
-      // most once and never again, and its search never reads whole.
-      const whole = source.kind === "markdown" && found.success.complete;
-      if (match !== undefined && (whole || source.kind !== "markdown")) {
-        return yield* adopt(capture, match, "marker");
-      }
-      if (match === undefined && whole) {
-        return yield* create(input, brief, source, writer, capture, capture.captureId);
-      }
-      return yield* uncertain(
-        capture,
-        source,
-        source.kind === "markdown" ? "incomplete" : "not_found",
-      );
-    });
+  ) {
+    const found = yield* backend
+      .findByMarker({ sourceId: capture.sourceId, marker: capture.captureId })
+      .pipe(Effect.result);
+    if (Result.isFailure(found)) {
+      return yield* uncertain(capture, source, "incomplete", found.failure);
+    }
+    const matches = found.success.items.filter((item) =>
+      opensWithMarker(item.body, capture.captureId),
+    );
+    const [match, ...others] = matches;
+    if (match !== undefined && others.length > 0) {
+      return yield* uncertain(capture, source, "ambiguous");
+    }
+    // A Markdown capture may be created again once a whole read finds none, so only a whole read
+    // shows that its one match is the only item, or that it has none. A tracker's is created at
+    // most once and never again, and its search never reads whole.
+    const whole = source.kind === "markdown" && found.success.complete;
+    if (match !== undefined && (whole || source.kind !== "markdown")) {
+      return yield* adopt(capture, match, "marker");
+    }
+    if (match === undefined && whole) {
+      return yield* create(input, brief, source, writer, capture, capture.captureId);
+    }
+    return yield* uncertain(
+      capture,
+      source,
+      source.kind === "markdown" ? "incomplete" : "not_found",
+    );
+  });
 
   /** Adopts the item named for an uncertain capture, when it is the capture's own. */
-  const recover = (capture: WorkCaptureStore.StoredCapture, itemId: WorkItemId) =>
-    Effect.gen(function* () {
-      const item = yield* backend
-        .read({ sourceId: capture.sourceId, itemId })
-        .pipe(Effect.mapError(workFailed));
-      if (!opensWithMarker(item.body, capture.captureId)) {
-        return yield* refused("recover_mismatch");
-      }
-      return yield* adopt(capture, item, "recover_item");
-    });
+  const recover = Effect.fn("WorkCapture.recover")(function* (
+    capture: WorkCaptureStore.StoredCapture,
+    itemId: WorkItemId,
+  ) {
+    const item = yield* backend
+      .read({ sourceId: capture.sourceId, itemId })
+      .pipe(Effect.mapError(workFailed));
+    if (!opensWithMarker(item.body, capture.captureId)) {
+      return yield* refused("recover_mismatch");
+    }
+    return yield* adopt(capture, item, "recover_item");
+  });
 
   /** Brings a recorded item up to date with the brief, unless someone else changed it. */
-  const update = (
+  const update = Effect.fn("WorkCapture.update")(function* (
     input: CaptureRequest,
     brief: Portfolio.ProjectBrief,
     source: HandoffBackend.HandoffSource,
     writer: HandoffBackend.HandoffWriter,
     capture: WorkCaptureStore.StoredCapture,
-  ) =>
-    Effect.gen(function* () {
-      if (capture.itemId === null) return yield* Effect.die("A captured capture names its item.");
-      const ref = { sourceId: capture.sourceId, itemId: capture.itemId };
-      const item = yield* backend
-        .read(ref)
-        .pipe(
-          Effect.mapError((error) =>
-            error.reason === "not_found" ? refused("item_missing") : workFailed(error),
-          ),
-        );
-      if (item.invalid) return yield* refused("item_invalid");
-      if (item.status === "done" || item.status === "cancelled") {
-        return yield* refused("item_closed");
-      }
-      const current: CapturedItem = {
-        sourceId: ref.sourceId,
-        itemId: ref.itemId,
-        key: item.key,
-        url: item.url,
-      };
-      const edited =
-        capture.itemFingerprint !== null && item.fingerprint !== capture.itemFingerprint;
-      // Only a title a read confirmed is the capture's to keep; an item edited or never confirmed
-      // goes back to what a new item would say.
-      const keepsTitle = capture.itemFingerprint !== null && !edited;
-      const content = renderCaptured(
-        brief,
-        capture.captureId,
-        brief.title ?? (keepsTitle ? item.title : Portfolio.shortTitleOf(brief.goal)),
+  ) {
+    if (capture.itemId === null) return yield* Effect.die("A captured capture names its item.");
+    const ref = { sourceId: capture.sourceId, itemId: capture.itemId };
+    const item = yield* backend
+      .read(ref)
+      .pipe(
+        Effect.mapError((error) =>
+          error.reason === "not_found" ? refused("item_missing") : workFailed(error),
+        ),
       );
-      const intended = fingerprintOf(source, content);
-      if (capture.itemFingerprint === null) {
-        // No read has confirmed the item since it was written (its read-back failed, an update's
-        // outcome was lost, or it was adopted saying something else). Only what the item actually
-        // says confirms it: exactly what was written, or what the brief says now.
-        const now = item.fingerprint === intended;
-        if (now || item.fingerprint === capture.contentHash) {
-          const confirmed = yield* commit(
-            capture,
-            {
-              ...fieldsOf(capture),
-              itemFingerprint: item.fingerprint,
-              ...(now
-                ? {
-                    contentHash: intended,
-                    scopeHash: Portfolio.briefScopeHash(brief),
-                    briefRevision: brief.revision,
-                  }
-                : {}),
-            },
-            "recovered",
-            { detail: "verified", clear: true, authorized: brief.executionAuthorized },
-          );
-          return Option.isSome(confirmed) ? again("verified") : again();
-        }
-        if (input.overwrite !== true) return yield* refused("item_unconfirmed");
-      }
-      const sameContent = intended === capture.contentHash;
-      const sameKind = input.kind === capture.kind;
-      if (capture.itemFingerprint !== null && !edited && sameContent) {
-        const scopeHash = Portfolio.briefScopeHash(brief);
-        if (sameKind && scopeHash === capture.scopeHash) {
-          return done(resultOf(capture, current, "unchanged", brief.executionAuthorized));
-        }
-        // The item says the same, but a title can move in or out of the brief without moving what
-        // the item says: the capture then records the brief it stands for, with nothing written and
-        // nothing new to review. Delivering it as another kind still needs authorizing again.
-        const recorded = yield* commit(
-          capture,
-          { ...fieldsOf(capture), kind: input.kind, scopeHash, briefRevision: brief.revision },
-          "updated",
-          {
-            detail: sameKind ? "scope" : "kind",
-            clear: !sameKind,
-            authorized: brief.executionAuthorized,
-          },
-        );
-        return Option.match(recorded, {
-          onNone: () => again(),
-          onSome: ({ saved, authorized }) =>
-            done(resultOf(saved, current, sameKind ? "unchanged" : "updated", authorized)),
-        });
-      }
-      if (edited && input.overwrite !== true) return yield* refused("external_edit");
-      const written = yield* Effect.uninterruptible(
-        backend
-          .update(writer, {
-            ref,
-            expectedRevision: item.revision,
-            title: content.title,
-            // Comments the item keeps in its body stay after the new text.
-            body: item.notes === "" ? content.body : `${content.body}\n\n${item.notes}`,
-          })
-          .pipe(Effect.andThen(readBack(ref)), Effect.result),
-      );
-      if (Result.isSuccess(written)) {
-        const updated = yield* commit(
+    if (item.invalid) return yield* refused("item_invalid");
+    if (item.status === "done" || item.status === "cancelled") {
+      return yield* refused("item_closed");
+    }
+    const current: CapturedItem = {
+      sourceId: ref.sourceId,
+      itemId: ref.itemId,
+      key: item.key,
+      url: item.url,
+    };
+    const edited = capture.itemFingerprint !== null && item.fingerprint !== capture.itemFingerprint;
+    // Only a title a read confirmed is the capture's to keep; an item edited or never confirmed
+    // goes back to what a new item would say.
+    const keepsTitle = capture.itemFingerprint !== null && !edited;
+    const content = renderCaptured(
+      brief,
+      capture.captureId,
+      brief.title ?? (keepsTitle ? item.title : Portfolio.shortTitleOf(brief.goal)),
+    );
+    const intended = fingerprintOf(source, content);
+    if (capture.itemFingerprint === null) {
+      // No read has confirmed the item since it was written (its read-back failed, an update's
+      // outcome was lost, or it was adopted saying something else). Only what the item actually
+      // says confirms it: exactly what was written, or what the brief says now.
+      const now = item.fingerprint === intended;
+      if (now || item.fingerprint === capture.contentHash) {
+        const confirmed = yield* commit(
           capture,
           {
             ...fieldsOf(capture),
-            kind: input.kind,
-            itemKey: item.key,
-            itemUrl: item.url,
-            itemFingerprint: written.success,
-            contentHash: intended,
-            scopeHash: Portfolio.briefScopeHash(brief),
-            briefRevision: brief.revision,
+            itemFingerprint: item.fingerprint,
+            ...(now
+              ? {
+                  contentHash: intended,
+                  scopeHash: Portfolio.briefScopeHash(brief),
+                  briefRevision: brief.revision,
+                }
+              : {}),
           },
-          "updated",
-          { clear: true, authorized: brief.executionAuthorized },
+          "recovered",
+          { detail: "verified", clear: true, authorized: brief.executionAuthorized },
         );
-        return Option.match(updated, {
-          onNone: () => again(),
-          onSome: ({ saved, authorized }) => done(resultOf(saved, current, "updated", authorized)),
-        });
+        return Option.isSome(confirmed) ? again("verified") : again();
       }
-      const failure = written.failure;
-      // Changed after the read above: the write was refused, and the change is someone else's.
-      if (failure.reason === "stale") return yield* refused("external_edit");
-      const reread = yield* backend.read(ref).pipe(Effect.option);
-      if (Option.isSome(reread) && reread.value.fingerprint === item.fingerprint) {
-        return yield* new WorkCaptureFailed({
-          stage: "update",
-          workReason: failure.reason,
-          cause: failure,
-        });
+      if (input.overwrite !== true) return yield* refused("item_unconfirmed");
+    }
+    const sameContent = intended === capture.contentHash;
+    const sameKind = input.kind === capture.kind;
+    if (capture.itemFingerprint !== null && !edited && sameContent) {
+      const scopeHash = Portfolio.briefScopeHash(brief);
+      if (sameKind && scopeHash === capture.scopeHash) {
+        return done(resultOf(capture, current, "unchanged", brief.executionAuthorized));
       }
-      // The item may say what was written or something else: neither is verified any more.
-      yield* commit(capture, { ...fieldsOf(capture), itemFingerprint: null }, "update_uncertain", {
-        detail: failure.reason,
-        clear: true,
-        authorized: brief.executionAuthorized,
-      }).pipe(
-        Effect.catchTags({
-          WorkCaptureFailed: (error) =>
-            Effect.logWarning("Work capture update left unrecorded", error),
-        }),
+      // The item says the same, but a title can move in or out of the brief without moving what
+      // the item says: the capture then records the brief it stands for, with nothing written and
+      // nothing new to review. Delivering it as another kind still needs authorizing again.
+      const recorded = yield* commit(
+        capture,
+        { ...fieldsOf(capture), kind: input.kind, scopeHash, briefRevision: brief.revision },
+        "updated",
+        {
+          detail: sameKind ? "scope" : "kind",
+          clear: !sameKind,
+          authorized: brief.executionAuthorized,
+        },
       );
-      return yield* new WorkCaptureUncertain({
-        operation: "update",
-        uncertainty: "unconfirmed",
-        captureId: capture.captureId,
-        tracker: false,
+      return Option.match(recorded, {
+        onNone: () => again(),
+        onSome: ({ saved, authorized }) =>
+          done(resultOf(saved, current, sameKind ? "unchanged" : "updated", authorized)),
+      });
+    }
+    if (edited && input.overwrite !== true) return yield* refused("external_edit");
+    const written = yield* Effect.uninterruptible(
+      backend
+        .update(writer, {
+          ref,
+          expectedRevision: item.revision,
+          title: content.title,
+          // Comments the item keeps in its body stay after the new text.
+          body: item.notes === "" ? content.body : `${content.body}\n\n${item.notes}`,
+        })
+        .pipe(Effect.andThen(readBack(ref)), Effect.result),
+    );
+    if (Result.isSuccess(written)) {
+      const updated = yield* commit(
+        capture,
+        {
+          ...fieldsOf(capture),
+          kind: input.kind,
+          itemKey: item.key,
+          itemUrl: item.url,
+          itemFingerprint: written.success,
+          contentHash: intended,
+          scopeHash: Portfolio.briefScopeHash(brief),
+          briefRevision: brief.revision,
+        },
+        "updated",
+        { clear: true, authorized: brief.executionAuthorized },
+      );
+      return Option.match(updated, {
+        onNone: () => again(),
+        onSome: ({ saved, authorized }) => done(resultOf(saved, current, "updated", authorized)),
+      });
+    }
+    const failure = written.failure;
+    // Changed after the read above: the write was refused, and the change is someone else's.
+    if (failure.reason === "stale") return yield* refused("external_edit");
+    const reread = yield* backend.read(ref).pipe(Effect.option);
+    if (Option.isSome(reread) && reread.value.fingerprint === item.fingerprint) {
+      return yield* new WorkCaptureFailed({
+        stage: "update",
         workReason: failure.reason,
         cause: failure,
       });
+    }
+    // The item may say what was written or something else: neither is verified any more.
+    yield* commit(capture, { ...fieldsOf(capture), itemFingerprint: null }, "update_uncertain", {
+      detail: failure.reason,
+      clear: true,
+      authorized: brief.executionAuthorized,
+    }).pipe(
+      Effect.catchTags({
+        WorkCaptureFailed: (error) =>
+          Effect.logWarning("Work capture update left unrecorded", error),
+      }),
+    );
+    return yield* new WorkCaptureUncertain({
+      operation: "update",
+      uncertainty: "unconfirmed",
+      captureId: capture.captureId,
+      tracker: false,
+      workReason: failure.reason,
+      cause: failure,
     });
+  });
 
   /**
    * One decision on what the capture holds now, and the write it calls for. `recoverItem` is the
    * input's until an item is adopted.
    */
-  const decide = (
+  const decide = Effect.fn("WorkCapture.decide")(function* (
     input: CaptureRequest,
     writer: HandoffBackend.HandoffWriter,
     recoverItem: WorkItemId | undefined,
-  ) =>
-    Effect.gen(function* () {
-      const brief = yield* briefOf(input.projectId, input.ideaId);
-      const stored = yield* captures
-        .get(input.projectId, input.ideaId)
-        .pipe(Effect.mapError(storageFailed));
-      const sources = yield* backend.sources(input.projectId).pipe(Effect.mapError(workFailed));
-      const source = yield* Effect.fromResult(
-        captureSource(sources, input.sourceId, stored, input.kind),
-      );
-      if (Option.isNone(stored)) {
-        if (recoverItem !== undefined) return yield* refused("recover_unneeded");
-        const uuid = yield* randomUuidV4;
-        return yield* create(input, brief, source, writer, null, `cap-${uuid}`);
-      }
-      const capture = stored.value;
-      if (capture.state === "captured") {
-        if (recoverItem !== undefined) return yield* refused("recover_unneeded");
-        return yield* update(input, brief, source, writer, capture);
-      }
-      if (recoverItem !== undefined) return yield* recover(capture, recoverItem);
-      // This instance created the item and could not record it: record it now.
-      const left = unrecorded.get(keyOf(input.projectId, input.ideaId));
-      if (capture.state === "pending" && left?.captureId === capture.captureId) {
-        return yield* recordCreated(capture, left);
-      }
-      // This call is the idea's only writer here, so whichever writer claimed the capture, in a
-      // process that shut down or in this one, has stopped writing.
-      return yield* reconcile(input, brief, source, writer, capture);
-    });
+  ) {
+    const brief = yield* briefOf(input.projectId, input.ideaId);
+    const stored = yield* captures
+      .get(input.projectId, input.ideaId)
+      .pipe(Effect.mapError(storageFailed));
+    const sources = yield* backend.sources(input.projectId).pipe(Effect.mapError(workFailed));
+    const source = yield* Effect.fromResult(
+      captureSource(sources, input.sourceId, stored, input.kind),
+    );
+    if (Option.isNone(stored)) {
+      if (recoverItem !== undefined) return yield* refused("recover_unneeded");
+      const uuid = yield* randomUuidV4;
+      return yield* create(input, brief, source, writer, null, `cap-${uuid}`);
+    }
+    const capture = stored.value;
+    if (capture.state === "captured") {
+      if (recoverItem !== undefined) return yield* refused("recover_unneeded");
+      return yield* update(input, brief, source, writer, capture);
+    }
+    if (recoverItem !== undefined) return yield* recover(capture, recoverItem);
+    // This instance created the item and could not record it: record it now.
+    const left = unrecorded.get(keyOf(input.projectId, input.ideaId));
+    if (capture.state === "pending" && left?.captureId === capture.captureId) {
+      return yield* recordCreated(capture, left);
+    }
+    // This call is the idea's only writer here, so whichever writer claimed the capture, in a
+    // process that shut down or in this one, has stopped writing.
+    return yield* reconcile(input, brief, source, writer, capture);
+  });
 
-  const run = (input: CaptureRequest, writer: HandoffBackend.HandoffWriter) =>
-    Effect.gen(function* () {
-      // What an earlier step found, reported when nothing more had to be written.
-      let found: "recovered" | "verified" | undefined;
-      let recoverItem = input.recoverItem;
-      for (let step = 0; step < MAX_STEPS; step++) {
-        const next = yield* decide(input, writer, recoverItem);
-        if (next.type === "done") {
-          return found !== undefined && next.result.outcome === "unchanged"
-            ? { ...next.result, outcome: found }
-            : next.result;
-        }
-        found ??= next.found;
-        // An adopted item is the capture's: the item named to recover has been taken.
-        if (next.found === "recovered") recoverItem = undefined;
+  const run = Effect.fn("WorkCapture.run")(function* (
+    input: CaptureRequest,
+    writer: HandoffBackend.HandoffWriter,
+  ) {
+    // What an earlier step found, reported when nothing more had to be written.
+    let found: "recovered" | "verified" | undefined;
+    let recoverItem = input.recoverItem;
+    for (let step = 0; step < MAX_STEPS; step++) {
+      const next = yield* decide(input, writer, recoverItem);
+      if (next.type === "done") {
+        return found !== undefined && next.result.outcome === "unchanged"
+          ? { ...next.result, outcome: found }
+          : next.result;
       }
-      return yield* new WorkCaptureFailed({ stage: "storage" });
-    });
+      found ??= next.found;
+      // An adopted item is the capture's: the item named to recover has been taken.
+      if (next.found === "recovered") recoverItem = undefined;
+    }
+    return yield* new WorkCaptureFailed({ stage: "storage" });
+  });
 
   /** Settles a writer's callers; a writer cut short by shutdown failed, not succeeded. */
   const settled = (
@@ -1033,39 +1010,39 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const joined = (
+  const joined = Effect.fn("WorkCapture.joined")(function* (
     input: CaptureRequest,
     writer: HandoffBackend.HandoffWriter,
     capturingRun: string | null,
-  ) =>
-    Effect.gen(function* () {
-      const key = keyOf(input.projectId, input.ideaId);
-      for (;;) {
-        const slot = yield* slotFor(
-          key,
-          run(input, writer).pipe(Effect.provideService(CapturingRun, capturingRun)),
-        );
-        if (slot.type === "capture") return yield* Deferred.await(slot.done);
-        // An abandon runs: once it ends, this capture starts afresh.
-        yield* Deferred.await(slot.done);
-      }
-    });
+  ) {
+    const key = keyOf(input.projectId, input.ideaId);
+    for (;;) {
+      const slot = yield* slotFor(
+        key,
+        run(input, writer).pipe(Effect.provideService(CapturingRun, capturingRun)),
+      );
+      if (slot.type === "capture") return yield* Deferred.await(slot.done);
+      // An abandon runs: once it ends, this capture starts afresh.
+      yield* Deferred.await(slot.done);
+    }
+  });
 
-  const capture: WorkCapture["Service"]["capture"] = (input) =>
-    Effect.gen(function* () {
+  const capture: WorkCapture["Service"]["capture"] = Effect.fn("WorkCapture.capture")(
+    function* (input) {
       const threadId = yield* assistantOnly(input.caller);
       const writer = yield* writerOf(input.caller);
       const capturingRun = yield* activeRunOf(input.caller.threads, threadId).pipe(
         Effect.mapError(storageFailed),
       );
       return yield* joined(input, writer, capturingRun);
-    });
+    },
+  );
 
   const captureAsOwner: WorkCapture["Service"]["captureAsOwner"] = ({ owner, ...input }) =>
     Effect.flatMap(writerOf(owner), (writer) => joined(input, writer, null));
 
-  const abandon: WorkCapture["Service"]["abandon"] = (input) =>
-    Effect.gen(function* () {
+  const abandon: WorkCapture["Service"]["abandon"] = Effect.fn("WorkCapture.abandon")(
+    function* (input) {
       yield* assistantOnly(input.caller);
       yield* writerOf(input.caller);
       const key = keyOf(input.projectId, input.ideaId);
@@ -1118,7 +1095,8 @@ const make = Effect.gen(function* () {
           );
         }),
       );
-    });
+    },
+  );
 
   return WorkCapture.of({ capture, captureAsOwner, abandon });
 });

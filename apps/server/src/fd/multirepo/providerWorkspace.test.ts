@@ -54,7 +54,11 @@ describe("multi-repository provider access", () => {
               params.sandboxPolicy.writableRoots,
               repositories.map((repository) => repository.rootPath),
             );
-          const thread = codexThreadRuntimeParams({ mcpSession: undefined, runtimePolicy });
+          const thread = codexThreadRuntimeParams({
+            threadId: null,
+            mcpSession: undefined,
+            runtimePolicy,
+          });
           assert.equal(thread.cwd, runtimePolicy.cwd);
           assert.deepEqual(
             thread.config["sandbox_workspace_write.writable_roots"],

@@ -13,7 +13,7 @@ import { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import type { WorkItemRef } from "@t3tools/contracts/fd/work-management";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -321,11 +321,9 @@ export type FactoryPullRequestWatchError =
   | ProjectService.ProjectOperationError;
 
 /**
- * What `recover` found of a PR stage whose result a restart lost: nothing proves it published
- * (core accepted no watch command of it), it published a pull request the records cannot name,
- * or what it published: the pull request, the thread it is linked to, the watch there as the
- * stage would have reported it, the wakes core committed since the delivery's first watch command,
- * and how the pull request left `open` if it did.
+ * What `recover` found of a PR stage whose result a restart lost: nothing proves it published,
+ * it published a pull request the records cannot name, or what it published, with its thread,
+ * watch, the wakes since the first watch command and how it left `open` if it did.
  */
 export type FactoryPullRequestRecovery =
   | { readonly type: "none" }
@@ -353,11 +351,9 @@ export type FactoryPullRequestError =
   | GitManagerServiceError;
 
 /**
- * What the PR stage published: the delivery's pull request and the thread it is linked to, where
- * core's watch wakes with its feedback. A parent has no author thread, so its pull request is
- * linked to its last child's author thread. `publicationFailure` says why what the host saved could
- * not be held compliant: the pull request is published all the same, so it is recorded, but the
- * delivery blocks on this text rather than watch it. Safe to show.
+ * The delivery's published pull request and the thread core's watch wakes (a parent's last
+ * child's author thread). `publicationFailure`, safe to show, says why what the host saved is not
+ * compliant: the pull request is still recorded, but the delivery blocks rather than watch it.
  */
 interface FactoryPublishedPullRequest {
   readonly pullRequest: FactoryOpenedPullRequest;
@@ -366,20 +362,10 @@ interface FactoryPublishedPullRequest {
 }
 
 /**
- * The PR stages' work. Opens the delivery's pull request from its worktree through the stacked
- * Git action (`create_pr`) with a short Conventional title and a body listing the accepted task and
- * its evidence, then links it to the author thread. A parent's is its one pull request: its body
- * lists its whole branch's verify and integrate review, then each child item in plan order with its
- * own, and it is linked to the last child's author thread, since a parent has none. A child opens
- * none. Every push and pull request first passes `evaluatePublication`, on the branch and every
- * commit it would publish, read then, and nothing here renames or rewrites them. The action runs
- * only while the worktree holds the approved commit on a clean tree, and pushes that exact commit,
- * so a commit made meanwhile never reaches the remote. An open pull request for the branch is
- * reported as it is, unchanged. What the host saved is read back, and a pull request that does not
- * comply is recorded with the delivery blocked. A delivery that recorded its pull request already, in
- * a follow-through round, only pushes its newly approved commit to that pull request's branch, once
- * what the host saved passes the same gate. The pull request is then watched on the thread it is
- * linked to, so its feedback wakes that thread. Once someone merged it, closes the delivery out.
+ * The PR stages' work: opens (or, in a follow-through round, pushes to) the delivery's pull
+ * request via `create_pr`, watches it on its linked thread, and closes the delivery out once
+ * merged. Every push first passes `evaluatePublication` and pushes the exact approved commit from a
+ * clean tree; nothing here renames or rewrites. A child opens none.
  */
 export class FactoryPullRequest extends Context.Service<
   FactoryPullRequest,
@@ -389,18 +375,10 @@ export class FactoryPullRequest extends Context.Service<
       effect: Extract<FactoryEffect, { readonly type: "open_pr" }>,
     ) => Effect.Effect<FactoryPublishedPullRequest, FactoryPullRequestError>;
     /**
-     * Has core watch the pull request on `threadId`, the thread `open` linked it to (a single
-     * item's author thread, a parent's last child's author thread), and reports what that left
-     * (see `FactoryWatchState`) with the wakes core committed there since the delivery's
-     * first watch command, in order, which the worker steps after the result. It first reads the
-     * pull request's watch, then those wakes, and starts a watch only when none is on and no end
-     * core committed is among wakes the delivery has not taken: core can end only a watch that
-     * is on, so none ends between that read and the command, and a watch core ended is never
-     * started again here. The command links the pull request first when it is not linked; its id
-     * derives from the delivery and the effect, so an effect carried out again starts no second
-     * watch. Which watch is Factory's is read from its watch commands' own records and the watch
-     * the delivery already holds (see `isFactorys`), so a result that was never stored loses
-     * nothing. None for a child, which opens no pull request.
+     * Has core watch the pull request on `threadId` and reports the watch with the wakes since the
+     * first watch command, for the worker to step. Starts one only when none is on and no untaken
+     * wake ended one, so a watch core ended never restarts; command ids derive from the delivery
+     * and effect, so a retry starts no second watch. None for a child.
      */
     readonly watch: (
       delivery: FactoryDeliveryStore.StoredFactoryDelivery,
@@ -415,29 +393,20 @@ export class FactoryPullRequest extends Context.Service<
       FactoryPullRequestWatchError
     >;
     /**
-     * What a PR stage whose result a restart lost after its watch command did, read from that
-     * command's records (see `FactoryPullRequestRecovery`). Core accepting the command proves the
-     * stage published and linked its pull request: the command runs only after that. Which pull
-     * request it was is read apart from whose watch is on it, from the event the command
-     * committed: the link a watch the command started is on, else the one link watched once the
-     * command had run, narrowed when the thread watches several to the link the stage's own link
-     * command added. A watch the command kept is someone else's, never Factory's. Reads only.
+     * Reads what a PR stage whose result a restart lost did, from its watch command's records (see
+     * `FactoryPullRequestRecovery`): an accepted command proves it published and linked. The pull
+     * request is found from the event that command committed (see `publishedLink`); a watch the
+     * command kept is someone else's. Reads only.
      */
     readonly recover: (
       delivery: FactoryDeliveryStore.StoredFactoryDelivery,
       effect: Extract<FactoryEffect, { readonly type: "open_pr" }>,
     ) => Effect.Effect<FactoryPullRequestRecovery, FactoryPullRequestWatchError>;
     /**
-     * Ends Factory's watch on the delivery's pull request (see `isFactorys`), as a cancel asks,
-     * only while it is that very watch: core checks its start under the thread's lock, so a watch
-     * the owner started meanwhile stays. Reports that watch (the one on, else the latest Factory
-     * started) and its pull request, where it ended (by this or before), where the delivery's first
-     * watch command was, and the wakes core committed since, which the worker steps so the
-     * cancelled delivery stops what its watch set off. Read on the thread the delivery records its
-     * pull request linked to (see `followedThread`), or for a parent whose PR stage result was lost
-     * before it recorded one, on the thread its watch commands name, which it reports. None when
-     * Factory started or holds no watch there. Fails only when the watch is still on and could not
-     * be ended.
+     * Ends Factory's watch (see `isFactorys`) for a cancel, only while core still sees that very
+     * watch, so one the owner started stays. Reports it with where it ended and the wakes since,
+     * for the worker to step. None when Factory holds no watch; fails only when it is still on and
+     * could not be ended.
      */
     readonly release: (delivery: FactoryDeliveryStore.StoredFactoryDelivery) => Effect.Effect<
       Option.Option<{
@@ -451,25 +420,17 @@ export class FactoryPullRequest extends Context.Service<
       FactoryPullRequestWatchError
     >;
     /**
-     * Follow-through once the delivery's pull request merged, first part: sets each child item
-     * done in plan order for a parent, then the delivery's own item, through Work under a Factory
-     * actor. An item the source reads as done already, after Work's reads are refreshed, is left
-     * as it is, so a retry after some of them were set, or an item someone else finished, writes
-     * nothing again: a source such as Jira refuses to move a done issue to done. An item the
-     * source cannot read in full is never taken as done, and a read or write that fails fails
-     * the close-out.
+     * After the merge, sets a parent's child items then the delivery's own item done through Work.
+     * Items the source (freshly read) already shows done are skipped, since Jira refuses done to
+     * done; one it cannot read in full is never taken as done. A failed read or write fails it.
      */
     readonly closeOutItems: (
       delivery: FactoryDeliveryStore.StoredFactoryDelivery,
     ) => Effect.Effect<void, FactoryCloseOutItemsError>;
     /**
-     * Follow-through once the delivery's pull request merged, second part: ends the watch the PR
-     * stage started on it, as core's watch would end on a merged pull request (a watch counts as
-     * a thread's background work, which keeps a worktree), then removes the delivery's worktree
-     * through the Git workflow when it is clean and no thread works in it. The branch always
-     * stays, and so does a worktree with changes, one a thread is working in, one already gone and
-     * the project's primary checkout. The worker calls this only under the delivery's lock, while
-     * the delivery still awaits its close-out, so a cancel never loses its checkout.
+     * After the merge, ends the PR stage's watch (it counts as background work that keeps the
+     * worktree), then removes the worktree if clean, unused and not the primary checkout; the branch
+     * stays. Call only under the delivery's lock while it awaits close-out, so a cancel keeps it.
      */
     readonly closeOutWorktree: (
       delivery: FactoryDeliveryStore.StoredFactoryDelivery,
@@ -553,7 +514,7 @@ const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
   const events = yield* EventStore.EventStoreV2;
-  const crypto = yield* Crypto.Crypto;
+  const crypto = yield* SecureRandom.SecureRandom;
   const projectService = yield* ProjectService.ProjectService;
   const pullRequestDetails = yield* PullRequestService.PullRequestService;
   const work = yield* WorkService.WorkService;
@@ -679,85 +640,79 @@ const make = Effect.gen(function* () {
    * Fails unless the worktree holds the approved commit on a clean tree. Record checked it, but a
    * commit or edit could land since, so this is read last, right before an action that publishes.
    */
-  const requireApproved = (
+  const requireApproved = Effect.fn("FactoryPullRequest.requireApproved")(function* (
     deliveryId: FactoryDeliveryId,
     basis: { readonly worktreePath: string; readonly approvedSha: string },
-  ) =>
-    Effect.gen(function* () {
-      const current = yield* readWorktreeState(basis.worktreePath).pipe(
-        Effect.provideContext(context),
-      );
-      if (current.headSha !== basis.approvedSha || !current.clean) {
-        return yield* new FactoryPullRequestUnapprovedError({
-          deliveryId,
-          approvedSha: basis.approvedSha,
-          headSha: current.headSha,
-          clean: current.clean,
-        });
-      }
-    });
+  ) {
+    const current = yield* readWorktreeState(basis.worktreePath).pipe(
+      Effect.provideContext(context),
+    );
+    if (current.headSha !== basis.approvedSha || !current.clean) {
+      return yield* new FactoryPullRequestUnapprovedError({
+        deliveryId,
+        approvedSha: basis.approvedSha,
+        headSha: current.headSha,
+        clean: current.clean,
+      });
+    }
+  });
 
   /** Fails unless the branch's upstream holds the approved commit after the action. */
-  const requirePublished = (
+  const requirePublished = Effect.fn("FactoryPullRequest.requirePublished")(function* (
     deliveryId: FactoryDeliveryId,
     basis: { readonly worktreePath: string; readonly approvedSha: string },
-  ) =>
-    Effect.gen(function* () {
-      const publishedSha = yield* publishedCommit(basis.worktreePath);
-      if (publishedSha !== basis.approvedSha) {
-        return yield* new FactoryPullRequestPublishedUnapprovedError({
-          deliveryId,
-          approvedSha: basis.approvedSha,
-          publishedSha,
-        });
-      }
-    });
+  ) {
+    const publishedSha = yield* publishedCommit(basis.worktreePath);
+    if (publishedSha !== basis.approvedSha) {
+      return yield* new FactoryPullRequestPublishedUnapprovedError({
+        deliveryId,
+        approvedSha: basis.approvedSha,
+        publishedSha,
+      });
+    }
+  });
 
   /**
-   * The branch and the remote branch a push of it lands on, every commit of the delivery up to the
-   * approved one and every other commit pushing that one would newly publish there, read now: their
-   * names, messages and identities are the ones that go out, whatever settle saw earlier. By the
-   * commit's id, since that is what the action pushes. The range alone would miss a base nobody
-   * pushed, and what is outgoing alone would let a delivery's own commit off for having been pushed
-   * already, so the gate reads both.
+   * The branch, its push target, and, read now by commit id, the delivery's commits up to the
+   * approved one plus every other commit the push would newly publish. The gate reads both sets:
+   * the range alone misses an unpushed base, the outgoing alone skips already-pushed own commits.
    */
-  const publicationFacts = (
+  const publicationFacts = Effect.fn("FactoryPullRequest.publicationFacts")(function* (
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,
     basis: { readonly worktreePath: string; readonly approvedSha: string },
-  ) =>
-    Effect.gen(function* () {
-      const { deliveryId, state } = delivery;
-      if (state.baseline === null) {
-        return yield* new FactoryPublicationRefusedError({
-          deliveryId,
-          branch: state.branch,
-          problems: [{ target: "commits", rule: "baseline_missing" }],
-        });
-      }
-      const facts = yield* readBranchFacts({
-        worktreePath: basis.worktreePath,
-        baselineSha: state.baseline,
-        headSha: basis.approvedSha,
-      }).pipe(Effect.provideContext(context));
-      const target = yield* readPushTarget({
-        worktreePath: basis.worktreePath,
+  ) {
+    const { deliveryId, state } = delivery;
+    if (state.baseline === null) {
+      return yield* new FactoryPublicationRefusedError({
+        deliveryId,
         branch: state.branch,
-      }).pipe(Effect.provideContext(context));
-      const outgoing =
-        target === null
-          ? null
-          : yield* readOutgoingCommits({
-              worktreePath: basis.worktreePath,
-              target,
-              headSha: basis.approvedSha,
-            }).pipe(Effect.provideContext(context));
-      const own = new Set(facts.commits.map(({ sha }) => sha));
-      return {
-        ...facts,
-        target,
-        ancestry: outgoing === null ? null : outgoing.filter(({ sha }) => !own.has(sha)),
-      };
-    });
+        problems: [{ target: "commits", rule: "baseline_missing" }],
+      });
+    }
+    const facts = yield* readBranchFacts({
+      worktreePath: basis.worktreePath,
+      baselineSha: state.baseline,
+      headSha: basis.approvedSha,
+    }).pipe(Effect.provideContext(context));
+    const target = yield* readPushTarget({
+      worktreePath: basis.worktreePath,
+      branch: state.branch,
+    }).pipe(Effect.provideContext(context));
+    const outgoing =
+      target === null
+        ? null
+        : yield* readOutgoingCommits({
+            worktreePath: basis.worktreePath,
+            target,
+            headSha: basis.approvedSha,
+          }).pipe(Effect.provideContext(context));
+    const own = new Set(facts.commits.map(({ sha }) => sha));
+    return {
+      ...facts,
+      target,
+      ancestry: outgoing === null ? null : outgoing.filter(({ sha }) => !own.has(sha)),
+    };
+  });
 
   /**
    * The remote branch and push URLs the gate judged, which the action's push is bound to: it goes to
@@ -766,7 +721,7 @@ const make = Effect.gen(function* () {
    */
   const checkedTarget = (
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,
-    facts: { readonly target: GitVcsDriver.GitPushTarget | null },
+    facts: { readonly target: GitVcsDriver.GitCheckedPushTarget | null },
   ) =>
     facts.target === null
       ? Effect.fail(
@@ -779,11 +734,9 @@ const make = Effect.gen(function* () {
       : Effect.succeed(facts.target);
 
   /**
-   * The action's push refused because it would no longer go to the target the gate judged, before
-   * writing anything or, when that changed while it pushed, having reached only that target and
-   * before anything after the push; or because the Git that pushes cannot be held to that target's
-   * URLs, before writing anything. Each is a refusal like the gate's, whose fixed text says so and
-   * what to do, where any other Git failure stays one whose text is never shown.
+   * Maps a push that would leave the target the gate judged, or a Git that cannot be held to its
+   * URLs, to a gate-style refusal with fixed, showable text. Any other Git failure stays one whose
+   * text is never shown.
    */
   const refusedOffTarget = <A, R>(
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,
@@ -831,12 +784,12 @@ const make = Effect.gen(function* () {
    * when it cannot be read, whatever the reason: a host Factory cannot read, or a pull request that
    * cannot be named, has not been shown to comply.
    */
-  const readSaved = (
-    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
-    pullRequest: FactoryOpenedPullRequest,
-    threadId: ThreadId,
-  ) =>
-    Effect.gen(function* () {
+  const readSaved = Effect.fn("FactoryPullRequest.readSaved")(
+    function* (
+      delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+      pullRequest: FactoryOpenedPullRequest,
+      threadId: ThreadId,
+    ) {
       const key = yield* pullRequestKey(threadId, pullRequest);
       if (key === null) return null;
       const reference = {
@@ -847,15 +800,15 @@ const make = Effect.gen(function* () {
       };
       yield* pullRequestDetails.invalidate({ reference });
       return yield* pullRequestDetails.detail(reference);
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause)
-          ? Effect.interrupt
-          : Effect.logWarning("factory could not read a saved pull request", cause).pipe(
-              Effect.as(null),
-            ),
-      ),
-    );
+    },
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.interrupt
+        : Effect.logWarning("factory could not read a saved pull request", cause).pipe(
+            Effect.as(null),
+          ),
+    ),
+  );
 
   const open: FactoryPullRequest["Service"]["open"] = Effect.fn("FactoryPullRequest.open")(
     function* (delivery, effect) {
@@ -867,15 +820,10 @@ const make = Effect.gen(function* () {
       const actionId = `factory-pr:${deliveryId}:${effect.id}`;
       const expectedBranch = state.branch;
 
-      // A follow-through round publishes its approved commit to the pull request it opened: a
-      // push alone, by the commit's id. Asking for a pull request again would open a second one
-      // when the first merged or closed before core's sync stored it. The push publishes no text,
-      // so the gate reads what the pull request says on the host instead of rendering anything,
-      // under the item's verified key, which holds a resume to what stopped it, with its head held
-      // to the remote branch the push lands on, so the push reaches it. A legacy branch or pull
-      // request is judged like any other. The branch and commits come first, so a branch that
-      // cannot publish costs no read of the tracker or the host, and again after those, since they
-      // can take long.
+      // A follow-through round only pushes the approved commit by id: asking for a pull request
+      // again could open a second one if the first merged before core's sync stored it. The gate
+      // judges the host's saved pull request, its head held to the push target. Local checks run
+      // before the slow tracker and host reads, then again after them.
       const recorded = state.pullRequest;
       if (recorded !== null && recorded.outcome === undefined) {
         const requireLocal = publicationFacts(delivery, basis).pipe(
@@ -1025,18 +973,20 @@ const make = Effect.gen(function* () {
    * project for one its URL cannot name, as `linkCreatedPullRequest` reads it. Null when neither
    * names it.
    */
-  const pullRequestKey = (threadId: ThreadId, pullRequest: FactoryOpenedPullRequest) =>
-    Effect.gen(function* () {
-      const thread = yield* orchestrator.getThreadShell(threadId);
-      const project =
-        thread === null
-          ? undefined
-          : Option.getOrUndefined(yield* projectService.getShell(thread.projectId));
-      return createdPullRequestKey(
-        { pr: { status: "opened_existing", number: pullRequest.number, url: pullRequest.url } },
-        project && { ...project, repositories: thread?.workspaceBinding?.repositories ?? [] },
-      );
-    });
+  const pullRequestKey = Effect.fn("FactoryPullRequest.pullRequestKey")(function* (
+    threadId: ThreadId,
+    pullRequest: FactoryOpenedPullRequest,
+  ) {
+    const thread = yield* orchestrator.getThreadShell(threadId);
+    const project =
+      thread === null
+        ? undefined
+        : Option.getOrUndefined(yield* projectService.getShell(thread.projectId));
+    return createdPullRequestKey(
+      { pr: { status: "opened_existing", number: pullRequest.number, url: pullRequest.url } },
+      project && { ...project, repositories: thread?.workspaceBinding?.repositories ?? [] },
+    );
+  });
 
   /** The thread's link to the pull request as the projection has it; none when unlinked. */
   const linkOf = (threadId: ThreadId, pullRequest: FactoryPullRequestKey) =>
@@ -1054,134 +1004,128 @@ const make = Effect.gen(function* () {
       );
 
   /** The thread's stored events after `after`, through its latest: a finite read of the log. */
-  const threadEvents = (threadId: ThreadId, after: number) =>
-    Effect.gen(function* () {
-      const through = yield* events.latestSequence({ threadId });
-      if (through <= after) return [];
-      return Array.from(
-        yield* events
-          .read({ threadId, afterSequence: after, throughSequence: through })
-          .pipe(Stream.runCollect),
-      );
-    });
+  const threadEvents = Effect.fn("FactoryPullRequest.threadEvents")(function* (
+    threadId: ThreadId,
+    after: number,
+  ) {
+    const through = yield* events.latestSequence({ threadId });
+    if (through <= after) return [];
+    return Array.from(
+      yield* events
+        .read({ threadId, afterSequence: after, throughSequence: through })
+        .pipe(Stream.runCollect),
+    );
+  });
 
   /**
    * The wakes among the thread's events, in order: each run whose command was a watch's sync
    * that stored it as the wake, as `wakeOf` judges it. Of the pull request only.
    */
-  const wakesIn = (
+  const wakesIn = Effect.fn("FactoryPullRequest.wakesIn")(function* (
     log: ReadonlyArray<OrchestrationV2StoredEvent>,
     pullRequest: FactoryPullRequestKey,
-  ) =>
-    Effect.gen(function* () {
-      const wakes: Array<FactoryWakeEvent> = [];
-      for (const stored of log) {
-        const run = runCreated(stored);
-        if (run === undefined) continue;
-        const receipt = Option.getOrUndefined(yield* receipts.getByCommandId(run.commandId));
-        const wake =
-          receipt?.status === "accepted" ? wakeOf(run, receipt.commandType, log) : undefined;
-        if (wake?.number === pullRequest.number && wake.url === pullRequest.url) wakes.push(wake);
-      }
-      return wakes;
-    });
+  ) {
+    const wakes: Array<FactoryWakeEvent> = [];
+    for (const stored of log) {
+      const run = runCreated(stored);
+      if (run === undefined) continue;
+      const receipt = Option.getOrUndefined(yield* receipts.getByCommandId(run.commandId));
+      const wake =
+        receipt?.status === "accepted" ? wakeOf(run, receipt.commandType, log) : undefined;
+      if (wake?.number === pullRequest.number && wake.url === pullRequest.url) wakes.push(wake);
+    }
+    return wakes;
+  });
 
   /**
-   * The delivery's own watch commands on the thread, read from their records so a command whose
-   * result was never stored still counts: where each committed, oldest first, and the watches
-   * they started, each with the link it is on (see `watchStartedBy`). Their ids derive from the
-   * delivery and an effect, so every effect the delivery issued is looked up. A watch starts only
-   * in a `thread.pull-request-synced` event, so the thread's events of that type through the last
-   * command tell a watch a command started from one it kept. A command whose event the log no
-   * longer holds proves nothing, and counts as starting none.
+   * The delivery's own watch commands on the thread, from their records (so an unstored result
+   * still counts), oldest first, with the watches they started (see `watchStartedBy`). Only a
+   * `thread.pull-request-synced` event starts a watch, which tells started from kept. A command
+   * whose event the log no longer holds counts as starting none.
    */
-  const watchCommands = (
+  const watchCommands = Effect.fn("FactoryPullRequest.watchCommands")(function* (
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,
     threadId: ThreadId,
-  ) =>
-    Effect.gen(function* () {
-      const positions: Array<number> = [];
-      for (let effectId = 1; effectId <= delivery.state.effectsIssued; effectId += 1) {
-        const receipt = Option.getOrUndefined(
-          yield* receipts.getByCommandId(watchCommandId(delivery.deliveryId, effectId)),
-        );
-        if (receipt?.status === "accepted" && receipt.threadId === threadId) {
-          positions.push(receipt.resultSequence);
-        }
-      }
-      positions.sort((a, b) => a - b);
-      const last = positions.at(-1);
-      if (last === undefined) return { positions, started: [] };
-      const synced = Array.from(
-        yield* events
-          .read({
-            threadId,
-            throughSequence: last,
-            eventType: "thread.pull-request-synced",
-          })
-          .pipe(Stream.runCollect),
+  ) {
+    const positions: Array<number> = [];
+    for (let effectId = 1; effectId <= delivery.state.effectsIssued; effectId += 1) {
+      const receipt = Option.getOrUndefined(
+        yield* receipts.getByCommandId(watchCommandId(delivery.deliveryId, effectId)),
       );
-      const started: Array<{
-        readonly at: number;
-        readonly startedAt: string;
-        readonly link: ThreadPullRequestLink;
-      }> = [];
-      for (const at of positions) {
-        const index = synced.findIndex((stored) => stored.sequence === at);
-        const event = synced[index];
-        const watch =
-          event === undefined ? undefined : watchStartedBy(event, synced.slice(0, index));
-        if (watch !== undefined) started.push({ at, ...watch });
+      if (receipt?.status === "accepted" && receipt.threadId === threadId) {
+        positions.push(receipt.resultSequence);
       }
-      return { positions, started };
-    });
+    }
+    positions.sort((a, b) => a - b);
+    const last = positions.at(-1);
+    if (last === undefined) return { positions, started: [] };
+    const synced = Array.from(
+      yield* events
+        .read({
+          threadId,
+          throughSequence: last,
+          eventType: "thread.pull-request-synced",
+        })
+        .pipe(Stream.runCollect),
+    );
+    const started: Array<{
+      readonly at: number;
+      readonly startedAt: string;
+      readonly link: ThreadPullRequestLink;
+    }> = [];
+    for (const at of positions) {
+      const index = synced.findIndex((stored) => stored.sequence === at);
+      const event = synced[index];
+      const watch = event === undefined ? undefined : watchStartedBy(event, synced.slice(0, index));
+      if (watch !== undefined) started.push({ at, ...watch });
+    }
+    return { positions, started };
+  });
 
   /**
    * The thread the delivery's watch commands watched its pull request on, from the first one core
    * accepted; none when core accepted none. Every PR stage of a delivery links its pull request to
    * the same thread, so this is where a PR stage whose result was lost linked it.
    */
-  const watchedThread = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
-    Effect.gen(function* () {
-      for (let effectId = 1; effectId <= delivery.state.effectsIssued; effectId += 1) {
-        const receipt = Option.getOrUndefined(
-          yield* receipts.getByCommandId(watchCommandId(delivery.deliveryId, effectId)),
-        );
-        if (receipt?.status === "accepted") return receipt.threadId;
-      }
-      return undefined;
-    });
+  const watchedThread = Effect.fn("FactoryPullRequest.watchedThread")(function* (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+  ) {
+    for (let effectId = 1; effectId <= delivery.state.effectsIssued; effectId += 1) {
+      const receipt = Option.getOrUndefined(
+        yield* receipts.getByCommandId(watchCommandId(delivery.deliveryId, effectId)),
+      );
+      if (receipt?.status === "accepted") return receipt.threadId;
+    }
+    return undefined;
+  });
 
   /**
-   * The pull request's watch on the thread as it is now, read only: its link, the start of the
-   * watch on it (null when none is on) and whether that watch is Factory's (`held`, see
-   * `isFactorys`), where the delivery's first watch command committed, the log's end, the wakes
-   * core committed since that first command, and whether an end of the watch the delivery has not
-   * taken is among them.
+   * The pull request's watch on the thread now, read only: its link, its start (null when off),
+   * whether it is Factory's (`held`), the first watch command's position, the log's end, the wakes
+   * since that command, and whether an untaken watch end is among them.
    */
-  const readWatch = (
+  const readWatch = Effect.fn("FactoryPullRequest.readWatch")(function* (
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,
     pullRequest: FactoryPullRequestKey,
     threadId: ThreadId,
-  ) =>
-    Effect.gen(function* () {
-      const { state } = delivery;
-      const { followThrough } = state;
-      // The watch on the pull request first: core can only end one that is on.
-      const link = yield* linkOf(threadId, pullRequest);
-      const current = link?.watch?.startedAt ?? null;
-      const commands = yield* watchCommands(delivery, threadId);
-      const from = followThrough?.watchedAfter ?? commands.positions[0];
-      const latest = yield* events.latestSequence({ threadId });
-      const wakes =
-        from === undefined ? [] : yield* wakesIn(yield* threadEvents(threadId, from), pullRequest);
-      const taken = followThrough?.runs ?? [];
-      const ended =
-        followThrough?.watchEnded === true ||
-        wakes.some((wake) => wake.kind === "ended" && !taken.includes(wake.runId));
-      const held = isFactorys(state, commands.started, pullRequest, current) ? current : null;
-      return { link, current, from, latest, wakes, ended, held };
-    });
+  ) {
+    const { state } = delivery;
+    const { followThrough } = state;
+    // The watch on the pull request first: core can only end one that is on.
+    const link = yield* linkOf(threadId, pullRequest);
+    const current = link?.watch?.startedAt ?? null;
+    const commands = yield* watchCommands(delivery, threadId);
+    const from = followThrough?.watchedAfter ?? commands.positions[0];
+    const latest = yield* events.latestSequence({ threadId });
+    const wakes =
+      from === undefined ? [] : yield* wakesIn(yield* threadEvents(threadId, from), pullRequest);
+    const taken = followThrough?.runs ?? [];
+    const ended =
+      followThrough?.watchEnded === true ||
+      wakes.some((wake) => wake.kind === "ended" && !taken.includes(wake.runId));
+    const held = isFactorys(state, commands.started, pullRequest, current) ? current : null;
+    return { link, current, from, latest, wakes, ended, held };
+  });
 
   const watch: FactoryPullRequest["Service"]["watch"] = Effect.fn("FactoryPullRequest.watch")(
     function* (delivery, effect, pullRequest, threadId) {
@@ -1251,47 +1195,42 @@ const make = Effect.gen(function* () {
       );
 
   /**
-   * The link of the pull request a PR stage published, read from the event its watch command
-   * committed at `at`: that command leaves the pull request it names watched, so it is the one
-   * link watched then. When the thread watches several, the link the stage's own link command
-   * added picks it, if that command added one (a link the thread had already is unchanged). None
-   * when neither tells which, or compaction dropped the events that would.
+   * The link a PR stage published, from the event its watch command committed at `at`: the one
+   * link watched then, or, when several are, the one the stage's own link command added. None
+   * when neither tells, or compaction dropped the events.
    */
-  const publishedLink = (
+  const publishedLink = Effect.fn("FactoryPullRequest.publishedLink")(function* (
     delivery: FactoryDeliveryStore.StoredFactoryDelivery,
     effect: Extract<FactoryEffect, { readonly type: "open_pr" }>,
     threadId: ThreadId,
     at: number,
-  ) =>
-    Effect.gen(function* () {
-      const watched = ((yield* linksAt(threadId, at)) ?? []).filter(
-        (link) => link.watch !== undefined,
-      );
-      if (watched.length <= 1) return watched[0];
-      const linked = Option.getOrUndefined(
-        yield* receipts.getByCommandId(linkCommandId(delivery.deliveryId, effect.id)),
-      );
-      if (linked?.status !== "accepted" || linked.threadId !== threadId) return undefined;
-      const after = (yield* linksAt(threadId, linked.resultSequence)) ?? [];
-      const previous = Array.from(
-        yield* events
-          .read({
-            threadId,
-            throughSequence: linked.resultSequence - 1,
-            eventType: "thread.pull-request-synced",
-          })
-          .pipe(Stream.runCollect),
-      ).at(-1)?.event;
-      const before =
-        previous?.type === "thread.pull-request-synced"
-          ? (previous.payload.pullRequests ?? [])
-          : [];
-      const same = (a: ThreadPullRequestLink) => (b: ThreadPullRequestLink) =>
-        a.host === b.host && a.repository === b.repository && a.number === b.number;
-      const added = after.filter((link) => !before.some(same(link)));
-      const picked = watched.filter((link) => added.some(same(link)));
-      return picked.length === 1 ? picked[0] : undefined;
-    });
+  ) {
+    const watched = ((yield* linksAt(threadId, at)) ?? []).filter(
+      (link) => link.watch !== undefined,
+    );
+    if (watched.length <= 1) return watched[0];
+    const linked = Option.getOrUndefined(
+      yield* receipts.getByCommandId(linkCommandId(delivery.deliveryId, effect.id)),
+    );
+    if (linked?.status !== "accepted" || linked.threadId !== threadId) return undefined;
+    const after = (yield* linksAt(threadId, linked.resultSequence)) ?? [];
+    const previous = Array.from(
+      yield* events
+        .read({
+          threadId,
+          throughSequence: linked.resultSequence - 1,
+          eventType: "thread.pull-request-synced",
+        })
+        .pipe(Stream.runCollect),
+    ).at(-1)?.event;
+    const before =
+      previous?.type === "thread.pull-request-synced" ? (previous.payload.pullRequests ?? []) : [];
+    const same = (a: ThreadPullRequestLink) => (b: ThreadPullRequestLink) =>
+      a.host === b.host && a.repository === b.repository && a.number === b.number;
+    const added = after.filter((link) => !before.some(same(link)));
+    const picked = watched.filter((link) => added.some(same(link)));
+    return picked.length === 1 ? picked[0] : undefined;
+  });
 
   const recover: FactoryPullRequest["Service"]["recover"] = Effect.fn("FactoryPullRequest.recover")(
     function* (delivery, effect) {
@@ -1335,32 +1274,31 @@ const make = Effect.gen(function* () {
    * that started at any other time. Returns the position of that removal; null when the watch
    * was already gone or replaced. Fails when it is still on and the command failed.
    */
-  const endWatchStartedAt = (
+  const endWatchStartedAt = Effect.fn("FactoryPullRequest.endWatchStartedAt")(function* (
     threadId: ThreadId,
     link: Pick<ThreadPullRequestLink, "host" | "repository" | "number" | "url">,
     startedAt: string,
-  ) =>
-    Effect.gen(function* () {
-      const id = yield* crypto.randomUUIDv4();
-      const ended = yield* Effect.exit(
-        orchestrator.dispatch({
-          type: "thread.pull-request-watch.sync",
-          // Each attempt is a command of its own: a refused one stays refused.
-          commandId: CommandId.make(`factory-pr-unwatch:${id}`),
-          threadId,
-          host: link.host,
-          repository: link.repository,
-          number: link.number,
-          startedAt,
-          watch: null,
-        }),
-      );
-      if (Exit.isSuccess(ended)) return ended.value.sequence;
-      if (Cause.hasInterruptsOnly(ended.cause)) return yield* Effect.interrupt;
-      // Refused because that watch is no longer on, or the command failed; only the first is done.
-      const still = (yield* linkOf(threadId, link))?.watch?.startedAt === startedAt;
-      return still ? yield* Effect.failCause(ended.cause) : null;
-    });
+  ) {
+    const id = yield* crypto.uuidV4();
+    const ended = yield* Effect.exit(
+      orchestrator.dispatch({
+        type: "thread.pull-request-watch.sync",
+        // Each attempt is a command of its own: a refused one stays refused.
+        commandId: CommandId.make(`factory-pr-unwatch:${id}`),
+        threadId,
+        host: link.host,
+        repository: link.repository,
+        number: link.number,
+        startedAt,
+        watch: null,
+      }),
+    );
+    if (Exit.isSuccess(ended)) return ended.value.sequence;
+    if (Cause.hasInterruptsOnly(ended.cause)) return yield* Effect.interrupt;
+    // Refused because that watch is no longer on, or the command failed; only the first is done.
+    const still = (yield* linkOf(threadId, link))?.watch?.startedAt === startedAt;
+    return still ? yield* Effect.failCause(ended.cause) : null;
+  });
 
   const release: FactoryPullRequest["Service"]["release"] = Effect.fn("FactoryPullRequest.release")(
     function* (delivery) {
@@ -1417,21 +1355,21 @@ const make = Effect.gen(function* () {
    * it is the watch read here: a watch counts as a thread's background work, which keeps the
    * worktree. A failure is logged, and the worktree stays.
    */
-  const endMergedWatch = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
-    Effect.gen(function* () {
+  const endMergedWatch = Effect.fn("FactoryPullRequest.endMergedWatch")(
+    function* (delivery: FactoryDeliveryStore.StoredFactoryDelivery) {
       const threadId = followedThread(delivery.state);
       const { pullRequest, followThrough } = delivery.state;
       if (followThrough === undefined || threadId === undefined || pullRequest === null) return;
       const link = yield* linkOf(threadId, pullRequest);
       if (link?.watch === undefined) return;
       yield* endWatchStartedAt(threadId, link, link.watch.startedAt);
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause)
-          ? Effect.interrupt
-          : Effect.logWarning("factory could not end a merged pull request's watch", cause),
-      ),
-    );
+    },
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.interrupt
+        : Effect.logWarning("factory could not end a merged pull request's watch", cause),
+    ),
+  );
 
   /** A merged delivery's items: a parent's children in plan order, then the delivery's own. */
   const finishedItems = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
@@ -1457,52 +1395,46 @@ const make = Effect.gen(function* () {
     fileSystem.realPath(target).pipe(Effect.orElseSucceed(() => path.resolve(target)));
 
   /**
-   * Whether a thread is working in the checkout at `root` (resolved): one with a run, run
-   * activity or background tasks whose checkout is `root` or inside it. That checkout is its
-   * worktree, the repositories it is bound to, or else its project's root, where its turns run.
-   * Core's checkout coordination applies this rule only before changing a shared checkout, which
-   * a delivery's own worktree is not, so Factory applies it here, to settled threads too: a
-   * thread settles with a background command still running, and its provider stops only after.
+   * Whether a thread has a run, run activity or background tasks in the checkout at `root`
+   * (resolved) or inside it. Core checks this only for shared checkouts, so Factory checks its own
+   * worktree here, settled threads included: a background command can outlive the settle.
    */
-  const inUse = (root: string) =>
-    Effect.gen(function* () {
-      const snapshot = yield* projections.getShellSnapshot();
-      const projectRoots = new Map(
-        (yield* projects.list({ includeDeleted: true })).map(
-          (project) => [project.projectId, project.workspaceRoot] as const,
-        ),
-      );
-      for (const thread of [...snapshot.threads, ...snapshot.archivedThreads]) {
+  const inUse = Effect.fn("FactoryPullRequest.inUse")(function* (root: string) {
+    const snapshot = yield* projections.getShellSnapshot();
+    const projectRoots = new Map(
+      (yield* projects.list({ includeDeleted: true })).map(
+        (project) => [project.projectId, project.workspaceRoot] as const,
+      ),
+    );
+    for (const thread of [...snapshot.threads, ...snapshot.archivedThreads]) {
+      if (
+        thread.activeRunId === null &&
+        thread.activityRunStatus == null &&
+        (thread.pendingBackgroundTasks?.length ?? 0) === 0
+      ) {
+        continue;
+      }
+      const projectRoot = projectRoots.get(thread.projectId);
+      const checkouts =
+        thread.worktreePath !== null
+          ? [thread.worktreePath]
+          : thread.workspaceBinding !== undefined
+            ? thread.workspaceBinding.repositories.map(({ rootPath }) => rootPath)
+            : projectRoot === undefined
+              ? []
+              : [projectRoot];
+      for (const checkout of checkouts) {
+        const relative = path.relative(root, yield* resolved(checkout));
         if (
-          thread.activeRunId === null &&
-          thread.activityRunStatus == null &&
-          (thread.pendingBackgroundTasks?.length ?? 0) === 0
+          relative === "" ||
+          (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
         ) {
-          continue;
-        }
-        const projectRoot = projectRoots.get(thread.projectId);
-        const checkouts =
-          thread.worktreePath !== null
-            ? [thread.worktreePath]
-            : thread.workspaceBinding !== undefined
-              ? thread.workspaceBinding.repositories.map(({ rootPath }) => rootPath)
-              : projectRoot === undefined
-                ? []
-                : [projectRoot];
-        for (const checkout of checkouts) {
-          const relative = path.relative(root, yield* resolved(checkout));
-          if (
-            relative === "" ||
-            (relative !== ".." &&
-              !relative.startsWith(`..${path.sep}`) &&
-              !path.isAbsolute(relative))
-          ) {
-            return true;
-          }
+          return true;
         }
       }
-      return false;
-    });
+    }
+    return false;
+  });
 
   const closeOutWorktree: FactoryPullRequest["Service"]["closeOutWorktree"] = Effect.fn(
     "FactoryPullRequest.closeOutWorktree",

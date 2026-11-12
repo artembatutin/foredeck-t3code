@@ -445,18 +445,25 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const createAssignment: PortfolioStore["Service"]["createAssignment"] = (input) =>
-    Effect.gen(function* () {
+  const createAssignment: PortfolioStore["Service"]["createAssignment"] = Effect.fn(
+    "PortfolioStore.createAssignment",
+  )(
+    function* (input) {
       const existing = yield* readAssignment(input.assignmentId);
       if (Option.isSome(existing)) return existing.value;
       const at = yield* now;
       const assignment = Portfolio.newAssignment({ ...input, at });
       yield* insertAssignment(assignment);
       return assignment;
-    }).pipe(sql.withTransaction, mapError("createAssignment"));
+    },
+    sql.withTransaction,
+    mapError("createAssignment"),
+  );
 
-  const transitionAssignment: PortfolioStore["Service"]["transitionAssignment"] = (input) =>
-    Effect.gen(function* () {
+  const transitionAssignment: PortfolioStore["Service"]["transitionAssignment"] = Effect.fn(
+    "PortfolioStore.transitionAssignment",
+  )(
+    function* (input) {
       const current = yield* readAssignment(input.assignmentId);
       if (Option.isNone(current)) {
         return yield* new AssignmentNotFound({ assignmentId: input.assignmentId });
@@ -471,36 +478,43 @@ const make = Effect.gen(function* () {
       );
       yield* updateAssignment(next);
       return next;
-    }).pipe(
-      sql.withTransaction,
-      Effect.catchTags({
-        SqlError: (cause) =>
-          Effect.fail(new PortfolioStoreError({ operation: "transitionAssignment", cause })),
-        SchemaError: (cause) =>
-          Effect.fail(new PortfolioStoreError({ operation: "transitionAssignment", cause })),
-      }),
-    );
+    },
+    sql.withTransaction,
+    Effect.catchTags({
+      SqlError: (cause) =>
+        Effect.fail(new PortfolioStoreError({ operation: "transitionAssignment", cause })),
+      SchemaError: (cause) =>
+        Effect.fail(new PortfolioStoreError({ operation: "transitionAssignment", cause })),
+    }),
+  );
 
   return PortfolioStore.of({
-    getBrief: (projectId, ideaId) => readBrief(projectId, ideaId).pipe(mapError("getBrief")),
-    listBriefs: () =>
+    getBrief: Effect.fn("PortfolioStore.getBrief")((projectId, ideaId) =>
+      readBrief(projectId, ideaId).pipe(mapError("getBrief")),
+    ),
+    listBriefs: Effect.fn("PortfolioStore.listBriefs")(() =>
       selectBriefs({}).pipe(
         Effect.map((rows) => rows.map(toBrief)),
         mapError("listBriefs"),
       ),
+    ),
     reviseBrief,
     priorityChanges: SubscriptionRef.changes(priorityEpoch),
-    listRevisions: (projectId, ideaId = "legacy") =>
+    listRevisions: Effect.fn("PortfolioStore.listRevisions")((projectId, ideaId = "legacy") =>
       selectRevisions({ projectId, ideaId }).pipe(mapError("listRevisions")),
+    ),
     createAssignment,
-    getAssignment: (assignmentId) => readAssignment(assignmentId).pipe(mapError("getAssignment")),
-    listAssignments: (filter) =>
+    getAssignment: Effect.fn("PortfolioStore.getAssignment")((assignmentId) =>
+      readAssignment(assignmentId).pipe(mapError("getAssignment")),
+    ),
+    listAssignments: Effect.fn("PortfolioStore.listAssignments")((filter) =>
       filter?.states?.length === 0
         ? Effect.succeed([])
         : selectAssignments({
             ...(filter?.projectId === undefined ? {} : { projectId: filter.projectId }),
             ...(filter?.states === undefined ? {} : { states: filter.states }),
           }).pipe(mapError("listAssignments")),
+    ),
     transitionAssignment,
   });
 });

@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -20,6 +21,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { Tool } from "effect/ai";
+import * as DocumentText from "../../../provider/DocumentText.ts";
 
 // Loaded before the MCP modules, as the core toolkit tests do, so their import cycle resolves.
 import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts";
@@ -141,6 +143,8 @@ const layer = FactoryService.layer.pipe(
   Layer.provideMerge(GitVcsDriver.layer),
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-plan-mcp-" })),
   Layer.provideMerge(VcsProcess.layer),
+  Layer.provideMerge(DocumentText.layer.pipe(Layer.provide(NodeServices.layer))),
+  Layer.provideMerge(NodeCrypto.layer),
   Layer.provideMerge(NodeServices.layer),
 );
 

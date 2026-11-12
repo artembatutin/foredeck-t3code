@@ -1,6 +1,8 @@
 import {
+  CLIENT_CAPABILITIES_QUERY_PARAM,
   ORCHESTRATION_PROTOCOL_QUERY_PARAM,
   ORCHESTRATION_PROTOCOL_VERSION,
+  SETTINGS_SECRET_REFERENCES_CAPABILITY,
   MULTIREPO_PROTOCOL_QUERY_PARAM,
   MULTIREPO_PROTOCOL_VERSION,
   type ExecutionEnvironmentDescriptor,
@@ -28,7 +30,6 @@ export function orchestrationProtocolCompatibilityError(
       });
 }
 
-/** Whether this client can drive the host's update remotely. */
 function canSelfUpdate(descriptor: ExecutionEnvironmentDescriptor): boolean {
   const { serverSelfUpdate, desktopAppUpdate } = descriptor.capabilities;
   return (
@@ -40,6 +41,7 @@ function canSelfUpdate(descriptor: ExecutionEnvironmentDescriptor): boolean {
 export function appendOrchestrationProtocol(socketUrl: string): string {
   const url = new URL(socketUrl);
   url.searchParams.set(ORCHESTRATION_PROTOCOL_QUERY_PARAM, String(ORCHESTRATION_PROTOCOL_VERSION));
+  url.searchParams.set(CLIENT_CAPABILITIES_QUERY_PARAM, SETTINGS_SECRET_REFERENCES_CAPABILITY);
   url.searchParams.set(MULTIREPO_PROTOCOL_QUERY_PARAM, String(MULTIREPO_PROTOCOL_VERSION));
   return url.toString();
 }

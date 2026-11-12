@@ -43,6 +43,8 @@ const world = vi.hoisted(() => ({
 }));
 
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => world.navigate }));
+// Escape navigation is covered by its own hook; this file tests the list and filters.
+vi.mock("./useEscapeToGoBack", () => ({ useEscapeToGoBack: () => undefined }));
 vi.mock("@effect/atom-react", () => ({
   useAtomRefresh: () => () => undefined,
   useAtomValue: (atom: unknown) => (Array.isArray(atom) ? atom : []),

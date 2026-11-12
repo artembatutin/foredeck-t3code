@@ -10,7 +10,7 @@ import {
   type WorkStatus,
 } from "@t3tools/contracts/fd/work-management";
 import * as ByteSize from "effect/ByteSize";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -376,7 +376,8 @@ const stampFrom = (info: FileSystem.File.Info): FileStamp => ({
     Option.map(info.mtime, (mtime) => mtime.getTime()),
     () => 0,
   ),
-  ino: Option.getOrElse(info.ino, () => 0),
+  // Node may report the inode as a bigint; a stamp only compares it.
+  ino: Number(Option.getOrElse(info.ino, () => 0)),
 });
 
 const sameStamp = (file: IndexedFile, stamp: FileStamp) =>
@@ -390,11 +391,11 @@ const unique = <A>(values: ReadonlyArray<A>) => [...new Set(values)];
 export const make: Effect.Effect<
   WorkSourceAdapter,
   never,
-  FileSystem.FileSystem | Path.Path | Crypto.Crypto
+  FileSystem.FileSystem | Path.Path | SecureRandom.SecureRandom
 > = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const crypto = yield* Crypto.Crypto;
+  const crypto = yield* SecureRandom.SecureRandom;
 
   const indexes = new Map<string, SourceIndex>();
   // One refresh at a time per source, one write at a time per file.
@@ -433,34 +434,36 @@ export const make: Effect.Effect<
       ? Effect.succeed(config)
       : Effect.fail(new WorkInvalid({ detail: "This source is not a Markdown source." }));
 
-  const resolve = (config: MarkdownConfig, rootPath: string) =>
-    Effect.gen(function* () {
-      const directory = parseSourceDirectory(config.directory);
-      if (Result.isFailure(directory)) {
-        const rejected = new WorkSourceRootRejected({ problem: directory.failure });
-        return yield* new WorkInvalid({ detail: rejected.message });
-      }
-      return yield* resolveSourceRoute(rootPath, directory.success, Effect.void).pipe(
-        Effect.catchTags({
-          WorkSourceRootRejected: (error) =>
-            Effect.fail(new WorkInvalid({ detail: error.message })),
-          WorkSourceFileError: (error) =>
-            Effect.fail(new WorkUnavailable({ detail: error.message, cause: error })),
-        }),
-        provideServices,
-      );
-    });
+  const resolve = Effect.fn("MarkdownSource.resolve")(function* (
+    config: MarkdownConfig,
+    rootPath: string,
+  ) {
+    const directory = parseSourceDirectory(config.directory);
+    if (Result.isFailure(directory)) {
+      const rejected = new WorkSourceRootRejected({ problem: directory.failure });
+      return yield* new WorkInvalid({ detail: rejected.message });
+    }
+    return yield* resolveSourceRoute(rootPath, directory.success, Effect.void).pipe(
+      Effect.catchTags({
+        WorkSourceRootRejected: (error) => Effect.fail(new WorkInvalid({ detail: error.message })),
+        WorkSourceFileError: (error) =>
+          Effect.fail(new WorkUnavailable({ detail: error.message, cause: error })),
+      }),
+      provideServices,
+    );
+  });
 
-  const open = (runtime: WorkSourceRuntime): Effect.Effect<Source, WorkDomainError> =>
-    Effect.gen(function* () {
-      const config = yield* markdownConfig(runtime.config);
-      const route = yield* resolve(config, runtime.rootPath);
-      return {
-        key: `${runtime.rootPath}\0${config.directory}`,
-        route,
-        directory: config.directory,
-      };
-    });
+  const open: (runtime: WorkSourceRuntime) => Effect.Effect<Source, WorkDomainError> = Effect.fn(
+    "MarkdownSource.open",
+  )(function* (runtime: WorkSourceRuntime) {
+    const config = yield* markdownConfig(runtime.config);
+    const route = yield* resolve(config, runtime.rootPath);
+    return {
+      key: `${runtime.rootPath}\0${config.directory}`,
+      route,
+      directory: config.directory,
+    };
+  });
 
   const indexOf = (source: Source): SourceIndex => {
     const existing = indexes.get(source.key);
@@ -471,57 +474,58 @@ export const make: Effect.Effect<
   };
 
   /**
-   * Inspects one `.md` entry without ever failing the source. A symbolic link is listed
-   * read-only and never followed; an entry whose stat or read fails, or whose size alone
-   * exceeds the document cap, is listed read-only without its bytes; one that vanished or is
-   * not a regular file is none. `previous` is reused while the file's stamp has not changed,
-   * except for an unreadable entry, which is retried because a permission fix leaves the
-   * stamp alone.
+   * Inspects one `.md` entry without failing the source. Symlinks, failed stats/reads and oversize
+   * files are listed read-only without bytes; vanished or non-regular entries are none. `previous`
+   * is reused while the stamp is unchanged, except unreadable entries: a permission fix keeps the
+   * stamp, so they are retried. Untraced: a refresh runs it once per directory entry.
    */
-  const inspect = (
+  const inspect: (
     filePath: string,
     filename: string,
     previous: IndexedFile | undefined,
-  ): Effect.Effect<Option.Option<Inspected>> =>
-    Effect.gen(function* () {
-      const info = yield* Effect.result(fs.stat(filePath));
-      if (
-        previous !== undefined &&
-        previous.diagnostic?.code !== UNREADABLE.code &&
-        Result.isSuccess(info) &&
-        info.success.type === "File" &&
-        sameStamp(previous, stampFrom(info.success))
-      ) {
-        // Same inode and bytes, even through a link swapped in meanwhile; a write looks again.
-        return Option.some({ file: previous, document: undefined });
-      }
-      // First sight or a change: a link is listed as such whether or not its target exists.
-      const link = yield* Effect.option(fs.readLink(filePath));
-      if (Option.isSome(link)) {
-        return Option.some({ file: indexUnread(filename, NO_STAMP, SYMLINK), document: undefined });
-      }
-      if (Result.isFailure(info)) {
-        return isNotFound(info.failure)
-          ? Option.none()
-          : Option.some({ file: indexUnread(filename, NO_STAMP, UNREADABLE), document: undefined });
-      }
-      if (info.success.type !== "File") return Option.none();
-      const stamp = stampFrom(info.success);
-      if (stamp.size > MAX_TASK_DOCUMENT_BYTES) {
-        return Option.some({
-          file: indexUnread(filename, stamp, TOO_LARGE_DIAGNOSTIC),
-          document: undefined,
-        });
-      }
-      const bytes = yield* Effect.result(fs.readFile(filePath));
-      if (Result.isFailure(bytes)) {
-        return isNotFound(bytes.failure)
-          ? Option.none()
-          : Option.some({ file: indexUnread(filename, stamp, UNREADABLE), document: undefined });
-      }
-      const document = decodeTaskDocument(bytes.success);
-      return Option.some({ file: indexFile(filename, document, stamp), document });
-    });
+  ) => Effect.Effect<Option.Option<Inspected>> = Effect.fnUntraced(function* (
+    filePath: string,
+    filename: string,
+    previous: IndexedFile | undefined,
+  ) {
+    const info = yield* Effect.result(fs.stat(filePath));
+    if (
+      previous !== undefined &&
+      previous.diagnostic?.code !== UNREADABLE.code &&
+      Result.isSuccess(info) &&
+      info.success.type === "File" &&
+      sameStamp(previous, stampFrom(info.success))
+    ) {
+      // Same inode and bytes, even through a link swapped in meanwhile; a write looks again.
+      return Option.some({ file: previous, document: undefined });
+    }
+    // First sight or a change: a link is listed as such whether or not its target exists.
+    const link = yield* Effect.option(fs.readLink(filePath));
+    if (Option.isSome(link)) {
+      return Option.some({ file: indexUnread(filename, NO_STAMP, SYMLINK), document: undefined });
+    }
+    if (Result.isFailure(info)) {
+      return isNotFound(info.failure)
+        ? Option.none()
+        : Option.some({ file: indexUnread(filename, NO_STAMP, UNREADABLE), document: undefined });
+    }
+    if (info.success.type !== "File") return Option.none();
+    const stamp = stampFrom(info.success);
+    if (stamp.size > MAX_TASK_DOCUMENT_BYTES) {
+      return Option.some({
+        file: indexUnread(filename, stamp, TOO_LARGE_DIAGNOSTIC),
+        document: undefined,
+      });
+    }
+    const bytes = yield* Effect.result(fs.readFile(filePath));
+    if (Result.isFailure(bytes)) {
+      return isNotFound(bytes.failure)
+        ? Option.none()
+        : Option.some({ file: indexUnread(filename, stamp, UNREADABLE), document: undefined });
+    }
+    const document = decodeTaskDocument(bytes.success);
+    return Option.some({ file: indexFile(filename, document, stamp), document });
+  });
 
   /** Brings the source's index up to date with the directory and returns the current view. */
   const refresh = (source: Source): Effect.Effect<SourceView, WorkDomainError> =>
@@ -562,18 +566,21 @@ export const make: Effect.Effect<
     );
 
   /** Re-indexes one file from the document just written, so the view reflects it now. */
-  const reindex = (source: Source, filename: string, document: TaskDocument) =>
-    Effect.gen(function* () {
-      const index = indexOf(source);
-      const info = yield* fs.stat(path.join(source.route.path, filename)).pipe(
-        Effect.asSome,
-        Effect.catchIf(isNotFound, () => Effect.succeedNone),
-        Effect.catchTags(unavailable("The Work directory could not be read.")),
-      );
-      if (Option.isNone(info) || info.value.type !== "File") index.files.delete(filename);
-      else index.files.set(filename, indexFile(filename, document, stampFrom(info.value)));
-      return buildView(index);
-    });
+  const reindex = Effect.fn("MarkdownSource.reindex")(function* (
+    source: Source,
+    filename: string,
+    document: TaskDocument,
+  ) {
+    const index = indexOf(source);
+    const info = yield* fs.stat(path.join(source.route.path, filename)).pipe(
+      Effect.asSome,
+      Effect.catchIf(isNotFound, () => Effect.succeedNone),
+      Effect.catchTags(unavailable("The Work directory could not be read.")),
+    );
+    if (Option.isNone(info) || info.value.type !== "File") index.files.delete(filename);
+    else index.files.set(filename, indexFile(filename, document, stampFrom(info.value)));
+    return buildView(index);
+  });
 
   /**
    * Lands the exact bytes through a sibling temp file and a rename, so a reader sees the old
@@ -599,17 +606,18 @@ export const make: Effect.Effect<
 
   const now = Effect.map(DateTime.now, DateTime.formatIso);
 
-  const normalizeLabels = (labels: ReadonlyArray<string>) =>
-    Effect.gen(function* () {
-      const trimmed = unique(labels.map((label) => label.trim()).filter((label) => label !== ""));
-      if (trimmed.some((label) => /[,\r\n]/.test(label))) {
-        return yield* new WorkInvalid({ detail: "Labels cannot contain commas or line breaks." });
-      }
-      if (trimmed.length > LABELS_MAX) {
-        return yield* new WorkInvalid({ detail: `An item can have at most ${LABELS_MAX} labels.` });
-      }
-      return trimmed;
-    });
+  const normalizeLabels = Effect.fn("MarkdownSource.normalizeLabels")(function* (
+    labels: ReadonlyArray<string>,
+  ) {
+    const trimmed = unique(labels.map((label) => label.trim()).filter((label) => label !== ""));
+    if (trimmed.some((label) => /[,\r\n]/.test(label))) {
+      return yield* new WorkInvalid({ detail: "Labels cannot contain commas or line breaks." });
+    }
+    if (trimmed.length > LABELS_MAX) {
+      return yield* new WorkInvalid({ detail: `An item can have at most ${LABELS_MAX} labels.` });
+    }
+    return trimmed;
+  });
 
   /** Parent and blocker references must be Markdown item ids; stem ids are not referenceable. */
   const normalizeReference = (itemId: WorkItemId) => {
@@ -621,23 +629,20 @@ export const make: Effect.Effect<
       : Effect.succeed(id);
   };
 
-  const mintUnusedId = (view: SourceView) =>
-    Effect.gen(function* () {
-      for (let attempt = 0; attempt < 8; attempt += 1) {
-        const bytes = yield* crypto
-          .randomBytes(4)
-          .pipe(Effect.catchTags(unavailable("Random bytes for a new task id were unavailable.")));
-        const id = mintTaskId(bytes);
-        if (!view.byId.has(id)) return id;
-      }
-      return yield* new WorkUnavailable({ detail: "Could not mint an unused task id." });
-    });
+  const mintUnusedId = Effect.fn("MarkdownSource.mintUnusedId")(function* (view: SourceView) {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const bytes = yield* crypto.randomBytes(4);
+      const id = mintTaskId(bytes);
+      if (!view.byId.has(id)) return id;
+    }
+    return yield* new WorkUnavailable({ detail: "Could not mint an unused task id." });
+  });
 
   /**
    * Reads, edits and rewrites one item's file under its lock. `makeEdit` sees the item as it
    * is on disk and the write time; the result is the item as re-read after the write.
    */
-  const writeItem = (
+  const writeItem: (
     runtime: WorkSourceRuntime,
     itemId: WorkItemId,
     expectedRevision: string | undefined,
@@ -646,8 +651,17 @@ export const make: Effect.Effect<
       current: CurrentDocument,
       writtenAt: string,
     ) => Effect.Effect<PendingEdit, WorkDomainError>,
-  ): Effect.Effect<{ readonly item: ListedItem; readonly view: SourceView }, WorkDomainError> =>
-    Effect.gen(function* () {
+  ) => Effect.Effect<{ readonly item: ListedItem; readonly view: SourceView }, WorkDomainError> =
+    Effect.fn("MarkdownSource.writeItem")(function* (
+      runtime: WorkSourceRuntime,
+      itemId: WorkItemId,
+      expectedRevision: string | undefined,
+      makeEdit: (
+        item: ListedItem,
+        current: CurrentDocument,
+        writtenAt: string,
+      ) => Effect.Effect<PendingEdit, WorkDomainError>,
+    ) {
       const source = yield* open(runtime);
       const id = normalizeId(itemId);
       const located = (yield* refresh(source)).byId.get(id);
@@ -712,24 +726,27 @@ export const make: Effect.Effect<
     // The registry dispatches by kind, so a foreign config never reaches this adapter.
     config.kind === "markdown" ? config.directory : "";
 
-  const test: WorkSourceAdapter["test"] = ({ config, rootPath }) =>
-    Effect.gen(function* () {
-      const markdown = yield* markdownConfig(config);
-      yield* resolve(markdown, rootPath);
-      return { identity: markdown.directory };
-    });
+  const test: WorkSourceAdapter["test"] = Effect.fn("MarkdownSource.test")(function* ({
+    config,
+    rootPath,
+  }) {
+    const markdown = yield* markdownConfig(config);
+    yield* resolve(markdown, rootPath);
+    return { identity: markdown.directory };
+  });
 
-  const prepare: WorkSourceAdapter["prepare"] = (runtime) =>
-    Effect.gen(function* () {
+  const prepare: WorkSourceAdapter["prepare"] = Effect.fn("MarkdownSource.prepare")(
+    function* (runtime) {
       const source = yield* open(runtime);
       if (source.route.exists) return;
       yield* fs
         .makeDirectory(source.route.path, { recursive: true })
         .pipe(Effect.catchTags(unavailable("The Work directory could not be created.")));
-    });
+    },
+  );
 
-  const list: WorkSourceAdapter["list"] = (runtime, query) =>
-    Effect.gen(function* () {
+  const list: WorkSourceAdapter["list"] = Effect.fn("MarkdownSource.list")(
+    function* (runtime, query) {
       if (query.cursor !== undefined && !CURSOR.test(query.cursor)) {
         return yield* new WorkInvalid({ detail: "The page cursor is not one this source issued." });
       }
@@ -753,10 +770,11 @@ export const make: Effect.Effect<
         nextCursor: end < matches.length ? String(end) : null,
         stale: view.stale,
       };
-    });
+    },
+  );
 
-  const get: WorkSourceAdapter["get"] = (runtime, itemId) =>
-    Effect.gen(function* () {
+  const get: WorkSourceAdapter["get"] = Effect.fn("MarkdownSource.get")(
+    function* (runtime, itemId) {
       const source = yield* open(runtime);
       const view = yield* refresh(source);
       const item = view.byId.get(normalizeId(itemId));
@@ -785,10 +803,11 @@ export const make: Effect.Effect<
         transitions: [],
         locator: `${source.directory}/${file.filename}`,
       };
-    });
+    },
+  );
 
-  const create: WorkSourceAdapter["create"] = (runtime, input) =>
-    Effect.gen(function* () {
+  const create: WorkSourceAdapter["create"] = Effect.fn("MarkdownSource.create")(
+    function* (runtime, input) {
       const source = yield* open(runtime);
       const view = yield* refresh(source);
       const id = yield* mintUnusedId(view);
@@ -827,7 +846,8 @@ export const make: Effect.Effect<
         return yield* new WorkUnavailable({ detail: "The task file could not be read back." });
       }
       return summarize(item, after, runtime.sourceId);
-    });
+    },
+  );
 
   const update: WorkSourceAdapter["update"] = (runtime, patch) =>
     writeItem(runtime, patch.ref.itemId, patch.expectedRevision, (item, current, writtenAt) =>
@@ -931,8 +951,8 @@ export const make: Effect.Effect<
     }).pipe(Effect.map(() => ({ commentId })));
   };
 
-  const findComment: WorkSourceAdapter["findComment"] = (runtime, itemId, text) =>
-    Effect.gen(function* () {
+  const findComment: WorkSourceAdapter["findComment"] = Effect.fn("MarkdownSource.findComment")(
+    function* (runtime, itemId, text) {
       const source = yield* open(runtime);
       const located = (yield* refresh(source)).byId.get(normalizeId(itemId));
       if (located === undefined) return yield* new WorkItemNotFound({ itemId });
@@ -955,16 +975,18 @@ export const make: Effect.Effect<
       return Option.fromUndefinedOr(
         parseNotes(document.item.body).find((note) => note.body.includes(text)),
       );
-    });
+    },
+  );
 
-  const snapshots: WorkSourceAdapter["snapshots"] = (runtime, itemIds) =>
-    Effect.gen(function* () {
+  const snapshots: WorkSourceAdapter["snapshots"] = Effect.fn("MarkdownSource.snapshots")(
+    function* (runtime, itemIds) {
       const view = yield* refresh(yield* open(runtime));
       return itemIds.flatMap((itemId) => {
         const item = view.byId.get(normalizeId(itemId));
         return item === undefined ? [] : [summarize(item, view, runtime.sourceId)];
       });
-    });
+    },
+  );
 
   // A missing directory or a watcher failure ends the stream quietly; the reactor keeps polling.
   const watch: NonNullable<WorkSourceAdapter["watch"]> = (runtime) =>

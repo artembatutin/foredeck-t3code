@@ -20,11 +20,9 @@ const Priority = Schema.Struct({
 export type Priority = typeof Priority.Type;
 
 /**
- * The agreed, environment-local brief for one project. `constraints` and `decisions` are durable
- * scope, delivered as written and never reclassified by their text. `conversationNotes` hold what
- * only this conversation needs, which no Work item and no worker receives. `title` is an optional
- * short title, which counts as scope once set. Authorization is only `executionAuthorized`, and a
- * review receipt: saving it as a decision or constraint would change the scope it authorizes.
+ * A project's agreed, environment-local brief. `constraints`, `decisions` and a set `title` are
+ * scope, delivered as written; `conversationNotes` never reach a Work item or worker.
+ * Authorization lives only in `executionAuthorized` and its review receipt, never in scope text.
  */
 export const ProjectBrief = Schema.Struct({
   projectId: ProjectId,
@@ -316,7 +314,7 @@ export type AssignmentEvent = { readonly note?: string } & (
  * the moves an ordinary worker's assignment takes; only the project assistant's admission of a
  * managed root writes it.
  */
-export const MIRRORED_STATES = [
+const MIRRORED_STATES = [
   "running",
   "needs-input",
   "stopping",
@@ -594,7 +592,7 @@ function summarizeAssignment(assignment: Assignment): string {
   return [
     `${assignment.assignmentId} ${assignment.state} (${detail.join(", ")})`,
     ...(latest ? [`latest: ${oneLine(latest)}`] : []),
-  ].join(" — ");
+  ].join(", ");
 }
 
 function summarizeProject(brief: ProjectBrief, assignments: ReadonlyArray<Assignment>): string {
@@ -610,7 +608,7 @@ function summarizeProject(brief: ProjectBrief, assignments: ReadonlyArray<Assign
       ? "unranked"
       : [brief.priority.rank, ...(brief.priority.reason ? [oneLine(brief.priority.reason)] : [])]
           .map(String)
-          .join(" — ");
+          .join(": ");
   return [
     `## ${brief.projectId} / ${brief.ideaId ?? "legacy"}`,
     `Priority: ${priority}`,

@@ -138,7 +138,7 @@ export const workItemReferenceText = (
   item: Pick<WorkItemSummary, "ref" | "key" | "title" | "url"> & { readonly locator?: string },
 ): string => {
   const where = item.url ?? item.locator;
-  return `Work item ${item.key}: ${item.title}${where === undefined || where === null ? "" : ` (${where})`} — read it with work_read ${workItemRefString(item.ref)}`;
+  return `Work item ${item.key}: ${item.title}${where === undefined || where === null ? "" : ` (${where})`}. Read it with work_read ${workItemRefString(item.ref)}`;
 };
 
 /**
@@ -280,7 +280,7 @@ export const WorkListPreferences = Schema.Struct({
 });
 export type WorkListPreferences = typeof WorkListPreferences.Type;
 
-export const DEFAULT_WORK_LIST_PREFERENCES: WorkListPreferences = {
+const DEFAULT_WORK_LIST_PREFERENCES: WorkListPreferences = {
   view: "ready",
   assignedToMe: false,
 };

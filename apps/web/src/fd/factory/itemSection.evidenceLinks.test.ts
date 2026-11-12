@@ -37,7 +37,7 @@ const blocking: FactoryReviewSummary = {
   reviewedAt: ms(9),
 };
 
-const FAILED_TEXT = "Failed with exit code 1 on 0123456 in 2.0s";
+const FAILED_TEXT = "Failed with exit code 1 on 0123456 in 2s";
 const REVIEW_TEXT = "Changes required, blocking on 0123456: 1 high, 0 medium, 2 low";
 
 /**

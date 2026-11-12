@@ -45,7 +45,7 @@ const wire = <A>(effect: Effect.Effect<A, WorkDomainError>): Effect.Effect<A, Wo
  * Thin WebSocket handlers: decode is done by the group, each entry calls one service method
  * and maps domain errors to the wire error.
  */
-export const wsHandlers = (input: {
+const wsHandlers = (input: {
   readonly work: WorkService.WorkService["Service"];
   readonly workThreads: WorkThreads.WorkThreads["Service"];
   readonly startup: ServerRuntimeStartup.ServerRuntimeStartup["Service"];

@@ -16,43 +16,44 @@ let sequence = 0;
 
 /** This CLI returns the slash-command RPC before its separate compaction notification settles. */
 export const devinCompaction: Pick<AcpAdapterV2Flavor, "registerExtensions" | "runPrompt"> = {
-  registerExtensions: (context) =>
-    Effect.gen(function* () {
-      const pending = new Map<string, Pending>();
-      pendingByRuntime.set(context.runtime, pending);
-      yield* context.runtime.handleExtNotification("_cognition.ai/compaction", Notice, (notice) =>
-        Effect.gen(function* () {
-          let operation = pending.get(notice.sessionId);
-          if (!operation && notice.status === "started") {
-            operation = {
-              id: `native-compaction:${++sequence}`,
-              done: yield* Deferred.make<string>(),
-            };
-            pending.set(notice.sessionId, operation);
-          }
-          if (!operation) return;
-          const status =
-            notice.status === "started"
-              ? "in_progress"
-              : notice.status === "completed"
-                ? "completed"
-                : notice.status === "failed"
-                  ? "failed"
-                  : undefined;
-          if (status === undefined) return;
-          yield* context.reportCompaction({
-            sessionId: notice.sessionId,
-            compactionId: operation.id,
-            status,
-            ...(notice.summary ? { summary: notice.summary } : {}),
-          });
-          if (status !== "in_progress") {
-            yield* Deferred.succeed(operation.done, status);
-            pending.delete(notice.sessionId);
-          }
-        }),
-      );
-    }),
+  registerExtensions: Effect.fn("devinCompaction.registerExtensions")(function* (
+    context: Parameters<NonNullable<AcpAdapterV2Flavor["registerExtensions"]>>[0],
+  ) {
+    const pending = new Map<string, Pending>();
+    pendingByRuntime.set(context.runtime, pending);
+    yield* context.runtime.handleExtNotification("_cognition.ai/compaction", Notice, (notice) =>
+      Effect.gen(function* () {
+        let operation = pending.get(notice.sessionId);
+        if (!operation && notice.status === "started") {
+          operation = {
+            id: `native-compaction:${++sequence}`,
+            done: yield* Deferred.make<string>(),
+          };
+          pending.set(notice.sessionId, operation);
+        }
+        if (!operation) return;
+        const status =
+          notice.status === "started"
+            ? "in_progress"
+            : notice.status === "completed"
+              ? "completed"
+              : notice.status === "failed"
+                ? "failed"
+                : undefined;
+        if (status === undefined) return;
+        yield* context.reportCompaction({
+          sessionId: notice.sessionId,
+          compactionId: operation.id,
+          status,
+          ...(notice.summary ? { summary: notice.summary } : {}),
+        });
+        if (status !== "in_progress") {
+          yield* Deferred.succeed(operation.done, status);
+          pending.delete(notice.sessionId);
+        }
+      }),
+    );
+  }),
   runPrompt: (runtime, sessionId, prompt) => {
     if (prompt[0]?.type !== "text" || !/^\/compact(?:\s|$)/.test(prompt[0].text))
       return runtime.prompt({ prompt });
@@ -69,21 +70,22 @@ export const devinCompaction: Pick<AcpAdapterV2Flavor, "registerExtensions" | "r
       };
       pending.set(sessionId, operation);
       return yield* runtime.prompt({ prompt }).pipe(
-        Effect.flatMap((result) =>
-          result.stopReason === "cancelled"
-            ? Effect.succeed(result)
-            : Deferred.await(operation.done).pipe(
-                Effect.flatMap((status) =>
-                  status === "completed"
-                    ? Effect.succeed(result)
-                    : Effect.fail(
-                        new Errors.AcpTransportError({
-                          cause: undefined,
-                          detail: "Devin reported that native compaction failed.",
-                        }),
-                      ),
-                ),
+        Effect.filterOrElse(
+          (result) => result.stopReason === "cancelled",
+          (result) =>
+            Deferred.await(operation.done).pipe(
+              Effect.filterOrElse(
+                (status) => status === "completed",
+                () =>
+                  Effect.fail(
+                    new Errors.AcpTransportError({
+                      cause: undefined,
+                      detail: "Devin reported that native compaction failed.",
+                    }),
+                  ),
               ),
+              Effect.as(result),
+            ),
         ),
         Effect.timeout("90 seconds"),
         Effect.mapError(

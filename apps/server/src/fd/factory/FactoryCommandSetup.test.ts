@@ -877,9 +877,9 @@ it.layer(NodeServices.layer)("FactoryCommandSetup validation", (it) => {
         Layer.provide(
           Layer.mock(ProjectStore.ProjectStoreV2)({
             get: (() =>
-              Effect.succeed(
-                Option.some({ workspaceRoot: root }),
-              )) as unknown as ProjectStore.ProjectStoreV2["Service"]["get"],
+              Effect.succeedSome({
+                workspaceRoot: root,
+              })) as unknown as ProjectStore.ProjectStoreV2["Service"]["get"],
           }),
         ),
         Layer.provide(NodePath.layerWin32),

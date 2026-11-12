@@ -1,9 +1,7 @@
 /**
- * How the caller policy (see `CallerPolicy`) treats each published MCP tool when a thread of a
- * Factory delivery the project assistant manages calls it, by exact name. A name this module does
- * not list is refused, so a tool published later stays refused there until it is classified.
- * The project assistant's own threads reach only the `allow` class and their own toolkit (see
- * `toolPolicy`).
+ * How `CallerPolicy` treats each MCP tool, by exact name, for threads of managed deliveries.
+ * Unlisted names are refused, so new tools stay refused until classified. The assistant's own
+ * threads reach only `allow` plus their toolkit (see `toolPolicy`).
  */
 export type CallerToolClass = "refuse" | "respond_live" | "delegate" | "allow";
 
@@ -18,13 +16,10 @@ const REFUSED: ReadonlySet<string> = new Set([
   "t3_thread_launch",
   "create_threads",
   "schedule_task",
-  "update_scheduled_task",
   "run_scheduled_task_now",
   "t3_worktree_handoff",
-  "t3_thread_fork",
-  "t3_thread_merge_back",
-  "t3_queue_edit",
-  "t3_queue_promote_to_steer",
+  "t3_environment_link",
+  "t3_environment_unlink",
   "watch_pull_request",
   "work_start_thread",
   "factory_deliver",
@@ -47,36 +42,30 @@ const ALLOWED: ReadonlySet<string> = new Set([
   "html_preview",
   "html_render",
   "link_pull_request",
+  "link_pull_requests",
   "list_scheduled_tasks",
   "list_thread_pull_requests",
   "orchestrator_capabilities",
-  "preview_click",
   "preview_dialog",
-  "preview_drag",
   "preview_evaluate",
-  "preview_hover",
   "preview_navigate",
   "preview_open",
-  "preview_press",
   "preview_recording_start",
   "preview_recording_stop",
   "preview_resize",
-  "preview_scroll",
-  "preview_select",
   "preview_set_appearance",
   "preview_snapshot",
   "preview_status",
-  "preview_type",
-  "preview_upload",
+  "preview_act",
   "preview_wait_for",
   "read_pull_request_guide",
   "request_secret",
   "t3_attachment_discard",
   "t3_attachment_prepare_upload",
+  "t3_background_wait",
   "t3_environment_preferences_update",
   "t3_environment_read",
-  "t3_pending_request_list",
-  "t3_pending_request_read",
+  "t3_environment_links",
   "t3_preview_close",
   "t3_preview_list",
   "t3_project_clone",
@@ -85,18 +74,12 @@ const ALLOWED: ReadonlySet<string> = new Set([
   "t3_project_list",
   "t3_project_read",
   "t3_project_update",
-  "t3_queue_cancel",
-  "t3_queue_list",
-  "t3_queue_read",
-  "t3_queue_reorder",
-  "t3_thread_configuration",
   "t3_thread_configure",
   "t3_thread_interrupt",
   "t3_thread_list",
   "t3_thread_organize",
   "t3_thread_read",
   "t3_thread_search",
-  "t3_thread_transfers",
   "t3_thread_update",
   "t3_thread_wait",
   "t3_workflow_stop",
@@ -105,6 +88,7 @@ const ALLOWED: ReadonlySet<string> = new Set([
   "task_cancel",
   "task_status",
   "unlink_pull_request",
+  "unlink_pull_requests",
   "unwatch_pull_request",
   "work_comment",
   "work_create",
@@ -117,11 +101,34 @@ const ALLOWED: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * The class of the tool `name`. `respond_live` answers only questions that continue a run
- * already counted; `delegate` runs under the delivery's slot (see `CallerPolicy`).
+ * Tools that take an `action`, classed per action. An action this does not list is refused.
  */
-export const callerToolClass = (name: string): CallerToolClass => {
-  if (name === "t3_pending_request_respond") return "respond_live";
+const ACTIONS: Readonly<Record<string, Readonly<Record<string, CallerToolClass>>>> = {
+  t3_pending_request: { list: "allow", read: "allow", respond: "respond_live" },
+  t3_queue: {
+    list: "allow",
+    read: "allow",
+    cancel: "allow",
+    reorder: "allow",
+    edit: "refuse",
+    promote_to_steer: "refuse",
+  },
+  t3_thread_transfer: { status: "allow", fork: "refuse", merge_back: "refuse" },
+};
+
+const actionOf = (args: unknown) =>
+  (args as { readonly action?: unknown } | null | undefined)?.action;
+
+/**
+ * The class of a call to the tool `name` with `args`. `respond_live` answers only questions that
+ * continue a run already counted; `delegate` runs under the delivery's slot (see `CallerPolicy`).
+ */
+export const callerToolClass = (name: string, args?: unknown): CallerToolClass => {
+  const actions = ACTIONS[name];
+  if (actions !== undefined) {
+    const action = actionOf(args);
+    return (typeof action === "string" ? actions[action] : undefined) ?? "refuse";
+  }
   if (name === "delegate_task") return "delegate";
   if (ALLOWED.has(name)) return "allow";
   return "refuse";
@@ -129,7 +136,7 @@ export const callerToolClass = (name: string): CallerToolClass => {
 
 /** Whether `name` has a class of its own here, rather than being refused as unlisted. */
 export const isClassifiedTool = (name: string) =>
-  name === "t3_pending_request_respond" ||
+  name in ACTIONS ||
   name === "delegate_task" ||
   name.startsWith(ASSISTANT_PREFIX) ||
   REFUSED.has(name) ||

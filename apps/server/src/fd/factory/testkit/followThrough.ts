@@ -493,6 +493,20 @@ export const runStatus = (threadId: ThreadId, runId: RunId) =>
     Effect.orDie,
   );
 
+/**
+ * Asserts core dropped a queued pull request wake before it started: a cancel ends the delivery's
+ * watch, and core cancels a wake its watch no longer owes when the run ahead of it ends. No
+ * provider turn ran it, so there is nothing for Factory to stop.
+ */
+export const wakeDroppedBeforeStart = (world: World, threadId: ThreadId, runId: RunId) =>
+  Effect.gen(function* () {
+    assert.strictEqual(yield* runStatus(threadId, runId), "cancelled");
+    assert.isFalse(
+      world.provider.started.some((turn) => turn.runId === runId),
+      `A provider turn started the dropped wake ${runId}.`,
+    );
+  });
+
 export const threadShell = (threadId: ThreadId) =>
   Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
     orchestrator.getThreadShell(threadId),

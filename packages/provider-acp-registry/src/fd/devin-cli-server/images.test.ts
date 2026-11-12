@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import {
@@ -33,6 +34,7 @@ import * as Exit from "effect/Exit";
 
 const layerInfrastructure = Layer.mergeAll(
   NodeServices.layer,
+  NodeCrypto.layer,
   AcpRegistryRuntimeCoordinator.layer,
   IdAllocator.layer,
   McpProviderSessions.layer,
@@ -191,5 +193,4 @@ it.live.each(["supported", "unsupported_session", "unsupported_model", "unreadab
       const terminal = events.find((event) => event.type === "turn.terminal");
       expect(terminal).toMatchObject({ status: "completed" });
     }).pipe(Effect.provide(layerTest), Effect.scoped),
-  { timeout: 15_000 },
 );

@@ -17,7 +17,7 @@ import type {
 } from "@t3tools/contracts/fd/work-management";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -57,11 +57,9 @@ export interface WorkThreadStart {
 }
 
 /**
- * Starts an agent thread from a Work item. Starts of one item (in its canonical spelling) are
- * serialized, the link row is written before the launch so a concurrent start sees it, and an
- * open thread an earlier start launched is returned instead of a second launch unless the caller forces one. The
- * link is a reservation for as long as the launch runs; a launch that ends without a thread
- * removes it, however it ended.
+ * Starts an agent thread from a Work item. Starts per canonical item are serialized and the link
+ * row is written first, reserving it while the launch runs; a launch ending without a thread
+ * removes it. An open earlier thread is returned instead unless the caller forces a new one.
  */
 export class WorkThreads extends Context.Service<
   WorkThreads,
@@ -80,7 +78,7 @@ const make = Effect.gen(function* () {
   const projects = yield* ProjectStore.ProjectStoreV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const settings = yield* ServerSettings.ServerSettingsService;
-  const crypto = yield* Crypto.Crypto;
+  const crypto = yield* SecureRandom.SecureRandom;
 
   // One server owns a T3 home, so an in-process lock per item is enough. Locks are tiny and
   // bounded by the items ever started in this process.
@@ -108,40 +106,39 @@ const make = Effect.gen(function* () {
    * before creating it. A thread linked by hand, by an agent, or launched by another feature
    * (a Factory stage) is not a start of this item: starting launches its own thread.
    */
-  const openLinkedThread = (ref: WorkItemRef) =>
-    Effect.gen(function* () {
-      const rows = yield* links
-        .listByItem(ref.sourceId, ref.itemId)
-        .pipe(Effect.mapError(storeFailure));
-      for (const link of rows) {
-        const started = link.source === "started" && link.origin === null;
-        // A reservation is released only once its thread exists or its link is gone, so it is
-        // checked before the thread.
-        if (yield* work.isLaunching(link.threadId)) {
-          if (started) return link.threadId;
-          continue;
-        }
-        const shell = yield* projections
-          .getThreadShell(link.threadId)
-          .pipe(Effect.mapError(threadReadFailure));
-        if (shell === null) {
-          // No launch holds it and no thread exists: a launch that died with the process.
-          yield* links
-            .unlink(link.sourceId, link.itemId, link.threadId)
-            .pipe(Effect.mapError(storeFailure));
-          continue;
-        }
-        if (
-          started &&
-          shell.deletedAt === null &&
-          shell.settledAt === null &&
-          shell.archivedAt === null
-        ) {
-          return link.threadId;
-        }
+  const openLinkedThread = Effect.fn("WorkThreads.openLinkedThread")(function* (ref: WorkItemRef) {
+    const rows = yield* links
+      .listByItem(ref.sourceId, ref.itemId)
+      .pipe(Effect.mapError(storeFailure));
+    for (const link of rows) {
+      const started = link.source === "started" && link.origin === null;
+      // A reservation is released only once its thread exists or its link is gone, so it is
+      // checked before the thread.
+      if (yield* work.isLaunching(link.threadId)) {
+        if (started) return link.threadId;
+        continue;
       }
-      return undefined;
-    });
+      const shell = yield* projections
+        .getThreadShell(link.threadId)
+        .pipe(Effect.mapError(threadReadFailure));
+      if (shell === null) {
+        // No launch holds it and no thread exists: a launch that died with the process.
+        yield* links
+          .unlink(link.sourceId, link.itemId, link.threadId)
+          .pipe(Effect.mapError(storeFailure));
+        continue;
+      }
+      if (
+        started &&
+        shell.deletedAt === null &&
+        shell.settledAt === null &&
+        shell.archivedAt === null
+      ) {
+        return link.threadId;
+      }
+    }
+    return undefined;
+  });
 
   /** Drops a reservation whose launch ended without creating its thread. */
   const releaseUnlaunched = (ref: WorkItemRef, threadId: ThreadId) =>
@@ -159,195 +156,186 @@ const make = Effect.gen(function* () {
       Effect.flatMap((ref) => startItem(actor, { ...input, ref }).pipe(withItemLock(ref))),
     );
 
-  const startItem = (actor: WorkActor, input: WorkThreadStart) =>
-    Effect.gen(function* () {
-      const { stored, adapter, runtime } = yield* work.resolveSource(input.ref.sourceId, {
-        interactive: true,
-      });
-      const item = yield* adapter.get(runtime, input.ref.itemId);
-
-      if (!input.force) {
-        const open = yield* openLinkedThread(input.ref);
-        if (open !== undefined) return { threadId: open, resumed: true };
-      }
-
-      const project = Option.getOrUndefined(
-        yield* projects
-          .get(stored.projectId)
-          .pipe(
-            Effect.mapError(
-              (cause) => new WorkUnavailable({ detail: "The project could not be read.", cause }),
-            ),
-          ),
-      );
-      if (project === undefined) {
-        return yield* new WorkInvalid({
-          detail: "The project is not available on this environment.",
-        });
-      }
-      const resolved = resolveProjectSettings(
-        yield* settings.getSettings.pipe(
-          Effect.mapError(
-            (cause) => new WorkUnavailable({ detail: "Settings could not be read.", cause }),
-          ),
-        ),
-        project.projectId,
-        project,
-      ).settings;
-
-      const requested = input.workspaceStrategy;
-      const worktree =
-        requested !== undefined
-          ? requested.type === "worktree"
-          : !RepositorySet.isMultiRepo(project.repositories) &&
-            resolved.defaultThreadEnvMode === "worktree";
-      const workspaceStrategy: ThreadLaunch.ThreadLaunchWorkspaceStrategy = worktree
-        ? {
-            type: "worktree",
-            baseRef: "HEAD",
-            branch:
-              requested?.type === "worktree" && requested.branch !== undefined
-                ? requested.branch
-                : workBranchName(item),
-            startFromOrigin: false,
-          }
-        : { type: "root" };
-      if (workspaceStrategy.type === "worktree") {
-        yield* launches
-          .checkWorktreeBase({ projectId: project.projectId, workspaceStrategy })
-          .pipe(Effect.mapError((error) => new WorkInvalid({ detail: error.message })));
-      }
-
-      // The same chain a new thread in the UI follows, ending at the automatic selection the
-      // clients show as "Automatic" when nothing is configured.
-      const modelSelection =
-        input.modelSelection ??
-        resolved.defaultModelSelection ??
-        input.fallbackModelSelection ??
-        getAutoBootstrapThreadModelSelection();
-
-      const threadId =
-        input.threadId ??
-        ThreadId.make(
-          yield* crypto
-            .randomUUIDv4()
-            .pipe(
-              Effect.mapError(
-                (cause) =>
-                  new WorkUnavailable({ detail: "A thread id could not be minted.", cause }),
-              ),
-            ),
-        );
-      const commandId = CommandId.make(
-        `work-start:${input.ref.sourceId}:${input.ref.itemId}:${threadId}`,
-      );
-      const scope = workItemLinkScope(item);
-
-      // Written first so a concurrent start (after this lock) or a crash both see the attempt,
-      // and reserved until the launch ends so the link sweep never takes a slow launch for a
-      // dead one. Whatever ends the launch without a thread (a failure, a defect, the caller
-      // going away) removes the link, so a retry never resumes a thread that does not exist.
-      const reserve = links
-        .link({
-          sourceId: input.ref.sourceId,
-          itemId: input.ref.itemId,
-          threadId,
-          source: "started",
-          snapshot: {
-            key: item.key,
-            title: item.title,
-            status: item.status,
-            url: item.url,
-            revision: item.revision,
-            mode: input.mode,
-            autoStarted: false,
-            ...scope,
-          },
-        })
-        .pipe(Effect.mapError(storeFailure));
-
-      const launch = launches
-        .launch({
-          commandId,
-          threadId,
-          projectId: project.projectId,
-          title: workThreadTitle(item),
-          modelSelection,
-          runtimeMode: input.runtimeMode ?? resolved.defaultRuntimeMode,
-          interactionMode: input.interactionMode ?? "default",
-          workspaceStrategy,
-          createdBy: actor.id.startsWith("session:") ? "user" : "agent",
-          creationSource: input.creationSource,
-          initialMessage: {
-            messageId: MessageId.make(`work-start-message:${threadId}`),
-            text: renderWorkPrompt({
-              item,
-              mode: input.mode,
-              directory: stored.config.kind === "markdown" ? stored.config.directory : undefined,
-              extra: input.prompt,
-            }),
-            attachments: [],
-          },
-        })
-        .pipe(
-          Effect.mapError((error) =>
-            error._tag === "ThreadManagementProviderInstanceDisabledError"
-              ? new WorkInvalid({ detail: error.message })
-              : new WorkUnavailable({ detail: error.message, cause: error }),
-          ),
-        );
-
-      const launched = yield* Effect.uninterruptibleMask((restore) =>
-        work.reserveLaunch(threadId).pipe(
-          Effect.andThen(reserve),
-          Effect.andThen(restore(launch)),
-          Effect.onExit((exit) =>
-            Exit.isSuccess(exit) ? Effect.void : releaseUnlaunched(input.ref, threadId),
-          ),
-          Effect.scoped,
-        ),
-      );
-
-      // Only Markdown moves on its own; remote trackers keep their workflow. The move is
-      // conditional on the item the thread was started from, so an item someone finished,
-      // cancelled or changed during the launch is left alone.
-      if (
-        !launched.resumed &&
-        stored.config.kind === "markdown" &&
-        stored.config.autoStart &&
-        item.status === "todo"
-      ) {
-        yield* adapter
-          .setStatus(
-            runtime,
-            { ref: input.ref, status: "in_progress", expectedRevision: item.revision },
-            actor,
-          )
-          .pipe(
-            Effect.flatMap((updated) =>
-              links.updateSnapshot(input.ref.sourceId, input.ref.itemId, threadId, {
-                key: updated.key,
-                title: updated.title,
-                status: updated.status,
-                url: updated.url,
-                revision: updated.revision,
-                mode: input.mode,
-                autoStarted: true,
-                // The write was conditional on the item the thread started from, and moved only
-                // its status, so what the thread saw stays what it is compared with.
-                ...scope,
-              }),
-            ),
-            Effect.catchCause((cause) =>
-              Effect.logWarning("work item auto-start status change skipped", cause),
-            ),
-          );
-      }
-
-      // The link changed, and a Markdown item may have moved to in progress.
-      yield* work.sourceChanged(input.ref.sourceId);
-      return { threadId: launched.threadId, resumed: launched.resumed };
+  const startItem = Effect.fn("WorkThreads.startItem")(function* (
+    actor: WorkActor,
+    input: WorkThreadStart,
+  ) {
+    const { stored, adapter, runtime } = yield* work.resolveSource(input.ref.sourceId, {
+      interactive: true,
     });
+    const item = yield* adapter.get(runtime, input.ref.itemId);
+
+    if (!input.force) {
+      const open = yield* openLinkedThread(input.ref);
+      if (open !== undefined) return { threadId: open, resumed: true };
+    }
+
+    const project = Option.getOrUndefined(
+      yield* projects
+        .get(stored.projectId)
+        .pipe(
+          Effect.mapError(
+            (cause) => new WorkUnavailable({ detail: "The project could not be read.", cause }),
+          ),
+        ),
+    );
+    if (project === undefined) {
+      return yield* new WorkInvalid({
+        detail: "The project is not available on this environment.",
+      });
+    }
+    const resolved = resolveProjectSettings(
+      yield* settings.getSettings.pipe(
+        Effect.mapError(
+          (cause) => new WorkUnavailable({ detail: "Settings could not be read.", cause }),
+        ),
+      ),
+      project.projectId,
+      project,
+    ).settings;
+
+    const requested = input.workspaceStrategy;
+    const worktree =
+      requested !== undefined
+        ? requested.type === "worktree"
+        : !RepositorySet.isMultiRepo(project.repositories) &&
+          resolved.defaultThreadEnvMode === "worktree";
+    const workspaceStrategy: ThreadLaunch.ThreadLaunchWorkspaceStrategy = worktree
+      ? {
+          type: "worktree",
+          baseRef: "HEAD",
+          branch:
+            requested?.type === "worktree" && requested.branch !== undefined
+              ? requested.branch
+              : workBranchName(item),
+          startFromOrigin: false,
+        }
+      : { type: "root" };
+    if (workspaceStrategy.type === "worktree") {
+      yield* launches
+        .checkWorktreeBase({ projectId: project.projectId, workspaceStrategy })
+        .pipe(Effect.mapError((error) => new WorkInvalid({ detail: error.message })));
+    }
+
+    // The same chain a new thread in the UI follows, ending at the automatic selection the
+    // clients show as "Automatic" when nothing is configured.
+    const modelSelection =
+      input.modelSelection ??
+      resolved.defaultModelSelection ??
+      input.fallbackModelSelection ??
+      getAutoBootstrapThreadModelSelection();
+
+    const threadId = input.threadId ?? ThreadId.make(yield* crypto.uuidV4());
+    const commandId = CommandId.make(
+      `work-start:${input.ref.sourceId}:${input.ref.itemId}:${threadId}`,
+    );
+    const scope = workItemLinkScope(item);
+
+    // Written first so a concurrent start (after this lock) or a crash both see the attempt,
+    // and reserved until the launch ends so the link sweep never takes a slow launch for a
+    // dead one. Whatever ends the launch without a thread (a failure, a defect, the caller
+    // going away) removes the link, so a retry never resumes a thread that does not exist.
+    const reserve = links
+      .link({
+        sourceId: input.ref.sourceId,
+        itemId: input.ref.itemId,
+        threadId,
+        source: "started",
+        snapshot: {
+          key: item.key,
+          title: item.title,
+          status: item.status,
+          url: item.url,
+          revision: item.revision,
+          mode: input.mode,
+          autoStarted: false,
+          ...scope,
+        },
+      })
+      .pipe(Effect.mapError(storeFailure));
+
+    const launch = launches
+      .launch({
+        commandId,
+        threadId,
+        projectId: project.projectId,
+        title: workThreadTitle(item),
+        modelSelection,
+        runtimeMode: input.runtimeMode ?? resolved.defaultRuntimeMode,
+        interactionMode: input.interactionMode ?? "default",
+        workspaceStrategy,
+        createdBy: actor.id.startsWith("session:") ? "user" : "agent",
+        creationSource: input.creationSource,
+        initialMessage: {
+          messageId: MessageId.make(`work-start-message:${threadId}`),
+          text: renderWorkPrompt({
+            item,
+            mode: input.mode,
+            directory: stored.config.kind === "markdown" ? stored.config.directory : undefined,
+            extra: input.prompt,
+          }),
+          attachments: [],
+        },
+      })
+      .pipe(
+        Effect.mapError((error) =>
+          error._tag === "ThreadManagementProviderInstanceDisabledError"
+            ? new WorkInvalid({ detail: error.message })
+            : new WorkUnavailable({ detail: error.message, cause: error }),
+        ),
+      );
+
+    const launched = yield* Effect.uninterruptibleMask((restore) =>
+      work.reserveLaunch(threadId).pipe(
+        Effect.andThen(reserve),
+        Effect.andThen(restore(launch)),
+        Effect.onExit((exit) =>
+          Exit.isSuccess(exit) ? Effect.void : releaseUnlaunched(input.ref, threadId),
+        ),
+        Effect.scoped,
+      ),
+    );
+
+    // Only Markdown moves on its own; remote trackers keep their workflow. The move is
+    // conditional on the item the thread was started from, so an item someone finished,
+    // cancelled or changed during the launch is left alone.
+    if (
+      !launched.resumed &&
+      stored.config.kind === "markdown" &&
+      stored.config.autoStart &&
+      item.status === "todo"
+    ) {
+      yield* adapter
+        .setStatus(
+          runtime,
+          { ref: input.ref, status: "in_progress", expectedRevision: item.revision },
+          actor,
+        )
+        .pipe(
+          Effect.flatMap((updated) =>
+            links.updateSnapshot(input.ref.sourceId, input.ref.itemId, threadId, {
+              key: updated.key,
+              title: updated.title,
+              status: updated.status,
+              url: updated.url,
+              revision: updated.revision,
+              mode: input.mode,
+              autoStarted: true,
+              // The write was conditional on the item the thread started from, and moved only
+              // its status, so what the thread saw stays what it is compared with.
+              ...scope,
+            }),
+          ),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("work item auto-start status change skipped", cause),
+          ),
+        );
+    }
+
+    // The link changed, and a Markdown item may have moved to in progress.
+    yield* work.sourceChanged(input.ref.sourceId);
+    return { threadId: launched.threadId, resumed: launched.resumed };
+  });
 
   return WorkThreads.of({ start });
 });

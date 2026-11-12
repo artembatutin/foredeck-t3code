@@ -307,7 +307,7 @@ export interface FactoryDeliveryView {
 
 const short = (sha: string) => sha.slice(0, 7);
 
-export const receiptText = (receipt: FactoryVerifyReceiptSummary): string => {
+const receiptText = (receipt: FactoryVerifyReceiptSummary): string => {
   const result = receipt.timedOut
     ? "Timed out"
     : receipt.code === 0
@@ -318,7 +318,7 @@ export const receiptText = (receipt: FactoryVerifyReceiptSummary): string => {
   return `${result} on ${short(receipt.headSha)} in ${formatDuration(receipt.durationMs)}`;
 };
 
-export const reviewText = (review: FactoryReviewSummary): string => {
+const reviewText = (review: FactoryReviewSummary): string => {
   const verdict = review.verdict === "pass" ? "Pass" : "Changes required";
   const { high, medium, low } = review.findings;
   return `${verdict}${review.blocking ? ", blocking" : ""} on ${short(review.headSha)}: ${high} high, ${medium} medium, ${low} low`;
@@ -336,11 +336,9 @@ const reviewLine = (review: FactoryReviewSummary): FactoryReviewLine => ({
 });
 
 /**
- * What a Work item's Factory section shows of the item's current delivery, on every client: null
- * on a server without Factory, before the project's deliveries load, and for an item with no
- * delivery. A control is offered only where the shared controls model allows it, the session
- * holds its grant and the environment is connected; during a reconnect's backoff nothing is
- * offered, though the deliveries read before still show.
+ * A Work item's current delivery for its Factory section on every client; null without Factory,
+ * before deliveries load, or with no delivery. Controls need the controls model, the session's
+ * grant and a connected environment, so a reconnect's backoff offers none but still shows them.
  */
 export function factoryDeliveryView(input: {
   readonly environmentId: EnvironmentId;

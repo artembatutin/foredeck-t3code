@@ -43,6 +43,7 @@ import {
 } from "../../components/ui/select";
 import { useConnectedEnvironmentIds } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
+import { providersIgnoringCheckedAtAtom } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { factoryErrorText } from "./deliver";
 import {
@@ -79,17 +80,16 @@ const LIMITS: ReadonlyArray<{ readonly limit: FactoryLimitName; readonly label: 
  */
 export function FactorySettings({
   project,
-  serverConfig,
   environmentLabel,
 }: {
   project: EnvironmentProject;
-  serverConfig: ServerConfig | null;
   environmentLabel: string;
 }) {
   const target: FactorySettingsTarget = {
     environmentId: project.environmentId,
     projectId: project.id,
   };
+  const providers = useAtomValue(providersIgnoringCheckedAtAtom(target.environmentId));
   const access: FactorySettingsAccess = {
     supported: useAtomValue(factoryEnvironment.supported(target.environmentId)),
     connected: useConnectedEnvironmentIds().some((id) => id === target.environmentId),
@@ -105,7 +105,7 @@ export function FactorySettings({
         key={JSON.stringify([target.environmentId, target.projectId])}
         target={target}
         access={access}
-        providers={serverConfig?.providers ?? []}
+        providers={providers}
       />
     </SettingsSection>
   );
@@ -136,6 +136,7 @@ function SettingsEditor({
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const commandSetup = commandSetupPermitted && factorySettingsMode(access) === "editable";
   const { environmentId, projectId } = target;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- runs the permission-guarded discovery RPC for the open target and drops a reply that lands after the target changes or the editor unmounts
   useEffect(() => {
     if (!commandSetup) return;
     let current = true;

@@ -28,12 +28,10 @@ export class FactoryChanges extends Context.Service<
     /** The current epoch on subscribe, then every move. */
     readonly changes: Stream.Stream<number>;
     /**
-     * Runs a write in a transaction of its own and moves the epoch once that has committed, so a
-     * client refetching on the new value reads what it stored; `stored` tells a result that wrote
-     * from one that did not. The write stays interruptible, and one that fails or is interrupted
-     * rolls back and moves nothing. Committing and moving are not: an interrupt that arrives
-     * meanwhile takes effect once the epoch has moved, so no committed write goes unannounced.
-     * Never call it inside another transaction, which would commit only later.
+     * Runs a write in its own transaction and moves the epoch once committed (only when `stored`
+     * says it wrote). A failed or interrupted write rolls back; commit-and-move is uninterruptible,
+     * so no committed write goes unannounced. Never call it inside another transaction, which
+     * would commit only later.
      */
     readonly transact: <A, E, R>(
       write: Effect.Effect<A, E, R>,
@@ -69,29 +67,32 @@ const make = Effect.gen(function* () {
     changes: SubscriptionRef.changes(epoch),
     announce: move,
     refusedTurns: Ref.get(refused),
-    noteRefusedTurn: (threadId, turn) =>
+    noteRefusedTurn: Effect.fn("FactoryChanges.noteRefusedTurn")((threadId, turn) =>
       Ref.modify(refused, (current) =>
         current.has(threadId)
           ? ([false, current] as const)
           : ([true, new Map(current).set(threadId, turn)] as const),
       ).pipe(Effect.flatMap((added) => (added ? move : Effect.void))),
-    clearRefusedTurn: (threadId) =>
+    ),
+    clearRefusedTurn: Effect.fn("FactoryChanges.clearRefusedTurn")((threadId) =>
       Ref.modify(refused, (current) => {
         if (!current.has(threadId)) return [false, current] as const;
         const next = new Map(current);
         next.delete(threadId);
         return [true, next] as const;
       }).pipe(Effect.flatMap((removed) => (removed ? move : Effect.void))),
+    ),
     // The transaction's own mask ends by raising an interrupt its commit held off, so the
     // transaction would exit interrupted though it committed. Inside this mask its own leaves
     // interruptibility alone: the exit seen here says whether it committed, and the interrupt is
     // raised once the epoch has moved.
-    transact: (write, stored = () => true) =>
+    transact: Effect.fn("FactoryChanges.transact")((write, stored = () => true) =>
       Effect.uninterruptibleMask((restore) =>
         Effect.onExit(sql.withTransaction(restore(write)), (exit) =>
           Exit.isSuccess(exit) && stored(exit.value) ? move : Effect.void,
         ),
       ),
+    ),
   });
 });
 

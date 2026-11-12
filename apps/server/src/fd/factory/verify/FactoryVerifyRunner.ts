@@ -144,13 +144,10 @@ export const verifySettingsHash = (settings: FactoryVerifySettings): string =>
     .digest("hex");
 
 /**
- * Runs a project's verify command against a delivery worktree's commit (port of Looper's
- * receipts). The command runs as an argument array with the worktree as cwd, never through a
- * shell; its stdout and stderr stream into `verify-<n>.log` in the delivery's evidence folder as
- * they arrive. A run that ends, fails or times out on a clean tree with HEAD unchanged becomes a
- * receipt, also written as `verify-<n>.json`; the engine decides whether it passed. A tree dirty
- * before or after the run, or a HEAD the command moved, is refused: no receipt, and the log stays
- * for diagnosis. The project's setup command runs the same way before an author's first turn.
+ * Runs a project's verify (or, before an author's first turn, setup) command in a delivery
+ * worktree as an argument array, never through a shell, streaming output to `verify-<n>.log`.
+ * Only a run on a tree clean before and after, with HEAD unchanged, yields a `verify-<n>.json`
+ * receipt; the engine decides whether it passed.
  */
 export class FactoryVerifyRunner extends Context.Service<
   FactoryVerifyRunner,
@@ -190,7 +187,7 @@ const make = Effect.gen(function* () {
    * chunk callbacks, never its buffered result, so output written before a timeout, a signal or
    * past the buffered limit stays in the log and nothing is appended twice.
    */
-  const runLogged = <E>(input: {
+  const runLogged = Effect.fn("FactoryVerifyRunner.runLogged")(function* <E>(input: {
     /** The resolved, shell-free executable to run. */
     readonly executable: string;
     readonly args: ReadonlyArray<string>;
@@ -199,63 +196,62 @@ const make = Effect.gen(function* () {
     readonly logPath: string;
     /** The error for a command that could not be run or read. */
     readonly failed: (cause: ProcessRunner.ProcessRunError) => E;
-  }) =>
-    Effect.gen(function* () {
-      const writeFailed = (cause: unknown) =>
-        new FactoryEvidence.FactoryEvidenceError({
-          operation: "write",
-          path: input.logPath,
-          cause,
-        });
-      // `wx`: a log is never overwritten, even by a concurrent run that picked the same number.
-      const log = yield* fileSystem
-        .open(input.logPath, { flag: "wx" })
-        .pipe(Effect.mapError(writeFailed));
-      const hash = NodeCrypto.createHash("sha256");
-      const append = (bytes: Uint8Array) =>
-        log.writeAll(bytes).pipe(
-          Effect.tap(() => Effect.sync(() => hash.update(bytes))),
-          Effect.mapError(writeFailed),
-        );
-
-      // The callbacks are synchronous, so they queue chunks for a writer outside the process
-      // runner's scope; its timeout cannot interrupt a write.
-      const chunks = yield* Queue.unbounded<Uint8Array, Cause.Done>();
-      const writer = yield* Stream.fromQueue(chunks).pipe(
-        Stream.runForEach(append),
-        Effect.forkScoped,
+  }) {
+    const writeFailed = (cause: unknown) =>
+      new FactoryEvidence.FactoryEvidenceError({
+        operation: "write",
+        path: input.logPath,
+        cause,
+      });
+    // `wx`: a log is never overwritten, even by a concurrent run that picked the same number.
+    const log = yield* fileSystem
+      .open(input.logPath, { flag: "wx" })
+      .pipe(Effect.mapError(writeFailed));
+    const hash = NodeCrypto.createHash("sha256");
+    const append = (bytes: Uint8Array) =>
+      log.writeAll(bytes).pipe(
+        Effect.tap(() => Effect.sync(() => hash.update(bytes))),
+        Effect.mapError(writeFailed),
       );
-      const queueChunk = (chunk: Uint8Array) => {
-        Queue.offerUnsafe(chunks, chunk);
-      };
-      const result = yield* processRunner
-        .run({
-          command: input.executable,
-          args: input.args,
-          cwd: input.cwd,
-          timeout: Duration.minutes(input.timeoutMinutes),
-          timeoutBehavior: "timedOutResult",
-          maxOutputBytes: BUFFERED_OUTPUT_BYTES,
-          outputMode: "truncate",
-          onStdoutChunk: queueChunk,
-          onStderrChunk: queueChunk,
-        })
-        .pipe(
-          Effect.map((output) => ({
-            code: output.code === null ? null : Number(output.code),
-            timedOut: output.timedOut,
-          })),
-          Effect.catch((cause) =>
-            // The exit code read fails only when a signal ended the process: a result, not an error.
-            cause._tag === "ProcessReadError" && cause.stream === "exitCode"
-              ? Effect.succeed({ code: null, timedOut: false })
-              : Effect.fail(input.failed(cause)),
-          ),
-        );
-      yield* Queue.end(chunks);
-      yield* Fiber.join(writer);
-      return { ...result, outputHash: hash.digest("hex") };
-    }).pipe(Effect.scoped);
+
+    // The callbacks are synchronous, so they queue chunks for a writer outside the process
+    // runner's scope; its timeout cannot interrupt a write.
+    const chunks = yield* Queue.unbounded<Uint8Array, Cause.Done>();
+    const writer = yield* Stream.fromQueue(chunks).pipe(
+      Stream.runForEach(append),
+      Effect.forkScoped,
+    );
+    const queueChunk = (chunk: Uint8Array) => {
+      Queue.offerUnsafe(chunks, chunk);
+    };
+    const result = yield* processRunner
+      .run({
+        command: input.executable,
+        args: input.args,
+        cwd: input.cwd,
+        timeout: Duration.minutes(input.timeoutMinutes),
+        timeoutBehavior: "timedOutResult",
+        maxOutputBytes: BUFFERED_OUTPUT_BYTES,
+        outputMode: "truncate",
+        onStdoutChunk: queueChunk,
+        onStderrChunk: queueChunk,
+      })
+      .pipe(
+        Effect.map((output) => ({
+          code: output.code === null ? null : Number(output.code),
+          timedOut: output.timedOut,
+        })),
+        Effect.catch((cause) =>
+          // The exit code read fails only when a signal ended the process: a result, not an error.
+          cause._tag === "ProcessReadError" && cause.stream === "exitCode"
+            ? Effect.succeed({ code: null, timedOut: false })
+            : Effect.fail(input.failed(cause)),
+        ),
+      );
+    yield* Queue.end(chunks);
+    yield* Fiber.join(writer);
+    return { ...result, outputHash: hash.digest("hex") };
+  }, Effect.scoped);
 
   return FactoryVerifyRunner.of({
     run: Effect.fn("FactoryVerifyRunner.run")(function* (input) {

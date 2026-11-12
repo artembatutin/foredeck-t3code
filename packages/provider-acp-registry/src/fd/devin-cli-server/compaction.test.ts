@@ -17,7 +17,6 @@ describe("native compaction completion", () => {
       const lifecycle: Array<string> = [];
       const services = yield* Layer.build(
         Layer.mock(Runtime.AcpSessionRuntime)({
-          processContainment: "none",
           handleExtNotification: (_method, _schema, handler) =>
             Effect.sync(() => {
               notify = (notice) => handler(notice as never).pipe(Effect.orDie);

@@ -39,7 +39,7 @@ export function WorkSourcesSettings({
   environmentLabel,
 }: {
   project: EnvironmentProject;
-  serverConfig: ServerConfig | null;
+  serverConfig: Pick<ServerConfig, "environment"> | null;
   environmentLabel: string;
 }) {
   const support = workSupport(serverConfig);

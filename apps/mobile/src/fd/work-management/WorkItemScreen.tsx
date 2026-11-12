@@ -48,12 +48,13 @@ import {
   View,
 } from "react-native";
 
-import { SymbolView } from "../../components/AppSymbol";
-import { AppText as Text, AppTextInput } from "../../components/AppText";
-import { EmptyState } from "../../components/EmptyState";
-import { ErrorBanner } from "../../components/ErrorBanner";
-import { ListRow } from "../../components/ListRow";
-import { ListFilterMenu } from "../../features/workspace/ListFilterMenu";
+import { SymbolView } from "../../components/ui/AppSymbol";
+import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
+import { EmptyState } from "../../components/ui/EmptyState";
+import { ErrorBanner } from "../../components/ui/ErrorBanner";
+import { ListRow } from "../../components/ui/ListRow";
+import { ListFilterMenu } from "../../features/layout/workspace/ListFilterMenu";
+import { useOpenWorkspaceDetail } from "../../features/layout/useOpenWorkspaceDetail";
 import { useMarkdownPreviewStyles } from "../../features/files/FileMarkdownPreview";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
@@ -127,6 +128,7 @@ export function WorkItemScreen({
   );
   const item = query.data;
 
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- keeps the native stack header title on the loaded item's key
   useLayoutEffect(() => {
     navigation.setOptions({ title: item?.key ?? "Work item" });
   }, [item?.key, navigation]);
@@ -197,6 +199,7 @@ function LoadedItem({
 }) {
   const navigation = useNavigation();
   const openThread = useOpenWorkThread();
+  const openDetail = useOpenWorkspaceDetail();
   const shells = useThreadShells();
   const markdownStyles = useMarkdownPreviewStyles();
   const setStatus = useAtomCommand(workCommands.setStatus);
@@ -361,10 +364,7 @@ function LoadedItem({
       draftKey,
       mergeComposerText(getComposerDraftSnapshot(draftKey).text, workItemReferenceText(item)),
     );
-    navigation.navigate("NewTaskSheet", {
-      screen: "NewTaskDraft",
-      params: { draftId: draftKey, title: item.key },
-    });
+    openDetail({ name: "Thread", params: { draft: { draftId: draftKey, title: item.key } } });
   };
 
   /** Adds what changed to the thread's draft, keeping anything the owner already typed. */

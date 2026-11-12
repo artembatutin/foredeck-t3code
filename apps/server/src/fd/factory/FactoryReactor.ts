@@ -35,18 +35,10 @@ import {
 } from "./pipeline/state.ts";
 
 /**
- * Feeds what happens to Factory's threads into their deliveries: a terminal run becomes
- * `run.finished` and a deleted thread `thread.deleted` for the delivery whose active stage
- * attempt owns the thread (any delivery recording it, for a deletion); other threads pass by.
- * A pull request link that core's sync stored merged or closed on the thread a delivery's open
- * pull request is linked to becomes `pr.merged` or `pr.closed` for that delivery; nothing polls.
- * A run that core's pull request watch queued as a wake on a thread a Factory launch made becomes
- * `pr.feedback` for the delivery whose pull request it may be (see `takeWake`), which the engine
- * adopts as a follow-through round or not.
- * A boot sweep catches up the deliveries that awaited something when the previous server stopped,
- * the pull requests that merged or closed meanwhile and the wakes queued for open ones, and posts
- * the Work comments it recorded and never finished. The tail starts at the event log position
- * read before the sweep, so no event falls between the two.
+ * Feeds Factory thread events into deliveries: terminal runs, thread deletions, pull request links
+ * synced merged or closed (nothing polls), and pull request watch wakes (see `takeWake`).
+ * A boot sweep catches up what happened while no server ran; the tail starts at the event log
+ * position read before the sweep, so no event falls between the two.
  */
 export class FactoryReactor extends Context.Service<
   FactoryReactor,
@@ -140,13 +132,14 @@ const make = Effect.gen(function* () {
    * The thread a delivery's pull request is linked to: its author's, or for a parent, which has
    * none, its last child's author's (see `FactoryPullRequest`). None without one.
    */
-  const pullRequestThread = ({ state }: FactoryDeliveryStore.StoredFactoryDelivery) =>
-    Effect.gen(function* () {
-      if (state.kind !== "parent") return state.threads.author;
-      const last = state.children.at(-1);
-      if (last === undefined) return undefined;
-      return Option.getOrUndefined(yield* deliveries.get(last))?.state.threads.author;
-    });
+  const pullRequestThread = Effect.fn("FactoryReactor.pullRequestThread")(function* ({
+    state,
+  }: FactoryDeliveryStore.StoredFactoryDelivery) {
+    if (state.kind !== "parent") return state.threads.author;
+    const last = state.children.at(-1);
+    if (last === undefined) return undefined;
+    return Option.getOrUndefined(yield* deliveries.get(last))?.state.threads.author;
+  });
 
   /** Whether the delivery recorded its pull request, and has not taken its merge or close. */
   const followsPullRequest = ({ state }: FactoryDeliveryStore.StoredFactoryDelivery) =>
@@ -157,116 +150,106 @@ const make = Effect.gen(function* () {
    * close, whatever a follow-through round is doing. The engine takes it only for the pull
    * request a delivery opened, and only once.
    */
-  const stepPullRequest = ({ threadId, event }: PullRequestEnded) =>
-    Effect.gen(function* () {
-      for (const delivery of yield* deliveries.listActive()) {
-        if (!followsPullRequest(delivery)) continue;
-        if ((yield* pullRequestThread(delivery)) !== threadId) continue;
-        yield* worker.step(delivery.deliveryId, event);
-      }
-    });
+  const stepPullRequest = Effect.fn("FactoryReactor.stepPullRequest")(function* ({
+    threadId,
+    event,
+  }: PullRequestEnded) {
+    for (const delivery of yield* deliveries.listActive()) {
+      if (!followsPullRequest(delivery)) continue;
+      if ((yield* pullRequestThread(delivery)) !== threadId) continue;
+      yield* worker.step(delivery.deliveryId, event);
+    }
+  });
 
   /** The wake a run starts, as `wakeOf` judges it from its command's record and events. */
-  const wakeOfRun = (run: RunCreated) =>
-    Effect.gen(function* () {
-      const receipt = Option.getOrUndefined(yield* receipts.getByCommandId(run.commandId));
-      if (receipt?.status !== "accepted") return undefined;
-      const events = yield* eventSink
-        .readByCommandId({ commandId: run.commandId })
-        .pipe(Stream.runCollect);
-      return wakeOf(run, receipt.commandType, events);
-    });
+  const wakeOfRun = Effect.fn("FactoryReactor.wakeOfRun")(function* (run: RunCreated) {
+    const receipt = Option.getOrUndefined(yield* receipts.getByCommandId(run.commandId));
+    if (receipt?.status !== "accepted") return undefined;
+    const events = yield* eventSink
+      .readByCommandId({ commandId: run.commandId })
+      .pipe(Stream.runCollect);
+    return wakeOf(run, receipt.commandType, events);
+  });
 
   /**
-   * Steps the delivery whose pull request may be linked to the run's thread with the wake the run
-   * starts, if it starts one. The thread's id names the delivery whose launch made it, which for a
-   * child is the wrong one: a child opens no pull request, and its parent's is linked to its last
-   * child's author thread, so the wake goes to the parent and the approved child is left alone.
-   * The engine takes it only on the thread the delivery follows. Stepped whatever the delivery's
-   * state as read here: the engine judges it under the delivery's lock, which the PR stage holds
-   * from starting the watch until it has stored the pull request and the thread it is linked to.
+   * Steps the run's wake, if any, into the delivery whose pull request may be linked to its thread.
+   * A child opens no pull request (its parent's links to its last author thread), so a child's
+   * wake goes to its parent. Stepped regardless of state read here: the engine judges it under the
+   * delivery's lock, which the PR stage holds until the pull request and its thread are stored.
    */
-  const takeWake = (run: RunCreated) =>
-    Effect.gen(function* () {
-      const launchedBy = launchDeliveryId(run.threadId);
-      if (launchedBy === undefined) return;
-      const wake = yield* wakeOfRun(run);
-      if (wake === undefined) return;
-      const launcher = Option.getOrUndefined(yield* deliveries.get(launchedBy));
-      yield* worker.step(launcher?.parentId ?? launchedBy, wake);
-    });
+  const takeWake = Effect.fn("FactoryReactor.takeWake")(function* (run: RunCreated) {
+    const launchedBy = launchDeliveryId(run.threadId);
+    if (launchedBy === undefined) return;
+    const wake = yield* wakeOfRun(run);
+    if (wake === undefined) return;
+    const launcher = Option.getOrUndefined(yield* deliveries.get(launchedBy));
+    yield* worker.step(launcher?.parentId ?? launchedBy, wake);
+  });
 
   /**
-   * The wakes core queued for a delivery's open pull request while no server ran Factory, on the
-   * thread it is linked to (see `followedThread`): each run created there since the delivery's
-   * first watch command, stepped in order as the tail would have stepped it, a parent's through
-   * `takeWake` like the tail's. The engine takes each run once, so a sweep run again takes nothing
-   * new. Nothing for a delivery whose pull request is not watched, or no longer open.
+   * Steps, through `takeWake` as the tail would, each run created on the followed thread (see
+   * `followedThread`) since the delivery's first watch command while no server ran Factory.
+   * The engine takes each run once, so a repeated sweep takes nothing new. Nothing for a delivery
+   * whose pull request is not watched or no longer open.
    */
-  const catchUpFeedback = (deliveryId: FactoryDeliveryId) =>
-    Effect.gen(function* () {
-      const delivery = Option.getOrUndefined(yield* deliveries.get(deliveryId));
-      const threadId = delivery === undefined ? undefined : followedThread(delivery.state);
-      const followThrough = delivery?.state.followThrough;
-      if (
-        delivery === undefined ||
-        isTerminal(delivery.state) ||
-        !followsPullRequest(delivery) ||
-        threadId === undefined ||
-        followThrough === undefined
-      ) {
-        return;
-      }
-      const last = yield* eventSink.latestSequence({ threadId });
-      if (last <= followThrough.watchedAfter) return;
-      const read = yield* eventSink
-        .stream({ threadId, afterSequence: followThrough.watchedAfter })
-        .pipe(
-          // The log replays every event of the thread up to its last before it goes live.
-          Stream.takeUntil((stored) => stored.sequence >= last),
-          Stream.runCollect,
-        );
-      for (const stored of read) {
-        const run = runCreated(stored);
-        if (run !== undefined) yield* takeWake(run);
-      }
-    });
+  const catchUpFeedback = Effect.fn("FactoryReactor.catchUpFeedback")(function* (
+    deliveryId: FactoryDeliveryId,
+  ) {
+    const delivery = Option.getOrUndefined(yield* deliveries.get(deliveryId));
+    const threadId = delivery === undefined ? undefined : followedThread(delivery.state);
+    const followThrough = delivery?.state.followThrough;
+    if (
+      delivery === undefined ||
+      isTerminal(delivery.state) ||
+      !followsPullRequest(delivery) ||
+      threadId === undefined ||
+      followThrough === undefined
+    ) {
+      return;
+    }
+    const last = yield* eventSink.latestSequence({ threadId });
+    if (last <= followThrough.watchedAfter) return;
+    const read = yield* eventSink
+      .stream({ threadId, afterSequence: followThrough.watchedAfter })
+      .pipe(
+        // The log replays every event of the thread up to its last before it goes live.
+        Stream.takeUntil((stored) => stored.sequence >= last),
+        Stream.runCollect,
+      );
+    for (const stored of read) {
+      const run = runCreated(stored);
+      if (run !== undefined) yield* takeWake(run);
+    }
+  });
 
   /**
    * The merge or close of a delivery's open pull request that core's sync stored while no server
    * ran Factory, read from its thread's link as the projection has it: the step the tail would
    * have taken. None while the link shows it open.
    */
-  const catchUpPullRequest = (delivery: FactoryDeliveryStore.StoredFactoryDelivery) =>
-    Effect.gen(function* () {
-      const { pullRequest } = delivery.state;
-      if (!followsPullRequest(delivery)) return;
-      const threadId = yield* pullRequestThread(delivery);
-      if (pullRequest === null || threadId === undefined) return;
-      const shell = yield* projections.getThreadShell(threadId);
-      const link = shell?.pullRequests?.find(
-        (candidate) => candidate.number === pullRequest.number && candidate.url === pullRequest.url,
-      );
-      const event = link === undefined ? undefined : pullRequestEnded(link);
-      if (event !== undefined) yield* worker.step(delivery.deliveryId, event);
-    });
+  const catchUpPullRequest = Effect.fn("FactoryReactor.catchUpPullRequest")(function* (
+    delivery: FactoryDeliveryStore.StoredFactoryDelivery,
+  ) {
+    const { pullRequest } = delivery.state;
+    if (!followsPullRequest(delivery)) return;
+    const threadId = yield* pullRequestThread(delivery);
+    if (pullRequest === null || threadId === undefined) return;
+    const shell = yield* projections.getThreadShell(threadId);
+    const link = shell?.pullRequests?.find(
+      (candidate) => candidate.number === pullRequest.number && candidate.url === pullRequest.url,
+    );
+    const event = link === undefined ? undefined : pullRequestEnded(link);
+    if (event !== undefined) yield* worker.step(delivery.deliveryId, event);
+  });
 
   /**
-   * Catches one delivery up with what happened while no server ran it, whatever its status. First
-   * what a restart cut short between a parent and its children is completed. One that recorded
-   * its open pull request takes its merge or close stored meanwhile, whatever else it awaits, and
-   * then the wakes queued for that pull request meanwhile, adopting one or keeping it pending. A
-   * delivery awaiting a run then gets the run's end or its thread's deletion, as the tail would
-   * have handed them on, so a stopping one stops where the run's end leads it. One awaiting an
-   * effect lost it with the previous process and blocks, unless what it did is stored or the
-   * effect waits for admission (see `failInterruptedEffect`); a PR stage blocked so after its
-   * watch command then records what that command proves (see `recoverPullRequest`). A parent
-   * awaiting its child takes the child's approval stored before the restart, and otherwise waits
-   * for that child. A delivery awaiting nothing else (queued, stopped, blocked) waits for its
-   * owner. Each step reads the delivery again, so one cancelled here takes nothing more.
+   * Catches one delivery up with what happened while no server ran it: family repair, then pull
+   * request end and wakes, then a run's end or thread deletion. An awaited effect was lost and
+   * blocks unless stored or awaiting admission (`failInterruptedEffect`, `recoverPullRequest`).
+   * Each step rereads the delivery, so one cancelled here takes nothing more.
    */
-  const reconcile = (listed: FactoryDeliveryStore.StoredFactoryDelivery) =>
-    Effect.gen(function* () {
+  const reconcile = Effect.fn("FactoryReactor.reconcile")(
+    function* (listed: FactoryDeliveryStore.StoredFactoryDelivery) {
       const { deliveryId } = listed;
       yield* worker.finishFamily(deliveryId);
       const read = deliveries.get(deliveryId).pipe(Effect.map(Option.getOrUndefined));
@@ -287,7 +270,9 @@ const make = Effect.gen(function* () {
       // stored or an earlier server did, it records what that stage's watch command proves. A
       // read that fails is logged; the next boot, and any resume, recovers it again first.
       yield* worker.recoverPullRequest(deliveryId);
-    }).pipe(Effect.catchCause(logSkipped("factory delivery reconcile skipped")));
+    },
+    Effect.catchCause(logSkipped("factory delivery reconcile skipped")),
+  );
 
   // Comments a previous process recorded and never finished go first, in their order. Work a
   // cancelled delivery's thread carried on after the restart is stopped last, once every

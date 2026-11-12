@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -67,8 +66,8 @@ vi.mock("@legendapp/list/react-native", () => ({
     </div>
   ),
 }));
-vi.mock("../../components/AppSymbol", () => ({ SymbolView: () => null }));
-vi.mock("../../components/AppText", () => ({
+vi.mock("../../components/ui/AppSymbol", () => ({ SymbolView: () => null }));
+vi.mock("../../components/ui/AppText", () => ({
   AppText: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
   AppTextInput: ({
     accessibilityLabel,
@@ -87,9 +86,9 @@ vi.mock("../../components/AppText", () => ({
     />
   ),
 }));
-vi.mock("../../components/EmptyState", () => ({ EmptyState: () => null }));
-vi.mock("../../components/ErrorBanner", () => ({ ErrorBanner: () => null }));
-vi.mock("../../features/workspace/ListFilterMenu", () => ({
+vi.mock("../../components/ui/EmptyState", () => ({ EmptyState: () => null }));
+vi.mock("../../components/ui/ErrorBanner", () => ({ ErrorBanner: () => null }));
+vi.mock("../../features/layout/workspace/ListFilterMenu", () => ({
   ListFilterMenu: ({
     accessibilityLabel,
     actions,
@@ -112,6 +111,7 @@ vi.mock("../../features/workspace/ListFilterMenu", () => ({
     </select>
   ),
 }));
+vi.mock("../../native/NativeScrollViewMarker", () => ({ NativeScrollView: () => null }));
 vi.mock("../../state/entities", () => ({
   useProjects: () => world.projects,
   useThreadShells: () => [],

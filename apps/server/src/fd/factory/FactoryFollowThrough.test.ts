@@ -2,6 +2,7 @@ import { assert, describe, it } from "@effect/vitest";
 import { CommandId, type RunId, type ThreadId } from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 
 import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore.ts";
@@ -42,12 +43,10 @@ import {
 } from "./testkit/followThrough.ts";
 
 /**
- * Follow-through rounds on the server's real stack: a single item's PR stage watches its pull
- * request on the author thread, and a wake core's watch queues there (dispatched here as core's
- * watch reactor dispatches it) becomes a round of the delivery, which Factory's reactor adopts
- * from the events core commits. The round is settled, verified, reviewed, recorded and published
- * through the fake provider, the project's verify command and the fake PR service. Nothing polls
- * or sleeps: each step drains.
+ * Follow-through rounds on the real stack: a PR stage watches its pull request on the author thread,
+ * and a wake core's watch queues there becomes a round Factory's reactor adopts from core's events,
+ * then is settled, verified, reviewed, recorded and published through the fakes and the project's
+ * verify command. Nothing polls or sleeps: each step drains.
  */
 
 const service = Factory.FactoryService.FactoryService;
@@ -458,9 +457,11 @@ describe("Factory follow-through: what a round refuses", () => {
         // action, after the gate read origin, the push URL moves: the remote and branch stay.
         world.publishing.throughDriver = true;
         const driver = yield* GitVcsDriver.GitVcsDriver;
+        const fileSystem = yield* FileSystem.FileSystem;
         world.publishHooks.push(
           git(worktreePath, ["remote", "set-url", "--push", "origin", elsewhere]).pipe(
             Effect.provideService(GitVcsDriver.GitVcsDriver, driver),
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
             Effect.orDie,
             Effect.asVoid,
           ),

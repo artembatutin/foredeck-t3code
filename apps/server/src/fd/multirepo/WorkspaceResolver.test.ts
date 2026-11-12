@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
@@ -28,7 +29,11 @@ const layer = Layer.mergeAll(
   ProjectionStore.layer,
   RepositorySet.layerDefault,
   VcsProcess.layer,
-).pipe(Layer.provide(Sqlite.layerMemory), Layer.provideMerge(NodeServices.layer));
+).pipe(
+  Layer.provide(Sqlite.layerMemory),
+  Layer.provideMerge(NodeServices.layer),
+  Layer.provide(NodeCrypto.layer),
+);
 
 it.layer(layer)("repository operation resolution", (it) => {
   it.effect(

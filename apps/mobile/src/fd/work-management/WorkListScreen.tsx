@@ -28,13 +28,14 @@ import { Atom } from "effect/reactivity";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { ActivityIndicator, Pressable, RefreshControl, View } from "react-native";
 
-import { SymbolView } from "../../components/AppSymbol";
-import { AppText as Text, AppTextInput } from "../../components/AppText";
-import { EmptyState } from "../../components/EmptyState";
-import { ErrorBanner } from "../../components/ErrorBanner";
-import { ListFilterMenu } from "../../features/workspace/ListFilterMenu";
+import { SymbolView } from "../../components/ui/AppSymbol";
+import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
+import { EmptyState } from "../../components/ui/EmptyState";
+import { ErrorBanner } from "../../components/ui/ErrorBanner";
+import { ListFilterMenu } from "../../features/layout/workspace/ListFilterMenu";
 import { relativeTime } from "../../lib/time";
 import { useProjects, useThreadShells } from "../../state/entities";
+import { NativeScrollView } from "../../native/NativeScrollViewMarker";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { CreateWorkItemForm } from "./CreateWorkItemForm";
@@ -96,11 +97,12 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
   const [labels, setLabels] = useState<ReadonlyArray<string>>([]);
   const [assignedToMe, setAssignedToMe] = useState(false);
   const [creating, setCreating] = useState(false);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- debounce timer for typed search; Clear filters sets the term at once
   useEffect(() => {
     const timer = setTimeout(() => setTerm(query.trim()), 250);
     return () => clearTimeout(timer);
   }, [query]);
-
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- keeps the native stack header title on the selected project
   useLayoutEffect(() => {
     navigation.setOptions({ title: project === undefined ? "Work" : `Work · ${project.title}` });
   }, [navigation, project]);
@@ -460,6 +462,7 @@ export function WorkListScreen({ route }: StaticScreenProps<WorkListParams>) {
         </View>
       ) : (
         <LegendList
+          renderScrollComponent={NativeScrollView}
           className="flex-1"
           contentContainerStyle={{ paddingBottom: 32 }}
           contentInsetAdjustmentBehavior="automatic"

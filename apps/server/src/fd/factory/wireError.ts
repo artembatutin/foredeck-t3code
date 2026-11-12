@@ -37,6 +37,8 @@ export type FactoryServiceError =
   | FactoryBranchUnavailableError
   | FactoryStoreError
   | ThreadLaunch.ThreadLaunchBaseRefError
+  | ThreadLaunch.ThreadLaunchBranchConflictError
+  | ThreadLaunch.ThreadLaunchNotRepositoryError
   | ProjectStore.ProjectStoreV2Error
   | ProjectionStore.ProjectionStoreV2Error
   | ServerRuntimeStartup.ServerRuntimeStartupError;
@@ -145,6 +147,17 @@ export const toFactoryError = (error: FactoryServiceError): FactoryError => {
       return new FactoryError({
         reason: "refused",
         message: "The project's checkout has no commit to start the delivery's worktree from.",
+      });
+    case "ThreadLaunchBranchConflictError":
+      return new FactoryError({
+        reason: "refused",
+        message:
+          "The delivery's branch cannot be created: a branch that conflicts with its name exists.",
+      });
+    case "ThreadLaunchNotRepositoryError":
+      return new FactoryError({
+        reason: "refused",
+        message: "The project's folder is not a Git repository, so a delivery cannot start.",
       });
     case "FactoryBranchUnavailableError":
       return new FactoryError({

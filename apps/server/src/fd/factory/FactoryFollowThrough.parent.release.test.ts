@@ -30,18 +30,16 @@ import {
   runStarted,
   runStatus,
   syncPullRequest,
+  wakeDroppedBeforeStart,
   wakeThread,
   watchPullRequest,
 } from "./testkit/followThrough.ts";
 
 /**
- * A parent's follow-through cancelled or closed out on the server's real stack. Its pull request
- * is linked to its last child's author thread, whose id names that approved child, so a cancel of
- * the parent, or of a child, which cancels its parent, must end the parent's watch there and stop
- * the wake runs that watch set off as the parent's, never the owner's turns, and leave its branch,
- * worktree and approved children as they are. A merged parent's close-out ends that watch before
- * it judges whether a thread still works in the shared worktree. Nothing polls or sleeps: each
- * step drains.
+ * A parent's follow-through cancelled or closed out on the real stack. Its PR's watch is on its last
+ * child's author thread; cancelling parent or child ends it and stops its wake runs, never the
+ * owner's turns, keeping branch, worktree and approved children. A merged close-out ends the watch
+ * before judging the shared worktree's use. Nothing polls or sleeps: each step drains.
  */
 
 const service = Factory.FactoryService.FactoryService;
@@ -297,7 +295,7 @@ describe("Factory follow-through of a parent cancelled after its PR stage", () =
   );
 
   it.live.each(targets)(
-    "stops a wake queued behind the owner's turn once it starts when $cancelled is cancelled, never that turn",
+    "drops a wake queued behind the owner's turn when $cancelled is cancelled, never that turn",
     ({ child }) =>
       withProject(verifyCommands.passes, (world) =>
         Effect.gen(function* () {
@@ -323,18 +321,12 @@ describe("Factory follow-through of a parent cancelled after its PR stage", () =
           assert.strictEqual(yield* runStatus(last.author, wake), "queued");
           assert.strictEqual(yield* world.endRun(ownerRun, "completed"), "completed");
 
-          // The wake goes live after it, on the approved child's thread, as the parent's turn,
-          // and is stopped then.
+          // The cancel ended the parent's watch on the approved child's thread, so core drops
+          // the wake once the owner's turn ends.
           yield* drainFactory;
           yield* drainOrchestration;
-          assert.deepStrictEqual(yield* cancelledRuns(last.author, deliveryId), [wake]);
-          assert.notInclude(interruptedTurns(world), providerTurnOf(world, ownerRun));
-          const stopped = yield* runStatus(last.author, wake);
-          assert.isTrue(
-            stopped === "interrupted" ||
-              interruptedTurns(world).includes(providerTurnOf(world, wake)),
-            `The queued wake went on as ${stopped}.`,
-          );
+          yield* wakeDroppedBeforeStart(world, last.author, wake);
+          assert.deepStrictEqual(interruptedTurns(world), []);
           yield* assertWorkKept(world, parent, child);
         }),
       ),

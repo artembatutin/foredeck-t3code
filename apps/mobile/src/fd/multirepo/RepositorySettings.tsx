@@ -11,8 +11,8 @@ import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import type { ProjectRepositoryInputs, ServerConfig } from "@t3tools/contracts";
 import { useMemo, useState } from "react";
 import { Pressable, View } from "react-native";
-import { AppText as Text, AppTextInput } from "../../components/AppText";
-import { ListSection } from "../../components/ListSection";
+import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
+import { ListSection } from "../../components/ui/ListSection";
 import { connectionAtomRuntime } from "../../connection/runtime";
 import { useAtomCommand } from "../../state/use-atom-command";
 
@@ -48,7 +48,7 @@ export function RepositorySettings({
   environmentLabel,
 }: {
   project: EnvironmentProject;
-  serverConfig: ServerConfig | null;
+  serverConfig: Pick<ServerConfig, "environment"> | null;
   environmentLabel: string;
 }) {
   const commands = useMemo(

@@ -4,28 +4,36 @@ import { callerToolClass } from "./callerTools.ts";
 import { AssistantToolkit } from "./tools.ts";
 
 /**
- * Tools the caller classes allow that still control a worker directly: on an assistant thread
+ * Calls the caller classes allow that still control a worker directly: on an assistant thread
  * they would bypass the durable queue's capacity, saved scope or question ownership.
  */
-const workerControls: ReadonlySet<string> = new Set([
-  "t3_thread_interrupt",
-  "t3_thread_configure",
-  "t3_queue_cancel",
-  "t3_queue_reorder",
-  "t3_workflow_stop",
-]);
+const controlsWorker = (name: string, args: unknown) => {
+  const input = args as { readonly action?: unknown; readonly modelSelection?: unknown } | null;
+  switch (name) {
+    case "t3_thread_interrupt":
+    case "t3_workflow_stop":
+      return true;
+    // Reading a thread's configuration controls nothing; setting its model does.
+    case "t3_thread_configure":
+      return input?.modelSelection !== undefined;
+    case "t3_queue":
+      return input?.action === "cancel" || input?.action === "reorder";
+    default:
+      return false;
+  }
+};
 
 const ownTools: ReadonlySet<string> = new Set(Object.keys(AssistantToolkit.tools));
 
 /**
- * Whether an assistant thread may call `name`: its own toolkit, or a tool the caller classes
- * allow that controls no worker. Anything else, including a tool published later and not yet
- * classified, is refused.
+ * Whether an assistant thread may call `name` with `args`: its own toolkit, or a call the caller
+ * classes allow that controls no worker. Anything else, including a tool published later and not
+ * yet classified, is refused.
  */
-export const assistantMayCall = (name: string) =>
-  ownTools.has(name) || (callerToolClass(name) === "allow" && !workerControls.has(name));
+const assistantMayCall = (name: string, args?: unknown) =>
+  ownTools.has(name) || (callerToolClass(name, args) === "allow" && !controlsWorker(name, args));
 
-export const assistantRefusalText =
+const assistantRefusalText =
   "Use assistant_assign, assistant_control or assistant_answer. Project assistant work must pass through the durable queue and its permission checks. Work items are started by the owner from Work; record an agreed idea as one with assistant_capture_work, and read and update items with the work_* tools.";
 
 /**
@@ -34,8 +42,10 @@ export const assistantRefusalText =
  */
 export function assistantToolRefusal(
   threadId: string | undefined,
-  calls: ReadonlyArray<{ readonly tool: string }>,
+  calls: ReadonlyArray<{ readonly tool: string; readonly arguments?: unknown }>,
 ) {
   if (!threadId || !isAssistantThread(threadId)) return undefined;
-  return calls.every((call) => assistantMayCall(call.tool)) ? undefined : assistantRefusalText;
+  return calls.every((call) => assistantMayCall(call.tool, call.arguments))
+    ? undefined
+    : assistantRefusalText;
 }

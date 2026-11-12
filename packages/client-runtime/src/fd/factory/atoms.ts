@@ -47,20 +47,10 @@ const sessionServes = (session: RpcSession, need: FactoryNeed) =>
   );
 
 /**
- * Factory reads and writes for one client. Nothing Factory reaches an environment unless its
- * server advertises Factory, both in this client's view of the server's config and in the config
- * of the session that would carry the request: just after a reconnect the view can still hold the
- * previous server's config. On any other environment a read stays idle and a write fails before
- * it is sent, checked when it would go out rather than when it was queued, and the change stream
- * closes when support goes, even while no view reads it. The plan gate's actions and a parent
- * start need planning advertised the same way, so on a server from before planning they fail
- * unsent rather than reach a server that would refuse them, or one that would start the item as
- * a single delivery.
- *
- * Every read refetches when the environment's Factory epoch moves, so a change made anywhere
- * (another client, an agent, the delivery's own worker) reaches every view without polling.
- * Writes are guarded by `permissionAtom`, rechecked against the destination's grants when they
- * run; their results arrive through the epoch the server moves after commit.
+ * Factory reads and writes for one client. Requests go out only when both the config view and the
+ * carrying session advertise Factory (a view can be stale after reconnect), checked at send time;
+ * plan-gate actions and parent starts also need planning advertised. Reads refetch on the
+ * Factory epoch, so changes reach every view without polling; writes are `permissionAtom`-guarded.
  */
 export function createFactoryEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
@@ -79,42 +69,40 @@ export function createFactoryEnvironmentAtoms<R, E>(
   const viewed = { factory: supported, planning, commandSetup } as const;
 
   /** Whether a request needing `need` may leave now for the environment the effect targets. */
-  const servedNow = (need: FactoryNeed) =>
-    Effect.gen(function* () {
-      const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
-      // Every atom effect runs with its registry in context; the shared helpers do not declare it.
-      const registry = yield* Effect.serviceOption(AtomRegistry.AtomRegistry);
-      if (
-        Option.isNone(registry) ||
-        !registry.value.get(viewed[need](supervisor.target.environmentId))
-      ) {
-        return false;
-      }
-      const session = yield* SubscriptionRef.get(supervisor.session);
-      return Option.isSome(session) && (yield* sessionServes(session.value, need));
-    });
+  const servedNow = Effect.fn("FactoryAtoms.servedNow")(function* (need: FactoryNeed) {
+    const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
+    // Every atom effect runs with its registry in context; the shared helpers do not declare it.
+    const registry = yield* Effect.serviceOption(AtomRegistry.AtomRegistry);
+    if (
+      Option.isNone(registry) ||
+      !registry.value.get(viewed[need](supervisor.target.environmentId))
+    ) {
+      return false;
+    }
+    const session = yield* SubscriptionRef.get(supervisor.session);
+    return Option.isSome(session) && (yield* sessionServes(session.value, need));
+  });
   /** A read held while the destination does not serve Factory, so it stays idle. */
   const readWhenServed = <A, Err>(
     send: Effect.Effect<A, Err, EnvironmentSupervisor.EnvironmentSupervisor>,
   ) => Effect.flatMap(servedNow("factory"), (served) => (served ? send : Effect.never));
   /** A write that fails, unsent, while the destination does not serve what it needs. */
-  const writeWhenServed = <A, Err>(
+  const writeWhenServed = Effect.fn("FactoryAtoms.writeWhenServed")(function* <A, Err>(
     need: FactoryNeed,
     send: Effect.Effect<A, Err, EnvironmentSupervisor.EnvironmentSupervisor>,
-  ) =>
-    Effect.gen(function* () {
-      if (yield* servedNow(need)) return yield* send;
-      const { environmentId, label } = (yield* EnvironmentSupervisor.EnvironmentSupervisor).target;
-      const wanted = {
-        factory: "Factory. Update its server to use Factory.",
-        planning: "Factory planning. Update its server to plan deliveries.",
-        commandSetup: "Factory command setup. Update its server to find and check commands.",
-      } as const;
-      return yield* new EnvironmentRpcUnavailableError({
-        environmentId,
-        message: `${label} does not offer ${wanted[need]}`,
-      });
+  ) {
+    if (yield* servedNow(need)) return yield* send;
+    const { environmentId, label } = (yield* EnvironmentSupervisor.EnvironmentSupervisor).target;
+    const wanted = {
+      factory: "Factory. Update its server to use Factory.",
+      planning: "Factory planning. Update its server to plan deliveries.",
+      commandSetup: "Factory command setup. Update its server to find and check commands.",
+    } as const;
+    return yield* new EnvironmentRpcUnavailableError({
+      environmentId,
+      message: `${label} does not offer ${wanted[need]}`,
     });
+  });
 
   const supportedOnly = <Input, A, Err>(
     label: string,

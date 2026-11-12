@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { resolveRuntimeWorkspace } from "./runtimeWorkspace.ts";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -15,6 +16,7 @@ const layer = RepositorySet.layer.pipe(
   Layer.provide(Layer.merge(WorkspacePaths.layer, VcsDriverRegistry.layer)),
   Layer.provideMerge(VcsProcess.layer),
   Layer.provideMerge(NodeServices.layer),
+  Layer.provide(NodeCrypto.layer),
 );
 
 const fixture = Effect.gen(function* () {

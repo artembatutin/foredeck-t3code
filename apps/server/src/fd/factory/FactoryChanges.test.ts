@@ -236,6 +236,7 @@ const heldCommit = (gate: {
       const database = yield* SqlClient.SqlClient;
       return yield* SqlClient.make({
         acquirer: database.reserve,
+        driver: database.driver,
         compiler: Statement.makeCompilerSqlite(),
         spanAttributes: [],
         commit: (connection) =>

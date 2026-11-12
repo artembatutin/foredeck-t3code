@@ -26,7 +26,7 @@ export const make = Effect.gen(function* () {
       if (threadId !== undefined) {
         const attached = yield* threads.getThread(threadId).pipe(
           Effect.catchTags({
-            ProjectionStoreThreadNotFoundError: () => Effect.succeed(undefined),
+            ProjectionStoreThreadNotFoundError: () => Effect.undefined,
           }),
         );
         if (attached !== undefined) {

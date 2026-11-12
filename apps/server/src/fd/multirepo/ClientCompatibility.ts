@@ -63,3 +63,9 @@ export const make = Effect.gen(function* () {
       }),
   };
 });
+
+/** Core behavior for a connection that has no compatibility checker. */
+export const passthrough: Effect.Success<typeof make> = {
+  assertWorkspace: () => Effect.undefined,
+  assertCommand: () => Effect.undefined,
+};

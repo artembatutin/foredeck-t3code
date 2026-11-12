@@ -245,17 +245,10 @@ interface Authorized {
 }
 
 /**
- * The project assistant's Factory executor (note 6.8 and 6.11): what its enqueue checks, its claim's
- * launch, its reconciliation before a delivery runs and its controls. Everything here but the fresh
- * read `readCaptured` runs under the assistant's lock, which a claim holds from its commit through
- * its start call, so a control never lands between the two: an intent is persisted first, and a
- * strict read of the delivery after it then decides, with no start in flight. Factory stays
- * authoritative: nothing here advances a delivery but `start`, `stop`, `resume` and `cancel` by its
- * own id, and a queued row is never handed to `stop` or `resume`, which refuse it.
- *
- * Each tick `reconcile` mirrors its delivery once it runs (note 6.8), releases its slot on evidence
- * (note 6.4) and retires an ended root through the admission fence (note 6.9); `maintain` looks
- * after waiting demands (note 6.3), and `grant` hands the fair head's demand its slot.
+ * The assistant's Factory executor (notes 6.8, 6.11). All but `readCaptured` runs under the
+ * assistant's lock, held by a claim from commit through start, so no control lands in between:
+ * intents persist first, then a strict delivery read decides. Factory stays authoritative; only
+ * `start`/`stop`/`resume`/`cancel` by id advance a delivery, and a queued row never gets stop/resume.
  */
 export const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -289,22 +282,26 @@ export const make = Effect.gen(function* () {
    * Why the claim's recheck refuses (F, then the verify command), or undefined when it holds. A
    * review carries its own verify command, so settings changed since cannot refuse it.
    */
-  const recheck = (assignment: HandoffAdmission.FactoryAssignment, projectId: ProjectId) =>
-    Effect.gen(function* () {
-      const fresh = yield* readWork(assignment.item);
-      const category = yield* admission.authority(assignment.assignmentId, fresh);
-      if (category !== undefined) return REFUSED_BECAUSE[category];
-      if (assignment.reviewed !== null) return undefined;
-      return (yield* factory.verifyConfigured(projectId)) ? undefined : NOT_CONFIGURED;
-    });
+  const recheck = Effect.fn("FactoryExecutor.recheck")(function* (
+    assignment: HandoffAdmission.FactoryAssignment,
+    projectId: ProjectId,
+  ) {
+    const fresh = yield* readWork(assignment.item);
+    const category = yield* admission.authority(assignment.assignmentId, fresh);
+    if (category !== undefined) return REFUSED_BECAUSE[category];
+    if (assignment.reviewed !== null) return undefined;
+    return (yield* factory.verifyConfigured(projectId)) ? undefined : NOT_CONFIGURED;
+  });
 
-  const uncertain = (assignmentId: string, note: string) =>
-    Effect.gen(function* () {
-      const current = yield* store.getAssignment(assignmentId);
-      if (Option.isSome(current) && current.value.state === "launching") {
-        yield* move(assignmentId, { type: "uncertain", note });
-      }
-    });
+  const uncertain = Effect.fn("FactoryExecutor.uncertain")(function* (
+    assignmentId: string,
+    note: string,
+  ) {
+    const current = yield* store.getAssignment(assignmentId);
+    if (Option.isSome(current) && current.value.state === "launching") {
+      yield* move(assignmentId, { type: "uncertain", note });
+    }
+  });
 
   const LAUNCH_UNKNOWN =
     "The Factory delivery's state could not be read; its slot stays held and the next pass reads it again.";
@@ -328,68 +325,63 @@ export const make = Effect.gen(function* () {
         }).pipe(Effect.asVoid);
 
   /** No delivery row exists, and none can: the assignment fails, and its root retires. */
-  const retireFailed = (
+  const retireFailed = Effect.fn("FactoryExecutor.retireFailed")(function* (
     assignment: HandoffAdmission.FactoryAssignment,
     root: string,
     claim: Pick<Claim, "admissionId" | "entrySeq"> | null,
     because: string,
-  ) =>
-    Effect.gen(function* () {
-      const note = `Factory delivery ${root} was not started because ${because}.`;
-      const outcome =
-        claim === null
-          ? ("contended" as const)
-          : yield* admission.retirePreDelivery({
-              root,
-              reason: "failed",
-              shape: { type: "claim", admissionId: claim.admissionId, entrySeq: claim.entrySeq },
-              note,
-            });
-      if (outcome === "contended") yield* uncertain(assignment.assignmentId, note);
-    });
+  ) {
+    const note = `Factory delivery ${root} was not started because ${because}.`;
+    const outcome =
+      claim === null
+        ? ("contended" as const)
+        : yield* admission.retirePreDelivery({
+            root,
+            reason: "failed",
+            shape: { type: "claim", admissionId: claim.admissionId, entrySeq: claim.entrySeq },
+            note,
+          });
+    if (outcome === "contended") yield* uncertain(assignment.assignmentId, note);
+  });
 
   /**
    * A queued orphan whose authority no longer holds (D4): its own row is cancelled, keeping the
    * claim's slot and admission until the family is quiescent. Never failed while a row exists.
    */
-  const cancelOrphan = (
+  const cancelOrphan = Effect.fn("FactoryExecutor.cancelOrphan")(function* (
     assignment: HandoffAdmission.FactoryAssignment,
     root: string,
     because: string,
-  ) =>
-    Effect.gen(function* () {
-      const cancelled = yield* Effect.result(factory.cancel(root));
-      if (
-        Result.isFailure(cancelled) &&
-        !(
-          cancelled.failure._tag === "HandoffFactoryRefused" && cancelled.failure.reason === "ended"
-        )
-      ) {
-        return yield* uncertain(assignment.assignmentId, LAUNCH_UNKNOWN);
-      }
-      yield* move(assignment.assignmentId, {
-        type: "mirror",
-        to: "stopping",
-        note: orphanNotice(root, because),
-      });
+  ) {
+    const cancelled = yield* Effect.result(factory.cancel(root));
+    if (
+      Result.isFailure(cancelled) &&
+      !(cancelled.failure._tag === "HandoffFactoryRefused" && cancelled.failure.reason === "ended")
+    ) {
+      return yield* uncertain(assignment.assignmentId, LAUNCH_UNKNOWN);
+    }
+    yield* move(assignment.assignmentId, {
+      type: "mirror",
+      to: "stopping",
+      note: orphanNotice(root, because),
     });
+  });
 
   /** A strict read of the delivery, for a refusal of a claim that may already have a row. */
-  const settleRefused = (
+  const settleRefused = Effect.fn("FactoryExecutor.settleRefused")(function* (
     assignment: HandoffAdmission.FactoryAssignment,
     root: string,
     claim: Pick<Claim, "admissionId" | "entrySeq"> | null,
     because: string,
-  ) =>
-    Effect.gen(function* () {
-      const read = yield* Effect.exit(factory.get(root));
-      if (Exit.isFailure(read)) return yield* uncertain(assignment.assignmentId, LAUNCH_UNKNOWN);
-      if (Option.isNone(read.value)) return yield* retireFailed(assignment, root, claim, because);
-      if (read.value.value.status === "queued") {
-        return yield* cancelOrphan(assignment, root, because);
-      }
-      return yield* adopt(assignment, root, read.value.value);
-    });
+  ) {
+    const read = yield* Effect.exit(factory.get(root));
+    if (Exit.isFailure(read)) return yield* uncertain(assignment.assignmentId, LAUNCH_UNKNOWN);
+    if (Option.isNone(read.value)) return yield* retireFailed(assignment, root, claim, because);
+    if (read.value.value.status === "queued") {
+      return yield* cancelOrphan(assignment, root, because);
+    }
+    return yield* adopt(assignment, root, read.value.value);
+  });
 
   /** The claim's start, under the id, ceiling and review it was queued with. */
   const callStart = (assignment: HandoffAdmission.FactoryAssignment, root: string) =>
@@ -413,42 +405,41 @@ export const make = Effect.gen(function* () {
       );
 
   /** Acts on what a start found, once its admission has been marked dispatched. */
-  const settle = (
+  const settle = Effect.fn("FactoryExecutor.settle")(function* (
     assignment: HandoffAdmission.FactoryAssignment,
     root: string,
     claim: Pick<Claim, "admissionId" | "entrySeq">,
     first: boolean,
     launch: Launch,
-  ) =>
-    Effect.gen(function* () {
-      switch (launch.type) {
-        case "started":
-          return yield* adopt(assignment, root, launch.delivery);
-        case "refused":
-          // A first claim's start has never been called, so its delivery cannot exist.
-          return first
-            ? yield* retireFailed(assignment, root, claim, launch.because)
-            : yield* settleRefused(assignment, root, claim, launch.because);
-        case "start_refused": {
-          const read = yield* Effect.exit(factory.get(root));
-          if (Exit.isFailure(read)) {
-            return yield* uncertain(assignment.assignmentId, LAUNCH_UNKNOWN);
-          }
-          return Option.isNone(read.value)
-            ? yield* retireFailed(assignment, root, claim, launch.because)
-            : yield* adopt(assignment, root, read.value.value);
+  ) {
+    switch (launch.type) {
+      case "started":
+        return yield* adopt(assignment, root, launch.delivery);
+      case "refused":
+        // A first claim's start has never been called, so its delivery cannot exist.
+        return first
+          ? yield* retireFailed(assignment, root, claim, launch.because)
+          : yield* settleRefused(assignment, root, claim, launch.because);
+      case "start_refused": {
+        const read = yield* Effect.exit(factory.get(root));
+        if (Exit.isFailure(read)) {
+          return yield* uncertain(assignment.assignmentId, LAUNCH_UNKNOWN);
         }
-        case "uncertain": {
-          const read = yield* Effect.exit(factory.get(root));
-          return Exit.isSuccess(read) && Option.isSome(read.value)
-            ? yield* adopt(assignment, root, read.value.value)
-            : yield* uncertain(
-                assignment.assignmentId,
-                "The Factory start did not confirm; the next pass reads its delivery and starts it under the same id.",
-              );
-        }
+        return Option.isNone(read.value)
+          ? yield* retireFailed(assignment, root, claim, launch.because)
+          : yield* adopt(assignment, root, read.value.value);
       }
-    });
+      case "uncertain": {
+        const read = yield* Effect.exit(factory.get(root));
+        return Exit.isSuccess(read) && Option.isSome(read.value)
+          ? yield* adopt(assignment, root, read.value.value)
+          : yield* uncertain(
+              assignment.assignmentId,
+              "The Factory start did not confirm; the next pass reads its delivery and starts it under the same id.",
+            );
+      }
+    }
+  });
 
   /**
    * Claims the queued assignment at the fair head: a first claim mints its intended id, a pending
@@ -456,35 +447,38 @@ export const make = Effect.gen(function* () {
    * the claim's admission is marked dispatched when they return, however they end, and only then
    * is what they found acted on. False when it was not at the head after all.
    */
-  const launch = (projectId: ProjectId, assignmentId: string, pendingRoot: string | null) =>
-    Effect.gen(function* () {
-      const deliveryId = pendingRoot === null ? yield* randomUuidV4 : undefined;
-      const { decision, value } = yield* admission.dispatchAdmitted(
-        admission.claim({ assignmentId, ...(deliveryId === undefined ? {} : { deliveryId }) }),
-        (admitted) =>
-          Effect.gen(function* () {
-            const assignment = yield* admission.factoryAssignment(assignmentId);
-            if (assignment === undefined) return { type: "uncertain" } as const;
-            const because = yield* recheck(assignment, projectId);
-            if (because !== undefined) return { type: "refused", because } as const;
-            return yield* callStart(assignment, admitted.root);
-          }).pipe(
-            // An interrupted claim has no result to act on; the next instance reconciles it.
-            Effect.catchCause((cause) =>
-              Cause.hasInterruptsOnly(cause)
-                ? Effect.interrupt
-                : Effect.succeed<Launch>({ type: "uncertain" }),
-            ),
+  const launch = Effect.fn("FactoryExecutor.launch")(function* (
+    projectId: ProjectId,
+    assignmentId: string,
+    pendingRoot: string | null,
+  ) {
+    const deliveryId = pendingRoot === null ? yield* randomUuidV4 : undefined;
+    const { decision, value } = yield* admission.dispatchAdmitted(
+      admission.claim({ assignmentId, ...(deliveryId === undefined ? {} : { deliveryId }) }),
+      (admitted) =>
+        Effect.gen(function* () {
+          const assignment = yield* admission.factoryAssignment(assignmentId);
+          if (assignment === undefined) return { type: "uncertain" } as const;
+          const because = yield* recheck(assignment, projectId);
+          if (because !== undefined) return { type: "refused", because } as const;
+          return yield* callStart(assignment, admitted.root);
+        }).pipe(
+          // An interrupted claim has no result to act on; the next instance reconciles it.
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.succeed<Launch>({ type: "uncertain" }),
           ),
-        { interruptible: true },
-      );
-      if (decision.type !== "claimed" || Option.isNone(value)) return false;
-      const assignment = yield* admission.factoryAssignment(assignmentId);
-      if (assignment !== undefined) {
-        yield* settle(assignment, decision.root, decision.admitted, decision.first, value.value);
-      }
-      return true;
-    });
+        ),
+      { interruptible: true },
+    );
+    if (decision.type !== "claimed" || Option.isNone(value)) return false;
+    const assignment = yield* admission.factoryAssignment(assignmentId);
+    if (assignment !== undefined) {
+      yield* settle(assignment, decision.root, decision.admitted, decision.first, value.value);
+    }
+    return true;
+  });
 
   const STOP_WAITS =
     "The stop is held until this assignment's claim can be released; its slot stays held and the next pass tries again.";
@@ -493,37 +487,39 @@ export const make = Effect.gen(function* () {
    * Parks a root stopped before its first start, if its claim's protection allows it now.
    * Anything else that holds the root keeps the claim, and the next pass tries again.
    */
-  const park = (assignmentId: string, root: string, claim: Claim | null) =>
-    Effect.gen(function* () {
-      const outcome =
-        claim === null
-          ? ("contended" as const)
-          : yield* admission.parkPreStart({
-              root,
-              admissionId: claim.admissionId,
-              entrySeq: claim.entrySeq,
-            });
-      if (outcome === "contended") yield* uncertain(assignmentId, STOP_WAITS);
-    });
+  const park = Effect.fn("FactoryExecutor.park")(function* (
+    assignmentId: string,
+    root: string,
+    claim: Claim | null,
+  ) {
+    const outcome =
+      claim === null
+        ? ("contended" as const)
+        : yield* admission.parkPreStart({
+            root,
+            admissionId: claim.admissionId,
+            entrySeq: claim.entrySeq,
+          });
+    if (outcome === "contended") yield* uncertain(assignmentId, STOP_WAITS);
+  });
 
   /** The strict read a reconciliation decides on: none when it failed, decided nothing. */
   const readDelivery = (root: string) =>
     factory
       .get(root)
-      .pipe(
-        Effect.map(Option.some),
-        Effect.catchTags({ HandoffFactoryError: () => Effect.succeedNone }),
-      );
+      .pipe(Effect.asSome, Effect.catchTags({ HandoffFactoryError: () => Effect.succeedNone }));
 
   /** Records `note` unless the assignment's recent notes already hold it. */
-  const noteOnce = (assignmentId: string, note: string) =>
-    Effect.gen(function* () {
-      const current = yield* store.getAssignment(assignmentId);
-      if (Option.isNone(current) || current.value.progress.some(({ text }) => text === note)) {
-        return;
-      }
-      yield* move(assignmentId, { type: "record-notice", note });
-    });
+  const noteOnce = Effect.fn("FactoryExecutor.noteOnce")(function* (
+    assignmentId: string,
+    note: string,
+  ) {
+    const current = yield* store.getAssignment(assignmentId);
+    if (Option.isNone(current) || current.value.progress.some(({ text }) => text === note)) {
+      return;
+    }
+    yield* move(assignmentId, { type: "record-notice", note });
+  });
 
   /**
    * The release pass (note 6.4): the slot's `entry_seq` and the root's admissions read first, then
@@ -531,29 +527,31 @@ export const make = Effect.gen(function* () {
    * for a parked or terminal family with nothing busy, deferred or unknown. A queued or missing
    * delivery is neither, so a pre-start claim's slot never leaves here.
    */
-  const releasePass = (assignmentId: string, root: string) =>
-    Effect.gen(function* () {
-      const settled = yield* admission.settleAdmissions(root, factory.runStateOf);
-      if (settled.entrySeq === null) return;
-      const report = yield* factory.activity(root);
-      if (report.phase !== "parked" && report.phase !== "terminal") return;
-      if (settled.unknown || report.unknown) {
-        return yield* noteOnce(
-          assignmentId,
-          `What Factory delivery ${root}'s threads are doing could not be read, so its project assistant slot stays held and the next pass reads it again.`,
-        );
-      }
-      if (settled.busy || report.busy) {
-        return report.phase === "parked"
-          ? yield* noteOnce(
-              assignmentId,
-              `Work on Factory delivery ${root}'s threads is still running, so its project assistant slot stays held until it ends.`,
-            )
-          : undefined;
-      }
-      if (report.deferred) return;
-      yield* admission.release(root, settled.entrySeq);
-    });
+  const releasePass = Effect.fn("FactoryExecutor.releasePass")(function* (
+    assignmentId: string,
+    root: string,
+  ) {
+    const settled = yield* admission.settleAdmissions(root, factory.runStateOf);
+    if (settled.entrySeq === null) return;
+    const report = yield* factory.activity(root);
+    if (report.phase !== "parked" && report.phase !== "terminal") return;
+    if (settled.unknown || report.unknown) {
+      return yield* noteOnce(
+        assignmentId,
+        `What Factory delivery ${root}'s threads are doing could not be read, so its project assistant slot stays held and the next pass reads it again.`,
+      );
+    }
+    if (settled.busy || report.busy) {
+      return report.phase === "parked"
+        ? yield* noteOnce(
+            assignmentId,
+            `Work on Factory delivery ${root}'s threads is still running, so its project assistant slot stays held until it ends.`,
+          )
+        : undefined;
+    }
+    if (report.deferred) return;
+    yield* admission.release(root, settled.entrySeq);
+  });
 
   /**
    * An ended delivery's retirement (note 6.9): the release pass, a fresh observation, then the
@@ -561,60 +559,59 @@ export const make = Effect.gen(function* () {
    * reservation goes by compare-and-delete, a reservation that became an admission stays and
    * counted, and anything else keeps the assignment as it is, with a note, until a later pass.
    */
-  const retireEnded = (
+  const retireEnded = Effect.fn("FactoryExecutor.retireEnded")(function* (
     assignmentId: string,
     root: string,
     status: HandoffBackend.HandoffDelivery["status"],
     pullRequest: HandoffBackend.HandoffFollow["pullRequest"] = null,
-  ) =>
-    Effect.gen(function* () {
-      const reason = status === "done" ? ("completed" as const) : ("cancelled" as const);
-      let seen: HandoffAdmission.Observation = UNOBSERVED;
-      const attempt = admission.retire({
-        root,
-        reason,
-        release: releasePass(assignmentId, root).pipe(deferred("release")),
-        observe: factory.activity(root).pipe(
-          Effect.orElseSucceed(() => UNOBSERVED),
-          Effect.tap((observation) =>
-            Effect.sync(() => {
-              seen = observation;
-            }),
-          ),
+  ) {
+    const reason = status === "done" ? ("completed" as const) : ("cancelled" as const);
+    let seen: HandoffAdmission.Observation = UNOBSERVED;
+    const attempt = admission.retire({
+      root,
+      reason,
+      release: releasePass(assignmentId, root).pipe(deferred("release")),
+      observe: factory.activity(root).pipe(
+        Effect.orElseSucceed(() => UNOBSERVED),
+        Effect.tap((observation) =>
+          Effect.sync(() => {
+            seen = observation;
+          }),
         ),
-        ...(reason === "completed"
+      ),
+      ...(reason === "completed"
+        ? {
+            evidence: [
+              `Factory delivery ${root} is done: its pull request merged and its close-out finished.`,
+              ...(pullRequest === null ? [] : [`Pull request ${pullRequest.url} merged.`]),
+            ],
+          }
+        : pullRequest?.outcome === "closed"
           ? {
-              evidence: [
-                `Factory delivery ${root} is done: its pull request merged and its close-out finished.`,
-                ...(pullRequest === null ? [] : [`Pull request ${pullRequest.url} merged.`]),
-              ],
+              note: `Factory delivery ${root} was cancelled: pull request ${pullRequest.url} closed without merging.`,
             }
-          : pullRequest?.outcome === "closed"
-            ? {
-                note: `Factory delivery ${root} was cancelled: pull request ${pullRequest.url} closed without merging.`,
-              }
-            : {}),
-      });
-      let outcome = yield* attempt;
-      if (outcome === "retired") return;
-      const fenced = yield* admission.factoryAssignment(assignmentId);
-      const reserved = fenced?.slot?.state === "reserved" ? fenced.slot.reservedDemandId : null;
-      if (
-        reserved !== null &&
-        (yield* admission.dropFencedReservation({ root, demandId: reserved })) === "dropped"
-      ) {
-        outcome = yield* attempt;
-      }
-      if (outcome === "retired") return;
-      yield* noteOnce(
-        assignmentId,
-        seen.unknown
-          ? `Factory delivery ${root} has ended, but what its threads are doing could not be read. This assignment finishes once it can be.`
-          : seen.busy && reason === "cancelled"
-            ? `Factory delivery ${root} is cancelled, but work on its threads is still running. Stop it in the thread to finish cancelling.`
-            : `Factory delivery ${root} has ended, and this assignment finishes once the work still counted on its threads has ended.`,
-      );
+          : {}),
     });
+    let outcome = yield* attempt;
+    if (outcome === "retired") return;
+    const fenced = yield* admission.factoryAssignment(assignmentId);
+    const reserved = fenced?.slot?.state === "reserved" ? fenced.slot.reservedDemandId : null;
+    if (
+      reserved !== null &&
+      (yield* admission.dropFencedReservation({ root, demandId: reserved })) === "dropped"
+    ) {
+      outcome = yield* attempt;
+    }
+    if (outcome === "retired") return;
+    yield* noteOnce(
+      assignmentId,
+      seen.unknown
+        ? `Factory delivery ${root} has ended, but what its threads are doing could not be read. This assignment finishes once it can be.`
+        : seen.busy && reason === "cancelled"
+          ? `Factory delivery ${root} is cancelled, but work on its threads is still running. Stop it in the thread to finish cancelling.`
+          : `Factory delivery ${root} has ended, and this assignment finishes once the work still counted on its threads has ended.`,
+    );
+  });
 
   /**
    * A parked or pending-resume root whose cancel is persisted, so no claim can be granted: absent,
@@ -622,165 +619,164 @@ export const make = Effect.gen(function* () {
    * cancelled; one that ended retires with its reason. A failed read or cancel changes nothing,
    * and the next pass tries again.
    */
-  const parkedCancel = (
+  const parkedCancel = Effect.fn("FactoryExecutor.parkedCancel")(function* (
     assignmentId: string,
     root: string,
     delivery: Option.Option<HandoffBackend.HandoffDelivery>,
-  ) =>
-    Effect.gen(function* () {
-      if (Option.isNone(delivery)) {
-        return yield* admission
-          .retirePreDelivery({ root, reason: "abandoned", shape: { type: "parked" } })
-          .pipe(Effect.asVoid);
-      }
-      const { status } = delivery.value;
-      if (isEnded(status)) return yield* retireEnded(assignmentId, root, status);
-      const cancelled = yield* Effect.result(factory.cancel(root));
-      if (Result.isFailure(cancelled)) return;
-      yield* move(assignmentId, {
-        type: "mirror",
-        to: "stopping",
-        note: `Cancelling Factory delivery ${root}.`,
-      });
-      if (isEnded(cancelled.success.status)) {
-        yield* retireEnded(assignmentId, root, cancelled.success.status);
-      }
+  ) {
+    if (Option.isNone(delivery)) {
+      return yield* admission
+        .retirePreDelivery({ root, reason: "abandoned", shape: { type: "parked" } })
+        .pipe(Effect.asVoid);
+    }
+    const { status } = delivery.value;
+    if (isEnded(status)) return yield* retireEnded(assignmentId, root, status);
+    const cancelled = yield* Effect.result(factory.cancel(root));
+    if (Result.isFailure(cancelled)) return;
+    yield* move(assignmentId, {
+      type: "mirror",
+      to: "stopping",
+      note: `Cancelling Factory delivery ${root}.`,
     });
+    if (isEnded(cancelled.success.status)) {
+      yield* retireEnded(assignmentId, root, cancelled.success.status);
+    }
+  });
 
   /**
    * A claim that has committed and is not being dispatched: the persisted intent first, then a
    * strict read of the delivery. Start is called only with no intent set, and only for a row that
    * is absent or queued; a dead instance's claim row counts as dispatched.
    */
-  const reconcileClaim = (
+  const reconcileClaim = Effect.fn("FactoryExecutor.reconcileClaim")(function* (
     current: Portfolio.Assignment,
     assignment: HandoffAdmission.FactoryAssignment,
     root: string,
-  ) =>
-    Effect.gen(function* () {
-      const { claim, control } = assignment;
-      if (assignment.root?.state !== "active") return;
-      // This instance's own dispatch still runs; its end acts on what it finds.
-      if (claim?.state === "dispatching" && claim.mine) {
-        return control === "none" ? undefined : yield* uncertain(current.assignmentId, STOP_WAITS);
-      }
-      const read = yield* Effect.exit(factory.get(root));
-      if (Exit.isFailure(read)) return yield* uncertain(current.assignmentId, LAUNCH_UNKNOWN);
-      const delivery = Option.getOrUndefined(read.value);
-      const honored = () =>
-        claim?.state === "dispatching" ? admission.markDispatched(claim) : Effect.void;
+  ) {
+    const { claim, control } = assignment;
+    if (assignment.root?.state !== "active") return;
+    // This instance's own dispatch still runs; its end acts on what it finds.
+    if (claim?.state === "dispatching" && claim.mine) {
+      return control === "none" ? undefined : yield* uncertain(current.assignmentId, STOP_WAITS);
+    }
+    const read = yield* Effect.exit(factory.get(root));
+    if (Exit.isFailure(read)) return yield* uncertain(current.assignmentId, LAUNCH_UNKNOWN);
+    const delivery = Option.getOrUndefined(read.value);
+    const honored = () =>
+      claim?.state === "dispatching" ? admission.markDispatched(claim) : Effect.void;
 
-      if (delivery !== undefined && isEnded(delivery.status)) {
-        yield* honored();
-        return yield* adopt(assignment, root, delivery);
+    if (delivery !== undefined && isEnded(delivery.status)) {
+      yield* honored();
+      return yield* adopt(assignment, root, delivery);
+    }
+    if (control === "stop") {
+      yield* honored();
+      if (delivery === undefined || delivery.status === "queued") {
+        return yield* park(current.assignmentId, root, claim);
       }
-      if (control === "stop") {
-        yield* honored();
-        if (delivery === undefined || delivery.status === "queued") {
-          return yield* park(current.assignmentId, root, claim);
-        }
-        const stopped = yield* Effect.result(factory.stop(root));
-        if (Result.isSuccess(stopped)) {
-          return yield* move(current.assignmentId, {
-            type: "mirror",
-            to: "stopping",
-            note: `Stopping Factory delivery ${root} after its step.`,
-          }).pipe(Effect.asVoid);
-        }
-        // Factory refusing a row that runs no stage spends the stop. Any other failure says
-        // nothing about the row, so the stop stays persisted and the next pass asks again.
-        if (
-          stopped.failure._tag !== "HandoffFactoryRefused" ||
-          stopped.failure.reason !== "not_stoppable"
-        ) {
-          return yield* uncertain(current.assignmentId, LAUNCH_UNKNOWN);
-        }
-        return yield* sql.withTransaction(
-          Effect.andThen(
-            admission.setControl(current.assignmentId, "none"),
-            adopt(
-              assignment,
-              root,
-              delivery,
-              `Factory delivery ${root} cannot stop after its step while it runs no stage, so the stop was dropped.`,
-            ),
-          ),
-        );
-      }
-      if (control === "cancel" && delivery === undefined) {
-        yield* honored();
-        if (claim === null) return;
-        return yield* admission
-          .retirePreDelivery({
-            root,
-            reason: "abandoned",
-            shape: { type: "claim", admissionId: claim.admissionId, entrySeq: claim.entrySeq },
-          })
-          .pipe(Effect.asVoid);
-      }
-      if (control === "cancel") {
-        yield* honored();
-        const cancelled = yield* Effect.result(factory.cancel(root));
-        if (Result.isFailure(cancelled)) {
-          return yield* uncertain(current.assignmentId, LAUNCH_UNKNOWN);
-        }
+      const stopped = yield* Effect.result(factory.stop(root));
+      if (Result.isSuccess(stopped)) {
         return yield* move(current.assignmentId, {
           type: "mirror",
           to: "stopping",
-          note: `Cancelling Factory delivery ${root}.`,
+          note: `Stopping Factory delivery ${root} after its step.`,
         }).pipe(Effect.asVoid);
       }
-      if (delivery !== undefined && delivery.status !== "queued") {
-        yield* honored();
-        return yield* adopt(assignment, root, delivery);
+      // Factory refusing a row that runs no stage spends the stop. Any other failure says
+      // nothing about the row, so the stop stays persisted and the next pass asks again.
+      if (
+        stopped.failure._tag !== "HandoffFactoryRefused" ||
+        stopped.failure.reason !== "not_stoppable"
+      ) {
+        return yield* uncertain(current.assignmentId, LAUNCH_UNKNOWN);
       }
-      // No intent, and nothing has started it: the recheck, then the start under the same id.
-      if (claim === null || assignment.slot === null) return;
-      const because = yield* Effect.exit(recheck(assignment, current.projectId));
-      if (Exit.isFailure(because)) return yield* uncertain(current.assignmentId, LAUNCH_UNKNOWN);
-      if (because.value !== undefined) {
-        yield* honored();
-        return delivery === undefined
-          ? yield* retireFailed(assignment, root, claim, because.value)
-          : yield* cancelOrphan(assignment, root, because.value);
-      }
-      const started = yield* callStart(assignment, root).pipe(
-        Effect.ensuring(honored().pipe(Effect.ignore)),
+      return yield* sql.withTransaction(
+        Effect.andThen(
+          admission.setControl(current.assignmentId, "none"),
+          adopt(
+            assignment,
+            root,
+            delivery,
+            `Factory delivery ${root} cannot stop after its step while it runs no stage, so the stop was dropped.`,
+          ),
+        ),
       );
-      yield* settle(assignment, root, claim, false, started);
-    });
+    }
+    if (control === "cancel" && delivery === undefined) {
+      yield* honored();
+      if (claim === null) return;
+      return yield* admission
+        .retirePreDelivery({
+          root,
+          reason: "abandoned",
+          shape: { type: "claim", admissionId: claim.admissionId, entrySeq: claim.entrySeq },
+        })
+        .pipe(Effect.asVoid);
+    }
+    if (control === "cancel") {
+      yield* honored();
+      const cancelled = yield* Effect.result(factory.cancel(root));
+      if (Result.isFailure(cancelled)) {
+        return yield* uncertain(current.assignmentId, LAUNCH_UNKNOWN);
+      }
+      return yield* move(current.assignmentId, {
+        type: "mirror",
+        to: "stopping",
+        note: `Cancelling Factory delivery ${root}.`,
+      }).pipe(Effect.asVoid);
+    }
+    if (delivery !== undefined && delivery.status !== "queued") {
+      yield* honored();
+      return yield* adopt(assignment, root, delivery);
+    }
+    // No intent, and nothing has started it: the recheck, then the start under the same id.
+    if (claim === null || assignment.slot === null) return;
+    const because = yield* Effect.exit(recheck(assignment, current.projectId));
+    if (Exit.isFailure(because)) return yield* uncertain(current.assignmentId, LAUNCH_UNKNOWN);
+    if (because.value !== undefined) {
+      yield* honored();
+      return delivery === undefined
+        ? yield* retireFailed(assignment, root, claim, because.value)
+        : yield* cancelOrphan(assignment, root, because.value);
+    }
+    const started = yield* callStart(assignment, root).pipe(
+      Effect.ensuring(honored().pipe(Effect.ignore)),
+    );
+    yield* settle(assignment, root, claim, false, started);
+  });
 
   /** Cancels a delivery past queued by its own id; it shows stopping until retired. */
-  const cancelDelivery = (current: Portfolio.Assignment, root: string) =>
-    Effect.gen(function* () {
-      yield* factory.cancel(root);
-      return current.state === "stopping"
-        ? current
-        : yield* move(current.assignmentId, {
-            type: "mirror",
-            to: "stopping",
-            note: `Cancelling Factory delivery ${root}.`,
-          });
-    });
+  const cancelDelivery = Effect.fn("FactoryExecutor.cancelDelivery")(function* (
+    current: Portfolio.Assignment,
+    root: string,
+  ) {
+    yield* factory.cancel(root);
+    return current.state === "stopping"
+      ? current
+      : yield* move(current.assignmentId, {
+          type: "mirror",
+          to: "stopping",
+          note: `Cancelling Factory delivery ${root}.`,
+        });
+  });
 
   /** A root parked or pending a resume, each pass: its cancel, or a delivery that ended. */
-  const reconcileParked = (
+  const reconcileParked = Effect.fn("FactoryExecutor.reconcileParked")(function* (
     current: Portfolio.Assignment,
     assignment: HandoffAdmission.FactoryAssignment,
     root: string,
-  ) =>
-    Effect.gen(function* () {
-      if (assignment.root?.state === "retired" || assignment.slot !== null) return;
-      const read = yield* readDelivery(root);
-      if (Option.isNone(read)) return;
-      const delivery = read.value;
-      if (assignment.control === "cancel") {
-        return yield* parkedCancel(current.assignmentId, root, delivery);
-      }
-      if (Option.isSome(delivery) && isEnded(delivery.value.status)) {
-        yield* retireEnded(current.assignmentId, root, delivery.value.status);
-      }
-    });
+  ) {
+    if (assignment.root?.state === "retired" || assignment.slot !== null) return;
+    const read = yield* readDelivery(root);
+    if (Option.isNone(read)) return;
+    const delivery = read.value;
+    if (assignment.control === "cancel") {
+      return yield* parkedCancel(current.assignmentId, root, delivery);
+    }
+    if (Option.isSome(delivery) && isEnded(delivery.value.status)) {
+      yield* retireEnded(current.assignmentId, root, delivery.value.status);
+    }
+  });
 
   /**
    * Effect demands against what Factory says (note 6.3, G3 and G4): a demand for an effect its
@@ -788,162 +784,160 @@ export const make = Effect.gen(function* () {
    * a notice naming Resume. A marked effect with no demand gets one, and one whose root holds its
    * slot now runs in that holding.
    */
-  const reconcileEffects = (
+  const reconcileEffects = Effect.fn("FactoryExecutor.reconcileEffects")(function* (
     assignment: HandoffAdmission.FactoryAssignment,
     root: string,
     follow: HandoffBackend.HandoffFollow,
     demands: ReadonlyArray<HandoffAdmission.Demand>,
-  ) =>
-    Effect.gen(function* () {
-      for (const demand of demands) {
-        if (demand.kind !== "effect" || demand.deliveryId === null || demand.effectId === null) {
-          continue;
-        }
-        const marked = yield* factory.ensureDeferred(demand.deliveryId, demand.effectId);
-        if (marked === "stale") {
-          yield* admission.dropStaleEffect({
-            demandId: demand.id,
-            effectId: demand.effectId,
-            seq: demand.seq,
-            note: staleEffectNotice(root),
-          });
-        }
+  ) {
+    for (const demand of demands) {
+      if (demand.kind !== "effect" || demand.deliveryId === null || demand.effectId === null) {
+        continue;
       }
-      if (assignment.slot?.state === "reserved") return;
-      for (const mark of follow.marked) {
-        if (assignment.slot?.state === "held") {
-          yield* factory.redispatch(mark.deliveryId, mark.effectId);
-        } else {
-          yield* admission.ensureEffectDemand({ root, ...mark });
-        }
+      const marked = yield* factory.ensureDeferred(demand.deliveryId, demand.effectId);
+      if (marked === "stale") {
+        yield* admission.dropStaleEffect({
+          demandId: demand.id,
+          effectId: demand.effectId,
+          seq: demand.seq,
+          note: staleEffectNotice(root),
+        });
       }
-    });
+    }
+    if (assignment.slot?.state === "reserved") return;
+    for (const mark of follow.marked) {
+      if (assignment.slot?.state === "held") {
+        yield* factory.redispatch(mark.deliveryId, mark.effectId);
+      } else {
+        yield* admission.ensureEffectDemand({ root, ...mark });
+      }
+    }
+  });
 
   /** What the owner can do about each request pending on the family's threads. */
-  const requestNotices = (assignmentId: string, root: string) =>
-    Effect.gen(function* () {
-      for (const request of yield* factory.requests(root)) {
-        if (request.run?.class === "explicit" || !isOwnerDecidedRequest(request.kind)) continue;
-        yield* noteOnce(
-          assignmentId,
-          pendingRequestNotice({
-            threadId: request.threadId,
-            requestId: request.requestId,
-            kind: request.kind,
-            runClass: request.run?.class ?? null,
-            runtimeMode: request.runtimeMode ?? null,
-            capability: request.capability,
-            reason: request.reason,
-            questions:
-              request.kind === "user_input"
-                ? encodeQuestions(request.questions).slice(0, 4000)
-                : null,
-          }),
-        );
-      }
-    });
+  const requestNotices = Effect.fn("FactoryExecutor.requestNotices")(function* (
+    assignmentId: string,
+    root: string,
+  ) {
+    for (const request of yield* factory.requests(root)) {
+      if (request.run?.class === "explicit" || !isOwnerDecidedRequest(request.kind)) continue;
+      yield* noteOnce(
+        assignmentId,
+        pendingRequestNotice({
+          threadId: request.threadId,
+          requestId: request.requestId,
+          kind: request.kind,
+          runClass: request.run?.class ?? null,
+          runtimeMode: request.runtimeMode ?? null,
+          capability: request.capability,
+          reason: request.reason,
+          questions:
+            request.kind === "user_input"
+              ? encodeQuestions(request.questions).slice(0, 4000)
+              : null,
+        }),
+      );
+    }
+  });
 
   /**
    * A delivery past queued, each pass: an ended one retires; otherwise a persisted cancel is asked
    * for again, a revoked root is asked to stop, the assignment mirrors the delivery, its demands are
    * looked after and its slot released on evidence. A read that fails decides nothing.
    */
-  const followRoot = (
+  const followRoot = Effect.fn("FactoryExecutor.followRoot")(function* (
     current: Portfolio.Assignment,
     assignment: HandoffAdmission.FactoryAssignment,
     root: string,
-  ) =>
-    Effect.gen(function* () {
-      if (assignment.root?.state === "retired") return;
-      const read = yield* factory
-        .follow(root)
-        .pipe(
-          Effect.map(Option.some),
-          Effect.catchTags({ HandoffFactoryError: () => Effect.succeedNone }),
-        );
-      if (Option.isNone(read)) return;
-      if (Option.isNone(read.value)) {
-        return yield* noteOnce(
-          current.assignmentId,
-          `Factory delivery ${root} could not be found. Its project assistant slot stays held; cancel the assignment if it is gone for good.`,
-        );
-      }
-      let follow = read.value.value;
-      if (isEnded(follow.status)) {
-        return yield* retireEnded(current.assignmentId, root, follow.status, follow.pullRequest);
-      }
-      // A cancel this pass asked for has moved the assignment already.
-      let shown = current;
-      if (assignment.control === "cancel") {
-        shown = (yield* cancelDelivery(current, root).pipe(deferred("cancel"))) ?? current;
-      } else {
-        const revoked = yield* admission.revocation(current.assignmentId);
-        if (revoked !== undefined) {
-          yield* noteOnce(current.assignmentId, revokedNotice(root, REFUSED_BECAUSE[revoked]));
-          if (follow.status === "running") {
-            const stopped = yield* factory.stop(root).pipe(Effect.option);
-            if (Option.isSome(stopped)) follow = { ...follow, status: stopped.value.status };
-          }
-        }
-      }
-      if (follow.status === "queued") return;
-      const { to, note } = mirrorOf(root, assignment.control, follow);
-      const refs: ReadonlyArray<Portfolio.WorkerRef> = [
-        { kind: "factory-delivery", id: root },
-        { kind: "work-item", id: workItemRefString(assignment.item) },
-        ...(follow.threadId === null ? [] : [{ kind: "thread" as const, id: follow.threadId }]),
-        ...(follow.child?.threadId == null
-          ? []
-          : [{ kind: "thread" as const, id: follow.child.threadId }]),
-      ];
-      const newRefs = refs.filter(
-        (ref) => !shown.workerRefs.some(({ kind, id }) => kind === ref.kind && id === ref.id),
+  ) {
+    if (assignment.root?.state === "retired") return;
+    const read = yield* factory
+      .follow(root)
+      .pipe(Effect.asSome, Effect.catchTags({ HandoffFactoryError: () => Effect.succeedNone }));
+    if (Option.isNone(read)) return;
+    if (Option.isNone(read.value)) {
+      return yield* noteOnce(
+        current.assignmentId,
+        `Factory delivery ${root} could not be found. Its project assistant slot stays held; cancel the assignment if it is gone for good.`,
       );
-      if (shown.state !== to) {
-        yield* move(current.assignmentId, { type: "mirror", to, note, workerRefs: newRefs });
-      } else {
-        if (newRefs.length > 0) {
-          yield* move(current.assignmentId, { type: "mirror", to, workerRefs: newRefs });
+    }
+    let follow = read.value.value;
+    if (isEnded(follow.status)) {
+      return yield* retireEnded(current.assignmentId, root, follow.status, follow.pullRequest);
+    }
+    // A cancel this pass asked for has moved the assignment already.
+    let shown = current;
+    if (assignment.control === "cancel") {
+      shown = (yield* cancelDelivery(current, root).pipe(deferred("cancel"))) ?? current;
+    } else {
+      const revoked = yield* admission.revocation(current.assignmentId);
+      if (revoked !== undefined) {
+        yield* noteOnce(current.assignmentId, revokedNotice(root, REFUSED_BECAUSE[revoked]));
+        if (follow.status === "running") {
+          const stopped = yield* factory.stop(root).pipe(Effect.option);
+          if (Option.isSome(stopped)) follow = { ...follow, status: stopped.value.status };
         }
-        if (to !== "running") yield* noteOnce(current.assignmentId, note);
       }
-      const demands = yield* admission.demands(root);
-      yield* reconcileEffects(assignment, root, follow, demands).pipe(deferred("demand check"));
-      for (const demand of demands) yield* noteOnce(current.assignmentId, demandNotice(demand));
-      yield* requestNotices(current.assignmentId, root).pipe(deferred("question notice"));
-      yield* releasePass(current.assignmentId, root).pipe(deferred("release"));
-    });
+    }
+    if (follow.status === "queued") return;
+    const { to, note } = mirrorOf(root, assignment.control, follow);
+    const refs: ReadonlyArray<Portfolio.WorkerRef> = [
+      { kind: "factory-delivery", id: root },
+      { kind: "work-item", id: workItemRefString(assignment.item) },
+      ...(follow.threadId === null ? [] : [{ kind: "thread" as const, id: follow.threadId }]),
+      ...(follow.child?.threadId == null
+        ? []
+        : [{ kind: "thread" as const, id: follow.child.threadId }]),
+    ];
+    const newRefs = refs.filter(
+      (ref) => !shown.workerRefs.some(({ kind, id }) => kind === ref.kind && id === ref.id),
+    );
+    if (shown.state !== to) {
+      yield* move(current.assignmentId, { type: "mirror", to, note, workerRefs: newRefs });
+    } else {
+      if (newRefs.length > 0) {
+        yield* move(current.assignmentId, { type: "mirror", to, workerRefs: newRefs });
+      }
+      if (to !== "running") yield* noteOnce(current.assignmentId, note);
+    }
+    const demands = yield* admission.demands(root);
+    yield* reconcileEffects(assignment, root, follow, demands).pipe(deferred("demand check"));
+    for (const demand of demands) yield* noteOnce(current.assignmentId, demandNotice(demand));
+    yield* requestNotices(current.assignmentId, root).pipe(deferred("question notice"));
+    yield* releasePass(current.assignmentId, root).pipe(deferred("release"));
+  });
 
   /** One Factory assignment, each tick and after each control. */
-  const reconcile = (current: Portfolio.Assignment) =>
-    Effect.gen(function* () {
-      if (!RECONCILED.has(current.state)) return;
-      const assignment = yield* admission.factoryAssignment(current.assignmentId);
-      const root = assignment?.deliveryId ?? null;
-      if (assignment === undefined || root === null) return;
-      switch (current.state) {
-        case "launching":
-        case "launch-uncertain":
-          return yield* reconcileClaim(current, assignment, root);
-        case "queued":
-          return yield* reconcileParked(current, assignment, root);
-        case "stopped": {
-          // Parked before its first start, or stopped by Factory: only the row tells them apart.
-          const read = yield* readDelivery(root);
-          if (Option.isNone(read)) return;
-          const row = read.value;
-          return Option.isNone(row) || row.value.status === "queued"
-            ? yield* reconcileParked(current, assignment, root)
-            : yield* followRoot(current, assignment, root);
-        }
-        case "running":
-        case "needs-input":
-        case "stopping":
-          return yield* followRoot(current, assignment, root);
-        default:
-          return;
+  const reconcile = Effect.fn("FactoryExecutor.reconcile")(function* (
+    current: Portfolio.Assignment,
+  ) {
+    if (!RECONCILED.has(current.state)) return;
+    const assignment = yield* admission.factoryAssignment(current.assignmentId);
+    const root = assignment?.deliveryId ?? null;
+    if (assignment === undefined || root === null) return;
+    switch (current.state) {
+      case "launching":
+      case "launch-uncertain":
+        return yield* reconcileClaim(current, assignment, root);
+      case "queued":
+        return yield* reconcileParked(current, assignment, root);
+      case "stopped": {
+        // Parked before its first start, or stopped by Factory: only the row tells them apart.
+        const read = yield* readDelivery(root);
+        if (Option.isNone(read)) return;
+        const row = read.value;
+        return Option.isNone(row) || row.value.status === "queued"
+          ? yield* reconcileParked(current, assignment, root)
+          : yield* followRoot(current, assignment, root);
       }
-    });
+      case "running":
+      case "needs-input":
+      case "stopping":
+        return yield* followRoot(current, assignment, root);
+      default:
+        return;
+    }
+  });
 
   const currentState = (assignmentId: string) =>
     store.getAssignment(assignmentId).pipe(
@@ -956,257 +950,258 @@ export const make = Effect.gen(function* () {
     );
 
   /** Persists the intent, then lets the strict read after it decide. */
-  const withIntent = (current: Portfolio.Assignment, control: "stop" | "cancel") =>
-    Effect.gen(function* () {
-      yield* admission.setControl(current.assignmentId, control);
-      yield* reconcile(current).pipe(
-        Effect.catchCause((cause) =>
-          Cause.hasInterruptsOnly(cause)
-            ? Effect.interrupt
-            : Effect.logWarning("A Factory assignment's control was deferred", cause),
-        ),
-      );
-      return yield* currentState(current.assignmentId);
-    });
+  const withIntent = Effect.fn("FactoryExecutor.withIntent")(function* (
+    current: Portfolio.Assignment,
+    control: "stop" | "cancel",
+  ) {
+    yield* admission.setControl(current.assignmentId, control);
+    yield* reconcile(current).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("A Factory assignment's control was deferred", cause),
+      ),
+    );
+    return yield* currentState(current.assignmentId);
+  });
 
-  const stop = (
+  const stop = Effect.fn("FactoryExecutor.stop")(function* (
     current: Portfolio.Assignment,
     assignment: HandoffAdmission.FactoryAssignment,
     root: string,
-  ) =>
-    Effect.gen(function* () {
-      switch (current.state) {
-        case "queued":
-          return yield* refusal(PENDING_RESUME_STOP);
-        case "launching":
-        case "launch-uncertain":
-          return yield* withIntent(current, "stop");
-        case "stopped":
-        case "stopping":
-          return current;
-        case "running":
-        case "needs-input":
-          yield* factory.stop(root);
-          return yield* move(assignment.assignmentId, {
-            type: "mirror",
-            to: "stopping",
-            note: `Stopping Factory delivery ${root} after its step.`,
-          });
-        default:
-          return yield* refusal(`This assignment is ${current.state}, so it cannot stop.`);
-      }
-    });
+  ) {
+    switch (current.state) {
+      case "queued":
+        return yield* refusal(PENDING_RESUME_STOP);
+      case "launching":
+      case "launch-uncertain":
+        return yield* withIntent(current, "stop");
+      case "stopped":
+      case "stopping":
+        return current;
+      case "running":
+      case "needs-input":
+        yield* factory.stop(root);
+        return yield* move(assignment.assignmentId, {
+          type: "mirror",
+          to: "stopping",
+          note: `Stopping Factory delivery ${root} after its step.`,
+        });
+      default:
+        return yield* refusal(`This assignment is ${current.state}, so it cannot stop.`);
+    }
+  });
 
-  const cancel = (
+  const cancel = Effect.fn("FactoryExecutor.cancel")(function* (
     current: Portfolio.Assignment,
     assignment: HandoffAdmission.FactoryAssignment,
     root: string,
-  ) =>
-    Effect.gen(function* () {
-      switch (current.state) {
-        case "queued":
-        case "launching":
-        case "launch-uncertain":
-        case "stopped":
-          return yield* withIntent(current, "cancel");
-        case "running":
-        case "needs-input":
-        case "stopping":
-          yield* admission.setControl(assignment.assignmentId, "cancel");
-          // Saved, the cancel stands: one Factory failed to take is the next pass's to ask again.
-          return yield* cancelDelivery(current, root).pipe(
-            Effect.catchTags({ HandoffFactoryError: () => Effect.succeed(current) }),
-          );
-        default:
-          return yield* move(assignment.assignmentId, { type: "cancel" });
-      }
-    });
+  ) {
+    switch (current.state) {
+      case "queued":
+      case "launching":
+      case "launch-uncertain":
+      case "stopped":
+        return yield* withIntent(current, "cancel");
+      case "running":
+      case "needs-input":
+      case "stopping":
+        yield* admission.setControl(assignment.assignmentId, "cancel");
+        // Saved, the cancel stands: one Factory failed to take is the next pass's to ask again.
+        return yield* cancelDelivery(current, root).pipe(
+          Effect.catchTags({ HandoffFactoryError: () => Effect.succeed(current) }),
+        );
+      default:
+        return yield* move(assignment.assignmentId, { type: "cancel" });
+    }
+  });
 
-  const resume = (
+  const resume = Effect.fn("FactoryExecutor.resume")(function* (
     current: Portfolio.Assignment,
     assignment: HandoffAdmission.FactoryAssignment,
     root: string,
     owed: ReviewResumeOwed | undefined,
-  ) =>
-    Effect.gen(function* () {
-      switch (current.state) {
-        case "queued":
-          return yield* refusal(PENDING_RESUME_STOP);
-        case "launching":
-        case "launch-uncertain":
-          // The claim goes on under its slot; the next pass starts it.
-          if (assignment.control === "none") {
-            return yield* refusal("This assignment is already launching.");
-          }
-          yield* admission.setControl(assignment.assignmentId, "none");
-          return current;
-        case "stopped":
-        case "running":
-        case "needs-input":
-        case "stopping":
-          break;
-        default:
-          return yield* refusal(`This assignment is ${current.state}, so it cannot resume.`);
-      }
-      const read = yield* Effect.exit(factory.get(root));
-      if (Exit.isFailure(read)) {
+  ) {
+    switch (current.state) {
+      case "queued":
+        return yield* refusal(PENDING_RESUME_STOP);
+      case "launching":
+      case "launch-uncertain":
+        // The claim goes on under its slot; the next pass starts it.
+        if (assignment.control === "none") {
+          return yield* refusal("This assignment is already launching.");
+        }
+        yield* admission.setControl(assignment.assignmentId, "none");
+        return current;
+      case "stopped":
+      case "running":
+      case "needs-input":
+      case "stopping":
+        break;
+      default:
+        return yield* refusal(`This assignment is ${current.state}, so it cannot resume.`);
+    }
+    const read = yield* Effect.exit(factory.get(root));
+    if (Exit.isFailure(read)) {
+      return yield* refusal(
+        "The Factory delivery could not be read, so nothing was resumed. Try again.",
+      );
+    }
+    const delivery = Option.getOrUndefined(read.value);
+    const fresh = yield* readWork(assignment.item);
+    // A review carries its own verify command, so settings changed since cannot refuse it.
+    if (assignment.reviewed === null) {
+      const verified = yield* Effect.exit(factory.verifyConfigured(current.projectId));
+      if (Exit.isFailure(verified)) {
         return yield* refusal(
-          "The Factory delivery could not be read, so nothing was resumed. Try again.",
+          "Factory's settings could not be read, so nothing was resumed. Try again.",
         );
       }
-      const delivery = Option.getOrUndefined(read.value);
-      const fresh = yield* readWork(assignment.item);
-      // A review carries its own verify command, so settings changed since cannot refuse it.
-      if (assignment.reviewed === null) {
-        const verified = yield* Effect.exit(factory.verifyConfigured(current.projectId));
-        if (Exit.isFailure(verified)) {
-          return yield* refusal(
-            "Factory's settings could not be read, so nothing was resumed. Try again.",
-          );
-        }
-        if (!verified.value) return yield* refusal(`Not resumed: ${NOT_CONFIGURED}.`);
+      if (!verified.value) return yield* refusal(`Not resumed: ${NOT_CONFIGURED}.`);
+    }
+    if (delivery === undefined || delivery.status === "queued") {
+      if (owed !== undefined) return yield* refusal(RESUME_MOVED_ON);
+      // A root parked before its first start waits in the queue again. Only a fair grant
+      // re-claims it, and that claim's recheck starts this same id.
+      if (current.state !== "stopped") {
+        return yield* refusal("This assignment's Factory delivery has not started.");
       }
-      if (delivery === undefined || delivery.status === "queued") {
-        if (owed !== undefined) return yield* refusal(RESUME_MOVED_ON);
-        // A root parked before its first start waits in the queue again. Only a fair grant
-        // re-claims it, and that claim's recheck starts this same id.
-        if (current.state !== "stopped") {
-          return yield* refusal("This assignment's Factory delivery has not started.");
-        }
-        const entered = yield* admission.resumeReentry({ root, work: fresh });
-        switch (entered.type) {
-          case "queued":
-            return yield* currentState(assignment.assignmentId);
-          case "refused":
-            return yield* refusal(`Not resumed: ${REFUSED_BECAUSE[entered.category]}.`);
-          case "contended":
-            return yield* refusal("This assignment changed meanwhile, so nothing was resumed.");
-        }
-      }
-      // A parent waits on the child it awaits, which alone can be resumed then.
-      const awaited =
-        delivery.status === "running" || delivery.status === "stopping"
-          ? yield* factory.follow(root).pipe(
-              Effect.map((follow) => Option.getOrUndefined(follow)?.child),
-              Effect.catchTags({
-                HandoffFactoryError: () =>
-                  Effect.fail(
-                    refusal(
-                      "The Factory delivery could not be read, so nothing was resumed. Try again.",
-                    ),
-                  ),
-              }),
-            )
-          : undefined;
-      const target =
-        awaited !== null && awaited !== undefined && isResumable(awaited.status)
-          ? awaited.deliveryId
-          : isResumable(delivery.status)
-            ? root
-            : undefined;
-      if (target === undefined) {
-        return yield* refusal(
-          `Factory delivery ${root} is ${delivery.status}, so it cannot resume.`,
-        );
-      }
-      if (owed !== undefined && target !== owed.deliveryId) {
-        return yield* refusal(RESUME_MOVED_ON);
-      }
-      const category = yield* admission.authority(assignment.assignmentId, fresh);
-      if (category !== undefined) {
-        return yield* refusal(`Not resumed: ${REFUSED_BECAUSE[category]}.`);
-      }
-      // The full recheck: what it restored enters the fair order again, at a fresh position.
-      yield* admission.recheckBlocked({ root, work: fresh, force: true });
-      if (owed === undefined) {
-        yield* factory.resume(target);
-      } else {
-        const taken = yield* factory.resume(target, { owedBy: owed.receiptId }).pipe(
-          Effect.as(true),
-          Effect.catchTags({
-            HandoffFactoryRefused: (refused) =>
-              refused.reason === "not_owed" ? Effect.succeed(false) : Effect.fail(refused),
-          }),
-        );
-        // Someone else's resume took it while this one read Work: whatever it does now, it does
-        // without this confirmation.
-        if (!taken) return current;
-      }
-      yield* admission.setControl(assignment.assignmentId, "none");
-      if (current.state === "running") return current;
-      return yield* move(assignment.assignmentId, {
-        type: "mirror",
-        to: "running",
-        note: `Resumed Factory delivery ${root}.`,
-      });
-    });
-
-  const retry = (current: Portfolio.Assignment, assignment: HandoffAdmission.FactoryAssignment) =>
-    Effect.gen(function* () {
-      if (
-        (current.state !== "failed" && current.state !== "cancelled") ||
-        assignment.root?.state !== "retired"
-      ) {
-        return yield* refusal(assignment.reviewed === null ? RESUME_KEEPS_ID : RETRY_NEEDS_REVIEW);
-      }
-      const entered = yield* admission.retryReentry({
-        assignmentId: assignment.assignmentId,
-        work: yield* readWork(assignment.item),
-      });
+      const entered = yield* admission.resumeReentry({ root, work: fresh });
       switch (entered.type) {
         case "queued":
           return yield* currentState(assignment.assignmentId);
         case "refused":
-          return yield* refusal(`Not retried: ${REFUSED_BECAUSE[entered.category]}.`);
+          return yield* refusal(`Not resumed: ${REFUSED_BECAUSE[entered.category]}.`);
         case "contended":
-          return yield* refusal(
-            "Another assignment uses this capture, or this one has not ended, so nothing was retried.",
-          );
-        case "review_required":
-          return yield* refusal(RETRY_NEEDS_REVIEW);
+          return yield* refusal("This assignment changed meanwhile, so nothing was resumed.");
       }
+    }
+    // A parent waits on the child it awaits, which alone can be resumed then.
+    const awaited =
+      delivery.status === "running" || delivery.status === "stopping"
+        ? yield* factory.follow(root).pipe(
+            Effect.map((follow) => Option.getOrUndefined(follow)?.child),
+            Effect.catchTags({
+              HandoffFactoryError: () =>
+                Effect.fail(
+                  refusal(
+                    "The Factory delivery could not be read, so nothing was resumed. Try again.",
+                  ),
+                ),
+            }),
+          )
+        : undefined;
+    const target =
+      awaited !== null && awaited !== undefined && isResumable(awaited.status)
+        ? awaited.deliveryId
+        : isResumable(delivery.status)
+          ? root
+          : undefined;
+    if (target === undefined) {
+      return yield* refusal(`Factory delivery ${root} is ${delivery.status}, so it cannot resume.`);
+    }
+    if (owed !== undefined && target !== owed.deliveryId) {
+      return yield* refusal(RESUME_MOVED_ON);
+    }
+    const category = yield* admission.authority(assignment.assignmentId, fresh);
+    if (category !== undefined) {
+      return yield* refusal(`Not resumed: ${REFUSED_BECAUSE[category]}.`);
+    }
+    // The full recheck: what it restored enters the fair order again, at a fresh position.
+    yield* admission.recheckBlocked({ root, work: fresh, force: true });
+    if (owed === undefined) {
+      yield* factory.resume(target);
+    } else {
+      const taken = yield* factory.resume(target, { owedBy: owed.receiptId }).pipe(
+        Effect.as(true),
+        Effect.catchTags({
+          HandoffFactoryRefused: (refused) =>
+            refused.reason === "not_owed" ? Effect.succeed(false) : Effect.fail(refused),
+        }),
+      );
+      // Someone else's resume took it while this one read Work: whatever it does now, it does
+      // without this confirmation.
+      if (!taken) return current;
+    }
+    yield* admission.setControl(assignment.assignmentId, "none");
+    if (current.state === "running") return current;
+    return yield* move(assignment.assignmentId, {
+      type: "mirror",
+      to: "running",
+      note: `Resumed Factory delivery ${root}.`,
     });
+  });
+
+  const retry = Effect.fn("FactoryExecutor.retry")(function* (
+    current: Portfolio.Assignment,
+    assignment: HandoffAdmission.FactoryAssignment,
+  ) {
+    if (
+      (current.state !== "failed" && current.state !== "cancelled") ||
+      assignment.root?.state !== "retired"
+    ) {
+      return yield* refusal(assignment.reviewed === null ? RESUME_KEEPS_ID : RETRY_NEEDS_REVIEW);
+    }
+    const entered = yield* admission.retryReentry({
+      assignmentId: assignment.assignmentId,
+      work: yield* readWork(assignment.item),
+    });
+    switch (entered.type) {
+      case "queued":
+        return yield* currentState(assignment.assignmentId);
+      case "refused":
+        return yield* refusal(`Not retried: ${REFUSED_BECAUSE[entered.category]}.`);
+      case "contended":
+        return yield* refusal(
+          "Another assignment uses this capture, or this one has not ended, so nothing was retried.",
+        );
+      case "review_required":
+        return yield* refusal(RETRY_NEEDS_REVIEW);
+    }
+  });
 
   /** The demand's fresh read of its root's item, reserving its slot, then its redelivery. */
-  const grantTurn = (demand: HandoffAdmission.Demand) =>
-    Effect.gen(function* () {
-      const assignment = yield* admission.factoryAssignment(demand.assignmentId);
-      if (assignment === undefined) return false;
-      const reserved = yield* admission.reserve(demand.id, yield* readWork(assignment.item));
-      if (reserved.type === "stale") return false;
-      if (reserved.type === "blocked") return true;
-      yield* redelivery.redeliver(reserved.demand).pipe(deferred("redelivery"));
-      return true;
-    });
+  const grantTurn = Effect.fn("FactoryExecutor.grantTurn")(function* (
+    demand: HandoffAdmission.Demand,
+  ) {
+    const assignment = yield* admission.factoryAssignment(demand.assignmentId);
+    if (assignment === undefined) return false;
+    const reserved = yield* admission.reserve(demand.id, yield* readWork(assignment.item));
+    if (reserved.type === "stale") return false;
+    if (reserved.type === "blocked") return true;
+    yield* redelivery.redeliver(reserved.demand).pipe(deferred("redelivery"));
+    return true;
+  });
 
   /** The marked effect's own grant: a held slot and its admission, then its redispatch. */
-  const grantEffect = (demand: HandoffAdmission.Demand) =>
-    Effect.gen(function* () {
-      const { deliveryId, effectId } = demand;
-      if (deliveryId === null || effectId === null) return false;
-      const marked = yield* factory.ensureDeferred(deliveryId, effectId);
-      if (marked === "running") return false;
-      if (marked === "stale") {
-        yield* admission.dropStaleEffect({
-          demandId: demand.id,
-          effectId,
-          seq: demand.seq,
-          note: staleEffectNotice(demand.root),
-        });
-        return true;
-      }
-      // Only the generation just checked: its redispatch names that effect and no other.
-      const { decision } = yield* admission.dispatchAdmitted(
-        admission.grantEffect(demand.id, { effectId, seq: demand.seq }),
-        () => factory.redispatch(deliveryId, effectId),
-      );
-      // Asked again, a revoked root's delivery refuses the effect itself and blocks.
-      if (decision.type === "refused") {
-        yield* factory.redispatch(deliveryId, effectId);
-        return false;
-      }
-      return decision.type === "granted";
-    });
+  const grantEffect = Effect.fn("FactoryExecutor.grantEffect")(function* (
+    demand: HandoffAdmission.Demand,
+  ) {
+    const { deliveryId, effectId } = demand;
+    if (deliveryId === null || effectId === null) return false;
+    const marked = yield* factory.ensureDeferred(deliveryId, effectId);
+    if (marked === "running") return false;
+    if (marked === "stale") {
+      yield* admission.dropStaleEffect({
+        demandId: demand.id,
+        effectId,
+        seq: demand.seq,
+        note: staleEffectNotice(demand.root),
+      });
+      return true;
+    }
+    // Only the generation just checked: its redispatch names that effect and no other.
+    const { decision } = yield* admission.dispatchAdmitted(
+      admission.grantEffect(demand.id, { effectId, seq: demand.seq }),
+      () => factory.redispatch(deliveryId, effectId),
+    );
+    // Asked again, a revoked root's delivery refuses the effect itself and blocks.
+    if (decision.type === "refused") {
+      yield* factory.redispatch(deliveryId, effectId);
+      return false;
+    }
+    return decision.type === "granted";
+  });
 
   /**
    * Grants the waiting demand at the free fair head (note 6.3): true when the next candidate can be
@@ -1264,41 +1259,43 @@ export const make = Effect.gen(function* () {
    * run of Factory's own that has not ended: answering any other could start a turn, or answer for
    * the owner. Refused with where to answer it.
    */
-  const questionThread = (current: Portfolio.Assignment, requestId: RuntimeRequestId) =>
-    Effect.gen(function* () {
-      const assignment = yield* admission.factoryAssignment(current.assignmentId);
-      const root = assignment?.deliveryId ?? null;
-      if (root === null) {
-        return yield* refusal("This assignment's Factory delivery has not started.");
-      }
-      const requests = yield* factory.requests(root).pipe(
-        Effect.catchTags({
-          HandoffFactoryError: () =>
-            Effect.fail(refusal("The delivery's requests could not be read. Try again.")),
-        }),
+  const questionThread = Effect.fn("FactoryExecutor.questionThread")(function* (
+    current: Portfolio.Assignment,
+    requestId: RuntimeRequestId,
+  ) {
+    const assignment = yield* admission.factoryAssignment(current.assignmentId);
+    const root = assignment?.deliveryId ?? null;
+    if (root === null) {
+      return yield* refusal("This assignment's Factory delivery has not started.");
+    }
+    const requests = yield* factory.requests(root).pipe(
+      Effect.catchTags({
+        HandoffFactoryError: () =>
+          Effect.fail(refusal("The delivery's requests could not be read. Try again.")),
+      }),
+    );
+    const request = requests.find((candidate) => candidate.requestId === requestId);
+    if (request === undefined) {
+      return yield* refusal(
+        "This is not a pending question of this assignment. Permission approvals must use the thread's approval UI.",
       );
-      const request = requests.find((candidate) => candidate.requestId === requestId);
-      if (request === undefined) {
-        return yield* refusal(
-          "This is not a pending question of this assignment. Permission approvals must use the thread's approval UI.",
-        );
-      }
-      if (request.kind !== "user_input") {
-        return yield* refusal(
-          `Thread ${request.threadId} is asking for a permission decision. Open that thread's approval UI; question tools cannot grant permission.`,
-        );
-      }
-      if (
-        request.capability !== "live" ||
-        request.run?.class !== "factory" ||
-        isTerminalRunStatus(request.run.status)
-      ) {
-        return yield* refusal(
-          `Only a live question of Factory's own running agent can be answered from here. Answer this one in thread ${request.threadId}.`,
-        );
-      }
-      return request.threadId;
-    });
+    }
+    if (request.kind !== "user_input") {
+      return yield* refusal(
+        `Thread ${request.threadId} is asking for a permission decision. Open that thread's approval UI; question tools cannot grant permission.`,
+      );
+    }
+    if (
+      request.capability !== "live" ||
+      request.run?.class !== "factory" ||
+      isTerminalRunStatus(request.run.status)
+    ) {
+      return yield* refusal(
+        `Only a live question of Factory's own running agent can be answered from here. Answer this one in thread ${request.threadId}.`,
+      );
+    }
+    return request.threadId;
+  });
 
   /**
    * What the delivery waits on someone for, from one read the whole overview shares: nothing here
@@ -1335,47 +1332,43 @@ export const make = Effect.gen(function* () {
   };
 
   /** The delivery as the overview shows it; a failed read reads as `unknown`, a missing row as none. */
-  const overviewDelivery = (
+  const overviewDelivery = Effect.fn("FactoryExecutor.overviewDelivery")(function* (
     root: string,
     projectId: ProjectId,
     pending: HandoffBackend.HandoffPendingRequests,
-  ) =>
-    Effect.gen(function* () {
-      const read = yield* factory
-        .follow(root)
-        .pipe(
-          Effect.map(Option.some),
-          Effect.catchTags({ HandoffFactoryError: () => Effect.succeedNone }),
-        );
-      const follow = Option.getOrNull(Option.flatten(read));
-      const child = follow?.child ?? null;
-      // A parent stopped or blocked by the child it awaits shows that child, as its mirror does.
-      const shown = child !== null && isResumable(child.status) ? child : follow;
-      const waiting = (yield* admission.demands(root)).filter(
-        ({ kind, state }) => kind !== "effect" && state === "waiting",
-      );
-      const blocked = waiting.filter(({ blockedReason }) => blockedReason !== null).length;
-      const ended = yield* admission.dispositions(root, OVERVIEW_NOTICES_MAX);
-      const threadId = child?.threadId ?? follow?.threadId ?? null;
-      const pendingActions = overviewPendingActions(root, projectId, follow, pending);
-      return {
-        deliveryId: root,
-        status: Option.isNone(read) ? ("unknown" as const) : (shown?.status ?? null),
-        stage: shown?.stage ?? null,
-        needsYou: shown?.reason ?? null,
-        capacityWait: (follow?.marked.length ?? 0) > 0,
-        automaticWaits: { waiting: waiting.length - blocked, blocked },
-        endedDispositions: ended.count,
-        notices: [...waiting.slice(-OVERVIEW_NOTICES_MAX).map(demandNotice), ...ended.notices],
-        pullRequestUrl: follow?.pullRequest?.url ?? null,
-        ...(follow?.pullRequest?.outcome == null
-          ? {}
-          : { pullRequestOutcome: follow.pullRequest.outcome }),
-        ...(follow?.proceeding === undefined ? {} : { proceeding: follow.proceeding }),
-        threadId: threadId === null ? null : ThreadId.make(threadId),
-        ...(pendingActions === undefined ? {} : { pendingActions }),
-      };
-    });
+  ) {
+    const read = yield* factory
+      .follow(root)
+      .pipe(Effect.asSome, Effect.catchTags({ HandoffFactoryError: () => Effect.succeedNone }));
+    const follow = Option.getOrNull(Option.flatten(read));
+    const child = follow?.child ?? null;
+    // A parent stopped or blocked by the child it awaits shows that child, as its mirror does.
+    const shown = child !== null && isResumable(child.status) ? child : follow;
+    const waiting = (yield* admission.demands(root)).filter(
+      ({ kind, state }) => kind !== "effect" && state === "waiting",
+    );
+    const blocked = waiting.filter(({ blockedReason }) => blockedReason !== null).length;
+    const ended = yield* admission.dispositions(root, OVERVIEW_NOTICES_MAX);
+    const threadId = child?.threadId ?? follow?.threadId ?? null;
+    const pendingActions = overviewPendingActions(root, projectId, follow, pending);
+    return {
+      deliveryId: root,
+      status: Option.isNone(read) ? ("unknown" as const) : (shown?.status ?? null),
+      stage: shown?.stage ?? null,
+      needsYou: shown?.reason ?? null,
+      capacityWait: (follow?.marked.length ?? 0) > 0,
+      automaticWaits: { waiting: waiting.length - blocked, blocked },
+      endedDispositions: ended.count,
+      notices: [...waiting.slice(-OVERVIEW_NOTICES_MAX).map(demandNotice), ...ended.notices],
+      pullRequestUrl: follow?.pullRequest?.url ?? null,
+      ...(follow?.pullRequest?.outcome == null
+        ? {}
+        : { pullRequestOutcome: follow.pullRequest.outcome }),
+      ...(follow?.proceeding === undefined ? {} : { proceeding: follow.proceeding }),
+      threadId: threadId === null ? null : ThreadId.make(threadId),
+      ...(pendingActions === undefined ? {} : { pendingActions }),
+    };
+  });
 
   return {
     launch,
@@ -1390,8 +1383,8 @@ export const make = Effect.gen(function* () {
      * `overviewSources`, for the whole overview at once. A read that fails leaves its part out, so
      * one assignment never costs the owner the others.
      */
-    overviewOf: (current: Portfolio.Assignment, pending: HandoffBackend.HandoffPendingRequests) =>
-      Effect.gen(function* () {
+    overviewOf: Effect.fn("FactoryExecutor.overviewOf")(
+      function* (current: Portfolio.Assignment, pending: HandoffBackend.HandoffPendingRequests) {
         const assignment = yield* admission.factoryAssignment(current.assignmentId);
         if (assignment === undefined) return {};
         const capture = Option.getOrUndefined(
@@ -1411,10 +1404,10 @@ export const make = Effect.gen(function* () {
               reviewed,
               factory: yield* overviewDelivery(assignment.deliveryId, current.projectId, pending),
             };
-      }).pipe(
-        deferred("overview"),
-        Effect.map((fields) => fields ?? {}),
-      ),
+      },
+      deferred("overview"),
+      Effect.map((fields) => fields ?? {}),
+    ),
 
     /**
      * What is pending across every root, read once for a whole overview however many assignments
@@ -1468,26 +1461,24 @@ export const make = Effect.gen(function* () {
         ),
 
     /** The captured item's fresh read, for an enqueue, taken before the assistant's lock. */
-    readCaptured: (projectId: ProjectId, ideaId: string) =>
-      Effect.gen(function* () {
+    readCaptured: Effect.fn("FactoryExecutor.readCaptured")(
+      function* (projectId: ProjectId, ideaId: string) {
         const capture = yield* captures.get(projectId, ideaId);
         if (Option.isNone(capture) || capture.value.itemId === null) return undefined;
         return yield* work.read({
           sourceId: capture.value.sourceId,
           itemId: capture.value.itemId,
         });
-      }).pipe(
-        Effect.catchTags({ HandoffBackendError: () => Effect.succeed("unreadable" as const) }),
-      ),
+      },
+      Effect.catchTags({ HandoffBackendError: () => Effect.succeed("unreadable" as const) }),
+    ),
 
     /**
-     * Whether the idea's capture may be queued (note 6.2, F). Refuses for a thread in plan mode, a
-     * capture that does not exist or was never confirmed, a brief or item that moved on from it, a
-     * closed or unreadable item, a project with no verify command, and a capture another
-     * assignment that has not ended uses. Reads that outlast these checks are answered by
-     * `enterAuthorized`.
+     * Whether the idea's capture may be queued (note 6.2, F). Refuses plan mode, a missing or
+     * unconfirmed capture, a brief or item that moved on, a closed or unreadable item, no verify
+     * command, or a capture another live assignment uses. `enterAuthorized` re-checks later reads.
      */
-    authorize: (input: {
+    authorize: Effect.fn("FactoryExecutor.authorize")(function* (input: {
       readonly projectId: ProjectId;
       readonly ideaId: string;
       readonly brief: Portfolio.ProjectBrief;
@@ -1495,70 +1486,69 @@ export const make = Effect.gen(function* () {
       readonly interactionMode: ProviderInteractionMode;
       readonly looperConfig: string | null;
       readonly read: HandoffBackend.HandoffItem | "unreadable" | undefined;
-    }) =>
-      Effect.gen(function* () {
-        if (input.looperConfig !== null) {
-          return yield* refusal(
-            "A Factory assignment runs through Factory, so it takes no Looper configuration.",
-          );
-        }
-        if (input.interactionMode === "plan") {
-          return yield* refusal(
-            "A thread in plan mode can only read, so it cannot queue Factory work.",
-          );
-        }
-        const captured = Option.getOrUndefined(yield* captures.get(input.projectId, input.ideaId));
-        if (captured?.state !== "captured" || captured.itemId === null) {
-          return yield* refusal(
-            "Capture this idea as a Work item with assistant_capture_work first, and have the owner review it in Work.",
-          );
-        }
-        if (captured.itemFingerprint === null) {
-          return yield* refusal(
-            "No read has confirmed what the captured Work item says. Capture the idea again, and have the owner review it in Work.",
-          );
-        }
-        if (captured.scopeHash !== Portfolio.briefScopeHash(input.brief)) {
-          return yield* refusal(
-            "The brief changed after this idea was captured. Capture it again, and have the owner review the item in Work.",
-          );
-        }
-        if (input.read === undefined || input.read === "unreadable" || input.read.invalid) {
-          return yield* refusal(
-            "The captured Work item could not be read, so nothing was queued. Try again once its source can be read.",
-          );
-        }
-        if (input.read.fingerprint !== captured.itemFingerprint) {
-          return yield* refusal(
-            "The captured Work item changed after it was captured. Show the owner what changed in Work, and capture the idea again.",
-          );
-        }
-        if (input.read.status === "done" || input.read.status === "cancelled") {
-          return yield* refusal(
-            "The captured Work item is done or cancelled, so nothing was queued.",
-          );
-        }
-        const verified = yield* factory.verifyConfigured(input.projectId);
-        if (!verified) {
-          return yield* refusal(
-            "Set a verify command in the project's Factory settings before queuing a delivery.",
-          );
-        }
-        if (yield* admission.captureInUse({ captureId: captured.captureId })) {
-          return yield* refusal(
-            "Another assignment that has not ended already delivers this capture.",
-          );
-        }
-        return {
-          captureId: captured.captureId,
-          item: { sourceId: captured.sourceId, itemId: captured.itemId },
-          kind: captured.kind,
-          scopeHash: captured.scopeHash,
-          itemFingerprint: captured.itemFingerprint,
-          runtimeMode: input.runtimeMode,
-          work: { type: "read", fingerprint: input.read.fingerprint, status: input.read.status },
-        } satisfies Authorized;
-      }),
+    }) {
+      if (input.looperConfig !== null) {
+        return yield* refusal(
+          "A Factory assignment runs through Factory, so it takes no Looper configuration.",
+        );
+      }
+      if (input.interactionMode === "plan") {
+        return yield* refusal(
+          "A thread in plan mode can only read, so it cannot queue Factory work.",
+        );
+      }
+      const captured = Option.getOrUndefined(yield* captures.get(input.projectId, input.ideaId));
+      if (captured?.state !== "captured" || captured.itemId === null) {
+        return yield* refusal(
+          "Capture this idea as a Work item with assistant_capture_work first, and have the owner review it in Work.",
+        );
+      }
+      if (captured.itemFingerprint === null) {
+        return yield* refusal(
+          "No read has confirmed what the captured Work item says. Capture the idea again, and have the owner review it in Work.",
+        );
+      }
+      if (captured.scopeHash !== Portfolio.briefScopeHash(input.brief)) {
+        return yield* refusal(
+          "The brief changed after this idea was captured. Capture it again, and have the owner review the item in Work.",
+        );
+      }
+      if (input.read === undefined || input.read === "unreadable" || input.read.invalid) {
+        return yield* refusal(
+          "The captured Work item could not be read, so nothing was queued. Try again once its source can be read.",
+        );
+      }
+      if (input.read.fingerprint !== captured.itemFingerprint) {
+        return yield* refusal(
+          "The captured Work item changed after it was captured. Show the owner what changed in Work, and capture the idea again.",
+        );
+      }
+      if (input.read.status === "done" || input.read.status === "cancelled") {
+        return yield* refusal(
+          "The captured Work item is done or cancelled, so nothing was queued.",
+        );
+      }
+      const verified = yield* factory.verifyConfigured(input.projectId);
+      if (!verified) {
+        return yield* refusal(
+          "Set a verify command in the project's Factory settings before queuing a delivery.",
+        );
+      }
+      if (yield* admission.captureInUse({ captureId: captured.captureId })) {
+        return yield* refusal(
+          "Another assignment that has not ended already delivers this capture.",
+        );
+      }
+      return {
+        captureId: captured.captureId,
+        item: { sourceId: captured.sourceId, itemId: captured.itemId },
+        kind: captured.kind,
+        scopeHash: captured.scopeHash,
+        itemFingerprint: captured.itemFingerprint,
+        runtimeMode: input.runtimeMode,
+        work: { type: "read", fingerprint: input.read.fingerprint, status: input.read.status },
+      } satisfies Authorized;
+    }),
 
     /**
      * The link and queue position of a Factory assignment, in its enqueue's transaction, which
@@ -1566,26 +1556,28 @@ export const make = Effect.gen(function* () {
      * as they stand now, with the read taken before it. Any of them can have changed while the
      * reads ran; failing here rolls back every row the enqueue wrote.
      */
-    enterAuthorized: (assignmentId: string, { work, ...link }: Authorized) =>
-      Effect.gen(function* () {
-        yield* admission.createLink({ assignmentId, ...link });
-        yield* admission.enterQueue(assignmentId);
-        const category = yield* admission.authority(assignmentId, work);
-        if (category !== undefined) {
-          return yield* refusal(`Not queued: ${REFUSED_BECAUSE[category]}.`);
-        }
-      }),
+    enterAuthorized: Effect.fn("FactoryExecutor.enterAuthorized")(function* (
+      assignmentId: string,
+      { work, ...link }: Authorized,
+    ) {
+      yield* admission.createLink({ assignmentId, ...link });
+      yield* admission.enterQueue(assignmentId);
+      const category = yield* admission.authority(assignmentId, work);
+      if (category !== undefined) {
+        return yield* refusal(`Not queued: ${REFUSED_BECAUSE[category]}.`);
+      }
+    }),
 
     /**
      * A control of a Factory assignment (note 6.8), under the assistant's lock. With `owed`, a resume
      * is refused unless it would pick that very delivery, and is that review's one resume or none.
      */
-    control: (
-      current: Portfolio.Assignment,
-      action: "stop" | "resume" | "retry" | "cancel",
-      options: { readonly owed?: ReviewResumeOwed } = {},
-    ) =>
-      Effect.gen(function* () {
+    control: Effect.fn("FactoryExecutor.control")(
+      function* (
+        current: Portfolio.Assignment,
+        action: "stop" | "resume" | "retry" | "cancel",
+        options: { readonly owed?: ReviewResumeOwed } = {},
+      ) {
         const assignment = yield* admission.factoryAssignment(current.assignmentId);
         if (assignment === undefined) return yield* refusal("Assignment not found.");
         const root = assignment.deliveryId;
@@ -1617,10 +1609,10 @@ export const make = Effect.gen(function* () {
           case "retry":
             return yield* retry(current, assignment);
         }
-      }).pipe(
-        Effect.catchTags({
-          HandoffFactoryRefused: (refused) => Effect.fail(refusal(refused.message)),
-        }),
-      ),
+      },
+      Effect.catchTags({
+        HandoffFactoryRefused: (refused) => Effect.fail(refusal(refused.message)),
+      }),
+    ),
   };
 });

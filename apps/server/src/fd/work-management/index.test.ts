@@ -1,8 +1,9 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { WORK_MANAGEMENT_CAPABILITY } from "@t3tools/contracts/fd/work-management";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
-import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
+import * as GitHubApi from "./sources/github/WorkGitHubApi.ts";
 import { FetchHttpClient } from "effect/http";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -57,7 +58,8 @@ describe("work-management composition", () => {
       Effect.provide(
         layerAdapters.pipe(
           Layer.provide(NodeServices.layer),
-          Layer.provide(Layer.mock(GitHubApi.GitHubApi)({})),
+          Layer.provide(NodeCrypto.layer),
+          Layer.provide(Layer.mock(GitHubApi.WorkGitHubApi)({})),
           Layer.provide(SourceControlRateLimit.layer),
           Layer.provide(FetchHttpClient.layer),
         ),
@@ -80,10 +82,11 @@ describe("work-management composition", () => {
           Layer.provide(Layer.mock(ServerSecretStore.ServerSecretStore)({})),
           Layer.provide(Layer.mock(ThreadLaunch.ThreadLaunchService)({})),
           Layer.provide(ServerSettings.layerTest()),
-          Layer.provide(Layer.mock(GitHubApi.GitHubApi)({})),
+          Layer.provide(Layer.mock(GitHubApi.WorkGitHubApi)({})),
           Layer.provide(SourceControlRateLimit.layer),
           Layer.provide(FetchHttpClient.layer),
           Layer.provide(NodeServices.layer),
+          Layer.provide(NodeCrypto.layer),
         ),
       ),
     ),

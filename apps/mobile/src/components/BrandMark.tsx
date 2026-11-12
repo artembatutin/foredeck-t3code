@@ -1,13 +1,13 @@
 import Constants from "expo-constants";
 import { View } from "react-native";
 
-import { AppText as Text } from "./AppText";
+import { AppText as Text } from "./ui/AppText";
 import { ForedeckAnchor } from "../fd/branding";
-import { FOREDECK_WORDMARK } from "@t3tools/shared/fd/branding";
+import { FOREDECK_PRODUCT_NAME } from "@t3tools/shared/fd/branding";
 
 const appVariant = Constants.expoConfig?.extra?.appVariant;
 const DEFAULT_STAGE_LABEL =
-  appVariant === "development" ? "Dev" : appVariant === "preview" ? "Preview" : "Alpha";
+  appVariant === "development" ? "Dev" : appVariant === "preview" ? "Preview" : "Beta";
 
 export function BrandMark(props: { readonly compact?: boolean; readonly stageLabel?: string }) {
   const compact = props.compact ?? false;
@@ -20,7 +20,7 @@ export function BrandMark(props: { readonly compact?: boolean; readonly stageLab
       <View className="gap-1">
         <View className="flex-row items-center gap-2">
           <Text className="font-bold text-foreground" style={{ fontSize: 22, letterSpacing: -0.3 }}>
-            {FOREDECK_WORDMARK}
+            {FOREDECK_PRODUCT_NAME}
           </Text>
           <View className="rounded-full bg-subtle px-2 py-1">
             <Text className="text-3xs font-semibold tracking-[0.3px] text-foreground-muted">

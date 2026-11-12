@@ -1,11 +1,18 @@
-import { CommandId, type OrchestrationV2ThreadProjection } from "@t3tools/contracts";
+import {
+  CommandId,
+  type MessageId,
+  type OrchestrationV2ThreadProjection,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Stream from "effect/Stream";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
+import type * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
 
@@ -59,16 +66,10 @@ const nativeRetryKey = (
 ): string => `native:${request.threadId}:${request.providerThreadId}:${messageId}`;
 
 /**
- * Drains ProviderContinuationRequests and dispatches an internal
- * message.dispatch per request so the wake turn buffered by the adapter is
- * ingested as a normal run. Delegated completions are durable mailbox offers:
- * the orchestrator selects native steering or queued delivery under its thread
- * lock. Adapter-buffered continuations still queue behind active work.
- *
- * Each turn first asks the automatic turn gate. A completion it holds back
- * stays open on its cohort for a later offer. A native wake's buffered output
- * lives only in its adapter, so the gate may keep its dispatch to run later; a
- * wake the gate could not decide is offered again under the same message id.
+ * Dispatches an internal message.dispatch per ProviderContinuationRequest so adapter-buffered
+ * wakes run normally; delegated completions are durable mailbox offers. Each turn asks the
+ * automatic turn gate first: held completions stay open for a later offer, native wakes may be
+ * kept, and undecided wakes are re-offered under the same message id.
  */
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
@@ -77,6 +78,8 @@ export const layer = Layer.effectDiscard(
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const gate = yield* AutomaticTurnGate.AutomaticTurnGate;
     const retryAttempts = yield* Ref.make(new Map<string, number>());
+    // Run watches outlive the wake the gate may run later, so they belong to the service.
+    const serviceScope = yield* Effect.scope;
 
     const clearRetryAttempt = (key: string) =>
       Ref.update(retryAttempts, (current) => {
@@ -94,21 +97,70 @@ export const layer = Layer.effectDiscard(
         return [Math.min(100 * 2 ** Math.min(attempt, 6), 5_000), updated] as const;
       });
 
-    const dropArchived = (request: ProviderContinuationRequests.ProviderContinuationRequest) =>
-      Effect.gen(function* () {
-        yield* Effect.logInfo("orchestration-v2.provider-continuation.thread-archived", {
-          threadId: request.threadId,
-          providerThreadId: request.providerThreadId,
-        });
-        // No continuation turn will start to clear the adapter's sticky offer.
-        if (request.clearIfCurrent !== undefined) {
-          yield* request.clearIfCurrent();
-        } else if (request.dispatchIfCurrent !== undefined) {
-          // Backward compatibility for request producers without an explicit
-          // drop callback.
-          yield* request.dispatchIfCurrent(Effect.void);
-        }
+    const dropArchived = Effect.fn("ProviderContinuationService.dropArchived")(function* (
+      request: ProviderContinuationRequests.ProviderContinuationRequest,
+    ) {
+      yield* Effect.logInfo("orchestration-v2.provider-continuation.thread-archived", {
+        threadId: request.threadId,
+        providerThreadId: request.providerThreadId,
       });
+      // No continuation turn will start to clear the adapter's sticky offer.
+      if (request.clearIfCurrent !== undefined) {
+        yield* request.clearIfCurrent();
+      } else if (request.dispatchIfCurrent !== undefined) {
+        // Backward compatibility for request producers without an explicit
+        // drop callback.
+        yield* request.dispatchIfCurrent(Effect.void);
+      }
+    });
+
+    // Cancelling or stopping a queued continuation ends it unstarted; only the request can release the adapter's wake latch.
+    const releaseIfNeverStarted = Effect.fn("ProviderContinuationService.releaseIfNeverStarted")(
+      function* (
+        request: ProviderContinuationRequests.ProviderContinuationRequest,
+        messageId: MessageId,
+        dispatched: Orchestrator.OrchestratorV2DispatchResult,
+      ) {
+        const onRunEndedWithoutStarting = request.onRunEndedWithoutStarting;
+        if (onRunEndedWithoutStarting === undefined) return;
+        const runId = dispatched.storedEvents.flatMap(({ event }) =>
+          event.type === "run.created" && event.payload.userMessageId === messageId
+            ? [event.payload.id]
+            : [],
+        )[0];
+        if (runId === undefined) return;
+        yield* threads
+          .streamStoredEventsFrom({
+            threadId: request.threadId,
+            afterSequence: dispatched.sequence,
+            eventType: "run.updated",
+          })
+          .pipe(
+            Stream.filter(
+              ({ event }) =>
+                event.type === "run.updated" &&
+                event.payload.id === runId &&
+                ThreadManagementService.isTerminalRunStatus(event.payload.status),
+            ),
+            Stream.runHead,
+            Effect.flatMap((ended) =>
+              Option.isSome(ended) &&
+              ended.value.event.type === "run.updated" &&
+              ended.value.event.payload.startedAt === null
+                ? onRunEndedWithoutStarting()
+                : Effect.void,
+            ),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("orchestration-v2.provider-continuation.run-watch-failed", {
+                threadId: request.threadId,
+                providerThreadId: request.providerThreadId,
+                cause,
+              }),
+            ),
+            Effect.forkIn(serviceScope),
+          );
+      },
+    );
 
     const dispatchContinuation = Effect.fn("ProviderContinuationService.dispatchContinuation")(
       function* (request: ProviderContinuationRequests.ProviderContinuationRequest) {
@@ -163,16 +215,6 @@ export const layer = Layer.effectDiscard(
               },
             })
             .pipe(
-              // The project turned the target instance off between the cohort
-              // read above and this dispatch. The finalize that claimed this
-              // delivery already wrote the children's results to the parent's
-              // history unconditionally, so nothing is lost: acknowledge each
-              // task administratively (observedByRunId: null, the same shape
-              // task_status uses when no run observed it) to consume this
-              // delivery instead of leaving it open to retry. The parent's
-              // next turn against an enabled instance reads those results from
-              // history the same way any turn does; nothing here re-offers
-              // this generation.
               Effect.catchTags({
                 ThreadManagementProviderInstanceDisabledError: (error) =>
                   Effect.logInfo(
@@ -190,16 +232,15 @@ export const layer = Layer.effectDiscard(
                           ids.allocate
                             .command({
                               fixtureName: "delegated-completion",
-                              commandName: "acknowledge-disabled",
+                              commandName: "dispose-disabled",
                             })
                             .pipe(
-                              Effect.flatMap((ackCommandId) =>
+                              Effect.flatMap((disposeCommandId) =>
                                 threads.dispatch({
-                                  type: "delegated_task.completion-delivery.acknowledge",
-                                  commandId: ackCommandId,
+                                  type: "delegated_task.completion-delivery.dispose",
+                                  commandId: disposeCommandId,
                                   parentThreadId: request.threadId,
                                   taskId,
-                                  observedByRunId: null,
                                 }),
                               ),
                             ),
@@ -235,8 +276,6 @@ export const layer = Layer.effectDiscard(
           yield* clearRetryAttempt(retryKey);
           return;
         }
-        // The ordinal is display metadata only: allocate.message appends a
-        // random UUID, so a stale projection read here cannot collide ids.
         // Allocated once: a re-offer after an undecided consult carries it.
         const messageId =
           request.messageId ??
@@ -245,34 +284,26 @@ export const layer = Layer.effectDiscard(
             ordinal: projection.messages.length + 1,
           }));
         const commandId = CommandId.make(`provider-continuation:${messageId}`);
-        const plainDispatch = threads.dispatch({
-          type: "message.dispatch",
-          commandId,
-          threadId: request.threadId,
-          messageId,
-          text: request.detail ?? CONTINUATION_MESSAGE_TEXT,
-          notification: request.notification ?? {
-            source: { kind: "background_task" },
-            outcome: "updated",
-            summary: "Background activity updated",
-          },
-          attachments: [],
-          dispatchMode: { type: "queue_after_active" },
-          createdBy: "agent",
-          // "provider" marks an adapter-buffered wake, which ClaudeAdapterV2
-          // detects to attach the buffered CLI output and drop this text. A
-          // message_text wake has no buffered output, so it must not carry that
-          // marker or the turn settles immediately having prompted nothing.
-          creationSource: request.delivery === "message_text" ? "server" : "provider",
-        });
-        // The adapter's buffered wake has nowhere else to go once the
-        // instance is off: drop it rather than warn, since nothing here
-        // retries it either way. This catch sits outside dispatchIfCurrent so
-        // an adapter that clears its own sticky offer flag on dispatch
-        // failure (inside dispatchIfCurrent) observes the raw failure first.
-        // Not every adapter self-clears that way, so the explicit callback is
-        // called here too; clearIfCurrent implementations are idempotent, so
-        // a source that already cleared is unaffected.
+        const plainDispatch = threads
+          .dispatch({
+            type: "message.dispatch",
+            commandId,
+            threadId: request.threadId,
+            messageId,
+            text: request.detail ?? CONTINUATION_MESSAGE_TEXT,
+            notification: request.notification ?? {
+              source: { kind: "background_task" },
+              outcome: "updated",
+              summary: "Background activity updated",
+            },
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "agent",
+            // Only buffered wakes use creationSource "provider"; Claude would drain an empty buffer instead of prompting message_text.
+            creationSource: request.delivery === "message_text" ? "server" : "provider",
+          })
+          .pipe(Effect.tap((dispatched) => releaseIfNeverStarted(request, messageId, dispatched)));
+        // Catch after dispatchIfCurrent so adapters see raw failures first; clearIfCurrent is idempotent and covers others.
         const logInstanceDisabled = (
           error: ThreadManagementService.ThreadManagementProviderInstanceDisabledError,
         ) =>
@@ -328,8 +359,8 @@ export const layer = Layer.effectDiscard(
             // Undecided: the adapter's offer stays as it is, and the same wake
             // is offered again after the next backoff step.
             Effect.catchTags({
-              AutomaticTurnDecisionError: (error) =>
-                Effect.gen(function* () {
+              AutomaticTurnDecisionError: Effect.fn("ProviderContinuationService.wakeUndecided")(
+                function* (error: AutomaticTurnGate.AutomaticTurnDecisionError) {
                   const retryDelay = yield* nextRetryDelay(retryKey);
                   yield* Effect.logWarning(
                     "orchestration-v2.provider-continuation.wake-undecided",
@@ -345,7 +376,8 @@ export const layer = Layer.effectDiscard(
                     Effect.forkScoped,
                   );
                   return false;
-                }),
+                },
+              ),
             }),
             Effect.onError(() => clearRetryAttempt(retryKey)),
           );
@@ -394,6 +426,8 @@ export const layer = Layer.effectDiscard(
                   ),
                   Effect.forkScoped,
                 );
+              } else if (request.clearIfCurrent !== undefined) {
+                yield* request.clearIfCurrent();
               }
             }),
           ),

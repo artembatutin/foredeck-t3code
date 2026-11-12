@@ -132,6 +132,22 @@ export type WorkDomainError =
   | WorkForbidden
   | WorkRateLimited;
 
+/** Every domain error, for a schema that carries one. */
+export const WorkDomainError = Schema.Union([
+  WorkPermissionDenied,
+  WorkSourceNotFound,
+  WorkItemNotFound,
+  WorkStale,
+  WorkSourceStale,
+  WorkConflict,
+  WorkUnsupported,
+  WorkInvalid,
+  WorkUnavailable,
+  WorkUnauthenticated,
+  WorkForbidden,
+  WorkRateLimited,
+]);
+
 const HOST_MESSAGE_LIMIT = 500;
 
 /** Bounds a host's own message before it becomes an attribute. */

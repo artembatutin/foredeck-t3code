@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -130,6 +131,7 @@ const setup = (
       Layer.provideMerge(harness.layer),
       Layer.provide(ServerSettings.layerTest()),
       Layer.provide(NodeServices.layer),
+      Layer.provide(NodeCrypto.layer),
     );
     return { markdown, harness, control, layer };
   });

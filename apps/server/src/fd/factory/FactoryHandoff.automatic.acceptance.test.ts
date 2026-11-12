@@ -1,4 +1,4 @@
-import { assert, describe, it, vi } from "@effect/vitest";
+import { assert, describe, it } from "@effect/vitest";
 import { CommandId, type RunId, type RuntimeRequestId, type ThreadId } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -69,16 +69,11 @@ import {
   withQuestionReactor,
 } from "./testkit/handoff.ts";
 
-// Real Git, verify commands and rebuilt servers on every path: a loaded machine only takes longer,
-// and nothing here waits on time, so the limit is just where a real hang fails.
-vi.setConfig({ testTimeout: 240_000 });
-
 /**
- * Core's own follow-ups on a Factory family, produced by the real producers on the server's real
- * stack: its continuation worker's native wakes and results, its usage-limit sweep, its question
- * reactor, its restart recovery and pull request wakes as the watch presents them. Each one asks the
- * gate the assistant answers: with both slots held by others it creates no run, and when a slot
- * frees it runs one counted quantum. A restart keeps only what the database holds.
+ * Core's own follow-ups on a Factory family from the real producers: continuation wakes and
+ * results, usage-limit sweep, question reactor, restart recovery and PR wakes. Each asks the
+ * assistant's gate: with both slots held by others it creates no run; when one frees it runs one
+ * counted quantum. A restart keeps only what the database holds.
  */
 
 const factoryService = Factory.FactoryService.FactoryService;
@@ -232,7 +227,6 @@ describe("a released family's follow-ups under full capacity", () => {
         stack(spy, watch, { limits: { maxReviewRounds: 5 } }),
       );
     },
-    300_000,
   );
 });
 
@@ -714,7 +708,7 @@ describe("a question a child asked, surviving a restart", () => {
   const questionMessage = (thread: ThreadId, requestId: RuntimeRequestId) =>
     `message:delegated-task-question:${thread}:${requestId}`;
 
-  it.live("is delivered once after the rebuild, in a slot of its own", () => {
+  it.live("is moot after the rebuild once its child settled, and its result runs alone", () => {
     const spy = spyOnFactoryPort();
     const watch = decisionWatch();
     return withProject(
@@ -736,20 +730,18 @@ describe("a question a child asked, surviving a restart", () => {
                   );
                   yield* release(filler);
                   yield* tick;
+                  yield* drainOrchestration;
+                  // Core drops a settled task's question wake, so the question's grant is moot
+                  // and wakes nothing.
                   const messageId = questionMessage(thread, requestId);
-                  const run = yield* runOfMessage(messageId);
-                  assert.strictEqual((yield* slotOf(root))?.state, "held");
-                  assert.deepStrictEqual(
-                    (yield* demandsOf(root)).map(({ kind }) => kind),
-                    ["delegated_completion"],
-                  );
-                  yield* tick;
-                  yield* tick;
-                  assert.lengthOf(yield* runsOfMessage(thread, messageId), 1);
-                  yield* oneQuantum(world, root, run);
-                  assert.lengthOf(yield* runsOfMessage(thread, messageId), 1);
+                  assert.deepStrictEqual(yield* runsOfMessage(thread, messageId), []);
+                  assert.deepInclude(yield* grantOutcomesOf(root), {
+                    kind: "delegated_question",
+                    outcome: "moot",
+                  });
                   // The child's result then takes a quantum of its own.
                   yield* oneQuantum(world, root, yield* runOfMessage(result));
+                  assert.deepStrictEqual(yield* runsOfMessage(thread, messageId), []);
                   assert.deepStrictEqual(yield* demandsOf(root), []);
                   assert.isUndefined(yield* slotOf(root));
                 }),
@@ -925,6 +917,5 @@ describe("a native wake waiting at a restart", () => {
         stack(spy, watch),
       );
     },
-    240_000,
   );
 });

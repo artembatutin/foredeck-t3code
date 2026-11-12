@@ -11,6 +11,7 @@ import * as CommandReceiptStore from "../../orchestration-v2/CommandReceiptStore
 import * as EventStore from "../../orchestration-v2/EventStore.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionMaintenance from "../../orchestration-v2/ProjectionMaintenance.ts";
+import { pruneEventLog } from "./testkit/eventLogPruning.ts";
 import * as Factory from "./index.ts";
 import * as FactoryDeliveryStore from "./persistence/FactoryDeliveryStore.ts";
 import { advance } from "./pipeline/engine.ts";
@@ -39,17 +40,16 @@ import {
   reviewPasses,
   runStarted,
   runStatus,
+  wakeDroppedBeforeStart,
   wakeThread,
   watchPullRequest,
 } from "./testkit/followThrough.ts";
 
 /**
- * Which watch is Factory's, and what a cancel releases, on the server's real stack: the watches
- * Factory's own commands started are read from those commands' records, so a PR stage whose
- * result was lost still knows them; a cancel takes the wakes its watch committed before the
- * release, to stop their runs; and the release ends that watch only while core still has it.
- * With `manualReactor`, Factory's reactor runs only while a server boots it, so a wake core's
- * watch commits between two boots reaches a cancel before any reactor hands it on.
+ * Which watch is Factory's, and what a cancel releases, on the real stack: watches are read from the
+ * records of the commands that started them, so a lost PR stage result still knows them; a cancel
+ * stops runs of wakes committed before release, and ends the watch only while core still has it.
+ * `manualReactor` lets a wake committed between two boots reach a cancel before any reactor.
  */
 
 const service = Factory.FactoryService.FactoryService;
@@ -294,39 +294,43 @@ describe("Factory follow-through: a cancel with a wake its watch committed befor
     ),
   );
 
-  it.live("stops a wake queued behind the owner's turn once it starts, never that turn", () =>
-    withProject(
-      verifyCommands.passes,
-      (world) =>
-        Effect.gen(function* () {
-          const factory = yield* service;
-          const worker = yield* Factory.FactoryWorker.FactoryWorker;
-          const { deliveryId, threadId: author } = yield* world.boot(openSingle(world));
-          const ownerRun = yield* world.ownerTurn(author, "Rename the export button.");
-          const wake = yield* wakeThread(author, yield* linkOf(author, fakePullRequest.number));
-          yield* drainOrchestration;
-          assert.strictEqual(yield* runStatus(author, wake), "queued");
+  it.live(
+    "drops a wake queued behind the owner's turn once the cancel ends its watch, never that turn",
+    () =>
+      withProject(
+        verifyCommands.passes,
+        (world) =>
+          Effect.gen(function* () {
+            const factory = yield* service;
+            const worker = yield* Factory.FactoryWorker.FactoryWorker;
+            const { deliveryId, threadId: author } = yield* world.boot(openSingle(world));
+            const ownerRun = yield* world.ownerTurn(author, "Rename the export button.");
+            const wake = yield* wakeThread(author, yield* linkOf(author, fakePullRequest.number));
+            yield* drainOrchestration;
+            assert.strictEqual(yield* runStatus(author, wake), "queued");
 
-          yield* factory.cancel(deliveryId).pipe(Effect.orDie);
-          yield* worker.drain;
-          yield* drainOrchestration;
-          assert.include((yield* stateOf(deliveryId)).followThrough?.runs ?? [], wake);
-          assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), []);
-          assert.strictEqual(yield* runStatus(author, ownerRun), "running");
+            yield* factory.cancel(deliveryId).pipe(Effect.orDie);
+            yield* worker.drain;
+            yield* drainOrchestration;
+            assert.include((yield* stateOf(deliveryId)).followThrough?.runs ?? [], wake);
+            assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), []);
+            assert.strictEqual(yield* runStatus(author, ownerRun), "running");
 
-          // The owner's turn ends with a server running Factory: the wake starts, and is stopped.
-          yield* world.boot(
-            Effect.gen(function* () {
-              assert.strictEqual(yield* world.endRun(ownerRun, "completed"), "completed");
-              yield* drainFactory;
-              yield* drainOrchestration;
-            }),
-          );
-          assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), [wake]);
-          assert.notInclude(interruptedTurns(world), providerTurnOf(world, ownerRun));
-        }),
-      { manualReactor: true },
-    ),
+            // The owner's turn ends with a server running Factory. The cancel ended the watch, so
+            // core drops the wake rather than starting it.
+            yield* world.boot(
+              Effect.gen(function* () {
+                assert.strictEqual(yield* world.endRun(ownerRun, "completed"), "completed");
+                yield* drainFactory;
+                yield* drainOrchestration;
+              }),
+            );
+            yield* wakeDroppedBeforeStart(world, author, wake);
+            assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), []);
+            assert.notInclude(interruptedTurns(world), providerTurnOf(world, ownerRun));
+          }),
+        { manualReactor: true },
+      ),
   );
 
   it.live("takes and stops at the next boot a wake committed after the cancel was stored", () =>
@@ -525,11 +529,8 @@ describe("Factory follow-through: a release whose command fails", () => {
 });
 
 describe("Factory follow-through: a watch whose command's event was compacted away", () => {
-  /** Core's public compaction, which keeps only each thread's newest whole-thread event. */
-  const compact = Effect.flatMap(
-    ProjectionMaintenance.ProjectionMaintenanceV2,
-    (maintenance) => maintenance.compactEventStore,
-  ).pipe(
+  /** Core's event log pruning, which drops covered events but each stream's newest. */
+  const compact = pruneEventLog.pipe(
     Effect.provide(ProjectionMaintenance.layer.pipe(Layer.provide(EventStore.layer))),
     Effect.orDie,
   );

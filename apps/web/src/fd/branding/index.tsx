@@ -1,4 +1,4 @@
-import { FOREDECK_ANCHOR_CONTENT, FOREDECK_WORDMARK } from "@t3tools/shared/fd/branding";
+import { FOREDECK_ANCHOR_CONTENT, FOREDECK_PRODUCT_NAME } from "@t3tools/shared/fd/branding";
 import type { SVGProps } from "react";
 
 export function ForedeckAnchor(props: SVGProps<SVGSVGElement>) {
@@ -15,6 +15,6 @@ export function ForedeckAnchor(props: SVGProps<SVGSVGElement>) {
 
 export function ForedeckWordmark() {
   return (
-    <span className="text-fd-wordmark font-bold tracking-fd-wordmark">{FOREDECK_WORDMARK}</span>
+    <span className="text-fd-wordmark font-bold tracking-fd-wordmark">{FOREDECK_PRODUCT_NAME}</span>
   );
 }

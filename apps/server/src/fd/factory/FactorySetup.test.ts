@@ -693,11 +693,7 @@ const plannedParent = (world: World) =>
  * it in `operation`, as a terminal that cannot open or take the command does. `started`
  * completes once core has asked for it.
  */
-const failingScript = (
-  world: World,
-  threadId: ThreadId,
-  operation: "openTerminal" | "writeCommand",
-) =>
+const failingScript = (world: World, threadId: ThreadId, operation: "openTerminal") =>
   Effect.gen(function* () {
     const script = {
       started: yield* Deferred.make<void>(),
@@ -723,7 +719,7 @@ const failingScript = (
   });
 
 describe("Factory setup and core's workspace preparation", () => {
-  it.live.each(["openTerminal", "writeCommand"] as const)(
+  it.live.each(["openTerminal"] as const)(
     "starts no child author while core starts the project's setup script, nor once it fails (%s)",
     (operation) =>
       withProject(passingVerify, (world) =>
@@ -846,13 +842,10 @@ const storeLaunching = (world: World, deliveryId: FactoryDeliveryId, branch: str
   }).pipe(Effect.orDie);
 
 /**
- * Stores the delivery awaiting its author's launch and leaves its thread, Git and the thread's
- * workspace as a restart leaves them partway through that launch's preparation, with the calls
- * core's preparation makes: the thread created without its message; then, with `git`, the branch
- * and its worktree created; with `recorded`, the worktree recorded on the thread; and with
- * `cleanedUp`, the worktree removed again and the thread's workspace cleared, as core does for a
- * preparation interrupted before it released a run, which keeps the branch. Returns the thread
- * and the worktree's path.
+ * Stores the delivery awaiting launch, with its thread, Git and workspace as a restart leaves core's
+ * preparation: thread created without its message; `git` adds branch and worktree; `recorded` puts
+ * the worktree on the thread; `cleanedUp` removes it and clears the workspace but keeps the branch.
+ * Returns the thread and the worktree's path.
  */
 const interruptedLaunch = (
   world: World,

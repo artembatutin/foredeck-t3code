@@ -35,6 +35,7 @@ export * as FactoryActivity from "./FactoryActivity.ts";
 export * as FactoryAdmission from "./FactoryAdmission.ts";
 export * as FactoryReactor from "./FactoryReactor.ts";
 export * as FactoryService from "./FactoryService.ts";
+export * as FactoryCommandSetup from "./FactoryCommandSetup.ts";
 export * as FactorySettings from "./FactorySettings.ts";
 export * as FactoryThreadEffects from "./FactoryThreadEffects.ts";
 export * as FactoryWorker from "./FactoryWorker.ts";
@@ -61,16 +62,9 @@ export const layerPersistence = Layer.mergeAll(
 
 /**
  * The Factory service, settings and worker over Factory persistence, for transports and the
- * reactor. Needs Work's service, the orchestration application (thread launches, management and
- * the orchestrator), the project store and service, server settings and config, the provider
- * registry (for model options), the Git workflow (for pull requests), the pull request service
- * (for what a host saved of them), the git driver and the process runner. The thread, verify, plan, child, review, record and pull request effects and
- * the Work comments on transitions stay private to the service and worker.
- * server.ts also mounts `layerPersistence` with core and Work persistence, so the ledger migrates
- * with theirs; one build shares the one instance.
- * Building it installs Factory's automatic turn gate (see `FactoryAutomaticTurns`) into the
- * installable gate core's producers consult, which the server provides beneath its runtime, until
- * the build's scope closes.
+ * reactor; its effects stay private. server.ts also mounts `layerPersistence` with core and Work
+ * persistence so the ledger migrates with theirs. Building it installs Factory's automatic turn
+ * gate (see `FactoryAutomaticTurns`) until the build's scope closes.
  */
 export const layerLive = FactoryService.layer.pipe(
   Layer.merge(FactoryAutomaticTurns.layer),

@@ -27,7 +27,6 @@ import { RedactedSensitiveText } from "./RedactedSensitiveText";
 
 const ProviderAuthTerminal = lazy(() => import("./ProviderAuthTerminal"));
 
-/** All actions target the provider's environment, even when the browser is on another device. */
 export function ProviderAuthenticationSection({
   environmentId,
   environmentLabel,
@@ -75,11 +74,16 @@ export function ProviderAuthenticationSection({
     (provider.setup?.canAuthenticate === false ||
       ((provider.driver === "acpRegistry" || provider.driver === "devin") &&
         auth?.methods?.length === 0));
+  const usesCredentials =
+    provider.driver === "antigravity" &&
+    (provider.auth.type === "gemini-api-key" || provider.auth.type === "agent-platform");
   const accountDescription = active
     ? auth?.phase === "starting"
-      ? "Starting sign-in…"
+      ? (auth.message ?? (usesCredentials ? "Connecting…" : "Starting sign-in…"))
       : auth?.phase === "verifying"
-        ? "Checking your account…"
+        ? usesCredentials
+          ? "Checking credentials and loading models…"
+          : "Checking your account…"
         : interaction?.type === "terminal"
           ? "Complete sign-in in the terminal below."
           : interaction?.type === "credentials"
@@ -91,7 +95,9 @@ export function ProviderAuthenticationSection({
         ? "Discovering sign-in methods…"
         : needsExternalSetup
           ? "No in-app sign-in advertised. Follow the provider's docs to finish setup."
-          : `Sign in on ${environmentLabel}.`;
+          : usesCredentials
+            ? `Connect on ${environmentLabel} to load models.`
+            : `Sign in on ${environmentLabel}.`;
   const statusMessage = auth?.phase === "failed" ? auth.message : null;
   const disabled = readOnly || pending || query.error !== null || isDiscovering;
   const draftId = `${auth?.flowId ?? ""}:${interaction?.id ?? ""}`;
@@ -137,12 +143,10 @@ export function ProviderAuthenticationSection({
   async function openBrowser() {
     if (!url || readOnly) return;
     const requiresConsent = interaction?.type === "browser" && interaction.requiresConsent;
-    // Browsers block tabs opened after an await, so the web build reserves one
-    // while the environment records consent.
+    // Reserve tabs before awaiting consent; browsers block later opens.
     const pending = requiresConsent && !window.desktopBridge ? window.open("", "_blank") : null;
     if (pending) pending.opener = null;
     try {
-      // Consent is checked on the environment before opening a provider URL locally.
       if (requiresConsent && !(await send({ type: "browser", action: "accept" }))) {
         pending?.close();
         return;
@@ -230,8 +234,8 @@ export function ProviderAuthenticationSection({
                       variant="ghost-muted"
                       disabled={disabled}
                       onClick={() => {
-                        // Copy inside the click so the clipboard keeps the user
-                        // activation; the link only works once consent is recorded.
+                        // Copy during the click to retain clipboard activation; consent must still be
+                        // recorded before use.
                         const copied = writeTextToClipboard(url, "Provider sign-in link");
                         void (async () => {
                           await copied;
@@ -295,8 +299,12 @@ export function ProviderAuthenticationSection({
                 {signedIn
                   ? "Change account"
                   : auth?.phase === "failed" || auth?.phase === "cancelled"
-                    ? "Retry sign-in"
-                    : "Sign in"}
+                    ? usesCredentials
+                      ? "Retry connection"
+                      : "Retry sign-in"
+                    : usesCredentials
+                      ? "Connect"
+                      : "Sign in"}
               </Button>
             ) : null}
             {!active && signedIn && (provider.auth.canLogout ?? provider.setup?.canAuthenticate) ? (

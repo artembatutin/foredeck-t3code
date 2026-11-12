@@ -519,8 +519,10 @@ const make = Effect.gen(function* () {
       Effect.map((rows) => Option.map(Option.fromUndefinedOr(rows[0]), fromRow)),
     );
 
-  const insert: FactoryDeliveryStore["Service"]["insert"] = (input) =>
-    Effect.gen(function* () {
+  const insert: FactoryDeliveryStore["Service"]["insert"] = Effect.fn(
+    "FactoryDeliveryStore.insert",
+  )(
+    function* (input) {
       if (!isTerminal(input.state.status)) {
         const [active] = yield* selectDeliveries({ itemRef: input.itemRef, activeOnly: true });
         if (active !== undefined) {
@@ -542,41 +544,46 @@ const make = Effect.gen(function* () {
       };
       yield* insertDelivery(toRow(created));
       return created;
-    }).pipe(
-      sql.withTransaction,
-      Effect.catchTags(FactoryStoreError.catchStorage("deliveries.insert")),
-    );
+    },
+    sql.withTransaction,
+    Effect.catchTags(FactoryStoreError.catchStorage("deliveries.insert")),
+  );
 
-  const update: FactoryDeliveryStore["Service"]["update"] = (deliveryId, state) =>
-    Effect.gen(function* () {
+  const update: FactoryDeliveryStore["Service"]["update"] = Effect.fn(
+    "FactoryDeliveryStore.update",
+  )(
+    function* (deliveryId, state) {
       const current = yield* readDelivery(deliveryId);
       if (Option.isNone(current)) return current;
       const updated: StoredFactoryDelivery = { ...current.value, state, updatedAt: yield* now };
       yield* writeState(toRow(updated));
       return Option.some(updated);
-    }).pipe(
-      sql.withTransaction,
-      Effect.catchTags(FactoryStoreError.catchStorage("deliveries.update")),
-    );
+    },
+    sql.withTransaction,
+    Effect.catchTags(FactoryStoreError.catchStorage("deliveries.update")),
+  );
 
   return FactoryDeliveryStore.of({
     insert,
-    get: (deliveryId) =>
+    get: Effect.fn("FactoryDeliveryStore.get")((deliveryId) =>
       readDelivery(deliveryId).pipe(
         Effect.catchTags(FactoryStoreError.catchStorage("deliveries.get")),
       ),
+    ),
     update,
-    listActive: () =>
+    listActive: Effect.fn("FactoryDeliveryStore.listActive")(() =>
       selectDeliveries({ activeOnly: true }).pipe(
         Effect.map((rows) => rows.map(fromRow)),
         Effect.catchTags(FactoryStoreError.catchStorage("deliveries.listActive")),
       ),
-    listByItem: (itemRef) =>
+    ),
+    listByItem: Effect.fn("FactoryDeliveryStore.listByItem")((itemRef) =>
       selectDeliveries({ itemRef }).pipe(
         Effect.map((rows) => rows.map(fromRow)),
         Effect.catchTags(FactoryStoreError.catchStorage("deliveries.listByItem")),
       ),
-    list: ({ projectId, itemRef, activeOnly }) =>
+    ),
+    list: Effect.fn("FactoryDeliveryStore.list")(({ projectId, itemRef, activeOnly }) =>
       selectDeliveries({
         ...(projectId === undefined ? {} : { projectId }),
         ...(itemRef === undefined ? {} : { itemRef }),
@@ -586,11 +593,13 @@ const make = Effect.gen(function* () {
         Effect.map((rows) => rows.map(fromRow)),
         Effect.catchTags(FactoryStoreError.catchStorage("deliveries.list")),
       ),
-    listReleasingWatch: () =>
+    ),
+    listReleasingWatch: Effect.fn("FactoryDeliveryStore.listReleasingWatch")(() =>
       selectDeliveries({ releasingWatch: true }).pipe(
         Effect.map((rows) => rows.map(fromRow)),
         Effect.catchTags(FactoryStoreError.catchStorage("deliveries.listReleasingWatch")),
       ),
+    ),
   });
 });
 

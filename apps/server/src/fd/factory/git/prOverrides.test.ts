@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, expect, it } from "@effect/vitest";
 import {
@@ -13,6 +14,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import { explicitBare } from "../testkit/gitCommand.ts";
 
 import * as ServerConfig from "../../../config.ts";
 import * as GitManager from "../../../git/GitManager.ts";
@@ -166,7 +168,9 @@ const makeTextGeneration = (mode: "generate" | "refuse") => {
 
 const git = (cwd: string, args: ReadonlyArray<string>) =>
   Effect.flatMap(GitVcsDriver.GitVcsDriver, (driver) =>
-    driver.execute({ operation: "test.git", cwd, args, timeoutMs: 30_000 }),
+    Effect.flatMap(explicitBare(cwd, args), (args) =>
+      driver.execute({ operation: "test.git", cwd, args, timeoutMs: 30_000 }),
+    ),
   ).pipe(Effect.map((result) => result.stdout.trim()));
 
 /** A repository whose `main` and feature branch are both pushed to a bare remote. */
@@ -240,6 +244,7 @@ const setup = (options: {
 const base = GitVcsDriver.layer.pipe(
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-pr-" })),
   Layer.provideMerge(VcsProcess.layer),
+  Layer.provideMerge(NodeCrypto.layer),
   Layer.provideMerge(NodeServices.layer),
 );
 

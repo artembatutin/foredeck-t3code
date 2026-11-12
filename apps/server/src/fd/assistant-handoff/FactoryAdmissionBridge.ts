@@ -39,14 +39,10 @@ export const readWorkWith =
     );
 
 /**
- * Factory's admission port over the project assistant's admission of the roots it manages (see
- * `HandoffAdmission`). Each Factory delivery's root is the assistant's managed root of the same id,
- * which names its assignment; a root the assistant never claimed is unmanaged, as Factory's
- * default port sees every root. A decision that would admit and needs the root's Work item read
- * again stops short and names the item: its read is taken here, outside any SQL transaction, and
- * the decision is made again with it. Admitted turns run inline in their producer's fiber, under
- * their admission; a native wake that waits is kept for its grant. Whatever the assistant cannot
- * decide fails as Factory and core's producers expect, deciding nothing.
+ * Factory's admission port over `HandoffAdmission`; roots the assistant never claimed are unmanaged.
+ * A decision needing a fresh Work read stops short; the read runs here, outside any SQL transaction,
+ * and the decision is retried with it. Admitted turns run inline under their admission; a waiting
+ * native wake is kept for its grant. Undecidable cases fail as producers expect, deciding nothing.
  */
 export const make = Effect.gen(function* () {
   const admission = yield* HandoffAdmission.HandoffAdmission;
@@ -55,14 +51,15 @@ export const make = Effect.gen(function* () {
   const readWork = readWorkWith(backend);
 
   /** Runs `decide` once, and again with a fresh read when it asked for one. */
-  const withWork = <X extends { readonly decision: { readonly type: string } }, E, R>(
-    decide: (work: HandoffAdmission.WorkRead | undefined) => Effect.Effect<X, E, R>,
-  ) =>
-    Effect.gen(function* () {
-      const first = yield* decide(undefined);
-      if (!HandoffAdmission.needsWork(first.decision)) return first;
-      return yield* decide(yield* readWork(first.decision.item));
-    });
+  const withWork = Effect.fn("FactoryAdmissionBridge.withWork")(function* <
+    X extends { readonly decision: { readonly type: string } },
+    E,
+    R,
+  >(decide: (work: HandoffAdmission.WorkRead | undefined) => Effect.Effect<X, E, R>) {
+    const first = yield* decide(undefined);
+    if (!HandoffAdmission.needsWork(first.decision)) return first;
+    return yield* decide(yield* readWork(first.decision.item));
+  });
 
   const readFailed = (root: string) => (cause: HandoffAdmission.HandoffAdmissionError) =>
     new FactoryAdmission.FactoryAdmissionReadError({ root: root as never, cause });
@@ -78,8 +75,8 @@ export const make = Effect.gen(function* () {
       Effect.mapError(readFailed(root)),
     );
 
-  const enter: Port["enter"] = (entry) =>
-    Effect.gen(function* () {
+  const enter: Port["enter"] = Effect.fn("FactoryAdmissionBridge.enter")(
+    function* (entry: Parameters<Port["enter"]>[0]) {
       if (!(yield* managed(entry.root))) return { type: "proceed" } as const;
       // The effect's job is counted in Factory's activity before it asks, so its admission is
       // dispatched once the decision returns.
@@ -107,10 +104,14 @@ export const make = Effect.gen(function* () {
         case "needs_work":
           return { type: "refuse", category: "unreadable" } as const;
       }
-    }).pipe(Effect.mapError(readFailed(entry.root)));
+    },
+    (effect, entry) => effect.pipe(Effect.mapError(readFailed(entry.root))),
+  );
 
-  const authorizeOpening: Port["authorizeOpening"] = (opening) =>
-    Effect.gen(function* () {
+  const authorizeOpening: Port["authorizeOpening"] = Effect.fn(
+    "FactoryAdmissionBridge.authorizeOpening",
+  )(
+    function* (opening: Parameters<Port["authorizeOpening"]>[0]) {
       if (!(yield* managed(opening.root))) return { type: "allow" } as const;
       const { decision } = yield* withWork((work) =>
         Effect.map(
@@ -132,7 +133,9 @@ export const make = Effect.gen(function* () {
             type: "refuse",
             category: decision.type === "refuse" ? decision.category : "unreadable",
           } as const);
-    }).pipe(Effect.mapError(readFailed(opening.root)));
+    },
+    (effect, opening) => effect.pipe(Effect.mapError(readFailed(opening.root))),
+  );
 
   const deferredDemand: Port["deferredDemand"] = (effect) =>
     admission.deferredDemand(effect).pipe(Effect.mapError(readFailed(effect.root)));
@@ -210,7 +213,7 @@ export const make = Effect.gen(function* () {
     authorizeOpening,
     automaticTurn,
     queueChanges: admission.queueChanges,
-    queuePriorities: (roots) =>
+    queuePriorities: Effect.fn("FactoryAdmission.queuePriorities")((roots) =>
       admission.queuePriorities(roots).pipe(
         Effect.map(
           (priorities) =>
@@ -223,6 +226,7 @@ export const make = Effect.gen(function* () {
         ),
         Effect.mapError(readFailed(roots[0] ?? "")),
       ),
+    ),
   });
 });
 
@@ -256,10 +260,9 @@ export const makeRedelivery = Effect.gen(function* () {
             requestId: RuntimeRequestId.make(demand.requestId),
           })
           .pipe(
-            Effect.flatMap((outcome) =>
-              outcome === "moot"
-                ? Effect.as(admission.moot(demand.id), "moot" as const)
-                : Effect.succeed(outcome),
+            Effect.filterOrElse(
+              (outcome) => outcome !== "moot",
+              () => Effect.as(admission.moot(demand.id), "moot" as const),
             ),
             failedAs(demand.kind),
           );

@@ -3,6 +3,7 @@ import { useSyncExternalStore } from "react";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { applyShellStreamEvent } from "@t3tools/client-runtime/state/shell";
+import { EMPTY_ENVIRONMENT_THREAD_STATE } from "@t3tools/client-runtime/state/threads";
 import { CommandId, EnvironmentId, OrchestrationV2DispatchCommandError } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
@@ -80,6 +81,7 @@ vi.mock("~/state/entities", () => {
     readThreadShells: () => world.shells,
     useProjects: () => useValue(() => world.projects),
     useThreadShells: () => useValue(() => world.shells),
+    useVisibleThreadShells: () => useValue(() => world.shells),
     useAllEnvironmentShellsBootstrapped: () => true,
     waitForThreadShell: (ref: Ref) =>
       new Promise<boolean>((resolve) => {
@@ -113,7 +115,10 @@ vi.mock("~/state/environments", () => ({
     ],
   }),
 }));
-vi.mock("~/state/session", () => ({ useEnvironmentScope: () => true }));
+vi.mock("~/state/session", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("~/state/session")>()),
+  useEnvironmentScope: () => true,
+}));
 vi.mock("~/state/threads", () => ({
   threadEnvironment: { create: "create", startTurn: "startTurn" },
 }));
@@ -141,7 +146,10 @@ vi.mock("~/components/ui/refresh-icon", () => ({ RefreshIcon: () => null }));
 vi.mock("~/components/ui/sidebar", () => ({
   SidebarInset: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
 }));
-vi.mock("~/cloud/publicConfig", () => ({ hasCloudPublicConfig: () => false }));
+vi.mock("~/cloud/publicConfig", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("~/cloud/publicConfig")>()),
+  hasCloudPublicConfig: () => false,
+}));
 vi.mock("~/branding", () => ({ APP_DISPLAY_NAME: "Test" }));
 vi.mock("~/localEnvironment", () => ({ isLocalEnvironmentDisabled: () => false }));
 vi.mock("~/env", () => ({ isElectron: false }));
@@ -291,6 +299,7 @@ beforeEach(() => {
             shell.id === target.params.threadId,
         ),
         serverThreadDeleted: false,
+        unlistedThreadDetail: EMPTY_ENVIRONMENT_THREAD_STATE,
         draftThreadExists: false,
       }),
     );

@@ -157,17 +157,10 @@ type FactoryReviewCandidate =
   | { readonly type: "invalid"; readonly problems: ReadonlyArray<string> };
 
 /**
- * Judges review submissions for a delivery's current round (port of Looper's `validateReview`),
- * by either path: the `factory_submit_review` tool, or the fenced JSON of the reviewer run's
- * last assistant message. A worktree whose HEAD or tree moved from the verified receipt, or that
- * is not clean, refuses any review. Otherwise the review must decode and pass the validation
- * port, evidence paths included; a valid one, blocking or not, is written to the delivery's
- * evidence as `review-<n>.json` and accepted with the bounded details clients see, a blocking one
- * with its failure fingerprint (the reviewed tree). An integrate review
- * of a parent's whole branch has an acceptance entry for each criterion of every approved task,
- * numbered across them in plan order (see `renderIntegratePrompt`): one out of that range is
- * invalid, and one missing blocks. Judging records nothing on the delivery; the engine does, from
- * the judgment.
+ * Judges a review submission (the `factory_submit_review` tool or the run's last fenced JSON),
+ * refused unless the worktree is clean at the verified receipt's HEAD and tree. A valid review is
+ * written as `review-<n>.json`. An integrate review numbers acceptance entries across approved
+ * tasks in plan order (`renderIntegratePrompt`). Judging records nothing; the engine does.
  */
 export class FactoryReview extends Context.Service<
   FactoryReview,
@@ -289,8 +282,8 @@ const make = Effect.gen(function* () {
     } satisfies FactoryReviewJudgment;
   });
 
-  const judge: FactoryReview["Service"]["judge"] = (delivery, submission) =>
-    Effect.gen(function* () {
+  const judge: FactoryReview["Service"]["judge"] = Effect.fn("FactoryReview.judge")(
+    function* (delivery, submission) {
       const basis = yield* reviewBasis(delivery);
       const decoded = (basis.tasks === null ? decodeReview : decodeIntegrateReview)(
         submission.review,
@@ -307,7 +300,8 @@ const make = Effect.gen(function* () {
               problems: [bounded(`The review is not valid: ${decoded.failure.message}`)],
             },
       );
-    });
+    },
+  );
 
   /** The text of the run's last assistant message that has any; none when it has none. */
   const lastAssistantText = (
@@ -325,23 +319,24 @@ const make = Effect.gen(function* () {
         ),
       );
 
-  const judgeFallback: FactoryReview["Service"]["judgeFallback"] = (delivery, effect) =>
-    Effect.gen(function* () {
-      const basis = yield* reviewBasis(delivery);
-      const text = yield* lastAssistantText(effect);
-      const parsed =
-        text === null
-          ? ({ status: "none" } as const)
-          : parseFencedReview(text, basis.tasks === null ? "review" : "integrate");
-      const candidate: FactoryReviewCandidate =
-        parsed.status === "decoded"
-          ? { type: "review", review: parsed.review }
-          : {
-              type: "invalid",
-              problems: [parsed.status === "none" ? NO_FENCED_REVIEW : parsed.message],
-            };
-      return yield* judgeCandidate(delivery, basis, "fallback", effect.threadId, candidate);
-    });
+  const judgeFallback: FactoryReview["Service"]["judgeFallback"] = Effect.fn(
+    "FactoryReview.judgeFallback",
+  )(function* (delivery, effect) {
+    const basis = yield* reviewBasis(delivery);
+    const text = yield* lastAssistantText(effect);
+    const parsed =
+      text === null
+        ? ({ status: "none" } as const)
+        : parseFencedReview(text, basis.tasks === null ? "review" : "integrate");
+    const candidate: FactoryReviewCandidate =
+      parsed.status === "decoded"
+        ? { type: "review", review: parsed.review }
+        : {
+            type: "invalid",
+            problems: [parsed.status === "none" ? NO_FENCED_REVIEW : parsed.message],
+          };
+    return yield* judgeCandidate(delivery, basis, "fallback", effect.threadId, candidate);
+  });
 
   return FactoryReview.of({ judge, judgeFallback });
 });

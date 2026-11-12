@@ -208,28 +208,30 @@ const make = Effect.gen(function* () {
   });
   const move = (id: string, event: Portfolio.AssignmentEvent) =>
     store.transitionAssignment({ assignmentId: id, event });
-  const withLimits = <A, E, R>(record: Dispatch, effect: Effect.Effect<A, E, R>) =>
-    Effect.gen(function* () {
-      const callerLimit = yield* DispatchModeLimit;
-      const limit =
-        callerLimit === undefined
-          ? record
-          : {
-              runtimeMode:
-                exceededDispatchModeLimit(
-                  { ...callerLimit, interactionMode: record.interactionMode },
-                  record,
-                ) === "runtime"
-                  ? callerLimit.runtimeMode
-                  : record.runtimeMode,
-              interactionMode:
-                callerLimit.interactionMode === "plan" || record.interactionMode === "plan"
-                  ? ("plan" as const)
-                  : ("default" as const),
-              ...(callerLimit.refused ? { refused: callerLimit.refused } : {}),
-            };
-      return yield* effect.pipe(Effect.provideService(DispatchModeLimit, limit));
-    });
+  const withLimits = Effect.fn("ProjectAssistant.withLimits")(function* <A, E, R>(
+    record: Dispatch,
+    effect: Effect.Effect<A, E, R>,
+  ) {
+    const callerLimit = yield* DispatchModeLimit;
+    const limit =
+      callerLimit === undefined
+        ? record
+        : {
+            runtimeMode:
+              exceededDispatchModeLimit(
+                { ...callerLimit, interactionMode: record.interactionMode },
+                record,
+              ) === "runtime"
+                ? callerLimit.runtimeMode
+                : record.runtimeMode,
+            interactionMode:
+              callerLimit.interactionMode === "plan" || record.interactionMode === "plan"
+                ? ("plan" as const)
+                : ("default" as const),
+            ...(callerLimit.refused ? { refused: callerLimit.refused } : {}),
+          };
+    return yield* effect.pipe(Effect.provideService(DispatchModeLimit, limit));
+  });
 
   const notice = Effect.fn(function* (record: Dispatch, key: string, text: string) {
     if (record.lastNotice === key) return record;
@@ -677,8 +679,10 @@ const make = Effect.gen(function* () {
 
   return ProjectAssistant.of({
     tick,
-    review: (input) => protect(reviews.snapshot(input)),
-    startReview: (input) => protect(reviews.start(input)),
+    review: Effect.fn("ProjectAssistant.review")((input) => protect(reviews.snapshot(input))),
+    startReview: Effect.fn("ProjectAssistant.startReview")((input) =>
+      protect(reviews.start(input)),
+    ),
     overview: protect(
       Effect.gen(function* () {
         const briefs = yield* store.listBriefs();
@@ -786,7 +790,7 @@ const make = Effect.gen(function* () {
         };
       }),
     ),
-    saveSpeech: (threadId, text) =>
+    saveSpeech: Effect.fn("ProjectAssistant.saveSpeech")((threadId, text) =>
       protect(
         Effect.gen(function* () {
           const { runs } = yield* threads.getThreadRecords(threadId, ["runs"]);
@@ -797,7 +801,8 @@ const make = Effect.gen(function* () {
         VALUES (${threadId}, ${run.id}, ${text}) ON CONFLICT(thread_id, run_id) DO UPDATE SET text = excluded.text`;
         }),
       ),
-    speech: (threadId) =>
+    ),
+    speech: Effect.fn("ProjectAssistant.speech")((threadId) =>
       protect(
         Effect.gen(function* () {
           const { runs } = yield* threads.getThreadRecords(threadId, ["runs"]);
@@ -808,7 +813,8 @@ const make = Effect.gen(function* () {
           return rows[0] ? { runId: run.id, text: rows[0].text } : null;
         }),
       ),
-    inspect: (projectId, ideaId) =>
+    ),
+    inspect: Effect.fn("ProjectAssistant.inspect")((projectId, ideaId) =>
       protect(
         Effect.gen(function* () {
           const briefs = (yield* store.listBriefs()).filter(
@@ -834,7 +840,8 @@ const make = Effect.gen(function* () {
           };
         }),
       ),
-    revise: (input) =>
+    ),
+    revise: Effect.fn("ProjectAssistant.revise")((input) =>
       protect(
         Effect.gen(function* () {
           const project = yield* projects.getById(input.projectId);
@@ -858,7 +865,8 @@ const make = Effect.gen(function* () {
           return yield* store.reviseBrief(revision);
         }),
       ),
-    enqueue: ({ executor = "foredeck", ...input }) =>
+    ),
+    enqueue: Effect.fn("ProjectAssistant.enqueue")(({ executor = "foredeck", ...input }) =>
       protect(
         // A Factory assignment's item is read before the lock, so a slow source holds nothing.
         (executor === "factory"
@@ -984,7 +992,8 @@ const make = Effect.gen(function* () {
           ),
         ),
       ),
-    control: (input) =>
+    ),
+    control: Effect.fn("ProjectAssistant.control")((input) =>
       protect(
         mutex.withPermit(
           Effect.gen(function* () {
@@ -1079,7 +1088,8 @@ const make = Effect.gen(function* () {
           }),
         ),
       ),
-    answer: (input) =>
+    ),
+    answer: Effect.fn("ProjectAssistant.answer")((input) =>
       protect(
         mutex.withPermit(
           Effect.gen(function* () {
@@ -1133,7 +1143,8 @@ const make = Effect.gen(function* () {
           }),
         ),
       ),
-    verify: (input) =>
+    ),
+    verify: Effect.fn("ProjectAssistant.verify")((input) =>
       protect(
         mutex.withPermit(
           Effect.gen(function* () {
@@ -1153,6 +1164,7 @@ const make = Effect.gen(function* () {
           }),
         ),
       ),
+    ),
   });
 });
 

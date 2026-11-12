@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import { CommandId, MessageId, ThreadId } from "@t3tools/contracts";
+import { CommandId, MessageId, type RunId, ThreadId } from "@t3tools/contracts";
 import type { FactoryDeliveryId } from "@t3tools/contracts/fd/factory";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -215,14 +215,18 @@ const approvalEvidence = (world: World, childId: FactoryDeliveryId, taskId: stri
 /** A plan of `twoTaskPlan`'s first task alone. */
 const oneTaskPlan = { tasks: [twoTaskPlan.tasks[0]] };
 
-/** Waits until the provider's running turn on the thread is stored, as core recovery reads it. */
-const providerTurnRunning = (threadId: ThreadId) =>
+/**
+ * Waits until the provider's running turn on the thread (of `runId` when given) is stored, as core
+ * recovery reads it.
+ */
+const providerTurnRunning = (threadId: ThreadId, runId?: RunId) =>
   Effect.flatMap(EventSink.EventSinkV2, (sink) =>
     sink.stream().pipe(
       Stream.filter(
         ({ event }) =>
           event.type === "provider-turn.updated" &&
           event.threadId === threadId &&
+          (runId === undefined || event.runId === runId) &&
           event.payload.status === "running",
       ),
       Stream.runHead,
@@ -758,7 +762,13 @@ describe("an approved parent's children", () => {
               const live = (yield* threadProjection(author.threadId)).runs.find(
                 (run) => run.restartContinuationOfRunId === author.runId,
               );
-              assert.isFalse(live === undefined || isTerminalRunStatus(live.status));
+              if (live === undefined || isTerminalRunStatus(live.status)) {
+                return assert.fail("Core's continuation is not live.");
+              }
+              // Core takes the provider's turn in from its event stream after the effect that
+              // started it settles. Until it is stored, core's interrupt ends the run "before
+              // provider start" without reaching the provider, so wait for the turn to be live.
+              yield* providerTurnRunning(author.threadId, live.id);
             }
             yield* world.boot(
               Effect.gen(function* () {

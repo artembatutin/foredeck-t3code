@@ -86,10 +86,9 @@ const interpreterOf = (head: string): string | undefined => {
 };
 
 /**
- * What the Factory settings form offers and checks for a project's verify and setup commands. Neither
- * method runs anything or saves anything: this service has no process runner to run with, and what it
- * reads is limited to `package.json`, whether a lockfile exists, and the file a command resolves to.
- * Only a delivery runs a command, the owner's saved one, in its own worktree, through
+ * What the Factory settings form offers and checks for a project's verify and setup commands.
+ * It never runs or saves anything and reads only `package.json`, lockfile presence, and the file a
+ * command resolves to. Only a delivery runs the owner's saved command, in its own worktree, through
  * [`FactoryVerifyRunner`](./verify/FactoryVerifyRunner.ts).
  */
 export class FactoryCommandSetup extends Context.Service<
@@ -123,19 +122,20 @@ const make = Effect.gen(function* () {
   const path = yield* Path.Path;
   const context = yield* Effect.context<FileSystem.FileSystem | Path.Path>();
 
-  const workspaceRootOf = (projectId: ProjectId) =>
-    Effect.gen(function* () {
-      const project = Option.getOrUndefined(yield* projects.get(projectId));
-      if (project === undefined) return yield* new FactoryProjectMissingError({ projectId });
-      return project.workspaceRoot;
-    });
+  const workspaceRootOf = Effect.fn("FactoryCommandSetup.workspaceRootOf")(function* (
+    projectId: ProjectId,
+  ) {
+    const project = Option.getOrUndefined(yield* projects.get(projectId));
+    if (project === undefined) return yield* new FactoryProjectMissingError({ projectId });
+    return project.workspaceRoot;
+  });
 
   /**
    * `package.json` as text: absent, or not a regular bounded file inside the checkout. A symlink out
    * of the checkout is someone else's file, and nothing here should read it.
    */
-  const readPackageJson = (root: string) =>
-    Effect.gen(function* () {
+  const readPackageJson = Effect.fn("FactoryCommandSetup.readPackageJson")(
+    function* (root: string) {
       const file = path.join(root, "package.json");
       if (!(yield* fileSystem.exists(file))) return { type: "absent" } as const;
       const [real, realRoot] = yield* Effect.all([
@@ -151,25 +151,26 @@ const make = Effect.gen(function* () {
         return { type: "unreadable" } as const;
       }
       return { type: "text", text: yield* fileSystem.readFileString(real) } as const;
-    }).pipe(Effect.orElseSucceed(() => ({ type: "unreadable" }) as const));
+    },
+    Effect.orElseSucceed(() => ({ type: "unreadable" }) as const),
+  );
 
-  const lockfilesIn = (root: string) =>
-    Effect.gen(function* () {
-      const present: Array<string> = [];
-      for (const { lockfiles } of PACKAGE_MANAGERS) {
-        for (const lockfile of lockfiles) {
-          const found = yield* fileSystem
-            .exists(path.join(root, lockfile))
-            .pipe(Effect.orElseSucceed(() => false));
-          if (found) present.push(lockfile);
-        }
+  const lockfilesIn = Effect.fn("FactoryCommandSetup.lockfilesIn")(function* (root: string) {
+    const present: Array<string> = [];
+    for (const { lockfiles } of PACKAGE_MANAGERS) {
+      for (const lockfile of lockfiles) {
+        const found = yield* fileSystem
+          .exists(path.join(root, lockfile))
+          .pipe(Effect.orElseSucceed(() => false));
+        if (found) present.push(lockfile);
       }
-      return present;
-    });
+    }
+    return present;
+  });
 
   /** An executable's interpreter, if its script names one this environment does not have. */
-  const missingRuntime = (resolvedPath: string, root: string) =>
-    Effect.gen(function* () {
+  const missingRuntime = Effect.fn("FactoryCommandSetup.missingRuntime")(
+    function* (resolvedPath: string, root: string) {
       const bytes = yield* Effect.scoped(
         Effect.flatMap(fileSystem.open(resolvedPath, { flag: "r" }), (file) =>
           file.readAlloc(SHEBANG_BYTES_MAX),
@@ -181,10 +182,14 @@ const make = Effect.gen(function* () {
       });
       if (runtime === undefined) return undefined;
       return (yield* resolveCommandPath(runtime, { cwd: root })) === null ? runtime : undefined;
-    }).pipe(Effect.orElseSucceed(() => undefined));
+    },
+    Effect.orElseSucceed(() => undefined),
+  );
 
-  const validate: FactoryCommandSetup["Service"]["validate"] = ({ projectId, command }) =>
-    Effect.gen(function* () {
+  const validate: FactoryCommandSetup["Service"]["validate"] = Effect.fn(
+    "FactoryCommandSetup.validate",
+  )(
+    function* ({ projectId, command }) {
       const root = yield* workspaceRootOf(projectId);
       const { executable, args } = command;
       const batchScript = {
@@ -235,68 +240,67 @@ const make = Effect.gen(function* () {
         resolvedPath,
         message: `Found ${resolvedPath} on this server. Factory did not run it, so this does not say the command passes.`,
       } satisfies FactoryCommandValidation;
-    }).pipe(
-      // A fresh scan every time: the shared cache keeps a miss for a while, and an owner who just
-      // installed the tool is asking again because of that.
-      Effect.provideService(CommandResolutionCache, new Map()),
-      Effect.provideContext(context),
-    );
+    },
+    Effect.provideService(CommandResolutionCache, new Map()),
+    Effect.provideContext(context),
+  );
 
-  const discover: FactoryCommandSetup["Service"]["discover"] = (projectId) =>
-    Effect.gen(function* () {
-      const root = yield* workspaceRootOf(projectId);
-      const lockfiles = yield* lockfilesIn(root);
-      const manager = PACKAGE_MANAGERS.find((candidate) =>
-        candidate.lockfiles.some((lockfile) => lockfiles.includes(lockfile)),
-      );
-      const install =
-        manager === undefined
-          ? []
-          : [
-              proposal("preset", "install", "setup", {
-                executable: manager.name,
-                args: [...manager.install],
-              }),
-            ];
-      const read = yield* readPackageJson(root);
-      const answer = (
-        scripts: FactoryCommandDiscovery["scripts"],
-        proposals: ReadonlyArray<FactoryCommandProposal>,
-        omittedScripts = 0,
-      ): FactoryCommandDiscovery => ({
-        scripts,
-        packageManager: manager?.name ?? null,
-        lockfiles,
-        proposals,
-        omittedScripts,
-      });
-      if (read.type === "absent") {
-        return answer("no_package_json", [
-          ...install,
-          ...VERIFY_PRESETS.map(({ name, command }) => proposal("preset", name, "verify", command)),
-        ]);
-      }
-      const parsed = read.type === "text" ? decodePackageJson(read.text) : Option.none();
-      if (Option.isNone(parsed)) return answer("unreadable", install);
-      const entries = Object.entries(parsed.value.scripts ?? {});
-      if (entries.length === 0) return answer("none", install);
-      const usable = entries
-        .filter(([name, body]) => typeof body === "string" && usableScriptName(name))
-        .map(([name]) => name);
-      const listed = usable.slice(0, SCRIPTS_MAX);
-      // Without a lockfile any Node install still has npm, and it reads the same scripts.
-      const runner = manager?.name ?? "npm";
-      return answer(
-        "found",
-        [
-          ...listed.map((name) =>
-            proposal("script", name, "any", { executable: runner, args: ["run", name] }),
-          ),
-          ...install,
-        ],
-        entries.length - listed.length,
-      );
+  const discover: FactoryCommandSetup["Service"]["discover"] = Effect.fn(
+    "FactoryCommandSetup.discover",
+  )(function* (projectId) {
+    const root = yield* workspaceRootOf(projectId);
+    const lockfiles = yield* lockfilesIn(root);
+    const manager = PACKAGE_MANAGERS.find((candidate) =>
+      candidate.lockfiles.some((lockfile) => lockfiles.includes(lockfile)),
+    );
+    const install =
+      manager === undefined
+        ? []
+        : [
+            proposal("preset", "install", "setup", {
+              executable: manager.name,
+              args: [...manager.install],
+            }),
+          ];
+    const read = yield* readPackageJson(root);
+    const answer = (
+      scripts: FactoryCommandDiscovery["scripts"],
+      proposals: ReadonlyArray<FactoryCommandProposal>,
+      omittedScripts = 0,
+    ): FactoryCommandDiscovery => ({
+      scripts,
+      packageManager: manager?.name ?? null,
+      lockfiles,
+      proposals,
+      omittedScripts,
     });
+    if (read.type === "absent") {
+      return answer("no_package_json", [
+        ...install,
+        ...VERIFY_PRESETS.map(({ name, command }) => proposal("preset", name, "verify", command)),
+      ]);
+    }
+    const parsed = read.type === "text" ? decodePackageJson(read.text) : Option.none();
+    if (Option.isNone(parsed)) return answer("unreadable", install);
+    const entries = Object.entries(parsed.value.scripts ?? {});
+    if (entries.length === 0) return answer("none", install);
+    const usable = entries
+      .filter(([name, body]) => typeof body === "string" && usableScriptName(name))
+      .map(([name]) => name);
+    const listed = usable.slice(0, SCRIPTS_MAX);
+    // Without a lockfile any Node install still has npm, and it reads the same scripts.
+    const runner = manager?.name ?? "npm";
+    return answer(
+      "found",
+      [
+        ...listed.map((name) =>
+          proposal("script", name, "any", { executable: runner, args: ["run", name] }),
+        ),
+        ...install,
+      ],
+      entries.length - listed.length,
+    );
+  });
 
   return FactoryCommandSetup.of({ discover, validate });
 });

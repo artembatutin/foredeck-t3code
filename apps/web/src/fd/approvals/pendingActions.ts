@@ -23,7 +23,6 @@ export {
   pendingRequestNotice,
   PLAN_GATE_ACTION,
   runtimeModeMeaning,
-  runtimeModeRefusal,
 } from "@t3tools/shared/fd/approvals";
 
 /**

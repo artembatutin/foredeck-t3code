@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, expect, it } from "@effect/vitest";
 import {
@@ -15,6 +16,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import { explicitBare } from "../testkit/gitCommand.ts";
 
 import * as ServerConfig from "../../../config.ts";
 import * as GitManager from "../../../git/GitManager.ts";
@@ -96,7 +98,9 @@ const makeFakeHost = () => {
 
 const git = (cwd: string, args: ReadonlyArray<string>) =>
   Effect.flatMap(GitVcsDriver.GitVcsDriver, (driver) =>
-    driver.execute({ operation: "test.git", cwd, args, timeoutMs: 30_000 }),
+    Effect.flatMap(explicitBare(cwd, args), (args) =>
+      driver.execute({ operation: "test.git", cwd, args, timeoutMs: 30_000 }),
+    ),
   ).pipe(Effect.map((result) => result.stdout.trim()));
 
 const commitFile = (repo: string, name: string, message: string) =>
@@ -166,7 +170,7 @@ const setup = Effect.gen(function* () {
   const run = (
     input: Partial<GitRunStackedActionInput>,
     beforePush?: ReturnType<typeof commitFile>,
-    expectedPushTarget?: GitVcsDriver.GitPushTarget,
+    expectedPushTarget?: GitVcsDriver.GitCheckedPushTarget,
   ) =>
     manager.runStackedAction(
       { actionId: "action-1", cwd: repo, action: "create_pr", ...text, ...input },
@@ -186,6 +190,7 @@ const setup = Effect.gen(function* () {
 const base = GitVcsDriver.layer.pipe(
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-exact-" })),
   Layer.provideMerge(VcsProcess.layer),
+  Layer.provideMerge(NodeCrypto.layer),
   Layer.provideMerge(NodeServices.layer),
 );
 
@@ -198,6 +203,7 @@ const spawnedThrough = (before: Parameters<typeof spawningThrough>[0]) =>
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-exact-" })),
     Layer.provide(spawningThrough(before)),
     Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(NodeCrypto.layer),
     Layer.provideMerge(NodeServices.layer),
   );
 
@@ -285,7 +291,7 @@ it.layer(base)("GitManager publishing an expected commit", (it) => {
   );
 
   describe("bound to a checked push target", () => {
-    /** What `resolvePushTarget` reports of `origin` at `remote`, which the push is checked against. */
+    /** What `resolveCheckedPushTarget` reports of `origin` at `remote`, which the push is checked against. */
     const checkedAt = (remote: string) => ({ remoteName: "origin", branch, pushUrls: [remote] });
 
     /** Every ref and setting the repository and the remote hold, to show nothing moved. */
@@ -301,7 +307,7 @@ it.layer(base)("GitManager publishing an expected commit", (it) => {
         const { repo, remote, host, approved, run } = yield* setup;
         const driver = yield* GitVcsDriver.GitVcsDriver;
         const checked = checkedAt(remote);
-        assert.deepStrictEqual(yield* driver.resolvePushTarget(repo, null), checked);
+        assert.deepStrictEqual(yield* driver.resolveCheckedPushTarget(repo, null), checked);
 
         const result = yield* run({ expectedHeadSha: approved }, undefined, checked);
 
@@ -332,9 +338,9 @@ it.layer(base)("GitManager publishing an expected commit", (it) => {
         const { repo, remote, host, approved, run } = yield* setup;
         const driver = yield* GitVcsDriver.GitVcsDriver;
         const checked = checkedAt(remote);
-        assert.deepStrictEqual(yield* driver.resolvePushTarget(repo, null), checked);
+        assert.deepStrictEqual(yield* driver.resolveCheckedPushTarget(repo, null), checked);
         yield* change(repo, remote);
-        assert.notDeepEqual(yield* driver.resolvePushTarget(repo, null), checked);
+        assert.notDeepEqual(yield* driver.resolveCheckedPushTarget(repo, null), checked);
         const before = yield* everything(repo, remote);
 
         const error = yield* Effect.flip(run({ expectedHeadSha: approved }, undefined, checked));
@@ -379,8 +385,10 @@ it.layer(base)("GitManager publishing an expected commit", (it) => {
         yield* git(repo, ["push", "my-org/fd", `main:refs/heads/${head}`]);
         yield* git(repo, ["fetch", "my-org/fd"]);
         yield* git(repo, ["branch", "--set-upstream-to", `my-org/fd/${head}`]);
+        // A Factory worktree records its base; without it core takes the upstream for the base.
+        yield* git(repo, ["config", `branch.${branch}.t3-merge-base`, "main"]);
         const alias = { remoteName: "my-org/fd", branch: head, pushUrls: [remote] };
-        assert.deepStrictEqual(yield* driver.resolvePushTarget(repo, null), alias);
+        assert.deepStrictEqual(yield* driver.resolveCheckedPushTarget(repo, null), alias);
 
         const refused = yield* Effect.flip(
           run({ expectedHeadSha: approved }, undefined, checkedAt(remote)),
@@ -444,10 +452,10 @@ it.layer(base)("GitManager publishing an expected commit", (it) => {
             const driver = yield* GitVcsDriver.GitVcsDriver;
             const other = yield* bare;
             const checked = checkedAt(remote);
-            assert.deepStrictEqual(yield* driver.resolvePushTarget(repo, null), checked);
+            assert.deepStrictEqual(yield* driver.resolveCheckedPushTarget(repo, null), checked);
             yield* change(repo, remote, other);
             // The remote and branch alone would still pass.
-            assert.deepStrictEqual(yield* driver.resolvePushTarget(repo, null), {
+            assert.deepStrictEqual(yield* driver.resolveCheckedPushTarget(repo, null), {
               ...checked,
               pushUrls: pushUrls(remote, other),
             });
@@ -503,7 +511,7 @@ it.layer(base)("GitManager publishing an expected commit", (it) => {
           const second = yield* bare;
           yield* git(repo, ["remote", "set-url", "--add", "--push", "origin", remote]);
           yield* git(repo, ["remote", "set-url", "--add", "--push", "origin", second]);
-          const checked = yield* driver.resolvePushTarget(repo, null);
+          const checked = yield* driver.resolveCheckedPushTarget(repo, null);
           assert.deepStrictEqual(checked, { ...checkedAt(remote), pushUrls: [remote, second] });
 
           const result = yield* run(
@@ -547,7 +555,7 @@ it.layer(base)("GitManager publishing an expected commit", (it) => {
           yield* git(ready.repo, ["remote", "set-url", "--add", "--push", "origin", extra]);
         }
         const driver = yield* GitVcsDriver.GitVcsDriver;
-        const checked = (yield* driver.resolvePushTarget(ready.repo, null)) ?? assert.fail();
+        const checked = (yield* driver.resolveCheckedPushTarget(ready.repo, null)) ?? assert.fail();
         assert.deepStrictEqual(checked, {
           remoteName: "origin",
           branch,
@@ -566,7 +574,7 @@ it.layer(base)("GitManager publishing an expected commit", (it) => {
       {
         name: "while it records its base",
         at: (args: ReadonlyArray<string>) =>
-          args[0] === "config" && args[1] === `branch.${branch}.gh-merge-base`,
+          args[0] === "config" && args[1] === `branch.${branch}.t3-merge-base`,
       },
       { name: "as the push starts", at: pushesBranch },
     ];
@@ -677,7 +685,7 @@ it.layer(base)("GitManager publishing an expected commit", (it) => {
           if (extra !== null) assert.strictEqual(yield* remoteHead(extra), approved);
           // Its base was recorded and its upstream is now the branch it published, as before.
           assert.strictEqual(
-            yield* git(repo, ["config", "--get", `branch.${branch}.gh-merge-base`]),
+            yield* git(repo, ["config", "--get", `branch.${branch}.t3-merge-base`]),
             "main",
           );
           assert.strictEqual(yield* git(repo, ["rev-parse", "@{upstream}"]), approved);

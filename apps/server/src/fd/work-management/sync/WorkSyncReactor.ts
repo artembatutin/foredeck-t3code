@@ -41,11 +41,9 @@ const LINK_SWEEP_INTERVAL = "5 minutes";
 const SNAPSHOT_BATCH = 50;
 
 /**
- * Keeps Work honest without polling lists: it runs one change watcher per source that can
- * report changes (Markdown directories), retires the sources of deleted projects, drops the
- * links of deleted and settled threads, records each linked run's last outcome, and bumps the
- * refresh epoch for all of them. The thread tail is live only, so a sweep at boot and every few
- * minutes reconciles what it missed, including outcomes committed while the server was down.
+ * Keeps Work current without polling: watches Markdown sources, retires deleted projects' sources,
+ * drops links of deleted/settled threads, records linked runs' outcomes, and bumps the epoch. The
+ * thread tail is live only, so a boot and periodic sweep reconciles what it missed.
  */
 export class WorkSyncReactor extends Context.Service<
   WorkSyncReactor,
@@ -123,52 +121,55 @@ const make = Effect.gen(function* () {
       return Fiber.interrupt(watcher.fiber).pipe(Effect.asVoid);
     });
 
-  const startWatcher = (
+  const startWatcher: (
     sourceId: WorkSourceId,
     source: WorkService.ResolvedSource,
     watch: NonNullable<WorkSourceAdapter["watch"]>,
-  ): Effect.Effect<void> =>
-    Effect.gen(function* () {
-      const token = {};
-      let reported = false;
-      // The stream waits until its entry exists, so a stream that ends at once still clears it.
-      const registered = yield* Deferred.make<void>();
-      const fiber = yield* Deferred.await(registered).pipe(
-        Effect.andThen(
-          Stream.runForEach(watch(source.runtime), () =>
-            Effect.suspend(() => {
-              reported = true;
-              return work.sourceChanged(sourceId);
-            }),
-          ),
-        ),
-        Effect.catchCause(logSkipped("work source watcher stopped")),
-        // A stream that ends on its own (a deleted directory, a failed fs.watch) is restarted by
-        // the next reconcile; one is scheduled so an idle server does not stay blind, later each
-        // time the stream ends without having reported anything.
-        Effect.onExit((exit) =>
+  ) => Effect.Effect<void> = Effect.fn("WorkSyncReactor.startWatcher")(function* (
+    sourceId: WorkSourceId,
+    source: WorkService.ResolvedSource,
+    watch: NonNullable<WorkSourceAdapter["watch"]>,
+  ) {
+    const token = {};
+    let reported = false;
+    // The stream waits until its entry exists, so a stream that ends at once still clears it.
+    const registered = yield* Deferred.make<void>();
+    const fiber = yield* Deferred.await(registered).pipe(
+      Effect.andThen(
+        Stream.runForEach(watch(source.runtime), () =>
           Effect.suspend(() => {
-            if (watchers.get(sourceId)?.token !== token) return Effect.void;
-            watchers.delete(sourceId);
-            if (Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) return Effect.void;
-            const previous = restartDelays.get(sourceId);
-            const delay =
-              reported || previous === undefined
-                ? WATCHER_RESTART_DELAY_MS
-                : Math.min(previous * 2, WATCHER_RESTART_DELAY_MAX_MS);
-            restartDelays.set(sourceId, delay);
-            return reconcileWatchers.pipe(
-              Effect.delay(Duration.millis(delay)),
-              Effect.forkIn(scope),
-              Effect.asVoid,
-            );
+            reported = true;
+            return work.sourceChanged(sourceId);
           }),
         ),
-        Effect.forkIn(scope),
-      );
-      watchers.set(sourceId, { key: keyOf(source), token, fiber });
-      yield* Deferred.succeed(registered, undefined);
-    });
+      ),
+      Effect.catchCause(logSkipped("work source watcher stopped")),
+      // A stream that ends on its own (a deleted directory, a failed fs.watch) is restarted by
+      // the next reconcile; one is scheduled so an idle server does not stay blind, later each
+      // time the stream ends without having reported anything.
+      Effect.onExit((exit) =>
+        Effect.suspend(() => {
+          if (watchers.get(sourceId)?.token !== token) return Effect.void;
+          watchers.delete(sourceId);
+          if (Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) return Effect.void;
+          const previous = restartDelays.get(sourceId);
+          const delay =
+            reported || previous === undefined
+              ? WATCHER_RESTART_DELAY_MS
+              : Math.min(previous * 2, WATCHER_RESTART_DELAY_MAX_MS);
+          restartDelays.set(sourceId, delay);
+          return reconcileWatchers.pipe(
+            Effect.delay(Duration.millis(delay)),
+            Effect.forkIn(scope),
+            Effect.asVoid,
+          );
+        }),
+      ),
+      Effect.forkIn(scope),
+    );
+    watchers.set(sourceId, { key: keyOf(source), token, fiber });
+    yield* Deferred.succeed(registered, undefined);
+  });
 
   const reconcileWatchersOnce = Effect.gen(function* () {
     reconcileQueued = false;
@@ -207,52 +208,53 @@ const make = Effect.gen(function* () {
    * The snapshot's revision is the item as the thread first saw it, the baseline clients compare
    * for "Changed since the thread started", so only the displayed fields move.
    */
-  const refreshSnapshots = (rows: ReadonlyArray<WorkLinkStore.StoredWorkLink>) =>
-    Effect.gen(function* () {
-      let changed = 0;
-      const bySource = new Map<WorkSourceId, Array<WorkLinkStore.StoredWorkLink>>();
-      for (const link of rows) {
-        const group = bySource.get(link.sourceId) ?? [];
-        group.push(link);
-        bySource.set(link.sourceId, group);
-      }
-      for (const [sourceId, group] of bySource) {
-        const itemIds = [...new Set(group.map((link) => link.itemId))];
-        for (let index = 0; index < itemIds.length; index += SNAPSHOT_BATCH) {
-          const batch = itemIds.slice(index, index + SNAPSHOT_BATCH);
-          const summaries = yield* work.snapshots(sourceId, batch).pipe(
-            // A source that is down or rate limited keeps its old snapshots until the next pass.
-            Effect.catchCause(logSkipped("work link snapshot refresh skipped")),
-            Effect.map((result) => result ?? []),
-          );
-          const byItem = new Map<WorkItemId, (typeof summaries)[number]>(
-            summaries.map((summary) => [summary.ref.itemId, summary]),
-          );
-          for (const link of group) {
-            const summary = byItem.get(link.itemId);
-            if (
-              summary === undefined ||
-              (summary.key === link.snapshot.key &&
-                summary.title === link.snapshot.title &&
-                summary.status === link.snapshot.status &&
-                summary.url === link.snapshot.url)
-            ) {
-              continue;
-            }
-            // Only the displayed fields: the link may have been rewritten since it was read (an
-            // automatic start stores its revision and mark after the launch).
-            yield* links.updateSnapshotDisplay(link.sourceId, link.itemId, link.threadId, {
-              key: summary.key,
-              title: summary.title,
-              status: summary.status,
-              url: summary.url,
-            });
-            changed += 1;
+  const refreshSnapshots = Effect.fn("WorkSyncReactor.refreshSnapshots")(function* (
+    rows: ReadonlyArray<WorkLinkStore.StoredWorkLink>,
+  ) {
+    let changed = 0;
+    const bySource = new Map<WorkSourceId, Array<WorkLinkStore.StoredWorkLink>>();
+    for (const link of rows) {
+      const group = bySource.get(link.sourceId) ?? [];
+      group.push(link);
+      bySource.set(link.sourceId, group);
+    }
+    for (const [sourceId, group] of bySource) {
+      const itemIds = [...new Set(group.map((link) => link.itemId))];
+      for (let index = 0; index < itemIds.length; index += SNAPSHOT_BATCH) {
+        const batch = itemIds.slice(index, index + SNAPSHOT_BATCH);
+        const summaries = yield* work.snapshots(sourceId, batch).pipe(
+          // A source that is down or rate limited keeps its old snapshots until the next pass.
+          Effect.catchCause(logSkipped("work link snapshot refresh skipped")),
+          Effect.map((result) => result ?? []),
+        );
+        const byItem = new Map<WorkItemId, (typeof summaries)[number]>(
+          summaries.map((summary) => [summary.ref.itemId, summary]),
+        );
+        for (const link of group) {
+          const summary = byItem.get(link.itemId);
+          if (
+            summary === undefined ||
+            (summary.key === link.snapshot.key &&
+              summary.title === link.snapshot.title &&
+              summary.status === link.snapshot.status &&
+              summary.url === link.snapshot.url)
+          ) {
+            continue;
           }
+          // Only the displayed fields: the link may have been rewritten since it was read (an
+          // automatic start stores its revision and mark after the launch).
+          yield* links.updateSnapshotDisplay(link.sourceId, link.itemId, link.threadId, {
+            key: summary.key,
+            title: summary.title,
+            status: summary.status,
+            url: summary.url,
+          });
+          changed += 1;
         }
       }
-      return changed;
-    });
+    }
+    return changed;
+  });
 
   const unlinkThreadOnce = (threadId: ThreadId, linkedUpTo: string | undefined) =>
     links.unlinkThread(threadId, linkedUpTo === undefined ? undefined : { linkedUpTo }).pipe(
@@ -260,8 +262,8 @@ const make = Effect.gen(function* () {
       Effect.catchCause(logSkipped("work thread unlink failed")),
     );
 
-  const runEndedOnce = (threadId: ThreadId, status: string, at: string) =>
-    Effect.gen(function* () {
+  const runEndedOnce = Effect.fn("WorkSyncReactor.runEndedOnce")(
+    function* (threadId: ThreadId, status: string, at: string) {
       const rows = (yield* links.listByThread(threadId)).filter((link) =>
         isNewerRun(link, { status, at }),
       );
@@ -271,24 +273,28 @@ const make = Effect.gen(function* () {
       }
       yield* refreshSnapshots(rows);
       yield* work.notifyChanged;
-    }).pipe(Effect.catchCause(logSkipped("work run outcome update failed")));
+    },
+    Effect.catchCause(logSkipped("work run outcome update failed")),
+  );
 
   /** The latest run's outcome when it ended after the link was made and the link lacks it. */
-  const missedOutcome = (link: WorkLinkStore.StoredWorkLink, shell: OrchestrationV2ThreadShell) =>
-    Effect.gen(function* () {
-      if (shell.activeRunId !== null || shell.latestRunId === null) return null;
-      const { runs } = yield* projections.getThreadRecords(shell.id, ["runs"], {
-        runIds: [shell.latestRunId],
-      });
-      const run = runs.find((candidate) => candidate.id === shell.latestRunId);
-      if (run === undefined || !isTerminalRunStatus(run.status) || run.completedAt === null) {
-        return null;
-      }
-      const outcome = { status: run.status, at: DateTime.formatIso(run.completedAt) };
-      return Date.parse(outcome.at) >= Date.parse(link.linkedAt) && isNewerRun(link, outcome)
-        ? outcome
-        : null;
+  const missedOutcome = Effect.fn("WorkSyncReactor.missedOutcome")(function* (
+    link: WorkLinkStore.StoredWorkLink,
+    shell: OrchestrationV2ThreadShell,
+  ) {
+    if (shell.activeRunId !== null || shell.latestRunId === null) return null;
+    const { runs } = yield* projections.getThreadRecords(shell.id, ["runs"], {
+      runIds: [shell.latestRunId],
     });
+    const run = runs.find((candidate) => candidate.id === shell.latestRunId);
+    if (run === undefined || !isTerminalRunStatus(run.status) || run.completedAt === null) {
+      return null;
+    }
+    const outcome = { status: run.status, at: DateTime.formatIso(run.completedAt) };
+    return Date.parse(outcome.at) >= Date.parse(link.linkedAt) && isNewerRun(link, outcome)
+      ? outcome
+      : null;
+  });
 
   const sweepLinksOnce = Effect.gen(function* () {
     const { links: rows } = yield* links.listAll(OPEN_LINKS_MAX);

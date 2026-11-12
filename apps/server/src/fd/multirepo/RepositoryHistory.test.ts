@@ -419,5 +419,5 @@ it.effect("keeps repository snapshots separate through partial failure, restart 
         CheckpointRefUnavailableError,
       );
     }).pipe(Effect.provide(session("replay")), Effect.scoped);
-  }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, gitLayer))),
+  }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer, gitLayer))),
 );

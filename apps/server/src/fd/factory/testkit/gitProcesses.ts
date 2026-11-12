@@ -1,6 +1,7 @@
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Redacted from "effect/Redacted";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 /**
@@ -22,6 +23,10 @@ export const spawningThrough = (
     ),
   );
 
+/** A word as the process sees it. */
+const plain = (word: string | Redacted.Redacted<string>) =>
+  Redacted.isRedacted(word) ? Redacted.value(word) : word;
+
 /**
  * Holds the first command whose arguments `matches` until `release`, after completing `reached`: a
  * deterministic point between two Git commands for a test to change the repository at.
@@ -32,7 +37,7 @@ export const holdFirst = (matches: (args: ReadonlyArray<string>) => boolean) =>
     const release = yield* Deferred.make<void>();
     let held = false;
     const before = (command: ChildProcess.StandardCommand) =>
-      held || !matches(command.args)
+      held || !matches(command.args.map(plain))
         ? Effect.succeed(command)
         : Effect.sync(() => {
             held = true;
@@ -74,7 +79,8 @@ export const appendingRemoteUrls = (command: ChildProcess.StandardCommand) => {
   const keys = Object.keys(env).filter((key) => /^GIT_CONFIG_KEY_\d+$/.test(key));
   const clearing = keys.filter(
     (key) =>
-      /^remote\..+\.(?:push)?url$/i.test(env[key] ?? "") && env[key.replace("KEY", "VALUE")] === "",
+      /^remote\..+\.(?:push)?url$/i.test(plain(env[key] ?? "")) &&
+      env[key.replace("KEY", "VALUE")] === "",
   );
   if (clearing.length === 0) return Effect.succeed(command);
   return Effect.succeed(

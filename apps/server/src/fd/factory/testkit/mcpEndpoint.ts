@@ -6,12 +6,14 @@ import {
   type ServerProvider,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { HttpBody, HttpClient, HttpRouter } from "effect/http";
 
+import * as AssetSigner from "../../../assets/AssetSigner.ts";
 import * as DeviceService from "../../../device/DeviceService.ts";
 import * as ServerEnvironment from "../../../environment/ServerEnvironment.ts";
 import * as GitWorkflowService from "../../../git/GitWorkflowService.ts";
@@ -21,9 +23,14 @@ import * as McpSessionRegistry from "../../../mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "../../../mcp/PreviewAutomationBroker.ts";
 import * as ProviderAdapterRegistry from "../../../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
+import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
+import * as PeerLinkRequests from "../../../peer/PeerLinkRequests.ts";
+import * as PeerLinks from "../../../peer/PeerLinks.ts";
+import * as RemoteDelegation from "../../../peer/RemoteDelegation.ts";
 import * as PreviewBrowser from "../../../preview/PreviewBrowser.ts";
 import * as PreviewManager from "../../../preview/Manager.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
+import * as ProjectCloneTracker from "../../../project/ProjectCloneTracker.ts";
 import * as ProjectSetupScriptRunner from "../../../project/ProjectSetupScriptRunner.ts";
 import * as ProviderRegistryMock from "../../../provider/testUtils/providerRegistryMock.ts";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
@@ -82,6 +89,13 @@ const layerStubs = (driver: ProviderDriverKind) =>
     Layer.mock(ServerEnvironment.ServerEnvironment)({
       getEnvironmentId: Effect.succeed("environment-factory-delivery" as never),
     }),
+    Layer.mock(AssetSigner.AssetSigner)({}),
+    Layer.mock(McpProviderSessions.McpProviderSessions)({}),
+    Layer.mock(PeerForwarding.PeerForwarding)({}),
+    Layer.mock(PeerLinkRequests.PeerLinkRequests)({}),
+    Layer.mock(PeerLinks.PeerLinks)({}),
+    Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+    Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({ get: () => Effect.succeed(null) }),
     PreviewAutomationBroker.layer,
     PreviewBrowser.layer,
   );

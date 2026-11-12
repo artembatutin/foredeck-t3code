@@ -1,4 +1,9 @@
-import type { AssetResource, ChatFileAttachment, EnvironmentId } from "@t3tools/contracts";
+import {
+  SOURCE_CONTROL_MEDIA_ASSET,
+  type AssetResource,
+  type ChatFileAttachment,
+  type EnvironmentId,
+} from "@t3tools/contracts";
 import { videoMimeType } from "@t3tools/shared/video";
 
 import type { DraftComposerFileAttachment } from "./composerImages";
@@ -22,14 +27,13 @@ export type MediaVideoPreviewSource = {
             | "attachment"
             | "media-file"
             | "draft-workspace-file"
-            | "github-media"
+            | typeof SOURCE_CONTROL_MEDIA_ASSET
             | "repository-file";
         }
       >;
     }
 );
 
-/** Resolves the current capability without making it the identity of the video. */
 export function mediaVideoPreviewUri(
   source: MediaVideoPreviewSource,
   assetUrl: string | null,
@@ -38,7 +42,6 @@ export function mediaVideoPreviewUri(
   return assetUrl === null ? null : assetUrl + (source.srcFragment ?? "");
 }
 
-/** Keeps thumbnails independent of refreshed asset signatures and scoped to their environment. */
 export function mediaVideoThumbnailKey(source: MediaVideoPreviewSource): string {
   return JSON.stringify(
     "uri" in source
@@ -62,13 +65,14 @@ export function mediaVideoThumbnailKey(source: MediaVideoPreviewSource): string 
                 source.resource.path,
                 source.srcFragment ?? "",
               ]
-            : source.resource._tag === "github-media"
+            : source.resource._tag === SOURCE_CONTROL_MEDIA_ASSET
               ? [
                   "media-video",
-                  "github-media",
+                  SOURCE_CONTROL_MEDIA_ASSET,
                   source.environmentId,
                   source.resource.cwd,
                   source.resource.url,
+                  source.resource.repository ?? "",
                 ]
               : [
                   "media-video",

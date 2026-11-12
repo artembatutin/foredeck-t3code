@@ -12,13 +12,14 @@ import type {
   WorkItemPatch,
   WorkPriority,
 } from "@t3tools/contracts/fd/work-management";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Pressable, View } from "react-native";
 
-import { SymbolView } from "../../components/AppSymbol";
-import { AppText as Text, AppTextInput } from "../../components/AppText";
-import { ErrorBanner } from "../../components/ErrorBanner";
-import { ListFilterMenu } from "../../features/workspace/ListFilterMenu";
+import { SymbolView } from "../../components/ui/AppSymbol";
+import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
+import { ErrorBanner } from "../../components/ui/ErrorBanner";
+import { ListFilterMenu } from "../../features/layout/workspace/ListFilterMenu";
+import { useDebouncedValue } from "../../state/queries";
 import { useEnvironmentQuery } from "../../state/query";
 import { Action } from "./shared";
 import { workEnvironment } from "./state";
@@ -71,11 +72,7 @@ export function AssigneeEditor({
   onClose: () => void;
 }) {
   const [search, setSearch] = useState("");
-  const [term, setTerm] = useState("");
-  useEffect(() => {
-    const timer = setTimeout(() => setTerm(search.trim()), 250);
-    return () => clearTimeout(timer);
-  }, [search]);
+  const term = useDebouncedValue(search.trim(), 250);
   const people = useEnvironmentQuery(
     item.capabilities.people
       ? workEnvironment.people({

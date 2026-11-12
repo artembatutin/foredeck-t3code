@@ -15,7 +15,10 @@ import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as HandoffMigrations from "./handoffMigrations.ts";
 import type { AssignmentEvent } from "./portfolio.ts";
 import * as PortfolioStore from "./PortfolioStore.ts";
-import portfolioMigration from "./migration.ts";
+import portfolioMigration, {
+  FORK_CORE_MIGRATIONS_TABLE,
+  forkCoreMigrationEntries,
+} from "./migration.ts";
 import * as ProjectAssistant from "./ProjectAssistant.ts";
 
 const PORTFOLIO_TABLES = [
@@ -102,17 +105,30 @@ describe("migration 064", () => {
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
 
-  it.effect("adds only portfolio objects to a database migrated through 063", () =>
+  it.effect("adds only portfolio objects to a database whose core schema is current", () =>
     Effect.gen(function* () {
-      yield* runMigrations({ toMigrationInclusive: 63 });
+      const sql = yield* SqlClient.SqlClient;
+      // Core current and the fork ledger through ProjectRepositories: only the assistant's run.
+      yield* sql`CREATE TABLE ${sql(FORK_CORE_MIGRATIONS_TABLE)} (
+        migration_id integer PRIMARY KEY NOT NULL,
+        created_at datetime NOT NULL DEFAULT current_timestamp,
+        name VARCHAR(255) NOT NULL
+      )`;
+      for (const [id, name] of forkCoreMigrationEntries) {
+        yield* sql`INSERT INTO ${sql(FORK_CORE_MIGRATIONS_TABLE)} (migration_id, name) VALUES (${id}, ${name})`;
+      }
+      yield* runMigrations();
+      yield* sql`DELETE FROM ${sql(FORK_CORE_MIGRATIONS_TABLE)} WHERE migration_id > 1`;
       const before = yield* schemaObjects;
       assert.isFalse(before.some((object) => isPortfolioObject(object.name)));
 
-      assert.deepStrictEqual(yield* runMigrations(), [
-        [64, "AssistantPortfolio"],
-        [65, "AssistantDispatches"],
-        [66, "AssistantIdeas"],
-      ]);
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      const ran = yield* sql<{ readonly migration_id: number; readonly name: string }>`
+        SELECT migration_id, name FROM ${sql(FORK_CORE_MIGRATIONS_TABLE)} ORDER BY migration_id`;
+      assert.deepStrictEqual(
+        ran.map(({ migration_id, name }) => [migration_id, name]),
+        forkCoreMigrationEntries.map(([id, name]) => [id, name]),
+      );
       const after = yield* schemaObjects;
       assert.deepStrictEqual(
         after.filter((object) => !isPortfolioObject(object.name)),

@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { ExecutionEnvironmentDescriptor } from "@t3tools/contracts";
@@ -14,7 +15,7 @@ import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 const encodeDescriptor = Schema.encodeSync(ExecutionEnvironmentDescriptor);
 const decodeDescriptor = Schema.decodeUnknownSync(ExecutionEnvironmentDescriptor);
 
-it.layer(NodeServices.layer)("Factory capability", (it) => {
+it.layer(Layer.merge(NodeServices.layer, NodeCrypto.layer))("Factory capability", (it) => {
   it.effect("is advertised in the server's environment descriptor as a client reads it", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

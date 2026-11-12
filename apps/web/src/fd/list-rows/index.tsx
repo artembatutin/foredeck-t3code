@@ -1,7 +1,5 @@
-import type { LucideIcon } from "lucide-react";
 import type { ReactNode } from "react";
 
-import { Separator } from "../../components/ui/separator";
 import { Skeleton } from "../../components/ui/skeleton";
 import { cn } from "../../lib/utils";
 import { formatRelativeTimeLabel } from "../../timestampFormat";
@@ -83,26 +81,6 @@ export function FdRelativeTime({ at, className }: { at: string; className?: stri
     <time dateTime={at} className={cn("shrink-0 whitespace-nowrap tabular-nums", className)}>
       {formatRelativeTimeLabel(at)}
     </time>
-  );
-}
-
-/** A group's glyph, name and count, then a rule to the edge, as the pull request list groups. */
-export function FdListGroupHeader({
-  icon: Icon,
-  label,
-  count,
-}: {
-  icon: LucideIcon;
-  label: string;
-  count: number;
-}) {
-  return (
-    <div className="flex items-center gap-2 px-3 pb-1 text-xs font-medium text-muted-foreground/70">
-      <Icon aria-hidden className="size-3.5 shrink-0" />
-      <h2 className="shrink-0">{label}</h2>
-      <span className="shrink-0 tabular-nums text-muted-foreground/50">{count}</span>
-      <Separator className="min-w-2 flex-1" />
-    </div>
   );
 }
 

@@ -12,12 +12,12 @@ import type { FactoryDelivery, FactoryDeliveryId } from "@t3tools/contracts/fd/f
 import type { WorkItemSummary } from "@t3tools/contracts/fd/work-management";
 import { useNavigation } from "@react-navigation/native";
 import { useLayoutEffect, useRef, useState } from "react";
-import { Alert, Platform, View } from "react-native";
+import { Alert, View } from "react-native";
 
-import { AppText as Text } from "../../components/AppText";
-import { ErrorBanner } from "../../components/ErrorBanner";
+import { AppText as Text } from "../../components/ui/AppText";
+import { ErrorBanner } from "../../components/ui/ErrorBanner";
 import { StatusPill } from "../../components/StatusPill";
-import { useAndroidWorkspaceSelection } from "../../features/workspace/useAndroidWorkspaceSelection";
+import { useOpenWorkspaceDetail } from "../../features/layout/useOpenWorkspaceDetail";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { relativeTime } from "../../lib/time";
 import { useProjects, useThreadShells } from "../../state/entities";
@@ -43,11 +43,9 @@ interface FactoryItemSectionProps {
 }
 
 /**
- * The Work item screen's Factory section: what the item's current delivery comes to now, read
- * from its current state with stop, resume and cancel beside it, then its plan while it waits at
- * the plan gate, its allowances, its timeline and what each role runs on. Renders nothing on a server
- * without Factory or for an item without a delivery. Registered with the Work item screen by the
- * app's Stack.
+ * The Work item screen's Factory section for the item's current delivery. Renders nothing on a
+ * server without Factory or for an item without a delivery. Registered with the Work item screen
+ * by the app's Stack.
  */
 export function FactoryItemSection(props: FactoryItemSectionProps) {
   // A pending action or error belongs to one destination and item.
@@ -72,7 +70,7 @@ const OUTCOME_CLASSES: Record<FactoryOutcomeTone, string> = {
 
 function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps) {
   const navigation = useNavigation();
-  const selectAndroidWorkspace = useAndroidWorkspaceSelection();
+  const openDetail = useOpenWorkspaceDetail();
   const environments = useWorkspaceEnvironments();
   const projects = useProjects();
   const threads = useThreadShells();
@@ -119,6 +117,7 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
   });
   // The confirmation's press reads the view as it is then, not as it was when the alert opened.
   const latestView = useRef(view);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- hands the committed view to an open native Alert's press callback
   useLayoutEffect(() => {
     latestView.current = view;
   });
@@ -159,11 +158,11 @@ function ItemSection({ environmentId, projectId, item }: FactoryItemSectionProps
     ]);
   };
 
-  const openThread = (thread: FactoryThreadTarget) => {
-    const params = { environmentId: thread.environmentId, threadId: thread.threadId };
-    if (Platform.OS === "android") selectAndroidWorkspace({ name: "Thread", params });
-    else navigation.navigate("Thread", params);
-  };
+  const openThread = (thread: FactoryThreadTarget) =>
+    openDetail({
+      name: "Thread",
+      params: { environmentId: thread.environmentId, threadId: thread.threadId },
+    });
 
   const { controls } = view;
   const noteClassName = view.nextAction.forYou

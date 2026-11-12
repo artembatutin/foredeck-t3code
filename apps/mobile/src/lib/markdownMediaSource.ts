@@ -5,7 +5,6 @@ import {
   type ResolveMediaSourceInput,
 } from "@t3tools/client-runtime/media-source";
 
-/** A project draft names its workspace explicitly because it has no thread. */
 export function resolveMobileMarkdownMediaSource(
   href: string,
   input: ResolveMediaSourceInput & { readonly repositoryTarget?: RepositoryTarget | undefined },

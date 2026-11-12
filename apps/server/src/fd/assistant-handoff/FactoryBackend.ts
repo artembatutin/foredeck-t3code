@@ -95,12 +95,13 @@ export const makeReview = Effect.gen(function* () {
   const factory = yield* FactoryService.FactoryService;
 
   return HandoffBackend.HandoffReview.of({
-    preview: (input) =>
+    preview: Effect.fn("HandoffReview.preview")((input) =>
       factory.previewReviewedExecution(input).pipe(Effect.mapError(failed("review"))),
-    holds: (input) => factory.reviewedExecutionHolds(input),
+    ),
+    holds: Effect.fn("HandoffReview.holds")((input) => factory.reviewedExecutionHolds(input)),
     // As the assistant's resume picks it: the child a parent still running waits on, or else the root.
-    atRest: (root) =>
-      Effect.gen(function* () {
+    atRest: Effect.fn("HandoffReview.atRest")(
+      function* (root) {
         const found = yield* factory.get(FactoryDeliveryId.make(root));
         if (Option.isNone(found)) return null;
         const { state } = found.value;
@@ -122,13 +123,15 @@ export const makeReview = Effect.gen(function* () {
         return status === "stopped" || status === "blocked"
           ? { deliveryId: picked.deliveryId, status, effectsIssued }
           : null;
-      }).pipe(Effect.mapError(failed("review"))),
+      },
+      Effect.mapError(failed("review")),
+    ),
     // A parent's children hold copies, and it takes each one's next stage only once it stands under
     // the review; one approved or ended keeps what it ran under. The delivery to resume goes last,
     // so the resume it then owes means the whole family stands under the review. Which that is was
     // decided when the owner confirmed: judged again here, a repeat could hand the resume on.
-    rebind: ({ root, execution, resume }) =>
-      Effect.gen(function* () {
+    rebind: Effect.fn("HandoffReview.rebind")(
+      function* ({ root, execution, resume }) {
         const deliveryId = FactoryDeliveryId.make(root);
         const found = yield* factory.get(deliveryId);
         if (Option.isNone(found)) return yield* refused("rebind", "not_found");
@@ -158,21 +161,21 @@ export const makeReview = Effect.gen(function* () {
         }
         if (deliveryId !== resuming) yield* rebindOne(deliveryId);
         yield* rebindOne(resuming);
-      }).pipe(
-        Effect.mapError((error) => {
-          switch (error._tag) {
-            case "HandoffFactoryRefused":
-              return error;
-            case "FactoryReviewedRebindRefusedError":
-              return refused("rebind", "rebind_refused");
-            case "FactoryDeliveryNotFoundError":
-              return refused("rebind", "not_found");
-            default:
-              return failed("review")(error);
-          }
-        }),
-      ),
-    resumeOwed: ({ deliveryId, receiptId }) =>
+      },
+      Effect.mapError((error) => {
+        switch (error._tag) {
+          case "HandoffFactoryRefused":
+            return error;
+          case "FactoryReviewedRebindRefusedError":
+            return refused("rebind", "rebind_refused");
+          case "FactoryDeliveryNotFoundError":
+            return refused("rebind", "not_found");
+          default:
+            return failed("review")(error);
+        }
+      }),
+    ),
+    resumeOwed: Effect.fn("HandoffReview.resumeOwed")(({ deliveryId, receiptId }) =>
       factory
         .get(FactoryDeliveryId.make(deliveryId))
         .pipe(
@@ -186,6 +189,7 @@ export const makeReview = Effect.gen(function* () {
           ),
           Effect.mapError(failed("review")),
         ),
+    ),
   });
 });
 
@@ -195,7 +199,7 @@ export const make = Effect.gen(function* () {
   const settings = yield* FactorySettings.FactorySettings;
 
   return HandoffBackend.HandoffFactory.of({
-    verifyConfigured: (projectId) =>
+    verifyConfigured: Effect.fn("HandoffFactory.verifyConfigured")((projectId) =>
       settings.requireDeliverySettings(projectId).pipe(
         Effect.as(true),
         Effect.catchTags({
@@ -203,21 +207,25 @@ export const make = Effect.gen(function* () {
           FactorySettingsStorageError: (cause) => Effect.fail(failed("verify")(cause)),
         }),
       ),
-    get: (deliveryId) =>
+    ),
+    get: Effect.fn("HandoffFactory.get")((deliveryId) =>
       factory
         .get(FactoryDeliveryId.make(deliveryId))
         .pipe(Effect.map(Option.map(deliveryOf)), Effect.mapError(failed("get"))),
-    start: ({ deliveryId, item, kind, runtimeModeCeiling, reviewedExecution }) =>
-      factory
-        .start({
-          deliveryId: FactoryDeliveryId.make(deliveryId),
-          itemRef: item,
-          kind,
-          runtimeModeCeiling,
-          ...(reviewedExecution === undefined ? {} : { reviewedExecution }),
-        })
-        .pipe(Effect.map(deliveryOf), Effect.mapError(startFailure)),
-    stop: (deliveryId) =>
+    ),
+    start: Effect.fn("HandoffFactory.start")(
+      ({ deliveryId, item, kind, runtimeModeCeiling, reviewedExecution }) =>
+        factory
+          .start({
+            deliveryId: FactoryDeliveryId.make(deliveryId),
+            itemRef: item,
+            kind,
+            runtimeModeCeiling,
+            ...(reviewedExecution === undefined ? {} : { reviewedExecution }),
+          })
+          .pipe(Effect.map(deliveryOf), Effect.mapError(startFailure)),
+    ),
+    stop: Effect.fn("HandoffFactory.stop")((deliveryId) =>
       factory.stop(FactoryDeliveryId.make(deliveryId)).pipe(
         Effect.map(deliveryOf),
         Effect.mapError((error) => {
@@ -231,7 +239,8 @@ export const make = Effect.gen(function* () {
           }
         }),
       ),
-    resume: (deliveryId, options) => {
+    ),
+    resume: Effect.fn("HandoffFactory.resume")((deliveryId, options) => {
       const id = FactoryDeliveryId.make(deliveryId);
       return (
         options?.owedBy === undefined
@@ -256,8 +265,8 @@ export const make = Effect.gen(function* () {
             : Effect.succeed(deliveryOf(resumed)),
         ),
       );
-    },
-    cancel: (deliveryId) =>
+    }),
+    cancel: Effect.fn("HandoffFactory.cancel")((deliveryId) =>
       factory.cancel(FactoryDeliveryId.make(deliveryId)).pipe(
         Effect.map(deliveryOf),
         Effect.mapError((error) => {
@@ -271,13 +280,15 @@ export const make = Effect.gen(function* () {
           }
         }),
       ),
-    activity: (root) =>
+    ),
+    activity: Effect.fn("HandoffFactory.activity")((root) =>
       factory.activity(FactoryDeliveryId.make(root)).pipe(
         Effect.map(({ phase, busy, deferred, unknown }) => ({ phase, busy, deferred, unknown })),
         Effect.mapError(failed("activity")),
       ),
-    follow: (root) =>
-      Effect.gen(function* () {
+    ),
+    follow: Effect.fn("HandoffFactory.follow")(
+      function* (root) {
         const found = yield* factory.get(FactoryDeliveryId.make(root));
         if (Option.isNone(found)) return Option.none();
         const delivery = found.value;
@@ -318,24 +329,30 @@ export const make = Effect.gen(function* () {
             yield* factory.refusedTurnActions(delivery),
           ),
         });
-      }).pipe(Effect.mapError(failed("follow"))),
-    ensureDeferred: (deliveryId, effectId) =>
+      },
+      Effect.mapError(failed("follow")),
+    ),
+    ensureDeferred: Effect.fn("HandoffFactory.ensureDeferred")((deliveryId, effectId) =>
       factory
         .ensureDeferred(FactoryDeliveryId.make(deliveryId), effectId)
         .pipe(Effect.mapError(failed("deferral"))),
-    redispatch: (deliveryId, effectId) =>
+    ),
+    redispatch: Effect.fn("HandoffFactory.redispatch")((deliveryId, effectId) =>
       factory
         .redispatch(FactoryDeliveryId.make(deliveryId), effectId)
         .pipe(Effect.mapError(failed("deferral"))),
-    runStateOf: ({ threadId, messageId }) =>
+    ),
+    runStateOf: Effect.fn("HandoffFactory.runStateOf")(({ threadId, messageId }) =>
       factory
         .turnRunState({ threadId: ThreadId.make(threadId), messageId: messageId as MessageId })
         .pipe(Effect.mapError(failed("runState"))),
-    requests: (root) =>
+    ),
+    requests: Effect.fn("HandoffFactory.requests")((root) =>
       factory.familyRequests(FactoryDeliveryId.make(root)).pipe(
         Effect.map((requests) => requests.map(handoffRequest)),
         Effect.mapError(failed("requests")),
       ),
+    ),
     pendingRequests: factory.pendingRequests.pipe(
       Effect.map(({ byDelivery, complete }) => ({
         byRoot: new Map(

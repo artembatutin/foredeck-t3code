@@ -14,7 +14,6 @@ import type {
 } from "@t3tools/contracts/fd/work-management";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/reactivity";
-import { useMemo } from "react";
 
 import { connectionAtomRuntime } from "../../connection/runtime";
 import { useConnectedEnvironmentIds } from "../../state/environments";
@@ -23,7 +22,7 @@ import { useEnvironmentScope, useEnvironmentsWithScope } from "../../state/sessi
 
 export const workEnvironment = createWorkEnvironmentAtoms(connectionAtomRuntime);
 export const workCommands = createWorkCommands(connectionAtomRuntime);
-export const workSupportAtom = createWorkSupportAtom(environmentServerConfigsAtom);
+const workSupportAtom = createWorkSupportAtom(environmentServerConfigsAtom);
 
 const EMPTY_LINKS: ReadonlyArray<WorkThreadLink> = [];
 
@@ -35,18 +34,11 @@ export function useWorkSupport(): ReadonlyMap<EnvironmentId, WorkManagementSuppo
 /** Environments that advertise Work and that this session may read Work on. */
 export function useReadableWorkEnvironments(): ReadonlyArray<EnvironmentId> {
   const support = useWorkSupport();
-  const environments = useMemo(
-    () => [...support.keys()].toSorted().map((environmentId) => ({ environmentId })),
-    [support],
-  );
+  const environments = [...support.keys()].toSorted().map((environmentId) => ({ environmentId }));
   const readable = useEnvironmentsWithScope(environments, WORK_READ_SCOPE);
-  return useMemo(
-    () =>
-      environments
-        .map(({ environmentId }) => environmentId)
-        .filter((environmentId) => readable.has(environmentId)),
-    [environments, readable],
-  );
+  return environments
+    .map(({ environmentId }) => environmentId)
+    .filter((environmentId) => readable.has(environmentId));
 }
 
 /** Whether any environment advertises Work: the gate for entry points (sidebar, palette). */

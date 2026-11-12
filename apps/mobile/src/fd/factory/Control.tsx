@@ -1,8 +1,8 @@
 import type { ReactNode } from "react";
 import { Platform, View } from "react-native";
 
-import { AppText as Text } from "../../components/AppText";
-import { ControlPill } from "../../components/ControlPill";
+import { AppText as Text } from "../../components/ui/AppText";
+import { ControlPill } from "../../components/ui/ControlPill";
 
 /** A Factory action button; `primary` marks the decision a section exists for. */
 export function Control({

@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { AuthWorkWriteScope, ProjectId, RunId, ThreadId } from "@t3tools/contracts";
@@ -113,17 +114,13 @@ const fakeWork = (world: World) =>
             world.source.push(input.body);
             return { commentId: String(world.source.length) };
           case "unavailable":
-            return yield* Effect.fail(
-              new FakeWorkUnavailable({
-                detail: "The source could not be reached.",
-              }) as unknown as WorkDomainError,
-            );
+            return yield* new FakeWorkUnavailable({
+              detail: "The source could not be reached.",
+            }) as unknown as WorkDomainError;
           case "refuses":
-            return yield* Effect.fail(
-              new FakeWorkInvalid({
-                detail: "The source refused the comment.",
-              }) as unknown as WorkDomainError,
-            );
+            return yield* new FakeWorkInvalid({
+              detail: "The source refused the comment.",
+            }) as unknown as WorkDomainError;
         }
       }),
     // The whole history, however long; Factory never reads the bounded `getItem` list.
@@ -136,11 +133,9 @@ const fakeWork = (world: World) =>
           yield* Deferred.await(held.release);
         }
         if (world.lookupFails) {
-          return yield* Effect.fail(
-            new FakeWorkUnavailable({
-              detail: "The source could not be reached.",
-            }) as unknown as WorkDomainError,
-          );
+          return yield* new FakeWorkUnavailable({
+            detail: "The source could not be reached.",
+          }) as unknown as WorkDomainError;
         }
         const index = world.source.findIndex((body) => body.includes(text));
         return index === -1
@@ -206,6 +201,7 @@ const baseLayer = (world: World) =>
     Layer.provideMerge(GitVcsDriver.layer),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "fd-factory-comments-" })),
     Layer.provideMerge(VcsProcess.layer),
+    Layer.provideMerge(NodeCrypto.layer),
     Layer.provideMerge(NodeServices.layer),
   );
 

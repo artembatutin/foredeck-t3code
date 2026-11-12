@@ -3,9 +3,9 @@ import type { WorkItemSummary, WorkSource } from "@t3tools/contracts/fd/work-man
 import { useRef, useState } from "react";
 import { View } from "react-native";
 
-import { AppText as Text, AppTextInput } from "../../components/AppText";
-import { ErrorBanner } from "../../components/ErrorBanner";
-import { ListFilterMenu } from "../../features/workspace/ListFilterMenu";
+import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
+import { ErrorBanner } from "../../components/ui/ErrorBanner";
+import { ListFilterMenu } from "../../features/layout/workspace/ListFilterMenu";
 import { uuidv4 } from "../../lib/uuid";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Action, workCommandError } from "./shared";

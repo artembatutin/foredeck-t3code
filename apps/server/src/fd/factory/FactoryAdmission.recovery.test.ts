@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProjectId, RunId, ThreadId } from "@t3tools/contracts";
@@ -110,8 +111,7 @@ const fakes = (world: World) =>
       getItem: () => Effect.succeed(item),
     }),
     Layer.mock(ProjectStore.ProjectStoreV2)({
-      get: (id) =>
-        Effect.succeed(Option.some({ projectId: id } as unknown as ProjectStore.ProjectRow)),
+      get: (id) => Effect.succeedSome({ projectId: id } as unknown as ProjectStore.ProjectRow),
     }),
     Layer.mock(ThreadLaunch.ThreadLaunchService)({ checkWorktreeBase: () => Effect.void }),
     Layer.mock(FactoryThreadEffects.FactoryThreadEffects)({
@@ -160,6 +160,7 @@ const withWorld = <A, E, R>(body: (world: World) => Effect.Effect<A, E, R>) => {
     Layer.provideMerge(FactorySettings.layer),
     Layer.provideMerge(Factory.layerPersistence),
     Layer.provideMerge(SqlitePersistence.layerMemory),
+    Layer.provideMerge(NodeCrypto.layer),
     Layer.provideMerge(NodeServices.layer),
   );
   return body(world).pipe(Effect.provide(layer), Effect.scoped);
