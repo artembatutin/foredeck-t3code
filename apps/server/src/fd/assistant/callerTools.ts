@@ -60,6 +60,7 @@ const ALLOWED: ReadonlySet<string> = new Set([
   "preview_wait_for",
   "read_pull_request_guide",
   "request_secret",
+  "send_to_user",
   "t3_attachment_discard",
   "t3_attachment_prepare_upload",
   "t3_background_wait",

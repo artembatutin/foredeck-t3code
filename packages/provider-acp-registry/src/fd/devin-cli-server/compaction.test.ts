@@ -37,6 +37,7 @@ describe("native compaction completion", () => {
           }),
         reportProviderRetry: () => Effect.die("unused"),
         markSessionCompacted: () => Effect.die("unused"),
+        reportForegroundWork: () => Effect.die("unused"),
         finishSubagent: () => Effect.die("unused"),
         applyBackgroundTaskMutation: () => Effect.die("unused"),
         requestUserInput: () => Effect.die("unused"),

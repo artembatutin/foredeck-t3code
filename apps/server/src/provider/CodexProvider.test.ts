@@ -15,6 +15,7 @@ import { buildCodexTurnStartParams } from "../orchestration-v2/Adapters/CodexAda
 import {
   applyPreferredCodexDefaultModel,
   checkCodexProviderStatus,
+  codexCustomEndpoint,
   codexRoutesSpendNativeQuota,
   CODEX_RUNTIME_MODE_POLICIES,
   codexRuntimeModeRestrictions,
@@ -210,6 +211,14 @@ it("reports native quota only for an OpenAI login on a native route", () => {
       name,
     );
   }
+  // The custom endpoint is what a usage-limit hub is matched against.
+  assert.strictEqual(codexCustomEndpoint(hub), "https://hub.example.com");
+  assert.strictEqual(
+    codexCustomEndpoint({ openai_base_url: "http://127.0.0.1:8317/v1" }),
+    "http://127.0.0.1:8317",
+  );
+  assert.strictEqual(codexCustomEndpoint({ openai_base_url: "https://chatgpt.com/x" }), undefined);
+  assert.strictEqual(codexCustomEndpoint({}), undefined);
 });
 
 const statusOf = (

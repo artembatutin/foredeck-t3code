@@ -382,7 +382,8 @@ interface OpenCodeThreadState {
   readonly messageRoles: Map<string, "user" | "assistant">;
   readonly userMessageIds: Array<string>;
   parentSubagent: OpenCodeSubagentContext | null;
-  nextChildTurnOrdinal: number;
+  // null: a child resumed after a restart, whose next ordinal is recovered from OpenCode.
+  nextChildTurnOrdinal: number | null;
   nextAdmissionGeneration: number;
   permission: PermissionRuleset;
   /** Parent rules last written into this child's `permission`; empty for root sessions. */
@@ -1329,6 +1330,22 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           });
         });
 
+        // A child turn's ordinal never exceeds its user message's position in the session, and that
+        // position survives restarts, so it stays above every ordinal allocated before.
+        const storedUserMessagePosition = Effect.fnUntraced(function* (
+          childSessionId: string,
+          messageId: string,
+        ) {
+          const response = yield* sdkCall("session.messages", { sessionID: childSessionId }, () =>
+            client.session.messages({ sessionID: childSessionId }),
+          );
+          const userMessageIds = unwrapData("session.messages", response).flatMap((entry) =>
+            entry.info.role === "user" ? [entry.info.id] : [],
+          );
+          const index = userMessageIds.indexOf(messageId);
+          return (index === -1 ? userMessageIds.length : index) + 1;
+        });
+
         const emitSubagent = Effect.fnUntraced(function* (
           state: OpenCodeThreadState,
           turn: ActiveOpenCodeTurn,
@@ -1437,6 +1454,15 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   permission: childPermission,
                 }),
             );
+            // A Task call with task_id resumes the child, whose earlier turns already hold ordinals.
+            const knownChild = threads.get(childSessionId);
+            const resumedChild = knownChild?.parentSubagent == null ? undefined : knownChild;
+            const nextChildTurnOrdinal =
+              resumedChild === undefined
+                ? recordString(input, "task_id") === childSessionId
+                  ? null
+                  : 1
+                : resumedChild.nextChildTurnOrdinal;
             threads.set(childSessionId, {
               nativeSessionId: childSessionId,
               providerThread: childProviderThread,
@@ -1444,10 +1470,10 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               activeTurn: null,
               providerTurns: new Map(),
               runtimeRequests: new Map(),
-              messageRoles: new Map(),
-              userMessageIds: [],
+              messageRoles: resumedChild?.messageRoles ?? new Map(),
+              userMessageIds: resumedChild?.userMessageIds ?? [],
               parentSubagent: context,
-              nextChildTurnOrdinal: 1,
+              nextChildTurnOrdinal,
               nextAdmissionGeneration: 1,
               permission: childPermission,
               inheritedPermission: openCodePermissionRules(turn.runtimePolicy),
@@ -2244,6 +2270,10 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           message: Extract<OpenCodeMessage, { role: "user" }>,
         ) {
           if (state.appThread === null || state.parentSubagent === null) return null;
+          const ordinal =
+            state.nextChildTurnOrdinal ??
+            (yield* storedUserMessagePosition(state.nativeSessionId, message.id));
+          state.nextChildTurnOrdinal = ordinal + 1;
           const now = yield* DateTime.now;
           const startedAt = dateTimeFromEpoch(message.time.created, now);
           const rootNodeId = idAllocator.derive.nodeFromProviderItem({
@@ -2260,7 +2290,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             nodeId: rootNodeId,
             runAttemptId: null,
             nativeTurnRef: providerRef(message.id, "weak"),
-            ordinal: state.nextChildTurnOrdinal++,
+            ordinal,
             status: "running",
             startedAt,
             completedAt: null,

@@ -24,6 +24,7 @@ import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -140,6 +141,7 @@ it.effect.each([
           ProviderAdapterRegistry.layerFromAdapters(
             scenario === "missing adapter" ? [] : [adapter],
           ),
+          Layer.mock(EventSink.EventSinkV2)({}),
         ),
       ),
     );
@@ -464,6 +466,7 @@ it.effect(
             layerProjection,
             layerSessionManager,
             ProviderAdapterRegistry.layerFromAdapters([]),
+            Layer.mock(EventSink.EventSinkV2)({}),
           ),
         ),
       );

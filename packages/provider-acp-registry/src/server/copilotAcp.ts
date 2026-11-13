@@ -26,6 +26,8 @@ export const copilotClientCapabilitiesMeta = {
       "assistant.message_delta",
       "assistant.reasoning_delta",
       "session.compaction_complete",
+      "assistant.turn_start",
+      "assistant.idle",
     ],
   },
 };
@@ -138,6 +140,15 @@ export function makeCopilotSubagentRouting() {
               return Effect.void;
             }
             return context.markSessionCompacted(event.sessionId);
+          }
+          // Copilot holds session/prompt while an attached async shell runs (github/copilot-cli#5293).
+          case "assistant.turn_start":
+          case "assistant.idle": {
+            if (event.agentId !== undefined || data.aborted === true) return Effect.void;
+            return context.reportForegroundWork({
+              sessionId: event.sessionId,
+              state: event.type === "assistant.idle" ? "idle" : "running",
+            });
           }
           default:
             return reportUsage(event);
