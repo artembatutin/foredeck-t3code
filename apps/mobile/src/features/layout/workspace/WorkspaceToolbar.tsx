@@ -84,10 +84,7 @@ export function WorkspaceToolbar(props: {
     searchRef.current?.focus();
     return true;
   };
-  const cancelSearch = () => {
-    workspace.recordScrollOffset(selectedTab, tab.searchEntryOffset);
-    workspace.dispatch({ type: "cancel", tab: selectedTab });
-  };
+  const cancelSearch = () => workspace.cancelSearch(selectedTab);
   const searchFocused = () =>
     tab.searchMode === "resting"
       ? enterSearch()
@@ -100,6 +97,8 @@ export function WorkspaceToolbar(props: {
   // The sidebar remains visible while its detail owns navigation focus.
   const searchHostVisible = focused || settingsListOnTop || primaryColumn?.presented === true;
   const restoreSearch = () => {
+    // A search cancelled while its screen was covered leaves its text in the native field.
+    if (tab.searchMode === "resting") searchRef.current?.setText("");
     if (
       searchHostVisible &&
       searchVisible &&

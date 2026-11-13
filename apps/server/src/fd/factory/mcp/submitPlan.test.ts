@@ -172,7 +172,7 @@ const scopeOf = (threadId: ThreadId | undefined): McpInvocationContext.McpInvoca
 const submit = (threadId: ThreadId | undefined, plan: unknown) =>
   Effect.gen(function* () {
     const toolkit = yield* FactoryToolkit;
-    return yield* toolkit.handle("factory_submit_plan", { plan }).pipe(
+    return yield* toolkit.handle("factory_submit_plan", { plan } as Schema.Json).pipe(
       Stream.unwrap,
       Stream.runCollect,
       Effect.map((results) => results.at(-1)!),

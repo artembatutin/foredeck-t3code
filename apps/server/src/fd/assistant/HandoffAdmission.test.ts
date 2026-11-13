@@ -72,6 +72,7 @@ const managerShell = (runtimeMode: RuntimeMode, archivedAt: string | null = null
 const projectRow = (overrides: Partial<ProjectRow> = {}): ProjectRow => ({
   projectId: alpha,
   title: "Alpha",
+  hasCustomTitle: false,
   workspaceRoot: "/projects/alpha",
   defaultModelSelection: null,
   defaultThreadEnvMode: null,

@@ -198,6 +198,7 @@ const fakes = (world: World) =>
           Option.some({
             projectId: id,
             title: "Alpha",
+            hasCustomTitle: false,
             workspaceRoot: world.cwd,
             defaultModelSelection: null,
             defaultThreadEnvMode: null,

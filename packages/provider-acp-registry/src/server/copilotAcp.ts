@@ -25,6 +25,7 @@ export const copilotClientCapabilitiesMeta = {
       "subagent.failed",
       "assistant.message_delta",
       "assistant.reasoning_delta",
+      "session.compaction_complete",
     ],
   },
 };
@@ -125,6 +126,18 @@ export function makeCopilotSubagentRouting() {
               status: event.type === "subagent.failed" ? "failed" : "completed",
               result: typeof data.error === "string" ? data.error : null,
             });
+          }
+          // Copilot sends no ACP compaction_update; agentId marks a subagent's own compaction.
+          // Older Copilot builds report a successful compaction without `outcome`.
+          case "session.compaction_complete": {
+            if (
+              event.agentId !== undefined ||
+              data.success !== true ||
+              (data.outcome !== undefined && data.outcome !== "applied")
+            ) {
+              return Effect.void;
+            }
+            return context.markSessionCompacted(event.sessionId);
           }
           default:
             return reportUsage(event);

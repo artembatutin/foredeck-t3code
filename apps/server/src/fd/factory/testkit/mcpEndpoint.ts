@@ -34,6 +34,7 @@ import * as ProjectCloneTracker from "../../../project/ProjectCloneTracker.ts";
 import * as ProjectSetupScriptRunner from "../../../project/ProjectSetupScriptRunner.ts";
 import * as ProviderRegistryMock from "../../../provider/testUtils/providerRegistryMock.ts";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
+import * as PullRequestService from "../../../pullRequest/PullRequestService.ts";
 import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "../../../secrets/SecretRequests.ts";
 import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
@@ -78,6 +79,7 @@ const layerStubs = (driver: ProviderDriverKind) =>
     Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
     Layer.mock(SecretRequests.SecretRequests)({}),
     Layer.mock(PullRequestReviewGuideService.PullRequestReviewGuideService)({}),
+    Layer.mock(PullRequestService.PullRequestService)({}),
     Layer.mock(GitWorkflowService.GitWorkflowService)({}),
     Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({}),
     Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({}),

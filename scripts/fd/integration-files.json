@@ -199,6 +199,7 @@
     "apps/web/src/components/files/FilePreviewPanel.tsx": "Scopes existing file read, edit and media-preview components to a saved repository target without duplicating their renderers.",
     "apps/web/src/components/files/ProjectFilePicker.tsx": "Composes fd repository selection and preserves the selected scope when existing picker results open file tabs.",
     "apps/web/src/components/files/filePreviewMode.ts": "Constructs explicit repository asset resources for the existing preview widgets.",
+    "apps/web/src/components/files/projectFilesQueryState.refresh.test.tsx": "Keeps legacy refresh fixtures explicitly outside a repository-scoped file panel.",
     "apps/web/src/components/files/projectFilesQueryState.test.tsx": "Keeps legacy query-hook fixtures explicitly outside a repository-scoped file panel.",
     "apps/web/src/components/files/projectFilesQueryState.ts": "Preserves repository identity through directory, text-file and picker queries and post-save refresh while retaining existing optimistic file state. Accepts an explicit repository target for configuration reads while retaining ambient preview context and file permission checks.",
     "apps/web/src/components/files/useDirectoryEntries.ts": "Uses the file panel's saved repository authority in bounded directory loading.",

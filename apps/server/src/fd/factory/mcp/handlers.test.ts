@@ -12,6 +12,7 @@ import {
 import { FactoryDeliveryId, type FactoryVerifyReceipt } from "@t3tools/contracts/fd/factory";
 import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -141,7 +142,7 @@ const scopeOf = (threadId: ThreadId | undefined): McpInvocationContext.McpInvoca
 const submit = (threadId: ThreadId | undefined, review: unknown) =>
   Effect.gen(function* () {
     const toolkit = yield* FactoryToolkit;
-    return yield* toolkit.handle("factory_submit_review", { review }).pipe(
+    return yield* toolkit.handle("factory_submit_review", { review } as Schema.Json).pipe(
       Stream.unwrap,
       Stream.runCollect,
       Effect.map((results) => results.at(-1)!),

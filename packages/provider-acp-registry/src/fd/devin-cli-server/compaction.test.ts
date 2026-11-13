@@ -36,6 +36,7 @@ describe("native compaction completion", () => {
             lifecycle.push(notice.status);
           }),
         reportProviderRetry: () => Effect.die("unused"),
+        markSessionCompacted: () => Effect.die("unused"),
         finishSubagent: () => Effect.die("unused"),
         applyBackgroundTaskMutation: () => Effect.die("unused"),
         requestUserInput: () => Effect.die("unused"),

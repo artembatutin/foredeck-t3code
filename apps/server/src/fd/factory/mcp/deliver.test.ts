@@ -93,12 +93,12 @@ const scopeOf = (caller: Caller): McpInvocationContext.McpInvocationScope => ({
   capabilities: new Set(["orchestration" as const]),
 });
 
-interface DeliverParams {
+type DeliverParams = {
   readonly item: string;
   readonly sourceId?: string;
   readonly projectId?: string;
   readonly kind?: "single" | "parent";
-}
+};
 
 /**
  * `factory_deliver` as `caller` calls it, decoded from its parameters like over MCP. The access

@@ -20,6 +20,7 @@ import * as Stream from "effect/Stream";
 
 import * as EventSink from "../../../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import { normalizeThreadPullRequestKey } from "../../../sourceControl/threadPullRequests.ts";
 import { type WorkActor, type WorkDomainError, WorkService } from "../../work-management/index.ts";
 import * as Factory from "../index.ts";
 import {
@@ -254,6 +255,27 @@ export const linkOf = (threadId: ThreadId, number: number, url?: string) =>
 
 let commands = 0;
 const commandId = (kind: string) => CommandId.make(`test-${kind}:${(commands += 1)}`);
+
+/** Marks a watch as already read once, so what the host reports next is news, not a baseline. */
+export const baselinedLinkOf = (threadId: ThreadId, number: number) =>
+  Effect.gen(function* () {
+    const link = yield* linkOf(threadId, number);
+    const { awaitingBaseline: _baseline, ...watch } =
+      link.watch ?? assert.fail(`Pull request #${number} is not watched.`);
+    yield* Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+      orchestrator.dispatch({
+        type: "thread.pull-request-watch.sync",
+        commandId: commandId("baselined-watch"),
+        threadId,
+        host: normalizeThreadPullRequestKey(link).host,
+        repository: link.repository,
+        number: link.number,
+        startedAt: watch.startedAt,
+        watch,
+      }),
+    ).pipe(Effect.orDie);
+    return yield* linkOf(threadId, number);
+  });
 
 /** Links a pull request to the thread, as the owner would. */
 export const linkPullRequest = (

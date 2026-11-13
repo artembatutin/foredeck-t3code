@@ -492,7 +492,7 @@ export const make = Effect.gen(function* () {
         },
         input.repositories,
       );
-      if (workspaceRoot !== previousRoot) {
+      if (workspaceRoot !== previousRoot || input.faviconPath !== undefined) {
         yield* projectEnrichment.invalidate([previousRoot, workspaceRoot]);
       }
       return yield* readCommitted(input.projectId);

@@ -86,6 +86,7 @@ import {
 } from "./testkit/deliveryHarness.ts";
 import {
   awaitedRun,
+  baselinedLinkOf,
   linkOf,
   linkPullRequest,
   openParent,
@@ -936,7 +937,7 @@ describe("core's producers consulting Factory's gate on the real stack", () => {
       (world) =>
         Effect.gen(function* () {
           const opened = yield* openSingle(world);
-          const link = yield* linkOf(opened.threadId, fakePullRequest.number);
+          const link = yield* baselinedLinkOf(opened.threadId, fakePullRequest.number);
           const before = (yield* threadProjection(opened.threadId).pipe(Effect.orDie)).runs.length;
           const at = DateTime.formatIso(yield* DateTime.now);
           const reactor = yield* PullRequestWatchReactor.make.pipe(
@@ -1684,7 +1685,7 @@ describe("Factory's gate when the host's policy refuses a thread's mode", () => 
         (world) =>
           Effect.gen(function* () {
             const opened = yield* openSingle(world);
-            const link = yield* linkOf(opened.threadId, fakePullRequest.number);
+            const link = yield* baselinedLinkOf(opened.threadId, fakePullRequest.number);
             const before = (yield* threadProjection(opened.threadId).pipe(Effect.orDie)).runs
               .length;
             const started = world.provider.started.length;
