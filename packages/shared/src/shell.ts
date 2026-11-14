@@ -194,7 +194,7 @@ export function mergePathEntries(
   for (const pathValue of [preferredPath, inheritedPath]) {
     if (!pathValue) continue;
     for (const entry of pathValue.split(delimiter)) {
-      const trimmedEntry = entry.trim();
+      const trimmedEntry = trimPathEntry(entry, platform);
       if (!trimmedEntry || seen.has(trimmedEntry)) {
         continue;
       }
@@ -449,12 +449,16 @@ function stripWrappingQuotes(value: string): string {
   return value.replace(/^"+|"+$/g, "");
 }
 
+function trimPathEntry(entry: string, platform: NodeJS.Platform): string {
+  return platform === "win32" ? entry.trim() : entry;
+}
+
 function pathDelimiterForPlatform(platform: NodeJS.Platform): string {
   return platform === "win32" ? WINDOWS_PATH_DELIMITER : POSIX_PATH_DELIMITER;
 }
 
 function normalizePathEntryForComparison(entry: string, platform: NodeJS.Platform): string {
-  const normalized = stripWrappingQuotes(entry.trim());
+  const normalized = stripWrappingQuotes(trimPathEntry(entry, platform));
   return platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
@@ -475,7 +479,7 @@ export function mergePathValues(
     if (!rawValue) continue;
 
     for (const entry of rawValue.split(delimiter)) {
-      const sanitized = sanitizePathEntry(entry.trim(), platform);
+      const sanitized = sanitizePathEntry(trimPathEntry(entry, platform), platform);
       if (sanitized.length === 0) continue;
 
       const normalized = normalizePathEntryForComparison(sanitized, platform);
@@ -531,7 +535,7 @@ function commandSearchDirectories(
   for (const entry of resolvePathEnvironmentVariable(env).split(
     pathDelimiterForPlatform(platform),
   )) {
-    const directory = stripWrappingQuotes(entry.trim());
+    const directory = stripWrappingQuotes(trimPathEntry(entry, platform));
     if (directory.length === 0 && (cwd === undefined || platform === "win32")) continue;
     directories.add(cwd === undefined ? directory : path.resolve(cwd, directory));
   }

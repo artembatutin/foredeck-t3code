@@ -66,6 +66,7 @@ import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.t
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts";
+import * as DocumentText from "../provider/DocumentText.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
@@ -545,6 +546,7 @@ const layerProductionTest = (gate: (typeof AutomaticTurnGate.AutomaticTurnGate)[
         Layer.mock(AnalyticsService.AnalyticsService)({}),
         Layer.mock(CloudManagedEndpointRuntime.CloudManagedEndpointRuntime)({}),
         Layer.mock(DeviceService.DeviceService)({}),
+        Layer.mock(DocumentText.DocumentText)({}),
         Layer.mock(PreviewManager.PreviewManager)({}),
         Layer.mock(SecretResolver.SecretResolver)({}),
         Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({}),

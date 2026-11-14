@@ -60,6 +60,7 @@ import type { ChildProcess } from "effect/process";
 import { explicitBare } from "./gitCommand.ts";
 
 import * as ServerSecretStore from "../../../auth/ServerSecretStore.ts";
+import * as CheckpointStore from "../../../checkpointing/CheckpointStore.ts";
 import * as ServerConfig from "../../../config.ts";
 import * as GitManager from "../../../git/GitManager.ts";
 import * as GitWorkflow from "../../../git/GitWorkflowService.ts";
@@ -916,6 +917,10 @@ const threadLaunch = (setupScripts: World["setupScripts"]) =>
           namedProjectsRoot: "/nowhere",
           folderForThread: () => Effect.succeedNone,
           isScratchProject: () => Effect.succeed(false),
+        }),
+        // Every project here is a Git repository.
+        Layer.mock(CheckpointStore.CheckpointStore)({
+          isGitRepository: () => Effect.succeed(true),
         }),
         gitWorkflow,
         hookedSetupScripts(setupScripts),
