@@ -2401,6 +2401,7 @@ export const make = Effect.gen(function* () {
     threadId: ThreadId | undefined,
     emit: GitActionProgressEmitter,
     overrides: Pick<GitRunStackedActionInput, "prTitle" | "prBody">,
+    pushRemoteRef?: { readonly remoteName: string; readonly upstreamRef: string },
   ) {
     const provider = yield* sourceControlProvider(cwd);
     const terms = sourceControlDefinitions.get(provider.kind).changeRequest;
@@ -2421,10 +2422,12 @@ export const make = Effect.gen(function* () {
       });
     }
 
-    const headContext = yield* resolveBranchHeadContext(cwd, {
-      branch,
-      upstreamRef: details.upstreamRef,
-    });
+    // A configured push remote receives the commits while the branch keeps
+    // tracking its upstream, so the PR head is the push remote's branch.
+    const headContext = yield* resolveBranchHeadContext(
+      cwd,
+      pushRemoteRef ? { branch, ...pushRemoteRef } : { branch, upstreamRef: details.upstreamRef },
+    );
 
     const existing = yield* findOpenPr(cwd, headContext);
     if (existing) {
@@ -2507,6 +2510,16 @@ export const make = Effect.gen(function* () {
         cwd,
         baseRefName: baseBranch,
         headSelector: headContext.preferredHeadSelector,
+        ...(provider.kind === "gitlab" &&
+        headContext.isCrossRepository &&
+        headContext.headRepositoryNameWithOwner
+          ? {
+              source: {
+                repository: headContext.headRepositoryNameWithOwner,
+                refName: headContext.headBranch,
+              },
+            }
+          : {}),
         title,
         bodyFile,
       })
@@ -3449,6 +3462,18 @@ export const make = Effect.gen(function* () {
         const wantsCommit = isCommitAction(input.action);
         const { expectedHeadSha } = input;
         const expectedPushTarget = options?.expectedPushTarget;
+        const upToDateBranch =
+          input.action === "create_pr" &&
+          initialStatus.hasUpstream &&
+          initialStatus.aheadCount === 0
+            ? initialStatus.branch
+            : null;
+        // A current upstream says nothing about a separate push remote, which may lack HEAD.
+        const pushTarget = upToDateBranch
+          ? yield* gitCore
+              .resolvePushTarget(input.cwd, { branch: upToDateBranch, hasUpstream: true })
+              .pipe(Effect.orElseSucceed(() => null))
+          : null;
         // With an expected commit the branch is always pushed, by that commit's id: the push is a
         // no-op when the remote already holds it and is refused when it would rewind the remote,
         // so the pull request never holds anything else.
@@ -3460,7 +3485,8 @@ export const make = Effect.gen(function* () {
             (expectedHeadSha !== undefined ||
               expectedPushTarget !== undefined ||
               !initialStatus.hasUpstream ||
-              initialStatus.aheadCount > 0));
+              initialStatus.aheadCount > 0 ||
+              pushTarget?.viaPushRemote === true));
         const wantsPr = input.action === "create_pr" || input.action === "commit_push_pr";
 
         if (input.featureBranch && !wantsCommit) {
@@ -3644,6 +3670,9 @@ export const make = Effect.gen(function* () {
                     input.threadId,
                     progress.emit,
                     input,
+                    "pushRemote" in push && push.pushRemote && push.upstreamBranch
+                      ? { remoteName: push.pushRemote, upstreamRef: push.upstreamBranch }
+                      : undefined,
                   ),
                 ),
               )

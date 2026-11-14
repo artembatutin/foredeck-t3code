@@ -148,9 +148,8 @@ export function useReviewDiffData(input: {
     environmentId,
     cwd,
     repositoryTarget,
-    source?.kind,
+    lazySource?.kind,
     source?.baseRef,
-    source?.diffHash,
   ]);
   const [requested, setRequested] = useState({ scope, indices: [0, 1, 2] });
   const indices = useMemo(

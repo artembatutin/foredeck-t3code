@@ -33,6 +33,7 @@ import { DocumentText } from "../../provider/DocumentText.ts";
 import { ProviderRegistry } from "../../provider/ProviderRegistry.ts";
 import { PullRequestReviewGuideService } from "../../pullRequest/PullRequestReviewGuideService.ts";
 import { PullRequestService } from "../../pullRequest/PullRequestService.ts";
+import { EnvironmentThemeService } from "../../environmentTheme.ts";
 import { ScheduledTaskService } from "../../scheduledTasks/ScheduledTaskService.ts";
 import { SecretRequests } from "../../secrets/SecretRequests.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -72,6 +73,7 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(ProviderRegistry)({}),
   Layer.mock(PullRequestReviewGuideService)({}),
   Layer.mock(PullRequestService)({}),
+  Layer.mock(EnvironmentThemeService)({}),
   Layer.mock(RemoteDelegation)({}),
   Layer.mock(ScheduledTaskService)({}),
   Layer.mock(SecretRequests)({}),

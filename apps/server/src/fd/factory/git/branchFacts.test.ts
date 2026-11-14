@@ -843,14 +843,15 @@ it.layer(layer)("readOutgoingCommits", (it) => {
       lands: "other",
     },
     {
-      name: "a branch tracking its own name, over pushDefault",
+      // Git pushes a tracked branch to its push remote too.
+      name: "a branch tracking its own name, by pushDefault",
       arrange: (cwd) =>
         git(cwd, ["push", "origin", `HEAD~1:refs/heads/${branch}`]).pipe(
           Effect.andThen(git(cwd, ["fetch", "origin"])),
           Effect.andThen(git(cwd, ["branch", "--set-upstream-to", `origin/${branch}`])),
           Effect.andThen(git(cwd, ["config", "remote.pushDefault", "other"])),
         ),
-      lands: "origin",
+      lands: "other",
     },
     {
       name: "a branch cut from another ref, by pushDefault",
@@ -872,13 +873,12 @@ it.layer(layer)("readOutgoingCommits", (it) => {
       lands: "origin",
     },
     {
-      // Git's name for a head of a remote whose own name holds a slash, over pushDefault.
+      // Git's name for a head of a remote whose own name holds a slash.
       name: "a branch aliasing its upstream's head",
       arrange: (cwd) =>
         git(cwd, ["push", "my-org/feature", "HEAD~1:refs/heads/item-7"]).pipe(
           Effect.andThen(git(cwd, ["fetch", "my-org/feature"])),
           Effect.andThen(git(cwd, ["branch", "--set-upstream-to", "my-org/feature/item-7"])),
-          Effect.andThen(git(cwd, ["config", "remote.pushDefault", "other"])),
         ),
       lands: "my-org/feature",
       onto: "item-7",

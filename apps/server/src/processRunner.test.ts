@@ -3,6 +3,8 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Cause from "effect/Cause";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
@@ -144,6 +146,29 @@ describe("runProcess", () => {
       expect(error).toMatchObject({ command: "jj", argumentCount: 1, cwd: "/repo" });
       expect(error.cause).toBe(defect);
     }),
+  );
+
+  it.effect("reports child startup before delivering cancellation during acquisition", () =>
+    Effect.gen(function* () {
+      let started = false;
+      const spawner = makeSpawner(() =>
+        Effect.withFiber((fiber) =>
+          Effect.sync(() => {
+            fiber.interruptUnsafe();
+            return makeHandle({});
+          }),
+        ),
+      );
+      const result = yield* runWith(spawner)({
+        command: "git",
+        args: ["restore"],
+        onSpawn: () => {
+          started = true;
+        },
+      }).pipe(Effect.exit);
+      expect(Exit.isFailure(result) && Cause.hasInterruptsOnly(result.cause)).toBe(true);
+      expect(started).toBe(true);
+    }).pipe(Effect.scoped),
   );
 
   it.effect("fails when output exceeds max buffer in default mode", () =>

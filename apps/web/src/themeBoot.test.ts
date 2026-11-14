@@ -4,10 +4,12 @@ import indexHtml from "../index.html?raw";
 import { FOREDECK_THEME, FOREDECK_THEME_ID, themeFollowsSystemByDefault } from "./fd/appearance";
 import {
   CUSTOM_THEMES_STORAGE_KEY,
+  ENVIRONMENT_THEMES_STORAGE_KEY,
   getDefaultThemeColors,
   getThemeColorsForMode,
   invalidateCustomThemes,
   isKnownThemePreference,
+  publishedThemeDefinitions,
   resolveThemeAppearance,
   T3_CHAT_THEME,
   EMBER_THEME,
@@ -297,6 +299,30 @@ describe("index.html boot script", () => {
     expect(boot.themeId).toBe(custom.id);
     expect(boot.bootVariables["--boot-background"]).toBe(custom.colors.canvas);
     expect(boot.bootVariables["--boot-accent"]).toBe(custom.colors.accent);
+  });
+
+  it("paints a published theme from its stored copy before the server connects", () => {
+    const [published] = publishedThemeDefinitions([
+      {
+        id: "nightfall",
+        name: "Nightfall",
+        appearance: "dark",
+        canvas: "#1a1b26",
+        accent: "#7aa2f7",
+      },
+    ]);
+    if (!published) throw new Error("expected the published theme");
+    const boot = runBootScript({
+      storage: {
+        [THEME_STORAGE_KEY]: "nightfall",
+        [ENVIRONMENT_THEMES_STORAGE_KEY]: JSON.stringify([published]),
+      },
+      prefersDark: true,
+    });
+
+    expect(boot.themeId).toBe("nightfall");
+    expect(boot.bootVariables["--boot-background"]).toBe(published.colors.canvas);
+    expect(boot.backgroundColor).toBe(published.colors.chrome);
   });
 
   it("keeps every built-in boot splash in sync with the real palettes", () => {

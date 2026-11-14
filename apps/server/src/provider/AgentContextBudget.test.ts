@@ -44,6 +44,7 @@ import { GitVcsDriver } from "../vcs/GitVcsDriver.ts";
 import { VcsStatusBroadcaster } from "../vcs/VcsStatusBroadcaster.ts";
 import { buildCodexAdditionalContext } from "./CodexDeveloperInstructions.ts";
 import { DocumentText } from "./DocumentText.ts";
+import { EnvironmentThemeService } from "../environmentTheme.ts";
 import { ProviderRegistry } from "./ProviderRegistry.ts";
 import * as Assistant from "../fd/assistant/index.ts";
 import * as Factory from "../fd/factory/index.ts";
@@ -61,6 +62,7 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(AssetSigner)({}),
   Layer.mock(DeviceService)({}),
   Layer.mock(DocumentText)({}),
+  Layer.mock(EnvironmentThemeService)({}),
   Layer.mock(GitVcsDriver)({}),
   Layer.mock(GitWorkflowService)({}),
   Layer.mock(ManagedProjectFolders)({ namedProjectsRoot: "" }),

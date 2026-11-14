@@ -75,6 +75,8 @@ const ALLOWED: ReadonlySet<string> = new Set([
   "t3_project_list",
   "t3_project_read",
   "t3_project_update",
+  "t3_theme_read",
+  "t3_theme_set",
   "t3_thread_configure",
   "t3_thread_interrupt",
   "t3_thread_list",
