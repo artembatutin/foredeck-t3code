@@ -1,5 +1,6 @@
 import { NATIVE_WORKSPACE_COLUMNS_SUPPORTED } from "../native/NativeWorkspaceColumns";
 import Constants from "expo-constants";
+import { useGT } from "gt-react-native";
 import { useState } from "react";
 import { Platform, View } from "react-native";
 
@@ -25,6 +26,7 @@ export function CompactBrandTitle(
     readonly fit?: boolean;
   } = {},
 ) {
+  const gt = useGT();
   const stageLabel = resolveMobileStageLabel(Constants.expoConfig?.extra?.appVariant);
   const titleOffset = brandTitleOffset();
   const { scale } = useAndroidControlSizing();
@@ -40,7 +42,9 @@ export function CompactBrandTitle(
         props.fit && showStage ? (event) => setFullWidth(event.nativeEvent.layout.width) : undefined
       }
       aria-level={1}
-      accessibilityLabel={props.accessibilityLabel ?? "foredeck-t3, Threads"}
+      accessibilityLabel={
+        props.accessibilityLabel ?? gt("{product}, Threads", { product: FOREDECK_PRODUCT_NAME })
+      }
       accessible
       role="heading"
       className="flex-row items-center gap-1.5"

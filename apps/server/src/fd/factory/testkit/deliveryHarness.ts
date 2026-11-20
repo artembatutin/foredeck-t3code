@@ -753,6 +753,8 @@ const gitWorkflow = GitWorkflow.layer.pipe(
           noTextGeneration,
           noSetupScript,
           ProviderRegistryMock.layer(),
+          // Only draft pull request actions reach it, which worktree creation never takes.
+          Layer.mock(PullRequestService.PullRequestService)({}),
           Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
             resolveLink: () => undefined,
             // No host provider: the worktree records no branch base with one.

@@ -90,14 +90,19 @@ const destination = (config: ServerConfig, scopes: ReadonlyArray<typeof AuthSett
         registry.get(factory.discoverCommands.permissionAtom(env)),
         registry.get(factory.validateCommand.permissionAtom(env)),
       ],
-      runAll: Effect.promise(() =>
-        Promise.all([
-          factory.discoverCommands.run(registry, { environmentId: env, input: { projectId } }),
-          factory.validateCommand.run(registry, {
-            environmentId: env,
-            input: { projectId, command },
-          }),
-        ]),
+      runAll: Effect.all(
+        [
+          Effect.exit(
+            factory.discoverCommands.run(registry, { environmentId: env, input: { projectId } }),
+          ),
+          Effect.exit(
+            factory.validateCommand.run(registry, {
+              environmentId: env,
+              input: { projectId, command },
+            }),
+          ),
+        ],
+        { concurrency: "unbounded" },
       ),
     };
   });

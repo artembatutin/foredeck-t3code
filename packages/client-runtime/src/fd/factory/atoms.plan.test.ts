@@ -11,6 +11,8 @@ import { WorkItemId, WorkSourceId } from "@t3tools/contracts/fd/work-management"
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -22,7 +24,6 @@ import { EnvironmentRegistry } from "../../connection/registry.ts";
 import { EnvironmentSupervisor } from "../../connection/supervisor.ts";
 import { EnvironmentRpcUnavailableError } from "../../rpc/client.ts";
 import type { RpcSession } from "../../rpc/session.ts";
-import type { AtomCommandResult } from "../../state/runtime.ts";
 import { createFactoryEnvironmentAtoms } from "./index.ts";
 
 // The destination's grants, read by every command's permission check.
@@ -141,7 +142,7 @@ const makeDestination = Effect.fn("TestFactoryPlanCommands.make")(function* () {
       readonly run: (
         registry: AtomRegistry.AtomRegistry,
         target: { readonly environmentId: EnvironmentId; readonly input: I },
-      ) => Promise<AtomCommandResult<A, E>>;
+      ) => Effect.Effect<A, E>;
     }) =>
     (input: I) =>
     () =>
@@ -154,7 +155,7 @@ const makeDestination = Effect.fn("TestFactoryPlanCommands.make")(function* () {
     replan: run(factory.replan)({ deliveryId, note: "Split the export." }),
   };
   /** What a command came to: sent, denied its grant, or refused unsent as unsupported. */
-  const outcome = (result: AtomCommandResult<unknown, unknown>) => {
+  const outcome = (result: Exit.Exit<unknown, unknown>) => {
     if (result._tag === "Success") return "sent";
     const failure = Cause.squash(result.cause);
     if (isAuthorization(failure)) return "denied";
@@ -169,8 +170,11 @@ const makeDestination = Effect.fn("TestFactoryPlanCommands.make")(function* () {
     commands,
     singleStart: run(factory.start)({ itemRef }),
     outcome,
-    runAll: (selected: ReadonlyArray<() => Promise<AtomCommandResult<unknown, unknown>>>) =>
-      Effect.forEach(selected, (command) => Effect.promise(command).pipe(Effect.map(outcome))),
+    runAll: <E>(selected: ReadonlyArray<() => Effect.Effect<unknown, E>>) =>
+      Effect.forEach(selected, (command) => Effect.exit(command()).pipe(Effect.map(outcome))),
+    /** Starts a command now, as a client would, without waiting for its turn in the lane. */
+    start: <E>(command: () => Effect.Effect<unknown, E>) =>
+      Effect.forkChild(Effect.exit(command()), { startImmediately: true }),
     /** Whether each plan command and the planning view are offered now. */
     offered: () => [
       registry.get(factory.planning(env)),
@@ -271,14 +275,17 @@ describe("Factory planning commands", () => {
 
         // Plan actions queued behind an edit of the same delivery, then planning withdrawn.
         const editing = yield* destination.hold(WS_METHODS.factoryPlanUpdate);
-        const edited = commands.updatePlan();
+        const edited = yield* destination.start(commands.updatePlan);
         yield* Deferred.await(editing.entered);
-        const queued = [commands.approvePlan(), commands.rejectPlan(), commands.replan()];
+        const queued = yield* Effect.forEach(
+          [commands.approvePlan, commands.rejectPlan, commands.replan],
+          destination.start,
+        );
         destination.view(BEFORE_PLANNING);
         expect(destination.offered()).toEqual([false, false, false, false, false]);
         yield* Deferred.succeed(editing.release, undefined);
-        expect(destination.outcome(yield* Effect.promise(() => edited))).toBe("sent");
-        const outcomes = yield* Effect.promise(() => Promise.all(queued));
+        expect(destination.outcome(yield* Fiber.join(edited))).toBe("sent");
+        const outcomes = yield* Fiber.joinAll(queued);
         expect(outcomes.map(destination.outcome)).toEqual(Array(3).fill("unsupported"));
         expect(destination.sent.map(([method]) => method)).toEqual([WS_METHODS.factoryPlanUpdate]);
 
@@ -287,13 +294,13 @@ describe("Factory planning commands", () => {
         destination.sent.length = 0;
         destination.view(PLANNING);
         const starting = yield* destination.hold(WS_METHODS.factoryDeliveriesStart);
-        const single = destination.singleStart();
+        const single = yield* destination.start(destination.singleStart);
         yield* Deferred.await(starting.entered);
-        const parent = commands.parentStart();
+        const parent = yield* destination.start(commands.parentStart);
         yield* destination.reconnect(BEFORE_PLANNING);
         yield* Deferred.succeed(starting.release, undefined);
-        expect(destination.outcome(yield* Effect.promise(() => single))).toBe("sent");
-        expect(destination.outcome(yield* Effect.promise(() => parent))).toBe("unsupported");
+        expect(destination.outcome(yield* Fiber.join(single))).toBe("sent");
+        expect(destination.outcome(yield* Fiber.join(parent))).toBe("unsupported");
         expect(destination.sent).toEqual([[WS_METHODS.factoryDeliveriesStart, { itemRef }]]);
       }),
     ),

@@ -2,6 +2,7 @@ import { useAtomValue } from "@effect/atom-react";
 import { repositoryHistoryGroups } from "@t3tools/client-runtime/fd/multirepo";
 import { resolveFilesystemReadAccess } from "@t3tools/client-runtime/state/filesystem";
 import { Atom } from "effect/reactivity";
+import { msg, useMessages } from "gt-react-native";
 
 import { deriveThreadCheckpointSummaries } from "@t3tools/client-runtime/state/thread-checkpoints";
 import type { EnvironmentId, ReviewDiffPreviewSource, ThreadId } from "@t3tools/contracts";
@@ -40,17 +41,21 @@ export function useReviewSections(input: {
   readonly reviewCache: ReviewCacheForThread;
 }) {
   const { environmentId, reviewCache, threadId } = input;
+  const messages = useMessages();
   const enabled = input.enabled ?? true;
   const fileAccessSession = useEnvironmentQuery(
     environmentId === undefined ? null : environmentSession.sessionStateAtom(environmentId),
   );
   const fileEnvironment = useEnvironmentPresentation(environmentId ?? null);
-  const fileAccess = resolveFilesystemReadAccess({
-    isCatalogReady: fileEnvironment.isReady,
-    connection: fileEnvironment.presentation?.connection ?? null,
-    session: fileAccessSession.data,
-    sessionError: fileAccessSession.error,
-  });
+  const fileAccess = resolveFilesystemReadAccess(
+    {
+      isCatalogReady: fileEnvironment.isReady,
+      connection: fileEnvironment.presentation?.connection ?? null,
+      session: fileAccessSession.data,
+      sessionError: fileAccessSession.error,
+    },
+    messages,
+  );
   const { canReadFiles } = fileAccess;
   const selectedThread = useSelectedThreadProjection();
   const { selectedThreadCwd, repositoryTarget, repositoryWorkspace } = useSelectedThreadWorktree();
@@ -99,14 +104,15 @@ export function useReviewSections(input: {
         canReadFiles || fileAccess.isPending ? (diffPreview.data?.sources ?? lastGitSections) : [],
       turnDiffById: reviewTurnDiffsBySectionId(readyCheckpoints, lastTurnDiffs),
       loadingGitSections: fileAccess.isPending || diffPreview.isPending,
+      resolve: messages,
     }),
   ];
   if (history) {
     cachedSections.unshift({
       id: "thread",
       kind: "thread",
-      title: "Conversation",
-      subtitle: "Recorded conversation snapshots",
+      title: messages(msg("Conversation")),
+      subtitle: messages(msg("Recorded conversation snapshots")),
       diff: null,
       isLoading: false,
     });
@@ -120,8 +126,8 @@ export function useReviewSections(input: {
       cachedSections.unshift({
         id: requested,
         kind: "turn",
-        title: `Turn ${requested.slice(5)}`,
-        subtitle: "Snapshot unavailable",
+        title: messages(msg("Turn {count}", { count: Number(requested.slice(5)) })),
+        subtitle: messages(msg("Snapshot unavailable")),
         diff: null,
         isLoading: false,
       });
@@ -218,7 +224,7 @@ export function useReviewSections(input: {
     error:
       (isHistorySelection ? activeTurnDiff.error : diffPreview.error) ??
       (selectedSection === null && !fileAccess.isPending && !canReadFiles
-        ? (fileAccess.error ?? "This connection cannot read local diffs.")
+        ? (fileAccess.error ?? messages(msg("This connection cannot read local diffs.")))
         : null),
     isSelectedSectionPending: isHistorySelection ? activeTurnDiff.isPending : diffPreview.isPending,
     reviewSections,

@@ -1,7 +1,7 @@
 import { OrchestratorMcpFailure, ProjectId, TrimmedNonEmptyString } from "@t3tools/contracts";
 import { FactoryMcpFailure, FactoryPlan, FactoryReview } from "@t3tools/contracts/fd/factory";
 import * as Schema from "effect/Schema";
-import { Tool, Toolkit } from "effect/ai";
+import { McpSchema, Tool, Toolkit } from "effect/ai";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
@@ -77,7 +77,7 @@ export const FactoryToolkit = Toolkit.make(
       McpInvocationContext.McpInvocationContext,
       ThreadManagement.ThreadManagementService,
     ],
-  }),
+  }).annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients),
   Tool.make("factory_submit_plan", {
     description:
       "Submit your Factory plan for the Work item. Only the planner thread of an active Factory plan may call it, once per round. An invalid plan comes back with the problems to correct; a second invalid one blocks the delivery. An empty task list ends planning with your note.",
@@ -90,7 +90,7 @@ export const FactoryToolkit = Toolkit.make(
       McpInvocationContext.McpInvocationContext,
       ThreadManagement.ThreadManagementService,
     ],
-  }),
+  }).annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients),
   Tool.make("factory_status", {
     description:
       "Read where Factory deliveries stand: pass delivery for one delivery, or item for every delivery of that Work item, newest first. Each shows its status, stage, rounds, what it has left of its allowance, its pull request, branch, threads by role, verify receipt and review summaries, and, when blocked, what needs the owner. Pass exactly one of delivery and item.",

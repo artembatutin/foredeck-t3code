@@ -37,6 +37,7 @@ export type FactoryServiceError =
   | FactoryBranchUnavailableError
   | FactoryStoreError
   | ThreadLaunch.ThreadLaunchBaseRefError
+  | ThreadLaunch.ThreadLaunchBranchExistsError
   | ThreadLaunch.ThreadLaunchBranchConflictError
   | ThreadLaunch.ThreadLaunchNotRepositoryError
   | ProjectStore.ProjectStoreV2Error
@@ -147,6 +148,12 @@ export const toFactoryError = (error: FactoryServiceError): FactoryError => {
       return new FactoryError({
         reason: "refused",
         message: "The project's checkout has no commit to start the delivery's worktree from.",
+      });
+    // Factory picks a free branch name first, so this is a branch created since; a retry picks anew.
+    case "ThreadLaunchBranchExistsError":
+      return new FactoryError({
+        reason: "refused",
+        message: "The delivery's branch was created by something else meanwhile. Try again.",
       });
     case "ThreadLaunchBranchConflictError":
       return new FactoryError({

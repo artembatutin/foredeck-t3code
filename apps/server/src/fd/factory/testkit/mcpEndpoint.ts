@@ -16,12 +16,15 @@ import { HttpBody, HttpClient, HttpRouter } from "effect/http";
 import * as AssetSigner from "../../../assets/AssetSigner.ts";
 import * as DeviceService from "../../../device/DeviceService.ts";
 import * as ServerEnvironment from "../../../environment/ServerEnvironment.ts";
+import * as GitManager from "../../../git/GitManager.ts";
 import * as GitWorkflowService from "../../../git/GitWorkflowService.ts";
+import * as IssueService from "../../../issue/IssueService.ts";
 import * as McpCallerPolicy from "../../../mcp/McpCallerPolicy.ts";
 import * as McpHttpServer from "../../../mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "../../../mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "../../../mcp/PreviewAutomationBroker.ts";
 import * as ProviderAdapterRegistry from "../../../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ThreadIssueService from "../../../orchestration-v2/ThreadIssueService.ts";
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as PeerLinkRequests from "../../../peer/PeerLinkRequests.ts";
@@ -80,9 +83,15 @@ const layerStubs = (driver: ProviderDriverKind) =>
     Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
     Layer.mock(SecretRequests.SecretRequests)({}),
     Layer.mock(PullRequestReviewGuideService.PullRequestReviewGuideService)({}),
-    Layer.mock(PullRequestService.PullRequestService)({}),
+    // No forge: the pull request tools stay hidden from these callers.
+    Layer.mock(PullRequestService.PullRequestService)({
+      servesProject: () => Effect.succeed(false),
+    }),
     Layer.mock(EnvironmentTheme.EnvironmentThemeService)({}),
     Layer.mock(GitWorkflowService.GitWorkflowService)({}),
+    Layer.mock(GitManager.GitManager)({}),
+    Layer.mock(IssueService.IssueService)({}),
+    Layer.mock(ThreadIssueService.ThreadIssueService)({}),
     Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({}),
     Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({}),
     Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/unused" }),

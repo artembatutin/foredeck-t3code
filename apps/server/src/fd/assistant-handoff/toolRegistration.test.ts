@@ -39,6 +39,9 @@ import { SecretRequests } from "../../secrets/SecretRequests.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { SourceControlRepositoryService } from "../../sourceControl/SourceControlRepositoryService.ts";
 import { GitVcsDriver } from "../../vcs/GitVcsDriver.ts";
+import { GitManager } from "../../git/GitManager.ts";
+import { IssueService } from "../../issue/IssueService.ts";
+import { ThreadIssueService } from "../../orchestration-v2/ThreadIssueService.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { ProjectAssistant, WorkCapture } from "../assistant/index.ts";
 import { FactoryService } from "../factory/index.ts";
@@ -55,6 +58,7 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(AssetSigner)({}),
   Layer.mock(DeviceService)({}),
   Layer.mock(DocumentText)({}),
+  Layer.mock(GitManager)({}),
   Layer.mock(GitVcsDriver)({}),
   Layer.mock(GitWorkflowService)({}),
   Layer.mock(ManagedProjectFolders)({ namedProjectsRoot: "" }),
@@ -75,6 +79,7 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(PullRequestService)({}),
   Layer.mock(EnvironmentThemeService)({}),
   Layer.mock(RemoteDelegation)({}),
+  Layer.mock(IssueService)({}),
   Layer.mock(ScheduledTaskService)({}),
   Layer.mock(SecretRequests)({}),
   ServerConfig.layerTest(process.cwd(), { prefix: "t3-fd-tool-registration-" }),
@@ -82,6 +87,7 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(ServerSecretStore)({}),
   Layer.mock(ServerSettingsService)({}),
   Layer.mock(SourceControlRepositoryService)({}),
+  Layer.mock(ThreadIssueService)({}),
   Layer.mock(ThreadLaunchService)({}),
   Layer.mock(ThreadManagementService)({}),
   Layer.mock(ThreadSearch)({}),

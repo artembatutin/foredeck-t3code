@@ -25,6 +25,7 @@ import * as ProjectStore from "../../../orchestration-v2/ProjectStore.ts";
 import * as SqlitePersistence from "../../../persistence/Sqlite.ts";
 import * as ProjectSetupScriptRunner from "../../../project/ProjectSetupScriptRunner.ts";
 import * as ProviderRegistryMock from "../../../provider/testUtils/providerRegistryMock.ts";
+import * as PullRequestService from "../../../pullRequest/PullRequestService.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import * as SourceControlProviderRegistry from "../../../sourceControl/SourceControlProviderRegistry.ts";
 import * as TextGeneration from "../../../textGeneration/TextGeneration.ts";
@@ -146,6 +147,7 @@ const setup = Effect.gen(function* () {
       Layer.mergeAll(
         Layer.mock(TextGeneration.TextGeneration)({}),
         ProviderRegistryMock.layer(),
+        Layer.mock(PullRequestService.PullRequestService)({}),
         Layer.succeed(ProjectSetupScriptRunner.ProjectSetupScriptRunner, {
           runForThread: () => Effect.succeed({ status: "no-script" as const }),
         }),

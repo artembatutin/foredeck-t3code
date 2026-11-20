@@ -10,7 +10,7 @@ import { isAssistantThread } from "@t3tools/shared/fd/assistant";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { Tool, Toolkit } from "effect/ai";
+import { McpSchema, Tool, Toolkit } from "effect/ai";
 import * as McpToolAccess from "../../mcp/McpToolAccess.ts";
 import * as McpInvocationContext from "../../mcp/McpInvocationContext.ts";
 import { readCaller } from "../../mcp/threadAccess.ts";
@@ -43,7 +43,7 @@ export const AssistantToolkit = Toolkit.make(
     description:
       "Save a separately composed owner-facing spoken answer for this turn. Use one or two natural sentences unless the owner asks for more. Lead with the outcome or focused question. No tool narration, progress, markup or technical logs. Call once when ready to give your final answer; the client plays it only after this run completes and only when voice is enabled.",
     parameters: Schema.Struct({ text: TrimmedNonEmptyString.check(Schema.isMaxLength(1600)) }),
-  }),
+  }).annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients),
   Tool.make("assistant_portfolio", {
     ...common,
     description:
@@ -63,7 +63,7 @@ export const AssistantToolkit = Toolkit.make(
       patch: BriefPatch,
       reason: Schema.optionalKey(Schema.String),
     }),
-  }),
+  }).annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients),
   Tool.make("assistant_assign", {
     ...common,
     description:
@@ -103,7 +103,7 @@ export const AssistantToolkit = Toolkit.make(
       assignmentId: TrimmedNonEmptyString,
       evidence: Schema.Array(TrimmedNonEmptyString).check(Schema.isMinLength(1)),
     }),
-  }),
+  }).annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients),
   Tool.make("assistant_capture_work", {
     ...capturing,
     description:
@@ -116,13 +116,13 @@ export const AssistantToolkit = Toolkit.make(
       overwrite: Schema.optionalKey(Schema.Boolean),
       recoverItem: Schema.optionalKey(TrimmedNonEmptyString),
     }),
-  }),
+  }).annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients),
   Tool.make("assistant_abandon_capture", {
     ...capturing,
     description:
       "Drop an idea's Work capture, for an uncertain capture whose item cannot be found, or to capture the idea anew. The Work item and the capture's history stay; the next capture creates a new item. Refused while the capture is being written or a Factory assignment that has not ended uses it.",
     parameters: Schema.Struct({ projectId: ProjectId, ideaId: TrimmedNonEmptyString }),
-  }),
+  }).annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients),
 );
 const assistantCaller = Effect.gen(function* () {
   const context = yield* readCaller();

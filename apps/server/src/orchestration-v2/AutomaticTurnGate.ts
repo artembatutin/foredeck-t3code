@@ -40,7 +40,7 @@ export interface PullRequestWakeTurn extends Presentation {
   /** When the watch whose sync carries the wake started. */
   readonly watchStartedAt: string;
   /** Why the wake's sync would end the watch, or null when watching goes on. */
-  readonly ending: "unreadable" | "closed" | "comment-limit" | null;
+  readonly ending: "unreadable" | "closed" | "merged" | "comment-limit" | null;
 }
 
 /** A restart's continuation of the run it cut. Keyed by that run. */

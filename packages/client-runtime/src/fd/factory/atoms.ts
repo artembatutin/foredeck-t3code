@@ -71,7 +71,7 @@ export function createFactoryEnvironmentAtoms<R, E>(
   /** Whether a request needing `need` may leave now for the environment the effect targets. */
   const servedNow = Effect.fn("FactoryAtoms.servedNow")(function* (need: FactoryNeed) {
     const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
-    // Every atom effect runs with its registry in context; the shared helpers do not declare it.
+    // Query atoms run with their registry in context; writes provide it (see `writeWhenServed`).
     const registry = yield* Effect.serviceOption(AtomRegistry.AtomRegistry);
     if (
       Option.isNone(registry) ||
@@ -86,12 +86,19 @@ export function createFactoryEnvironmentAtoms<R, E>(
   const readWhenServed = <A, Err>(
     send: Effect.Effect<A, Err, EnvironmentSupervisor.EnvironmentSupervisor>,
   ) => Effect.flatMap(servedNow("factory"), (served) => (served ? send : Effect.never));
-  /** A write that fails, unsent, while the destination does not serve what it needs. */
+  /**
+   * A write that fails, unsent, while the destination does not serve what it needs. Commands
+   * hand their registry to `execute` rather than running with it in context.
+   */
   const writeWhenServed = Effect.fn("FactoryAtoms.writeWhenServed")(function* <A, Err>(
+    registry: AtomRegistry.AtomRegistry,
     need: FactoryNeed,
     send: Effect.Effect<A, Err, EnvironmentSupervisor.EnvironmentSupervisor>,
   ) {
-    if (yield* servedNow(need)) return yield* send;
+    const served = yield* servedNow(need).pipe(
+      Effect.provideService(AtomRegistry.AtomRegistry, registry),
+    );
+    if (served) return yield* send;
     const { environmentId, label } = (yield* EnvironmentSupervisor.EnvironmentSupervisor).target;
     const wanted = {
       factory: "Factory. Update its server to use Factory.",
@@ -236,8 +243,9 @@ export function createFactoryEnvironmentAtoms<R, E>(
       createEnvironmentRpcCommand(runtime, {
         label: "environment-data:factory:start",
         tag: WS_METHODS.factoryDeliveriesStart,
-        execute: (input) =>
+        execute: (input, registry) =>
           writeWhenServed(
+            registry,
             input.kind === "parent" ? "planning" : "factory",
             requestGuarded(WS_METHODS.factoryDeliveriesStart, input),
           ),
@@ -253,8 +261,12 @@ export function createFactoryEnvironmentAtoms<R, E>(
       createEnvironmentRpcCommand(runtime, {
         label: "environment-data:factory:stop",
         tag: WS_METHODS.factoryDeliveriesStop,
-        execute: (input) =>
-          writeWhenServed("factory", requestGuarded(WS_METHODS.factoryDeliveriesStop, input)),
+        execute: (input, registry) =>
+          writeWhenServed(
+            registry,
+            "factory",
+            requestGuarded(WS_METHODS.factoryDeliveriesStop, input),
+          ),
         scheduler,
         concurrency: byDelivery,
       }),
@@ -263,8 +275,12 @@ export function createFactoryEnvironmentAtoms<R, E>(
       createEnvironmentRpcCommand(runtime, {
         label: "environment-data:factory:resume",
         tag: WS_METHODS.factoryDeliveriesResume,
-        execute: (input) =>
-          writeWhenServed("factory", requestGuarded(WS_METHODS.factoryDeliveriesResume, input)),
+        execute: (input, registry) =>
+          writeWhenServed(
+            registry,
+            "factory",
+            requestGuarded(WS_METHODS.factoryDeliveriesResume, input),
+          ),
         scheduler,
         concurrency: byDelivery,
       }),
@@ -273,8 +289,12 @@ export function createFactoryEnvironmentAtoms<R, E>(
       createEnvironmentRpcCommand(runtime, {
         label: "environment-data:factory:cancel",
         tag: WS_METHODS.factoryDeliveriesCancel,
-        execute: (input) =>
-          writeWhenServed("factory", requestGuarded(WS_METHODS.factoryDeliveriesCancel, input)),
+        execute: (input, registry) =>
+          writeWhenServed(
+            registry,
+            "factory",
+            requestGuarded(WS_METHODS.factoryDeliveriesCancel, input),
+          ),
         scheduler,
         concurrency: byDelivery,
       }),
@@ -283,8 +303,12 @@ export function createFactoryEnvironmentAtoms<R, E>(
       createEnvironmentRpcCommand(runtime, {
         label: "environment-data:factory:set-settings",
         tag: WS_METHODS.factorySettingsSet,
-        execute: (input) =>
-          writeWhenServed("factory", requestGuarded(WS_METHODS.factorySettingsSet, input)),
+        execute: (input, registry) =>
+          writeWhenServed(
+            registry,
+            "factory",
+            requestGuarded(WS_METHODS.factorySettingsSet, input),
+          ),
         scheduler,
         concurrency: {
           mode: "serial",
@@ -297,8 +321,9 @@ export function createFactoryEnvironmentAtoms<R, E>(
       createEnvironmentRpcCommand(runtime, {
         label: "environment-data:factory:discover-commands",
         tag: WS_METHODS.factoryCommandsDiscover,
-        execute: (input) =>
+        execute: (input, registry) =>
           writeWhenServed(
+            registry,
             "commandSetup",
             requestGuarded(WS_METHODS.factoryCommandsDiscover, input),
           ),
@@ -311,8 +336,9 @@ export function createFactoryEnvironmentAtoms<R, E>(
       createEnvironmentRpcCommand(runtime, {
         label: "environment-data:factory:validate-command",
         tag: WS_METHODS.factoryCommandsValidate,
-        execute: (input) =>
+        execute: (input, registry) =>
           writeWhenServed(
+            registry,
             "commandSetup",
             requestGuarded(WS_METHODS.factoryCommandsValidate, input),
           ),
@@ -325,8 +351,12 @@ export function createFactoryEnvironmentAtoms<R, E>(
       createEnvironmentRpcCommand(runtime, {
         label: "environment-data:factory:update-plan",
         tag: WS_METHODS.factoryPlanUpdate,
-        execute: (input) =>
-          writeWhenServed("planning", requestGuarded(WS_METHODS.factoryPlanUpdate, input)),
+        execute: (input, registry) =>
+          writeWhenServed(
+            registry,
+            "planning",
+            requestGuarded(WS_METHODS.factoryPlanUpdate, input),
+          ),
         scheduler,
         concurrency: byDelivery,
       }),
@@ -336,8 +366,12 @@ export function createFactoryEnvironmentAtoms<R, E>(
       createEnvironmentRpcCommand(runtime, {
         label: "environment-data:factory:approve-plan",
         tag: WS_METHODS.factoryPlanApprove,
-        execute: (input) =>
-          writeWhenServed("planning", requestGuarded(WS_METHODS.factoryPlanApprove, input)),
+        execute: (input, registry) =>
+          writeWhenServed(
+            registry,
+            "planning",
+            requestGuarded(WS_METHODS.factoryPlanApprove, input),
+          ),
         scheduler,
         concurrency: byDelivery,
       }),
@@ -347,8 +381,12 @@ export function createFactoryEnvironmentAtoms<R, E>(
       createEnvironmentRpcCommand(runtime, {
         label: "environment-data:factory:reject-plan",
         tag: WS_METHODS.factoryPlanReject,
-        execute: (input) =>
-          writeWhenServed("planning", requestGuarded(WS_METHODS.factoryPlanReject, input)),
+        execute: (input, registry) =>
+          writeWhenServed(
+            registry,
+            "planning",
+            requestGuarded(WS_METHODS.factoryPlanReject, input),
+          ),
         scheduler,
         concurrency: byDelivery,
       }),
@@ -358,8 +396,12 @@ export function createFactoryEnvironmentAtoms<R, E>(
       createEnvironmentRpcCommand(runtime, {
         label: "environment-data:factory:replan",
         tag: WS_METHODS.factoryPlanReplan,
-        execute: (input) =>
-          writeWhenServed("planning", requestGuarded(WS_METHODS.factoryPlanReplan, input)),
+        execute: (input, registry) =>
+          writeWhenServed(
+            registry,
+            "planning",
+            requestGuarded(WS_METHODS.factoryPlanReplan, input),
+          ),
         scheduler,
         concurrency: byDelivery,
       }),

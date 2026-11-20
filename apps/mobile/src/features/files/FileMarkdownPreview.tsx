@@ -3,6 +3,7 @@ import type { EnvironmentId, RepositoryTarget, ThreadId } from "@t3tools/contrac
 import { resolveMobileMarkdownMediaSource } from "../../lib/markdownMediaSource";
 import { getBrowseDirectoryPath } from "@t3tools/client-runtime/state/projects";
 import { maskMarkdownFrontmatter } from "@t3tools/shared/markdownFrontmatter";
+import { useGT } from "gt-react-native";
 import { useState } from "react";
 import { StackActions, useNavigation } from "@react-navigation/native";
 import { ScrollView, View } from "react-native";
@@ -87,6 +88,7 @@ export function FileMarkdownPreview(props: {
   readonly onRefresh?: () => Promise<void> | void;
 }) {
   const navigation = useNavigation();
+  const gt = useGT();
   const [isPullRefreshing, setIsPullRefreshing] = useState(false);
   const [expandedFile, setExpandedFile] = useState<FilePreviewSource | null>(null);
   const [expandedVideo, setExpandedVideo] = useState<VideoPreviewSource | null>(null);
@@ -123,11 +125,11 @@ export function FileMarkdownPreview(props: {
       (!props.captured && fileLink.kind === "file" && fileLink.line !== undefined)
     ) {
       const name =
-        preview?.source.name ?? (fileLink.kind === "file" ? fileLink.label : "Open file");
+        preview?.source.name ?? (fileLink.kind === "file" ? fileLink.label : gt("Open file"));
       return (
         <Text
           accessibilityRole="link"
-          accessibilityLabel={`Open ${name}`}
+          accessibilityLabel={gt("Open {name}", { name })}
           onPress={() => openMedia(image.href, true)}
           style={{ color: styles.nativeTextStyle.linkColor }}
         >
