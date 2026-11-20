@@ -31,6 +31,7 @@ export function useT3ProjectFileState(
     request.cwd,
     request.path,
     cwd !== null,
+    undefined,
     request.repositoryTarget,
   );
   const contents = query.data && !query.data.truncated ? query.data.contents : null;

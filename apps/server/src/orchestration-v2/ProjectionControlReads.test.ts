@@ -24,6 +24,7 @@ import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -398,6 +399,7 @@ it.effect.each(storageCases)(
               Layer.mergeAll(
                 layerSessions,
                 layerEvents,
+                McpAppModelContext.layerEmpty,
                 ProviderAdapterRegistry.layerFromAdapters([]),
               ),
             ),

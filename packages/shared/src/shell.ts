@@ -284,6 +284,20 @@ export function buildEnvironmentCaptureCommand(
     : command;
 }
 
+// Process first so profile prepends win; User and Machine add dirs missing from the launch snapshot.
+export function windowsEnvironmentValueCommand(name: string): string {
+  if (name === "PATH") {
+    return (
+      "$value = (@(" +
+      "[Environment]::GetEnvironmentVariable('PATH','Process')," +
+      "[Environment]::GetEnvironmentVariable('PATH','Machine')," +
+      "[Environment]::GetEnvironmentVariable('PATH','User')" +
+      ") | Where-Object { $_ }) -join ';'"
+    );
+  }
+  return `$value = [Environment]::GetEnvironmentVariable('${name}')`;
+}
+
 function buildWindowsEnvironmentCaptureCommand(names: ReadonlyArray<string>): string {
   return [
     "$ErrorActionPreference = 'Stop'",
@@ -294,7 +308,7 @@ function buildWindowsEnvironmentCaptureCommand(names: ReadonlyArray<string>): st
 
       return [
         `Write-Output '${envCaptureStart(name)}'`,
-        `$value = [Environment]::GetEnvironmentVariable('${name}')`,
+        windowsEnvironmentValueCommand(name),
         "if ($null -ne $value -and $value.Length -gt 0) { Write-Output $value }",
         `Write-Output '${envCaptureEnd(name)}'`,
       ];
@@ -445,12 +459,13 @@ export const readEnvironmentFromWindowsShell = Effect.fn("shell.readEnvironmentF
   },
 );
 
-function stripWrappingQuotes(value: string): string {
-  return value.replace(/^"+|"+$/g, "");
-}
-
 function trimPathEntry(entry: string, platform: NodeJS.Platform): string {
   return platform === "win32" ? entry.trim() : entry;
+}
+
+// POSIX PATH entries are literal: whitespace and quotes are part of the directory name.
+function normalizePathEntry(entry: string, platform: NodeJS.Platform): string {
+  return platform === "win32" ? entry.trim().replace(/^"+|"+$/g, "") : entry;
 }
 
 function pathDelimiterForPlatform(platform: NodeJS.Platform): string {
@@ -458,7 +473,7 @@ function pathDelimiterForPlatform(platform: NodeJS.Platform): string {
 }
 
 function normalizePathEntryForComparison(entry: string, platform: NodeJS.Platform): string {
-  const normalized = stripWrappingQuotes(trimPathEntry(entry, platform));
+  const normalized = normalizePathEntry(entry, platform);
   return platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
@@ -535,7 +550,7 @@ function commandSearchDirectories(
   for (const entry of resolvePathEnvironmentVariable(env).split(
     pathDelimiterForPlatform(platform),
   )) {
-    const directory = stripWrappingQuotes(trimPathEntry(entry, platform));
+    const directory = normalizePathEntry(entry, platform);
     if (directory.length === 0 && (cwd === undefined || platform === "win32")) continue;
     directories.add(cwd === undefined ? directory : path.resolve(cwd, directory));
   }
@@ -941,6 +956,7 @@ const CONSOLE_FREE_GIT_READS = [
   "rev-parse --git-path index",
   "rev-parse --git-common-dir",
   "rev-parse --show-toplevel",
+  "rev-parse --path-format=absolute --git-path index --git-common-dir --show-toplevel",
   "rev-parse --symbolic-full-name HEAD",
   "rev-parse --abbrev-ref --symbolic-full-name @{upstream}",
   "symbolic-ref --quiet HEAD",

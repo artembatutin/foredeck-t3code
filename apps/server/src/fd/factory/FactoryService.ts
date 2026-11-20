@@ -387,6 +387,7 @@ export type FactoryStartError =
   | ProjectStore.ProjectStoreV2Error
   | FactoryThreadEffects.FactoryProjectMissingError
   | ThreadLaunch.ThreadLaunchBaseRefError
+  | ThreadLaunch.ThreadLaunchBranchExistsError
   | ThreadLaunch.ThreadLaunchBranchConflictError
   | ThreadLaunch.ThreadLaunchNotRepositoryError
   | FactoryBranchUnavailableError

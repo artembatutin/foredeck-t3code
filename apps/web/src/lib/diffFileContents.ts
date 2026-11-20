@@ -1,3 +1,4 @@
+import { msg } from "gt-react";
 import type { FileDiffContentsLoader, FileDiffMetadata } from "@pierre/diffs";
 import {
   squashAtomCommandFailure,
@@ -14,6 +15,7 @@ import type {
   ReviewDiffPreviewSourceKind,
 } from "@t3tools/contracts";
 
+import { m } from "../i18n/messages";
 import { resolveFileDiffPath } from "./diffRendering";
 
 interface GitDiffFileContentsSource {
@@ -130,7 +132,7 @@ function createDiffFileContentsLoader(
     }
     if (!reproducesPatch(fileDiff, contents.oldContents, contents.newContents)) {
       throw new Error(
-        "This file changed since the diff was loaded. Refresh the diff to expand it.",
+        m(msg("This file changed since the diff was loaded. Refresh the diff to expand it.")),
       );
     }
     return {

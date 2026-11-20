@@ -9,8 +9,11 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Stream from "effect/Stream";
 import * as HttpClient from "effect/http/HttpClient";
 
 import * as AcpRegistrySupport from "../../server/AcpRegistrySupport.ts";
@@ -55,7 +58,11 @@ it.live.skipIf(process.env.DEVIN_CLI_LIVE !== "1")(
           commandPath: devinCommandPath,
         },
       });
-      const initial = yield* instance.snapshot.getSnapshot;
+      const firstCheck = yield* instance.snapshot.streamChanges.pipe(
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      const initial = Option.getOrThrow(yield* Fiber.join(firstCheck));
       expect(initial).toMatchObject({
         driver: "devin",
         installed: true,

@@ -15,6 +15,7 @@ import {
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2Notification,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -103,12 +104,17 @@ function layerTest(input: {
   readonly getThreadRecords: () => Effect.Effect<OrchestrationV2ThreadProjection>;
   readonly dispatch?: ThreadManagementService.ThreadManagementService["Service"]["dispatch"];
   readonly gate?: (typeof AutomaticTurnGate.AutomaticTurnGate)["Service"];
+  readonly beforeDispatch?: (threadId: ThreadId) => Effect.Effect<void>;
 }) {
   const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
     getThreadRecords: input.getThreadRecords,
     dispatch:
       input.dispatch ??
-      ((command) => Queue.offer(input.dispatched, command).pipe(Effect.as({} as never))),
+      ((command) =>
+        (
+          ("threadId" in command ? input.beforeDispatch?.(command.threadId) : undefined) ??
+          Effect.void
+        ).pipe(Effect.andThen(Queue.offer(input.dispatched, command)), Effect.as({} as never))),
   });
   const layerWorker = ProviderContinuationService.layer.pipe(
     Layer.provide(
@@ -1028,4 +1034,42 @@ describe("ProviderContinuationService", () => {
       );
     });
   });
+
+  it.effect(
+    "a wake held by another thread's parent lock does not delay other threads' wakes",
+    () => {
+      return Effect.gen(function* () {
+        const dispatched = yield* Queue.unbounded<unknown>();
+        const blockedChildId = ThreadId.make("thread-provider-continuation-blocked-child");
+        const dispatchedAt = new Map<ThreadId, number>();
+        yield* Effect.gen(function* () {
+          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          yield* requests.offer({ ...request(), threadId: blockedChildId });
+          yield* requests.offer(request());
+          yield* TestClock.adjust("10 minutes");
+          yield* Queue.take(dispatched);
+          yield* Queue.take(dispatched);
+          assert.equal(dispatchedAt.get(blockedChildId), 10 * 60 * 1000);
+          assert.equal(dispatchedAt.get(threadId), 0);
+        }).pipe(
+          Effect.provide(
+            layerTest({
+              dispatched,
+              getThreadRecords: () => Effect.succeed(projection),
+              // Models the child's message intake waiting on its coordinator's dispatch lock.
+              beforeDispatch: (dispatchThreadId) =>
+                (dispatchThreadId === blockedChildId
+                  ? Effect.sleep("10 minutes")
+                  : Effect.void
+                ).pipe(
+                  Effect.andThen(Clock.currentTimeMillis),
+                  Effect.map((now) => void dispatchedAt.set(dispatchThreadId, now)),
+                ),
+            }),
+          ),
+          Effect.scoped,
+        );
+      });
+    },
+  );
 });

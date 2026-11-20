@@ -8,9 +8,12 @@ import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEve
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import { writeFakeCli } from "@t3tools/provider-testing/fakeCli";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import { DEFAULT_DEVIN_SETTINGS, DevinSettings } from "../devin/index.ts";
@@ -125,7 +128,12 @@ it.layer(layerTest)("DevinDriver", (it) => {
           }),
         ),
       );
-      const snapshot = yield* instance.snapshot.getSnapshot;
+      // Creation returns a placeholder; the first readiness check runs in the background.
+      const checked = yield* instance.snapshot.streamChanges.pipe(
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      const snapshot = Option.getOrThrow(yield* Fiber.join(checked));
       expect(snapshot.models.map(({ slug, name }) => ({ slug, name }))).toEqual([
         { slug: "native-low", name: "Native Low Thinking" },
         { slug: "native-high", name: "Native High Thinking" },

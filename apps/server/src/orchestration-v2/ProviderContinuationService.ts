@@ -2,6 +2,7 @@ import {
   CommandId,
   type MessageId,
   type OrchestrationV2ThreadProjection,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -11,6 +12,7 @@ import * as Stream from "effect/Stream";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as AutomaticTurnGate from "./AutomaticTurnGate.ts";
 import type * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
@@ -80,6 +82,7 @@ export const layer = Layer.effectDiscard(
     const retryAttempts = yield* Ref.make(new Map<string, number>());
     // Run watches outlive the wake the gate may run later, so they belong to the service.
     const serviceScope = yield* Effect.scope;
+    const continuations = yield* KeyedLock.makeRunner<ThreadId>();
 
     const clearRetryAttempt = (key: string) =>
       Ref.update(retryAttempts, (current) => {
@@ -431,6 +434,8 @@ export const layer = Layer.effectDiscard(
               }
             }),
           ),
+          // A dispatch can wait on its parent's lock, so only its own thread's later requests queue behind it.
+          (handled) => continuations.run(request.threadId, handled),
         ),
       ),
       Effect.forever,

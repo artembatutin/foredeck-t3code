@@ -152,7 +152,11 @@ describe("Factory follow-through cancelled", () => {
         yield* drainFactory;
         yield* drainOrchestration;
         assert.strictEqual((yield* stateOf(deliveryId)).status, "cancelled");
-        assert.deepStrictEqual(interruptedTurns(world), [providerTurnOf(world, wakeRun)]);
+        // Starting the owner's queued turn stops the wake's still-running turn again.
+        assert.deepStrictEqual(
+          [...new Set(interruptedTurns(world))],
+          [providerTurnOf(world, wakeRun)],
+        );
         assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), [wakeRun]);
 
         // The wake's turn stops; the owner's turn then runs, and is left alone.
@@ -160,7 +164,10 @@ describe("Factory follow-through cancelled", () => {
         yield* started(ownerRun);
         yield* drainFactory;
         yield* drainOrchestration;
-        assert.deepStrictEqual(interruptedTurns(world), [providerTurnOf(world, wakeRun)]);
+        assert.deepStrictEqual(
+          [...new Set(interruptedTurns(world))],
+          [providerTurnOf(world, wakeRun)],
+        );
         assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), [wakeRun]);
         assert.strictEqual(yield* world.endRun(ownerRun, "completed"), "completed");
         assert.strictEqual((yield* stateOf(deliveryId)).status, "cancelled");
@@ -577,7 +584,11 @@ describe("Factory follow-through cancelled with the last comment-limit wake", ()
         yield* drainFactory;
         yield* drainOrchestration;
         assert.deepStrictEqual(yield* cancelledRuns(author, deliveryId), [last]);
-        assert.deepStrictEqual(interruptedTurns(world), [providerTurnOf(world, last)]);
+        // Starting the owner's queued turn stops the wake's still-running turn again.
+        assert.deepStrictEqual(
+          [...new Set(interruptedTurns(world))],
+          [providerTurnOf(world, last)],
+        );
 
         yield* world.endRun(last, "cancelled");
         yield* started(ownerRun);

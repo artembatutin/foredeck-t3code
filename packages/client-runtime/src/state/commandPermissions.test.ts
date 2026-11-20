@@ -35,6 +35,7 @@ import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -42,7 +43,7 @@ import { Atom, AtomRegistry, AsyncResult } from "effect/reactivity";
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { createFactoryEnvironmentAtoms } from "../fd/factory/index.ts";
 import { createCommandPermissions } from "./commandPermissions.ts";
-import { type AtomCommandResult, createEnvironmentRpcCommand } from "./runtime.ts";
+import { createEnvironmentRpcCommand, runAtomCommand } from "./runtime.ts";
 import { AVAILABLE_CONNECTION_STATE, BearerConnectionTarget } from "../connection/model.ts";
 import { createPeerLinkEnvironmentAtoms } from "./peerLinks.ts";
 
@@ -235,6 +236,31 @@ describe("command permissions", () => {
       }),
   );
 
+  it.effect("requires the destination settings grant to connect or bind an issue tracker", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        const connect = createCommandPermissions(runtime, WS_METHODS.issueTrackersConnect);
+        const bind = createCommandPermissions(runtime, WS_METHODS.issueTrackersBindProject);
+        registry.set(sessions(env), AsyncResult.success(grant(true)));
+        expect(registry.get(connect.permissionAtom(env))).toBe(false);
+        expect(registry.get(bind.permissionAtom(env))).toBe(false);
+        registry.set(
+          sessions(env),
+          AsyncResult.success({
+            ...grant(false),
+            scopes: [AuthSettingsWriteScope],
+            permissions: [AuthSettingsWriteScope],
+          }),
+        );
+        expect(registry.get(connect.permissionAtom(env))).toBe(true);
+        expect(registry.get(bind.permissionAtom(env))).toBe(true);
+        yield* connect.authorize(registry, env);
+        yield* bind.authorize(registry, env);
+      }),
+    ),
+  );
+
   it.effect.each([WS_METHODS.scheduledTasksDelete, ORCHESTRATION_V2_WS_METHODS.stopWorkflow])(
     "uses the target grant for both availability and execution of %s",
     (method) =>
@@ -304,9 +330,10 @@ describe("command permissions", () => {
     });
     const target = { environmentId: env, input: { id: ScheduledTaskId.make("task") } };
     try {
-      const first = command.run(registry, target);
+      const quiet = { reportFailure: false, reportDefect: false };
+      const first = runAtomCommand(registry, command, target, quiet);
       await entered;
-      const second = command.run(registry, target);
+      const second = runAtomCommand(registry, command, target, quiet);
       registry.set(sessions(env), AsyncResult.success(grant(false)));
       release();
       expect((await first)._tag).toBe("Success");
@@ -482,10 +509,10 @@ it.effect(
       setAccess(false);
       expect(yield* readLinks).toEqual({ links: [] });
       const linkInput = { url: peer.urls[0]!, pairingCode: "test-code", access: peer.access };
-      const link = Effect.promise(() =>
+      const link = Effect.exit(
         peerLinks.link.run(registry, { environmentId: env, input: linkInput }),
       );
-      const unlink = Effect.promise(() =>
+      const unlink = Effect.exit(
         peerLinks.unlink.run(registry, {
           environmentId: env,
           input: { environmentId: peer.environmentId },
@@ -765,7 +792,7 @@ const makeFactoryCommands = Effect.fn("TestFactoryCommands.make")(function* (
         }),
     },
   };
-  const outcome = (result: AtomCommandResult<unknown, unknown>) => {
+  const outcome = (result: Exit.Exit<unknown, unknown>) => {
     if (result._tag === "Success") return "sent";
     const failure = Cause.squash(result.cause);
     return isAuthorizationError(failure)
@@ -780,10 +807,8 @@ const makeFactoryCommands = Effect.fn("TestFactoryCommands.make")(function* (
     commands,
     controls: [commands.start, commands.stop, commands.resume, commands.cancel],
     outcome,
-    runAll: (
-      selected: ReadonlyArray<{ readonly run: () => Promise<AtomCommandResult<unknown, unknown>> }>,
-    ) =>
-      Effect.forEach(selected, (command) => Effect.promise(command.run).pipe(Effect.map(outcome))),
+    runAll: <E>(selected: ReadonlyArray<{ readonly run: () => Effect.Effect<unknown, E> }>) =>
+      Effect.forEach(selected, (command) => Effect.exit(command.run()).pipe(Effect.map(outcome))),
     permitted: (selected: ReadonlyArray<{ readonly permission: Atom.Atom<boolean> }>) =>
       selected.map((command) => registry.get(command.permission)),
     allow: (
@@ -853,15 +878,19 @@ it.effect(
         factory.sent.length = 0;
         factory.allow([AuthOrchestrationOperateScope, AuthSettingsWriteScope]);
         const held = yield* factory.holdResume;
-        const resumed = factory.commands.resume.run();
+        const resumed = yield* Effect.forkChild(Effect.exit(factory.commands.resume.run()), {
+          startImmediately: true,
+        });
         yield* Deferred.await(held.entered);
-        const cancelled = factory.commands.cancel.run();
+        const cancelled = yield* Effect.forkChild(Effect.exit(factory.commands.cancel.run()), {
+          startImmediately: true,
+        });
         expect(factory.permitted([factory.commands.cancel])).toEqual([true]);
         factory.allow([]);
         expect(factory.permitted([factory.commands.cancel])).toEqual([false]);
         yield* Deferred.succeed(held.release, undefined);
-        expect(factory.outcome(yield* Effect.promise(() => resumed))).toBe("sent");
-        expect(factory.outcome(yield* Effect.promise(() => cancelled))).toBe("denied");
+        expect(factory.outcome(yield* Fiber.join(resumed))).toBe("sent");
+        expect(factory.outcome(yield* Fiber.join(cancelled))).toBe("denied");
         expect(factory.sent).toEqual([WS_METHODS.factoryDeliveriesResume]);
       }),
     ),
@@ -889,14 +918,18 @@ it.effect(
         // A cancel queued behind a resume of the same delivery is checked again when it runs.
         factory.viewConfig(FACTORY_SERVER);
         const held = yield* factory.holdResume;
-        const resumed = factory.commands.resume.run();
+        const resumed = yield* Effect.forkChild(Effect.exit(factory.commands.resume.run()), {
+          startImmediately: true,
+        });
         yield* Deferred.await(held.entered);
-        const cancelled = factory.commands.cancel.run();
+        const cancelled = yield* Effect.forkChild(Effect.exit(factory.commands.cancel.run()), {
+          startImmediately: true,
+        });
         factory.viewConfig(factoryServer({}));
         expect(factory.permitted([factory.commands.cancel])).toEqual([false]);
         yield* Deferred.succeed(held.release, undefined);
-        expect(factory.outcome(yield* Effect.promise(() => resumed))).toBe("sent");
-        expect(factory.outcome(yield* Effect.promise(() => cancelled))).toBe("unsupported");
+        expect(factory.outcome(yield* Fiber.join(resumed))).toBe("sent");
+        expect(factory.outcome(yield* Fiber.join(cancelled))).toBe("unsupported");
         expect(factory.sent).toEqual([WS_METHODS.factoryDeliveriesResume]);
 
         // Reconnected to an older server, before its config replaces the one this client holds.

@@ -13,6 +13,8 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 
 import { OrchestratorProjectionError } from "../orchestration-v2/Orchestrator.ts";
@@ -114,9 +116,18 @@ const probe = {
 };
 const ProbeToolkit = Toolkit.make(
   Tool.make("reads", probe),
-  Tool.make("reads_as_caller", probe),
-  Tool.make("acts_as_caller", probe),
-  Tool.make("delegates_as_caller", probe),
+  Tool.make("reads_as_caller", probe).annotate(
+    McpSchema.EnabledWhen,
+    McpInvocationContext.hiddenFromOutsideClients,
+  ),
+  Tool.make("acts_as_caller", probe).annotate(
+    McpSchema.EnabledWhen,
+    McpInvocationContext.hiddenFromOutsideClients,
+  ),
+  Tool.make("delegates_as_caller", probe).annotate(
+    McpSchema.EnabledWhen,
+    McpInvocationContext.hiddenFromOutsideClients,
+  ),
   Tool.make("writes", probe),
   Tool.make("writes_with_capability", probe),
   Tool.make("writes_threads", {
@@ -258,7 +269,6 @@ it.effect.each([
   ["writes_environment", readOnlyClient, {}, "capability_denied"],
 
   ["reads_as_caller", ended, {}, "ran"],
-  ["reads_as_caller", fullAccessClient, {}, "thread_credential_required"],
   ["acts_as_caller", supervised, {}, "ran"],
   ["acts_as_caller", ended, {}, "parent_not_active"],
   ["acts_as_caller", background, {}, "ran"],
@@ -266,12 +276,9 @@ it.effect.each([
   ["acts_as_caller", mismatchedProvider, {}, "parent_not_active"],
   ["acts_as_caller", archivedBackground, {}, "parent_not_active"],
   ["acts_as_caller", unknownOwnerBackground, {}, "parent_not_active"],
-  ["acts_as_caller", fullAccessClient, {}, "thread_credential_required"],
   // Delegating checks what acting as the caller does; with no policy provided it then just runs.
   ["delegates_as_caller", supervised, {}, "ran"],
   ["delegates_as_caller", ended, {}, "parent_not_active"],
-  ["delegates_as_caller", fullAccessClient, {}, "thread_credential_required"],
-  ["delegates_as_caller", readOnlyClient, {}, "thread_credential_required"],
 
   ["writes", supervised, {}, "ran"],
   ["writes", ended, {}, "parent_not_active"],
@@ -464,7 +471,12 @@ it.effect.each([
 
 it.effect("refuses a linked environment to a tool that acts as its calling thread", () =>
   Effect.gen(function* () {
-    const CallerToolkit = Toolkit.make(Tool.make("acts_as_caller", linkedProbe));
+    const CallerToolkit = Toolkit.make(
+      Tool.make("acts_as_caller", linkedProbe).annotate(
+        McpSchema.EnabledWhen,
+        McpInvocationContext.hiddenFromOutsideClients,
+      ),
+    );
     const built = yield* Layer.build(
       McpToolAccess.HandlersLayer.layer(
         McpToolAccess.toLayer(CallerToolkit, {
@@ -473,6 +485,39 @@ it.effect("refuses a linked environment to a tool that acts as its calling threa
       ),
     ).pipe(Effect.scoped, Effect.exit);
     expect(Exit.isFailure(built) && Cause.hasDies(built.cause)).toBe(true);
+  }),
+);
+
+// Discovery hides these tools. The handler must refuse on its own if that ever changes.
+it.effect.each(["reads_as_caller", "acts_as_caller", "delegates_as_caller"] as const)(
+  "%s refuses an outside client behind discovery",
+  (tool) =>
+    Effect.gen(function* () {
+      const built = yield* ProbeToolkit;
+      const { result } = yield* built
+        .handle(tool, {})
+        .pipe(Stream.unwrap, Stream.run(Sink.last()), Effect.flatMap(Effect.fromOption));
+      expect(result).toMatchObject({ code: "thread_credential_required" });
+    }).pipe(
+      Effect.provide(McpToolAccess.HandlersLayer.layer(layerProbeHandlers)),
+      Effect.provideService(McpInvocationContext.McpInvocationContext, fullAccessClient),
+      Effect.provide(Layer.mock(ThreadManagement.ThreadManagementService)({})),
+    ),
+);
+
+it.effect("refuses to build a thread-bound tool that outside clients would be offered", () =>
+  Effect.gen(function* () {
+    const CallerToolkit = Toolkit.make(Tool.make("reads_as_caller", probe));
+    const built = yield* Layer.build(
+      McpToolAccess.HandlersLayer.layer(
+        McpToolAccess.toLayer(CallerToolkit, {
+          reads_as_caller: McpToolAccess.readsAsCaller(() => ran),
+        }),
+      ),
+    ).pipe(Effect.scoped, Effect.exit);
+    expect(Exit.isFailure(built) && Cause.pretty(built.cause)).toContain(
+      "reads_as_caller acts as its calling thread",
+    );
   }),
 );
 
@@ -512,9 +557,6 @@ describe("delegation under a caller policy", () => {
       expect(running.seen).toEqual([supervisedThreadId]);
       // The caller's own checks refuse first: the policy never sees these.
       expect(yield* runs("delegates_as_caller", ended)).toBe("parent_not_active");
-      expect(yield* runs("delegates_as_caller", fullAccessClient)).toBe(
-        "thread_credential_required",
-      );
       // Acting as the caller is not delegating.
       expect(yield* runs("acts_as_caller", supervised)).toBe("ran");
       expect(running.seen).toEqual([supervisedThreadId]);

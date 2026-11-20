@@ -1,4 +1,5 @@
 import { usesSharedCheckouts } from "@t3tools/client-runtime/fd/multirepo";
+import { msg, useMessages } from "gt-react-native";
 import { useAtomValue } from "@effect/atom-react";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
@@ -14,13 +15,14 @@ import { settingsTargetsForProject } from "./settings-environment-filter.logic";
 import {
   scheduledTaskEditorHasChanges,
   scheduledTaskEditorSessionAtom,
+  setScheduledTaskEditorSaving,
   startScheduledTaskEditor,
   updateScheduledTaskEditor,
   readScheduledTaskEditor,
   type ScheduledTaskEditor,
 } from "./scheduled-task-editor-state";
 
-export const NEW_THREAD_DESTINATION_LABEL = "New thread each run";
+export const NEW_THREAD_DESTINATION_LABEL = msg("New thread each run");
 
 export function useScheduledTaskThread(
   environmentId: EnvironmentId | null,
@@ -42,9 +44,10 @@ export function useScheduledTaskDestinationLabel(
   environmentId: EnvironmentId | null,
   threadId: ThreadId | null,
 ): string {
+  const m = useMessages();
   const thread = useScheduledTaskThread(environmentId, threadId);
-  if (environmentId === null || threadId === null) return NEW_THREAD_DESTINATION_LABEL;
-  return thread?.title.trim() || `Thread ${threadId}`;
+  if (environmentId === null || threadId === null) return m(NEW_THREAD_DESTINATION_LABEL);
+  return thread?.title.trim() || m(msg("Thread {id}", { id: threadId }));
 }
 
 /** The form draft lives in an atom, so it survives while its native picker routes are on top. */
@@ -98,6 +101,8 @@ export function useScheduledTaskEditor() {
   const editor = session ? session.current : defaultEditor;
   const initial = session ? session.initial : defaultEditor;
   const hasChanges = scheduledTaskEditorHasChanges(initial, editor);
+  const saving = session?.saving ?? false;
+  const setSaving = (next: boolean) => setScheduledTaskEditorSaving(next, defaultEditor);
   const setEditor: Dispatch<SetStateAction<ScheduledTaskEditor | null>> = (update) => {
     updateScheduledTaskEditor(update, defaultEditor);
   };
@@ -111,6 +116,8 @@ export function useScheduledTaskEditor() {
     setEditor,
     startEditor,
     hasChanges,
+    saving,
+    setSaving,
     resetEditor,
     draftForEnvironment,
   };
